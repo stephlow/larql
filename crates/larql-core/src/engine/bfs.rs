@@ -112,7 +112,7 @@ pub fn extract_bfs(
                 // Queue valid entities for further exploration
                 let obj = result.answer.trim().to_string();
                 if !visited.contains(&obj)
-                    && depth + 1 <= config.max_depth
+                    && depth < config.max_depth
                     && is_valid_entity(&obj)
                 {
                     queue.push_back((obj, depth + 1));

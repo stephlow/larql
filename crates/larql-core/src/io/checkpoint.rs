@@ -36,7 +36,7 @@ impl CheckpointLog {
     pub fn append(&mut self, edge: &Edge) -> std::io::Result<()> {
         let compact = CompactEdge::from(edge);
         let json = serde_json::to_string(&compact)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         writeln!(self.file, "{json}")?;
         self.file.flush()?;
         self.count += 1;

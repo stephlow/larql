@@ -515,6 +515,100 @@ fn merge_graphs(target: &mut PyGraph, other: &PyGraph) -> usize {
     lq::merge_graphs(&mut target.inner, &other.inner)
 }
 
+/// Walk FFN weights from a model directory. Returns a Graph of extracted edges.
+///
+/// Args:
+///     model_path: Path to model directory (safetensors + tokenizer.json)
+///     output_path: Where to save the result (.larql.json or .larql.bin)
+///     layer: Optional single layer to walk (default: all)
+///     top_k: Top-k tokens per feature (default: 5)
+///     min_score: Minimum activation score (default: 0.02)
+#[pyfunction]
+#[pyo3(signature = (model_path, output_path=None, layer=None, top_k=5, min_score=0.02))]
+fn weight_walk(
+    model_path: &str,
+    output_path: Option<&str>,
+    layer: Option<usize>,
+    top_k: usize,
+    min_score: f32,
+) -> PyResult<PyGraph> {
+    let config = lq::WalkConfig { top_k, min_score };
+    let layers: Option<Vec<usize>> = layer.map(|l| vec![l]);
+
+    let mut graph = lq::Graph::new();
+    graph.metadata.insert(
+        "model".to_string(),
+        serde_json::Value::String(model_path.to_string()),
+    );
+    graph.metadata.insert(
+        "method".to_string(),
+        serde_json::Value::String("weight-walk".to_string()),
+    );
+
+    let mut callbacks = lq::walker::weight_walker::SilentWalkCallbacks;
+
+    lq::walk_model(
+        model_path,
+        layers.as_deref(),
+        &config,
+        &mut graph,
+        &mut callbacks,
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    if let Some(path) = output_path {
+        lq::save(&graph, path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    }
+
+    Ok(PyGraph { inner: graph })
+}
+
+/// Walk attention OV circuits from a model. Returns a Graph of routing edges.
+#[pyfunction]
+#[pyo3(signature = (model_path, output_path=None, layer=None, top_k=3, min_score=0.0))]
+fn attention_walk(
+    model_path: &str,
+    output_path: Option<&str>,
+    layer: Option<usize>,
+    top_k: usize,
+    min_score: f32,
+) -> PyResult<PyGraph> {
+    let walker = lq::AttentionWalker::load(model_path)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let config = lq::WalkConfig { top_k, min_score };
+
+    let mut graph = lq::Graph::new();
+    graph.metadata.insert(
+        "model".to_string(),
+        serde_json::Value::String(model_path.to_string()),
+    );
+    graph.metadata.insert(
+        "method".to_string(),
+        serde_json::Value::String("attention-walk".to_string()),
+    );
+
+    let layers: Vec<usize> = match layer {
+        Some(l) => vec![l],
+        None => (0..walker.num_layers()).collect(),
+    };
+
+    let mut callbacks = lq::walker::weight_walker::SilentWalkCallbacks;
+    for &l in &layers {
+        walker
+            .walk_layer(l, &config, &mut graph, &mut callbacks)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    }
+
+    if let Some(path) = output_path {
+        lq::save(&graph, path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    }
+
+    Ok(PyGraph { inner: graph })
+}
+
 // ── Module ──
 
 #[pymodule]
@@ -526,5 +620,7 @@ fn _larql_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(shortest_path, m)?)?;
     m.add_function(wrap_pyfunction!(merge_graphs, m)?)?;
+    m.add_function(wrap_pyfunction!(weight_walk, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_walk, m)?)?;
     Ok(())
 }

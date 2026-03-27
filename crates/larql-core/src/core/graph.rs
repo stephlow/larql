@@ -139,7 +139,7 @@ impl Graph {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|(rel, _, _)| relation.map_or(true, |r| rel == r))
+                    .filter(|(rel, _, _)| relation.is_none_or(|r| rel == r))
                     .map(|(_, _, idx)| &self.edges[*idx])
                     .collect()
             })
@@ -153,7 +153,7 @@ impl Graph {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|(rel, _, _)| relation.map_or(true, |r| rel == r))
+                    .filter(|(rel, _, _)| relation.is_none_or(|r| rel == r))
                     .map(|(_, _, idx)| &self.edges[*idx])
                     .collect()
             })
@@ -234,7 +234,7 @@ impl Graph {
 
             for edge in self.select(&node, None) {
                 sub.add_edge(edge.clone());
-                if d + 1 <= depth {
+                if d < depth {
                     queue.push_back((edge.object.clone(), d + 1));
                 }
             }
@@ -292,8 +292,8 @@ impl Graph {
     ) -> usize {
         self.edges
             .iter()
-            .filter(|e| relation.map_or(true, |r| e.relation == r))
-            .filter(|e| source.map_or(true, |s| &e.source == s))
+            .filter(|e| relation.is_none_or(|r| e.relation == r))
+            .filter(|e| source.is_none_or(|s| &e.source == s))
             .count()
     }
 

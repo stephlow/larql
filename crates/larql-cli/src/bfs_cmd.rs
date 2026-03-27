@@ -157,12 +157,11 @@ pub fn run(args: BfsArgs) -> Result<(), Box<dyn std::error::Error>> {
         .resume
         .as_ref()
         .or(Some(&args.output))
-        .map(|p| {
+        .and_then(|p| {
             let mut cp_path = p.clone();
             cp_path.set_extension("checkpoint");
             CheckpointLog::open(cp_path).ok()
-        })
-        .flatten();
+        });
 
     let mut callbacks = ProgressCallbacks {
         bar,

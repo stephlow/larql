@@ -25,3 +25,6 @@ build/
 
 # Checkpoints / temp
 *.checkpoint
+
+# output
+output/
