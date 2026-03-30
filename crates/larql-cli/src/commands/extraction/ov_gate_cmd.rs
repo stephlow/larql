@@ -1,9 +1,11 @@
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Args;
 use larql_inference::ndarray::{self, Array2};
 use larql_inference::tokenizers;
-use larql_inference::InferenceModel;
+use larql_inference::{load_feature_labels, InferenceModel};
 
 #[derive(Args)]
 pub struct OvGateArgs {
@@ -25,9 +27,24 @@ pub struct OvGateArgs {
     /// Show verbose per-feature details.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Output format: "table" (default) or "ndjson".
+    #[arg(long, default_value = "table")]
+    output: String,
+
+    /// Output file path (for ndjson output). Defaults to stdout.
+    #[arg(short = 'o', long)]
+    output_file: Option<PathBuf>,
+
+    /// Path to feature labels file (down_meta.jsonl or ffn_gate.vectors.jsonl).
+    /// Skips slow vocab projection — uses precomputed labels instead.
+    #[arg(long)]
+    labels: Option<PathBuf>,
 }
 
 pub fn run(args: OvGateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ndjson = args.output == "ndjson";
+
     eprintln!("Loading model: {}", args.model);
     let start = Instant::now();
     let model = InferenceModel::load(&args.model)?;
@@ -51,83 +68,77 @@ pub fn run(args: OvGateArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => (0..num_layers).collect(),
     };
 
+    // Set up output writer for NDJSON mode
+    let mut ndjson_writer: Option<BufWriter<Box<dyn Write>>> = if ndjson {
+        let writer: Box<dyn Write> = match &args.output_file {
+            Some(path) => Box::new(std::fs::File::create(path)?),
+            None => Box::new(std::io::stdout()),
+        };
+        let mut w = BufWriter::new(writer);
+        // Write header
+        let header = serde_json::json!({
+            "_header": true,
+            "type": "ov_gate_coupling",
+            "model": args.model,
+            "top_k": args.top_k,
+            "num_layers": num_layers,
+            "num_q_heads": num_q_heads,
+            "layers": &layers,
+        });
+        serde_json::to_writer(&mut w, &header)?;
+        w.write_all(b"\n")?;
+        Some(w)
+    } else {
+        None
+    };
+
     // ── For each layer, for each head: compute OV circuit → gate coupling ──
 
-    println!(
-        "\n{:<6} {:<5} {:>8}  {:<60}  {:<60}",
-        "Layer", "Head", "Coupling", "Top gate features (what head activates)", "Top gate features (what head hears)"
-    );
-    println!("{}", "-".repeat(150));
+    if !ndjson {
+        println!(
+            "\n{:<6} {:<5} {:>8}  {:<60}  {:<60}",
+            "Layer", "Head", "Coupling", "Top gate features (what head activates)", "Top gate features (what head hears)"
+        );
+        println!("{}", "-".repeat(150));
+    }
 
-    for &layer in &layers {
-        let w_v = match weights.tensors.get(&arch.attn_v_key(layer)) {
-            Some(w) => w,
-            None => continue,
-        };
+    // Collected data: (layer, head, feature, coupling, total_coupling)
+    struct HeadData {
+        layer: usize,
+        head: usize,
+        couplings: Vec<(usize, f32)>,
+        total_coupling: f32,
+    }
+
+    let compute_start = Instant::now();
+    eprintln!();
+    let mut all_heads: Vec<HeadData> = Vec::new();
+
+    for (li, &layer) in layers.iter().enumerate() {
+        eprint!("L{layer}... ");
+        let _ = std::io::stderr().flush();
+        if (li + 1) % 10 == 0 {
+            eprintln!("({}/{} layers, {:.0}s)", li + 1, layers.len(), compute_start.elapsed().as_secs_f64());
+            eprint!("  ");
+            let _ = std::io::stderr().flush();
+        }
+
         let w_o = match weights.tensors.get(&arch.attn_o_key(layer)) {
             Some(w) => w,
             None => continue,
         };
-
-        // Gate at THIS layer's FFN (attention output feeds into same layer's FFN)
         let w_gate = match weights.tensors.get(&arch.ffn_gate_key(layer)) {
             Some(w) => w,
             None => continue,
         };
-
-        // Also check next layer's gate (attention can set up for next layer too)
-        let _w_gate_next = if layer + 1 < num_layers {
-            weights.tensors.get(&arch.ffn_gate_key(layer + 1))
-        } else {
-            None
-        };
-
         let intermediate = w_gate.shape()[0];
 
         for q_head in 0..num_q_heads {
-            let kv_head = q_head / reps;
-
-            // Extract V block for this KV head: (head_dim, hidden_size)
-            let v_start = kv_head * head_dim;
-            let v_block = w_v.slice(ndarray::s![v_start..v_start + head_dim, ..]);
-
-            // Extract O block for this Q head: (hidden_size, head_dim)
             let o_start = q_head * head_dim;
             let o_block = w_o.slice(ndarray::s![.., o_start..o_start + head_dim]);
-
-            // OV circuit: W_O_block × W_V_block = (hidden_size, head_dim) × (head_dim, hidden_size)
-            //           = (hidden_size, hidden_size) — what this head writes to the residual
-            // But we don't need the full OV matrix. We need:
-            //   gate_coupling = W_gate × OV = W_gate × (W_O_block × W_V_block)
-            //   = (intermediate, hidden) × (hidden, hidden) = (intermediate, hidden)
-            //
-            // We want per-feature coupling strength: ||gate_coupling[f, :]|| for each feature f.
-            // But that's expensive. Instead, compute:
-            //   OV_col_norms: for each output dimension, how much does this head write?
-            //   Then gate_coupling[f] = gate_row[f] · OV_col_norms
-            //
-            // Actually, the right metric is: for a random input, how much does feature f
-            // activate through this head? That's the Frobenius inner product:
-            //   coupling[f] = ||W_gate[f,:] × W_O_block × W_V_block||_F
-            //
-            // Efficient: compute W_gate × W_O_block first = (intermediate, head_dim)
-            // Then for each feature, the norm of (gate_o[f,:] × W_V_block) is the coupling.
-            // But gate_o[f,:] is (head_dim,) and W_V_block is (head_dim, hidden), so
-            // gate_o[f,:] × W_V_block = (hidden,) — too expensive per feature.
-            //
-            // Simplest useful metric: project the OV output direction against gate rows.
-            // The "output direction" of the OV circuit is the dominant singular vector of OV.
-            // But computing SVD of (hidden, hidden) per head is slow.
-            //
-            // Practical shortcut: compute W_gate × W_O_block = (intermediate, head_dim).
-            // This tells us: for each gate feature, which directions in head-space activate it.
-            // The norm of each row = how strongly the head can activate that feature.
-
             let o_block_owned = o_block.to_owned();
-            // gate_o = W_gate × W_O_block = (intermediate, hidden) × (hidden, head_dim) = (intermediate, head_dim)
             let gate_o = w_gate.dot(&o_block_owned);
 
-            // Per-feature coupling: L2 norm of gate_o[f, :] = how much this head can activate feature f
             let mut couplings: Vec<(usize, f32)> = Vec::with_capacity(intermediate);
             for f in 0..intermediate {
                 let row = gate_o.row(f);
@@ -135,36 +146,106 @@ pub fn run(args: OvGateArgs) -> Result<(), Box<dyn std::error::Error>> {
                 couplings.push((f, norm));
             }
 
-            // Total coupling strength for this head
             let total_coupling: f32 = couplings.iter().map(|(_, n)| n).sum::<f32>();
 
-            // Top-K features by coupling
             let k = args.top_k.min(couplings.len());
             couplings.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
             couplings.truncate(k);
             couplings.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-            // Get the "hears" label from gate vector projection against embeddings
-            // (what the gate feature responds to)
-            let top_activates: String = couplings
+            all_heads.push(HeadData {
+                layer,
+                head: q_head,
+                couplings,
+                total_coupling,
+            });
+        }
+    }
+    eprintln!("\n  {} heads computed ({:.1}s)", all_heads.len(), compute_start.elapsed().as_secs_f64());
+
+    // Label unique features
+    let label_start = Instant::now();
+    let feature_labels: std::collections::HashMap<(usize, usize), String> = if let Some(ref labels_path) = args.labels {
+        eprintln!("  Loading labels from {}...", labels_path.display());
+        let labels = load_feature_labels(labels_path)?;
+        eprintln!("  {} labels loaded ({:.1}s)", labels.len(), label_start.elapsed().as_secs_f64());
+        labels
+    } else {
+        eprintln!("  Labeling features (slow — use --labels for instant labels)...");
+        let mut labels: std::collections::HashMap<(usize, usize), String> = std::collections::HashMap::new();
+        for hd in &all_heads {
+            for &(f, _) in &hd.couplings {
+                labels.entry((hd.layer, f)).or_default();
+            }
+        }
+        let total_features = labels.len();
+        for (i, (&(layer, feat), label)) in labels.iter_mut().enumerate() {
+            let gate_key = arch.ffn_gate_key(layer);
+            if let Some(w_gate) = weights.tensors.get(&gate_key) {
+                let gate_row = w_gate.row(feat);
+                *label = project_top_token(&weights.embed, &gate_row.to_vec(), model.tokenizer());
+            }
+            if (i + 1) % 500 == 0 {
+                eprint!("\r  {}/{} features...", i + 1, total_features);
+                let _ = std::io::stderr().flush();
+            }
+        }
+        eprintln!("\r  {} features labeled ({:.1}s)", total_features, label_start.elapsed().as_secs_f64());
+        labels
+    };
+
+    // Output
+    let mut total_edges = 0usize;
+
+    if let Some(ref mut writer) = ndjson_writer {
+        for hd in &all_heads {
+            for &(f, c) in &hd.couplings {
+                let top_tok = feature_labels.get(&(hd.layer, f)).map(|s| s.as_str()).unwrap_or("?");
+                let record = serde_json::json!({
+                    "head": format!("L{}_H{}", hd.layer, hd.head),
+                    "layer": hd.layer,
+                    "head_idx": hd.head,
+                    "feature": format!("L{}_F{}", hd.layer, f),
+                    "feature_idx": f,
+                    "feature_layer": hd.layer,
+                    "target_token": top_tok,
+                    "coupling": (c * 1000.0).round() / 1000.0,
+                    "total_coupling": (hd.total_coupling * 10.0).round() / 10.0,
+                });
+                serde_json::to_writer(&mut *writer, &record)?;
+                writer.write_all(b"\n")?;
+                total_edges += 1;
+            }
+        }
+        writer.flush()?;
+        eprintln!(
+            "\nWrote {} coupling edges ({} layers × {} heads × top-{})",
+            total_edges, layers.len(), num_q_heads, args.top_k,
+        );
+    } else {
+        println!(
+            "\n{:<6} {:<5} {:>8}  {:<60}  {:<60}",
+            "Layer", "Head", "Coupling", "Top gate features (what head activates)", "Top gate features (what head hears)"
+        );
+        println!("{}", "-".repeat(150));
+
+        for hd in &all_heads {
+            let top_activates: String = hd.couplings
                 .iter()
                 .take(5)
                 .map(|(f, c)| {
-                    // Look up what this gate feature's top token is
-                    // Project gate row against embeddings
-                    let gate_row = w_gate.row(*f);
-                    let top_tok = project_top_token(&weights.embed, &gate_row.to_vec(), model.tokenizer());
-                    format!("F{}→{} ({:.2})", f, top_tok, c)
+                    let tok = feature_labels.get(&(hd.layer, *f)).map(|s| s.as_str()).unwrap_or("?");
+                    format!("F{}→{} ({:.2})", f, tok, c)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            // Also compute what the head "hears" via W_Q × W_K^T → embedding projection
-            // Simpler: project the V block rows against embeddings to see what tokens
-            // this head reads from
-            let top_hears: String = {
-                // V block rows = what positions this head reads
-                // Sum V block rows to get aggregate "reads from" direction
+            // V-block hears (still needs vocab projection — but only 5 per head for display)
+            let w_v = weights.tensors.get(&arch.attn_v_key(hd.layer));
+            let top_hears: String = if let Some(w_v) = w_v {
+                let kv_head = hd.head / reps;
+                let v_start = kv_head * head_dim;
+                let v_block = w_v.slice(ndarray::s![v_start..v_start + head_dim, ..]);
                 let mut v_sum = vec![0.0f32; hidden_size];
                 for d in 0..head_dim {
                     let row = v_block.row(d);
@@ -172,22 +253,21 @@ pub fn run(args: OvGateArgs) -> Result<(), Box<dyn std::error::Error>> {
                         v_sum[j] += v.abs();
                     }
                 }
-                // Project against embeddings
                 let top_toks = project_top_n(&weights.embed, &v_sum, 5, model.tokenizer());
                 top_toks.join(", ")
+            } else {
+                String::new()
             };
 
             println!(
                 "L{:<4} H{:<4} {:>7.1}  {:<60}  {:<60}",
-                layer, q_head, total_coupling, top_activates, top_hears,
+                hd.layer, hd.head, hd.total_coupling, top_activates, top_hears,
             );
 
             if args.verbose {
-                // Show all top-K with details
-                for (f, c) in &couplings {
-                    let gate_row = w_gate.row(*f);
-                    let top_tok = project_top_token(&weights.embed, &gate_row.to_vec(), model.tokenizer());
-                    println!("        F{:<6} coupling={:.3}  gate_hears={}", f, c, top_tok);
+                for (f, c) in &hd.couplings {
+                    let tok = feature_labels.get(&(hd.layer, *f)).map(|s| s.as_str()).unwrap_or("?");
+                    println!("        F{:<6} coupling={:.3}  gate_hears={}", f, c, tok);
                 }
             }
         }

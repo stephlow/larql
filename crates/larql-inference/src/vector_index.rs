@@ -1153,6 +1153,53 @@ pub fn load_vindex_config(dir: &Path) -> Result<VindexConfig, InferenceError> {
     serde_json::from_str(&text).map_err(|e| InferenceError::Parse(e.to_string()))
 }
 
+/// Load feature labels from down_meta.jsonl — fast hash lookup, no vocab projection.
+///
+/// Returns a map: (layer, feature) → top_token string.
+/// Also works with the gate vectors NDJSON from vector-extract (has same fields).
+pub fn load_feature_labels(path: &Path) -> Result<HashMap<(usize, usize), String>, InferenceError> {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::with_capacity(1 << 20, file);
+    let mut labels: HashMap<(usize, usize), String> = HashMap::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let obj: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| InferenceError::Parse(e.to_string()))?;
+
+        if obj.get("_header").is_some() {
+            continue;
+        }
+
+        // Support both compact (l/f/t) and full (layer/feature/top_token) formats
+        let layer = obj
+            .get("l")
+            .or_else(|| obj.get("layer"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let feature = obj
+            .get("f")
+            .or_else(|| obj.get("feature"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let token = obj
+            .get("t")
+            .or_else(|| obj.get("top_token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        labels.insert((layer, feature), token);
+    }
+
+    Ok(labels)
+}
+
 /// Write all model weights (attention + FFN + norms) to a vindex directory.
 ///
 /// Creates `model_weights.bin` containing all 2D tensors and 1D vectors

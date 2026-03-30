@@ -155,6 +155,7 @@ pub fn discover_vector_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, Surre
 const SETUP_TEMPLATE: &str = include_str!("../surql/setup.surql");
 const SCHEMA_TEMPLATE: &str = include_str!("../surql/component_schema.surql");
 const PROGRESS_TEMPLATE: &str = include_str!("../surql/load_progress.surql");
+const OV_GATE_COUPLING_TEMPLATE: &str = include_str!("../surql/ov_gate_coupling_schema.surql");
 
 /// Generate the full schema DDL for a namespace + database setup.
 pub fn setup_sql(ns: &str, db: &str) -> String {
@@ -247,4 +248,108 @@ pub fn completed_layers_sql(table: &str) -> String {
 /// Count records in a table.
 pub fn count_sql(table: &str) -> String {
     format!("SELECT count() FROM {table} GROUP ALL;")
+}
+
+// ═══════════════════════════════════════════════════
+// OV→Gate Coupling Edge Loading
+// ═══════════════════════════════════════════════════
+
+/// Generate schema DDL for the ov_gate_coupling table.
+pub fn ov_gate_coupling_schema_sql() -> String {
+    OV_GATE_COUPLING_TEMPLATE.to_string()
+}
+
+/// A single OV→gate coupling record from NDJSON.
+#[derive(serde::Deserialize)]
+pub struct CouplingRecord {
+    pub head: String,
+    pub layer: usize,
+    pub head_idx: usize,
+    pub feature: String,
+    pub feature_idx: usize,
+    pub feature_layer: usize,
+    pub target_token: String,
+    pub coupling: f32,
+    pub total_coupling: f32,
+}
+
+/// Generate INSERT SQL for a single coupling record.
+pub fn coupling_insert_sql(record: &CouplingRecord) -> String {
+    let id = format!("{}_{}", record.head, record.feature);
+    let content = serde_json::json!({
+        "head": record.head,
+        "layer": record.layer,
+        "head_idx": record.head_idx,
+        "feature": record.feature,
+        "feature_idx": record.feature_idx,
+        "feature_layer": record.feature_layer,
+        "target_token": record.target_token,
+        "coupling": record.coupling,
+        "total_coupling": record.total_coupling,
+    });
+
+    format!("CREATE ov_gate_coupling:{id} CONTENT {json};", json = content)
+}
+
+/// Generate a batch INSERT transaction for coupling records.
+pub fn coupling_batch_insert_sql(records: &[CouplingRecord]) -> String {
+    let mut sql = String::from("BEGIN TRANSACTION;\n");
+
+    for record in records {
+        sql.push_str(&coupling_insert_sql(record));
+        sql.push('\n');
+    }
+
+    sql.push_str("COMMIT TRANSACTION;");
+    sql
+}
+
+/// Streaming reader for coupling NDJSON files.
+pub struct CouplingReader {
+    reader: std::io::BufReader<std::fs::File>,
+    line_buf: String,
+}
+
+impl CouplingReader {
+    /// Open a coupling NDJSON file and skip the header.
+    pub fn open(path: &Path) -> Result<Self, SurrealError> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+
+        // Read and validate header
+        let mut header_line = String::new();
+        reader
+            .read_line(&mut header_line)
+            .map_err(|e| SurrealError::Parse(format!("failed to read header: {e}")))?;
+
+        let header: serde_json::Value = serde_json::from_str(&header_line)
+            .map_err(|e| SurrealError::Parse(format!("invalid header: {e}")))?;
+
+        if header.get("type").and_then(|v| v.as_str()) != Some("ov_gate_coupling") {
+            return Err(SurrealError::Parse(
+                "not an ov_gate_coupling file (wrong header type)".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            reader,
+            line_buf: String::new(),
+        })
+    }
+
+    /// Read the next coupling record. Returns None at EOF.
+    pub fn next_record(&mut self) -> Result<Option<CouplingRecord>, SurrealError> {
+        self.line_buf.clear();
+        let bytes = self.reader.read_line(&mut self.line_buf)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let trimmed = self.line_buf.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let record: CouplingRecord = serde_json::from_str(trimmed)
+            .map_err(|e| SurrealError::Parse(format!("invalid coupling record: {e}")))?;
+        Ok(Some(record))
+    }
 }

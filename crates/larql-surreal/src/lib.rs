@@ -15,6 +15,12 @@ pub use loader::{
     schema_sql,
     setup_sql,
     single_insert_sql,
+    // Coupling edge loading
+    coupling_batch_insert_sql,
+    coupling_insert_sql,
+    ov_gate_coupling_schema_sql,
+    CouplingReader,
+    CouplingRecord,
     LoadCallbacks,
     LoadConfig,
     LoadSummary,

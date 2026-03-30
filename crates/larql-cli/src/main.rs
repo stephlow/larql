@@ -55,6 +55,9 @@ enum Commands {
     /// Map attention OV circuits to FFN gate features (what each head activates).
     OvGate(ov_gate_cmd::OvGateArgs),
 
+    /// Discover attention→FFN circuits from weight decomposition. No forward passes.
+    CircuitDiscover(circuit_discover_cmd::CircuitDiscoverArgs),
+
     /// Build a .vindex — the model decompiled to a standalone vector index.
     ExtractIndex(extract_index_cmd::ExtractIndexArgs),
 
@@ -70,6 +73,9 @@ enum Commands {
 
     /// Export vectors to .surql files for manual import.
     VectorExportSurql(vector_export_surql_cmd::VectorExportSurqlArgs),
+
+    /// Load OV→gate coupling edges into SurrealDB for circuit discovery.
+    CouplingLoad(coupling_load_cmd::CouplingLoadArgs),
 
     // ── Query ──
     /// Query a graph for facts.
@@ -102,6 +108,7 @@ fn main() {
         Commands::AttentionCapture(args) => attention_capture_cmd::run(args),
         Commands::QkTemplates(args) => qk_templates_cmd::run(args),
         Commands::OvGate(args) => ov_gate_cmd::run(args),
+        Commands::CircuitDiscover(args) => circuit_discover_cmd::run(args),
         Commands::ExtractRoutes(args) => extract_routes_cmd::run(args),
         Commands::Walk(args) => walk_cmd::run(args),
         Commands::ExtractIndex(args) => extract_index_cmd::run(args),
@@ -110,6 +117,7 @@ fn main() {
         Commands::VectorLoad(args) => vector_load_cmd::run(args),
         Commands::VectorImport(args) => vector_import_cmd::run(args),
         Commands::VectorExportSurql(args) => vector_export_surql_cmd::run(args),
+        Commands::CouplingLoad(args) => coupling_load_cmd::run(args),
         // Query
         Commands::Query(args) => query_cmd::run(args),
         Commands::Describe(args) => describe_cmd::run(args),

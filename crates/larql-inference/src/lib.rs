@@ -33,8 +33,9 @@ pub use forward::{
 pub use graph_ffn::{GateIndex, GraphFfn, IndexBuildCallbacks, SilentIndexCallbacks};
 pub use route_ffn::{RouteFfn, RouteGuidedFfn, RouteTable};
 pub use vector_index::{
-    load_model_weights_from_vindex, load_vindex_config, load_vindex_embeddings,
-    load_vindex_tokenizer, write_model_weights, VectorIndex, VindexConfig, WalkFfn, WalkTrace,
+    load_feature_labels, load_model_weights_from_vindex, load_vindex_config,
+    load_vindex_embeddings, load_vindex_tokenizer, write_model_weights, VectorIndex, VindexConfig,
+    WalkFfn, WalkTrace,
 };
 pub use model::{load_model_dir, resolve_model_path, ModelWeights};
 pub use tokenizer::{decode_token, load_tokenizer};
