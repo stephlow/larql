@@ -1,52 +1,59 @@
 //! Vindex — the queryable model format.
 //!
-//! Storage format, KNN index, load, save, and mutate operations for
-//! the .vindex directory format. This crate owns the on-disk format
-//! and the in-memory query index.
-//!
-//! Build pipeline (EXTRACT) and weight management live in `larql-inference`
-//! because they need ModelWeights.
+//! Decompile, browse, edit, and recompile neural networks.
+//! This crate owns the complete vindex lifecycle:
+//! extract, load, query, mutate, patch, save, compile.
 
 extern crate blas_src;
 
-pub mod build;
-pub mod checksums;
+// ── Module structure ──
 pub mod clustering;
 pub mod config;
 pub mod describe;
-pub mod dtype;
-pub mod down_meta;
 pub mod error;
 pub mod extract;
-pub mod extract_from_vectors;
+pub mod format;
 pub mod index;
-pub mod load;
-pub mod loader;
-pub mod mutate;
 pub mod patch;
-pub mod weights;
 
-// Re-export dependencies for downstream crates.
+// ── Re-export dependencies ──
 pub use ndarray;
 pub use tokenizers;
 
-// Re-export essentials at crate root.
-pub use dtype::StorageDtype;
-pub use config::{
-    ExtractLevel, LayerBands, MoeConfig, VindexConfig, VindexLayerInfo, VindexModelConfig,
-    VindexSource,
+// ── Re-export essentials at crate root ──
+
+// Config
+pub use config::dtype::StorageDtype;
+pub use config::types::{
+    DownMetaRecord, DownMetaTopK, ExtractLevel, LayerBands, MoeConfig,
+    VindexConfig, VindexLayerInfo, VindexModelConfig, VindexSource,
 };
-pub use describe::{DescribeEdge, LabelSource};
+
+// Error
 pub use error::VindexError;
-pub use index::{
+
+// Index
+pub use index::core::{
     FeatureMeta, IndexLoadCallbacks, SilentLoadCallbacks, VectorIndex, WalkHit, WalkTrace,
 };
-pub use build::{IndexBuildCallbacks, SilentBuildCallbacks};
-pub use patch::{PatchOp, PatchedVindex, VindexPatch};
-pub use weights::{write_model_weights, load_model_weights};
-pub use extract::{build_vindex, build_vindex_resume};
-pub use extract_from_vectors::build_vindex_from_vectors;
-pub use loader::{load_model_dir, resolve_model_path};
-pub use load::{
+
+// Describe
+pub use describe::{DescribeEdge, LabelSource};
+
+// Extract
+pub use extract::{
+    build_vindex, build_vindex_resume, build_vindex_from_vectors,
+    IndexBuildCallbacks, SilentBuildCallbacks,
+};
+
+// Format
+pub use format::checksums;
+pub use format::down_meta;
+pub use format::load::{
     load_feature_labels, load_vindex_config, load_vindex_embeddings, load_vindex_tokenizer,
 };
+pub use format::loader::{load_model_dir, resolve_model_path};
+pub use format::weights::{write_model_weights, load_model_weights};
+
+// Patch
+pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};

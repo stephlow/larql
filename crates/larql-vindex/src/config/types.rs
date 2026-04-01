@@ -33,7 +33,7 @@ pub struct VindexConfig {
     pub extract_level: ExtractLevel,
     /// Storage precision (f32 or f16).
     #[serde(default)]
-    pub dtype: crate::dtype::StorageDtype,
+    pub dtype: crate::config::dtype::StorageDtype,
     /// Model-specific layer band boundaries for DESCRIBE and label matching.
     #[serde(default)]
     pub layer_bands: Option<LayerBands>,

@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::VindexError;
 use larql_models::ModelWeights;
 
-use crate::build::IndexBuildCallbacks;
+use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::config::{VindexConfig, VindexModelConfig};
-use crate::{IndexLoadCallbacks, load_vindex_config};
+use crate::index::core::IndexLoadCallbacks; use crate::format::load::load_vindex_config;
 
 #[derive(Serialize, Deserialize)]
 struct WeightEntry {
@@ -46,9 +46,9 @@ pub fn write_model_weights(
     let start = std::time::Instant::now();
 
     // Read dtype from config if available, default to F32
-    let dtype = crate::load_vindex_config(dir)
+    let dtype = crate::format::load::load_vindex_config(dir)
         .map(|c| c.dtype)
-        .unwrap_or(crate::dtype::StorageDtype::F32);
+        .unwrap_or(crate::config::dtype::StorageDtype::F32);
 
     let arch = &*weights.arch;
     let num_layers = weights.num_layers;
@@ -175,7 +175,7 @@ pub fn write_model_weights(
     let mut norms_offset: u64 = 0;
 
     for (key, vec) in &weights.vectors {
-        let bytes = crate::dtype::encode_floats(vec, dtype);
+        let bytes = crate::config::dtype::encode_floats(vec, dtype);
         norms_file.write_all(&bytes)?;
         entries.push(WeightEntry {
             key: key.clone(),
@@ -192,7 +192,7 @@ pub fn write_model_weights(
     // ── LM Head ──
     let lm_head_path = dir.join("lm_head.bin");
     let lm_data = weights.lm_head.as_slice().unwrap();
-    let lm_bytes = crate::dtype::encode_floats(lm_data, dtype);
+    let lm_bytes = crate::config::dtype::encode_floats(lm_data, dtype);
     std::fs::write(&lm_head_path, &lm_bytes)?;
     entries.push(WeightEntry {
         key: "lm_head.weight".into(),
@@ -242,9 +242,9 @@ pub fn write_model_weights(
     Ok(())
 }
 
-fn write_tensor(w: &mut BufWriter<std::fs::File>, tensor: &Array2<f32>, dtype: crate::dtype::StorageDtype) -> Result<u64, VindexError> {
+fn write_tensor(w: &mut BufWriter<std::fs::File>, tensor: &Array2<f32>, dtype: crate::config::dtype::StorageDtype) -> Result<u64, VindexError> {
     let data = tensor.as_slice().unwrap();
-    let bytes = crate::dtype::encode_floats(data, dtype);
+    let bytes = crate::config::dtype::encode_floats(data, dtype);
     w.write_all(&bytes)?;
     Ok(bytes.len() as u64)
 }
@@ -339,7 +339,7 @@ pub fn load_model_weights(
             continue;
         }
         let raw_bytes = &data[byte_offset..byte_offset + byte_count];
-        let floats = crate::dtype::decode_floats(raw_bytes, config.dtype);
+        let floats = crate::config::dtype::decode_floats(raw_bytes, config.dtype);
         let slice = &floats[..];
 
         match entry.kind.as_str() {
@@ -366,8 +366,8 @@ pub fn load_model_weights(
     // Gate vectors: read from gate_vectors.bin and inject into tensors
     // (the forward pass needs them as tensors, but they're stored in the query index)
     let gate_bytes = std::fs::read(dir.join("gate_vectors.bin"))?;
-    let gate_floats = crate::dtype::decode_floats(&gate_bytes, config.dtype);
-    let bpf = crate::dtype::bytes_per_float(config.dtype);
+    let gate_floats = crate::config::dtype::decode_floats(&gate_bytes, config.dtype);
+    let bpf = crate::config::dtype::bytes_per_float(config.dtype);
     for info in &config.layers {
         let float_offset = info.offset as usize / bpf;
         let float_count = info.num_features * config.hidden_size;

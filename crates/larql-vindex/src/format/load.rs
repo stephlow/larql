@@ -37,11 +37,11 @@ impl VectorIndex {
 
         let gate_path = dir.join("gate_vectors.bin");
         let gate_bytes = std::fs::read(&gate_path)?;
-        let gate_floats = crate::dtype::decode_floats(&gate_bytes, config.dtype);
+        let gate_floats = crate::config::dtype::decode_floats(&gate_bytes, config.dtype);
 
         let mut gate_vectors: Vec<Option<Array2<f32>>> = vec![None; num_layers];
         let mut total_gate = 0;
-        let bpf = crate::dtype::bytes_per_float(config.dtype);
+        let bpf = crate::config::dtype::bytes_per_float(config.dtype);
 
         for info in &config.layers {
             let float_offset = info.offset as usize / bpf;
@@ -65,11 +65,11 @@ impl VectorIndex {
         // Load down metadata — prefer binary, fall back to JSONL
         let start = std::time::Instant::now();
         // Try binary first (fast), fall back to JSONL (compatible)
-        let binary_result = if crate::down_meta::has_binary(dir) {
+        let binary_result = if crate::format::down_meta::has_binary(dir) {
             match load_vindex_tokenizer(dir) {
                 Ok(tokenizer) => {
                     callbacks.on_file_start("down_meta", &dir.join("down_meta.bin").display().to_string());
-                    match crate::down_meta::read_binary(dir, &tokenizer) {
+                    match crate::format::down_meta::read_binary(dir, &tokenizer) {
                         Ok((dm, count)) => {
                             callbacks.on_file_done("down_meta", count, start.elapsed().as_secs_f64() * 1000.0);
                             Some((dm, count))
@@ -156,7 +156,7 @@ pub fn load_vindex_embeddings(dir: &Path) -> Result<(Array2<f32>, f32), VindexEr
         .map_err(|e| VindexError::Parse(e.to_string()))?;
 
     let embed_bytes = std::fs::read(dir.join("embeddings.bin"))?;
-    let embed_floats = crate::dtype::decode_floats(&embed_bytes, config.dtype);
+    let embed_floats = crate::config::dtype::decode_floats(&embed_bytes, config.dtype);
 
     let embed = Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
         .map_err(|e| VindexError::Parse(e.to_string()))?;

@@ -421,7 +421,7 @@ impl Session {
         // Write updated config with new layer infos
         let mut new_config = config.clone();
         new_config.layers = layer_infos;
-        new_config.checksums = larql_vindex::checksums::compute_checksums(&output_dir).ok();
+        new_config.checksums = larql_vindex::format::checksums::compute_checksums(&output_dir).ok();
         larql_vindex::VectorIndex::save_config(&new_config, &output_dir)
             .map_err(|e| LqlError::Execution(format!("failed to save config: {e}")))?;
 
@@ -552,7 +552,7 @@ impl Session {
                                 layer: *layer,
                                 feature: feat,
                                 gate_vector_b64: None,
-                                down_meta: Some(larql_vindex::patch::PatchDownMeta {
+                                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                                     top_token: b.top_token.clone(),
                                     top_token_id: b.top_token_id,
                                     c_score: b.c_score,
@@ -575,7 +575,7 @@ impl Session {
                                 target: b.top_token.clone(),
                                 confidence: Some(b.c_score),
                                 gate_vector_b64: None,
-                                down_meta: Some(larql_vindex::patch::PatchDownMeta {
+                                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                                     top_token: b.top_token.clone(),
                                     top_token_id: b.top_token_id,
                                     c_score: b.c_score,

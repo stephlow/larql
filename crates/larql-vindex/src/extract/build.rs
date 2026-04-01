@@ -9,12 +9,12 @@ use crate::error::VindexError;
 use larql_models::ModelWeights;
 
 use larql_models::TopKEntry;
-use crate::dtype::StorageDtype;
+use crate::config::dtype::StorageDtype;
 
 /// Write f32 data to a writer, encoding as f32 or f16 based on dtype.
 #[allow(dead_code)]
 fn write_floats(w: &mut impl Write, data: &[f32], dtype: StorageDtype) -> Result<u64, VindexError> {
-    let bytes = crate::dtype::encode_floats(data, dtype);
+    let bytes = crate::config::dtype::encode_floats(data, dtype);
     w.write_all(&bytes)?;
     Ok(bytes.len() as u64)
 }
@@ -285,7 +285,7 @@ use crate::config::{
 };
 
 // Callbacks from larql-vindex (canonical definition)
-pub use crate::build::IndexBuildCallbacks;
+pub use crate::extract::callbacks::IndexBuildCallbacks;
 
     /// Build a .vindex from model weights and write it to disk.
     ///
@@ -399,7 +399,7 @@ pub use crate::build::IndexBuildCallbacks;
         callbacks.on_stage("embeddings");
         let embed_path = output_dir.join("embeddings.bin");
         let embed_data = weights.embed.as_slice().unwrap();
-        let embed_bytes = crate::dtype::encode_floats(embed_data, dtype);
+        let embed_bytes = crate::config::dtype::encode_floats(embed_data, dtype);
         std::fs::write(&embed_path, &embed_bytes)?;
         callbacks.on_stage_done("embeddings", 0.0);
 
@@ -646,7 +646,7 @@ pub use crate::build::IndexBuildCallbacks;
         if extract_level != crate::ExtractLevel::Browse {
             callbacks.on_stage("model_weights");
             let start = std::time::Instant::now();
-            crate::write_model_weights(weights, output_dir, callbacks)?;
+            crate::format::weights::write_model_weights(weights, output_dir, callbacks)?;
             config.has_model_weights = true;
             callbacks.on_stage_done("model_weights", start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -659,7 +659,7 @@ pub use crate::build::IndexBuildCallbacks;
             extracted_at: chrono_now(),
             larql_version: env!("CARGO_PKG_VERSION").to_string(),
         });
-        config.checksums = crate::checksums::compute_checksums(output_dir).ok();
+        config.checksums = crate::format::checksums::compute_checksums(output_dir).ok();
 
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| VindexError::Parse(e.to_string()))?;
@@ -844,7 +844,7 @@ pub use crate::build::IndexBuildCallbacks;
             }),
         };
 
-        config.checksums = crate::checksums::compute_checksums(output_dir).ok();
+        config.checksums = crate::format::checksums::compute_checksums(output_dir).ok();
 
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| VindexError::Parse(e.to_string()))?;

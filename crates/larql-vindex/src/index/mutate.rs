@@ -133,7 +133,7 @@ impl VectorIndex {
             .unwrap_or(10);
 
         // Write binary format
-        let count = crate::down_meta::write_binary(dir, &self.down_meta, max_top_k)?;
+        let count = crate::format::down_meta::write_binary(dir, &self.down_meta, max_top_k)?;
 
         // Also write JSONL for backward compat
         let path = dir.join("down_meta.jsonl");

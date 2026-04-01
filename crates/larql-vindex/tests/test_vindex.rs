@@ -399,7 +399,7 @@ fn save_config_round_trip() {
 
 #[test]
 fn binary_down_meta_write_read_round_trip() {
-    let idx = test_index();
+    let _idx = test_index();
     let dir = std::env::temp_dir().join("larql_test_binary_dm");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1074,7 +1074,7 @@ fn patch_save_and_load_round_trip() {
                 target: "Colchester".into(),
                 confidence: Some(0.85),
                 gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::PatchDownMeta {
+                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "Colchester".into(),
                     top_token_id: 42,
                     c_score: 4.2,
@@ -1131,7 +1131,7 @@ fn patched_vindex_overrides_base() {
                 layer: 0,
                 feature: 0,
                 gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::PatchDownMeta {
+                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "London".into(),
                     top_token_id: 300,
                     c_score: 0.99,
@@ -1195,7 +1195,7 @@ fn patched_vindex_bake_down() {
                 layer: 0,
                 feature: 0,
                 gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::PatchDownMeta {
+                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "London".into(),
                     top_token_id: 300,
                     c_score: 0.99,
@@ -1222,8 +1222,8 @@ fn patched_vindex_bake_down() {
 #[test]
 fn base64_gate_vector_round_trip() {
     let vec = vec![1.0f32, 2.0, 3.0, -4.5];
-    let encoded = larql_vindex::patch::encode_gate_vector(&vec);
-    let decoded = larql_vindex::patch::decode_gate_vector(&encoded).unwrap();
+    let encoded = larql_vindex::patch::core::encode_gate_vector(&vec);
+    let decoded = larql_vindex::patch::core::decode_gate_vector(&encoded).unwrap();
     assert_eq!(vec, decoded);
 }
 
@@ -1244,7 +1244,7 @@ fn patched_vindex_remove_patch() {
             larql_vindex::PatchOp::Update {
                 layer: 0, feature: 0,
                 gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::PatchDownMeta {
+                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "London".into(), top_token_id: 300, c_score: 0.99,
                 }),
             },
@@ -1352,8 +1352,8 @@ fn dtype_serde_round_trip() {
 
 #[test]
 fn dtype_bytes_per_float() {
-    assert_eq!(larql_vindex::dtype::bytes_per_float(larql_vindex::StorageDtype::F32), 4);
-    assert_eq!(larql_vindex::dtype::bytes_per_float(larql_vindex::StorageDtype::F16), 2);
+    assert_eq!(larql_vindex::config::dtype::bytes_per_float(larql_vindex::StorageDtype::F32), 4);
+    assert_eq!(larql_vindex::config::dtype::bytes_per_float(larql_vindex::StorageDtype::F16), 2);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1407,7 +1407,7 @@ fn patch_multiple_patches_stack() {
         created_at: String::new(), description: None, author: None, tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
             layer: 0, feature: 0, gate_vector_b64: None,
-            down_meta: Some(larql_vindex::patch::PatchDownMeta {
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "London".into(), top_token_id: 300, c_score: 0.99,
             }),
         }],
@@ -1420,7 +1420,7 @@ fn patch_multiple_patches_stack() {
         created_at: String::new(), description: None, author: None, tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
             layer: 0, feature: 1, gate_vector_b64: None,
-            down_meta: Some(larql_vindex::patch::PatchDownMeta {
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "Munich".into(), top_token_id: 301, c_score: 0.95,
             }),
         }],
@@ -1444,7 +1444,7 @@ fn patched_vindex_later_patch_overrides_earlier() {
         created_at: String::new(), description: None, author: None, tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
             layer: 0, feature: 0, gate_vector_b64: None,
-            down_meta: Some(larql_vindex::patch::PatchDownMeta {
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "London".into(), top_token_id: 300, c_score: 0.99,
             }),
         }],
@@ -1454,7 +1454,7 @@ fn patched_vindex_later_patch_overrides_earlier() {
         created_at: String::new(), description: None, author: None, tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
             layer: 0, feature: 0, gate_vector_b64: None,
-            down_meta: Some(larql_vindex::patch::PatchDownMeta {
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                 top_token: "Tokyo".into(), top_token_id: 400, c_score: 0.88,
             }),
         }],
@@ -1536,6 +1536,370 @@ fn full_lifecycle_build_query_mutate_save_reload() {
     // KNN should find Canberra for dim 3
     let q2 = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
     assert_eq!(loaded.gate_knn(0, &q2, 1)[0].0, 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ══════════════════════════════════════════════════════════════
+// EXTRACT PIPELINE (synthetic model)
+// ══════════════════════════════════════════════════════════════
+
+fn make_synthetic_model() -> larql_models::ModelWeights {
+    use std::collections::HashMap;
+
+    let num_layers = 2;
+    let hidden = 8;
+    let intermediate = 4;
+    let vocab_size = 16;
+
+    let mut tensors: HashMap<String, ndarray::Array2<f32>> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+    // Per layer: gate, up, down, attn Q/K/V/O, norms
+    for layer in 0..num_layers {
+        // FFN gate (intermediate × hidden)
+        let mut gate = ndarray::Array2::<f32>::zeros((intermediate, hidden));
+        for i in 0..intermediate { gate[[i, i % hidden]] = 1.0 + layer as f32; }
+        tensors.insert(format!("layers.{layer}.mlp.gate_proj.weight"), gate);
+
+        // FFN up (intermediate × hidden)
+        let mut up = ndarray::Array2::<f32>::zeros((intermediate, hidden));
+        for i in 0..intermediate { up[[i, (i + 1) % hidden]] = 0.5; }
+        tensors.insert(format!("layers.{layer}.mlp.up_proj.weight"), up);
+
+        // FFN down (hidden × intermediate)
+        let mut down = ndarray::Array2::<f32>::zeros((hidden, intermediate));
+        for i in 0..intermediate { down[[i % hidden, i]] = 0.3; }
+        tensors.insert(format!("layers.{layer}.mlp.down_proj.weight"), down);
+
+        // Attention Q/K/V/O (hidden × hidden)
+        for suffix in &["q_proj", "k_proj", "v_proj", "o_proj"] {
+            let mut attn = ndarray::Array2::<f32>::zeros((hidden, hidden));
+            for i in 0..hidden { attn[[i, i]] = 1.0; }
+            tensors.insert(format!("layers.{layer}.self_attn.{suffix}.weight"), attn);
+        }
+
+        // Norms
+        vectors.insert(format!("layers.{layer}.input_layernorm.weight"), vec![1.0; hidden]);
+        vectors.insert(format!("layers.{layer}.post_attention_layernorm.weight"), vec![1.0; hidden]);
+    }
+
+    // Final norm
+    vectors.insert("norm.weight".into(), vec![1.0; hidden]);
+
+    // Embeddings (vocab × hidden)
+    let mut embed = ndarray::Array2::<f32>::zeros((vocab_size, hidden));
+    for i in 0..vocab_size {
+        embed[[i, i % hidden]] = 1.0;
+    }
+
+    let lm_head = embed.clone();
+
+    let arch = larql_models::detect_from_json(&serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": hidden,
+        "num_hidden_layers": num_layers,
+        "intermediate_size": intermediate,
+        "head_dim": hidden,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "rope_theta": 10000.0,
+        "vocab_size": vocab_size,
+    }));
+
+    larql_models::ModelWeights {
+        tensors,
+        vectors,
+        embed,
+        lm_head,
+        num_layers,
+        hidden_size: hidden,
+        intermediate_size: intermediate,
+        vocab_size,
+        head_dim: hidden,
+        num_q_heads: 1,
+        num_kv_heads: 1,
+        rope_base: 10000.0,
+        arch,
+    }
+}
+
+#[test]
+fn extract_synthetic_model_f32() {
+    let dir = std::env::temp_dir().join("larql_test_extract_f32");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let weights = make_synthetic_model();
+
+    // Write tokenizer (minimal — just needs to exist)
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    // Build with extract level All
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex(
+        &weights,
+        &tokenizers::Tokenizer::from_bytes(tok_json).unwrap(),
+        "test/synthetic",
+        &dir,
+        5,
+        larql_vindex::ExtractLevel::All,
+        larql_vindex::StorageDtype::F32,
+        &mut cb,
+    ).unwrap();
+
+    // Verify files exist
+    assert!(dir.join("gate_vectors.bin").exists());
+    assert!(dir.join("embeddings.bin").exists());
+    assert!(dir.join("down_meta.jsonl").exists());
+    assert!(dir.join("index.json").exists());
+    assert!(dir.join("attn_weights.bin").exists());
+    assert!(dir.join("up_weights.bin").exists());
+    assert!(dir.join("down_weights.bin").exists());
+    assert!(dir.join("norms.bin").exists());
+    assert!(dir.join("lm_head.bin").exists());
+    assert!(dir.join("weight_manifest.json").exists());
+
+    // Verify config
+    let config = larql_vindex::load_vindex_config(&dir).unwrap();
+    assert_eq!(config.version, 2);
+    assert_eq!(config.model, "test/synthetic");
+    assert_eq!(config.num_layers, 2);
+    assert_eq!(config.hidden_size, 8);
+    assert_eq!(config.intermediate_size, 4);
+    assert_eq!(config.has_model_weights, true);
+    assert_eq!(config.dtype, larql_vindex::StorageDtype::F32);
+    assert!(config.source.is_some());
+    // layer_bands may be None for tiny models (< 8 layers)
+
+    // Load and query
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let index = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();
+    assert_eq!(index.num_layers, 2);
+    assert_eq!(index.total_gate_vectors(), 8); // 2 layers × 4 features
+
+    // KNN should work
+    let query = ndarray::Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let hits = index.gate_knn(0, &query, 2);
+    assert!(!hits.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extract_synthetic_model_f16() {
+    let dir = std::env::temp_dir().join("larql_test_extract_f16");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let weights = make_synthetic_model();
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex(
+        &weights,
+        &tokenizers::Tokenizer::from_bytes(tok_json).unwrap(),
+        "test/synthetic-f16",
+        &dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F16,
+        &mut cb,
+    ).unwrap();
+
+    // Verify f16 files are smaller
+    let gate_size = std::fs::metadata(dir.join("gate_vectors.bin")).unwrap().len();
+    // 2 layers × 4 features × 8 hidden × 2 bytes = 128 bytes (f16)
+    // vs 256 bytes (f32)
+    assert_eq!(gate_size, 128);
+
+    let embed_size = std::fs::metadata(dir.join("embeddings.bin")).unwrap().len();
+    // 16 vocab × 8 hidden × 2 bytes = 256 bytes (f16)
+    assert_eq!(embed_size, 256);
+
+    // Config should record f16
+    let config = larql_vindex::load_vindex_config(&dir).unwrap();
+    assert_eq!(config.dtype, larql_vindex::StorageDtype::F16);
+
+    // Load should decode f16 → f32 transparently
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let index = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();
+    assert_eq!(index.total_gate_vectors(), 8);
+
+    // KNN should still work (f16 precision is sufficient)
+    let query = ndarray::Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let hits = index.gate_knn(0, &query, 1);
+    assert_eq!(hits[0].0, 0); // feature 0 responds to dim 0
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extract_then_load_weights_round_trip() {
+    let dir = std::env::temp_dir().join("larql_test_weight_rt");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let weights = make_synthetic_model();
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex(
+        &weights,
+        &tokenizers::Tokenizer::from_bytes(tok_json).unwrap(),
+        "test/weight-rt",
+        &dir,
+        5,
+        larql_vindex::ExtractLevel::All,
+        larql_vindex::StorageDtype::F32,
+        &mut cb,
+    ).unwrap();
+
+    // Load weights back
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let loaded = larql_vindex::load_model_weights(&dir, &mut lcb).unwrap();
+
+    // Verify dimensions match
+    assert_eq!(loaded.num_layers, 2);
+    assert_eq!(loaded.hidden_size, 8);
+    assert_eq!(loaded.intermediate_size, 4);
+
+    // Verify gate vectors round-tripped (loaded from gate_vectors.bin)
+    let gate_key = loaded.arch.ffn_gate_key(0);
+    let gate = loaded.tensors.get(&gate_key).unwrap();
+    assert_eq!(gate.shape(), &[4, 8]);
+    assert!((gate[[0, 0]] - 1.0).abs() < 0.01); // layer 0, feature 0, dim 0
+
+    // Verify up/down from split files
+    let up_key = loaded.arch.ffn_up_key(0);
+    assert!(loaded.tensors.contains_key(&up_key));
+    let down_key = loaded.arch.ffn_down_key(0);
+    assert!(loaded.tensors.contains_key(&down_key));
+
+    // Verify attention weights
+    let q_key = loaded.arch.attn_q_key(0);
+    assert!(loaded.tensors.contains_key(&q_key));
+
+    // Verify norms
+    assert!(!loaded.vectors.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extract_mutate_reload_verifies_mutation() {
+    let dir = std::env::temp_dir().join("larql_test_extract_mutate");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let weights = make_synthetic_model();
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex(
+        &weights,
+        &tokenizers::Tokenizer::from_bytes(tok_json).unwrap(),
+        "test/mutate",
+        &dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut cb,
+    ).unwrap();
+
+    // Load, mutate, save
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let mut index = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();
+
+    // Insert a new feature
+    let gate_vec = ndarray::Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 99.0]);
+    let slot = index.find_free_feature(0).unwrap();
+    index.set_gate_vector(0, slot, &gate_vec);
+    index.set_feature_meta(0, slot, make_meta("INSERTED", 999, 0.99));
+
+    // Save back
+    index.save_gate_vectors(&dir).unwrap();
+    index.save_down_meta(&dir).unwrap();
+
+    // Remove binary down_meta so reload uses JSONL (which has string tokens)
+    let _ = std::fs::remove_file(dir.join("down_meta.bin"));
+
+    // Reload and verify mutation persisted
+    let index2 = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();
+    let meta = index2.feature_meta(0, slot).unwrap();
+    assert_eq!(meta.top_token, "INSERTED");
+
+    // KNN should find the inserted feature for dim 7
+    let query = ndarray::Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    let hits = index2.gate_knn(0, &query, 1);
+    assert_eq!(hits[0].0, slot);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extract_with_patches_bake_down() {
+    let dir = std::env::temp_dir().join("larql_test_extract_patch");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let weights = make_synthetic_model();
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex(
+        &weights,
+        &tokenizers::Tokenizer::from_bytes(tok_json).unwrap(),
+        "test/patch",
+        &dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut cb,
+    ).unwrap();
+
+    // Load base
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let base = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();
+
+    // Create and apply a patch
+    let patch = larql_vindex::VindexPatch {
+        version: 1,
+        base_model: "test/patch".into(),
+        base_checksum: None,
+        created_at: String::new(),
+        description: Some("test patch".into()),
+        author: None,
+        tags: vec![],
+        operations: vec![
+            larql_vindex::PatchOp::Update {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                    top_token: "PATCHED".into(),
+                    top_token_id: 888,
+                    c_score: 5.0,
+                }),
+            },
+        ],
+    };
+
+    let mut patched = larql_vindex::PatchedVindex::new(base);
+    patched.apply_patch(patch);
+
+    // Verify patch applied
+    assert_eq!(patched.feature_meta(0, 0).unwrap().top_token, "PATCHED");
+
+    // Bake down to new index
+    let baked = patched.bake_down();
+    assert_eq!(baked.feature_meta(0, 0).unwrap().top_token, "PATCHED");
+    assert_eq!(baked.total_gate_vectors(), 8);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

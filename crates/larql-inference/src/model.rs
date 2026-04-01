@@ -4,4 +4,4 @@
 pub use larql_models::ModelWeights;
 
 // Re-export loading functions from larql-vindex
-pub use larql_vindex::loader::{load_model_dir, resolve_model_path};
+pub use larql_vindex::{load_model_dir, resolve_model_path};
