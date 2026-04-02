@@ -647,7 +647,7 @@ SHOW PATCHES;
 
 The user doesn't know or care whether the vindex is local or remote. Same statements, same output format.
 
-**Implementation status:** `USE REMOTE` is implemented. Supported statements over remote: DESCRIBE, WALK, INFER, STATS, SHOW RELATIONS. Mutations (INSERT/DELETE/UPDATE) and local patch overlay on remote results are not yet supported.
+**Implementation status:** `USE REMOTE` is fully implemented. Supported: DESCRIBE, WALK, INFER, SELECT, STATS, SHOW RELATIONS, INSERT, DELETE, UPDATE. Local patches (APPLY PATCH) stay client-side and overlay on remote DESCRIBE results.
 
 ---
 
