@@ -103,6 +103,9 @@ impl<'a> WalkFfn<'a> {
     }
 
     /// KNN-direct walk: gate scores as activations + down from mmap.
+    /// NOTE: Produces wrong answer without up projection (tested: Jack instead of Paris).
+    /// Kept for future research when combined gate+up vectors are available.
+    #[allow(dead_code)]
     ///
     /// Gate KNN scores = x @ gate_vectors^T = the gate projection.
     /// Apply SiLU activation. Multiply by down matrix. Done.
@@ -154,9 +157,6 @@ impl<'a> WalkFfn<'a> {
     ) -> (Array2<f32>, Array2<f32>) {
         let arch = &*self.weights.arch;
         let w_up = self.weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
-        let hidden = x.shape()[1];
-        let intermediate = w_up.shape()[0];
-        let seq_len = x.shape()[0];
 
         let is_gated = arch.ffn_type() == larql_models::FfnType::Gated;
         let use_gelu = matches!(

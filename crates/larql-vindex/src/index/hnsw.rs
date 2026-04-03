@@ -162,7 +162,7 @@ impl HnswLayer {
         let ef = ef_search.max(top_k);
 
         // Project query to low-dim for graph traversal
-        let proj_view = self.projected.view();
+        let _proj_view = self.projected.view();
         // Compute projected query: query @ proj_matrix
         // We don't store the projection matrix, so compute projected query
         // by dotting against each projected vector during search.

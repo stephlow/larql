@@ -60,7 +60,7 @@ pub fn run_attention_block(
     capture_attention: bool,
 ) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>)> {
     use crate::forward::{dot_proj, add_bias};
-    use crate::residual::{rms_norm, rms_norm_heads};
+    use crate::residual::rms_norm_heads;
 
     let arch = &*weights.arch;
     let head_dim = weights.head_dim;

@@ -207,13 +207,35 @@ cargo run --release -p larql-vindex --example build_down_features -- path/to/vin
 
 ## Files
 
+### Vindex index modules
+
+| Module | Lines | Responsibility |
+|--------|-------|---------------|
+| `index/types.rs` | 130 | FeatureMeta, GateIndex trait, WalkHit, callbacks |
+| `index/core.rs` | 449 | VectorIndex struct, constructors, loading, accessors |
+| `index/gate.rs` | 690 | Gate KNN: search, batch, scores, HNSW integration, warmup |
+| `index/walk.rs` | 111 | Walk FFN data: mmap'd down/up feature-major vectors |
+| `index/hnsw.rs` | 337 | HNSW graph index (standalone data structure) |
+| `index/mutate.rs` | 283 | Gate vector mutation (INSERT/DELETE) |
+| `index/router.rs` | 125 | MoE expert routing |
+
+### Inference modules
+
 | File | Purpose |
 |------|---------|
-| `crates/larql-inference/src/vindex/walk_ffn.rs` | WalkFfn: 3-engine FFN backend |
-| `crates/larql-inference/src/ffn/sparse_compute.rs` | Sparse FFN compute (shared) |
-| `crates/larql-vindex/src/index/core.rs` | Gate KNN, mmap, warmup, HNSW, down features |
-| `crates/larql-vindex/src/index/hnsw.rs` | HNSW graph index (experimental) |
-| `crates/larql-vindex/examples/convert_gates_f32.rs` | f16 → f32 gate vector converter |
-| `crates/larql-vindex/examples/build_down_features.rs` | Feature-major down vector builder |
-| `crates/larql-inference/examples/bench_walk_inference.rs` | Walk benchmark (dense vs walk vs HNSW) |
-| `crates/larql-inference/examples/walk_boundary_sweep.rs` | Correctness sweep (all 34 layers) |
+| `vindex/walk_ffn.rs` | WalkFfn: mmap walk FFN (faster than dense) |
+| `ffn/weight.rs` | WeightFfn: dense FFN (ground truth) |
+| `ffn/sparse_compute.rs` | Sparse FFN compute (shared by walk fallback) |
+| `attention.rs` | BLAS-fused attention + shared attention block |
+| `forward.rs` | Forward pass: embed → layers → logits |
+
+### Tools and benchmarks
+
+| File | Purpose |
+|------|---------|
+| `larql-vindex/examples/convert_gates_f32.rs` | f16 → f32 gate vector converter |
+| `larql-vindex/examples/build_down_features.rs` | Feature-major down vector builder |
+| `larql-vindex/examples/build_up_features.rs` | Feature-major up vector builder |
+| `larql-inference/examples/bench_walk_inference.rs` | Walk benchmark (dense vs walk vs HNSW) |
+| `larql-inference/examples/walk_boundary_sweep.rs` | Correctness sweep (all 34 layers) |
+| `larql-inference/examples/profile_overhead.rs` | Forward pass bottleneck profiler |

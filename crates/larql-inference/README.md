@@ -159,10 +159,22 @@ cargo test -p larql-inference --test test_walker_utils      # 10 tests
 ```
 larql-models      ModelWeights, architecture traits, quant
     |
-larql-vindex      VectorIndex, gate KNN, patches
+larql-vindex      VectorIndex (types, core, gate, walk, hnsw, mutate, router)
     |
 larql-inference   Forward pass, attention, backends, WalkFfn
 ```
+
+### Vindex module structure
+
+| Module | Responsibility |
+|--------|---------------|
+| `types` | FeatureMeta, GateIndex trait, WalkHit, callbacks |
+| `core` | VectorIndex struct, constructors, loading, accessors |
+| `gate` | Gate KNN: search, batch, scores, HNSW, warmup |
+| `walk` | Walk FFN data: mmap'd down/up feature-major vectors |
+| `hnsw` | HNSW graph index |
+| `mutate` | INSERT/DELETE mutations |
+| `router` | MoE expert routing |
 
 ## License
 
