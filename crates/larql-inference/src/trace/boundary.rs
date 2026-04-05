@@ -252,8 +252,7 @@ impl BoundaryWriter {
 
         let boundary_idx = self.header.n_boundaries as usize;
         if boundary_idx >= self.max_boundaries {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "boundary index full — increase max_boundaries",
             ));
         }

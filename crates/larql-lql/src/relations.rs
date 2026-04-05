@@ -207,8 +207,7 @@ impl RelationClassifier {
 /// Normalise a relation name: lowercase, replace hyphens/underscores/spaces with a single space.
 fn normalise_relation(s: &str) -> String {
     s.to_lowercase()
-        .replace('-', " ")
-        .replace('_', " ")
+        .replace(['-', '_'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

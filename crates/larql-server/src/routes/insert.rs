@@ -56,7 +56,7 @@ fn compute_residuals(
     };
 
     let prompt = format!("The {} of {} is",
-        req.relation.replace('-', " ").replace('_', " "), req.entity);
+        req.relation.replace(['-', '_'], " "), req.entity);
     let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
@@ -208,11 +208,11 @@ fn run_insert(
         // Global: read from global for residuals, write to global for insert
         let residuals = {
             let patched = model.patched.blocking_read();
-            compute_residuals(model, &*patched, req, &insert_layers)
+            compute_residuals(model, &patched, req, &insert_layers)
         };
 
         let mut patched = model.patched.blocking_write();
-        apply_insert(model, &mut *patched, req, &insert_layers, &residuals)
+        apply_insert(model, &mut patched, req, &insert_layers, &residuals)
     };
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;

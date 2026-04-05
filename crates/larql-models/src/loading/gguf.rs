@@ -122,7 +122,7 @@ impl GgufFile {
 
         // Version
         let version = read_u32(&mut r)?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             return Err(ModelError::Parse(format!("unsupported GGUF version: {version}")));
         }
 
@@ -153,9 +153,9 @@ impl GgufFile {
 
         // Data starts at next alignment boundary (32 bytes)
         let pos = r.stream_position()
-            .map_err(|e| ModelError::Io(e))?;
+            .map_err(ModelError::Io)?;
         let alignment = 32u64;
-        let data_offset = (pos + alignment - 1) / alignment * alignment;
+        let data_offset = pos.div_ceil(alignment) * alignment;
 
         Ok(GgufFile {
             metadata,
@@ -435,7 +435,9 @@ pub fn normalize_gguf_key(name: &str) -> String {
     // HF uses "model.layers.N.self_attn.q_proj.weight" format
     // We normalize to the HF style since that's what ModelArchitecture expects
 
-    let name = name
+    
+
+    name
         .replace("blk.", "layers.")
         .replace("attn_q.", "self_attn.q_proj.")
         .replace("attn_k.", "self_attn.k_proj.")
@@ -448,9 +450,7 @@ pub fn normalize_gguf_key(name: &str) -> String {
         .replace("ffn_norm.", "post_attention_layernorm.")
         .replace("token_embd.", "embed_tokens.")
         .replace("output_norm.", "norm.")
-        .replace("output.", "lm_head.");
-
-    name
+        .replace("output.", "lm_head.")
 }
 
 #[cfg(test)]

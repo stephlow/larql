@@ -560,7 +560,7 @@ impl Session {
         // Raw token relations (from down_meta scan)
         if let Some(rels) = body["relations"].as_array() {
             if !rels.is_empty() {
-                out.push(format!("Top output tokens:"));
+                out.push("Top output tokens:".to_string());
                 out.push(format!("{:<25} {:>8}", "Token", "Count"));
                 out.push("-".repeat(35));
                 for rel in rels {

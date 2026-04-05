@@ -125,10 +125,7 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
         Ok(()) => info!("  Down features: loaded (mmap walk enabled)"),
         Err(_) => info!("  Down features: not available"),
     }
-    match index.load_up_features(&path) {
-        Ok(()) => info!("  Up features: loaded (full mmap FFN)"),
-        Err(_) => {}
-    }
+    if let Ok(()) = index.load_up_features(&path) { info!("  Up features: loaded (full mmap FFN)") }
     index.warmup();
     info!("  Warmup: done");
 

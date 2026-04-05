@@ -178,7 +178,7 @@ impl<'a> WalkFfn<'a> {
         layer: usize,
         x: &Array2<f32>,
     ) -> Option<(Array2<f32>, Array2<f32>)> {
-        use larql_models::quant::ggml::{q4_0_matvec_ffi, q4_0_vecmat_ffi};
+        use larql_compute::cpu::ops::{q4_matvec, q4_vecmat};
 
         let q4_mmap = self.index.interleaved_q4_mmap_ref()?;
         let intermediate = self.index.num_features(layer);
@@ -245,8 +245,8 @@ impl<'a> WalkFfn<'a> {
                 let x_row = x.row(s);
                 let x_slice = x_row.as_slice().unwrap();
 
-                let gate_scores = q4_0_matvec_ffi(gate_q4, x_slice, intermediate, hidden);
-                let up_scores = q4_0_matvec_ffi(up_q4, x_slice, intermediate, hidden);
+                let gate_scores = q4_matvec::dispatch(gate_q4, x_slice, intermediate, hidden);
+                let up_scores = q4_matvec::dispatch(up_q4, x_slice, intermediate, hidden);
 
                 let mut activation = vec![0.0f32; intermediate];
                 for i in 0..intermediate {
@@ -260,7 +260,7 @@ impl<'a> WalkFfn<'a> {
                     full_activation[[s, i]] = activation[i];
                 }
 
-                let down_result = q4_0_vecmat_ffi(&activation, down_q4, intermediate, hidden);
+                let down_result = q4_vecmat::dispatch(&activation, down_q4, intermediate, hidden);
                 let mut out_row = out.row_mut(s);
                 for j in 0..hidden { out_row[j] = down_result[j]; }
             }
@@ -511,7 +511,7 @@ impl<'a> FfnBackend for WalkFfn<'a> {
 
         // Q4 interleaved: only when Metal backend is available (GPU Q4 beats CPU f32).
         // Without Metal, f32 BLAS is faster than C kernel Q4 dequant.
-        if self.index.has_interleaved_q4() && self.backend.map_or(false, |be| be.has_q4()) {
+        if self.index.has_interleaved_q4() && self.backend.is_some_and(|be| be.has_q4()) {
             if let Some(result) = self.walk_ffn_q4_interleaved(layer, x) {
                 return result;
             }

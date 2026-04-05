@@ -5,13 +5,12 @@
 //! Simpler than Q4 — no nibble unpacking. Each weight is one signed byte.
 //! Used for V projection where Q4 accuracy is insufficient.
 
-use super::q4_common::quantize_to_q8;
 
 /// Quantize a weight matrix to Q8 format: int8 values + per-block f32 scales.
 /// Returns (int8_data[N*K], scales[N * K/32]).
 pub fn quantize_weights_q8(weights: &[f32], num_rows: usize, hidden: usize) -> (Vec<i8>, Vec<f32>) {
     assert_eq!(weights.len(), num_rows * hidden);
-    assert!(hidden % 32 == 0);
+    assert!(hidden.is_multiple_of(32));
 
     let blocks_per_row = hidden / 32;
     let mut q8_data = vec![0i8; num_rows * hidden];
@@ -62,6 +61,7 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::q4::quantize_to_q8;
 
     #[test]
     fn q8_matvec_produces_output() {

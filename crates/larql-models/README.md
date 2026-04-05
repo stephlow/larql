@@ -74,12 +74,20 @@ Auto-detects format from file extensions. Resolves HuggingFace model IDs from ca
 
 ## Quantization Formats
 
+Data format encoding and decoding. Compute operations (matvec, vecmat) are in `larql-compute`.
+
 ```
 quant/
 ├── half.rs      f16/bf16 ↔ f32 (encode + decode)
-├── ggml.rs      Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 block dequantization
+├── ggml.rs      GGML block quantization:
+│                  - Dequantize: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0
+│                  - Quantize: Q4_0, Q8_0 (f32 → packed bytes)
+│                  - Format metadata: tensor_data_size, type_name
 └── mxfp4.rs     MXFP4 microscaling (e8m0 scales + 4-bit values)
 ```
+
+> **Note:** Q4/Q8 matrix-vector operations (matvec, vecmat, NEON kernels) have moved
+> to `larql-compute`. This crate only handles data format encoding/decoding.
 
 ## Crate Structure
 

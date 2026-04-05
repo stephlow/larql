@@ -259,7 +259,7 @@ impl Session {
             Backend::Weight { model_id, weights, .. } => {
                 let mut out = Vec::new();
                 out.push(format!("Model:           {}", model_id));
-                out.push(format!("Backend:         live weights (no vindex)"));
+                out.push("Backend:         live weights (no vindex)".to_string());
                 out.push(String::new());
                 out.push(format!("Layers:          {}", weights.num_layers));
                 out.push(format!("Hidden size:     {}", weights.hidden_size));
@@ -681,7 +681,7 @@ impl Session {
                     "CURRENT refers to a live model, not a vindex. Extract first:\n  \
                      EXTRACT MODEL \"{}\" INTO \"{}.vindex\"",
                     model_id,
-                    model_id.split('/').last().unwrap_or(model_id),
+                    model_id.split('/').next_back().unwrap_or(model_id),
                 ))),
                 _ => Err(LqlError::NoBackend),
             },

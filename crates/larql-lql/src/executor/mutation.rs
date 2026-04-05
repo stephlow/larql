@@ -71,7 +71,7 @@ impl Session {
             use_constellation = config.has_model_weights;
             residuals = if use_constellation {
                 let prompt = format!("The {} of {} is",
-                    relation.replace('-', " ").replace('_', " "), entity);
+                    relation.replace(['-', '_'], " "), entity);
 
                 let mut cb = larql_vindex::SilentLoadCallbacks;
                 let weights = larql_vindex::load_model_weights(path, &mut cb)

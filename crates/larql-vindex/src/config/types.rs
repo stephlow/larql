@@ -67,8 +67,10 @@ pub struct VindexSource {
 /// What components are included in the vindex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ExtractLevel {
     /// Gate + embed + down_meta only. Enables WALK, DESCRIBE, SELECT.
+    #[default]
     Browse,
     /// + attention weights. Enables INFER, EXPLAIN INFER.
     Inference,
@@ -76,11 +78,6 @@ pub enum ExtractLevel {
     All,
 }
 
-impl Default for ExtractLevel {
-    fn default() -> Self {
-        Self::Browse
-    }
-}
 
 impl std::fmt::Display for ExtractLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

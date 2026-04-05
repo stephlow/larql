@@ -81,11 +81,9 @@ pub fn run_repl() {
                 if !trimmed_stmt.ends_with(';')
                     && !trimmed_stmt.to_uppercase().starts_with("STATS")
                     && !trimmed_stmt.to_uppercase().starts_with("SHOW MODELS")
-                {
-                    if !is_complete_statement(trimmed_stmt) {
+                    && !is_complete_statement(trimmed_stmt) {
                         continue;
                     }
-                }
 
                 let input = statement_buf.trim().to_string();
                 statement_buf.clear();

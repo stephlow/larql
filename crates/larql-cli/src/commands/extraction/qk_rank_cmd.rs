@@ -48,8 +48,8 @@ pub fn run(args: QkRankArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n── Computing QK rank per head ──\n");
 
     println!(
-        "{:<6} {:<5} {:>6} {:>6} {:>8} {:>8} {:>8}  {}",
-        "Layer", "Head", "Rank", "Dim", "S_max", "S_10", "S_50", "Spectrum (top 10 singular values)"
+        "{:<6} {:<5} {:>6} {:>6} {:>8} {:>8} {:>8}  Spectrum (top 10 singular values)",
+        "Layer", "Head", "Rank", "Dim", "S_max", "S_10", "S_50"
     );
     println!("{}", "-".repeat(100));
 

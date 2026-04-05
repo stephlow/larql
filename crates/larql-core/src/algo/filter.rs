@@ -72,20 +72,20 @@ impl FilterConfig {
 
         if let Some(min) = self.min_layer {
             let layer = meta_u64("layer");
-            if layer.map_or(true, |l| (l as usize) < min) { return false; }
+            if layer.is_none_or(|l| (l as usize) < min) { return false; }
         }
         if let Some(max) = self.max_layer {
             let layer = meta_u64("layer");
-            if layer.map_or(true, |l| (l as usize) > max) { return false; }
+            if layer.is_none_or(|l| (l as usize) > max) { return false; }
         }
         if let Some(min) = self.min_selectivity {
-            if meta_f64("selectivity").map_or(true, |v| v < min) { return false; }
+            if meta_f64("selectivity").is_none_or(|v| v < min) { return false; }
         }
         if let Some(min) = self.min_c_in {
-            if meta_f64("c_in").map_or(true, |v| v < min) { return false; }
+            if meta_f64("c_in").is_none_or(|v| v < min) { return false; }
         }
         if let Some(min) = self.min_c_out {
-            if meta_f64("c_out").map_or(true, |v| v < min) { return false; }
+            if meta_f64("c_out").is_none_or(|v| v < min) { return false; }
         }
 
         true

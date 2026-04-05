@@ -367,7 +367,7 @@ impl GateIndex {
         let token_scores: Vec<(usize, f32)> = token_ids.iter().map(|&t| (t as usize, 1.0)).collect();
         let max_layer = self.index.keys().copied().max().unwrap_or(0);
         let mut result = vec![Vec::new(); max_layer + 1];
-        for (&layer, _) in &self.index {
+        for &layer in self.index.keys() {
             result[layer] = self.lookup_from_tokens(&token_scores, layer, top_k);
         }
         result

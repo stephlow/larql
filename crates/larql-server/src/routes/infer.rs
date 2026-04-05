@@ -98,11 +98,11 @@ fn run_infer(
             } else {
                 drop(sessions);
                 let patched = model.patched.blocking_read();
-                run_walk(&*patched)
+                run_walk(&patched)
             }
         } else {
             let patched = model.patched.blocking_read();
-            run_walk(&*patched)
+            run_walk(&patched)
         };
 
         let predictions: Vec<serde_json::Value> = pred

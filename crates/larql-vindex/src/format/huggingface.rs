@@ -240,7 +240,7 @@ fn create_hf_dataset_repo(repo_id: &str, token: &str) -> Result<(), VindexError>
         .post("https://huggingface.co/api/repos/create")
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({
-            "name": repo_id.split('/').last().unwrap_or(repo_id),
+            "name": repo_id.split('/').next_back().unwrap_or(repo_id),
             "type": "dataset",
             "private": false,
         }))

@@ -10,6 +10,7 @@ categories = ["science"]
 
 [dependencies]
 larql-models = { path = "../larql-models" }
+larql-compute = { path = "../larql-compute" }
 larql-core = { path = "../larql-core" }
 larql-vindex = { path = "../larql-vindex" }
 serde = { workspace = true }

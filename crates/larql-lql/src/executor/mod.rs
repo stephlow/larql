@@ -69,6 +69,12 @@ pub(crate) struct PatchRecording {
     pub operations: Vec<larql_vindex::PatchOp>,
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     pub fn new() -> Self {
         Self {
@@ -370,7 +376,7 @@ impl Session {
                 "this operation requires a vindex. Extract first:\n  \
                  EXTRACT MODEL \"{}\" INTO \"{}.vindex\"",
                 model_id,
-                model_id.split('/').last().unwrap_or(model_id),
+                model_id.split('/').next_back().unwrap_or(model_id),
             ))),
             _ => Err(LqlError::NoBackend),
         }
@@ -386,7 +392,7 @@ impl Session {
                 "mutation requires a vindex. Extract first:\n  \
                  EXTRACT MODEL \"{}\" INTO \"{}.vindex\"",
                 model_id,
-                model_id.split('/').last().unwrap_or(model_id),
+                model_id.split('/').next_back().unwrap_or(model_id),
             ))),
             _ => Err(LqlError::NoBackend),
         }
@@ -403,7 +409,7 @@ impl Session {
                 "this operation requires a vindex. Extract first:\n  \
                  EXTRACT MODEL \"{}\" INTO \"{}.vindex\"",
                 model_id,
-                model_id.split('/').last().unwrap_or(model_id),
+                model_id.split('/').next_back().unwrap_or(model_id),
             ))),
             _ => Err(LqlError::NoBackend),
         }

@@ -217,19 +217,17 @@ pub fn write_model_weights(
         }
 
         // QK norms (1D vectors, stored alongside attention)
-        for key_opt in &[arch.attn_q_norm_key(layer), arch.attn_k_norm_key(layer)] {
-            if let Some(key) = key_opt {
-                if let Some(data) = source.get_vector(key) {
-                    let bytes = crate::config::dtype::encode_floats(&data, dtype);
-                    attn_file.write_all(&bytes)?;
-                    entries.push(WeightEntry {
-                        key: key.clone(), kind: "vector".into(),
-                        shape: vec![data.len()],
-                        offset: attn_offset, length: bytes.len() as u64,
-                        file: "attn_weights.bin".into(),
-                    });
-                    attn_offset += bytes.len() as u64;
-                }
+        for key in [arch.attn_q_norm_key(layer), arch.attn_k_norm_key(layer)].iter().flatten() {
+            if let Some(data) = source.get_vector(key) {
+                let bytes = crate::config::dtype::encode_floats(&data, dtype);
+                attn_file.write_all(&bytes)?;
+                entries.push(WeightEntry {
+                    key: key.clone(), kind: "vector".into(),
+                    shape: vec![data.len()],
+                    offset: attn_offset, length: bytes.len() as u64,
+                    file: "attn_weights.bin".into(),
+                });
+                attn_offset += bytes.len() as u64;
             }
         }
 

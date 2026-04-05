@@ -163,18 +163,17 @@ pub enum ExplainMode {
 
 /// Display mode for DESCRIBE output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum DescribeMode {
     /// Default: relation labels, also-tokens, layer ranges, multi-layer hits.
     Verbose,
     /// Compact: top edges only, primary layer, no also-tokens.
+    #[default]
     Brief,
     /// No probe labels — pure model signal.
     Raw,
 }
 
-impl Default for DescribeMode {
-    fn default() -> Self { Self::Brief }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerBand {

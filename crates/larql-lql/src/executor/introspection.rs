@@ -35,46 +35,43 @@ impl Session {
 
         for &layer in &scan_layers {
             if let Some(metas) = patched.down_meta_at(layer) {
-                for meta_opt in metas.iter() {
-                    if let Some(meta) = meta_opt {
-                        let tok = meta.top_token.trim();
-                        if !is_content_token(tok) {
-                            continue;
-                        }
-                        if meta.c_score < 0.2 {
-                            continue;
-                        }
-                        let key = tok.to_lowercase();
-                        let examples: Vec<String> = meta.top_k.iter()
-                            .filter(|t| t.token.trim() != tok && is_content_token(t.token.trim()))
-                            .take(3)
-                            .map(|t| t.token.trim().to_string())
-                            .collect();
-                        let entry = tokens.entry(key).or_insert(TokenInfo {
-                            count: 0,
-                            max_score: 0.0,
-                            min_layer: layer,
-                            max_layer: layer,
-                            original: tok.to_string(),
-                            examples,
-                        });
-                        entry.count += 1;
-                        if meta.c_score > entry.max_score {
-                            entry.max_score = meta.c_score;
-                        }
-                        if layer < entry.min_layer {
-                            entry.min_layer = layer;
-                        }
-                        if layer > entry.max_layer {
-                            entry.max_layer = layer;
-                        }
+                for meta in metas.iter().flatten() {
+                    let tok = meta.top_token.trim();
+                    if !is_content_token(tok) {
+                        continue;
+                    }
+                    if meta.c_score < 0.2 {
+                        continue;
+                    }
+                    let key = tok.to_lowercase();
+                    let examples: Vec<String> = meta.top_k.iter()
+                        .filter(|t| t.token.trim() != tok && is_content_token(t.token.trim()))
+                        .take(3)
+                        .map(|t| t.token.trim().to_string())
+                        .collect();
+                    let entry = tokens.entry(key).or_insert(TokenInfo {
+                        count: 0,
+                        max_score: 0.0,
+                        min_layer: layer,
+                        max_layer: layer,
+                        original: tok.to_string(),
+                        examples,
+                    });
+                    entry.count += 1;
+                    if meta.c_score > entry.max_score {
+                        entry.max_score = meta.c_score;
+                    }
+                    if layer < entry.min_layer {
+                        entry.min_layer = layer;
+                    }
+                    if layer > entry.max_layer {
+                        entry.max_layer = layer;
                     }
                 }
             }
         }
 
-        let mut sorted: Vec<(&str, &TokenInfo)> = tokens.iter()
-            .map(|(_, info)| (info.original.as_str(), info))
+        let mut sorted: Vec<(&str, &TokenInfo)> = tokens.values().map(|info| (info.original.as_str(), info))
             .collect();
         sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
         sorted.truncate(30);
@@ -221,7 +218,7 @@ impl Session {
                     .top_k
                     .iter()
                     .take(5)
-                    .map(|t| format!("{}", t.token))
+                    .map(|t| t.token.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
 

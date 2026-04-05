@@ -310,7 +310,7 @@ impl ContextWriter {
         let idx = self.header.n_boundaries as usize;
 
         if idx >= self.max_boundaries {
-            return Err(io::Error::new(io::ErrorKind::Other, "index full"));
+            return Err(io::Error::other("index full"));
         }
         if residual.len() != hidden {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "residual size mismatch"));

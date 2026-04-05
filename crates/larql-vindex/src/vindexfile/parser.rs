@@ -109,8 +109,7 @@ fn parse_directive(line: &str, line_num: usize) -> Result<VindexfileDirective, V
         let path = line[7..].trim().to_string();
         Ok(VindexfileDirective::Labels(path))
     } else if upper.starts_with("EXPOSE ") {
-        let levels: Vec<String> = line[7..].trim()
-            .split_whitespace()
+        let levels: Vec<String> = line[7..].split_whitespace()
             .map(|s| s.to_lowercase())
             .collect();
         Ok(VindexfileDirective::Expose(levels))

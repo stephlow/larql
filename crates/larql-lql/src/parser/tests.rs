@@ -688,6 +688,57 @@ fn parse_explain_walk_with_top() {
     }
 }
 
+#[test]
+fn parse_explain_infer_with_band() {
+    let stmt = parse(r#"EXPLAIN INFER "test" KNOWLEDGE;"#).unwrap();
+    match stmt {
+        Statement::Explain { mode, band, .. } => {
+            assert_eq!(mode, ExplainMode::Infer);
+            assert_eq!(band, Some(LayerBand::Knowledge));
+        }
+        _ => panic!("expected Explain"),
+    }
+}
+
+#[test]
+fn parse_explain_infer_relations_only() {
+    let stmt = parse(r#"EXPLAIN INFER "test" RELATIONS ONLY;"#).unwrap();
+    match stmt {
+        Statement::Explain { mode, relations_only, .. } => {
+            assert_eq!(mode, ExplainMode::Infer);
+            assert!(relations_only);
+        }
+        _ => panic!("expected Explain"),
+    }
+}
+
+#[test]
+fn parse_explain_infer_with_attention() {
+    let stmt = parse(r#"EXPLAIN INFER "test" WITH ATTENTION;"#).unwrap();
+    match stmt {
+        Statement::Explain { mode, with_attention, .. } => {
+            assert_eq!(mode, ExplainMode::Infer);
+            assert!(with_attention);
+        }
+        _ => panic!("expected Explain"),
+    }
+}
+
+#[test]
+fn parse_explain_infer_all_options() {
+    let stmt = parse(r#"EXPLAIN INFER "test" KNOWLEDGE TOP 1 RELATIONS ONLY WITH ATTENTION;"#).unwrap();
+    match stmt {
+        Statement::Explain { mode, band, top, relations_only, with_attention, .. } => {
+            assert_eq!(mode, ExplainMode::Infer);
+            assert_eq!(band, Some(LayerBand::Knowledge));
+            assert_eq!(top, Some(1));
+            assert!(relations_only);
+            assert!(with_attention);
+        }
+        _ => panic!("expected Explain"),
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // MUTATION STATEMENTS
 // ══════════════════════════════════════════════════════════════

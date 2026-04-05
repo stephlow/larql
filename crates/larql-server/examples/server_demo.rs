@@ -328,9 +328,9 @@ fn main() {
     session_a.delete_feature(1, 0); // Session A removes Paris
 
     println!("Session A (removed feature L1:F0):");
-    println!("  L1:F0 = {:?}", session_a.feature_meta(1, 0).map(|m| &m.top_token));
+    println!("  L1:F0 = {:?}", session_a.feature_meta(1, 0).map(|m| m.top_token.clone()));
     println!("Session B (untouched):");
-    println!("  L1:F0 = {:?}", session_b.feature_meta(1, 0).map(|m| m.top_token.as_str()));
+    println!("  L1:F0 = {:?}", session_b.feature_meta(1, 0).map(|m| m.top_token.clone()));
     println!("\nSessions are isolated — patches don't leak between clients.");
 
     // ── 10. DESCRIBE CACHE ──

@@ -238,7 +238,7 @@ async fn remove_patch_from_model(
             .sessions
             .remove_patch(&sid, name)
             .await
-            .map_err(|e| ServerError::NotFound(e))?;
+            .map_err(ServerError::NotFound)?;
         return Ok(Json(serde_json::json!({
             "removed": name,
             "active_patches": remaining,

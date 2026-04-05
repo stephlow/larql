@@ -429,7 +429,7 @@ fn grpc_infer(
 ) -> Result<InferResponse, Status> {
     let weights = model
         .get_or_load_weights()
-        .map_err(|e| Status::unavailable(e))?;
+        .map_err(Status::unavailable)?;
 
     let encoding = model
         .tokenizer
@@ -512,14 +512,12 @@ fn grpc_relations(
     let mut counts: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
     for &layer in &all_layers {
         if let Some(metas) = patched.down_meta_at(layer) {
-            for meta_opt in metas.iter() {
-                if let Some(meta) = meta_opt {
-                    let tok = meta.top_token.trim();
-                    if tok.len() >= 2 && meta.c_score >= 0.2 {
-                        let example = meta.top_k.first().map(|t| t.token.trim().to_string()).unwrap_or_default();
-                        let entry = counts.entry(tok.to_string()).or_insert((0, example));
-                        entry.0 += 1;
-                    }
+            for meta in metas.iter().flatten() {
+                let tok = meta.top_token.trim();
+                if tok.len() >= 2 && meta.c_score >= 0.2 {
+                    let example = meta.top_k.first().map(|t| t.token.trim().to_string()).unwrap_or_default();
+                    let entry = counts.entry(tok.to_string()).or_insert((0, example));
+                    entry.0 += 1;
                 }
             }
         }

@@ -8,16 +8,13 @@ use serde::{Deserialize, Serialize};
 /// Storage precision for vindex binary files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum StorageDtype {
+    #[default]
     F32,
     F16,
 }
 
-impl Default for StorageDtype {
-    fn default() -> Self {
-        Self::F32
-    }
-}
 
 impl std::fmt::Display for StorageDtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

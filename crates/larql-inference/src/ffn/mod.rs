@@ -95,7 +95,7 @@ pub fn gelu_tanh_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
 }
 
 pub fn gelu_tanh(x: f32) -> f32 {
-    let c = 0.7978845608f32;
+    let c = 0.797_884_6_f32;
     0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
 }
 

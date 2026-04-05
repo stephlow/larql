@@ -778,7 +778,7 @@ pub use crate::extract::callbacks::IndexBuildCallbacks;
                 }
             }
             count += 1;
-            if count % 50000 == 0 {
+            if count.is_multiple_of(50000) {
                 eprint!("\r  Read {} features...", count);
             }
         }

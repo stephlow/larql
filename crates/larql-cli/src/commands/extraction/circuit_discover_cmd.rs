@@ -320,8 +320,8 @@ pub fn run(args: CircuitDiscoverArgs) -> Result<(), Box<dyn std::error::Error>> 
         while let Some(current) = queue.pop() {
             if let Some(neighbors) = adjacency.get(&current) {
                 for &(neighbor, _sim) in neighbors {
-                    if !cluster_id.contains_key(&neighbor) {
-                        cluster_id.insert(neighbor, cid);
+                    if let std::collections::hash_map::Entry::Vacant(e) = cluster_id.entry(neighbor) {
+                        e.insert(cid);
                         queue.push(neighbor);
                     }
                 }
