@@ -64,7 +64,7 @@ use crate::forward::run_layer_with_ffn;
 /// predictions, raw logits, masking, etc.).
 ///
 /// Shared by [`predict_q4k`] and [`generate_q4k_cpu_constrained`].
-fn predict_q4k_hidden(
+pub fn predict_q4k_hidden(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,

@@ -453,6 +453,59 @@ vindexes in the local cache that's ~200 MB of duplicate data. Low
 priority — worth doing as a content-addressed store if the cache
 grows, otherwise skip.
 
+### Decode-vs-prefill parity on Gemma 4 31B (open)
+
+`test_decode_consistency::decode_consistency_gemma4_31b_dense` is the
+single failing test in the new parity suite. **The Metal KV-cached
+`decode_token` produces a different L0 hidden state than a fresh
+Metal/CPU prefill at the same effective sequence length** —
+`cos=0.996586, max_abs=1.270` (2.7 % of the reference layer norm) at
+L0, compounding to `cos≈0.76` at L59. The other three architectures
+in the suite (Gemma 3 4B, Llama 2 7B, Mistral 7B) match cleanly.
+
+**What this affects.** Gemma 4 31B-it produces a coherent first token
+("Paris") then drifts on every subsequent decoded token versus what a
+full re-prefill would produce. End-to-end tokens stay in-distribution
+(the architecture goldens still pass) but they aren't the
+mathematically-correct continuation of the prompt.
+
+**Cleared as the cause.** Each of these has a kernel-level test that
+passes at the failing geometry (Gemma 4 31B global: `head_dim=512`,
+`num_kv=4`, partial RoPE 25 %, `rope_base=500000`):
+
+- `fused_attention`              — `test_metal_shaders::fused_attention_head_dim_512`
+- `v_norm_batched`               — `test_kernel_v_norm` (caught + fixed two
+   shader bugs along the way; see ship log)
+- `kv_attention`                 — `test_kernel_kv_attention`
+- `rope_at_pos_batched`          — `test_kernel_rope`
+- Mixed-Q4K+Q6K fused QKV proj   — forced-disable test in decode shows
+   identical drift, so it's not the cause.
+
+**Remaining suspects.** What hasn't been kernel-tested yet:
+
+1. `kv_cache_append` shader + the prefill→decode KV cache layout/stride
+   hand-off. Cheapest next test — write a kernel test that prefills 18
+   tokens, decodes 1, then reads `kv_cache.layers[0].k_cache` directly
+   and compares position-by-position to a CPU reference of the same
+   computation.
+2. K/V buffers post-RoPE inside Metal prefill vs CPU prefill. Prefill
+   `h_out` matches end-to-end, but it's possible the intermediate
+   K/V values that get *copied into the cache* are off (and the
+   prefill's own `fused_attention` happens to compensate via a
+   different but-also-wrong calculation that lands at the right
+   `h_out`).
+3. Per-stage residual capture in `residual_diff::ResidualCapture` —
+   currently captures end-of-layer only. Extending to per-stage
+   (`q_out`, `k_out`, `v_out`, `attn_out`, `o_out`, `ffn_norm_out`,
+   …) for both prefill and decode would localise this in one shot.
+
+**Path forward.** Do (1) → (2) → (3) in order. The drift value is
+*exactly* `cos=0.996586` regardless of which fix I apply, which
+strongly suggests a single structural difference (off-by-one in cache
+stride, missing application of one shader stage, or similar) rather
+than accumulated per-kernel error. Once localised, the fix should be
+small.
+
 ---
 
 ## P2 — Demo production
@@ -491,6 +544,69 @@ the attention weights taking a third of RAM.
 ---
 
 ## Done (ship log)
+
+### Backend parity testing infrastructure + 2 shader fixes (2026-04-24)
+
+Replaced the ad-hoc env-var-driven dump scaffolding (`LARQL_CPU_DUMP_LAYERS`,
+`LARQL_METAL_DUMP_LAYERS`, `LARQL_DECODE_DUMP_LAYERS`,
+`LARQL_STAGE_DUMP_LAYER`, `LARQL_DUMP_L0`, …) with a typed in-memory
+parity API and split the kernel test surface into focused files. Two
+real shader bugs surfaced and got fixed in the process.
+
+**New module — `larql_inference::residual_diff`** (3 files):
+
+- `capture.rs`: `ResidualCapture::cpu_prefill / metal_prefill /
+  metal_decode` — drives the corresponding production forward path,
+  reads its per-layer hidden state into a `Vec<Vec<f32>>`, returns a
+  typed struct. Tempfile + env-var plumbing is private to the module.
+- `compare.rs`: `compare_captures(a, b, ParityThreshold::tight())`
+  → `ParityReport` with first-bad-layer detail, `assert_clean()` for
+  test ergonomics. f64-accumulated cos + relative max-abs metrics so
+  the same threshold travels across `hidden ∈ {2560, 4096, 5376}`.
+- `mod.rs`: 12 unit tests covering shape mismatch, threshold
+  semantics, env-var save/restore, dump-file decoding.
+
+**New tests, all driven by the module above or the shared `tests/common/mod.rs`**:
+
+- `larql-inference/tests/test_cpu_metal_parity.rs` (4 tests) —
+  refactored. No more env-var setup in the test body. Asserts
+  per-layer cos ≥ 0.99995 / rel max_abs ≤ 1 % across all four test
+  vindexes.
+- `larql-inference/tests/test_decode_consistency.rs` (4 tests, 1
+  expected-fail) — NEW. Asserts `Metal prefill(N) + decode(1) ==
+  CPU prefill(N+1).last_position()` per layer. Currently fails for
+  Gemma 4 31B; see P1 "Decode-vs-prefill parity" above.
+- `larql-compute/tests/common/mod.rs` — `get_metal`, `max_diff`,
+  `cos_sim` shared helpers across kernel test files.
+- `larql-compute/tests/test_kernel_v_norm.rs` (3 tests) — see fixes
+  below.
+- `larql-compute/tests/test_kernel_kv_attention.rs` (5 tests) —
+  pins `kv_attention` against a CPU softmax reference at Llama-2 /
+  Gemma 3 / Gemma 4 sliding / Gemma 4 global / long-context T=512.
+- `larql-compute/tests/test_kernel_rope.rs` (5 tests) — pins
+  `rope_at_pos_batched` at the Gemma 4 global head_dim=512 partial
+  RoPE geometry.
+
+**Shader bugs caught + fixed**:
+
+- `metal/shaders/v_norm.rs::v_norm_batched` — the original used
+  `[[thread_position_in_grid]]: uint2` with `dispatch_threads`. On M3
+  the 2D form silently dispatched only the first TG along Y, so heads
+  1+ stayed at the buffer's initial state (zero). Caught by
+  `v_norm_batched_all_ones_4x256`. Fix: switched to a single-`uint`
+  `[[threadgroup_position_in_grid]]` with one TG per head, mirroring
+  the `qk_norm` shader's pattern.
+- Same shader, separate latent issue: in production decode the
+  shader runs in-place (`x` and `out` aliased), and every thread
+  re-read the full head for `sum_sq` while other threads were
+  writing. Caught by `v_norm_batched_in_place_matches_reference`.
+  Fix: cooperative threadgroup-shared partial-sum reduction with an
+  explicit barrier between the read and write phases.
+
+**File-size cleanup**: `test_metal_shaders.rs` shrank 3581 → 3405
+lines. Future kernel tests live in dedicated `test_kernel_*.rs`
+files using `tests/common/mod.rs` for shared helpers — additions
+won't grow the legacy file further.
 
 ### Gemma 4 26B A4B end-to-end correctness (2026-04-24)
 Closed four independent gaps that together produced garbage output on

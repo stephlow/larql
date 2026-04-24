@@ -37,21 +37,80 @@ impl VectorIndex {
         None
     }
 
-    /// Number of features indexed at a layer.
-    pub fn num_features(&self, layer: usize) -> usize {
-        // Check mmap first
+    /// Human-readable description of what the walk kernel will actually
+    /// do on this vindex. Use to sanity-check a loaded vindex — if the
+    /// description says "weights fallback" or "dense (legacy)", the
+    /// vindex is not being used for FFN storage and that is probably
+    /// not what the caller expected.
+    ///
+    /// Emitted by [`crate::format::load::load_vindex`] at load time
+    /// when `LARQL_VINDEX_DESCRIBE=1` and by the CLI `--describe`
+    /// flag. Also useful from tests to assert the expected storage
+    /// backend is attached.
+    pub fn describe_ffn_backend(&self) -> String {
+        // Mirror the walk_ffn routing priority order (see
+        // larql-inference::vindex::walk_ffn/mod.rs routing table).
+        let mut parts = Vec::new();
+        if self.fp4_storage.is_some() {
+            let fp4 = self.fp4_storage.as_ref().unwrap();
+            let g = fp4.manifest.projections.gate.precision;
+            let u = fp4.manifest.projections.up.precision;
+            let d = fp4.manifest.projections.down.precision;
+            parts.push(format!("FP4 sparse (gate={g}, up={u}, down={d})"));
+        }
+        if self.interleaved_q4k_mmap.is_some() {
+            parts.push("Q4K interleaved".into());
+        }
+        if self.interleaved_q4_mmap.is_some() {
+            parts.push("Q4_0 interleaved".into());
+        }
+        if self.interleaved_mmap.is_some() {
+            parts.push("f32 interleaved".into());
+        }
+        if self.up_features_mmap.is_some() && self.down_features_mmap.is_some() {
+            parts.push("full mmap (up+down f32)".into());
+        }
         if self.gate_mmap_bytes.is_some() {
-            return self
-                .gate_mmap_slices
+            parts.push(format!("gate KNN ({:?} mmap)", self.gate_mmap_dtype));
+        }
+        if parts.is_empty() {
+            "weights fallback (safetensors — vindex not wired)".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Number of features indexed at a layer.
+    ///
+    /// Check order: legacy gate mmap slices → legacy heap gate vectors
+    /// → FP4 storage's per-layer feature counts (exp 26). The FP4
+    /// fallback fires when an FP4-only vindex has no legacy
+    /// `gate_vectors.bin` mapped — without this, the walk kernel
+    /// sees `num_features == 0` and falls through to the safetensors
+    /// weights path, silently bypassing the vindex entirely.
+    pub fn num_features(&self, layer: usize) -> usize {
+        if self.gate_mmap_bytes.is_some() {
+            let n = self.gate_mmap_slices
                 .get(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0);
+            if n > 0 { return n; }
         }
-        self.gate_vectors
+        if let Some(n) = self.gate_vectors
             .get(layer)
             .and_then(|v| v.as_ref())
             .map(|m| m.shape()[0])
-            .unwrap_or(0)
+        {
+            if n > 0 { return n; }
+        }
+        // FP4 storage fallback — layer_features is populated from
+        // `index.json.layers[]` at load time.
+        if let Some(ref fp4) = self.fp4_storage {
+            if let Some(&n) = fp4.layer_features.get(layer) {
+                return n;
+            }
+        }
+        0
     }
 
     /// Total gate vectors loaded across all layers.

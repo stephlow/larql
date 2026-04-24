@@ -54,11 +54,24 @@ impl Policy {
     }
 
     /// (gate, up, down) precision under this policy.
-    fn precisions(self) -> (Precision, Precision, Precision) {
+    ///
+    /// **Architectural note (exp 26 Q2 finding):** gate is always kept
+    /// at source dtype (f32/f16) rather than FP4. The walk kernel's
+    /// gate KNN (`gate_scores_batch`, `gate_walk`) requires a dense
+    /// gate matrix for batch matmul — per-feature FP4 gate access
+    /// would bypass this entirely. FP4-storing gate saves ~25% of FFN
+    /// storage in theory but has no consumer in the current walk
+    /// kernel; the savings would stay on disk and never translate to
+    /// bandwidth gains in memory-bound inference.
+    ///
+    /// Options labelled A/B/C in the policy spec now apply only to
+    /// the up/down projections. Gate stays at whatever dtype the
+    /// source vindex used, hard-linked by the converter.
+    fn precisions(self, gate_source: Precision) -> (Precision, Precision, Precision) {
         match self {
-            Policy::A => (Precision::Fp4, Precision::Fp4, Precision::Fp4),
-            Policy::B => (Precision::Fp4, Precision::Fp4, Precision::Fp8),
-            Policy::C => (Precision::Fp4, Precision::Fp4, Precision::F16),
+            Policy::A => (gate_source, Precision::Fp4, Precision::Fp4),
+            Policy::B => (gate_source, Precision::Fp4, Precision::Fp8),
+            Policy::C => (gate_source, Precision::Fp4, Precision::F16),
         }
     }
 }
@@ -269,7 +282,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Read + quantise each projection ──────────────────────────────────────
     let t_total = Instant::now();
     let mut compliance_entries: Vec<Value> = Vec::new();
-    let (policy_g, policy_u, policy_d) = args.policy.precisions();
+    let gate_source_precision = match src_dtype {
+        SrcDtype::F32 => Precision::F32,
+        SrcDtype::F16 => Precision::F16,
+        SrcDtype::Bf16 => Precision::F16, // stored as bf16 but flagged as F16 for now
+    };
+    let (policy_g, policy_u, policy_d) = args.policy.precisions(gate_source_precision);
 
     let projections = [
         ("gate", "gate_vectors.bin", policy_g),

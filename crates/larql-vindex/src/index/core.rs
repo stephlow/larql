@@ -584,4 +584,82 @@ mod refactor_tests {
         let src = v.hnsw_cache.lock().unwrap();
         assert_eq!(src.len(), 3);
     }
+
+    /// Exp 26 Q2 regression guard: on a VectorIndex with only
+    /// `fp4_storage` set (no legacy `gate_vectors.bin`), `num_features`
+    /// must return the per-layer feature count carried by the FP4
+    /// manifest. Without this fallback, `num_features` returns 0 and
+    /// the walk kernel short-circuits to `zero_features_dense`,
+    /// silently bypassing the vindex — which is exactly what happened
+    /// during Q2 before this fallback was added.
+    #[test]
+    fn num_features_falls_back_to_fp4_storage() {
+        use super::super::fp4_storage::Fp4Storage;
+        use crate::config::types::Fp4Config;
+
+        let storage = Fp4Storage {
+            manifest: Fp4Config::option_b_default(),
+            gate_mmap: None,
+            up_mmap: None,
+            down_mmap: None,
+            layer_features: vec![10240, 10240, 10240],
+            hidden: 2560,
+        };
+        let mut v = VectorIndex::empty(3, 2560);
+        v.fp4_storage = Some(Arc::new(storage));
+
+        assert_eq!(v.num_features(0), 10240);
+        assert_eq!(v.num_features(1), 10240);
+        assert_eq!(v.num_features(2), 10240);
+        // Out-of-range layer still returns 0 gracefully.
+        assert_eq!(v.num_features(99), 0);
+    }
+
+    /// Non-uniform per-layer widths (MoE / E2B-style) survive the
+    /// FP4 fallback.
+    #[test]
+    fn num_features_fp4_fallback_non_uniform_widths() {
+        use super::super::fp4_storage::Fp4Storage;
+        use crate::config::types::Fp4Config;
+
+        let storage = Fp4Storage {
+            manifest: Fp4Config::option_b_default(),
+            gate_mmap: None,
+            up_mmap: None,
+            down_mmap: None,
+            layer_features: vec![6144, 12288, 6144, 12288],
+            hidden: 1536,
+        };
+        let mut v = VectorIndex::empty(4, 1536);
+        v.fp4_storage = Some(Arc::new(storage));
+
+        assert_eq!(v.num_features(0), 6144);
+        assert_eq!(v.num_features(1), 12288);
+        assert_eq!(v.num_features(2), 6144);
+        assert_eq!(v.num_features(3), 12288);
+    }
+
+    /// Legacy path still wins when both are set — gate_vectors.bin
+    /// is authoritative when present. (Otherwise an FP4 vindex with
+    /// a stale fp4 manifest could silently override a correct legacy
+    /// count.)
+    #[test]
+    fn num_features_legacy_wins_when_gate_present() {
+        use super::super::fp4_storage::Fp4Storage;
+        use crate::config::types::Fp4Config;
+
+        let mut v = VectorIndex::empty(2, 256);
+        // Heap gate vectors present for layer 0.
+        v.gate_vectors[0] = Some(Array2::<f32>::zeros((8, 256)));
+        // FP4 says 16, but heap says 8 — heap wins.
+        let storage = Fp4Storage {
+            manifest: Fp4Config::option_b_default(),
+            gate_mmap: None, up_mmap: None, down_mmap: None,
+            layer_features: vec![16, 16], hidden: 256,
+        };
+        v.fp4_storage = Some(Arc::new(storage));
+        assert_eq!(v.num_features(0), 8);
+        // Layer 1 has no heap → FP4 fallback fires.
+        assert_eq!(v.num_features(1), 16);
+    }
 }

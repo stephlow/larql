@@ -170,6 +170,18 @@ impl VectorIndex {
         // is set. Non-fatal if absent or malformed — other FFN mmaps
         // already loaded remain authoritative.
         let _ = index.load_fp4_storage(dir, &config);
+
+        // Engine observability: emit the walk-kernel backend summary
+        // to stderr when `LARQL_VINDEX_DESCRIBE=1`. Lets users spot
+        // silent fallbacks (e.g. FP4 vindex wired as "weights fallback"
+        // would have prevented the exp 26 Q2 bug if this had existed).
+        if std::env::var("LARQL_VINDEX_DESCRIBE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[larql-vindex] {} → walk backend: {}",
+                dir.display(),
+                index.describe_ffn_backend(),
+            );
+        }
         // Opportunistically adopt the f16 `embeddings.bin` as an f16 view
         // of the LM head — but ONLY when the vindex has no separate lm_head
         // file. `embeddings.bin` IS the lm_head for tied-embedding models

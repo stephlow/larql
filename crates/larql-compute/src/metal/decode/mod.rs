@@ -434,18 +434,26 @@ impl MetalBackend {
             }
 
             // ── Step 3: V-norm batched (optional, Gemma 4) ──
+            // Cooperative reduction: one threadgroup per KV head; threads
+            // within a TG share the sum-of-squares via threadgroup memory
+            // and a barrier (see `shaders/v_norm.rs`). Round tg width up
+            // to a power of two ≤ 512 for the tree reduction.
             if layer.has_v_norm {
                 let hd_val = layer_head_dim as u32;
                 let num_kv = layer_num_kv_heads as u32;
+                let mut tg_w: u64 = 1;
+                while tg_w < layer_head_dim as u64 && tg_w < 512 {
+                    tg_w <<= 1;
+                }
                 enc.set_compute_pipeline_state(&self.v_norm_batched_pipeline);
                 enc.set_buffer(0, Some(&v_out), 0);
                 enc.set_buffer(1, Some(&v_out), 0);
                 enc.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(3, 4, &eps as *const f32 as *const std::ffi::c_void);
                 enc.set_bytes(4, 4, &num_kv as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_threads(
-                    MTLSize::new(layer_head_dim as u64, layer_num_kv_heads as u64, 1),
-                    MTLSize::new((layer_head_dim as u64).min(256), 1, 1),
+                enc.dispatch_thread_groups(
+                    MTLSize::new(layer_num_kv_heads as u64, 1, 1),
+                    MTLSize::new(tg_w, 1, 1),
                 );
             }
 
@@ -946,6 +954,33 @@ impl MetalBackend {
                         &enc, &self.scale_vector_pipeline,
                         new_h, 1, hidden, layer.layer_scalar,
                     );
+                }
+            }
+
+            // Optional per-layer end-of-layer dump for decode-path
+            // diagnostics. Flushes the encoder so `new_h` is readable,
+            // writes `decode_layer_{LL}.f32`, then restarts the encoder
+            // for the next layer. Paired with Metal prefill's
+            // `metal_layer_{LL}_h_out.f32` hook so the two paths can be
+            // diffed at the same layer boundaries. Gated on an env var to
+            // keep normal decode free of flush overhead.
+            if let Ok(dir) = std::env::var("LARQL_DECODE_DUMP_LAYERS") {
+                if !encoder_ended {
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    encoder_ended = true;
+                }
+                let hidden_bytes = super::buffers::read_buffer_f32(new_h, hidden);
+                let as_bytes: Vec<u8> = hidden_bytes.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("{dir}/decode_layer_{l:02}.f32");
+                if let Err(e) = std::fs::write(&path, &as_bytes) {
+                    eprintln!("[decode-dump] failed to write {path}: {e}");
+                }
+                if l + 1 < num_layers {
+                    cmd = self.queue.new_command_buffer().to_owned();
+                    enc = cmd.new_compute_command_encoder().to_owned();
+                    encoder_ended = false;
                 }
             }
 

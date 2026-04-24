@@ -33,6 +33,11 @@ rayon = "1.10"
 # Tokenizer
 tokenizers = "0.21"
 
+# Used by `residual_diff::capture` to drive the backend-side per-layer
+# dump hooks into a private dir per call. dev-only would force every
+# crate consumer to pull tempfile in just to use the in-memory diff API.
+tempfile = "3"
+
 # Chat-template rendering (HF `tokenizer_config.json::chat_template` is Jinja).
 # `minijinja-contrib` ships `pycompat::unknown_method_callback` which gives us
 # Python-style method calls (`.get()`, `.items()`, `.startswith()`, …) that

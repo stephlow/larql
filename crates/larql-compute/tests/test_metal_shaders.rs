@@ -1942,6 +1942,7 @@ fn v_norm_matches_cpu() {
     assert!(diff < 1e-5, "V-norm max diff {diff} exceeds 1e-5");
 }
 
+
 #[test]
 fn scale_vector_matches_cpu() {
     let metal = get_metal();

@@ -21,6 +21,9 @@ pub mod unlimited_context;
 #[cfg(feature = "real-model")]
 pub mod apollo;
 
+#[cfg(feature = "real-model")]
+pub mod vindex_compare;
+
 use metrics::Metrics;
 use model_config::ModelConfig;
 

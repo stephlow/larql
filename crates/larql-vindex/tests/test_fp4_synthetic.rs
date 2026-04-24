@@ -303,6 +303,33 @@ fn synthetic_ffn_row_returns_none_on_oob() {
     assert!(index.ffn_row_dot(0, 9, 0, &x).is_none());
 }
 
+/// Exp 26 Q2 regression guard: a VectorIndex loaded from an FP4-only
+/// vindex directory must report `num_features > 0` per layer. Before
+/// the `fp4_storage` fallback in `VectorIndex::num_features`, this
+/// returned 0 because the legacy `gate_vectors.bin` was absent — which
+/// in turn caused the walk kernel to short-circuit to
+/// `zero_features_dense` and silently run on safetensors weights,
+/// hiding FP4 quantisation error entirely.
+///
+/// This test asserts the fallback works at the VectorIndex level; the
+/// walk-kernel-level regression guard (routing picks FP4 not
+/// `zero_features_dense`) lives in `walk_ffn/routing_tests.rs`
+/// and covers the pure predicate logic.
+#[test]
+fn synthetic_num_features_never_zero_on_fp4_vindex() {
+    let (_tmp, dir, _, _, _, _, per_layer_features) = build_minimal_vindex();
+    let index = load_minimal(&dir);
+
+    for (layer, &expected) in per_layer_features.iter().enumerate() {
+        let got = larql_vindex::GateIndex::num_features(&index, layer);
+        assert_eq!(
+            got, expected,
+            "layer {layer}: num_features returned {got}, expected {expected} — \
+             FP4 fallback regression (see VectorIndex::num_features)"
+        );
+    }
+}
+
 #[test]
 fn synthetic_cloned_index_preserves_fp4_storage() {
     // Clone invariants test: after cloning a loaded VectorIndex, the
