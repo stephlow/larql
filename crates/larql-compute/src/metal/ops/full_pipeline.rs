@@ -882,16 +882,22 @@ pub fn dispatch_full_pipeline(
             };
             // End-of-layer residual (matches CPU dump exactly).
             write_f32("h_out", &h_bufs[l + 1], seq_len * hidden);
-            // Per-stage snapshots for layer 0 only (noise budget): these
-            // let us bisect which shader stage first diverges from CPU.
-            if l == 0 {
+            // h_post_attn for every layer — cheap and lets the residual-diff
+            // tool bisect drift into attention vs FFN at any layer. Without
+            // this, L0 was the only layer with this snapshot available.
+            write_f32("h_post_attn", &h_post_attns[l], seq_len * hidden);
+            // Per-stage snapshots for layer 0 by default, or the layer
+            // named by `LARQL_STAGE_DUMP_LAYER` — useful for bisecting
+            // drift at a specific later layer (e.g. Gemma 4 global L5).
+            let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
+                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            if l == stage_layer {
                 write_f32("norm_out",     &norm_outs[l],     seq_len * hidden);
                 write_f32("q_out",        &q_outs[l],        seq_len * layer_q_dim);
                 write_f32("k_out",        &k_outs[l],        seq_len * layer_kv_dim);
                 write_f32("v_out",        &v_outs[l],        seq_len * layer_kv_dim);
                 write_f32("attn_out",     &attn_outs[l],     seq_len * layer_q_dim);
                 write_f32("o_out",        &o_outs[l],        seq_len * hidden);
-                write_f32("h_post_attn",  &h_post_attns[l],  seq_len * hidden);
                 write_f32("ffn_norm_out", &ffn_norm_outs[l], seq_len * hidden);
                 write_f32("gate_out",     &gate_outs[l],     seq_len * inter);
                 write_f32("up_out",       &up_outs[l],       seq_len * inter);

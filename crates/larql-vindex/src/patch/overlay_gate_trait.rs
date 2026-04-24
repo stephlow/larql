@@ -152,6 +152,29 @@ impl GateIndex for PatchedVindex {
         self.base.q4k_matmul_transb(layer, component, x, x_rows, backend)
     }
 
+    // ── FP4 / FP8 FFN storage (exp 26) ─────────────────────────────────────
+
+    fn has_fp4_storage(&self) -> bool {
+        self.base.has_fp4_storage()
+    }
+
+    fn fp4_ffn_row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+        self.base.fp4_ffn_row_dot(layer, component, feat, x)
+    }
+
+    fn fp4_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        self.base.fp4_ffn_row_scaled_add(layer, component, feat, alpha, out)
+    }
+
+    fn fp4_ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
+        self.base.fp4_ffn_row_into(layer, component, feat, out)
+    }
+
+    // The unified `ffn_row_*` methods use the default dispatch impl in
+    // GateIndex. PatchedVindex never intercepts them directly; overrides
+    // land through `up_override` / `down_override` in the walk kernel and
+    // through the underlying backend accessors above.
+
     fn gate_knn_batch(&self, layer: usize, x: &ndarray::Array2<f32>, top_k: usize) -> Vec<usize> {
         // The base impl runs a BLAS gemm against the disk-side gate
         // matrix and ignores the patch overlay — so any feature with

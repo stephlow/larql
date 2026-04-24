@@ -150,7 +150,7 @@ fn run_larql(
             "larql bench currently requires a Q4K vindex (got {:?})", cfg.quant,
         ).into());
     }
-    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
+    let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)?;
     let token_ids: Vec<u32> = larql_inference::encode_prompt(
         &tokenizer, &*weights.arch, args.prompt.as_str(),
@@ -171,19 +171,21 @@ fn run_larql(
     // include this one-time allocation cost even though it is amortized to zero
     // in real multi-turn usage.
     if metal {
+        let num_layers = weights.num_layers;
         let _ = generate(
-            &weights, &tokenizer, &token_ids,
+            &mut weights, &tokenizer, &token_ids,
             1, &q4_index, &*backend,
-            &cached_layers, 0..weights.num_layers,
+            &cached_layers, 0..num_layers,
         );
     }
 
     let max_tokens = args.warmup + args.tokens;
+    let num_layers = weights.num_layers;
     let t0 = Instant::now();
     let result = generate(
-        &weights, &tokenizer, &token_ids,
+        &mut weights, &tokenizer, &token_ids,
         max_tokens, &q4_index, &*backend,
-        &cached_layers, 0..weights.num_layers,
+        &cached_layers, 0..num_layers,
     );
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 

@@ -200,21 +200,14 @@ fn bench_save_load(c: &mut Criterion) {
         version: 2,
         model: "bench-load".into(),
         family: "bench".into(),
-        source: None,
-        checksums: None,
         num_layers,
         hidden_size: hidden,
         intermediate_size: features,
         vocab_size: 100,
         embed_scale: 1.0,
-        extract_level: larql_vindex::ExtractLevel::Browse,
-        dtype: larql_vindex::StorageDtype::F32,
-        quant: larql_vindex::QuantFormat::None,
-        layer_bands: None,
         layers: layer_infos,
         down_top_k: 5,
-        has_model_weights: false,
-        model_config: None,
+        ..Default::default()
     };
     VectorIndex::save_config(&config, &load_dir).unwrap();
     let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;

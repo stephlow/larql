@@ -106,6 +106,13 @@ impl InferenceModel {
         &self.weights
     }
 
+    /// Mutable accessor — needed by the generate() entry point so the CPU
+    /// fallback can dequantise per-layer Q4K tensors into `weights.tensors`.
+    /// Metal-only callers can continue to use the shared `weights()`.
+    pub fn weights_mut(&mut self) -> &mut ModelWeights {
+        &mut self.weights
+    }
+
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
     }

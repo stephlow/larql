@@ -104,7 +104,7 @@ pub fn precompute_per_layer_inputs(
 ///   contribution = gated @ projection.T   → [seq, hidden]
 ///   normed = RMSNorm(contribution)
 ///   h = h + normed
-pub(super) fn apply_per_layer_embedding(
+pub(crate) fn apply_per_layer_embedding(
     weights: &ModelWeights,
     h: &Array2<f32>,
     layer: usize,

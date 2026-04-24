@@ -409,23 +409,21 @@ impl<'a> WalkFfn<'a> {
             for (feat, gate_score) in hits {
                 let act = if is_gated {
                     // Up source: INSERT override (rare) > native mmap row >
-                    // Q4K per-row NEON decode. The `layer_has_overrides`
-                    // early-out skips the HashMap lookup on clean layers.
+                    // unified `ffn_row_dot` (FP4 → Q4K, dispatched by the
+                    // GateIndex trait). Per-layer `up_native` is hoisted
+                    // out of the feature loop above so the native-f32 hot
+                    // path stays a single row view + BLAS dot — the
+                    // unified fallback only fires when no native mmap is
+                    // attached (FP4 or Q4K-only vindexes).
                     let up_ov = if layer_has_overrides {
                         self.index.up_override(layer, feat)
                     } else { None };
-                    let up_score = if let Some(up_ov) = up_ov {
-                        if up_ov.len() == hidden {
-                            ndarray::ArrayView1::from(up_ov).dot(&x_row)
-                        } else if let Some(ref up_view) = up_native {
-                            up_view.row(feat).dot(&x_row)
-                        } else {
-                            self.index.q4k_ffn_row_dot(layer, 1, feat, x_slice)?
-                        }
+                    let up_score = if let Some(up_ov) = up_ov.filter(|o| o.len() == hidden) {
+                        ndarray::ArrayView1::from(up_ov).dot(&x_row)
                     } else if let Some(ref up_view) = up_native {
                         up_view.row(feat).dot(&x_row)
                     } else {
-                        self.index.q4k_ffn_row_dot(layer, 1, feat, x_slice)?
+                        self.index.ffn_row_dot(layer, 1, feat, x_slice)?
                     };
                     let activated_gate = if use_gelu {
                         crate::ffn::gelu_tanh(gate_score)
@@ -444,26 +442,21 @@ impl<'a> WalkFfn<'a> {
                 full_activation[[s, feat]] = act;
 
                 if act.abs() > 1e-10 {
-                    // Down: INSERT override (rare) > native mmap > Q4K cache.
+                    // Down: INSERT override (rare) > native mmap row >
+                    // unified `ffn_row_scaled_add` (FP4 → Q4K-via-cache,
+                    // dispatched by the GateIndex trait).
                     let down_ov = if layer_has_overrides {
                         self.index.down_override(layer, feat)
                     } else { None };
-                    if let Some(override_down) = down_ov {
-                        if override_down.len() == hidden {
-                            out_row.scaled_add(act, &ndarray::ArrayView1::from(override_down));
-                            continue;
-                        }
+                    if let Some(override_down) = down_ov.filter(|o| o.len() == hidden) {
+                        out_row.scaled_add(act, &ndarray::ArrayView1::from(override_down));
+                        continue;
                     }
                     if let Some(ref down_view) = down_native {
                         out_row.scaled_add(act, &down_view.row(feat));
                     } else {
-                        // Serial sparse fallback hits Q4K row-scaled-add
-                        // against the transposed cache — populates it on
-                        // demand; sized ~intermediate×hidden per layer.
                         let out_slice = out_row.as_slice_mut().unwrap();
-                        if !self.index.q4k_ffn_row_scaled_add_via_cache(
-                            layer, 2, feat, act, out_slice,
-                        ) {
+                        if !self.index.ffn_row_scaled_add(layer, 2, feat, act, out_slice) {
                             return None;
                         }
                     }

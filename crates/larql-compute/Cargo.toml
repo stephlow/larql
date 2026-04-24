@@ -11,6 +11,8 @@ categories = ["science"]
 [dependencies]
 # Matrix types
 ndarray = { version = "0.16", features = ["blas"] }
+# MoE expert parallelism: top-k experts run independently per token.
+rayon = "1.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }

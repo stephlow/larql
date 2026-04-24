@@ -33,6 +33,13 @@ rayon = "1.10"
 # Tokenizer
 tokenizers = "0.21"
 
+# Chat-template rendering (HF `tokenizer_config.json::chat_template` is Jinja).
+# `minijinja-contrib` ships `pycompat::unknown_method_callback` which gives us
+# Python-style method calls (`.get()`, `.items()`, `.startswith()`, …) that
+# Gemma 4 / Qwen / Llama-3 chat templates rely on.
+minijinja = { version = "2", features = ["loader"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
 # Remote FFN backend (RemoteWalkBackend → POST /v1/walk-ffn)
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 

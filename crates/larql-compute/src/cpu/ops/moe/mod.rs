@@ -14,6 +14,7 @@
 mod math;
 mod expert;
 mod forward;
+mod cache;
 
 pub use expert::{run_single_expert, run_single_expert_with_norm};
 pub use forward::cpu_moe_forward;

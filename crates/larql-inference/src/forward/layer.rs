@@ -110,11 +110,16 @@ pub fn run_ffn(
 }
 
 /// Apply per-layer scalar multiplier if present (e.g., Gemma 4 layer_scalar).
-pub(super) fn apply_layer_scalar(weights: &ModelWeights, h: &mut Array2<f32>, layer: usize) {
+///
+/// Skip when the scalar is 0.0 (absent / unloaded — multiplying would zero the
+/// layer output, collapsing generation) or 1.0 (identity). Matches the Metal
+/// `apply_whole_layer_scalar` in `metal/decode/moe_combine.rs:88-94` so the
+/// CPU MoE path produces the same residual as the GPU path.
+pub(crate) fn apply_layer_scalar(weights: &ModelWeights, h: &mut Array2<f32>, layer: usize) {
     if let Some(key) = weights.arch.layer_scalar_key(layer) {
         if let Some(scalars) = weights.vectors.get(&key) {
             if let Some(&scalar) = scalars.first() {
-                if scalar != 1.0 {
+                if scalar != 0.0 && scalar != 1.0 {
                     *h *= scalar;
                 }
             }
@@ -144,6 +149,17 @@ pub fn run_layer_with_ffn(
         let (h_pa, kv) = run_attention_with_kv_cache(weights, h, layer)?;
         (h_pa, Some(kv))
     };
+    // Diagnostic: per-layer `h_post_attn` dump, paired with Metal's
+    // `metal_layer_{LL}_h_post_attn.f32`. Lets the `residual_diff` tool
+    // bisect any layer's drift into attention (compare h_post_attn) vs
+    // FFN+PLE+scalar (compare h_out minus h_post_attn). Gated on the
+    // same env var as the end-of-layer dump; no overhead when unset.
+    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+        let slice = h_post_attn.as_slice().unwrap_or(&[]);
+        let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
+        let _ = std::fs::write(&path, &bytes);
+    }
     let (h_post_ffn, activation) = run_ffn(weights, &h_post_attn, layer, ffn, capture_activation);
     let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
     apply_layer_scalar(weights, &mut h_out, layer);

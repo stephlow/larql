@@ -4,7 +4,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Metadata stored in index.json inside a .vindex directory.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// All fields implement `Default`. Prefer
+/// `VindexConfig { version: 2, model: "...".into(), ..Default::default() }`
+/// over listing every field explicitly — optional additions (like `fp4`)
+/// don't then propagate to every construction site.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct VindexConfig {
     /// Format version.
     pub version: u32,
@@ -54,6 +59,14 @@ pub struct VindexConfig {
     /// Model config for architecture reconstruction.
     #[serde(default)]
     pub model_config: Option<VindexModelConfig>,
+    /// Optional FP4/FP8 block-storage manifest. Set when one or more FFN
+    /// projections are stored in the block-quantised format described
+    /// in `docs/specs/vindex-format-spec.md` §5.10 and
+    /// `experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md`.
+    /// Absent or null → legacy f16/f32 projection files are
+    /// authoritative and loaders use the legacy codepath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp4: Option<Fp4Config>,
 }
 
 /// Provenance: which model checkpoint this vindex was built from.
@@ -153,6 +166,132 @@ impl std::fmt::Display for QuantFormat {
             Self::None => write!(f, "none"),
             Self::Q4k => write!(f, "q4k"),
         }
+    }
+}
+
+/// Per-projection storage precision tag for FP4 vindexes.
+///
+/// Legal values for `Fp4Config.projections.{gate,up,down}.precision`.
+/// Readers MUST dispatch on this tag and MUST NOT sniff filenames.
+/// Unrecognised values should produce an explicit error rather than
+/// silently downgrade — future tags (e.g. `fp6`, `nf4`) will require
+/// a code-path addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Precision {
+    /// FP4 E2M1 values + FP8 E4M3 sub-block scales + FP8 E4M3 block scale.
+    Fp4,
+    /// FP8 E4M3 values + FP8 E4M3 block scale. No sub-block scales.
+    Fp8,
+    /// Legacy IEEE half-precision. Uses the non-suffixed filename.
+    F16,
+    /// Legacy f32. Uses the non-suffixed filename.
+    F32,
+}
+
+impl std::fmt::Display for Precision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fp4 => write!(f, "fp4"),
+            Self::Fp8 => write!(f, "fp8"),
+            Self::F16 => write!(f, "f16"),
+            Self::F32 => write!(f, "f32"),
+        }
+    }
+}
+
+/// One projection's storage descriptor in the FP4 manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectionFormat {
+    pub precision: Precision,
+    /// Filename relative to the vindex directory. Readers open this
+    /// file directly. Must be the legacy name (e.g. `gate_vectors.bin`)
+    /// when `precision` is `f16`/`f32`, and the suffixed name (e.g.
+    /// `gate_vectors_fp4.bin`) when `precision` is `fp4`/`fp8`.
+    pub file: String,
+}
+
+/// The three FFN projection tags covered by FP4 storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Projections {
+    pub gate: ProjectionFormat,
+    pub up: ProjectionFormat,
+    pub down: ProjectionFormat,
+}
+
+/// Self-policing gate applied at extract time. When a projection's Q1
+/// compliance falls below `min_compliant_fraction` at `threshold_ratio`,
+/// the extractor downgrades that projection to `fallback_precision`
+/// rather than committing a vindex that silently violates the contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceGate {
+    pub threshold_ratio: f32,
+    pub min_compliant_fraction: f32,
+    pub fallback_precision: Precision,
+}
+
+/// FP4 vindex manifest — the inline block that lives under `index.json.fp4`
+/// when any FFN projection is stored in FP4 or FP8.
+///
+/// `fp4_format_version` is independent of `VindexConfig.version`. It
+/// bumps only when the on-disk byte layout of blocks themselves
+/// changes; schema additions (new precision tags, new optional fields)
+/// are non-breaking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fp4Config {
+    pub fp4_format_version: u32,
+    /// Elements per FP4/FP8 block. v1 pins this at 256 (the largest
+    /// size that divides every model family LARQL currently ships).
+    pub block_elements: u32,
+    /// Elements per sub-block. v1 pins this at 32 (matches OCP MXFP4).
+    pub sub_block_elements: u32,
+    /// Scale dtype for the 8 per-sub-block scales inside each FP4 block.
+    /// v1: `"fp8_e4m3"`.
+    pub sub_block_scale_dtype: String,
+    /// Scale dtype for the per-block scale (both FP4 and FP8 blocks).
+    /// v1: `"fp8_e4m3"`.
+    pub block_scale_dtype: String,
+    /// Encoding identifier for the FP4 4-bit values themselves.
+    /// v1: `"fp4_e2m1_mxfp4_nibble_order"`.
+    pub value_encoding: String,
+    /// Per-projection precision + filename.
+    pub projections: Projections,
+    /// Compliance policy applied by the extractor.
+    pub compliance_gate: ComplianceGate,
+    /// Filename of the compliance sidecar (relative to vindex dir).
+    /// v1 default: `"fp4_compliance.json"`.
+    pub compliance_report: String,
+}
+
+impl Fp4Config {
+    /// The v1 default: 256-element blocks, 32-element sub-blocks,
+    /// FP4 E2M1 values with FP8 E4M3 two-level scales, MXFP4 nibble order.
+    /// `projections` is filled by the caller.
+    pub fn v1_defaults(projections: Projections) -> Self {
+        Self {
+            fp4_format_version: 1,
+            block_elements: 256,
+            sub_block_elements: 32,
+            sub_block_scale_dtype: "fp8_e4m3".into(),
+            block_scale_dtype: "fp8_e4m3".into(),
+            value_encoding: "fp4_e2m1_mxfp4_nibble_order".into(),
+            projections,
+            compliance_gate: ComplianceGate {
+                threshold_ratio: 16.0,
+                min_compliant_fraction: 0.99,
+                fallback_precision: Precision::Fp8,
+            },
+            compliance_report: "fp4_compliance.json".into(),
+        }
+    }
+
+    /// Option B default: FP4 gate + FP4 up + FP8 down.
+    pub fn option_b_default() -> Self {
+        Self::v1_defaults(Projections {
+            gate: ProjectionFormat { precision: Precision::Fp4, file: "gate_vectors_fp4.bin".into() },
+            up:   ProjectionFormat { precision: Precision::Fp4, file: "up_features_fp4.bin".into() },
+            down: ProjectionFormat { precision: Precision::Fp8, file: "down_features_fp8.bin".into() },
+        })
     }
 }
 
@@ -333,7 +472,7 @@ fn default_router_type() -> String {
 }
 
 /// Per-layer info for gate_vectors.bin layout.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct VindexLayerInfo {
     pub layer: usize,
     pub num_features: usize,
@@ -374,4 +513,112 @@ pub struct DownMetaTopK {
     pub token_id: u32,
     #[serde(rename = "s")]
     pub logit: f32,
+}
+
+#[cfg(test)]
+mod fp4_schema_tests {
+    use super::*;
+
+    #[test]
+    fn option_b_default_shape() {
+        let cfg = Fp4Config::option_b_default();
+        assert_eq!(cfg.fp4_format_version, 1);
+        assert_eq!(cfg.block_elements, 256);
+        assert_eq!(cfg.sub_block_elements, 32);
+        assert_eq!(cfg.sub_block_scale_dtype, "fp8_e4m3");
+        assert_eq!(cfg.block_scale_dtype, "fp8_e4m3");
+        assert_eq!(cfg.value_encoding, "fp4_e2m1_mxfp4_nibble_order");
+        assert!(matches!(cfg.projections.gate.precision, Precision::Fp4));
+        assert!(matches!(cfg.projections.up.precision, Precision::Fp4));
+        assert!(matches!(cfg.projections.down.precision, Precision::Fp8));
+        assert_eq!(cfg.projections.gate.file, "gate_vectors_fp4.bin");
+        assert_eq!(cfg.projections.down.file, "down_features_fp8.bin");
+        assert_eq!(cfg.compliance_gate.threshold_ratio, 16.0);
+        assert_eq!(cfg.compliance_gate.min_compliant_fraction, 0.99);
+        assert!(matches!(cfg.compliance_gate.fallback_precision, Precision::Fp8));
+        assert_eq!(cfg.compliance_report, "fp4_compliance.json");
+    }
+
+    #[test]
+    fn fp4_config_serde_round_trip() {
+        let cfg = Fp4Config::option_b_default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Fp4Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.fp4_format_version, cfg.fp4_format_version);
+        assert_eq!(back.block_elements, cfg.block_elements);
+        assert_eq!(back.projections.gate.file, cfg.projections.gate.file);
+    }
+
+    #[test]
+    fn precision_json_is_snake_case() {
+        let cfg = Fp4Config::option_b_default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        // The JSON surface must use the stable tags the format spec pins.
+        assert!(json.contains("\"fp4\""));
+        assert!(json.contains("\"fp8\""));
+        assert!(!json.contains("\"Fp4\""), "camel/title case leaked: {json}");
+    }
+
+    #[test]
+    fn vindex_config_without_fp4_serialises_without_key() {
+        // Verify the `skip_serializing_if = "Option::is_none"` path so a
+        // legacy vindex's index.json is byte-stable after a round trip.
+        let cfg = VindexConfig {
+            version: 2,
+            model: "x".into(),
+            family: "gemma3".into(),
+            source: None,
+            checksums: None,
+            num_layers: 1,
+            hidden_size: 256,
+            intermediate_size: 1024,
+            vocab_size: 32,
+            embed_scale: 1.0,
+            extract_level: ExtractLevel::default(),
+            dtype: Default::default(),
+            quant: QuantFormat::None,
+            layer_bands: None,
+            layers: vec![],
+            down_top_k: 10,
+            has_model_weights: false,
+            model_config: None,
+            fp4: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("\"fp4\""), "legacy config leaked fp4 field: {json}");
+
+        // And still deserialises when the key is absent (default).
+        let parsed: VindexConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.fp4.is_none());
+    }
+
+    #[test]
+    fn vindex_config_with_fp4_round_trips() {
+        let cfg = VindexConfig {
+            version: 2,
+            model: "x".into(),
+            family: "gemma3".into(),
+            source: None,
+            checksums: None,
+            num_layers: 1,
+            hidden_size: 256,
+            intermediate_size: 1024,
+            vocab_size: 32,
+            embed_scale: 1.0,
+            extract_level: ExtractLevel::default(),
+            dtype: Default::default(),
+            quant: QuantFormat::None,
+            layer_bands: None,
+            layers: vec![],
+            down_top_k: 10,
+            has_model_weights: false,
+            model_config: None,
+            fp4: Some(Fp4Config::option_b_default()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"fp4\""));
+        let parsed: VindexConfig = serde_json::from_str(&json).unwrap();
+        let fp4 = parsed.fp4.expect("round trip kept fp4");
+        assert!(matches!(fp4.projections.down.precision, Precision::Fp8));
+    }
 }

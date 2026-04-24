@@ -117,6 +117,217 @@ pub trait GateIndex: Send + Sync {
         false
     }
 
+    // ── FP4 / FP8 FFN storage (exp 26) ─────────────────────────────────────
+    //
+    // These mirror the `q4k_ffn_row_*` family for the FP4 block format. All
+    // default to "no data" so overlays / GateIndex impls that don't carry
+    // FP4 storage work unchanged.
+
+    /// Whether this index has FP4/FP8 FFN storage attached.
+    fn has_fp4_storage(&self) -> bool { false }
+
+    /// FP4/FP8 fused dequant + dot. `component`: 0=gate, 1=up, 2=down.
+    fn fp4_ffn_row_dot(&self, _layer: usize, _component: usize, _feat: usize, _x: &[f32]) -> Option<f32> {
+        None
+    }
+
+    /// FP4/FP8 fused dequant + scaled-add: `out += alpha * dequant(row)`.
+    fn fp4_ffn_row_scaled_add(&self, _layer: usize, _component: usize, _feat: usize, _alpha: f32, _out: &mut [f32]) -> bool {
+        false
+    }
+
+    /// FP4/FP8 dequantise one row into `out`.
+    fn fp4_ffn_row_into(&self, _layer: usize, _component: usize, _feat: usize, _out: &mut [f32]) -> bool {
+        false
+    }
+
+    // ── Unified FFN row access ─────────────────────────────────────────────
+    //
+    // One entry point per operation; the walk kernel calls these and
+    // doesn't have to care about storage format. Default impls below
+    // dispatch through the priority chain:
+    //   1. FP4/FP8 (exp 26) — tried first when `has_fp4_storage()` is true
+    //   2. Native f32 mmap  — interleaved / up_features / down_features
+    //   3. Q4K interleaved  — `q4k_ffn_row_*` with via-cache for down
+    //
+    // Each step returns early on success. If every backend declines,
+    // returns `None` / `false`.
+    //
+    // Overriding these in a concrete impl is rarely correct — the default
+    // logic is the contract. Override the *specific* backend methods
+    // (`fp4_ffn_row_dot`, `q4k_ffn_row_dot`, etc.) instead.
+
+    /// Unified fused dequant + dot. `component`: 0=gate, 1=up, 2=down.
+    /// Returns the dot product `row(layer, component, feat) · x` from
+    /// whichever backend is loaded, or `None` if no backend covers this
+    /// coordinate.
+    fn ffn_row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+        // 1. FP4/FP8 backend (if loaded). fp4_ffn_row_dot returns None
+        //    when the projection's precision tag is f16/f32 (caller
+        //    falls through to native).
+        if self.has_fp4_storage() {
+            if let Some(dot) = self.fp4_ffn_row_dot(layer, component, feat, x) {
+                return Some(dot);
+            }
+        }
+        // 2. Native f32 mmap.
+        let x_view = ndarray::ArrayView1::from(x);
+        match component {
+            0 => {
+                if let Some(m) = self.interleaved_gate(layer) {
+                    if feat < m.nrows() && m.ncols() == x.len() {
+                        return Some(m.row(feat).dot(&x_view));
+                    }
+                }
+            }
+            1 => {
+                if let Some(m) = self.interleaved_up(layer) {
+                    if feat < m.nrows() && m.ncols() == x.len() {
+                        return Some(m.row(feat).dot(&x_view));
+                    }
+                }
+                if let Some(m) = self.up_layer_matrix(layer) {
+                    if feat < m.nrows() && m.ncols() == x.len() {
+                        return Some(m.row(feat).dot(&x_view));
+                    }
+                }
+            }
+            2 => {
+                if let Some(row) = self.down_feature_vector(layer, feat) {
+                    if row.len() == x.len() {
+                        return Some(ndarray::ArrayView1::from(row).dot(&x_view));
+                    }
+                }
+                if let Some(m) = self.interleaved_down(layer) {
+                    if feat < m.nrows() && m.ncols() == x.len() {
+                        return Some(m.row(feat).dot(&x_view));
+                    }
+                }
+                if let Some(m) = self.down_layer_matrix(layer) {
+                    if feat < m.nrows() && m.ncols() == x.len() {
+                        return Some(m.row(feat).dot(&x_view));
+                    }
+                }
+            }
+            _ => {}
+        }
+        // 3. Q4K fallback.
+        if self.has_interleaved_q4k() {
+            return self.q4k_ffn_row_dot(layer, component, feat, x);
+        }
+        None
+    }
+
+    /// Unified fused dequant + scaled-add: `out[i] += alpha * row[i]`.
+    /// Returns `true` on success, `false` if no backend covers the
+    /// coordinate (or shapes don't match).
+    fn ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        if self.has_fp4_storage()
+            && self.fp4_ffn_row_scaled_add(layer, component, feat, alpha, out) {
+            return true;
+        }
+        let mut out_view = ndarray::ArrayViewMut1::from(&mut out[..]);
+        match component {
+            0 => {
+                if let Some(m) = self.interleaved_gate(layer) {
+                    if feat < m.nrows() && m.ncols() == out_view.len() {
+                        out_view.scaled_add(alpha, &m.row(feat));
+                        return true;
+                    }
+                }
+            }
+            1 => {
+                if let Some(m) = self.interleaved_up(layer) {
+                    if feat < m.nrows() && m.ncols() == out_view.len() {
+                        out_view.scaled_add(alpha, &m.row(feat));
+                        return true;
+                    }
+                }
+                if let Some(m) = self.up_layer_matrix(layer) {
+                    if feat < m.nrows() && m.ncols() == out_view.len() {
+                        out_view.scaled_add(alpha, &m.row(feat));
+                        return true;
+                    }
+                }
+            }
+            2 => {
+                if let Some(row) = self.down_feature_vector(layer, feat) {
+                    if row.len() == out_view.len() {
+                        out_view.scaled_add(alpha, &ndarray::ArrayView1::from(row));
+                        return true;
+                    }
+                }
+                if let Some(m) = self.interleaved_down(layer) {
+                    if feat < m.nrows() && m.ncols() == out_view.len() {
+                        out_view.scaled_add(alpha, &m.row(feat));
+                        return true;
+                    }
+                }
+                if let Some(m) = self.down_layer_matrix(layer) {
+                    if feat < m.nrows() && m.ncols() == out_view.len() {
+                        out_view.scaled_add(alpha, &m.row(feat));
+                        return true;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        if self.has_interleaved_q4k() {
+            // Q4K down is stored transposed — per-row decode reads
+            // hidden-dim rows, not feature vectors. Use the cached
+            // whole-layer decode path for down; direct row decode for gate/up.
+            if component == 2 {
+                return self.q4k_ffn_row_scaled_add_via_cache(layer, component, feat, alpha, out);
+            }
+            return self.q4k_ffn_row_scaled_add(layer, component, feat, alpha, out);
+        }
+        false
+    }
+
+    /// Unified decode-into-buffer. `out.len()` must equal the row width.
+    fn ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
+        if self.has_fp4_storage()
+            && self.fp4_ffn_row_into(layer, component, feat, out) {
+            return true;
+        }
+        let copy_row = |row: ndarray::ArrayView1<'_, f32>, out: &mut [f32]| -> bool {
+            if row.len() != out.len() { return false; }
+            for (i, &v) in row.iter().enumerate() { out[i] = v; }
+            true
+        };
+        match component {
+            0 => {
+                if let Some(m) = self.interleaved_gate(layer) {
+                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                }
+            }
+            1 => {
+                if let Some(m) = self.interleaved_up(layer) {
+                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                }
+                if let Some(m) = self.up_layer_matrix(layer) {
+                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                }
+            }
+            2 => {
+                if let Some(row) = self.down_feature_vector(layer, feat) {
+                    return copy_row(ndarray::ArrayView1::from(row), out);
+                }
+                if let Some(m) = self.interleaved_down(layer) {
+                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                }
+                if let Some(m) = self.down_layer_matrix(layer) {
+                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                }
+            }
+            _ => return false,
+        }
+        if self.has_interleaved_q4k() {
+            return self.q4k_ffn_row_into(layer, component, feat, out);
+        }
+        false
+    }
+
     /// Direct Q4K/Q6K matmul — `Y = X @ W.T` against the layer's Q4K bytes.
     /// See `VectorIndex::q4k_matmul_transb`. `x` is `[x_rows, w_cols]`.
     /// `backend` (when provided) routes through Metal/CPU-SIMD kernels.

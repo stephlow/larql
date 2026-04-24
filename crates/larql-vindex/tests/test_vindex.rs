@@ -399,7 +399,7 @@ fn save_and_load_down_meta_round_trip() {
         dtype: larql_vindex::StorageDtype::F32,
         quant: larql_vindex::QuantFormat::None,
         layer_bands: None,
-        model_config: None,
+        model_config: None, fp4: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -481,7 +481,7 @@ fn save_config_round_trip() {
         dtype: larql_vindex::StorageDtype::F32,
         quant: larql_vindex::QuantFormat::None,
         layer_bands: None,
-        model_config: None,
+        model_config: None, fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -762,6 +762,7 @@ fn v2_config_full_round_trip() {
             rope_local_base: None, query_pre_attn_scalar: None,
             final_logit_softcapping: None,
         }),
+        fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -842,6 +843,7 @@ fn v2_config_with_moe() {
             rope_local_base: None, query_pre_attn_scalar: None,
             final_logit_softcapping: None,
         }),
+        fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -968,6 +970,7 @@ fn moe_layer_info_round_trip() {
             rope_local_base: None, query_pre_attn_scalar: None,
             final_logit_softcapping: None,
         }),
+        fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1014,7 +1017,7 @@ fn layer_bands_config_round_trip() {
             knowledge: (14, 27),
             output: (28, 33),
         }),
-        model_config: None,
+        model_config: None, fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1163,7 +1166,7 @@ fn source_provenance_round_trip() {
         layers: vec![],
         down_top_k: 10,
         has_model_weights: true,
-        model_config: None,
+        model_config: None, fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1422,7 +1425,7 @@ fn weight_manifest_round_trip() {
         layers: vec![],
         down_top_k: 1,
         has_model_weights: false,
-        model_config: None,
+        model_config: None, fp4: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -1461,7 +1464,7 @@ fn dtype_config_f16_round_trip() {
         layers: vec![],
         down_top_k: 10,
         has_model_weights: false,
-        model_config: None,
+        model_config: None, fp4: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1655,7 +1658,7 @@ fn full_lifecycle_build_query_mutate_save_reload() {
         dtype: larql_vindex::StorageDtype::F32,
         quant: larql_vindex::QuantFormat::None,
         layer_bands: None, layers: layer_infos, down_top_k: 1,
-        has_model_weights: false, model_config: None,
+        has_model_weights: false, model_config: None, fp4: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -2202,7 +2205,7 @@ fn vindexfile_parse_and_build() {
         layer_bands: None,
         layers: vec![],
         down_top_k: 5,
-        model_config: None,
+        model_config: None, fp4: None,
     };
     index.save_vindex(&base_dir, &mut config).unwrap();
 

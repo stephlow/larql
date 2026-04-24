@@ -163,7 +163,7 @@ where
 /// plus timing (prefill_ms, per_token_ms).
 #[allow(clippy::too_many_arguments)]
 pub fn generate(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
     max_tokens: usize,
@@ -172,6 +172,14 @@ pub fn generate(
     cached_layers: &CachedLayerGraph,
     layer_range: std::ops::Range<usize>,
 ) -> GenerateResult {
+    // Backends that don't implement the fused Q4 prefill (today: CpuBackend)
+    // delegate to the CPU Q4K per-layer dequant path. It mutates `weights.tensors`
+    // per layer and needs &mut; this is the sole reason `generate` itself takes
+    // &mut. Metal backends pass straight through and never touch the map here.
+    if !backend_supports_fused_q4_pipeline(backend) {
+        return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index);
+    }
+
     let norm_offset = weights.arch.norm_weight_offset();
     let arch = &*weights.arch;
     let hidden = weights.hidden_size;
@@ -250,21 +258,26 @@ pub fn generate(
     let softcap_val = arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
-    let h_vec = backend.prefill_q4(
+    let h_vec = match backend.prefill_q4(
         &layers, &x, hidden, intermediate, q_dim, kv_dim,
         seq_len, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
         rope, qk_norm_val, softcap_val,
-    ).unwrap_or_else(|| {
-        let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
-        let mut h = h_embed.clone();
-        for layer in 0..num_layers {
-            let (h_post_attn, _, _) =
-                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None).unwrap();
-            let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
-            h = h_out;
+    ) {
+        Some(v) => v,
+        None => {
+            // GPU prefill on a backend that claimed `backend_supports_fused_q4_pipeline`
+            // returned None. CPU backends are intercepted at the top of this
+            // function; a None here is a GPU-side failure, so return empty
+            // rather than fall through to a dense-tensor path that doesn't
+            // exist for Q4K vindexes.
+            return GenerateResult {
+                tokens: Vec::new(),
+                prefill_ms: 0.0,
+                decode_ms: Vec::new(),
+                stage_timings: StageTimings::default(),
+            };
         }
-        h.as_slice().unwrap_or(&[]).to_vec()
-    });
+    };
 
     let h_metal = ndarray::Array2::from_shape_vec((seq_len, hidden), h_vec.clone())
         .unwrap_or_else(|_| h_embed.clone());
@@ -308,14 +321,16 @@ pub fn generate(
 
     let first_hits = lm_head_topk(index, weights, &h_1d, 5, backend);
     if let Some(&(tid, score)) = first_hits.first() {
-        let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default().trim().to_string();
+        // Keep the raw token text (with leading spaces); trimming here
+        // caused multi-token outputs like " Paris", " and", " it" to
+        // concatenate into "Parisandit" in `GenerateResult::text()`.
+        let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
         let prob = super::logits::softmax_prob(score, &first_hits, weights.arch.logits_scaling(), weights.arch.final_logit_softcapping());
         tokens.push((tok_str, prob));
     }
 
     // ── Phase 2: GPU decode loop ──
     let mut current_token_id = first_hits.first().map(|&(tid, _)| tid).unwrap_or(0);
-    let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
 
     // Per-stage decode profiling. Set LARQL_PROFILE_DECODE=1 to log a
     // one-line per-step breakdown of embed / GPU forward / final norm /
@@ -400,10 +415,13 @@ pub fn generate(
 
             if let Some(&(tid, score)) = hits.first() {
                 let t4 = std::time::Instant::now();
-                let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default().trim().to_string();
+                // Preserve raw token text so GenerateResult::text() reads
+                // naturally; trim only for EOS marker matching.
+                let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
                 let detok_ms = t4.elapsed().as_secs_f64() * 1000.0;
                 let prob = super::logits::softmax_prob(score, &hits, weights.arch.logits_scaling(), weights.arch.final_logit_softcapping());
-                let is_eos = tok_str == "<eos>" || tok_str == "</s>" || tok_str == "<|endoftext|>";
+                let tok_trimmed = tok_str.trim();
+                let is_eos = tok_trimmed == "<eos>" || tok_trimmed == "</s>" || tok_trimmed == "<|endoftext|>";
                 if profile {
                     eprintln!(
                         "[profile] step={} total={:.1}ms  embed={:.2}  gpu={:.1}  norm={:.2}  lm_head={:.1}  detok={:.2}",
@@ -420,34 +438,16 @@ pub fn generate(
                 break;
             }
         } else {
-            // GPU failed — CPU fallback
+            // GPU returned None mid-decode. The generate() function routes
+            // non-fused-Q4 backends (today: CPU) to a full CPU Q4K path at
+            // the top, so this branch can only fire when a GPU backend that
+            // passed `backend_supports_fused_q4_pipeline` subsequently fails
+            // a single decode step. Treat as early-stop rather than re-run
+            // the O(N²) CPU path mid-loop without a kept id list.
             if profile {
-                eprintln!("[profile] step={} — GPU returned None, CPU fallback", _step);
+                eprintln!("[profile] step={} — GPU decode returned None; stopping generation", _step);
             }
-            let mut h_dec = h_tok;
-            for layer in 0..num_layers {
-                let (h_post_attn, _, _) =
-                    crate::attention::run_attention_block_gpu(weights, &h_dec, layer, false, None).unwrap();
-                let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
-                h_dec = h_out;
-            }
-            let h_final = crate::forward::apply_norm(weights, &h_dec, weights.arch.final_norm_key(), norm_offset);
-            let h_1d = h_final.row(0).to_owned();
-            let hits = lm_head_topk(index, weights, &h_1d, 5, backend);
-            let step_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-            decode_ms.push(step_ms);
-            if let Some(&(tid, score)) = hits.first() {
-                let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default().trim().to_string();
-                let prob = super::logits::softmax_prob(score, &hits, weights.arch.logits_scaling(), weights.arch.final_logit_softcapping());
-                let is_eos = tok_str == "<eos>" || tok_str == "</s>" || tok_str == "<|endoftext|>";
-                // CPU-fallback path: the full decode is attributed to `gpu_ms_total`
-                // for lack of a better bucket — consumers interpret it as "forward
-                // work" regardless of which backend ran it.
-                t_gpu += step_ms;
-                tokens.push((tok_str, prob));
-                current_token_id = tid;
-                if is_eos { break; }
-            } else { break; }
+            break;
         }
     }
 
@@ -496,7 +496,7 @@ pub fn generate(
 /// Stops on EOS / common end-of-turn markers or when `max_tokens` is hit.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_constrained<M>(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
     max_tokens: usize,
@@ -509,6 +509,12 @@ pub fn generate_constrained<M>(
 where
     M: FnMut(&[u32], &mut Vec<f32>),
 {
+    if !backend_supports_fused_q4_pipeline(backend) {
+        return generate_constrained_via_cpu_q4k(
+            weights, tokenizer, token_ids, max_tokens, index, mask_fn,
+        );
+    }
+
     let arch = &*weights.arch;
     let norm_offset = arch.norm_weight_offset();
     let hidden = weights.hidden_size;
@@ -579,22 +585,24 @@ where
     let softcap_val = arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
-    let h_vec = backend.prefill_q4(
+    // Constrained-path prefill: CPU-only backends delegate at the top of the
+    // function, so `prefill_q4` should succeed. If it returns None, bail out
+    // with no tokens rather than taking the removed dense-tensor panic path.
+    let h_vec = match backend.prefill_q4(
         &layers, &x, hidden, intermediate, q_dim, kv_dim,
         seq_len, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
         rope, qk_norm_val, softcap_val,
-    ).unwrap_or_else(|| {
-        // CPU fallback: same as unconstrained generate's fallback.
-        let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
-        let mut h = h_embed.clone();
-        for layer in 0..num_layers {
-            let (h_post_attn, _, _) =
-                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None).unwrap();
-            let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
-            h = h_out;
+    ) {
+        Some(v) => v,
+        None => {
+            return GenerateResult {
+                tokens: Vec::new(),
+                prefill_ms: 0.0,
+                decode_ms: Vec::new(),
+                stage_timings: StageTimings::default(),
+            };
         }
-        h.as_slice().unwrap_or(&[]).to_vec()
-    });
+    };
 
     let h_metal = ndarray::Array2::from_shape_vec((seq_len, hidden), h_vec.clone())
         .unwrap_or_else(|_| h_embed.clone());
@@ -624,8 +632,6 @@ where
         None => return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() },
     };
 
-    let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
-
     // ── Phase 2: GPU decode loop ──
     for _step in 1..max_tokens {
         let decode_start = std::time::Instant::now();
@@ -643,16 +649,10 @@ where
             let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
             h_final.row(0).to_owned()
         } else {
-            // CPU fallback for one decode step.
-            let mut h_dec = h_tok;
-            for layer in 0..num_layers {
-                let (h_post_attn, _, _) =
-                    crate::attention::run_attention_block_gpu(weights, &h_dec, layer, false, None).unwrap();
-                let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
-                h_dec = h_out;
-            }
-            let h_final = crate::forward::apply_norm(weights, &h_dec, weights.arch.final_norm_key(), norm_offset);
-            h_final.row(0).to_owned()
+            // GPU returned None mid-decode. Stop rather than re-run a long
+            // O(N²) CPU Q4K path (CPU-only backends already delegate at the
+            // top of the function, so this is reachable only via a GPU fault).
+            break;
         };
 
         let pick = pick_next_token_masked(weights, &h_1d, &generated, backend, &mut mask_fn);
@@ -731,5 +731,136 @@ impl GenerateResult {
 
     pub fn text(&self) -> String {
         self.tokens.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("")
+    }
+}
+
+// ── Backend capability probe + CPU Q4K delegation ────────────────────────────
+//
+// `generate` / `generate_constrained` assume the backend implements the fused
+// Q4 prefill + KV-cached decode pipeline (currently: Metal). Backends that
+// lack it (CpuBackend) delegate to the per-layer CPU Q4K dequant path
+// (`predict_q4k_hidden`), which mutates `weights.tensors` per layer — that's
+// the single reason these functions take `&mut ModelWeights`.
+
+/// True when the backend can handle the fused Q4 prefill + decode pipeline
+/// directly. Metal: yes. Pure CPU: no — that path produces correct forward
+/// results via the vindex Q4K dequant loop in `crate::vindex::q4k_forward`.
+fn backend_supports_fused_q4_pipeline(backend: &dyn ComputeBackend) -> bool {
+    // CpuBackend reports `has_q4() == true` (it has Q4 matvecs) but does not
+    // override `prefill_q4` — the trait default returns None. A zero-arg
+    // probe would allocate; probe the backend name instead, which is stable
+    // and cheap. Metal's CpuBackend is labelled "cpu (...)".
+    let name = backend.name();
+    !name.starts_with("cpu")
+}
+
+/// CPU Q4K generate path: loops `predict_q4k` one step at a time. O(N²) in
+/// context length (no KV cache), but correct across all supported
+/// architectures including hybrid MoE (if wired — see
+/// `crate::vindex::q4k_forward::predict_q4k_hidden`).
+fn generate_via_cpu_q4k(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+) -> GenerateResult {
+    let prefill_start = std::time::Instant::now();
+    // First-token pass covers the prompt — that's our "prefill" here.
+    let first = crate::vindex::predict_q4k(
+        weights, tokenizer, token_ids, 5, index,
+    );
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
+    let mut decode_ms = Vec::with_capacity(max_tokens);
+    let mut t_gpu = 0.0f64;
+
+    let mut ids = token_ids.to_vec();
+    // Seed with the first predicted token from the prefill pass.
+    if let (Some(&id), Some(first_pred)) = (first.token_ids.first(), first.predictions.first()) {
+        tokens.push((first_pred.0.clone(), 1.0));
+        let stop = crate::vindex::is_end_of_turn(first_pred.0.trim());
+        ids.push(id);
+        if stop {
+            return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() };
+        }
+    } else {
+        return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() };
+    }
+
+    for _step in 1..max_tokens {
+        let t0 = std::time::Instant::now();
+        let result = crate::vindex::predict_q4k(
+            weights, tokenizer, &ids, 5, index,
+        );
+        let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        decode_ms.push(step_ms);
+        t_gpu += step_ms;
+
+        match result.token_ids.first() {
+            Some(&id) => {
+                let tok = result.predictions.first().map(|p| p.0.clone()).unwrap_or_default();
+                let stop = crate::vindex::is_end_of_turn(tok.trim());
+                tokens.push((tok, 1.0));
+                ids.push(id);
+                if stop { break; }
+            }
+            None => break,
+        }
+    }
+
+    GenerateResult {
+        tokens,
+        prefill_ms,
+        decode_ms,
+        stage_timings: StageTimings {
+            embed_ms_total: 0.0,
+            gpu_ms_total: t_gpu,
+            norm_ms_total: 0.0,
+            lm_head_ms_total: 0.0,
+            detok_ms_total: 0.0,
+        },
+    }
+}
+
+/// Constrained variant of [`generate_via_cpu_q4k`]. Thin wrapper over
+/// `vindex::q4k_forward::generate_q4k_cpu_constrained` that adapts the
+/// result shape into `GenerateResult`.
+fn generate_constrained_via_cpu_q4k<M>(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    mask_fn: M,
+) -> GenerateResult
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+{
+    let prefill_start = std::time::Instant::now();
+    let out = crate::vindex::generate_q4k_cpu_constrained(
+        weights, tokenizer, token_ids, max_tokens, index, mask_fn,
+    );
+    let total_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    // Heuristic split: attribute the first token to prefill, the rest to
+    // decode. Matches the semantics of the GPU path closely enough for
+    // bench-report purposes without tracking per-step timing inside the
+    // constrained CPU loop.
+    let n = out.len();
+    let (prefill_ms, decode_ms_each) = if n == 0 {
+        (total_ms, 0.0)
+    } else {
+        let avg = total_ms / n as f64;
+        (avg, avg)
+    };
+    let tokens: Vec<(String, f64)> =
+        out.into_iter().map(|(t, _)| (t, 1.0)).collect();
+    let decode_ms = (1..tokens.len()).map(|_| decode_ms_each).collect();
+    GenerateResult {
+        tokens,
+        prefill_ms,
+        decode_ms,
+        stage_timings: StageTimings::default(),
     }
 }

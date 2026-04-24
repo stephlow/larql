@@ -343,30 +343,31 @@ mod experts {
                     let q4_index = self.q4_index.as_ref().expect("metal-q4k needs q4_index");
                     let backend = larql_compute::default_backend();
                     let cached_layers = larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
+                    let num_layers = self.weights.num_layers;
                     let result = if let Some(ops) = mask_op_names {
                         let mut mask = OpNameMask::new(ops.to_vec(), &self.tokenizer);
                         mask.set_seed_text(OP_CALL_PREFIX);
                         larql_inference::layer_graph::generate_constrained(
-                            &self.weights,
+                            &mut self.weights,
                             &self.tokenizer,
                             &token_ids,
                             max_tokens,
                             q4_index,
                             &*backend,
                             &cached_layers,
-                            0..self.weights.num_layers,
+                            0..num_layers,
                             |ids, logits| mask.apply(ids, logits),
                         )
                     } else {
                         larql_inference::layer_graph::generate(
-                            &self.weights,
+                            &mut self.weights,
                             &self.tokenizer,
                             &token_ids,
                             max_tokens,
                             q4_index,
                             &*backend,
                             &cached_layers,
-                            0..self.weights.num_layers,
+                            0..num_layers,
                         )
                     };
                     result.tokens.iter().map(|(t, _)| t.as_str()).collect()

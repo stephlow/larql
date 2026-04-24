@@ -11,20 +11,10 @@ pub(super) fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Extract one expert's weight slice from packed BF16 tensor and dequantize to f32.
-/// Packed layout: [num_experts, out_rows, in_cols] — expert `e` starts at byte
-/// `e * out_rows * in_cols * 2`.
-pub(super) fn extract_expert_weights(
-    packed: &[u8],
-    expert_idx: usize,
-    out_rows: usize,
-    in_cols: usize,
-) -> Vec<f32> {
-    let bytes_per_expert = out_rows * in_cols * 2;
-    let start = expert_idx * bytes_per_expert;
-    let end = start + bytes_per_expert;
-    bf16_to_f32(&packed[start..end])
-}
+// `extract_expert_weights` was the pre-cache code path (eager BF16→f32 on
+// every token). Replaced by `super::cache::cached_dequant` in both
+// `forward.rs` and `expert.rs` — keeping `bf16_to_f32` as the underlying
+// conversion helper, but the bulk-extract shim is no longer needed.
 
 /// RMSNorm: out[i] = x[i] / rms(x) * (w[i] + offset)
 pub(super) fn rms_norm(x: &[f32], w: &[f32], eps: f32, offset: f32) -> Vec<f32> {
@@ -55,14 +45,24 @@ pub(super) fn gelu_tanh(x: f32) -> f32 {
     0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
 }
 
-/// Compute y = x @ W.T where W is [out_rows, in_cols] stored row-major.
+/// Compute y = W · x  (W is [out_rows, in_cols] row-major, x is [in_cols]).
+///
+/// Uses BLAS sgemv via the workspace-level `ndarray` BLAS feature (Accelerate
+/// on macOS, OpenBLAS on Linux). For the 26B A4B MoE this replaces a scalar
+/// loop that dominated decode time: each expert call is roughly
+/// `out_rows × in_cols` multiplies, repeated 8 experts × 60 layers per token,
+/// and BLAS sgemv hits the AMX tiles + SIMD fused-multiply-add pipeline that
+/// the scalar path misses entirely.
 pub(super) fn matmul_vec(x: &[f32], w: &[f32], out_rows: usize, in_cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_rows * in_cols);
     debug_assert_eq!(x.len(), in_cols);
-    (0..out_rows).map(|row| {
-        let w_row = &w[row * in_cols..(row + 1) * in_cols];
-        x.iter().zip(w_row.iter()).map(|(a, b)| a * b).sum()
-    }).collect()
+    if out_rows == 0 || in_cols == 0 { return vec![0.0f32; out_rows]; }
+    let w_view = ndarray::ArrayView2::from_shape((out_rows, in_cols), w)
+        .expect("matmul_vec: weight shape mismatch");
+    let x_view = ndarray::ArrayView1::from(x);
+    // `Array2.dot(&Array1)` dispatches to BLAS sgemv when the ndarray blas
+    // feature is enabled at the workspace level (larql-compute owns that).
+    w_view.dot(&x_view).to_vec()
 }
 
 /// Softmax in-place.

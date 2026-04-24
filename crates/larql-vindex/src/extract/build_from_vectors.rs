@@ -293,6 +293,7 @@ use crate::config::{
             quant: crate::QuantFormat::None,
             layer_bands: None,
             model_config: None,
+            fp4: None,
         };
 
         let config_json = serde_json::to_string_pretty(&config)

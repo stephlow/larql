@@ -138,6 +138,14 @@ fn run_gguf_to_vindex(
         dtype,
         &mut callbacks,
     )?;
+    // GGUF conversion: HF metadata (tokenizer_config.json etc.) is not
+    // packed in the GGUF itself, but if the user kept the HF files next
+    // to the `.gguf`, snapshot them. Missing-file case is a no-op.
+    if let Some(src_dir) = input.parent() {
+        if let Err(e) = larql_vindex::snapshot_hf_metadata(src_dir, output) {
+            eprintln!("  warning: failed to snapshot HF metadata: {e}");
+        }
+    }
 
     eprintln!("Done: {}", output.display());
     Ok(())
@@ -189,6 +197,12 @@ fn run_safetensors_to_vindex(
         dtype,
         &mut callbacks,
     )?;
+    // Snapshot HF-side metadata (chat template, special tokens, generation
+    // config) from the source directory. `input` here is the safetensors
+    // model dir, which is where these files live in the HF cache.
+    if let Err(e) = larql_vindex::snapshot_hf_metadata(input, output) {
+        eprintln!("  warning: failed to snapshot HF metadata: {e}");
+    }
 
     eprintln!("Done: {}", output.display());
     Ok(())

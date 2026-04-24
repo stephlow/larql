@@ -511,6 +511,7 @@ pub fn build_vindex_streaming(
             query_pre_attn_scalar: cfg.query_pre_attn_scalar,
             final_logit_softcapping: cfg.final_logit_softcapping,
         }),
+        fp4: None,
     };
 
     // Write preliminary index.json (needed by write_model_weights which reads dtype from it)

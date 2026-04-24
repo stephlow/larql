@@ -479,7 +479,7 @@ fn make_config(model: &str, layers: usize, hidden: usize, intermediate: usize,
         extract_level: larql_vindex::ExtractLevel::Browse, dtype,
         quant: larql_vindex::QuantFormat::None,
         layer_bands: None, layers: layer_infos, down_top_k: 1,
-        has_model_weights: false, model_config: None,
+        has_model_weights: false, model_config: None, fp4: None,
     }
 }
 

@@ -481,10 +481,11 @@ fn run_predict_q4k(
         if args.max_tokens > 1 {
             use std::io::Write;
             let cached_layers = larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
+            let num_layers = weights.num_layers;
             let result = larql_inference::layer_graph::generate(
                 weights, tokenizer, &token_ids,
                 args.max_tokens, &q4_index, &*backend,
-                &cached_layers, 0..weights.num_layers,
+                &cached_layers, 0..num_layers,
             );
             let mut stdout = std::io::stdout();
             for (tok, _) in &result.tokens {

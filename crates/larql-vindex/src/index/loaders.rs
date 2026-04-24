@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::Mutex;
 
 use ndarray::Array2;
 use larql_models::TopKEntry;
@@ -140,43 +139,8 @@ impl VectorIndex {
 
         Ok(VectorIndex {
             gate_vectors,
-            gate_mmap_bytes: None,
-            gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
-            gate_mmap_slices: Vec::new(),
             down_meta: gate_meta,
-            down_meta_mmap: None,
-            down_overrides: HashMap::new(),
-            up_overrides: HashMap::new(),
-            f16_decode_cache: Mutex::new(vec![None; num_layers]),
-            gate_cache_lru: Mutex::new(std::collections::VecDeque::new()),
-            gate_cache_max_layers: std::sync::atomic::AtomicUsize::new(0),
-            warmed_gates: std::sync::RwLock::new(vec![None; num_layers]),
-            down_features_mmap: None,
-            up_features_mmap: None,
-            hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
-            hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
-            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
-            lm_head_mmap: None,
-            lm_head_f16_mmap: None,
-            vocab_size: 0,
-            interleaved_mmap: None,
-            interleaved_q4_mmap: None,
-            interleaved_q4k_mmap: None,
-            interleaved_q4k_manifest: None,
-            q4k_ffn_cache: Mutex::new((0..num_layers).map(|_| [None, None, None]).collect()),
-            gate_q4_mmap: None,
-            gate_q4_slices: Vec::new(),
-            lm_head_q4_mmap: None,
-            lm_head_q4_synth: None,
-            attn_q4k_mmap: None,
-            attn_q4k_manifest: None,
-            attn_q4_mmap: None,
-            attn_q4_manifest: None,
-            attn_q8_mmap: None,
-            attn_q8_manifest: None,
-            num_layers,
-            hidden_size,
-            layer_range: None,
+            ..VectorIndex::empty(num_layers, hidden_size)
         })
     }
 

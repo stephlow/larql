@@ -87,9 +87,13 @@ fn run_attention_block_core(
     let seq_len = h.shape()[0];
     let norm_offset = arch.norm_weight_offset();
 
-    // Layer-0 stage dumps, paired with the Metal side via
-    // LARQL_CPU_STAGE_DUMP=<dir>. Scoped to layer 0 for noise budget.
-    let stage_dump = if layer == 0 { std::env::var("LARQL_CPU_STAGE_DUMP").ok() } else { None };
+    // Per-layer stage dumps, paired with Metal via LARQL_CPU_STAGE_DUMP=<dir>.
+    // Default is layer 0 (noise budget); set LARQL_STAGE_DUMP_LAYER=<N> to
+    // capture a specific layer instead — Gemma 4 global layers (5, 11, …)
+    // are useful for bisecting partial-RoPE / V-norm interactions.
+    let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
+        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let stage_dump = if layer == stage_layer { std::env::var("LARQL_CPU_STAGE_DUMP").ok() } else { None };
     let dump_f32 = |name: &str, arr: &Array2<f32>| {
         if let Some(ref dir) = stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);
@@ -130,13 +134,6 @@ fn run_attention_block_core(
         (cached_k.clone(), cached_v.clone())
     } else {
         let w_k = weights.tensors.get(&arch.attn_k_key(layer)).unwrap();
-        // v_from_k: architecturally asserted OR tensor genuinely absent.
-        // On Gemma 4 31B global layers, attention_k_eq_v=true AND v_proj is
-        // omitted from safetensors — both signals align. Prefer the arch
-        // assertion so we honour intent even if a redundant v_proj slipped
-        // into a vindex rebuild.
-        let v_from_k = arch.v_shares_k(layer)
-            || !weights.tensors.contains_key(&arch.attn_v_key(layer));
 
         let mut k_full = dot_proj(&h_norm, w_k);
         if let Some(bias) = arch.attn_k_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
@@ -148,12 +145,21 @@ fn run_attention_block_core(
             None => k_full.clone(),
         };
 
-        // When v shares k, v = k post-k-norm (no separate v_norm, no RoPE).
-        // Otherwise compute v via its own projection + optional v_norm.
-        let v_full = if v_from_k {
-            k_normed.clone()
-        } else {
-            let w_v = weights.tensors.get(&arch.attn_v_key(layer)).unwrap();
+        // V projection. Always go through the stored W_v tensor when it
+        // exists — including on `attention_k_eq_v` (Gemma 4 global) layers
+        // where the bytes in W_v were derived from W_k at extraction time.
+        // The reason: the vindex re-quantises V as Q6_K while K stays Q4_K
+        // (see `format/weights/write.rs`: `is_v { quantize_q6_k } else {
+        // quantize_q4_k }`), so `Q6_K_dequant(K_bytes)` is numerically
+        // closer to the original bf16 weight than `Q4_K_dequant(K_bytes)`.
+        // Metal's V projection uses the Q6_K path; the old CPU shortcut
+        // (`v = k_full`) was ~0.25 off per element on Gemma 4 31B L5+,
+        // which is what L5's attn_out drift was tracking.
+        //
+        // Fallback: when W_v is genuinely absent from the vindex (older
+        // extracts with no v_proj tensor for `attention_k_eq_v` layers),
+        // reuse `k_full` — matches pre-Q6K-V behaviour.
+        let v_full = if let Some(w_v) = weights.tensors.get(&arch.attn_v_key(layer)) {
             let mut v = dot_proj(&h_norm, w_v);
             if let Some(bias) = arch.attn_v_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
                 add_bias(&mut v, bias);
@@ -162,6 +168,10 @@ fn run_attention_block_core(
                 v = rms_norm_heads_no_weight(&v, num_kv, head_dim);
             }
             v
+        } else if arch.has_v_norm() {
+            rms_norm_heads_no_weight(&k_full, num_kv, head_dim)
+        } else {
+            k_full.clone()
         };
 
         let k_r = apply_rope_partial(&k_normed, num_kv, head_dim, layer_rope_base, rotary_frac);
@@ -169,6 +179,8 @@ fn run_attention_block_core(
     };
 
     dump_f32("q_out_after_rope", &q_rope);
+    dump_f32("k_out_after_rope", &k_rope);
+    dump_f32("v_out", &v_final);
 
     // GQA attention
     let softcap = arch.attn_logit_softcapping();

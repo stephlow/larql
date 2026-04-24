@@ -74,34 +74,42 @@ struct ArchCase {
 /// with — we're guarding against "did we break this arch?" not "is this
 /// model factually correct?". Instruct-tuned Gemmas do answer "Paris";
 /// Llama 2 base rambles into "a city of contrasts"; Mistral base gets it.
+// Prompts are wrapped in the model family's chat template when
+// `run_case` detects an instruct model (hint from `cfg.model` in the
+// vindex — e.g. `google/gemma-3-4b-it`). Gemma 3 instruct now answers
+// `"The capital of France is **Paris**"` with the template applied;
+// Gemma 4 falls through to raw prompting (see `chat::detect_chat_format`
+// for the reason) and matches HF's raw-prompt continuation. Base Llama 2
+// and base Mistral skip wrapping and produce their raw-text continuations.
 const CASES: &[ArchCase] = &[
     ArchCase {
         arch_family: "gemma3", vindex_name: "gemma3-4b-q4k-v2",
         expected_substring: "Paris", cpu_unimplemented: false,
     },
+    // Gemma 4 31B dense — chat-template-wrapped (`chat_template.jinja` in
+    // the vindex). The model answers `"The capital of France is **Paris**"`
+    // on both GPU and CPU.
     ArchCase {
         arch_family: "gemma4-dense", vindex_name: "gemma4-31b-q4k",
         expected_substring: "Paris", cpu_unimplemented: false,
     },
-    // Hybrid-MoE. Note on the expected substring: 26B-A4B is an instruct
-    // model; on a raw (non-chat-templated) "The capital of France is" it
-    // confidently answers with generic tokens — HF bf16 top-1 on this
-    // prompt is `' CAP'`, with ` true` deeper in the top-5. We assert on
-    // `"true"` because it's what a correctly-quantised forward produces
-    // (verified against the HF reference residual diff) and because
-    // `"Paris"` would be a stricter match than HF itself achieves here.
-    // CPU backend has no MoE forward implementation yet; flag it so the
-    // test skips cleanly rather than falling through to dense.
+    // Hybrid-MoE with `chat_template.jinja` rendered (Gemma 4 uses the
+    // newer standalone-file convention, not an embedded
+    // `tokenizer_config.json::chat_template` field). Model now produces
+    // `"The capital of France is **Paris**"` on GPU. CPU MoE still has a
+    // small numerical-drift gap vs Metal on the template-wrapped prompt;
+    // `cpu_unimplemented: true` keeps the CPU case skipped cleanly.
     ArchCase {
         arch_family: "gemma4-moe", vindex_name: "gemma-4-26B-A4B-it",
-        expected_substring: "true", cpu_unimplemented: true,
+        expected_substring: "Paris", cpu_unimplemented: true,
     },
-    // Llama 2 base isn't instruct-tuned — "a city of contrasts" is its
-    // actual continuation. Anchor on "city" rather than "Paris".
+    // Llama 2 base isn't instruct-tuned — no chat template; "a city of
+    // contrasts" is its actual continuation. Anchor on "city".
     ArchCase {
         arch_family: "llama2", vindex_name: "llama2-7b-q4k",
         expected_substring: "city", cpu_unimplemented: false,
     },
+    // Mistral base — no chat template.
     ArchCase {
         arch_family: "mistral", vindex_name: "mistral-7b-v0.1-q4k",
         expected_substring: "Paris", cpu_unimplemented: false,
@@ -148,7 +156,7 @@ fn run_case(
         return Err(format!("only Q4k vindexes are supported by this suite (got {:?})", cfg.quant));
     }
 
-    let weights = load_model_weights_q4k(vindex_path, &mut cb)
+    let mut weights = load_model_weights_q4k(vindex_path, &mut cb)
         .map_err(|e| format!("load_model_weights_q4k: {e}"))?;
     let tokenizer = load_vindex_tokenizer(vindex_path)
         .map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
@@ -158,7 +166,20 @@ fn run_case(
     q4_index.load_interleaved_q4k(vindex_path).map_err(|e| format!("load_interleaved_q4k: {e}"))?;
     let _ = q4_index.load_lm_head_q4(vindex_path);
 
-    let prompt_ids = encode_prompt(&tokenizer, &*weights.arch, prompt)
+    // Instruct-tuned models answer trivia only inside their chat template.
+    // Primary source is the HF-published template snapshotted into the
+    // vindex (`tokenizer_config.json::chat_template`). When that's
+    // missing (not all upstream configs publish it), `wrap_chat_prompt`
+    // falls back to a hardcoded Jinja template keyed on the `cfg.model`
+    // hint for well-known instruct families (Llama-2-chat,
+    // Mistral-Instruct). Base models don't match either path and pass
+    // through unchanged.
+    let wrap = larql_inference::wrap_chat_prompt(
+        vindex_path, Some(cfg.model.as_str()), prompt,
+    );
+    eprintln!("[{}] chat-template applied={} ({})",
+        cfg.model, wrap.applied, wrap.note);
+    let prompt_ids = encode_prompt(&tokenizer, &*weights.arch, &wrap.prompt)
         .map_err(|e| format!("encode_prompt: {e}"))?;
 
     let backend = backend_kind.backend();
@@ -166,7 +187,7 @@ fn run_case(
     let num_layers = weights.num_layers;
 
     let result = gen(
-        &weights,
+        &mut weights,
         &tokenizer,
         &prompt_ids,
         max_tokens,
@@ -187,10 +208,16 @@ fn prompt() -> String {
 }
 
 fn max_tokens() -> usize {
+    // Raw-prompt cases (base models) answer in 1-3 tokens, but chat-templated
+    // instruct models often answer with a full sentence — e.g. Gemma's
+    // `"The capital of France is Paris."`, where `"Paris"` is the 6th token.
+    // Keep the default at 8 so the substring assertion captures that answer
+    // in full without inflating test runtime noticeably (most models still
+    // hit EOS / end-of-turn before the budget expires).
     std::env::var("LARQL_ARCH_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
+        .unwrap_or(8)
 }
 
 /// Exercise one case on one backend. Asserts on success/failure; calls

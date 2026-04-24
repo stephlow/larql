@@ -12,7 +12,7 @@ use crate::detect::ModelError;
 /// MXFP4 lookup table: maps 4-bit value to float.
 /// Bit layout: [sign(1)][exponent(2)][mantissa(1)]
 /// Values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}
-const MXFP4_TABLE: [f32; 16] = [
+pub const MXFP4_TABLE: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];

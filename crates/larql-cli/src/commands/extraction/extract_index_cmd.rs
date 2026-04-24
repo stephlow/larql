@@ -290,6 +290,15 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.drop_gate_vectors,
             &mut callbacks,
         )?;
+
+        // Opportunistically copy HF metadata (tokenizer_config.json,
+        // special_tokens_map.json, generation_config.json) from the source
+        // directory into the vindex. Chat-template-aware runtimes read
+        // `tokenizer_config.json::chat_template` from here; missing files
+        // are silently skipped.
+        if let Err(e) = larql_vindex::snapshot_hf_metadata(&model_path, output) {
+            eprintln!("  warning: failed to snapshot HF metadata: {e}");
+        }
     }
 
     callbacks.feature_bar.finish_and_clear();

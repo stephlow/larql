@@ -473,6 +473,7 @@ impl<'a> BuildContext<'a> {
                     final_logit_softcapping: cfg.final_logit_softcapping,
                 })
             },
+            fp4: None,
         };
 
         // Preliminary write — `write_model_weights` reads the index.
@@ -734,6 +735,7 @@ pub fn build_vindex_resume(
                 final_logit_softcapping: cfg.final_logit_softcapping,
             })
         },
+        fp4: None,
     };
 
     config.checksums = crate::format::checksums::compute_checksums(output_dir).ok();

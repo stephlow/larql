@@ -48,6 +48,7 @@ metal = ["larql-compute/metal"]
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [[bench]]
 name = "vindex_ops"

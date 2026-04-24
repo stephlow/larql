@@ -166,6 +166,10 @@ impl VectorIndex {
         let _ = index.load_interleaved(dir);
         let _ = index.load_up_features(dir);
         let _ = index.load_down_features(dir);
+        // Opt-in FP4/FP8 storage (exp 26): present iff `index.json.fp4`
+        // is set. Non-fatal if absent or malformed — other FFN mmaps
+        // already loaded remain authoritative.
+        let _ = index.load_fp4_storage(dir, &config);
         // Opportunistically adopt the f16 `embeddings.bin` as an f16 view
         // of the LM head — but ONLY when the vindex has no separate lm_head
         // file. `embeddings.bin` IS the lm_head for tied-embedding models

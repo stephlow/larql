@@ -5,7 +5,14 @@
 //! shard. The BF16 expert weights are dequantized on demand so only the
 //! selected experts pay the conversion cost.
 
-use super::math::{extract_expert_weights, gelu_tanh, matmul_vec, rms_norm, silu};
+use super::cache::cached_dequant;
+use super::math::{gelu_tanh, matmul_vec, rms_norm, silu};
+
+fn expert_byte_slice(packed: &[u8], expert_idx: usize, out_rows: usize, in_cols: usize) -> &[u8] {
+    let bytes_per_expert = out_rows * in_cols * 2;
+    let start = expert_idx * bytes_per_expert;
+    &packed[start..start + bytes_per_expert]
+}
 
 /// Run a single expert's gated FFN given a pre-normed input vector.
 ///
@@ -23,7 +30,8 @@ pub fn run_single_expert(
     let hidden = h_norm.len();
     if inter == 0 || hidden == 0 { return vec![0.0f32; hidden]; }
 
-    let gate_up_w = extract_expert_weights(experts_gate_up, expert_idx, 2 * inter, hidden);
+    let gate_up_bytes = expert_byte_slice(experts_gate_up, expert_idx, 2 * inter, hidden);
+    let gate_up_w = cached_dequant(gate_up_bytes);
     let gate_w = &gate_up_w[..inter * hidden];
     let up_w = &gate_up_w[inter * hidden..];
 
@@ -37,7 +45,8 @@ pub fn run_single_expert(
         })
         .collect();
 
-    let down_w = extract_expert_weights(experts_down, expert_idx, hidden, inter);
+    let down_bytes = expert_byte_slice(experts_down, expert_idx, hidden, inter);
+    let down_w = cached_dequant(down_bytes);
     matmul_vec(&hidden_state, &down_w, hidden, inter)
 }
 

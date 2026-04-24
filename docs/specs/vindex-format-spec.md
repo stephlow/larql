@@ -1,12 +1,13 @@
 # Vindex Format Specification
 
-**Version:** 0.3  
-**Date:** 2026-04-01  
-**Status:** Implemented (~98%)  
-**Implementation:** `larql-vindex` crate (Rust)  
+**Version:** 0.4
+**Date:** 2026-04-24
+**Status:** Implemented (~98%); FP4/FP8 storage in progress (exp 26)
+**Implementation:** `larql-vindex` crate (Rust)
 **Companion specs:** [Operations](vindex-operations-spec.md), [Ecosystem](vindex-ecosystem-spec.md), [LQL](lql-spec.md)
+**Experiment references:** [FP4 format](../../experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md), [FP4 precision policy](../../experiments/26_fp4_quantisation/FP4_PRECISION_POLICY.md)
 
-**Implementation coverage:** File layout, binary formats, extract levels, f16 storage, checksums, mmap loading, streaming extraction, `larql verify` — all implemented. Remaining: int8/int4 quantisation (future).
+**Implementation coverage:** File layout, binary formats, extract levels, f16 storage, checksums, mmap loading, streaming extraction, `larql verify`, Q4_K quantisation — all implemented. **FP4/FP8 block storage** — codec layer landed (see §5.10), writer and walk-kernel dispatch in progress.
 
 ---
 
@@ -108,6 +109,17 @@ model.vindex/
 ├── attn_weights_q4k_manifest.json
 ├── interleaved_q4k.bin       # FFN gate/up = Q4_K, down = Q6_K (or Q4_K with --down-q4k) per layer
 ├── interleaved_q4k_manifest.json
+│
+│  # ═══ FP4/FP8 Storage (when index.json.fp4 is set — exp 26) ═══
+│  # Per-projection precision controlled by the `fp4.projections` manifest.
+│  # Written alongside or instead of the legacy gate/up/down files depending
+│  # on the per-projection `precision` tag. Loaders dispatch on the tag, never
+│  # sniff filenames.
+│
+├── gate_vectors_fp4.bin      # Gate at FP4 E2M1, 256-elem blocks (137 B/block)
+├── up_features_fp4.bin       # Up at FP4 E2M1, same layout
+├── down_features_fp8.bin     # Down at FP8 E4M3, 256-elem blocks (257 B/block)
+├── fp4_compliance.json       # Extract-time Q1 compliance scan + per-projection actions
 │
 │  # ═══ Gemma 4 E2B Per-Layer Embeddings ═══
 │  # Emitted only when has_per_layer_embeddings() == true.
@@ -272,6 +284,96 @@ JSON array mapping tensor keys to byte offsets in the weight files.
 and surface in `ModelWeights.tensors`, so the downstream forward code
 can read them like any other dense matrix.
 
+### 5.10 FP4/FP8 block storage (exp 26)
+
+When `index.json.fp4` is present, the vindex stores one or more FFN
+projections in a block-quantised format instead of (or alongside) the
+f16/f32 gate_vectors.bin, up_features.bin, down_features.bin files. Per-
+projection precision is controlled by `fp4.projections.{gate|up|down}.
+precision` — legal values are `fp4`, `fp8`, `f16`, `f32`.
+
+**Block geometry (v1).** All blocks cover 256 elements, chosen as the
+largest block size that divides every model family LARQL currently ships
+(hidden ∈ {512, 1536, 2560, 5376}). Each 256-element block holds 8
+sub-blocks of 32 elements each, matching the OCP MXFP4 sub-block size.
+
+**FP4 block layout — 137 bytes per 256 elements:**
+
+| Offset  | Size  | Contents                                    |
+| ------- | ----- | ------------------------------------------- |
+| 0–127   | 128 B | 256 FP4 E2M1 values, nibble-packed (2/byte) |
+| 128–135 | 8 B   | 8 FP8 E4M3 sub-block scales                 |
+| 136     | 1 B   | 1 FP8 E4M3 block scale                      |
+
+Dequantisation: `x = fp4_value × sub_block_scale × block_scale / 6`. Nibble
+packing: lower nibble = even-indexed element of each pair.
+
+**FP8 block layout — 257 bytes per 256 elements:**
+
+| Offset | Size  | Contents                      |
+| ------ | ----- | ----------------------------- |
+| 0–255  | 256 B | 256 FP8 E4M3 values           |
+| 256    | 1 B   | 1 FP8 E4M3 block scale        |
+
+Dequantisation: `x = fp8_value × block_scale`. No sub-block scales — E4M3's
+dynamic range (±448) absorbs typical FFN weight magnitude spread directly.
+
+**Per-file byte layout.** Same layer/feature concatenation convention as
+legacy projection files. Per-layer byte offsets come from the existing
+`layers[i].num_features` field — no new layer-offset metadata needed;
+the writer knows the block count per feature from `hidden / 256`.
+
+**Mmap-friendliness.** Each feature vector's blocks are contiguous — one
+cacheline-friendly prefetch walk per feature, same access pattern as the
+legacy f16 layout.
+
+**Compression vs F16 (4B, 3 projections):**
+
+| Configuration                          | Per-feature | Compression |
+| -------------------------------------- | -----------:| -----------:|
+| F16 baseline (3 × 2560 × 2 bytes)      | 15,360 B    | 1.00×       |
+| Uniform FP4 (all 3 projections)        | 4,110 B     | **3.74×**   |
+| FP4 gate/up + FP8 down (default)       | 5,310 B     | **2.89×**   |
+| FP4 gate/up + F16 down (conservative)  | 7,860 B     | 1.95×       |
+
+**Policy default.** Option B (`{gate: fp4, up: fp4, down: fp8}`). The
+`down` projection carries FFN's heaviest-tailed per-feature magnitude
+distribution (exp 26 cross-model data); FP8 E4M3 absorbs that tail
+without any distributional assumption, at an ~8% FFN-vindex cost vs
+uniform FP4. See [precision policy](../../experiments/26_fp4_quantisation/FP4_PRECISION_POLICY.md) §5.
+
+**Full byte-layout specification** including nibble-order, E2M1 table,
+and E4M3 encoding detail is in the experiment format spec:
+[FP4_FORMAT_SPEC.md](../../experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md).
+
+### 5.11 fp4_compliance.json
+
+Extract-time sidecar emitted alongside any vindex written with FP4
+storage. Contains the full output of the Q1 compliance scan plus
+per-projection actions taken by the extractor:
+
+```json
+{
+  "extracted_at": "2026-04-24T...",
+  "extractor_version": "...",
+  "scanner_version": "...",
+  "block_elements_scanned": 256,
+  "compliance_gate_threshold_ratio": 16.0,
+  "compliance_gate_min_fraction": 0.99,
+  "per_projection": [
+    {"projection": "gate", "compliance_at_R16": 0.99999, "action": "wrote_fp4"},
+    {"projection": "up",   "compliance_at_R16": 0.99999, "action": "wrote_fp4"},
+    {"projection": "down", "compliance_at_R16": 0.99950, "action": "wrote_fp8_per_policy_default"}
+  ],
+  "full_scan": { /* fp4_q1_scan.rs JSON */ }
+}
+```
+
+Advisory for humans; the authoritative precision per projection is always
+`index.json.fp4.projections.{gate|up|down}.precision`. The sidecar records
+*why* each projection landed at the precision it did (met the compliance
+gate, was downgraded after failing it, or was set by policy regardless).
+
 ---
 
 ## 6. index.json (VindexConfig)
@@ -331,9 +433,35 @@ The central configuration file. Version 2 is the current format.
     "attention_type": "gqa",
     "activation": "geglu",
     "tie_word_embeddings": true
+  },
+
+  "fp4": {
+    "fp4_format_version": 1,
+    "block_elements": 256,
+    "sub_block_elements": 32,
+    "sub_block_scale_dtype": "fp8_e4m3",
+    "block_scale_dtype": "fp8_e4m3",
+    "value_encoding": "fp4_e2m1_mxfp4_nibble_order",
+    "projections": {
+      "gate": { "precision": "fp4", "file": "gate_vectors_fp4.bin" },
+      "up":   { "precision": "fp4", "file": "up_features_fp4.bin" },
+      "down": { "precision": "fp8", "file": "down_features_fp8.bin" }
+    },
+    "compliance_gate": {
+      "threshold_ratio": 16.0,
+      "min_compliant_fraction": 0.99,
+      "fallback_precision": "fp8"
+    },
+    "compliance_report": "fp4_compliance.json"
   }
 }
 ```
+
+The `fp4` field is optional. Absent or null → the vindex uses legacy
+f16/f32 projection files as before. Present → per-projection precision
+is authoritative from this field; loaders dispatch on the tag and never
+sniff filenames. Adding this field does **not** bump the parent
+`version` — FP4 is additive opt-in, not a breaking change.
 
 ### Key fields
 
@@ -400,22 +528,39 @@ Key format: `"layer:feature"`. These override cluster labels at query time.
 
 ## 8. Storage Precision
 
-The `dtype` field in `index.json` controls storage precision for all binary files.
+Two surfaces control storage precision:
+
+**`dtype`** (top-level): controls legacy gate_vectors.bin, up_features.bin,
+down_features.bin, attn_weights.bin, embeddings.bin, lm_head.bin. `"f32"`
+or `"f16"`. Cast to f32 at load time. Gate KNN accuracy at f16 is
+effectively identical to f32 — top-K ranking is preserved.
 
 | Dtype | Bytes/float | gate_vectors (4B) | embeddings (4B) | Total browse |
 |-------|-------------|-------------------|-----------------|--------------|
 | f32 | 4 | 3.32 GB | 2.50 GB | ~6 GB |
 | f16 | 2 | 1.66 GB | 1.25 GB | ~3 GB |
 
-All data is cast to f32 at load time. Gate KNN accuracy at f16 is effectively identical to f32 — the top-K results don't change because ranking is preserved.
+**`fp4.projections.{gate|up|down}.precision`** (optional, per-projection):
+overrides `dtype` for the FFN projections when the `fp4` field is set.
+Legal values: `fp4`, `fp8`, `f16`, `f32`. The FP4 and FP8 formats are
+block-quantised (see §5.10); the f16 and f32 values map to the legacy
+files and the legacy codepath.
 
-Controlled by `StorageDtype` enum in the implementation:
 ```rust
-pub enum StorageDtype {
-    F32,
-    F16,
+// Legacy global storage precision.
+pub enum StorageDtype { F32, F16 }
+
+// Per-projection precision tag (exp 26).
+pub enum Precision { Fp4, Fp8, F16, F32 }
+
+pub struct ProjectionFormat {
+    pub precision: Precision,
+    pub file: String,   // e.g. "gate_vectors_fp4.bin"
 }
 ```
+
+FP4/FP8 data is dequantised to f32 lazily at walk time — the block codec
+(`larql-models::quant::{fp4,fp8,fp4_block}`) handles this per-feature.
 
 ---
 
@@ -453,6 +598,29 @@ pub enum StorageDtype {
 | **Inference total** | **~6 GB** | |
 | **All total** | **~10 GB** | |
 
+### FP4 + FP8 (Option B default, exp 26)
+
+Gate and up in FP4, down in FP8. Inference-level FFN storage only — rest
+of the vindex (embeddings, attn, lm_head) stays at the `dtype` setting
+(typically f16).
+
+| File | Size | Description |
+|------|------|-------------|
+| gate_vectors_fp4.bin | ~0.48 GB | 34 × 10,240 × 1,370 B per feature |
+| up_features_fp4.bin | ~0.48 GB | Same layout as gate |
+| down_features_fp8.bin | ~0.89 GB | 34 × 10,240 × 2,570 B per feature |
+| fp4_compliance.json | <100 KB | Extract-time Q1 scan |
+| **FFN total (vs ~5.0 GB F16)** | **~1.85 GB (2.89× compression)** | |
+
+At 31B scale (Gemma 4 31B, hidden=5376, intermediate=21504, 60 layers):
+
+| Config | FFN storage | vs F16 FFN (41.6 GB) |
+|--------|-------------|----------------------|
+| F16 baseline | 41.6 GB | 1.00× |
+| Uniform FP4 (Option A) | 11.1 GB | **3.74×** |
+| FP4 gate/up + FP8 down (Option B, default) | 14.4 GB | **2.89×** |
+| FP4 gate/up + F16 down (Option C) | 21.2 GB | 1.95× |
+
 ---
 
 ## 10. Version History
@@ -460,7 +628,15 @@ pub enum StorageDtype {
 | Version | Changes |
 |---------|---------|
 | 1 | Original: gate + embed + down_meta JSONL + model_weights.bin |
-| 2 | Added extract_level, layer_bands, model_config, source, checksums, dtype. Binary down_meta. Split weight files (attn, up, down, norms, lm_head). f16 storage. |
+| 2 | Added extract_level, layer_bands, model_config, source, checksums, dtype. Binary down_meta. Split weight files (attn, up, down, norms, lm_head). f16 storage. Q4_K/Q6_K quantisation (interleaved_q4k.bin + manifest). |
+
+**FP4/FP8 storage is an additive extension, not a version bump.** Version
+2 vindexes can optionally carry an `fp4` field in `index.json` with
+per-projection precision and byte layout per §5.10 / §6. Readers that
+don't understand the field ignore it and use the legacy f16/f32 files.
+The `fp4.fp4_format_version` field is independent of the parent version
+and bumps only on byte-layout changes to FP4 blocks themselves, not on
+schema additions (new precision tags, new manifest fields).
 
 **Compatibility:** v1 vindexes load with sensible defaults for missing fields:
 - Missing `layer_bands` → auto-computed from layer count
@@ -468,6 +644,7 @@ pub enum StorageDtype {
 - Missing `checksums` → skip verification
 - Missing `extract_level` → inferred from `has_model_weights`
 - Missing `dtype` → assumed f32
+- Missing `fp4` → legacy f16/f32 codepath (never FP4/FP8)
 
 Legacy `model_weights.bin` is still supported for loading. The engine checks for split weight files first, falls back to `model_weights.bin` + `weight_manifest.json`.
 
@@ -497,20 +674,29 @@ larql verify gemma3-4b.vindex
 
 ## 12. Future Format Changes
 
-### 12.1 Quantised Browse (Priority: LOW)
+### 12.1 Quantised Browse — SUPERSEDED BY FP4 (exp 26, in progress)
 
-Store gate vectors at int8 or int4 precision. KNN accuracy is nearly identical — ranking is preserved.
+The earlier int8 / int4 proposal is superseded by the FP4 block format
+described in §5.10. The FP4 path is a richer version of the original
+idea: per-block FP8 E4M3 block scales preserve ranking better than
+integer quantisation, and the measurement-first approach (Q1 scan,
+compliance floor, self-policing extractor) removes the "nearly identical
+ranking" handwave that the int8/int4 proposal relied on.
 
-```
-Gate vectors at f32:  3.32 GB
-Gate vectors at f16:  1.66 GB
-Gate vectors at int8: 0.83 GB
-Gate vectors at int4: 0.42 GB — a 4B model's knowledge in 400 MB
-```
+Projected storage under Option B (FP4 gate/up + FP8 down) at 4B:
+- FFN storage: **~1.85 GB (vs 5.0 GB F16, 2.89× compression)**
+- Under uniform FP4 (Option A): 1.43 GB (3.74× compression)
 
 ### 12.2 MXFP4 Quantized Models
 
 Models distributed with MXFP4 block quantization (e.g., GPT-OSS-120B) can be extracted to vindex format, but gate KNN produces noisy results due to 4-bit weight precision. The model works correctly at inference time because the full forward pass (SiLU gating × up projection, transformed residuals) compensates for quantization noise. Isolated gate dot products cannot.
+
+**Note the distinction.** OCP/MXFP4 (the GPT-OSS format) uses single-level
+e8m0 per-sub-block scales. The LARQL FP4 format (§5.10) reuses the same
+FP4 E2M1 value encoding and nibble packing but adds a two-level scale
+hierarchy (FP8 E4M3 sub-block scales + FP8 E4M3 block scale) to absorb
+the per-feature magnitude distributions measured in exp 26. The value
+encoding is compatible; the scale format is LARQL's own extension.
 
 See [Operations Spec Section 6](vindex-operations-spec.md) for strategies.
 

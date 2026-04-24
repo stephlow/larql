@@ -20,10 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let model = InferenceModel::load("google/gemma-3-4b-it")?;
-    let weights = model.weights();
-    let tokenizer = model.tokenizer();
-    let num_layers = weights.num_layers;
+    let mut model = InferenceModel::load("google/gemma-3-4b-it")?;
+    let num_layers = model.weights().num_layers;
+    let tokenizer = model.tokenizer().clone();
 
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
@@ -35,12 +34,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = index.load_interleaved_q4k(&vindex_path);
 
     let gpu_be = default_backend();
-    let dense_ffn = WeightFfn { weights };
     let cached_layers: Vec<usize> = (0..=12).collect();
     let prompt = "The capital of France is";
     let encoding = tokenizer.encode(prompt, true).map_err(|e| format!("{e}"))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-    let cache = CachedLayerGraph::build(weights, &token_ids, &cached_layers, &dense_ffn);
+    // Build the residual cache with an immutable borrow; scope drops it so the
+    // subsequent mutable borrow for `generate` can proceed.
+    let cache = {
+        let weights = model.weights();
+        let dense_ffn = WeightFfn { weights };
+        CachedLayerGraph::build(weights, &token_ids, &cached_layers, &dense_ffn)
+    };
+    let weights = model.weights_mut();
 
     println!("╔═══════════════════════════════════════════════╗");
     println!("║       LARQL Generate Benchmark                ║");
@@ -52,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let result = generate(
-        weights, tokenizer, &token_ids, 20,
+        weights, &tokenizer, &token_ids, 20,
         &index, &*gpu_be, &cache, 13..num_layers,
     );
 

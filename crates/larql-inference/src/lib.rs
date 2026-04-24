@@ -2,6 +2,7 @@ extern crate blas_src;
 
 pub mod attention;
 pub mod capture;
+pub mod chat;
 pub mod error;
 pub mod ffn;
 pub mod forward;
@@ -45,6 +46,7 @@ pub use larql_compute::MetalBackend;
 pub use capture::{
     CaptureCallbacks, CaptureConfig, InferenceModel, TopKEntry, VectorFileHeader, VectorRecord,
 };
+pub use chat::{wrap_chat_prompt, wrap_with_vindex_template, wrap_prompt_raw, ChatWrap};
 pub use error::InferenceError;
 pub use ffn::{
     FfnBackend, LayerFfnRouter, RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend,

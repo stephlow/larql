@@ -98,7 +98,7 @@ pub fn build_arch_params<'a>(
     }
 }
 
-fn build_moe_weights<'a>(
+pub(crate) fn build_moe_weights<'a>(
     weights: &'a ModelWeights,
     arch: &dyn larql_models::ModelArchitecture,
     layer: usize,

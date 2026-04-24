@@ -133,8 +133,25 @@ fn predict_q4k_hidden(
             .arch
             .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
+        let is_moe_layer = weights.arch.is_hybrid_moe();
         let ffn_backend = crate::ffn::WeightFfn { weights };
-        if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
+        if is_moe_layer {
+            // Gemma 4 hybrid-MoE layer: dense FFN (h1) + CPU MoE (h2),
+            // combined under the outer post-FFN norm, then PLE + layer_scalar.
+            if let Some((h_new, kv_out)) = run_moe_layer_cpu(
+                weights,
+                &h,
+                layer,
+                &ffn_backend,
+                ple_inputs.get(layer),
+                shared_kv,
+            ) {
+                h = h_new;
+                if let Some(kv) = kv_out {
+                    kv_cache.insert(layer, kv);
+                }
+            }
+        } else if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
             weights,
             &h,
             layer,
@@ -168,6 +185,105 @@ fn predict_q4k_hidden(
     }
 
     h
+}
+
+/// CPU forward for one hybrid-MoE layer (Gemma 4 26B A4B).
+///
+/// Matches HF's `Gemma4TextDecoderLayer.forward` for MoE-enabled layers:
+///
+/// 1. `h_post_attn = h + attn_out`
+/// 2. Dense branch: `h1 = post_ffn_norm_1(dense_mlp(pre_norm(h_post_attn)))`
+/// 3. MoE branch:   `h2 = post_ffn_norm_2(moe_block(h_post_attn))`
+///                  (the MoE block itself applies `pre_experts_norm`, runs
+///                   router + top-k + experts, and applies `post_experts_norm_2`)
+/// 4. Combine:      `h_out = h_post_attn + outer_post_ffn_norm(h1 + h2)`
+/// 5. Per-layer embedding contribution (PLE)
+/// 6. `h_out *= layer_scalar`
+///
+/// Mirrors the Metal decode interleave in
+/// `larql-compute/src/metal/decode/mod.rs` and `moe_combine.rs` so that CPU
+/// and GPU paths produce the same hidden state (verified against HF bf16
+/// via residual-cosine diff in the Metal `diag.rs` dumps).
+fn run_moe_layer_cpu(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn crate::ffn::FfnBackend,
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let arch = &*weights.arch;
+    let norm_offset = arch.norm_weight_offset();
+    let eps = arch.norm_eps();
+    let hidden = h.ncols();
+
+    // ── 1. Attention (with or without shared K/V) ─────────────────────────
+    let (h_post_attn, kv_out) = if let Some(shared) = shared_kv {
+        let (h_pa, _, _) = crate::attention::run_attention_block_shared(
+            weights, h, layer, false, Some(shared),
+        )?;
+        (h_pa, None)
+    } else {
+        let (h_pa, _, _, k_rope, v_final) =
+            crate::attention::run_attention_block_with_kv_out(weights, h, layer, false, None)?;
+        (h_pa, Some((k_rope, v_final)))
+    };
+
+    // ── 2. Dense FFN branch (h1). `run_ffn` returns `h_post_attn + _1(dense)`
+    //     plus residual; subtract h_post_attn to isolate `_1(dense) = h1`.
+    let (h_post_ffn_dense, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, ffn, false);
+    let h1 = &h_post_ffn_dense - &h_post_attn;
+
+    // ── 3. MoE branch (h2). Per-position call — one row of h_post_attn at
+    //     a time, since `cpu_moe_forward` takes a 1D hidden-size slice.
+    let moe_weights = crate::layer_graph::pipeline_layer::build_moe_weights(weights, arch, layer);
+    let seq_len = h_post_attn.nrows();
+    let mut h2 = Array2::<f32>::zeros((seq_len, hidden));
+    if let Some(ref moe) = moe_weights {
+        for pos in 0..seq_len {
+            let row: Vec<f32> = h_post_attn.row(pos).to_vec();
+            let moe_out = larql_compute::cpu::ops::moe::cpu_moe_forward(
+                &row, moe, norm_offset, eps,
+            );
+            for (dst, src) in h2.row_mut(pos).iter_mut().zip(moe_out.iter()) {
+                *dst = *src;
+            }
+        }
+    } else {
+        // Arch says hybrid-MoE but we couldn't assemble the weights —
+        // fall back to dense-only (behaves like non-MoE path).
+        // h_post_ffn_dense already encodes the full dense residual.
+        let mut out = h_post_ffn_dense;
+        let mut h_ple = crate::forward::ple::apply_per_layer_embedding(weights, &out, layer, ple_input);
+        crate::forward::layer::apply_layer_scalar(weights, &mut h_ple, layer);
+        out = h_ple;
+        return Some((out, kv_out));
+    }
+
+    // ── 4. Combine via outer post-FFN norm, then residual add. The outer
+    //     weight is a distinct tensor (un-suffixed `post_feedforward_layernorm`);
+    //     if the extractor didn't emit it, fall back to the dense-branch _1
+    //     weight (matches `moe_combine::apply_outer_combine`'s fallback).
+    let combined = &h1 + &h2;
+    let combined_normed = if arch.moe_has_combined_output_norm() {
+        let outer_key = arch.moe_post_outer_norm_key(layer)
+            .or_else(|| arch.post_feedforward_layernorm_key(layer));
+        match outer_key {
+            Some(k) => crate::forward::apply_norm(weights, &combined, &k, norm_offset),
+            None => combined,
+        }
+    } else {
+        combined
+    };
+    let mut h_out = &h_post_attn + &combined_normed;
+
+    // ── 5 + 6. PLE then whole-layer `layer_scalar` — same order as
+    //     `run_layer_with_ffn`, so non-MoE and MoE paths produce the same
+    //     shape of residual downstream.
+    h_out = crate::forward::ple::apply_per_layer_embedding(weights, &h_out, layer, ple_input);
+    crate::forward::layer::apply_layer_scalar(weights, &mut h_out, layer);
+
+    Some((h_out, kv_out))
 }
 
 /// End-to-end predict on a Q4_K/Q6_K vindex.

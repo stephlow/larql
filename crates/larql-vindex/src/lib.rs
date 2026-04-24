@@ -46,7 +46,8 @@ pub use tokenizers;
 // Config
 pub use config::dtype::StorageDtype;
 pub use config::types::{
-    DownMetaRecord, DownMetaTopK, ExtractLevel, LayerBands, MoeConfig, QuantFormat,
+    ComplianceGate, DownMetaRecord, DownMetaTopK, ExtractLevel, Fp4Config, LayerBands,
+    MoeConfig, Precision, ProjectionFormat, Projections, QuantFormat,
     VindexConfig, VindexLayerInfo, VindexModelConfig, VindexSource,
 };
 
@@ -67,6 +68,7 @@ pub use describe::{DescribeEdge, LabelSource};
 pub use extract::{
     build_vindex, build_vindex_resume, build_vindex_from_vectors,
     build_vindex_streaming,
+    snapshot_hf_metadata, SNAPSHOT_FILES,
     IndexBuildCallbacks, SilentBuildCallbacks,
 };
 

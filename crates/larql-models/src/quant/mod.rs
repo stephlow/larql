@@ -11,3 +11,6 @@
 pub mod half;
 pub mod ggml;
 pub mod mxfp4;
+pub mod fp8;
+pub mod fp4;
+pub mod fp4_block;

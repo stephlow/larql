@@ -15,7 +15,16 @@
 
 use crate::MoeLayerWeights;
 
-use super::math::{extract_expert_weights, gelu_tanh, matmul_vec, rms_norm, rms_norm_no_weight, silu, softmax, top_k};
+use super::cache::cached_dequant;
+use super::math::{gelu_tanh, matmul_vec, rms_norm, rms_norm_no_weight, silu, softmax, top_k};
+
+/// Slice the byte range for one expert out of a packed BF16 tensor.
+/// Packed layout: `[num_experts, out_rows, in_cols]`, 2 bytes per value.
+fn expert_byte_slice(packed: &[u8], expert_idx: usize, out_rows: usize, in_cols: usize) -> &[u8] {
+    let bytes_per_expert = out_rows * in_cols * 2;
+    let start = expert_idx * bytes_per_expert;
+    &packed[start..start + bytes_per_expert]
+}
 
 /// Run the MoE expert block for one token.
 ///
@@ -115,35 +124,52 @@ pub fn cpu_moe_forward(h: &[f32], moe: &MoeLayerWeights<'_>, norm_offset: f32, e
     }
 
     // 9. Run each selected expert's gated FFN (BF16 dequant on demand).
-    //    We inline the per-expert math rather than calling `run_single_expert`
-    //    so the pre-normed `h_norm` is reused across experts without cloning.
+    //    Experts are independent — their only shared input is `h_norm` and
+    //    their outputs are summed. Parallelise across the top-K experts with
+    //    rayon so BLAS-accelerated gemv on each core overlaps. `moe.activation`
+    //    is a plain enum (Copy), and `cached_dequant` hands out shared
+    //    Arc<Vec<f32>> values that are Sync, so the closure is Send+Sync.
+    //
     //    gate_up layout: [num_experts, 2*inter, hidden]  (gate rows first, then up rows)
     //    down layout:    [num_experts, hidden, inter]
+    use rayon::prelude::*;
+    let activation = moe.activation;
+    let per_expert: Vec<(f32, Vec<f32>)> = expert_indices
+        .par_iter()
+        .zip(expert_weights.par_iter())
+        .filter_map(|(&ei, &weight)| {
+            if weight == 0.0 { return None; }
+
+            // Dequantise with LRU caching keyed by the mmap byte pointer.
+            // Re-selected experts skip both the 312 MB allocation and the
+            // BF16 → f32 conversion — the dominant cost on the scalar path.
+            let gate_up_bytes = expert_byte_slice(moe.experts_gate_up, ei, 2 * inter, hidden);
+            let gate_up_w = cached_dequant(gate_up_bytes);
+            let gate_w = &gate_up_w[..inter * hidden];
+            let up_w = &gate_up_w[inter * hidden..];
+
+            let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
+            let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
+
+            // Gated activation: ACT(gate) * up.  Gemma 4 uses GELU-tanh; Mixtral uses SiLU.
+            let hidden_state: Vec<f32> = gate_out.iter().zip(up_out.iter())
+                .map(|(&g, &u)| match activation {
+                    crate::Activation::GeluTanh => gelu_tanh(g) * u,
+                    _ => silu(g) * u,
+                })
+                .collect();
+
+            let down_bytes = expert_byte_slice(moe.experts_down, ei, hidden, inter);
+            let down_w = cached_dequant(down_bytes);
+            let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter);
+            Some((weight, expert_contribution))
+        })
+        .collect();
+
     let mut expert_out = vec![0.0f32; hidden];
-    for (rank, &ei) in expert_indices.iter().enumerate() {
-        let weight = expert_weights[rank];
-        if weight == 0.0 { continue; }
-
-        let gate_up_w = extract_expert_weights(moe.experts_gate_up, ei, 2 * inter, hidden);
-        let gate_w = &gate_up_w[..inter * hidden];
-        let up_w = &gate_up_w[inter * hidden..];
-
-        let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
-        let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
-
-        // Gated activation: ACT(gate) * up.  Gemma 4 uses GELU-tanh; Mixtral uses SiLU.
-        let hidden_state: Vec<f32> = gate_out.iter().zip(up_out.iter())
-            .map(|(&g, &u)| match moe.activation {
-                crate::Activation::GeluTanh => gelu_tanh(g) * u,
-                _ => silu(g) * u,
-            })
-            .collect();
-
-        let down_w = extract_expert_weights(moe.experts_down, ei, hidden, inter);
-        let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter);
-
-        for (acc, &val) in expert_out.iter_mut().zip(expert_contribution.iter()) {
-            *acc += val * weight;
+    for (weight, contribution) in &per_expert {
+        for (acc, &val) in expert_out.iter_mut().zip(contribution.iter()) {
+            *acc += val * *weight;
         }
     }
 
