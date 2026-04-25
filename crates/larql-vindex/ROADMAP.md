@@ -2,10 +2,11 @@
 
 ## Current State
 
-- 146 tests passing, 0 build warnings
+- 167 unit tests + 137 integration tests passing, 0 build warnings
 - 3 storage formats: f32, Q8, Q4_K/Q6_K (Ollama-compatible)
 - Mmap zero-copy with adaptive residency
-- HNSW graph index for sub-linear KNN
+- HNSW graph index wired into `gate_knn` (opt-in via `--hnsw`)
+- Q4_K dequant cache LRU-bounded via `--max-q4k-cache-layers`
 - Patch system for editable knowledge
 
 ## P0: Decode-path performance
@@ -14,11 +15,16 @@ Items raised by the 2026-04-25 perf audit (see PERFORMANCE.md and the
 `gpu_forward_gap` memo). Vindex-side only — Metal kernel work lives in
 larql-compute's roadmap.
 
-### Bound the Q4_K dequant cache (LRU like gate cache)
+### Bound the Q4_K dequant cache (LRU like gate cache) — DONE
 **Impact**: Caps CPU-fallback RAM at a configurable budget (worst-case
 today: 10.7 GB on 4B / ~110 GB on 31B if all layers cache fully)
 **Effort**: Low
-**Status**: Not started
+**Status**: ✅ Complete (2026-04-25)
+- `set_q4k_ffn_cache_max_layers` API + LRU eviction in `walk.rs`
+- `q4k_ffn_cache_stats` diagnostic, surfaced via `larql bench -v`
+- `--max-q4k-cache-layers N` flag on `larql serve`
+- Confirmed empirically: Metal full-K decode never populates the cache
+  (`q4k_ffn_cache after larql-metal: 0 populated slots, 0.0 MB`)
 
 **Finding from 2026-04-25 audit**: the Metal hot path never populates
 `q4k_ffn_cache` (`larql bench --backends metal -v` reports
@@ -48,53 +54,51 @@ cache:
    for a CPU-only Gemma 3 4B server (≈ 840 MB ceiling for the down
    leg; gate/up dequant aren't on the hot path).
 
-### Q4_K interleaved madvise + per-layer prefetch
+### Q4_K interleaved madvise + per-layer prefetch — DONE
 **Impact**: Free win on cold-page first-token latency; small steady-state
 **Effort**: Low
-**Status**: Not started
+**Status**: ✅ Complete (2026-04-25)
+- `prefetch_interleaved_q4k_layer` added to `walk.rs` (manifest-aware
+  for mixed Q4_K/Q6_K layouts; uniform-stride fallback otherwise)
+- Wired into `walk_ffn/sparse.rs` (hot path) and
+  `walk_ffn/interleaved_q4k.rs` (dequant fallback)
+- Trait surface: `GateIndex::prefetch_interleaved_q4k_layer`
 
-`load_interleaved_q4k` (`walk.rs:235`) opens with `mmap_demand_paged`
-(MADV_RANDOM) but the decode loop reads every layer once per token in
-order. The Q4_0 path already has `prefetch_interleaved_q4_layer`
-(`walk.rs:649`) issuing MADV_WILLNEED for layer N+1 while N computes —
-mirror it for Q4_K (`prefetch_interleaved_q4k_layer`) and call it from
-the inference walk. Consider switching Q4_K's initial advise to
-SEQUENTIAL since the access pattern is linear over layers within a
-token.
+### Audit `save_gate_vectors` 1.4 → 2.0 ms regression — DONE (false alarm)
+**Status**: ✅ Resolved (2026-04-25) — not a regression
+- Criterion's own change report flagged `p = 0.21 > 0.05` ("No change
+  in performance detected"); the eyeballed 40% drift was inside the CI
+- `git log` shows no functional changes to the save path since
+  2026-04-07 (only sibling additions: `set_up_vector`, etc.)
 
-### Audit `save_gate_vectors` 1.4 → 2.0 ms regression
-**Impact**: 40% slip on a build-time hot path
-**Effort**: Low
-**Status**: Not started
-
-`save_load/save_gate_vectors` was 1.4 ms in 2026-04-07's PERFORMANCE.md,
-1.99 ms in 2026-04-25 criterion run on the same dimensions. Bisect via
-`git log -p crates/larql-vindex/src/format/save.rs` since 2026-04-07.
-
-### Lift gate KNN out of brute-force on the decode hot path
-**Impact**: 64-expert MoE 230 → ~30 ms gate KNN/layer (HNSW table)
+### Lift gate KNN out of brute-force on the decode hot path — DONE
+**Impact**: 64-expert MoE 230 → ~60 ms gate KNN/layer (search + re-rank)
 **Effort**: Medium
-**Status**: Index built, not wired
+**Status**: ✅ Complete (2026-04-25)
+- `gate_knn_hnsw` was already routed in `gate_knn` behind
+  `hnsw_enabled`. Two production fixes landed:
+  1. **Zero-copy view** for f32-mmap layers — was cloning the entire
+     gate matrix per query (~100 MB on Gemma 3 4B) defeating mmap
+  2. **Abs-magnitude ranking parity** — brute uses `|dot|`, HNSW
+     ranked by signed dot, systematically dropping large-negative
+     features. Now oversamples 4× and re-ranks at the seam to match
+- New end-to-end smoke test (`gate_knn_hnsw_smoke`) verifies
+  enable/disable cycle restores brute results bit-for-bit
+- `--hnsw` + `--hnsw-ef-search` flags on `larql serve`
+- **Caveat**: HNSW is approximate (recall 80–95%). Default off; opt-in
+  for high-feature MoE where brute gemv dominates
 
-`index/hnsw.rs` exists and the `q4k_vs_f32` bench already shows HNSW
-beats brute force at 1024–28K features. Decode currently calls
-`gate_walk` → `gate_knn` (full BLAS gemv). For dense 4B–8B the gemv
-ceiling is fine; for high-expert MoE it dominates. Wire HNSW behind an
-opt-in flag on `VectorIndex` and validate ranking parity vs brute on a
-held-out feature set before defaulting on.
-
-### Bench rig hygiene — fail fast under host contention
+### Bench rig hygiene — fail fast under host contention — DONE
 **Impact**: Makes regression detection meaningful again
 **Effort**: Low
-**Status**: Not started
-
-`production_knn_per_layer` swung 4.56 → 8.58 ms run-to-run on
-2026-04-25 because `larql-server` (6 GB RSS) and `larql-router` were
-sharing cores. Add a precondition to `vindex_scaling`: refuse to run
-if `pgrep -f 'larql-(server|router)'` returns non-empty, and surface a
-warning if `pmset -g therm` reports throttling. Move scaling to its
-own `make bench-scaling` target so it doesn't run back-to-back with
-`vindex_ops` (which leaves the M3 Max thermal budget cooked).
+**Status**: ✅ Complete (2026-04-25)
+- `vindex_scaling` calls `refuse_under_contention()` at every bench
+  group entry; refuses with non-zero exit if `pgrep -fl
+  'larql-(server|router)'` matches
+- `LARQL_BENCH_ALLOW_DAEMONS=1` env override for intentional in-flight
+  benching
+- `make bench-vindex` (synthetic, safe) and `make bench-vindex-scaling`
+  (production-dim, daemon-checked) split as separate targets
 
 ## P0: Support Cached Layer Decode
 

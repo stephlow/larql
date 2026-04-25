@@ -2,11 +2,25 @@
 
 use metal::ComputePipelineState;
 
+use crate::metal::kernel::KernelHandle;
+
 /// Pipeline states for Q4 operations — compiled from modular shaders.
+///
+/// `matvec` is a [`KernelHandle`] because its kernel uses simdgroup
+/// row-tiling — the dispatcher must agree with the kernel's hardcoded
+/// row map. The handle bundles geometry with the pipeline so they
+/// cannot drift apart (see `metal::kernel` module docs).
+///
+/// `vecmat` and `f32_matvec` use flat `dispatch_threads` and don't
+/// have per-TG row geometry; bare [`ComputePipelineState`] is enough.
 pub struct Q4Pipelines {
-    pub matvec: ComputePipelineState,       // Q4 × Q8 matvec (optimised simdgroup)
-    pub vecmat: ComputePipelineState,       // Q4 vector-matrix (scatter)
-    pub f32_matvec: ComputePipelineState,   // Q4 × f32 matvec (transposed down)
+    /// Q4 × Q8 matvec (simdgroup-tiled, currently `q4_matvec_v4`).
+    pub matvec: KernelHandle,
+    /// Q4 vector-matrix scatter (flat dispatch, currently `q4_vecmat`).
+    pub vecmat: ComputePipelineState,
+    /// Q4 × f32 matvec for transposed down projection (one thread
+    /// per output row, currently `q4_f32_matvec`).
+    pub f32_matvec: ComputePipelineState,
 }
 
 /// Pre-quantize f32 vector to Q8_0 (int8 + per-block f32 scale).

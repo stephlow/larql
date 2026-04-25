@@ -10,12 +10,6 @@ use std::ffi::c_void;
 use metal::*;
 
 use crate::metal::buffers::BufferCache;
-// Geometry constants must come from the same shader module the matvec
-// pipeline is built from in `metal/mod.rs` (currently q4_matvec_v4).
-// Importing from a different shader silently desyncs num_tgs from the
-// kernel's row-mapping → 75 %-row drop. See ops/q4_matvec.rs and
-// test_kernel_lm_head_gemv::q4_matvec_dispatch_geometry_matches_v4_kernel.
-use crate::metal::shaders::q4_matvec_v4 as shader;
 use super::q4_common::{Q4Pipelines, quantize_to_q8};
 
 /// Batched gate+up for ALL seq positions in ONE GPU submission.
@@ -34,9 +28,13 @@ pub fn pair_batch(
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let n_val = num_rows as u32;
     let k_val = hidden as u32;
-    let num_tgs = (num_rows as u64).div_ceil(shader::ROWS_PER_TG);
+    // Geometry travels with the kernel — read both sides from the
+    // same `KernelHandle` to guarantee num_tgs and threads_per_tg
+    // agree with what the kernel was compiled for.
+    let kernel = &pipelines.matvec;
+    let num_tgs = (num_rows as u64).div_ceil(kernel.rows_per_tg);
     let grid = MTLSize::new(num_tgs, 1, 1);
-    let tg_size = MTLSize::new(shader::THREADS_PER_TG, 1, 1);
+    let tg_size = MTLSize::new(kernel.threads_per_tg, 1, 1);
     let out_bytes = (num_rows * 4) as u64;
 
     let buf_gate = bufs.get_bytes(gate_q4);
@@ -57,7 +55,7 @@ pub fn pair_batch(
 
         // Gate
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.matvec);
+        enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(&buf_gate), 0);
         enc.set_buffer(1, Some(&buf_q8), 0);
         enc.set_buffer(2, Some(&buf_scales), 0);
@@ -69,7 +67,7 @@ pub fn pair_batch(
 
         // Up
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.matvec);
+        enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(&buf_up), 0);
         enc.set_buffer(1, Some(&buf_q8), 0);
         enc.set_buffer(2, Some(&buf_scales), 0);
@@ -150,7 +148,7 @@ pub fn multi_layer_ffn(
     for l in 0..num_layers {
         // Gate
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.matvec);
+        enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(&gate_bufs[l]), 0);
         enc.set_buffer(1, Some(&q8_bufs[l]), 0);
         enc.set_buffer(2, Some(&q8s_bufs[l]), 0);
@@ -162,7 +160,7 @@ pub fn multi_layer_ffn(
 
         // Up
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.matvec);
+        enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(&up_bufs[l]), 0);
         enc.set_buffer(1, Some(&q8_bufs[l]), 0);
         enc.set_buffer(2, Some(&q8s_bufs[l]), 0);

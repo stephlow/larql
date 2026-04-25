@@ -98,6 +98,21 @@ struct Cli {
     #[arg(long, default_value = "0")]
     max_q4k_cache_layers: usize,
 
+    /// Use HNSW for gate KNN instead of brute-force matmul. Indexes
+    /// are built lazily per layer on first query. Approximate (recall
+    /// drops from 100% to 80–95% depending on `--hnsw-ef-search`); the
+    /// retrieval ranks by |dot| like the brute path, but oversamples
+    /// HNSW and re-ranks at the seam. Wins for high-feature MoE
+    /// (64-expert ≈ 230 → 60 ms/layer); break-even or net loss for
+    /// dense ≤ 10K-feature models.
+    #[arg(long)]
+    hnsw: bool,
+
+    /// HNSW beam width. Higher = better recall, slower search. 50 is
+    /// the floor; 200 is the default; 400 is the practical ceiling.
+    #[arg(long, default_value = "200")]
+    hnsw_ef_search: usize,
+
     /// Ask the kernel to drop resident mmap pages after each walk-ffn
     /// request (calls `madvise(MADV_DONTNEED)` on every mapping). On
     /// Linux RSS drops immediately; on Darwin the kernel may defer.
@@ -187,6 +202,7 @@ fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn load_single_vindex(
     path_str: &str,
     no_infer: bool,
@@ -195,6 +211,7 @@ fn load_single_vindex(
     layer_range: Option<(usize, usize)>,
     max_gate_cache_layers: usize,
     max_q4k_cache_layers: usize,
+    hnsw: Option<usize>,
     release_mmap_after_request: bool,
     expert_filter: Option<(usize, usize)>,
 ) -> Result<LoadedModel, BoxError> {
@@ -220,6 +237,10 @@ fn load_single_vindex(
     if max_q4k_cache_layers > 0 {
         index.set_q4k_ffn_cache_max_layers(max_q4k_cache_layers);
         info!("  Q4K FFN cache: LRU, max {} layers", max_q4k_cache_layers);
+    }
+    if let Some(ef) = hnsw {
+        index.enable_hnsw(ef);
+        info!("  HNSW gate KNN: enabled (ef_search={ef})");
     }
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
 
@@ -385,13 +406,15 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, cli.release_mmap_after_request, expert_filter) {
+            let hnsw = if cli.hnsw { Some(cli.hnsw_ef_search) } else { None };
+            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.release_mmap_after_request, expert_filter) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
-        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, cli.release_mmap_after_request, expert_filter)?;
+        let hnsw = if cli.hnsw { Some(cli.hnsw_ef_search) } else { None };
+        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.release_mmap_after_request, expert_filter)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());

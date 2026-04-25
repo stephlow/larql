@@ -390,100 +390,91 @@ Worth doing for the Act 2 demo but non-trivial. See
 
 ## P1 — Loose ends in shipped features
 
-### Metal `q4_matvec_v4` drops 75 % of rows at vocab scale (open)
+### `compute` crate hygiene — six follow-ups from the q4_matvec_v4 review
 
-Surfaced and bisected 2026-04-25. Production decode on tied-embedding
-models (Gemma 3 4B, Gemma 4 31B) emits *different first tokens* on
-CPU vs Metal — `larql run` against Gemma 3 4B with the auto-router
-picks one token under Metal and a totally different one under CPU.
+The 75 %-row-drop bug (closed 2026-04-25, see ship log) was a
+symptom: dispatch geometry constants imported separately from the
+pipeline kernel name, so the two could silently desync. Walking the
+crate to look for the same bug class in other shaders surfaced
+several modularity/maintainability issues. Each is its own follow-up.
 
-**Symptom (`test_logits_goldens.rs`).** On the prompt
-`"The capital of France is"`:
+#### P0a — Stamp pipeline + geometry on a single handle (open)
 
-- **Llama 2 7B / Mistral 7B v0.1** — CPU and Metal produce
-  bit-identical top-5 (`[263, 278, 697, 3681, 884]` for Llama;
-  `[5465, 264, 272, 5651, 624]` for Mistral). Same top-1 logit
-  (29.99 / 1.45) on both backends. Clean.
-- **Gemma 3 4B / Gemma 4 31B (tied embed)** — CPU and Metal produce
-  *completely different* top-5 sets. e.g. Gemma 3 4B: Metal top-1
-  token 50429 (logit 2874); CPU top-1 token 256240 (logit 3632) —
-  different magnitudes, different parts of the 262K vocab.
+Today `Q4Pipelines.matvec` is a bare `ComputePipelineState`; geometry
+constants (`ROWS_PER_TG`, `THREADS_PER_TG`) are imported separately
+from the shader module name at every dispatch site. There were 6
+sites, all hand-wired to `crate::metal::shaders::q4_matvec` while the
+pipeline was actually built from `q4_matvec_v4` — that mismatch is
+exactly how the row-drop bug landed. Other shaders with the same
+shape (`q4k_matvec`, `q4kf_qkv_proj`, `q6k_matvec`, `q4k_ffn_gate_up`)
+have the same latent risk.
 
-The per-layer parity tests (`test_cpu_metal_parity`,
-`test_decode_consistency`, `test_decode_stage_bisect`) all pass on
-Gemma 3 4B / Gemma 4 31B with `cos=1.0` through `down_out` — so
-prefill is clean across backends. The divergence is in the LM-head
-step that runs after.
+Replace bare pipelines with `KernelHandle { state, rows_per_tg,
+threads_per_tg, name }`. Dispatchers read `q4.matvec.rows_per_tg` —
+single source of truth, swap kernel = swap struct field. Pinned by a
+contract test like `q4_matvec_dispatch_geometry_matches_v4_kernel`
+applied to every shader family.
 
-**Root cause (`test_kernel_lm_head_gemv.rs`, gated on
-`LARQL_RUN_LM_HEAD_BISECT=1` because it allocates a 2.68 GB f32
-matrix).** Two suspects, ruled out then ruled in:
+#### P0b — Delete unused `q4_matvec_v2/v3/v5` shaders (open)
 
-1. **`f32_gemv` at vocab scale (262 144 × 2 560)** — bit-equivalent
-   between CPU and Metal. Top-5 match in identical order, top-1 logit
-   Δ = 2.4 e-7 (rel 7.6 e-8). `f32_gemv_cpu_vs_metal_at_vocab_scale`
-   pins this clean. Cleared.
-2. **`q4_matvec_v4` (Q4_0 + Q8 query) at vocab scale** — **the
-   cause.** Metal silently computes only **~25 % of rows** — exactly
-   2 rows per TG out of the intended 8. The remaining 75 % of the
-   output stays at 0.0. `q4_matvec_cutoff_sweep` confirms this
-   across N from 8 000 to 262 144; the 25 % ratio is constant.
+Five `q4_matvec_v*` files in `crates/larql-compute/src/metal/shaders/`,
+only `_v4` is wired up. v2/v3/v5 are dead weight, all reachable by
+name from `library.get_function()` — the row-drop bug literally was
+importing the *wrong* one's constants. Delete v2/v3/v5; if any are
+still useful for benchmarking move them under `experimental/` behind
+a feature flag.
 
-   The pipeline's `maxTotalThreadsPerThreadgroup` is 1024 (queried at
-   runtime — `q4_matvec_pipeline_max_threads_per_tg` reports it), so
-   the dispatch's requested 256 threads-per-TG isn't being clamped at
-   the pipeline level. Yet only 2 of the 8 simdgroups fire per TG.
-   Likely candidates: a `dispatch_thread_groups` vs `dispatch_threads`
-   semantics mismatch in the encode wrapper, or per-thread register
-   pressure in the heavy-integer-arithmetic inner loop silently
-   spilling simdgroups. Both need a closer look at the shader +
-   dispatch site (`crates/larql-compute/src/metal/shaders/q4_matvec_v4.rs`,
-   `crates/larql-compute/src/metal/ops/q4_matvec.rs`).
+#### P1a — Unify per-quant matvec into one `quant_matvec` trait method (open)
 
-**Why only Gemma 3 / Gemma 4 hit it.** `lm_head_knn_backend` has
-three paths (Q4 → f16 → f32). Tied-embedding models (Gemma 3/4)
-build `lm_head_q4_synth` from the f16 embedding table and route
-through `backend.q4_matvec` at full vocab — that's the broken path.
-Llama 2 / Mistral ship with a separate `lm_head` matrix and fall
-through to the f32 path which is clean.
+`ComputeBackend` has separate `q4_matvec`, `q4k_matvec`, `q6k_matvec`
+methods (and CPU has internal `q8_matvec`, FP4 will need its own).
+Adding a quant touches 7-9 places: cpu kernel + metal shader + metal
+op + pipeline field + trait method + cpu impl + metal impl +
+`QuantFormat` enum + `prefill::encode_quant_matvec_at_offset` +
+`metal/stages/quant_matvec.rs`. The match-on-format already exists in
+`metal/stages/quant_matvec.rs:36-133`; lift it to the trait. Adding
+FP4 should drop to 1 enum variant + 1 match arm + 1 shader + 1 cpu
+kernel.
 
-**What this affects right now.** `larql run` / `larql chat` against
-Gemma 3 4B or Gemma 4 31B may produce different first tokens
-depending on which backend the auto-router picks. Behaviour stays
-in-distribution (the architecture goldens still pass — the model
-emits sensible tokens either way), but the two backends aren't
-reproducing each other's argmax.
+#### P1b — Criterion bench suite covering all quants × cpu/metal (open)
 
-**Pinned by.**
-- `larql-inference/tests/test_logits_goldens.rs` — per-backend top-5
-  + top-1 logit goldens. Currently records *separate* goldens for CPU
-  and Metal on Gemma 3/4. After the fix, they should converge and the
-  per-backend split collapses to a single golden per arch.
-- `larql-compute/tests/test_kernel_lm_head_gemv.rs` — three gated
-  kernel tests. `f32_gemv_cpu_vs_metal_at_vocab_scale` passes (suspect
-  cleared); `q4_matvec_pipeline_max_threads_per_tg` is a probe;
-  `q4_matvec_cpu_vs_metal_at_vocab_scale` + `q4_matvec_cutoff_sweep`
-  both fail until the kernel/dispatch is fixed.
+Two criterion benches today (`benches/matmul.rs`, `benches/linalg.rs`)
+both CPU only. No Q4_K / Q6_K / Q4_KF / Q8_0 benches, no CPU-vs-Metal
+comparison at the same shape, no regression-detector bench (the
+75 %-row drop would have shown as a 4× throughput cliff on a Q4_0
+lm-head bench three weeks before goldens caught it). 26
+`examples/profile_*.rs` files do ad-hoc benchmarking with no
+historical baselines.
 
-**Path forward.** Two angles a Metal-shader-experienced contributor
-should try first:
+Consolidate into `benches/quant_matvec.rs` with groups per format
+(Q4_0, Q4_K, Q4_KF, Q6_K, Q8_0) × per shape (decode-token N=2560,
+prefill-seq=128, lm-head N=262144) × per backend (cpu, metal). HTML
+output under `target/criterion/`. Prune the profile examples.
 
-1. Replace `enc.dispatch_thread_groups((num_tgs, 1, 1), (256, 1, 1))`
-   with `enc.dispatch_threads((num_tgs * 256, 1, 1), (256, 1, 1))` at
-   the dispatch site. If the 25 % ratio disappears, the bug was in
-   the threadgroup-grid form's interaction with the pipeline's
-   register-occupancy schedule.
-2. Reduce ROWS_PER_TG to 2 (matching what's *actually* firing) and
-   re-benchmark — if performance is unchanged, the kernel was
-   silently scheduling at 64 threads-per-TG anyway. If perf drops,
-   the simdgroup-fan-out is genuinely needed and the dispatch path
-   is the real bug.
+#### P2a — Trait split + Capability enum (open)
 
-Either path lands a one-line fix once the right diagnosis is in
-hand. The kernel-level tests above pin both regressions and the
-recovery — running `LARQL_RUN_LM_HEAD_BISECT=1 cargo test
---release --features metal -p larql-compute --test
-test_kernel_lm_head_gemv` is enough to verify a fix.
+`ComputeBackend` is 27 methods, half are `Option<>`-returning
+capability probes mixing f32 matmul, per-quant matvec, KV cache, MoE,
+decode, prefill, profiling, MoE remote hook, split-profile timing.
+Split into smaller traits: `MatMul` (f32/f16), `QuantMatVec` (one
+method, dispatch on `QuantFormat`), `DecodeBackend` (token / prefill
+/ KV), `ProfileSplit`. Backends opt in via blanket impls or a
+capability bitset. Callers branch on `backend.supports(Capability::…)`
+instead of `Option::is_some()`.
+
+#### P2b — Decompose `ops/full_pipeline.rs`, drop `decode_profile.rs` (open)
+
+Three big files trending past comprehension:
+- `metal/ops/full_pipeline.rs` — 942 LOC
+- `metal/decode/mod.rs` — 707 LOC (already shrunk from 1080 in the
+  Decode-vs-prefill parity work; same pattern applies)
+- `metal/decode_profile.rs` — 567 LOC, looks like `decode/mod.rs`
+  plus per-stage timing (DRY violation)
+
+Apply the `encode_qkv` / `encode_ffn` extraction pattern to
+`full_pipeline.rs`. Replace `decode_profile.rs` with an opt-in
+`Profile` wrapper that decorates `decode/mod.rs` so timing logic
+isn't a duplicate decode path.
 
 ### `--compact` loader reconstruction — WalkFfn-only today
 
@@ -586,6 +577,61 @@ the attention weights taking a third of RAM.
 ---
 
 ## Done (ship log)
+
+### Metal `q4_matvec_v4` 75 %-row drop on tied-embedding LM-head — closed (2026-04-25)
+
+CPU and Metal disagreed on the next-token argmax for Gemma 3 4B and
+Gemma 4 31B because Metal's Q4_0 matvec was only writing 25 % of
+output rows at vocab scale. The other 75 % stayed at the buffer's
+zero-init value. Llama 2 / Mistral were unaffected (their LM head
+goes through the f32 path; Gemma 3/4 are tied-embedding and route
+through the synthesised Q4_0 path against the f16 embedding table).
+
+**Symptom.** `test_logits_goldens.rs` recorded *separate* CPU and
+Metal goldens on Gemma 3 4B (Metal top-1 = token 50429 logit 2874,
+CPU top-1 = token 256240 logit 3632) and Gemma 4 31B. Llama 2 +
+Mistral matched bit-for-bit across backends.
+
+**Root cause.** `ops/q4_matvec.rs` and 5 sibling dispatch sites
+imported geometry constants from `crate::metal::shaders::q4_matvec`
+(`ROWS_PER_TG=32`, `THREADS_PER_TG=1024`) — but the pipeline at
+`metal/mod.rs:124` was built from `q4_matvec_v4`, whose row mapping
+is hardcoded `row_idx = tg_id * 8 + sg_id`. `num_tgs = N/32` over-
+divided; each TG only consumed 8 unique row addresses; result =
+exactly `N/4` rows ever written. The "2 of 8 simdgroups firing"
+hypothesis in the original write-up was wrong — Metal *did* dispatch
+all 32 simdgroups, but v4's row map only consumed sg_id 0..7
+uniquely; the remaining sg_ids race-wrote rows already covered by
+the previous TG.
+
+**Fix.** One-line import change in 6 files: `use … shaders::q4_matvec`
+→ `use … shaders::q4_matvec_v4`. Diagnosed and shipped same day.
+
+**Pinned by.** `crates/larql-compute/tests/test_kernel_lm_head_gemv.rs`
+gained four new un-gated regression tests:
+- `q4_matvec_metal_writes_every_row_small_n` (N=1024 × K=256)
+- `q4_matvec_metal_writes_every_row_misaligned_n` (N=1027,
+  not a multiple of ROWS_PER_TG)
+- `q4_matvec_dispatch_geometry_matches_v4_kernel` (N=64 — the
+  smallest size where the geometry mismatch manifests)
+- `q4_matvec_pipeline_max_threads_per_tg` (asserts pipeline cap ≥
+  requested TG size; pre-fix this only logged, now it fails loudly)
+
+The two gated vocab-scale tests (`q4_matvec_cpu_vs_metal_at_vocab_scale`,
+`q4_matvec_cutoff_sweep`) gained assertions that every output row is
+non-zero. `q4_matvec_matches_cpu` in `test_metal_shaders.rs` (rows=10240)
+which had been silently failing with `max diff 1831` is now clean.
+
+`test_logits_goldens.rs` per-arch top-5 sets collapsed to one golden
+across CPU + Metal, as predicted in the original entry's "After the
+fix, they should converge."
+
+**Aftershocks.** The bug was a symptom of geometry constants imported
+separately from pipeline kernel name — six follow-ups landed in P1
+(`compute` crate hygiene) to kill the bug class entirely:
+`KernelHandle` consolidation, dead-shader cleanup, unified
+`quant_matvec`, criterion bench suite, trait split + capability enum,
+and decomposition of the three remaining oversized files.
 
 ### Decode-vs-prefill parity on Gemma 4 31B — closed (2026-04-25)
 

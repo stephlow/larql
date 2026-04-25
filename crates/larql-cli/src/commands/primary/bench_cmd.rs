@@ -22,6 +22,7 @@
 use std::time::Instant;
 
 use clap::Args;
+use larql_inference::engines::EngineKind;
 
 use crate::commands::primary::cache;
 
@@ -52,6 +53,12 @@ pub struct BenchArgs {
     /// model name (e.g. `gemma3:4b`). Requires `ollama serve` running.
     #[arg(long, value_name = "MODEL")]
     pub ollama: Option<String>,
+
+    /// Comma-separated KV engines to bench alongside the GPU path.
+    /// Supported: `markov-rs`, `unlimited-context`.
+    /// Example: `--engine markov-rs,unlimited-context`.
+    #[arg(long, value_name = "ENGINE,...")]
+    pub engine: Option<String>,
 
     /// Verbose load / warmup logging.
     #[arg(short, long)]
@@ -109,6 +116,30 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(ref ollama_model) = args.ollama {
         rows.push(run_ollama(ollama_model, &args.prompt, args.tokens));
+    }
+
+    // KV engine rows (CPU forward path, all engines comparable).
+    if let Some(ref engine_list) = args.engine {
+        let token_ids: Vec<u32> = {
+            let mut cb = larql_vindex::SilentLoadCallbacks;
+            let weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
+            let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
+            larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+                .map_err(|e| format!("tokenize: {e}"))?
+        };
+        let mut cb = larql_vindex::SilentLoadCallbacks;
+        let weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
+
+        for engine_name in engine_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            match EngineKind::from_name(engine_name) {
+                Some(kind) => {
+                    rows.push(run_engine(&weights, &token_ids, kind, &args)?);
+                }
+                None => {
+                    eprintln!("unknown engine {:?} — supported: markov-rs, unlimited-context", engine_name);
+                }
+            }
+        }
     }
 
     print_table(&rows);
@@ -242,6 +273,88 @@ fn run_larql(
 
 fn backend_name_for(metal: bool) -> &'static str {
     if metal { "larql-metal" } else { "larql-cpu" }
+}
+
+/// Run the CPU KV-engine bench path for a single engine kind.
+///
+/// Runs prefill on `token_ids` then decodes `args.tokens` steps with greedy
+/// argmax. Reports prefill time, avg decode time, and engine memory.
+fn run_engine(
+    weights: &larql_inference::ModelWeights,
+    token_ids: &[u32],
+    kind: EngineKind,
+    args: &BenchArgs,
+) -> Result<BenchRow, Box<dyn std::error::Error>> {
+    use larql_inference::forward::hidden_to_raw_logits;
+
+    let mut engine = kind.build();
+    let info = engine.info();
+    let label = format!("{} [{}]", info.name, info.backend);
+
+    if args.verbose {
+        eprintln!("[bench] engine: {}", info.summary());
+    }
+
+    // Prefill.
+    let t_pre = Instant::now();
+    let mut hidden = engine.prefill(weights, token_ids)
+        .ok_or("engine prefill failed")?;
+    let prefill_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+
+    // Decode loop: greedy argmax over vocab.
+    let max_steps = args.warmup + args.tokens;
+    let mut decode_ms_all: Vec<f64> = Vec::with_capacity(max_steps);
+    let mut last_token = {
+        let logits = hidden_to_raw_logits(weights, &hidden);
+        argmax_token(&logits)
+    };
+
+    for _ in 0..max_steps {
+        let t = Instant::now();
+        hidden = engine.decode_step(weights, last_token)
+            .ok_or("engine decode_step failed")?;
+        let step_ms = t.elapsed().as_secs_f64() * 1000.0;
+        decode_ms_all.push(step_ms);
+
+        let logits = hidden_to_raw_logits(weights, &hidden);
+        last_token = argmax_token(&logits);
+    }
+
+    let n_warm = args.warmup.min(decode_ms_all.len());
+    let measured = &decode_ms_all[n_warm..];
+    let measured_n = measured.len();
+    let (avg_decode_ms, tok_per_s) = if measured_n == 0 {
+        (0.0, 0.0)
+    } else {
+        let avg = measured.iter().sum::<f64>() / measured_n as f64;
+        (avg, 1000.0 / avg)
+    };
+
+    let mem_mb = engine.memory_bytes() as f64 / 1_048_576.0;
+    let note = format!("engine-mem={:.1}MB", mem_mb);
+
+    if args.verbose {
+        eprintln!("[bench] {} after decode: {}", info.name, engine.info().description);
+    }
+
+    Ok(BenchRow {
+        backend: label,
+        prefill_ms,
+        avg_decode_ms,
+        tok_per_s,
+        stages: None,
+        n_steps: measured_n,
+        note,
+    })
+}
+
+fn argmax_token(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 /// Query a local Ollama server for a one-shot generate at `n` tokens.

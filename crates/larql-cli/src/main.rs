@@ -321,6 +321,16 @@ struct ServeArgs {
     #[arg(long, default_value = "0")]
     max_q4k_cache_layers: usize,
 
+    /// Use HNSW for gate KNN instead of brute-force matmul. Approximate
+    /// (recall 80–95%); wins for high-feature MoE, neutral on dense 4B.
+    /// Pairs with `--hnsw-ef-search` to control the recall/speed knob.
+    #[arg(long)]
+    hnsw: bool,
+
+    /// HNSW beam width — higher = better recall, slower search.
+    #[arg(long, default_value = "200")]
+    hnsw_ef_search: usize,
+
     /// madvise(MADV_DONTNEED) on all mmaps after each walk-ffn request.
     /// Enforces a hard RSS bound alongside --max-gate-cache-layers at the
     /// cost of re-fault per request. Prefer --layers sharding for real
@@ -541,6 +551,11 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.max_q4k_cache_layers > 0 {
         cmd_args.push("--max-q4k-cache-layers".into());
         cmd_args.push(args.max_q4k_cache_layers.to_string());
+    }
+    if args.hnsw {
+        cmd_args.push("--hnsw".into());
+        cmd_args.push("--hnsw-ef-search".into());
+        cmd_args.push(args.hnsw_ef_search.to_string());
     }
     if args.release_mmap_after_request {
         cmd_args.push("--release-mmap-after-request".into());

@@ -22,6 +22,7 @@
 pub mod shaders;   // modular: shaders/mod.rs → one file per shader
 pub mod buffers;
 pub mod f32_ops;
+pub mod kernel;     // KernelHandle: pipeline + dispatch geometry, bundled
 pub mod ops;        // modular: ops/mod.rs → one file per operation
 pub mod stages;     // modular: stages/mod.rs → one file per pipeline stage
 pub mod calibrate;
@@ -40,6 +41,7 @@ use metal::*;
 use crate::backend::{ComputeBackend, MatMulOp};
 use buffers::BufferCache;
 use f32_ops::F32Ops;
+use kernel::KernelHandle;
 use ops::q4_common::Q4Pipelines;
 
 /// Metal GPU compute backend.
@@ -120,23 +122,33 @@ impl MetalBackend {
 
         let sgemm_fn = library.get_function("sgemm", None).ok()?;
         let transb_fn = library.get_function("sgemm_transb", None).ok()?;
-        // Use v4 (uint32 wide loads) as production Q4 matvec — 2× faster than v1
-        let q4_matvec_fn = library.get_function("q4_matvec_v4", None).ok()?;
-        let q4_vecmat_fn = library.get_function("q4_vecmat", None).ok()?;
 
         let f32_ops = F32Ops {
             sgemm_pipeline: device.new_compute_pipeline_state_with_function(&sgemm_fn).ok()?,
             transb_pipeline: device.new_compute_pipeline_state_with_function(&transb_fn).ok()?,
         };
 
-        let q4_f32_matvec_fn = library.get_function("q4_f32_matvec", None).ok()?;
         let geglu_fn = library.get_function("geglu_silu", None).ok()?;
         let q8_quant_fn = library.get_function("quantize_q8", None).ok()?;
         let causal_attn_fn = library.get_function("causal_attention", None).ok()?;
         let causal_attn_pipeline = device.new_compute_pipeline_state_with_function(&causal_attn_fn).ok()?;
 
+        // Q4 family pipelines.
+        //
+        // `matvec` is simdgroup-tiled. Its kernel name + row map +
+        // threads-per-TG live in `shaders/q4_matvec_v4.rs` via the
+        // `TiledKernel` impl on the `Kernel` marker; binding it here
+        // is one type-parameter line. To swap to a future v6, change
+        // `q4_matvec_v4::Kernel` → `q4_matvec_v6::Kernel` here and
+        // nothing else. See `metal::kernel` and the q4_matvec_v4
+        // 75 %-row-drop ship-log entry.
+        //
+        // `vecmat` and `f32_matvec` use flat `dispatch_threads` — no
+        // per-TG geometry, bare pipeline state is enough.
+        let q4_vecmat_fn = library.get_function("q4_vecmat", None).ok()?;
+        let q4_f32_matvec_fn = library.get_function("q4_f32_matvec", None).ok()?;
         let q4 = Q4Pipelines {
-            matvec: device.new_compute_pipeline_state_with_function(&q4_matvec_fn).ok()?,
+            matvec: KernelHandle::from_kernel::<shaders::q4_matvec_v4::Kernel>(&device, &library)?,
             vecmat: device.new_compute_pipeline_state_with_function(&q4_vecmat_fn).ok()?,
             f32_matvec: device.new_compute_pipeline_state_with_function(&q4_f32_matvec_fn).ok()?,
         };

@@ -686,6 +686,18 @@ impl VectorIndex {
     }
 
     /// Gate KNN via HNSW: graph search instead of brute-force matmul.
+    ///
+    /// Re-rank uses a zero-copy view onto the gate data when the layer
+    /// is f32-mmap'd; only the f16-mmap and heap paths fall back to
+    /// `gate_matrix_f32` (which clones). Dense 4B with f32 mmap pays
+    /// only the search cost; the 100 MB-per-query clone is gone.
+    ///
+    /// **Ranking semantics.** The brute-force `gate_knn` path returns
+    /// the top-K features by |dot| (absolute magnitude — matches the
+    /// gate-activation strength regardless of sign). HNSW's internal
+    /// rank is by signed dot, which would systematically drop
+    /// large-negative features. We oversample HNSW (4× top_k) and then
+    /// re-rank by abs at the seam to match the brute path's semantics.
     fn gate_knn_hnsw(
         &self,
         layer: usize,
@@ -695,19 +707,45 @@ impl VectorIndex {
         if !self.get_or_build_hnsw(layer) { return None; }
 
         let ef = self.hnsw_ef_search.load(std::sync::atomic::Ordering::Relaxed);
-
-        // We need both the HNSW index and the vectors for search
+        // Oversample so the abs-rank seam below has signed candidates
+        // from both tails to choose from.
+        let hnsw_k = top_k.saturating_mul(4).max(top_k);
         let cache = self.hnsw_cache.lock().unwrap();
         let hnsw = cache[layer].as_ref()?;
 
-        // Get gate matrix for dot product computation during search
-        let (data, num_features) = self.gate_matrix_f32(layer)?;
-        let view = ArrayView2::from_shape(
-            (num_features, self.hidden_size), &data
-        ).unwrap();
+        let mut candidates = if self.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32
+            && self.gate_mmap_bytes.is_some()
+        {
+            // Zero-copy view onto f32-mmap.
+            let mmap = self.gate_mmap_bytes.as_ref().unwrap();
+            let slice = self.gate_mmap_slices.get(layer)?;
+            if slice.num_features == 0 { return None; }
+            let byte_offset = slice.float_offset * 4;
+            let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
+            if byte_end > mmap.len() { return None; }
+            let data = unsafe {
+                let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
+                std::slice::from_raw_parts(ptr, slice.num_features * self.hidden_size)
+            };
+            let view = ArrayView2::from_shape(
+                (slice.num_features, self.hidden_size), data,
+            ).unwrap();
+            hnsw.search(&view, residual, hnsw_k, ef)
+        } else {
+            // Fallback (f16 mmap or heap): owned clone.
+            let (data, num_features) = self.gate_matrix_f32(layer)?;
+            let view = ArrayView2::from_shape(
+                (num_features, self.hidden_size), &data
+            ).unwrap();
+            hnsw.search(&view, residual, hnsw_k, ef)
+        };
 
-        let results = hnsw.search(&view, residual, top_k, ef);
-        Some(results)
+        // Re-rank by |dot| to match brute-force semantics.
+        candidates.sort_unstable_by(|a, b| {
+            b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(top_k);
+        Some(candidates)
     }
 
     /// Adaptive gate KNN — automatically picks the fastest path per layer.

@@ -3,6 +3,7 @@ extern crate blas_src;
 pub mod attention;
 pub mod capture;
 pub mod chat;
+pub mod engines;
 pub mod error;
 pub mod ffn;
 pub mod forward;
@@ -95,6 +96,11 @@ pub use layer_graph::{
 pub use vindex::{WalkFfn, WalkFfnConfig, FfnL1Cache, predict_q4k};
 pub use model::{load_model_dir, resolve_model_path, ModelWeights};
 pub use tokenizer::{decode_token, decode_token_raw, encode_prompt, load_tokenizer};
+
+// Engine re-exports.
+pub use engines::{EngineInfo, EngineKind, KvEngine};
+pub use engines::markov_residual::MarkovResidualEngine;
+pub use engines::unlimited_context::UnlimitedContextEngine;
 
 // Walker re-exports.
 pub use walker::attention_walker::{AttentionLayerResult, AttentionWalker};
