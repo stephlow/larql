@@ -4,7 +4,6 @@
 //! the dot-product → top-K compute.
 
 use ndarray::{Array1, Array2, ArrayView2};
-use larql_compute::ComputeBackend;
 
 use crate::index::core::VectorIndex;
 use crate::index::storage::gate_store::{gate_gemv_gpu, gate_matmul, gemv};

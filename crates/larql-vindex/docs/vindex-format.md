@@ -34,9 +34,16 @@ model.vindex/
 ├── interleaved_q4k.bin        Q4_K/Q6_K interleaved (optional)
 ├── interleaved_q4k_manifest.json  Per-tensor offsets for interleaved_q4k.bin
 │
+├── gate_vectors_fp4.bin       FP4 gate vectors (exp 26, optional)
+├── up_features_fp4.bin        FP4 up features (exp 26, optional)
+├── down_features_fp8.bin      FP8 down features — wider tail format (exp 26, optional)
+│
 ├── router_weights.bin         MoE router (optional, for MoE models)
 ├── relation_clusters.json     Discovered relation types (optional)
-└── feature_labels.json        Probe-confirmed labels (optional)
+├── feature_labels.json        Probe-confirmed labels (optional)
+│
+└── .extract_checkpoint.json   Auto-resume marker — written during streaming
+                               extract, deleted on success (transient)
 ```
 
 ## Extract Levels

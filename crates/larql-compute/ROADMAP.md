@@ -4,13 +4,21 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **68–69** | 14.5–14.8 | production extract; 4-elem batching in q6k_matvec |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **68** | 14.7 | production extract; q6k_matvec 4-elem rewrite + min-heap top-k |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
 | **Ollama** gemma3:4b | **100–105** | 9.5–10.0 | reference |
-| **Gap** | LARQL is 1.48–1.51× slower | +4.5ms/tok | per-stage decomposition below |
+| **Gap** | LARQL is 1.48–1.53× slower | +5ms/tok | per-stage decomposition below |
 
-GPU forward: **12.6–12.7ms** (was 14.3ms before q6k_matvec 4-element rewrite).
-LM head: **2.4ms** (85% GPU kernel, 15% CPU sort/overhead).
+Per-stage breakdown (larql-metal, gemma3-4b-q4k-v2, 100-token run):
+
+| Stage | ms/tok | % |
+|---|---|---|
+| GPU fwd | 12.7 | 84.8% |
+| lm_head | 2.3 | 15.1% |
+| embed + norm + detok | ~0.01 | ~0% |
+
+GPU fwd is 84% of decode time; FFN is ~87% of GPU fwd. The Q6_K down
+projection (2560×10240 per layer × 34 layers) is the dominant kernel.
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
@@ -62,35 +70,35 @@ pass a float input to a future `q6k_matvec_f32in` kernel (avoids
 the per-row `tanh` recomputation entirely while still fusing
 dispatch). ~50 LOC new shader.
 
-### #2 — Coalesce per-layer command encoders (open)
+### #2 — Single encoder per token (done — was already implemented)
 
-**Estimated gain: ~1.0ms/tok / ~7% / +5 tok/s.** Per-layer dispatch
-count is ~11 (input norm, QKV, QK-norm, RoPE, KV-append + attend, O,
-post-attn fused, gate+up, GEGLU, down, post-FFN). With ~5-8µs Metal
-command-encoder overhead per dispatch, ×34 layers = **1.9-3ms** of
-pure encoder overhead per token.
+**Status:** The decode loop already uses ONE encoder for ALL 34 layers
+(non-MoE path). The ROADMAP item was mislabelled — the actual overhead
+is per-`dispatch_thread_groups` call (~5-8µs each), not per-encoder.
+Current dispatch count: ~14 dispatches/layer × 34 = 476 dispatches/tok
+= ~2.4-3.8ms of dispatch overhead. Reducing requires kernel fusion.
 
-Ollama groups consecutive ops into the same encoder when possible.
-Refactor `decode_token_with_moe_fn` to issue ONE encoder per layer
-(or even per-token where MoE doesn't interleave CPU work), instead
-of one per stage. Medium-effort change in `metal/decode/mod.rs`.
+### #3 — Fused `rms_norm + QKV projection` for Q4_K/Q6_K path (open)
 
-### #3 — Fused `rms_norm + Q4_K matvec` for QKV input (open)
+**Estimated gain: ~0.2ms/tok (1 saved dispatch × 34 layers × 5-8µs).**
+Currently `encode_input_norm_and_qkv` runs two dispatches per layer:
+`rms_norm_pipeline` → f32 norm_out buffer → `q4k_q6k_qkv_proj`.
+The norm_out write/read is L2-cached (10 KB), so main saving is the
+dispatch. A fused `rms_norm_q4k_q6k_qkv` shader:
+- Phase 1 (all 128 threads cooperate): reduce `||h||²` / hidden
+- Phase 2 (each simdgroup independently): matvec with inline `h[i] / rms * w[i]`
+Effort: ~200 LOC MSL (cooperative reduction + two-format Q4K/Q6K paths).
+The revised estimate is ~0.2ms (not 0.4ms — norm_out is L2-cached).
 
-**Estimated gain: ~0.4ms/tok / ~3%.** Today's Q4_K attention path
-runs `rms_norm` then `q4k_qkv_proj` as separate dispatches. Q8 path
-already has `rms_norm_q8` (fused) — Q4_K never got the equivalent.
-A `rms_norm_q4k_qkv` shader saves one dispatch per layer × 34.
-Effort: ~100 LOC MSL.
+### #4 — LM head wrapper overhead (partial — heap done 2026-04-25)
 
-### #4 — LM head wrapper overhead (open)
-
-**Estimated gain: ~0.3ms/tok / ~2%.** Criterion shows the kernel
-runs at 1.55ms; observed end-to-end is 2.34ms. The 0.79ms gap is
-roughly: CPU `quantize_to_q8(query)` ~50µs, GPU dispatch+commit+wait
-~200µs, buffer readback (1 MB) ~150µs, partial-sort 262k → top-k
-~300µs. Move quantize to GPU, async readback, smaller heap-based
-top-k.
+**Remaining gain: ~0.1ms.** `backend_lm_head_topk`:
+- ~~partial-sort 262k → top-k~~ → **min-heap done**: avoids 2MB Vec allocation,
+  saves ~0.1ms (observed lm_head 2.38 → 2.27ms).
+- GPU dispatch+commit+wait: ~200µs — reducible with async readback.
+- Buffer readback (1 MB): ~150µs — async pipelining needed.
+- Remaining overhead after heap: ~0.35ms.
+The GPU kernel itself (1.55ms) is the irreducible floor.
 
 ### #5 — `q6k_matvec` 4-element batching (done 2026-04-25)
 
@@ -288,12 +296,6 @@ decode-loop prefill.
 
 ## P1: Production Hardening
 
-### CUDA backend
-**Effort**: Large  
-**Status**: Trait ready, no implementation
-
-ComputeBackend trait supports it. Need: CUDA buffer management, kernel ports for Q4_K/Q8 matvec, fused attention, KV cache.
-
 ### Streaming prefill
 **Effort**: Medium  
 **Status**: Prefill pipeline exists but uses CPU for KV cache population
@@ -305,6 +307,66 @@ The `prefill_q4` GPU pipeline runs the forward pass. KV cache is populated via C
 **Status**: Fixed at 4096 max_seq
 
 Current KV cache allocates for 4096 tokens at creation. Need dynamic growth or configurable max_seq for long-context inference.
+
+---
+
+## P1.5: Platform expansion
+
+**Prerequisite: performance parity with Ollama on Metal first.**
+These items are sequenced after the Metal gap closes (~1.0× vs Ollama),
+so platform users start with a competitive baseline.
+
+### Linux support
+**Effort**: Medium  
+**Status**: Not started
+
+larql-compute is Metal-only. The `ComputeBackend` trait and CPU fallback
+already compile on Linux (no Metal dependency at the trait level). Gaps:
+
+- `larql-compute` feature-gates: `#[cfg(feature = "metal")]` guards the
+  entire `metal::` module; the CPU path is the Linux baseline today.
+- `larql-cli` / `larql-inference`: a small number of `metal`-feature
+  entrypoints need `#[cfg(...)]` guards to build without Metal.
+- No build-system CI: add a GitHub Actions Linux matrix that builds all
+  crates without `--features metal` and runs the CPU test suite.
+
+Expected result: `cargo build -p larql-cli` (no features) works on
+Ubuntu 22.04 / 24.04 x86_64 and aarch64, with CPU-only decode.
+
+### Windows support
+**Effort**: Medium  
+**Status**: Not started
+
+Similar to Linux plus:
+- Path handling: a small number of `std::fs::File::create` /
+  `PathBuf::join` calls use `/tmp/` or Unix paths — audit and fix.
+- Symbol visibility: `extern "C"` symbols from BLAS need checked on
+  MSVC (MKL) and MinGW (OpenBLAS).
+- CI: Windows matrix in GitHub Actions using `windows-2022`.
+
+Expected result: `cargo build -p larql-cli` works on Windows 11
+x86_64 (MSVC toolchain) with CPU-only decode.
+
+### CUDA backend (re-land from earlier PR)
+**Effort**: Large  
+**Status**: Trait ready, implementation was in an earlier PR — needs
+        cherry-pick + rebase onto current `ComputeBackend` trait.
+
+An earlier PR implemented CUDA kernels but was not merged. Current
+`ComputeBackend` trait supports the interface; the Metal decode loop
+(`decode_token_with_moe_fn`) provides the implementation template.
+
+Scope to re-land:
+1. `cuda::` module gated on `--features cuda` (mirrors `metal::` module).
+2. Buffer management via `cuMemAlloc` / `cuMemcpy` under unified-memory
+   or explicit device buffers.
+3. Kernel ports: `q4k_matvec`, `q6k_matvec`, fused attention (FlashAttention
+   or a clean CUDA port of the Metal `kv_attention` kernel), `rms_norm`.
+4. `DecodeBackend` impl wired into `decode_token_with_moe_fn`.
+5. `larql bench --backends cuda` path in the CLI.
+
+Target: competitive with llama.cpp on a single A100 / H100 for
+Gemma 3 4B and Gemma 4 27B (the models already validated on Metal).
 
 ## P2: Research
 

@@ -28,9 +28,12 @@ use crate::format::filenames::{
 };
 use crate::mmap_util::{mmap_demand_paged, mmap_optimized};
 
-/// Feature store methods for VectorIndex.
-
 // ── FfnStore composed-substore ─────────────────────────────────────────
+
+/// Per-layer Q4_K/Q6_K FFN dequant cache: outer index = layer, inner array =
+/// `[gate, up, down]`. `Arc` shares the decoded matrix across `VectorIndex`
+/// clones; `Mutex` guards LRU eviction.
+pub type Q4kFfnCache = Mutex<Vec<[Option<Arc<Vec<f32>>>; 3]>>;
 
 pub struct FfnStore {
     /// Feature-major down projections (f32 mmap).
@@ -51,7 +54,7 @@ pub struct FfnStore {
     /// `[intermediate × hidden]` matrix for component `c`
     /// (0=gate, 1=up, 2=down). LRU-bounded by
     /// `q4k_ffn_cache_max_layers`.
-    pub q4k_ffn_cache: Mutex<Vec<[Option<Arc<Vec<f32>>>; 3]>>,
+    pub q4k_ffn_cache: Q4kFfnCache,
     /// LRU of layers held in `q4k_ffn_cache`. Front = newest.
     pub q4k_ffn_cache_lru: Mutex<std::collections::VecDeque<usize>>,
     /// Cap on `q4k_ffn_cache`. 0 = unlimited (default).

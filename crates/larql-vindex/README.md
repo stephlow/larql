@@ -353,7 +353,7 @@ Load dequantises to f32 at mmap time and inserts into `weights.tensors`.
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 306 tests (169 unit + 137 integration; all green as of 2026-04-25)
+cargo test -p larql-vindex                                                      # 328 tests (180 unit + 148 integration; all green as of 2026-04-25)
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -392,7 +392,7 @@ cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 
-Test coverage (306 tests):
+Test coverage (328 tests):
 - Construction, dimensions, layer counts, feature counts
 - Gate KNN: brute-force, f32, Q4 via compute backend, top-K ordering
 - Gate walk: BLAS gemv path matches brute-force KNN
@@ -507,9 +507,9 @@ pinned layers skip PCIe transfers and the gradient steepens.
 ## Status
 
 ```
-Tests:      146 passing (41 clustering + 7 HNSW + 98 main)
-Warnings:   0 (build)
-Formats:    f32, Q8_0, Q4_K, Q6_K, Q4_0
+Tests:      328 passing (180 unit + 148 integration; clippy clean as of 2026-04-25)
+Warnings:   0 (build), 0 (clippy --all-targets)
+Formats:    f32, Q8_0, Q4_K, Q6_K, Q4_0, FP4, FP8
 Models:     Gemma 2/3/4, Llama, Mistral, Mixtral, Qwen, Phi, DeepSeek, Granite, StarCoder2, GPT-OSS, GPT-2
 ```
 

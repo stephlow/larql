@@ -497,9 +497,11 @@ mod tests {
 
     #[test]
     fn bucket_compliance_fraction() {
-        let mut b = Bucket::default();
-        b.ratios = vec![1.5, 2.0, 3.0, 18.0];
-        b.all_zero_blocks = 1;
+        let b = Bucket {
+            ratios: vec![1.5, 2.0, 3.0, 18.0],
+            all_zero_blocks: 1,
+            ..Default::default()
+        };
         // total = 5; under 16 = 3 non-zero + 1 all-zero = 4; 4/5 = 0.8.
         assert!((b.compliance_at(16.0) - 0.8).abs() < 1e-9);
         assert!((b.compliance_at(20.0) - 1.0).abs() < 1e-9);

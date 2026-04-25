@@ -260,7 +260,6 @@ pub fn fetch_collection_items(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::is_hf_path;
 
     #[test]

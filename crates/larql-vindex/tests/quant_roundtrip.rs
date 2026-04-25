@@ -5,10 +5,10 @@
 //! inside published tolerances. Catches the silent-fallback class:
 //!
 //! - "I added Q5_K's quantize but forgot the dequantize entry in
-//!    `quant::registry`" — round-trip would diverge bit-for-bit
+//!   `quant::registry`" — round-trip would diverge bit-for-bit
 //! - "Block layout drifted by one byte" — element-wise error explodes
 //! - "Scale encoding changed format" — bias/sign error shows up in
-//!    aggregate stats
+//!   aggregate stats
 //!
 //! Per-format tolerance bounds are loose enough to absorb expected
 //! quantisation noise but tight enough that a real codec break trips
@@ -147,7 +147,7 @@ fn q6_k_roundtrip_many_blocks() {
 /// reconstructed values would be coarser.
 #[test]
 fn q6_k_more_accurate_than_q4_k() {
-    let original = synth_block(256, 0x6_bea7_4u64);
+    let original = synth_block(256, 0x006b_ea74_u64);
     let q4 = dequantize_q4_k(&quantize_q4_k(&original), 256).unwrap();
     let q6 = dequantize_q6_k(&quantize_q6_k(&original), 256).unwrap();
 

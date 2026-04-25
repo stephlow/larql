@@ -89,21 +89,47 @@ fn backend_lm_head_topk(
         };
     }
 
-    let mut indexed: Vec<(u32, f32)> = scores_vec
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, s)| (i as u32, s))
-        .collect();
-    let k = top_k.min(indexed.len());
-    if k > 0 && k < indexed.len() {
-        indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        indexed.truncate(k);
-    }
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.retain(|(_, s)| s.is_finite());
+    // Min-heap of size k: O(k) space, O(N log k) time.
+    // Avoids allocating the full 262K×8=2MB indexed Vec.
+    let k = top_k.min(vocab);
     let _ = vocab;
-    indexed
+    let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+
+    // sift-down to maintain min-heap property (smallest score at index 0).
+    fn sift_down(h: &mut [(f32, u32)], mut i: usize) {
+        let n = h.len();
+        loop {
+            let mut smallest = i;
+            let l = 2 * i + 1;
+            let r = 2 * i + 2;
+            if l < n && h[l].0 < h[smallest].0 { smallest = l; }
+            if r < n && h[r].0 < h[smallest].0 { smallest = r; }
+            if smallest == i { break; }
+            h.swap(i, smallest);
+            i = smallest;
+        }
+    }
+
+    for (i, &s) in scores_vec.iter().enumerate() {
+        if !s.is_finite() { continue; }
+        if heap.len() < k {
+            heap.push((s, i as u32));
+            if heap.len() == k {
+                // Build min-heap in O(k)
+                for j in (0..k / 2).rev() { sift_down(&mut heap, j); }
+            }
+        } else if s > heap[0].0 {
+            heap[0] = (s, i as u32);
+            sift_down(&mut heap, 0);
+        }
+    }
+    // If we gathered fewer than k finite values, still heapify.
+    if heap.len() < k && heap.len() > 1 {
+        for j in (0..heap.len() / 2).rev() { sift_down(&mut heap, j); }
+    }
+
+    heap.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    heap.into_iter().map(|(s, i)| (i, s)).collect()
 }
 
 /// Kept for the `LARQL_METAL_COMPARE_CPU=1` diagnostic mode which wants a
