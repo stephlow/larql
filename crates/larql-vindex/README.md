@@ -428,6 +428,8 @@ reports go to `target/criterion/`.
 | `gate_knn_batch / seq256_10240f×2560h` (prefill) | **8.44 ms** (-24 % via parallel per-position top-K) |
 | `hnsw_warmup / dense-8L-10240×2560 / serial` | 395 ms |
 | `hnsw_warmup / dense-8L-10240×2560 / parallel` | **109 ms** (3.6× via `warmup_hnsw_all_layers`) |
+| `q4k_down / cache+transpose / K=100` (Gemma 4B Q4_K) | 77.6 ms |
+| `q4k_down / feature_major / K=100` (Gemma 4B Q4_K) | **31.8 µs** (2440× via `down_features_q4k.bin`, opt-in at extract) |
 | `feature_meta_lookup` (per call) | ~245 ns |
 | `mutate / set_meta_plus_gate` | 301 ns |
 | `save_load / save_gate_vectors` | 2.01 ms |

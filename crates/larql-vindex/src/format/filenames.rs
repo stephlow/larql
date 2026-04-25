@@ -30,6 +30,24 @@ pub const DOWN_META_BIN: &str = "down_meta.bin";
 pub const DOWN_FEATURES_BIN: &str = "down_features.bin";
 pub const UP_FEATURES_BIN: &str = "up_features.bin";
 
+/// Feature-major Q4_K-encoded down projections (W2 of perf round-4).
+///
+/// On-disk PyTorch `nn.Linear` orientation for down is
+/// `[hidden, intermediate]`, so a single feature's down vector requires
+/// gathering across `hidden` separate rows — there is no per-feature
+/// row decode. The legacy code path (`q4k_ffn_layer` + cache) amortises
+/// this by dequantising the whole layer to f32 and transposing once.
+///
+/// Emitting `down_features_q4k.bin` at extract time stores down already
+/// in feature-major `[intermediate, hidden]` orientation, Q4_K-encoded.
+/// Per-feature decode becomes a single row dequant — no cache, no
+/// transpose, no ~840 MB heap ceiling on Gemma 4B. The disk cost is
+/// roughly the same as the down portion of `interleaved_q4k.bin` (~14
+/// MB / layer at Gemma 4B dims). Opt-in via `Q4kWriteOptions::feature_major_down`.
+pub const DOWN_FEATURES_Q4K_BIN: &str = "down_features_q4k.bin";
+/// Per-layer (offset, length, format) entries for `down_features_q4k.bin`.
+pub const DOWN_FEATURES_Q4K_MANIFEST_JSON: &str = "down_features_q4k_manifest.json";
+
 // ── Interleaved FFN (gate|up|down packed per layer) ────────────────────
 pub const INTERLEAVED_BIN: &str = "interleaved.bin";
 pub const INTERLEAVED_Q4_BIN: &str = "interleaved_q4.bin";
@@ -91,6 +109,7 @@ mod tests {
             WEIGHT_MANIFEST_JSON, EMBEDDINGS_BIN, NORMS_BIN,
             GATE_VECTORS_BIN, GATE_VECTORS_Q4_BIN, GATE_VECTORS_FP4_BIN,
             DOWN_META_BIN, DOWN_FEATURES_BIN, DOWN_FEATURES_FP8_BIN,
+            DOWN_FEATURES_Q4K_BIN, DOWN_FEATURES_Q4K_MANIFEST_JSON,
             UP_FEATURES_BIN, UP_FEATURES_FP4_BIN,
             INTERLEAVED_BIN, INTERLEAVED_Q4_BIN, INTERLEAVED_Q4K_BIN,
             INTERLEAVED_Q4K_MANIFEST_JSON,

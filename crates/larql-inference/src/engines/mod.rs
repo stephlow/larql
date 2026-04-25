@@ -70,6 +70,41 @@ pub trait KvEngine: Send {
 
     /// Per-stage timing summary. Returns `None` if profiling was not enabled.
     fn stage_summary(&self) -> Option<profiler::DecodeStageSummary> { None }
+
+    /// Prefill using Q4K quantised weights from `index` and `backend`.
+    ///
+    /// When the backend supports the fused Q4 pipeline (Metal), this routes
+    /// through `backend.prefill_q4` for full GPU speed. Falls back to the
+    /// f32 path when `backend.has_q4() == false` or `index` has no Q4K data.
+    ///
+    /// `weights` is `&mut` so the engine can lazily insert dequantised f32
+    /// attention tensors into `weights.tensors` on the first call (one-time
+    /// cost; subsequent decode steps reuse the cached tensors).
+    fn prefill_q4k(
+        &mut self,
+        weights: &mut crate::model::ModelWeights,
+        index: &larql_vindex::VectorIndex,
+        token_ids: &[u32],
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        let _ = (index, backend);
+        self.prefill(weights, token_ids) // default: f32 fallback
+    }
+
+    /// One autoregressive decode step using Q4K weights.
+    ///
+    /// Same routing semantics as [`prefill_q4k`]: Metal via `decode_token`
+    /// when available, f32 fallback otherwise.
+    fn decode_step_q4k(
+        &mut self,
+        weights: &mut crate::model::ModelWeights,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        let _ = (index, backend);
+        self.decode_step(weights, token_id) // default: f32 fallback
+    }
 }
 
 // ─── EngineKind ───────────────────────────────────────────────────────────────

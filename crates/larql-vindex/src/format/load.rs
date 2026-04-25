@@ -171,6 +171,9 @@ impl VectorIndex {
         let _ = index.load_interleaved(dir);
         let _ = index.load_up_features(dir);
         let _ = index.load_down_features(dir);
+        // W2: feature-major Q4_K down. Optional file; when present the
+        // CPU sparse walk skips the `q4k_ffn_layer` cache for component=2.
+        let _ = index.load_down_features_q4k(dir);
         // Opt-in FP4/FP8 storage (exp 26): present iff `index.json.fp4`
         // is set. Non-fatal if absent or malformed — other FFN mmaps
         // already loaded remain authoritative.

@@ -83,21 +83,38 @@ with K ≪ N, replace with a fixed-size min-heap (K = top_k) walked
 once over the scores. Same comparator (`abs` order); allocation drops
 from O(N) to O(K).
 
-#### W2. Q4K down cache — investigate, don't blindly delete
-**Impact**: Up to ~840 MB potential RSS removal, plus a hot-path
-mutex — *if* a transposed-row alternative can be built. Premise of
-the bench was wrong: `q4k_cache` measures `[intermediate, hidden]`
-(gate/up shape) where row beats cache 230× at K=100. But the cache
-*only* fires on down, which is `[hidden, intermediate]` on disk
-(PyTorch `nn.Linear` orientation). There is no per-feature down
-decode without either (a) a new transposed-block kernel, or (b) a
-new on-disk feature-major Q4K down file.
-**Effort**: 1–2 days for option (a); larger with format change for (b)
-**Bench**: Need a new bench that decodes one feature's down vector
-from `[hidden, intermediate]` Q4K bytes — both the cache path and
-any new transposed-row path — to measure the actual trade-off
-**Status**: Investigation. Don't delete the cache until the
-replacement kernel exists.
+#### W2. Feature-major Q4_K down ✅ shipped 2026-04-25
+**Impact**: First-access down decode at Gemma 4B dims (Q4_K
+10240×2560): **2440× at K=100**, **251× at K=1024**, **25× at full
+K**. Eliminates the ~840 MB heap cache ceiling on CPU sparse walk.
+For MoE/grid shards (where each shard touches each layer once or
+twice and the cache never amortises) this is the dominant win.
+**Effort**: ~1 day actual
+**Bench**: `cargo bench -p larql-vindex --bench q4k_cache --
+q4k_down_cache_vs_feature_major` (new bench shipped with this
+change)
+**Status**: ✅ Shipped — `down_features_q4k.bin` + manifest emitted
+at extract time when `Q4kWriteOptions::feature_major_down=true` (CLI
+flag `--feature-major-down` on `larql extract-index` and
+`larql convert quantize q4k`). Loader reads the file via
+`load_down_features_q4k`; the dispatch in `ffn_row_scaled_add` for
+`component == 2` prefers the feature-major path and falls back to
+the legacy cache when the file is absent. Per-row decode uses the
+manifest's stored padded width so synthetic fixtures with
+`hidden % 256 != 0` round-trip correctly.
+
+| K | Cache+transpose | Feature-major | Speedup |
+|---|---|---|---|
+| 100 (sparse) | 77.6 ms | 31.8 µs | 2440× |
+| 1024 (medium) | 81.7 ms | 325 µs | 251× |
+| 10240 (full) | 82.9 ms | 3.24 ms | 25× |
+
+Default is **off** (extract grows by ~14 MB / layer at Gemma 4B
+dims; not free). Recommended for CPU-walk and grid/MoE workloads;
+Metal users (full-K matmul, never touches the cache) gain nothing
+and can stay on the default. Future: when feature-major down is
+ubiquitous, tighten the default `q4k_ffn_cache_max_layers` to 1 and
+emit an explicit warning when a vindex is loaded without it.
 
 Side findings — even without removing the cache, these are cheap
 cleanups worth doing:

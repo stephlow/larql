@@ -22,7 +22,8 @@ use crate::error::VindexError;
 use crate::index::core::VectorIndex;
 
 use crate::format::filenames::{
-    DOWN_FEATURES_BIN, GATE_VECTORS_Q4_BIN, INTERLEAVED_BIN,
+    DOWN_FEATURES_BIN, DOWN_FEATURES_Q4K_BIN, DOWN_FEATURES_Q4K_MANIFEST_JSON,
+    GATE_VECTORS_Q4_BIN, INTERLEAVED_BIN,
     INTERLEAVED_Q4_BIN, INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON,
     UP_FEATURES_BIN,
 };
@@ -35,9 +36,36 @@ use crate::mmap_util::{mmap_demand_paged, mmap_optimized};
 /// clones; `Mutex` guards LRU eviction.
 pub type Q4kFfnCache = Mutex<Vec<[Option<Arc<Vec<f32>>>; 3]>>;
 
+/// Per-layer manifest entry for `down_features_q4k.bin` (W2). Carries
+/// the padded row width so the row decoder doesn't have to back-derive
+/// it from `length / n_features`.
+#[derive(Clone, Debug)]
+pub struct DownFeaturesQ4kEntry {
+    pub offset: usize,
+    pub length: usize,
+    pub format: String,
+    /// Row stride in elements after `pad_rows_to_256`. For production
+    /// models this equals `hidden_size`; preserved literally so the
+    /// decoder can dequant `padded_width` floats per feature and the
+    /// caller takes the first `hidden_size` of them.
+    pub padded_width: usize,
+}
+
 pub struct FfnStore {
     /// Feature-major down projections (f32 mmap).
     pub down_features_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Feature-major Q4_K-encoded down projections — W2 of perf round-4.
+    /// When present, lets per-feature down decode skip the
+    /// `q4k_ffn_layer` cache (which dequants the whole layer). See
+    /// `DOWN_FEATURES_Q4K_BIN` for the rationale.
+    pub down_features_q4k_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Per-layer entries for `down_features_q4k_mmap`. One entry per
+    /// layer (vs three for the interleaved manifest). `padded_width`
+    /// is the row stride after `pad_rows_to_256` — usually equal to
+    /// `hidden_size`, but on synthetic fixtures with `hidden % 256 != 0`
+    /// it's the next 256-multiple. Carrying it in the manifest avoids
+    /// rederiving it from `length` at every row decode.
+    pub down_features_q4k_manifest: Option<Vec<DownFeaturesQ4kEntry>>,
     /// Feature-major up projections (f32 mmap).
     pub up_features_mmap: Option<Arc<memmap2::Mmap>>,
     /// Interleaved [gate|up|down] FFN data (f32, packed per layer).
@@ -67,6 +95,8 @@ impl FfnStore {
     pub fn empty(num_layers: usize) -> Self {
         Self {
             down_features_mmap: None,
+            down_features_q4k_mmap: None,
+            down_features_q4k_manifest: None,
             up_features_mmap: None,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
@@ -92,6 +122,8 @@ impl Clone for FfnStore {
             .unwrap_or(0);
         Self {
             down_features_mmap: self.down_features_mmap.clone(),
+            down_features_q4k_mmap: self.down_features_q4k_mmap.clone(),
+            down_features_q4k_manifest: self.down_features_q4k_manifest.clone(),
             up_features_mmap: self.up_features_mmap.clone(),
             interleaved_mmap: self.interleaved_mmap.clone(),
             interleaved_q4_mmap: self.interleaved_q4_mmap.clone(),
@@ -375,6 +407,88 @@ impl VectorIndex {
 
     pub fn has_interleaved_q4k(&self) -> bool {
         self.ffn.interleaved_q4k_mmap.is_some()
+    }
+
+    /// Load `down_features_q4k.bin` if present (W2 feature-major down).
+    /// Silent no-op when the file is absent — older vindexes still work
+    /// via the `q4k_ffn_layer` cache fallback. Idempotent.
+    pub fn load_down_features_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+        let path = dir.join(DOWN_FEATURES_Q4K_BIN);
+        if !path.exists() {
+            return Ok(());
+        }
+        let manifest_path = dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON);
+        if !manifest_path.exists() {
+            return Err(VindexError::Parse(format!(
+                "{DOWN_FEATURES_Q4K_BIN} present but {DOWN_FEATURES_Q4K_MANIFEST_JSON} missing"
+            )));
+        }
+        let file = std::fs::File::open(&path)?;
+        // Demand-paged: only the activated features' byte ranges per
+        // layer get read in. Same access pattern as `interleaved_q4k.bin`.
+        let mmap = unsafe { mmap_demand_paged(&file)? };
+        self.ffn.down_features_q4k_mmap = Some(Arc::new(mmap));
+
+        let json: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path)
+                .map_err(|e| VindexError::Parse(e.to_string()))?,
+        )
+        .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let entries: Vec<DownFeaturesQ4kEntry> = json
+            .iter()
+            .map(|e| {
+                let offset = e["offset"].as_u64().unwrap_or(0) as usize;
+                let length = e["length"].as_u64().unwrap_or(0) as usize;
+                let tag = e["format"].as_str().ok_or_else(|| {
+                    VindexError::Parse(format!(
+                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON} entry missing `format`"
+                    ))
+                })?;
+                if crate::quant::registry::lookup(tag).is_none() {
+                    return Err(VindexError::Parse(format!(
+                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON}: unknown format tag {tag:?}"
+                    )));
+                }
+                // Shape is [intermediate, padded_hidden] in the writer —
+                // the second element is the row-stride we need.
+                let padded_width = e["shape"][1].as_u64().ok_or_else(|| {
+                    VindexError::Parse(format!(
+                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON} entry missing `shape[1]` (padded_width)"
+                    ))
+                })? as usize;
+                Ok(DownFeaturesQ4kEntry {
+                    offset,
+                    length,
+                    format: tag.to_string(),
+                    padded_width,
+                })
+            })
+            .collect::<Result<Vec<_>, VindexError>>()?;
+        self.ffn.down_features_q4k_manifest = Some(entries);
+        Ok(())
+    }
+
+    /// Whether feature-major Q4_K-encoded down vectors are loaded.
+    pub fn has_down_features_q4k(&self) -> bool {
+        self.ffn.down_features_q4k_mmap.is_some()
+            && self.ffn.down_features_q4k_manifest.is_some()
+    }
+
+    /// Per-layer slice of `down_features_q4k.bin` plus the format tag
+    /// and the padded row width. Returns `None` when the file isn't
+    /// loaded or the layer is out of range. The bytes are feature-major
+    /// `[intermediate, padded_width]`, Q4_K/Q6_K-encoded — feature
+    /// `feat` lives at byte offset
+    /// `feat * bytes_per_row(padded_width)` inside the slice.
+    pub fn down_features_q4k_layer_data(&self, layer: usize) -> Option<(&[u8], &str, usize)> {
+        let mmap = self.ffn.down_features_q4k_mmap.as_ref()?;
+        let manifest = self.ffn.down_features_q4k_manifest.as_ref()?;
+        let entry = manifest.get(layer)?;
+        Some((
+            &mmap[entry.offset..entry.offset + entry.length],
+            entry.format.as_str(),
+            entry.padded_width,
+        ))
     }
 
     /// Per-layer Q4_K/Q6_K FFN slices — [gate, up, down] with formats.

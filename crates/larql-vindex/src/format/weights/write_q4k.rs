@@ -98,6 +98,18 @@ pub struct Q4kWriteOptions {
     /// to match up-proj timings. Quantisation noise on the scatter-sum
     /// averages across the intermediate dimension; empirically close.
     pub down_q4k: bool,
+
+    /// Emit `down_features_q4k.bin` alongside `interleaved_q4k.bin`.
+    /// When set, the down weights are also stored in feature-major
+    /// `[intermediate, hidden]` orientation (Q4_K/Q6_K matching
+    /// `down_q4k`), so per-feature decode can skip the
+    /// `q4k_ffn_layer` whole-layer dequant + transpose cache. Adds
+    /// roughly the same disk footprint as the down portion of
+    /// `interleaved_q4k.bin` (~14 MB / layer at Gemma 4B dims).
+    /// Recommended for CPU sparse walk and grid/MoE workloads where
+    /// the ~840 MB heap cache ceiling is the binding constraint.
+    /// Default `false` so existing extracts don't grow on disk.
+    pub feature_major_down: bool,
 }
 
 /// Write model weights in Q4_K/Q6_K format, zero f32 intermediate on disk.
@@ -228,6 +240,25 @@ pub fn write_model_weights_q4k_with_opts(
     let mut ff_offset: u64 = 0;
     let mut ff_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 3);
 
+    // ── down_features_q4k.bin (W2 feature-major down, opt-in) ──
+    //
+    // Captures the same down-proj data as interleaved_q4k.bin's down
+    // slot, but transposed to [intermediate, hidden] orientation and
+    // re-quantised at the same precision. Lets per-feature decode at
+    // load time skip the cache. Allocated lazily so non-opt-in
+    // extracts pay nothing.
+    let mut fm_state: Option<(BufWriter<std::fs::File>, u64, Vec<Q4kAttnEntry>)> =
+        if opts.feature_major_down {
+            let path = dir.join(DOWN_FEATURES_Q4K_BIN);
+            Some((
+                BufWriter::new(std::fs::File::create(&path)?),
+                0u64,
+                Vec::with_capacity(num_layers),
+            ))
+        } else {
+            None
+        };
+
     for layer in 0..num_layers {
         callbacks.on_layer_start(COMP_FFN_Q4K, layer, num_layers);
         for (i, key) in [
@@ -258,6 +289,41 @@ pub fn write_model_weights_q4k_with_opts(
                     length,
                 });
                 ff_offset += length;
+
+                // Feature-major down emission: transpose `padded`
+                // from [hidden=rows, padded_intermediate] to
+                // [padded_intermediate, hidden], pad each output
+                // row to 256, and quantise at the same precision.
+                if is_down {
+                    if let Some((fm_file, fm_offset, fm_manifest)) = fm_state.as_mut() {
+                        let intermediate = padded_cols;
+                        let hidden = rows;
+                        let mut transposed = vec![0.0f32; intermediate * hidden];
+                        for h in 0..hidden {
+                            let src = &padded[h * intermediate..(h + 1) * intermediate];
+                            for (feat, &v) in src.iter().enumerate() {
+                                transposed[feat * hidden + h] = v;
+                            }
+                        }
+                        let (fm_padded, fm_padded_cols) =
+                            pad_rows_to_256(&transposed, intermediate, hidden);
+                        let fm_bytes = if use_q6 {
+                            quantize_q6_k(&fm_padded)
+                        } else {
+                            quantize_q4_k(&fm_padded)
+                        };
+                        fm_file.write_all(&fm_bytes)?;
+                        let fm_len = fm_bytes.len() as u64;
+                        fm_manifest.push(Q4kAttnEntry {
+                            key: key.clone(),
+                            shape: vec![intermediate, fm_padded_cols],
+                            format,
+                            offset: *fm_offset,
+                            length: fm_len,
+                        });
+                        *fm_offset += fm_len;
+                    }
+                }
             }
         }
         callbacks.on_layer_done(COMP_FFN_Q4K, layer, 0.0);
@@ -268,6 +334,14 @@ pub fn write_model_weights_q4k_with_opts(
     let ff_manifest_json = serde_json::to_string_pretty(&ff_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(INTERLEAVED_Q4K_MANIFEST_JSON), ff_manifest_json)?;
+
+    if let Some((mut fm_file, _, fm_manifest)) = fm_state.take() {
+        fm_file.flush()?;
+        drop(fm_file);
+        let json = serde_json::to_string_pretty(&fm_manifest)
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        std::fs::write(dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON), json)?;
+    }
 
     // ── experts_packed.bin (hybrid MoE PackedBF16, e.g. Gemma 4 26B A4B) ──
     //

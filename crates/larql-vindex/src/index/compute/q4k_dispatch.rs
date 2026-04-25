@@ -140,6 +140,55 @@ impl VectorIndex {
         scaled_add(&bytes[start..end], alpha, out).is_ok()
     }
 
+    /// Fused Q4_K/Q6_K decode + `out += alpha * down[feat]` reading
+    /// from `down_features_q4k.bin` — the W2 feature-major down path.
+    ///
+    /// When the vindex was extracted with `feature_major_down=true`,
+    /// down lives in feature-major orientation on disk and a single
+    /// row is one feature's down vector (`hidden`-dim wide). This
+    /// skips the `q4k_ffn_layer` cache entirely — no whole-layer
+    /// dequant, no transpose, no Mutex contention, no ~840 MB RSS
+    /// ceiling on Gemma 4B.
+    ///
+    /// Returns `false` when `down_features_q4k.bin` isn't loaded —
+    /// caller falls back to `q4k_ffn_row_scaled_add_via_cache`.
+    #[inline]
+    pub fn q4k_down_feature_scaled_add(
+        &self,
+        layer: usize,
+        feat: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
+        let hidden = self.hidden_size;
+        if out.len() != hidden { return false; }
+        let Some((bytes, format, padded_width)) = self.down_features_q4k_layer_data(layer)
+        else { return false; };
+        if feat >= self.num_features(layer) { return false; }
+        let Some(info) = crate::quant::registry::lookup(format) else { return false; };
+        let Some(bytes_per_row) = info.bytes_per_row(padded_width) else { return false; };
+        let start = feat * bytes_per_row;
+        let end = start + bytes_per_row;
+        if end > bytes.len() { return false; }
+
+        if padded_width == hidden {
+            // Production fast path: row width matches hidden, fused
+            // scaled-add writes straight into `out`.
+            let Some(scaled_add) = info.row_scaled_add else { return false; };
+            return scaled_add(&bytes[start..end], alpha, out).is_ok();
+        }
+        // Padded path: dequant the full padded row, accumulate the
+        // first `hidden` floats. Used by synthetic fixtures with
+        // `hidden % 256 != 0`; production hits the fast path above.
+        let Ok(decoded) = (info.dequantize)(&bytes[start..end], padded_width) else {
+            return false;
+        };
+        for (h, slot) in out.iter_mut().enumerate() {
+            *slot += alpha * decoded[h];
+        }
+        true
+    }
+
     /// Decode one row of a Q4K/Q6K FFN matrix directly into `out` without
     /// caching. `component`: 0=gate, 1=up, 2=down; `feat` is the feature
     /// (row) index; `out` must have length `hidden_size`. Returns `false`

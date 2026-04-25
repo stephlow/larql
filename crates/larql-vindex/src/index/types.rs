@@ -89,6 +89,21 @@ pub trait GateIndex: Send + Sync {
     /// `None` when the FFN manifest wasn't emitted (older vindexes).
     fn interleaved_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 3]> { None }
 
+    /// Whether feature-major Q4_K-encoded down vectors
+    /// (`down_features_q4k.bin`) are loaded. When true,
+    /// `q4k_down_feature_scaled_add` can serve component=2 row decode
+    /// without going through the `q4k_ffn_layer` cache.
+    fn has_down_features_q4k(&self) -> bool { false }
+
+    /// W2: feature-major down decode. Returns `true` on success and
+    /// writes `out += alpha * down[layer][feat]`. Returns `false` when
+    /// the file isn't loaded; caller falls back to the cache path.
+    fn q4k_down_feature_scaled_add(
+        &self, _layer: usize, _feat: usize, _alpha: f32, _out: &mut [f32],
+    ) -> bool {
+        false
+    }
+
     /// Dequantised Q4K/Q6K FFN matrix for `(layer, component)` where
     /// `component` is 0=gate, 1=up, 2=down. Lazily decoded and cached.
     /// Returns `None` when the vindex has no Q4K interleaved data.
@@ -278,10 +293,14 @@ pub trait GateIndex: Send + Sync {
             _ => return false,
         }
         if self.has_interleaved_q4k() {
-            // Q4K down is stored transposed — per-row decode reads
-            // hidden-dim rows, not feature vectors. Use the cached
-            // whole-layer decode path for down; direct row decode for gate/up.
             if component == 2 {
+                // W2: prefer the feature-major down file when present —
+                // a single row decode beats the whole-layer dequant +
+                // transpose path. Fall back to the cache for vindexes
+                // extracted before the feature-major down emit landed.
+                if self.q4k_down_feature_scaled_add(layer, feat, alpha, out) {
+                    return true;
+                }
                 return self.q4k_ffn_row_scaled_add_via_cache(layer, component, feat, alpha, out);
             }
             return self.q4k_ffn_row_scaled_add(layer, component, feat, alpha, out);

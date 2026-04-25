@@ -87,6 +87,13 @@ enum QuantizeCommand {
         #[arg(long)]
         down_q4k: bool,
 
+        /// Emit `down_features_q4k.bin` (W2 feature-major down) so per-feature
+        /// row decode can skip the `q4k_ffn_layer` cache. Adds ~14 MB / layer
+        /// at Gemma 4B dims; eliminates the ~840 MB heap cache ceiling.
+        /// Recommended for CPU sparse walk and grid/MoE workloads.
+        #[arg(long)]
+        feature_major_down: bool,
+
         /// Overwrite the output directory if it already exists.
         #[arg(long)]
         force: bool,
@@ -174,8 +181,8 @@ fn run_quantize(cmd: QuantizeCommand) -> Result<(), Box<dyn std::error::Error>> 
             compliance_floor, threshold,
             force, strict, no_sidecar, quiet,
         }),
-        QuantizeCommand::Q4K { input, output, down_q4k, force, quiet } => {
-            run_quantize_q4k(QuantizeQ4kOpts { input, output, down_q4k, force, quiet })
+        QuantizeCommand::Q4K { input, output, down_q4k, feature_major_down, force, quiet } => {
+            run_quantize_q4k(QuantizeQ4kOpts { input, output, down_q4k, feature_major_down, force, quiet })
         }
     }
 }
@@ -184,6 +191,7 @@ struct QuantizeQ4kOpts {
     input: PathBuf,
     output: PathBuf,
     down_q4k: bool,
+    feature_major_down: bool,
     force: bool,
     quiet: bool,
 }
@@ -193,6 +201,7 @@ fn run_quantize_q4k(opts: QuantizeQ4kOpts) -> Result<(), Box<dyn std::error::Err
 
     let config = Q4kConvertConfig {
         down_q4k: opts.down_q4k,
+        feature_major_down: opts.feature_major_down,
         force: opts.force,
     };
 

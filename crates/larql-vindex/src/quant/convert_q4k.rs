@@ -38,6 +38,11 @@ pub struct Q4kConvertConfig {
     /// down). See `write_model_weights_q4k_with_opts` for the
     /// tradeoff.
     pub down_q4k: bool,
+    /// Emit `down_features_q4k.bin` (W2 feature-major down) so per-feature
+    /// row decode can skip the `q4k_ffn_layer` cache. Disk grows by
+    /// roughly one extra down-leg per layer; load-time RSS drops because
+    /// the cache stays empty. See `Q4kWriteOptions::feature_major_down`.
+    pub feature_major_down: bool,
     /// Overwrite `dst` if it already exists.
     pub force: bool,
 }
@@ -135,7 +140,10 @@ pub fn vindex_to_q4k(
     // attn_weights_q4k.bin + manifest, interleaved_q4k.bin + manifest,
     // lm_head_q4.bin, norms.bin, weight_manifest.json. Also rewrites
     // index.json with quant=q4k.
-    let opts = Q4kWriteOptions { down_q4k: config.down_q4k };
+    let opts = Q4kWriteOptions {
+        down_q4k: config.down_q4k,
+        feature_major_down: config.feature_major_down,
+    };
     let mut build_cb = SilentCallbacks;
     write_model_weights_q4k_with_opts(
         &weights, &dst_tmp, &mut build_cb as &mut dyn crate::IndexBuildCallbacks, opts,

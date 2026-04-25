@@ -310,6 +310,14 @@ impl GateIndex for VectorIndex {
         VectorIndex::q4k_ffn_row_scaled_add_via_cache(self, layer, component, feat, alpha, out)
     }
 
+    fn has_down_features_q4k(&self) -> bool {
+        VectorIndex::has_down_features_q4k(self)
+    }
+
+    fn q4k_down_feature_scaled_add(&self, layer: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        VectorIndex::q4k_down_feature_scaled_add(self, layer, feat, alpha, out)
+    }
+
     fn q4k_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
         VectorIndex::q4k_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
     }

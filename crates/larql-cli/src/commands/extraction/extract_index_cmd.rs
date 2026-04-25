@@ -88,6 +88,14 @@ pub struct ExtractIndexArgs {
     #[arg(long)]
     down_q4k: bool,
 
+    /// Emit `down_features_q4k.bin` (W2 feature-major down) so per-feature
+    /// row decode can skip the `q4k_ffn_layer` cache. Adds ~14 MB / layer
+    /// at Gemma 4B dims; eliminates the ~840 MB heap cache ceiling on
+    /// CPU sparse walk and frees the same headroom across all grid shards.
+    /// Requires `--quant q4k`.
+    #[arg(long)]
+    feature_major_down: bool,
+
     /// Skip stages that already have output files (resume interrupted builds).
     #[arg(long)]
     resume: bool,
@@ -276,7 +284,16 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 "--down-q4k requires --quant q4k (only the Q4K writer honours this flag)".into(),
             );
         }
-        let q4k_opts = larql_vindex::Q4kWriteOptions { down_q4k: args.down_q4k };
+        if args.feature_major_down && args.quant != larql_vindex::QuantFormat::Q4K {
+            return Err(
+                "--feature-major-down requires --quant q4k (only the Q4K writer honours this flag)"
+                    .into(),
+            );
+        }
+        let q4k_opts = larql_vindex::Q4kWriteOptions {
+            down_q4k: args.down_q4k,
+            feature_major_down: args.feature_major_down,
+        };
         larql_vindex::build_vindex_streaming(
             &model_path,
             &tokenizer,

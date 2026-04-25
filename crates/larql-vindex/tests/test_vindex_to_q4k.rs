@@ -308,3 +308,171 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     assert!(report.aux_linked_count > 0, "at least one aux file should land via hard-link");
     assert!(!report.walk_backend.is_empty(), "walk_backend description must be populated");
 }
+
+/// Round-trip the W2 feature-major down emit: convert with
+/// `feature_major_down=true`, load, then ask the dispatch path for one
+/// feature's down vector. With the new file present, the dispatch
+/// should serve the row from `down_features_q4k.bin` and skip the
+/// cache (asserted via `q4k_ffn_cache_stats`).
+#[test]
+fn q4k_feature_major_down_round_trip() {
+    use larql_vindex::QuantFormat;
+    use std::collections::HashMap;
+
+    let tmp = TempDir::new("fm_down");
+    let model_dir = tmp.0.join("model");
+    let src_dir = tmp.0.join("src.vindex");
+    let dst_dir = tmp.0.join("dst.vindex");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let hidden = 8usize;
+    let intermediate = 4usize;
+    let num_layers = 2usize;
+    let vocab = 16usize;
+
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": hidden,
+        "num_hidden_layers": num_layers,
+        "intermediate_size": intermediate,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": hidden,
+        "rope_theta": 10000.0,
+        "vocab_size": vocab,
+    });
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
+    let push = |tensors: &mut HashMap<String, Vec<f32>>,
+                metadata: &mut Vec<(String, Vec<usize>)>,
+                name: &str,
+                shape: Vec<usize>| {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        tensors.insert(name.into(), data);
+        metadata.push((name.into(), shape));
+    };
+    push(&mut tensors, &mut metadata, "model.embed_tokens.weight", vec![vocab, hidden]);
+    push(&mut tensors, &mut metadata, "model.norm.weight", vec![hidden]);
+    for layer in 0..num_layers {
+        let lp = format!("model.layers.{layer}");
+        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.gate_proj.weight"), vec![intermediate, hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.up_proj.weight"), vec![intermediate, hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.down_proj.weight"), vec![hidden, intermediate]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.input_layernorm.weight"), vec![hidden]);
+        push(&mut tensors, &mut metadata, &format!("{lp}.post_attention_layernorm.weight"), vec![hidden]);
+    }
+
+    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
+        .iter()
+        .map(|(name, shape)| {
+            let data = &tensors[name];
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            (name.clone(), bytes, shape.clone())
+        })
+        .collect();
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
+        .iter()
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/fm-down",
+        &src_dir,
+        4,
+        larql_vindex::ExtractLevel::Inference,
+        larql_vindex::StorageDtype::F32,
+        QuantFormat::None,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::Q4kWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .unwrap();
+
+    let convert_config = Q4kConvertConfig {
+        feature_major_down: true,
+        ..Default::default()
+    };
+    vindex_to_q4k(&src_dir, &dst_dir, &convert_config).unwrap();
+
+    // ── Files emitted ──
+    assert!(
+        dst_dir.join(DOWN_FEATURES_Q4K_BIN).exists(),
+        "down_features_q4k.bin must be emitted when feature_major_down=true"
+    );
+    assert!(
+        dst_dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON).exists(),
+        "down_features_q4k_manifest.json must be emitted alongside it"
+    );
+
+    // ── Load + dispatch through the feature-major path ──
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let index = larql_vindex::VectorIndex::load_vindex(&dst_dir, &mut lcb).unwrap();
+    assert!(
+        index.has_down_features_q4k(),
+        "loader must surface the feature-major down file"
+    );
+
+    // Cache-bypass evidence: ask for one feature's down. The W2 path
+    // serves it from `down_features_q4k.bin` without populating the
+    // legacy cache.
+    let mut out = vec![0.0f32; hidden];
+    let alpha = 1.0f32;
+    let layer = 0;
+    let feat = 1usize;
+    assert!(
+        index.q4k_down_feature_scaled_add(layer, feat, alpha, &mut out),
+        "feature-major down decode must succeed when the file is present"
+    );
+    let (cache_slots, cache_bytes) = index.q4k_ffn_cache_stats();
+    assert_eq!(
+        (cache_slots, cache_bytes),
+        (0, 0),
+        "feature-major path must NOT have populated the legacy q4k_ffn_layer cache"
+    );
+
+    // ── Round-trip the values: decoded row must approximate
+    //    down_proj[:, feat] from the source synthetic ramp ──
+    // Each synthetic tensor's ramp restarts from 0, so down_proj's
+    // values are `(i * 0.01)` for `i in 0..hidden*intermediate`. With
+    // shape [hidden, intermediate] row-major, feature `feat`'s vector
+    // is `[down_proj[h, feat] for h in 0..hidden]`, i.e.
+    // `[(h * intermediate + feat) * 0.01 for h in 0..hidden]`.
+    let expected: Vec<f32> = (0..hidden)
+        .map(|h| ((h * intermediate + feat) as f32) * 0.01)
+        .collect();
+    for (h, &got) in out.iter().enumerate() {
+        let want = expected[h];
+        assert!(
+            (got - want).abs() < 0.05,
+            "down[{layer}][feat={feat}][{h}] diverged: got {got}, expected {want}"
+        );
+    }
+    let _ = vocab; // silence unused-arg warning if compiler complains
+}

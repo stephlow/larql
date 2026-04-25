@@ -17,6 +17,7 @@
 use ndarray::Array2;
 use serde::Serialize;
 use larql_compute::{ComputeBackend, cpu_backend};
+use larql_vindex::VectorIndex;
 
 use crate::attention::SharedKV;
 use crate::model::ModelWeights;
@@ -268,6 +269,186 @@ impl KvEngine for UnlimitedContextEngine {
     fn cold_bytes(&self) -> usize {
         self.checkpoints.total_bytes() + self.archive.total_bytes()
     }
+
+    /// Q4K prefill — uses Metal `prefill_q4` when available (full GPU pipeline).
+    ///
+    /// Falls back to the CPU `process()` path when the backend does not support
+    /// the fused Q4 pipeline. The Metal path runs at ~75 tok/s on Gemma 3 4B
+    /// (same as `larql bench`) because it submits all 34 layers in one command
+    /// buffer rather than per-layer CPU dispatch.
+    fn prefill_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        index: &VectorIndex,
+        token_ids: &[u32],
+        backend: &dyn ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        if let Some(h) = q4k_prefill_metal(weights, index, token_ids, backend) {
+            // Metal path: KV cache populated in GPU buffers by prefill_q4.
+            // Switch to Q4K decode mode — store abs_position for RoPE.
+            self.abs_offset = token_ids.len();
+            self.last_hidden = Some(h.clone());
+            return Some(h);
+        }
+        // CPU fallback.
+        self.process(weights, token_ids)?;
+        self.last_hidden.clone()
+    }
+
+    /// Q4K decode step — uses Metal `decode_token` when available.
+    fn decode_step_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        index: &VectorIndex,
+        token_id: u32,
+        backend: &dyn ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        // If we did a Metal prefill, continue on the Metal decode path.
+        if backend.has_q4() && index.attn_q4k_layer_data(0).is_some() {
+            if let Some(h) = q4k_decode_token(weights, index, token_id, backend) {
+                self.abs_offset += 1;
+                self.last_hidden = Some(h.clone());
+                return Some(h);
+            }
+        }
+        // CPU fallback.
+        self.process(weights, &[token_id])?;
+        self.last_hidden.clone()
+    }
+}
+
+// ─── Q4K / Metal helper fns ───────────────────────────────────────────────────
+
+/// Run GPU prefill via `backend.prefill_q4` using Q4K pipeline layers built
+/// from `index`. Returns the last-token hidden state on success.
+fn q4k_prefill_metal(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_ids: &[u32],
+    backend: &dyn ComputeBackend,
+) -> Option<Array2<f32>> {
+    use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+    use larql_vindex::GateIndex;
+
+    if !backend.has_q4() { return None; }
+
+    let gate_index: &dyn GateIndex = index;
+    let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
+        (m, true)
+    } else if let Some(m) = gate_index.interleaved_q4_mmap_ref() {
+        (m, false)
+    } else {
+        return None;
+    };
+    if index.attn_q4k_layer_data(0).is_none() { return None; }
+
+    let arch = &*weights.arch;
+    let hidden = weights.hidden_size;
+    let num_layers = weights.num_layers;
+    let intermediate = gate_index.num_features(0);
+    if intermediate == 0 { return None; }
+
+    let q4_ffn_per_matrix = if ffn_is_q4k {
+        (intermediate * hidden).div_ceil(256) * 144
+    } else {
+        intermediate * hidden / 32 * 18
+    };
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+
+    let layers = build_pipeline_layers(
+        weights, index, 0..num_layers, q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+    );
+
+    let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
+    let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+
+    let q_dim  = weights.num_q_heads * weights.head_dim;
+    let kv_dim = weights.num_kv_heads * weights.head_dim;
+    let rope   = arch.rope_base_for_layer(0) as f32;
+    let seq_len = token_ids.len();
+    let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
+    let qk_norm = arch.attn_q_norm_key(0).is_some();
+
+    backend.reset_kv_cache();
+    {
+        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
+            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
+            .collect();
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+    }
+
+    let h_vec = backend.prefill_q4(
+        &layers, &x, hidden, intermediate, q_dim, kv_dim,
+        seq_len, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
+        rope, qk_norm, softcap,
+    )?;
+
+    let norm_offset = arch.norm_weight_offset();
+    let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
+    let h_normed = crate::forward::apply_norm(weights, &h_2d, arch.final_norm_key(), norm_offset);
+    let last = h_normed.shape()[0] - 1;
+    Some(h_normed.slice(ndarray::s![last..=last, ..]).to_owned())
+}
+
+/// Run one Metal decode step via `backend.decode_token`.
+fn q4k_decode_token(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_id: u32,
+    backend: &dyn ComputeBackend,
+) -> Option<Array2<f32>> {
+    use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+    use larql_vindex::GateIndex;
+
+    let gate_index: &dyn GateIndex = index;
+    let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
+        (m, true)
+    } else if let Some(m) = gate_index.interleaved_q4_mmap_ref() {
+        (m, false)
+    } else {
+        return None;
+    };
+
+    let arch   = &*weights.arch;
+    let hidden = weights.hidden_size;
+    let num_layers = weights.num_layers;
+    let intermediate = gate_index.num_features(0);
+
+    let q4_ffn_per_matrix = if ffn_is_q4k {
+        (intermediate * hidden).div_ceil(256) * 144
+    } else {
+        intermediate * hidden / 32 * 18
+    };
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+
+    let layers = build_pipeline_layers(
+        weights, index, 0..num_layers, q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+    );
+
+    let h_tok = crate::forward::embed_tokens_pub(weights, &[token_id]);
+    let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+
+    let q_dim  = weights.num_q_heads * weights.head_dim;
+    let kv_dim = weights.num_kv_heads * weights.head_dim;
+    let rope   = arch.rope_base_for_layer(0) as f32;
+
+    let h_vec = backend.decode_token(
+        &layers, &x_dec, hidden, intermediate, q_dim, kv_dim,
+        weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+    )?;
+
+    let norm_offset = arch.norm_weight_offset();
+    let h_2d = Array2::from_shape_vec((1, hidden), h_vec).ok()?;
+    let h_normed = crate::forward::apply_norm(weights, &h_2d, arch.final_norm_key(), norm_offset);
+    Some(h_normed)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

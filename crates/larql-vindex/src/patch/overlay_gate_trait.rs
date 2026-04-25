@@ -134,6 +134,14 @@ impl GateIndex for PatchedVindex {
         self.base.q4k_ffn_row_scaled_add_via_cache(layer, component, feat, alpha, out)
     }
 
+    fn has_down_features_q4k(&self) -> bool {
+        self.base.has_down_features_q4k()
+    }
+
+    fn q4k_down_feature_scaled_add(&self, layer: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+        self.base.q4k_down_feature_scaled_add(layer, feat, alpha, out)
+    }
+
     fn q4k_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
         self.base.q4k_ffn_row_scaled_add(layer, component, feat, alpha, out)
     }

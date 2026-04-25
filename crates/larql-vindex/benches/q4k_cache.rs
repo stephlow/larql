@@ -111,5 +111,103 @@ fn bench_cached_vs_row(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_cached_vs_row);
+/// W2 — down leg specifically. Down is stored `[hidden, intermediate]`
+/// on disk (PyTorch `nn.Linear` orientation). The legacy
+/// `q4k_ffn_layer` cache amortises the transpose by dequantising the
+/// whole layer once. The W2 fix emits a feature-major Q4_K down file
+/// at extract time so per-feature decode is a single row dequant —
+/// no transpose, no cache, no Mutex.
+///
+/// This bench compares both paths by simulating one full pass of K
+/// scaled-adds:
+/// - `cache_transpose`: dequantise the `[hidden, intermediate]` layer
+///   to f32, transpose to feature-major, then plain scaled-add per
+///   feature. Models the legacy `q4k_ffn_row_scaled_add_via_cache`.
+/// - `feature_major`: per feature, fused `q4k_row_scaled_add` against
+///   feature-major Q4_K bytes. Models `q4k_down_feature_scaled_add`.
+fn bench_down_cache_vs_feature_major(c: &mut Criterion) {
+    use larql_compute::cpu::ops::q4_common::quantize_q4_k;
+    let mut group = c.benchmark_group("q4k_down_cache_vs_feature_major");
+
+    // Production-relevant Gemma 3 4B dims for down.
+    let intermediate = 10_240usize;
+    let hidden = 2560usize;
+
+    // Pre-encode a feature-major down (already transposed, then Q4_K).
+    let f32_data = synth_block(intermediate * hidden, 0xfacef00d);
+    let fm_q4k_bytes = quantize_q4_k(&f32_data);
+
+    // Pre-encode the legacy [hidden, intermediate] orientation: same
+    // values, indexed differently. The cache path dequants this and
+    // transposes to feature-major before scaled-add.
+    let mut hi_layout = vec![0.0f32; intermediate * hidden];
+    for feat in 0..intermediate {
+        for h in 0..hidden {
+            hi_layout[h * intermediate + feat] = f32_data[feat * hidden + h];
+        }
+    }
+    let hi_q4k_bytes = quantize_q4_k(&hi_layout);
+
+    for &k in &[100usize, 1024, 10_240] {
+        group.throughput(Throughput::Elements(k as u64));
+
+        // Cache + transpose path.
+        group.bench_with_input(
+            BenchmarkId::new("cache_transpose", k),
+            &(hi_q4k_bytes.clone(), k),
+            |b, (bytes, k_in)| {
+                let k_local = *k_in;
+                b.iter(|| {
+                    let info = lookup("Q4_K").unwrap();
+                    let n = intermediate * hidden;
+                    let dequant = (info.dequantize)(bytes, n).unwrap();
+                    // Transpose to feature-major: [intermediate, hidden].
+                    let mut feature_major = vec![0.0f32; n];
+                    for h in 0..hidden {
+                        let src = &dequant[h * intermediate..(h + 1) * intermediate];
+                        for (feat, &v) in src.iter().enumerate() {
+                            feature_major[feat * hidden + h] = v;
+                        }
+                    }
+                    // Scaled-add per feature into a hidden-dim accumulator.
+                    let mut out = vec![0.0f32; hidden];
+                    for feat in 0..k_local.min(intermediate) {
+                        let row = &feature_major[feat * hidden..(feat + 1) * hidden];
+                        let alpha = 0.001 * feat as f32;
+                        for (o, &r) in out.iter_mut().zip(row.iter()) {
+                            *o += alpha * r;
+                        }
+                    }
+                    out
+                })
+            },
+        );
+
+        // Feature-major Q4_K row decode.
+        group.bench_with_input(
+            BenchmarkId::new("feature_major", k),
+            &(fm_q4k_bytes.clone(), k),
+            |b, (bytes, k_in)| {
+                let k_local = *k_in;
+                b.iter(|| {
+                    let info = lookup("Q4_K").unwrap();
+                    let scaled_add = info.row_scaled_add.unwrap();
+                    let bytes_per_row = info.bytes_per_row(hidden).unwrap();
+                    let mut out = vec![0.0f32; hidden];
+                    for feat in 0..k_local {
+                        let start = feat * bytes_per_row;
+                        let end = start + bytes_per_row;
+                        if end > bytes.len() { break; }
+                        let alpha = 0.001 * feat as f32;
+                        scaled_add(&bytes[start..end], alpha, &mut out).unwrap();
+                    }
+                    out
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_cached_vs_row, bench_down_cache_vs_feature_major);
 criterion_main!(benches);

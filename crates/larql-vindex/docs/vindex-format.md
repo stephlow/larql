@@ -34,6 +34,9 @@ model.vindex/
 ├── interleaved_q4k.bin        Q4_K/Q6_K interleaved (optional)
 ├── interleaved_q4k_manifest.json  Per-tensor offsets for interleaved_q4k.bin
 │
+├── down_features_q4k.bin      Feature-major Q4_K/Q6_K down (W2, optional)
+├── down_features_q4k_manifest.json  Per-layer offsets for down_features_q4k.bin
+│
 ├── gate_vectors_fp4.bin       FP4 gate vectors (exp 26, optional)
 ├── up_features_fp4.bin        FP4 up features (exp 26, optional)
 ├── down_features_fp8.bin      FP8 down features — wider tail format (exp 26, optional)

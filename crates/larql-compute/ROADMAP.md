@@ -28,10 +28,18 @@ convention); the q4_KF fast-path doesn't apply to those.
 
 ---
 
-## P0: Production gap closers (open)
+## P0: Production gap closers
 
-These are the optimizations from the 2026-04-25 diagnostic — ranked
-by leverage. Lands sequentially; #1 alone closes ~half the gap.
+Remaining gap: **1.33×** (72 vs 98 tok/s, 3.7ms/tok). Three sources ranked by size:
+
+| # | Item | Gap | Status |
+|---|---|---|---|
+| **6** | Q4_K matvec rewrite (llama.cpp interleave + preload) | **~1.5ms** | open |
+| **7** | Dispatch fusion (norm+QKV, QK-norm Q+K, RoPE Q+K) | **~1.0ms** | open |
+| **4** | LM head async readback + GPU top-k | **~0.5ms** | partial |
+| — | Other (attention, residuals, activation) | ~0.7ms | unclear |
+
+Closing #6 + #7 brings LARQL to ~90–95 tok/s (Ollama parity).
 
 ### #1 — Q6_K fused activation+down (closed — wrong fix, correct diagnosis)
 
@@ -122,17 +130,103 @@ Q6_K layout (GGUF's transposed layout can't be ported directly — different for
   2× more concurrent TGs, better latency hiding on LPDDR5X.
 Effective Q6_K bandwidth: ~322 GB/s (up from ~294 GB/s).
 
-### #5b — `q4k_matvec` llama.cpp-style rewrite (open)
+### #5b — `q4k_matvec` llama.cpp-style rewrite (open — see #6)
 
-**Estimated gain: ~0.5ms/tok.** Gate+up (Q4_K, 29.5 MB/layer) still uses the
-original sub-block stride kernel. llama.cpp's Q4_K uses:
-- 4 parallel block groups (`ix = tiisg/8`, `ib += 4`)
-- `yl[16]/yh[16]` preloaded X before compute + `sumy[4]` sum precompute
-- `float4 acc1/acc2` vectorized accumulation (potential 4× ALU throughput)
+Folded into #6 below with updated size estimate.
 
-The Q4_K inner structure is more complex than Q6_K (8-group scale packing,
-min correction). Estimate ~150 LOC MSL. LARQL's Q4_K format matches GGUF
-(same 144-byte block layout), so llama.cpp's algorithm can be ported directly.
+---
+
+### #6 — `q4k_matvec` inter-superblock rewrite (open — highest priority)
+
+**Estimated gain: ~1.0–1.5ms/tok.** The Q4_K kernel handles:
+- Wq (8192×2560) + Wk (4096×2560) + Wv fused QKV: 26.3 MB/layer × 34 = 895 MB
+- Wo (2560×8192): 11.8 MB/layer × 34 = 401 MB
+- W gate+up (10240×2560 ×2, fused): 29.5 MB/layer × 34 = 1003 MB
+- **Total Q4_K data: ~2300 MB/token** (vs Q6_K's 1023 MB — more than double)
+
+The old sub-block-stride kernel hasn't been touched. Applying the same
+inter-superblock + preload + deferred-scale treatment as Q6_K should
+close a proportionally larger gap.
+
+**llama.cpp Q4_K algorithm** (`kernel_mul_mv_q4_K_f32_impl`):
+```
+ix = tiisg / 8     → 0..3: which of 4 parallel superblock groups
+it = tiisg % 8     → 0..7: position within the group
+iq = it / 4        → 0 or 1: low or high sub-block
+ir = it % 4        → 0..3: which of 4 groups within sub-block
+
+for (ib = ix; ib < nb; ib += 4):   // stride 4, processes 4 superblocks at once
+    yl[16], yh[16] = preload X values for this superblock
+    sumy[4]        = precompute X sums (for the min correction term)
+    for row in 0..nr0:             // nr0=2: 2 rows per simdgroup
+        float4 acc1, acc2 = { 0 }  // vectorized accumulation
+        FOR_UNROLL (i=0..3):
+            acc1[0..3], acc2[0..3] += nibble × yl/yh
+        sumf[row] += d × (acc1 scale corrections) - dmin × (sumy correction)
+```
+
+Key differences from LARQL's current `q4k_matvec`:
+1. **4 parallel superblock groups** (ix=0..3): all 4 groups run simultaneously,
+   4× as many concurrent DRAM reads vs LARQL's 1 per stride.
+2. **`yl[16]/yh[16]` preloaded**: X reads issued before weight bytes.
+3. **`sumy[4]` precomputed**: the `Σ x[i]` term for min correction is
+   accumulated once per superblock per ix-group, not per nibble.
+4. **`float4 acc1/acc2`**: 4-wide vectorized accumulation — compiler can emit
+   packed FMAs for 4× instruction-level throughput.
+5. **2 rows per simdgroup** (`nr0=2`): both rows share the same superblock
+   reads, amortising preload cost across 2 outputs.
+
+**LARQL's Q4_K format matches GGUF** (same 144-byte block structure: d/dmin
+f16 + 12-byte packed scales/mins + 128 bytes of 4-bit nibbles). llama.cpp's
+algorithm can be ported directly without format translation.
+
+**Effort:** ~200 LOC MSL. Need to adapt the `yl[]/yh[]` preload pattern
+for LARQL's block layout, handle the `fused_q4k_qkv` path (3 output
+matrices), and update `q4k_ffn_gate_up` to use the same interleaving.
+
+### #7 — Dispatch fusion: consolidate per-layer ops (open)
+
+**Estimated gain: ~1.0ms/tok** (saves ~200 dispatches at ~5µs each).
+
+Current per-layer dispatch count (~14 for Gemma 3 4B):
+1. `rms_norm` (input norm)
+2. `q4k_q6k_qkv_proj` (QKV projection)
+3. `qk_norm` — Q heads
+4. `qk_norm` — K heads
+5. `rope_at_pos_batched` — Q heads
+6. `rope_at_pos_batched` — K heads
+7. `kv_append`
+8. `kv_attend`
+9. `o_proj` (O projection)
+10. `residual_norm` (post-attention residual + FFN norm)
+11. `q4k_ffn_gate_up` (fused gate+up)
+12. `geglu_gelu_tanh` (activation)
+13. `q6k_matvec` (FFN down)
+14. `residual_add` (post-FFN)
+
+Three fusions with clear wins (each saves 34 dispatches = ~0.17ms):
+
+**7a — Fused QK-norm Q+K** (~0.17ms):
+Currently dispatches `qk_norm` twice (dispatches 3+4) with same pipeline.
+A single dispatch with `total_heads = q_heads + kv_heads` and a flag or
+offset to select the weight vector would halve it. ~30 LOC MSL change.
+
+**7b — Fused RoPE Q+K** (~0.17ms):
+Dispatches 5+6 reuse the same `rope_at_pos_batched` pipeline with a buffer
+swap. A single dispatch with total threads covering Q+K heads, distinguishing
+them by offset, halves it. ~30 LOC MSL change.
+
+**7c — Fused input norm + QKV projection** (~0.17ms):
+Dispatch 1+2 can be merged: each QKV TG independently computes the RMS norm
+(all 128 threads reduce `||h||²` cooperatively via simd_sum + threadgroup
+barrier), then proceeds with its row's matvec using inline `h[i]/rms*w[i]`.
+The `norm_out` 10KB buffer write is eliminated. ~200 LOC MSL (cooperative
+reduction + two-format Q4_K/Q6_K inline norm). See encode_qkv.rs.
+
+**7d — Fused GEGLU + down** (~0.17ms):
+Dispatches 12+13 can be merged for Q4_K down (already done). For Q6_K down,
+fusion was attempted but regressed due to GELU-tanh recomputation cost
+(see #1 closed). Not viable unless activation is precomputed separately.
 
 ---
 
