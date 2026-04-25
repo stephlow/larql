@@ -26,18 +26,28 @@
 use std::ffi::c_void;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 
+use crate::metal::kernel::KernelHandle;
+
 /// Metal shader pipelines this stage may dispatch, in one bundle.
 ///
 /// Not every caller has every pipeline (e.g. the legacy benchmark path
 /// passes `None` for `q4kf_proj`). The dispatcher falls back to
 /// `q4k_matvec_fallback` when the preferred shader is absent.
+///
+/// `q4_matvec` is a [`KernelHandle`] — geometry travels with the
+/// pipeline (the bug class q4_matvec_v4 hit). The `q4k_*` / `q6k_*`
+/// fields are still bare `ComputePipelineState` because some callsites
+/// hand in `q4k_proj` for the matvec slot (a different pipeline that
+/// happens to share the dispatcher contract). Wrapping those in
+/// `KernelHandle` is its own follow-up — markers exist at
+/// `shaders::q4k_matvec::Kernel`, `shaders::q6k_matvec::Kernel`, etc.
 pub struct Pipelines<'a> {
     /// Preferred shader for `Q4_K` / `Q4_KF` — 144-byte GGUF llama.cpp-exact.
     pub q4kf_proj: Option<&'a ComputePipelineState>,
     /// Fallback for `Q4_K` if `q4kf_proj` is unavailable.
     pub q4k_matvec_fallback: &'a ComputePipelineState,
     pub q6k_matvec: &'a ComputePipelineState,
-    pub q4_matvec: &'a ComputePipelineState,
+    pub q4_matvec: &'a KernelHandle,
 }
 
 /// Encode a single-vector matvec `out[N] = W[N×K] · x[K]` onto `enc`.
@@ -73,6 +83,9 @@ pub fn encode(
     match format {
         crate::QuantFormat::Q4_K | crate::QuantFormat::Q4_KF => {
             if let Some(q4kf_proj_pipe) = pipes.q4kf_proj {
+                // q4kf_proj is still a bare pipeline; geometry comes
+                // from the shader module until its KernelHandle
+                // migration lands (see ROADMAP P0a follow-ups).
                 use crate::metal::shaders::q4kf_qkv_proj as q4kf;
                 let num_tgs = (num_rows as u64).div_ceil(q4kf::ROWS_PER_TG);
                 enc.set_compute_pipeline_state(q4kf_proj_pipe);
@@ -86,6 +99,9 @@ pub fn encode(
                     MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
                 );
             } else {
+                // Bare pipeline path — geometry comes from the shader
+                // module (callsites hand in either q4k_matvec or
+                // q4k_proj here, which happen to share dispatch shape).
                 use crate::metal::shaders::q4k_matvec as q4k;
                 let num_tgs = (num_rows as u64).div_ceil(q4k::ROWS_PER_TG);
                 enc.set_compute_pipeline_state(pipes.q4k_matvec_fallback);
@@ -115,12 +131,11 @@ pub fn encode(
             );
         }
         crate::QuantFormat::Q4_0 | crate::QuantFormat::Q8_0 => {
-            // Q4_0 matvec expects Q8 input + Q8 scales (per-32 f16-scaled blocks).
-            // Geometry constants must come from the same shader the pipeline
-            // is built from in metal/mod.rs (q4_matvec_v4); see ops/q4_matvec.rs.
-            use crate::metal::shaders::q4_matvec_v4 as q4mv;
-            let num_tgs = (num_rows as u64).div_ceil(q4mv::ROWS_PER_TG);
-            enc.set_compute_pipeline_state(pipes.q4_matvec);
+            // Q4_0 matvec expects Q8 input + Q8 scales (per-32 f16-scaled
+            // blocks). Geometry travels with the kernel handle.
+            let kernel = pipes.q4_matvec;
+            let num_tgs = (num_rows as u64).div_ceil(kernel.rows_per_tg);
+            enc.set_compute_pipeline_state(&kernel.state);
             enc.set_buffer(0, Some(w_buf), 0);
             enc.set_buffer(1, Some(q8_in), q8_in_off);
             enc.set_buffer(2, Some(q8s_in), q8s_in_off);
@@ -129,7 +144,7 @@ pub fn encode(
             enc.set_bytes(5, 4, &k as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(num_tgs, 1, 1),
-                MTLSize::new(q4mv::THREADS_PER_TG, 1, 1),
+                MTLSize::new(kernel.threads_per_tg, 1, 1),
             );
         }
     }

@@ -9,13 +9,18 @@ use crate::error::VindexError;
 
 use super::core::VectorIndex;
 
+use crate::format::filenames::{
+    DOWN_FEATURES_BIN, GATE_VECTORS_Q4_BIN, INTERLEAVED_BIN,
+    INTERLEAVED_Q4_BIN, INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON,
+    UP_FEATURES_BIN,
+};
 use crate::mmap_util::{mmap_demand_paged, mmap_optimized};
 
 /// Feature store methods for VectorIndex.
 impl VectorIndex {
     /// Load feature-major down vectors from down_features.bin.
     pub fn load_down_features(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("down_features.bin");
+        let path = dir.join(DOWN_FEATURES_BIN);
         if !path.exists() {
             return Err(VindexError::Parse(
                 "down_features.bin not found. Run: cargo run --release -p larql-vindex --example build_down_features -- <vindex>".into()
@@ -76,7 +81,7 @@ impl VectorIndex {
 
     /// Load feature-major up vectors from up_features.bin.
     pub fn load_up_features(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("up_features.bin");
+        let path = dir.join(UP_FEATURES_BIN);
         if !path.exists() {
             return Err(VindexError::Parse(
                 "up_features.bin not found. Run: cargo run --release -p larql-vindex --example build_up_features -- <vindex>".into()
@@ -116,7 +121,7 @@ impl VectorIndex {
     /// Load interleaved FFN data: [gate|up|down] per layer in one contiguous file.
     /// Eliminates TLB thrash from 3 separate mmap files.
     pub fn load_interleaved(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("interleaved.bin");
+        let path = dir.join(INTERLEAVED_BIN);
         if !path.exists() {
             return Err(VindexError::Parse(
                 "interleaved.bin not found. Run: cargo run --release -p larql-vindex --example build_interleaved -- <vindex>".into()
@@ -210,7 +215,7 @@ impl VectorIndex {
 
     /// Load Q4_0 interleaved FFN data.
     pub fn load_interleaved_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("interleaved_q4.bin");
+        let path = dir.join(INTERLEAVED_Q4_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("interleaved_q4.bin not found".into()));
         }
@@ -233,7 +238,7 @@ impl VectorIndex {
     /// vindexes from `build_q4k_weights.rs` — callers fall back to the legacy
     /// uniform-stride path.
     pub fn load_interleaved_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("interleaved_q4k.bin");
+        let path = dir.join(INTERLEAVED_Q4K_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("interleaved_q4k.bin not found".into()));
         }
@@ -243,7 +248,7 @@ impl VectorIndex {
         let mmap = unsafe { mmap_demand_paged(&file)? };
         self.interleaved_q4k_mmap = Some(Arc::new(mmap));
 
-        let manifest_path = dir.join("interleaved_q4k_manifest.json");
+        let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
         if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)
@@ -416,11 +421,8 @@ impl VectorIndex {
         let hidden = self.hidden_size;
         let n = intermediate * hidden;
         let padded = n.div_ceil(256) * 256;
-        let decoded = match format {
-            "Q4_K" => larql_models::quant::ggml::dequantize_q4_k(bytes, padded).ok()?,
-            "Q6_K" => larql_models::quant::ggml::dequantize_q6_k(bytes, padded).ok()?,
-            _ => return None,
-        };
+        let info = crate::quant::registry::lookup(format)?;
+        let decoded = (info.dequantize)(bytes, padded).ok()?;
         // Gate (0) and up (1) are stored row-major [intermediate, hidden] — row
         // `feat` already contains that feature's weight vector.
         //
@@ -545,13 +547,11 @@ impl VectorIndex {
         // but we don't have it wired yet — keep the hook for future use.
         let _ = backend;
 
-        let (block_bytes, block_size) = match format {
-            "Q4_K" => (144usize, 256usize),
-            "Q6_K" => (210usize, 256usize),
-            _ => return None,
-        };
-        let blocks_per_row = w_cols / block_size;
-        let bytes_per_w_row = blocks_per_row * block_bytes;
+        // Format dispatch via the registry — one lookup, no inline 144/210
+        // magic, no silent `_ => 0.0` arm scattered in the hot loop.
+        let info = crate::quant::registry::lookup(format)?;
+        let row_dot = info.row_dot?;
+        let bytes_per_w_row = info.bytes_per_row(w_cols)?;
 
         // CPU fallback: rayon over W rows, NEON per-row dot.
         let mut y_t = vec![0.0f32; w_rows * x_rows];
@@ -560,11 +560,7 @@ impl VectorIndex {
             let w_row = &bytes[w_row_start..w_row_start + bytes_per_w_row];
             for i in 0..x_rows {
                 let x_row = &x[i * w_cols..(i + 1) * w_cols];
-                slot[i] = match format {
-                    "Q4_K" => larql_models::quant::ggml::q4k_row_dot(w_row, x_row).unwrap_or(0.0),
-                    "Q6_K" => larql_models::quant::ggml::q6k_row_dot(w_row, x_row).unwrap_or(0.0),
-                    _ => 0.0,
-                };
+                slot[i] = row_dot(w_row, x_row).unwrap_or(0.0);
             }
         });
         let mut y = vec![0.0f32; x_rows * w_rows];
@@ -595,25 +591,13 @@ impl VectorIndex {
         let (bytes, format) = slices[component];
         let hidden = self.hidden_size;
         if feat >= self.num_features(layer) { return None; }
-        match format {
-            "Q4_K" => {
-                if !hidden.is_multiple_of(256) { return None; }
-                let bytes_per_row = (hidden / 256) * 144;
-                let start = feat * bytes_per_row;
-                let end = start + bytes_per_row;
-                if end > bytes.len() { return None; }
-                larql_models::quant::ggml::q4k_row_dot(&bytes[start..end], x).ok()
-            }
-            "Q6_K" => {
-                if !hidden.is_multiple_of(256) { return None; }
-                let bytes_per_row = (hidden / 256) * 210;
-                let start = feat * bytes_per_row;
-                let end = start + bytes_per_row;
-                if end > bytes.len() { return None; }
-                larql_models::quant::ggml::q6k_row_dot(&bytes[start..end], x).ok()
-            }
-            _ => None,
-        }
+        let info = crate::quant::registry::lookup(format)?;
+        let row_dot = info.row_dot?;
+        let bytes_per_row = info.bytes_per_row(hidden)?;
+        let start = feat * bytes_per_row;
+        let end = start + bytes_per_row;
+        if end > bytes.len() { return None; }
+        row_dot(&bytes[start..end], x).ok()
     }
 
     /// Fused Q4K/Q6K decode + scaled-add into `out` for one feature.
@@ -632,25 +616,13 @@ impl VectorIndex {
         let (bytes, format) = slices[component];
         let hidden = self.hidden_size;
         if feat >= self.num_features(layer) { return false; }
-        match format {
-            "Q4_K" => {
-                if !hidden.is_multiple_of(256) { return false; }
-                let bytes_per_row = (hidden / 256) * 144;
-                let start = feat * bytes_per_row;
-                let end = start + bytes_per_row;
-                if end > bytes.len() { return false; }
-                larql_models::quant::ggml::q4k_row_scaled_add(&bytes[start..end], alpha, out).is_ok()
-            }
-            "Q6_K" => {
-                if !hidden.is_multiple_of(256) { return false; }
-                let bytes_per_row = (hidden / 256) * 210;
-                let start = feat * bytes_per_row;
-                let end = start + bytes_per_row;
-                if end > bytes.len() { return false; }
-                larql_models::quant::ggml::q6k_row_scaled_add(&bytes[start..end], alpha, out).is_ok()
-            }
-            _ => false,
-        }
+        let Some(info) = crate::quant::registry::lookup(format) else { return false; };
+        let Some(scaled_add) = info.row_scaled_add else { return false; };
+        let Some(bytes_per_row) = info.bytes_per_row(hidden) else { return false; };
+        let start = feat * bytes_per_row;
+        let end = start + bytes_per_row;
+        if end > bytes.len() { return false; }
+        scaled_add(&bytes[start..end], alpha, out).is_ok()
     }
 
     /// Decode one row of a Q4K/Q6K FFN matrix directly into `out` without
@@ -676,36 +648,14 @@ impl VectorIndex {
         let hidden = self.hidden_size;
         if feat >= self.num_features(layer) { return false; }
 
-        match format {
-            "Q4_K" => {
-                // Q4_K block: 144 bytes for 256 elements.
-                if !hidden.is_multiple_of(256) { return false; }
-                let blocks_per_row = hidden / 256;
-                let bytes_per_row = blocks_per_row * 144;
-                let start = feat * bytes_per_row;
-                let end = start + bytes_per_row;
-                if end > bytes.len() { return false; }
-                let row_bytes = &bytes[start..end];
-                match larql_models::quant::ggml::dequantize_q4_k(row_bytes, hidden) {
-                    Ok(v) => { out.copy_from_slice(&v[..hidden]); true }
-                    Err(_) => false,
-                }
-            }
-            "Q6_K" => {
-                // Q6_K block: 210 bytes for 256 elements.
-                if !hidden.is_multiple_of(256) { return false; }
-                let blocks_per_row = hidden / 256;
-                let bytes_per_row = blocks_per_row * 210;
-                let start = feat * bytes_per_row;
-                let end = start + bytes_per_row;
-                if end > bytes.len() { return false; }
-                let row_bytes = &bytes[start..end];
-                match larql_models::quant::ggml::dequantize_q6_k(row_bytes, hidden) {
-                    Ok(v) => { out.copy_from_slice(&v[..hidden]); true }
-                    Err(_) => false,
-                }
-            }
-            _ => false,
+        let Some(info) = crate::quant::registry::lookup(format) else { return false; };
+        let Some(bytes_per_row) = info.bytes_per_row(hidden) else { return false; };
+        let start = feat * bytes_per_row;
+        let end = start + bytes_per_row;
+        if end > bytes.len() { return false; }
+        match (info.dequantize)(&bytes[start..end], hidden) {
+            Ok(v) => { out.copy_from_slice(&v[..hidden]); true }
+            Err(_) => false,
         }
     }
 
@@ -794,7 +744,7 @@ impl VectorIndex {
     /// The per-layer feature count comes from gate_mmap_slices (must load
     /// f32/f16 gates first for the slice metadata, or pass feature counts).
     pub fn load_gate_vectors_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("gate_vectors_q4.bin");
+        let path = dir.join(GATE_VECTORS_Q4_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("gate_vectors_q4.bin not found".into()));
         }

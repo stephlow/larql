@@ -7,6 +7,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 
 /// Compute SHA256 checksum of a file. Returns hex string.
 pub fn sha256_file(path: &Path) -> Result<String, VindexError> {
@@ -29,14 +30,14 @@ pub fn compute_checksums(dir: &Path) -> Result<HashMap<String, String>, VindexEr
     let mut checksums = HashMap::new();
 
     let files = [
-        "gate_vectors.bin",
-        "embeddings.bin",
-        "down_meta.bin",
+        GATE_VECTORS_BIN,
+        EMBEDDINGS_BIN,
+        DOWN_META_BIN,
         "down_meta.jsonl",
-        "attn_weights.bin",
+        ATTN_WEIGHTS_BIN,
         "up_weights.bin",
         "down_weights.bin",
-        "norms.bin",
+        NORMS_BIN,
         "lm_head.bin",
     ];
 

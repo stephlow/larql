@@ -6,16 +6,20 @@
 pub mod common;
 pub mod sgemm;
 pub mod sgemm_transb;
-pub mod q4_matvec;
+// Q4_0 matvec: only `q4_matvec_v4` ships. Earlier variants
+// (q4_matvec, _v2, _v3, _v5) were experiments kept around for ad-hoc
+// benchmarks; deleted 2026-04-25 because every shader compiled into
+// the library is reachable by `library.get_function(name)` and was a
+// pipeline-selection hazard (see ROADMAP P0b / q4_matvec_v4 ship-log).
+// If a future variant lands, add its file here AND a `Kernel` marker
+// implementing `metal::kernel::TiledKernel` so the binding site reads
+// it by *path*, not by hand-typed string.
+pub mod q4_matvec_v4;
 pub mod q4_vecmat;
 pub mod q4_f32_matvec;
 pub mod geglu;
 pub mod quantize_q8;
 pub mod causal_attention;
-pub mod q4_matvec_v2;
-pub mod q4_matvec_v3;
-pub mod q4_matvec_v4;
-pub mod q4_matvec_v5;
 pub mod q8_matvec;
 pub mod kv_attention;
 pub mod q4_sparse_matvec;
@@ -51,12 +55,8 @@ pub fn all_shaders() -> String {
     src.push_str(sgemm_transb::SHADER);
     src.push_str(f32_gemv::SHADER);
     src.push_str(f16_gemv::SHADER);
-    // Q4 dense matvec variants
-    src.push_str(q4_matvec::SHADER);
-    src.push_str(q4_matvec_v2::SHADER);
-    src.push_str(q4_matvec_v3::SHADER);
+    // Q4 dense matvec
     src.push_str(q4_matvec_v4::SHADER);
-    src.push_str(q4_matvec_v5::SHADER);
     // Q4 other
     src.push_str(q4_vecmat::SHADER);
     src.push_str(q4_f32_matvec::SHADER);

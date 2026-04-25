@@ -11,6 +11,7 @@
 //!
 //! Zero forward passes. Pure matrix multiplication.
 
+use larql_vindex::format::filenames::*;
 use larql_core::core::edge::Edge;
 use larql_core::core::enums::SourceType;
 use larql_core::core::graph::Graph;
@@ -52,7 +53,7 @@ impl AttentionWalker {
         let model_path = resolve_model_path(model)?;
         let weights = crate::model::load_model_dir(&model_path)?;
 
-        let tokenizer_path = model_path.join("tokenizer.json");
+        let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {
             return Err(InferenceError::MissingTensor(
                 "tokenizer.json not found".into(),

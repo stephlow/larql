@@ -13,8 +13,8 @@ use larql_models::TopKEntry;
 
 use crate::error::VindexError;
 
-use super::core::VectorIndex;
-use super::types::*;
+use crate::index::core::VectorIndex;
+use crate::index::types::*;
 
 impl VectorIndex {
     pub fn load_gates(

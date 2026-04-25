@@ -51,7 +51,7 @@ pub use capture::{
 pub use chat::{wrap_chat_prompt, wrap_with_vindex_template, wrap_prompt_raw, ChatWrap};
 pub use error::InferenceError;
 pub use ffn::{
-    FfnBackend, LayerFfnRouter, RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend,
+    BackendFfn, FfnBackend, LayerFfnRouter, RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend,
     RemoteLatencyStats, SparseFfn, WeightFfn,
     MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig,
 };
@@ -99,6 +99,9 @@ pub use tokenizer::{decode_token, decode_token_raw, encode_prompt, load_tokenize
 
 // Engine re-exports.
 pub use engines::{EngineInfo, EngineKind, KvEngine};
+pub use engines::accuracy::{
+    HiddenAccuracy, compare_hidden, cosine_similarity, kl_divergence, js_divergence, mse, softmax,
+};
 pub use engines::markov_residual::MarkovResidualEngine;
 pub use engines::unlimited_context::UnlimitedContextEngine;
 

@@ -113,7 +113,9 @@ pub fn multi_layer_ffn(
     let k_val = hidden as u32;
     let inter_val = inter as u32;
     let hidden_val = hidden as u32;
-    let num_tgs = (inter as u64).div_ceil(shader::ROWS_PER_TG);
+    let kernel = &pipelines.matvec;
+    let num_tgs = (inter as u64).div_ceil(kernel.rows_per_tg);
+    let tg_size = MTLSize::new(kernel.threads_per_tg, 1, 1);
     let n_blocks = (hidden / 32) as u32;
 
     let (q8_init, q8s_init) = quantize_to_q8(x);
@@ -155,7 +157,7 @@ pub fn multi_layer_ffn(
         enc.set_buffer(3, Some(&gate_outs[l]), 0);
         enc.set_bytes(4, 4, &n_val as *const u32 as *const c_void);
         enc.set_bytes(5, 4, &k_val as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), tg_size);
         enc.end_encoding();
 
         // Up
@@ -167,7 +169,7 @@ pub fn multi_layer_ffn(
         enc.set_buffer(3, Some(&up_outs[l]), 0);
         enc.set_bytes(4, 4, &n_val as *const u32 as *const c_void);
         enc.set_bytes(5, 4, &k_val as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), tg_size);
         enc.end_encoding();
 
         // GEGLU

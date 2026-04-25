@@ -48,7 +48,22 @@ pub use pipeline::{
 
 // ── Re-exports: backend ──
 
-pub use backend::{ComputeBackend, MatMulOp, dot_proj_gpu, matmul_gpu};
+pub use backend::{
+    Capability, ComputeBackend, DecodeBackend, MatMul, MatMulOp, QuantMatVec,
+    dot_proj_gpu, matmul_gpu,
+};
+
+/// Bring every backend sub-trait into scope at once.
+///
+/// Most test/bench/example code calls methods like `matmul_transb` or
+/// `q4_matvec` directly on a concrete `CpuBackend` / `MetalBackend`,
+/// which Rust resolves through the sub-trait that defines the method.
+/// `use larql_compute::prelude::*;` saves listing them one by one.
+pub mod prelude {
+    pub use crate::backend::{
+        Capability, ComputeBackend, DecodeBackend, MatMul, MatMulOp, QuantMatVec,
+    };
+}
 pub use cpu::CpuBackend;
 pub use cpu::ops::vector::{dot, norm, cosine};
 pub use cpu::ops::linalg::{cholesky, cholesky_solve, cholesky_inverse, ridge_decomposition_solve};

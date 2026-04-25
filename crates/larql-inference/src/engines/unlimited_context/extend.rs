@@ -1,13 +1,13 @@
 //! Multi-token extend with prior K,V checkpoint.
 //!
-//! Runs a CPU forward pass over new tokens, seeding each layer's attention with
-//! an optional prior K,V cache (the window boundary checkpoint). Equivalent to
-//! Python `UnlimitedContextEngine.replay_window` inner loop.
+//! Runs a CPU/GPU forward pass over new tokens, seeding each layer's attention
+//! with an optional prior K,V cache (the window boundary checkpoint).
 
 use ndarray::Array2;
+use larql_compute::ComputeBackend;
 
-use crate::attention::{run_attention_block_decode_step, SharedKV};
-use crate::ffn::WeightFfn;
+use crate::attention::{run_attention_block_decode_step_backend, SharedKV};
+use crate::ffn::BackendFfn;
 use crate::forward::{embed_tokens_pub, run_ffn};
 use crate::model::ModelWeights;
 
@@ -21,7 +21,7 @@ pub struct ExtendOutput {
 }
 
 /// Run the decoder forward over `token_ids` seeded with an optional prior K,V
-/// checkpoint at each layer.
+/// checkpoint at each layer. Matmuls route through `backend`.
 ///
 /// `abs_start` is the absolute position of the *first new token*.
 pub fn rs_extend_from_checkpoint(
@@ -30,8 +30,21 @@ pub fn rs_extend_from_checkpoint(
     prior_kv: &[SharedKV],
     abs_start: usize,
 ) -> Option<ExtendOutput> {
+    rs_extend_from_checkpoint_backend(
+        weights, token_ids, prior_kv, abs_start,
+        &larql_compute::CpuBackend,
+    )
+}
+
+/// Backend-dispatched variant of [`rs_extend_from_checkpoint`].
+pub fn rs_extend_from_checkpoint_backend(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    prior_kv: &[SharedKV],
+    abs_start: usize,
+    backend: &dyn ComputeBackend,
+) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
-    let ffn = WeightFfn { weights };
 
     if token_ids.is_empty() { return None; }
     if prior_kv.len() != num_layers { return None; }
@@ -50,10 +63,12 @@ pub fn rs_extend_from_checkpoint(
                 None
             };
 
-            let (h_post_attn, new_kv) =
-                run_attention_block_decode_step(weights, &h, layer, kv_entry, abs_position)?;
+            let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
+                weights, &h, layer, kv_entry, abs_position, Some(backend),
+            )?;
 
-            let (h_out, _capture) = run_ffn(weights, &h_post_attn, layer, &ffn, false);
+            let bffn = BackendFfn { weights, backend };
+            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
             h = h_out;
             *kv_slot = new_kv;
         }
@@ -78,8 +93,7 @@ pub fn rs_extend_from_checkpoint(
     })
 }
 
-/// Build an empty (zero-row) K,V seed for use as `prior_kv` when no prior
-/// checkpoint exists (first window, or replay of window 0).
+/// Build an empty (zero-row) K,V seed for use when no prior checkpoint exists.
 pub fn empty_prior(weights: &ModelWeights) -> Vec<SharedKV> {
     let arch = &*weights.arch;
     (0..weights.num_layers)

@@ -5,6 +5,7 @@
 //! and pushes the answer token through the LM head. CLI-driven; contrasts
 //! with patch mode (vindex-driven, many edges).
 
+use larql_vindex::format::filenames::*;
 use std::collections::HashMap;
 
 use ndarray::ArcArray2;
@@ -31,7 +32,7 @@ pub fn run(args: CompileArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config = weights.arch.config();
     eprintln!("  {} layers, dim={}", config.num_layers, config.hidden_size);
 
-    let tokenizer_path = args.base.join("tokenizer.json");
+    let tokenizer_path = args.base.join(TOKENIZER_JSON);
     if !tokenizer_path.exists() {
         return Err(format!(
             "tokenizer.json not found in {}",

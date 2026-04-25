@@ -4,6 +4,7 @@
 //! a text-only language model. Tied lm_head is dropped when `embed_tokens` is
 //! present, matching HuggingFace's tied-embedding convention.
 
+use larql_vindex::format::filenames::*;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -120,8 +121,8 @@ pub fn write_safetensors(
 /// a text-only Gemma 3 checkpoint (multimodal tensors were skipped above).
 pub fn copy_model_config(base: &Path, output: &Path) {
     for name in &[
-        "tokenizer.json",
-        "tokenizer_config.json",
+        TOKENIZER_JSON,
+        TOKENIZER_CONFIG_JSON,
         "special_tokens_map.json",
         "generation_config.json",
         "tokenizer.model",  // SentencePiece model — required by llama.cpp's GGUF converter

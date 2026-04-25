@@ -28,12 +28,14 @@ pub mod q4 {
 }
 
 use ndarray::{Array2, ArrayView2};
-use crate::backend::ComputeBackend;
+use crate::backend::{
+    Capability, ComputeBackend, DecodeBackend, MatMul, QuantMatVec,
+};
 
 /// CPU backend using BLAS (f32) and C kernel (Q4).
 pub struct CpuBackend;
 
-impl ComputeBackend for CpuBackend {
+impl MatMul for CpuBackend {
     fn matmul(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
         ops::f32_matmul::matmul(a, b)
     }
@@ -41,7 +43,9 @@ impl ComputeBackend for CpuBackend {
     fn matmul_transb(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
         ops::f32_matmul::matmul_transb(a, b)
     }
+}
 
+impl QuantMatVec for CpuBackend {
     fn q4_matvec(
         &self, q4_data: &[u8], q8_x: &[i8], q8_scales: &[f32],
         num_rows: usize, hidden: usize,
@@ -69,7 +73,14 @@ impl ComputeBackend for CpuBackend {
     }
 
     fn has_q4(&self) -> bool { true }
+}
 
+// CPU doesn't run the full decode pipeline through ComputeBackend —
+// `larql-inference` drives that path. The default `None` impls are
+// the right answer here.
+impl DecodeBackend for CpuBackend {}
+
+impl ComputeBackend for CpuBackend {
     fn name(&self) -> &str {
         "cpu (BLAS + C Q4 kernel)"
     }
@@ -79,5 +90,12 @@ impl ComputeBackend for CpuBackend {
         { "macOS Accelerate AMX".to_string() }
         #[cfg(not(target_os = "macos"))]
         { "CPU BLAS".to_string() }
+    }
+
+    fn supports(&self, cap: Capability) -> bool {
+        matches!(
+            cap,
+            Capability::QuantMatVec | Capability::Q4VecMat,
+        )
     }
 }

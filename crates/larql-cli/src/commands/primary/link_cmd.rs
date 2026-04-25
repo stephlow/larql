@@ -17,6 +17,7 @@
 //! - Otherwise the basename of `<path>`, with a trailing `.vindex`
 //!   stripped (so `output/gemma3-4b-f16.vindex` → `gemma3-4b-f16`).
 
+use larql_vindex::format::filenames::*;
 use std::path::PathBuf;
 
 use clap::Args;
@@ -48,7 +49,7 @@ pub fn run(args: LinkArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !target.is_dir() {
         return Err(format!("not a directory: {}", target.display()).into());
     }
-    if !target.join("index.json").exists() {
+    if !target.join(INDEX_JSON).exists() {
         return Err(format!(
             "not a vindex: {} (no index.json)",
             target.display()

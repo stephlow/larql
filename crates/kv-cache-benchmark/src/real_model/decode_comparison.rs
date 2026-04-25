@@ -18,6 +18,7 @@
 //!   L29/L30 → in-context comprehension (dynamic for in-context, static for parametric)
 
 use ndarray::Array2;
+use larql_compute::MatMul;
 use larql_inference::model::ModelWeights;
 use larql_inference::attention::run_attention_block_decode_step;
 use larql_inference::forward::{embed_tokens_pub, run_ffn, logits_to_predictions_pub};
@@ -90,7 +91,7 @@ pub fn run_decode_comparison(
     // --- Prefill -----------------------------------------------------------
     // Both strategies share the same prefill. Divergence is decode-only.
     let kv = capture_kv(weights, token_ids);
-    let rs_result = rs_prefill(weights, token_ids, Some(window_size));
+    let rs_result = rs_prefill(weights, token_ids, Some(window_size), &larql_compute::CpuBackend);
 
     // Build per-layer mutable KV cache from captured tensors.
     let mut kv_cache: Vec<(Array2<f32>, Array2<f32>)> = kv.keys
@@ -127,7 +128,7 @@ pub fn run_decode_comparison(
         let next_full_prob = full_preds.predictions.first().map(|(_, p)| *p).unwrap_or(0.0);
 
         // --- RS decode step ---
-        let (h_rs, new_store) = match rs_decode_step(weights, rs_id, rs_store) {
+        let (h_rs, new_store) = match rs_decode_step(weights, rs_id, rs_store, &larql_compute::CpuBackend) {
             Some(r) => r,
             None => break,
         };

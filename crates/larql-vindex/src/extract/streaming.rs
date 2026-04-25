@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use ndarray::Array2;
 
 use crate::config::dtype::StorageDtype;
+use crate::format::filenames::*;
 use crate::config::types::QuantFormat;
 use crate::config::{VindexConfig, VindexLayerInfo, VindexModelConfig};
 use crate::error::VindexError;
@@ -123,7 +124,7 @@ pub fn build_vindex_streaming(
     // but redirect writes to `/dev/null` (`io::sink`). The gate bytes
     // are recoverable from `interleaved_q4k.bin` at load time.
     callbacks.on_stage("gate_vectors");
-    let gate_path = output_dir.join("gate_vectors.bin");
+    let gate_path = output_dir.join(GATE_VECTORS_BIN);
     enum GateSink {
         File(BufWriter<std::fs::File>),
         Discard(std::io::Sink),
@@ -314,7 +315,7 @@ pub fn build_vindex_streaming(
     let vocab_size = embed.shape()[0];
     let embed_data = embed.as_slice().unwrap();
     let embed_bytes = crate::config::dtype::encode_floats(embed_data, dtype);
-    std::fs::write(output_dir.join("embeddings.bin"), &embed_bytes)?;
+    std::fs::write(output_dir.join(EMBEDDINGS_BIN), &embed_bytes)?;
     callbacks.on_stage_done("embeddings", 0.0);
 
     // ── 3. Down meta (streaming) ──
@@ -398,7 +399,7 @@ pub fn build_vindex_streaming(
 
                 let w_chunk = w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
                 let cpu = larql_compute::CpuBackend;
-                use larql_compute::ComputeBackend;
+                use larql_compute::{ComputeBackend, MatMul};
                 let chunk_logits = cpu.matmul(embed.view(), w_chunk.view());
 
                 for feat in batch_start..batch_end {
@@ -451,7 +452,7 @@ pub fn build_vindex_streaming(
     callbacks.on_stage("tokenizer");
     let tokenizer_json = tokenizer.to_string(true)
         .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
-    std::fs::write(output_dir.join("tokenizer.json"), tokenizer_json)?;
+    std::fs::write(output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
     callbacks.on_stage_done("tokenizer", 0.0);
 
     // ── 5. Config ──
@@ -517,7 +518,7 @@ pub fn build_vindex_streaming(
     // Write preliminary index.json (needed by write_model_weights which reads dtype from it)
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(output_dir.join("index.json"), config_json)?;
+    std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
 
     // ── 6. Model weights (if extract level requires them) ──
     // With quant=q4k we always materialise weights regardless of the
@@ -557,13 +558,13 @@ pub fn build_vindex_streaming(
     }
 
     // Final checksums
-    let config_text = std::fs::read_to_string(output_dir.join("index.json"))?;
+    let config_text = std::fs::read_to_string(output_dir.join(INDEX_JSON))?;
     let mut config: VindexConfig = serde_json::from_str(&config_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     config.checksums = crate::format::checksums::compute_checksums(output_dir).ok();
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(output_dir.join("index.json"), config_json)?;
+    std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
 
     Ok(())
 }

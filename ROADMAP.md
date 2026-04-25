@@ -390,91 +390,75 @@ Worth doing for the Act 2 demo but non-trivial. See
 
 ## P1 — Loose ends in shipped features
 
-### `compute` crate hygiene — six follow-ups from the q4_matvec_v4 review
+### `compute` crate hygiene — five remaining follow-ups
 
-The 75 %-row-drop bug (closed 2026-04-25, see ship log) was a
-symptom: dispatch geometry constants imported separately from the
-pipeline kernel name, so the two could silently desync. Walking the
-crate to look for the same bug class in other shaders surfaced
-several modularity/maintainability issues. Each is its own follow-up.
+The 75 %-row-drop bug (closed 2026-04-25) was a symptom: dispatch
+geometry constants imported separately from the pipeline kernel
+name, so the two could silently desync. The crate-wide review that
+followed surfaced six modularity / maintainability items; five
+shipped in the same window (P0a, P0b, P1a, P1b, P2a — see ship log)
+and one landed partially (P2b). What's left below is what's still
+open:
 
-#### P0a — Stamp pipeline + geometry on a single handle (open)
+#### Spread `KernelHandle` to remaining tiled shaders (open)
 
-Today `Q4Pipelines.matvec` is a bare `ComputePipelineState`; geometry
-constants (`ROWS_PER_TG`, `THREADS_PER_TG`) are imported separately
-from the shader module name at every dispatch site. There were 6
-sites, all hand-wired to `crate::metal::shaders::q4_matvec` while the
-pipeline was actually built from `q4_matvec_v4` — that mismatch is
-exactly how the row-drop bug landed. Other shaders with the same
-shape (`q4k_matvec`, `q4kf_qkv_proj`, `q6k_matvec`, `q4k_ffn_gate_up`)
-have the same latent risk.
+P0a shipped `KernelHandle` for `q4_matvec_v4`. The same desync risk
+exists for every other simdgroup-tiled shader where the dispatcher
+imports `ROWS_PER_TG` / `THREADS_PER_TG` separately from the
+pipeline name: `q4k_matvec`, `q4kf_qkv_proj`, `q6k_matvec`,
+`q4k_ffn_gate_up`, `q4kf_ffn_gate_up`, `q4k_q6k_qkv_proj`,
+`q4k_proj`, `q4kf_proj`, `q4k_geglu_silu_down`,
+`q4k_geglu_gelu_tanh_down` (~9 shaders). Each gets a `Kernel`
+marker (`impl TiledKernel` in its shader file), a `KernelHandle`
+field on `MetalBackend`, and the call sites lose their direct
+`shaders::*::ROWS_PER_TG` imports. Mechanical — same pattern as
+the v4 transformation, just repeated.
 
-Replace bare pipelines with `KernelHandle { state, rows_per_tg,
-threads_per_tg, name }`. Dispatchers read `q4.matvec.rows_per_tg` —
-single source of truth, swap kernel = swap struct field. Pinned by a
-contract test like `q4_matvec_dispatch_geometry_matches_v4_kernel`
-applied to every shader family.
+#### Migrate callers off the per-format matvec helpers (open)
 
-#### P0b — Delete unused `q4_matvec_v2/v3/v5` shaders (open)
+P1a landed `quant_matvec(format, weights, x, n, k)` as the unified
+entry point, but the per-format helpers `q4_matvec`, `q4k_matvec`,
+`q6k_matvec` still exist on the trait — kept around because hot
+decode paths pre-quantise the input once and reuse it across many
+gate/up matvecs in a layer (the unified method re-quantises every
+call). Migration plan: add a pre-quantised variant
+`quant_matvec_q8_input` on `QuantMatVec` for the Q4_0/Q8_0 path,
+route remaining callsites through it, then delete the per-format
+helpers. Until then `quant_matvec` is the API for new code and the
+per-format methods are legacy.
 
-Five `q4_matvec_v*` files in `crates/larql-compute/src/metal/shaders/`,
-only `_v4` is wired up. v2/v3/v5 are dead weight, all reachable by
-name from `library.get_function()` — the row-drop bug literally was
-importing the *wrong* one's constants. Delete v2/v3/v5; if any are
-still useful for benchmarking move them under `experimental/` behind
-a feature flag.
+#### Extract stage helpers from `dispatch_full_pipeline` (open)
 
-#### P1a — Unify per-quant matvec into one `quant_matvec` trait method (open)
+`metal/ops/full_pipeline.rs` is at 654 LOC after P2b's dead-code
+cleanup; the remaining content is the live `dispatch_full_pipeline`
+procedure (~570 LOC, one function). Apply the
+`encode_qkv` / `encode_ffn` extraction pattern (the one that pulled
+`decode/mod.rs` from 1080 → 707) to break it into stage-named
+helpers. Pure organisation work, no behaviour change — same kind
+of mechanical commit as the v4 KernelHandle spread.
 
-`ComputeBackend` has separate `q4_matvec`, `q4k_matvec`, `q6k_matvec`
-methods (and CPU has internal `q8_matvec`, FP4 will need its own).
-Adding a quant touches 7-9 places: cpu kernel + metal shader + metal
-op + pipeline field + trait method + cpu impl + metal impl +
-`QuantFormat` enum + `prefill::encode_quant_matvec_at_offset` +
-`metal/stages/quant_matvec.rs`. The match-on-format already exists in
-`metal/stages/quant_matvec.rs:36-133`; lift it to the trait. Adding
-FP4 should drop to 1 enum variant + 1 match arm + 1 shader + 1 cpu
-kernel.
+#### Replace `decode_profile.rs` with a `Profile` decorator (open)
 
-#### P1b — Criterion bench suite covering all quants × cpu/metal (open)
+`metal/decode_profile.rs` (567 LOC) is a near-duplicate of
+`metal/decode/mod.rs` with per-command-buffer timing tags. Today
+it's only consulted under `LARQL_PROFILE_SPLIT=1`, so it carries no
+production risk, but it's a DRY violation. Replace by threading an
+optional timing hook through `decode/mod.rs` and have
+`decode_token_split_profile` populate a `Profile` struct that
+records each command buffer's wall time. Once parity is verified,
+delete `decode_profile.rs` outright.
 
-Two criterion benches today (`benches/matmul.rs`, `benches/linalg.rs`)
-both CPU only. No Q4_K / Q6_K / Q4_KF / Q8_0 benches, no CPU-vs-Metal
-comparison at the same shape, no regression-detector bench (the
-75 %-row drop would have shown as a 4× throughput cliff on a Q4_0
-lm-head bench three weeks before goldens caught it). 26
-`examples/profile_*.rs` files do ad-hoc benchmarking with no
-historical baselines.
+#### Plug `benches/quant_matvec` into CI (open)
 
-Consolidate into `benches/quant_matvec.rs` with groups per format
-(Q4_0, Q4_K, Q4_KF, Q6_K, Q8_0) × per shape (decode-token N=2560,
-prefill-seq=128, lm-head N=262144) × per backend (cpu, metal). HTML
-output under `target/criterion/`. Prune the profile examples.
-
-#### P2a — Trait split + Capability enum (open)
-
-`ComputeBackend` is 27 methods, half are `Option<>`-returning
-capability probes mixing f32 matmul, per-quant matvec, KV cache, MoE,
-decode, prefill, profiling, MoE remote hook, split-profile timing.
-Split into smaller traits: `MatMul` (f32/f16), `QuantMatVec` (one
-method, dispatch on `QuantFormat`), `DecodeBackend` (token / prefill
-/ KV), `ProfileSplit`. Backends opt in via blanket impls or a
-capability bitset. Callers branch on `backend.supports(Capability::…)`
-instead of `Option::is_some()`.
-
-#### P2b — Decompose `ops/full_pipeline.rs`, drop `decode_profile.rs` (open)
-
-Three big files trending past comprehension:
-- `metal/ops/full_pipeline.rs` — 942 LOC
-- `metal/decode/mod.rs` — 707 LOC (already shrunk from 1080 in the
-  Decode-vs-prefill parity work; same pattern applies)
-- `metal/decode_profile.rs` — 567 LOC, looks like `decode/mod.rs`
-  plus per-stage timing (DRY violation)
-
-Apply the `encode_qkv` / `encode_ffn` extraction pattern to
-`full_pipeline.rs`. Replace `decode_profile.rs` with an opt-in
-`Profile` wrapper that decorates `decode/mod.rs` so timing logic
-isn't a duplicate decode path.
+P1b shipped the bench suite covering Q4_0/Q4_K/Q4_KF/Q6_K × decode/
+prefill/lm-head shapes × CPU/Metal — but it only runs when a human
+types `cargo bench`. Wire it to CI on PRs: stash a baseline
+under `target/criterion/` keyed by main, run the suite on each PR,
+post a comment with the per-cell delta. The 75 %-row drop bug would
+have shown as a 4× throughput cliff on `quant_matvec_q4_0/metal/
+lm_head_262144` weeks before goldens caught it — that's the
+detection cadence we want from CI, not from a goldens-fail two
+weeks later.
 
 ### `--compact` loader reconstruction — WalkFfn-only today
 
@@ -577,6 +561,77 @@ the attention weights taking a third of RAM.
 ---
 
 ## Done (ship log)
+
+### `compute` crate hygiene — five of six follow-ups closed (2026-04-25)
+
+Six follow-ups dropped out of the `q4_matvec_v4` review (see the
+ship-log entry below for that bug). Five landed the same day; one
+is partial. Five further items still open are tracked under
+`compute crate hygiene` in P1.
+
+**P0a — Pipeline + geometry on a single handle.** New module
+`metal/kernel/{mod, handle, traits}.rs`. `KernelHandle` carries
+pipeline state + `rows_per_tg` + `threads_per_tg` + name as one
+struct; `TiledKernel` marker trait lets each shader file own its
+own constants (`pub struct Kernel; impl TiledKernel for Kernel { …
+}`). Binding sites read by *type path* — no magic strings, no
+shader-vs-dispatcher constants drift. Construction asserts
+`pipeline.maxTotalThreadsPerThreadgroup() ≥ threads_per_tg` so
+silent simdgroup drop is caught at startup. Applied to the Q4_0
+matvec family in this commit; spreading to other tiled shaders is
+its own follow-up.
+
+**P0b — Dead `q4_matvec_v2/v3/v5` shaders deleted.** Four shader
+files removed from `metal/shaders/`; two example files retired
+(`profile_kernels.rs`, `test_shaders.rs` — superseded by P1b's
+bench suite); `prefill.rs` switched to a flat `dispatch_threads`
+for the f32 matvec path; `profile_components.rs` reads geometry
+from the live `KernelHandle`. Library is shorter and the kernel-
+name registry has no decoy entries.
+
+**P1a — Unified `quant_matvec(format, …)` trait method.** New
+default impl on `QuantMatVec` dispatches on `QuantFormat`
+(Q4_K/Q4_KF → q4k_matvec, Q6_K → q6k_matvec, Q4_0/Q8_0 →
+quantize-then-q4_matvec). Adding FP4/FP8 = one enum variant + one
+match arm. Pinned by
+`cpu_quant_matvec_matches_per_format_helpers`. Per-format helpers
+stay around for hot pre-quantised paths; final removal is its own
+follow-up.
+
+**P1b — Criterion bench suite.** `benches/quant_matvec.rs` covers
+Q4_0/Q4_K/Q4_KF/Q6_K × {decode_2560, prefill_10240, lm_head_262144}
+× {cpu, metal}. Single Criterion group per format → side-by-side
+HTML reports under `target/criterion/`. The next 4× throughput
+cliff (the kind the row-drop caused) shows up here as a regression
+the moment the bench runs. Wiring this into CI is its own
+follow-up.
+
+**P2a — Trait split + `Capability` enum.** `backend/` is now a
+folder: `mod.rs` (umbrella + `name`/`device_info`/`supports`),
+`matmul.rs` (`MatMul`), `quant_matvec.rs` (`QuantMatVec`),
+`decode.rs` (`DecodeBackend`), `capability.rs` (`Capability`),
+`helpers.rs` (`dot_proj_gpu` / `matmul_gpu`). Same split for
+Metal: `metal/trait_impl/{matmul, quant_matvec, decode, mod}.rs`.
+CPU/Metal each declare what they accelerate via `supports(cap) →
+bool` — callers can branch on capability instead of probing for
+`None`. `larql_compute::prelude::*` brings every sub-trait in
+scope at once.
+
+**P2b — Big-file decomposition (partial).**
+`metal/ops/full_pipeline.rs`: 942 → 654 LOC by deleting six
+`#[allow(dead_code)]` legacy helpers (`encode_q4_matvec`,
+`encode_q8_matvec`, `encode_q4_matvec_offset`,
+`encode_quant_matvec_offset`, `dispatch_ffn_matvec`,
+`encode_quant_matvec`). The remaining 654 LOC is the live
+`dispatch_full_pipeline` body — extracting stage-named helpers from
+it is its own follow-up. `decode_profile.rs` (567 LOC duplicate of
+`decode/mod.rs` + timing tags) deferred — it's only consulted under
+`LARQL_PROFILE_SPLIT=1` and the proper Profile-decorator refactor
+is its own surgery.
+
+**Verification.** 180 tests pass across larql-compute, whole
+workspace builds, examples build, criterion bench framework
+smoke-tested on both backends.
 
 ### Metal `q4_matvec_v4` 75 %-row drop on tied-embedding LM-head — closed (2026-04-25)
 

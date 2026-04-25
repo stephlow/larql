@@ -22,6 +22,7 @@ use std::path::Path;
 use larql_models::{ModelWeights, TopKEntry, WeightArray};
 
 use crate::config::dtype::{write_floats, StorageDtype};
+use crate::format::filenames::*;
 use crate::config::{VindexConfig, VindexLayerInfo, VindexModelConfig};
 use crate::error::VindexError;
 
@@ -104,7 +105,7 @@ impl<'a> BuildContext<'a> {
     /// concatenates each expert's matrix). Populates `layer_infos`.
     fn write_gate_vectors(&mut self) -> Result<(), VindexError> {
         self.callbacks.on_stage("gate_vectors");
-        let gate_path = self.output_dir.join("gate_vectors.bin");
+        let gate_path = self.output_dir.join(GATE_VECTORS_BIN);
         let mut gate_file = BufWriter::new(std::fs::File::create(&gate_path)?);
         let mut offset: u64 = 0;
 
@@ -185,7 +186,7 @@ impl<'a> BuildContext<'a> {
     /// Stage 2 — write `embeddings.bin`.
     fn write_embeddings(&mut self) -> Result<(), VindexError> {
         self.callbacks.on_stage("embeddings");
-        let embed_path = self.output_dir.join("embeddings.bin");
+        let embed_path = self.output_dir.join(EMBEDDINGS_BIN);
         let embed_data = self.weights.embed.as_slice().unwrap();
         let embed_bytes = crate::config::dtype::encode_floats(embed_data, self.dtype);
         std::fs::write(&embed_path, &embed_bytes)?;
@@ -281,7 +282,7 @@ impl<'a> BuildContext<'a> {
 
                     let w_chunk = w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
                     let cpu = larql_compute::CpuBackend;
-                    use larql_compute::ComputeBackend;
+                    use larql_compute::{ComputeBackend, MatMul};
                     let chunk_logits = cpu.matmul(self.weights.embed.view(), w_chunk.view());
 
                     for feat in batch_start..batch_end {
@@ -401,7 +402,7 @@ impl<'a> BuildContext<'a> {
             .tokenizer
             .to_string(true)
             .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
-        std::fs::write(self.output_dir.join("tokenizer.json"), tokenizer_json)?;
+        std::fs::write(self.output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
         self.callbacks.on_stage_done("tokenizer", 0.0);
         Ok(())
     }
@@ -479,7 +480,7 @@ impl<'a> BuildContext<'a> {
         // Preliminary write — `write_model_weights` reads the index.
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| VindexError::Parse(e.to_string()))?;
-        std::fs::write(self.output_dir.join("index.json"), config_json)?;
+        std::fs::write(self.output_dir.join(INDEX_JSON), config_json)?;
 
         if extract_level != crate::ExtractLevel::Browse {
             crate::format::weights::write_model_weights(self.weights, self.output_dir, self.callbacks)?;
@@ -498,7 +499,7 @@ impl<'a> BuildContext<'a> {
 
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| VindexError::Parse(e.to_string()))?;
-        std::fs::write(self.output_dir.join("index.json"), config_json)?;
+        std::fs::write(self.output_dir.join(INDEX_JSON), config_json)?;
         Ok(())
     }
 }
@@ -553,7 +554,7 @@ pub fn build_vindex_resume(
     let embed_scale = weights.arch.embed_scale();
 
     // Reconstruct layer_infos from gate_vectors.bin
-    let gate_path = output_dir.join("gate_vectors.bin");
+    let gate_path = output_dir.join(GATE_VECTORS_BIN);
     let gate_size = std::fs::metadata(&gate_path)?.len();
     let bytes_per_layer = (intermediate_size * hidden_size * 4) as u64;
     let mut layer_infos = Vec::new();
@@ -668,7 +669,7 @@ pub fn build_vindex_resume(
     callbacks.on_stage("tokenizer");
     let tokenizer_json = tokenizer.to_string(true)
         .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
-    std::fs::write(output_dir.join("tokenizer.json"), tokenizer_json)?;
+    std::fs::write(output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
     callbacks.on_stage_done("tokenizer", 0.0);
 
     let down_top_k = 10; // default
@@ -742,7 +743,7 @@ pub fn build_vindex_resume(
 
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(output_dir.join("index.json"), config_json)?;
+    std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
 
     Ok(())
 }

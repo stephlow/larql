@@ -2,7 +2,7 @@
 
 use ndarray::Array2;
 
-use larql_compute::ComputeBackend;
+use larql_compute::prelude::*;
 use crate::model::ModelWeights;
 
 /// Prefill with KV cache population: run CPU attention, capture K/V, populate Metal KV cache.

@@ -69,3 +69,11 @@ harness = false
 [[bench]]
 name = "q4k_vs_f32"
 harness = false
+
+[[bench]]
+name = "hnsw_decode"
+harness = false
+
+[[bench]]
+name = "q4k_cache"
+harness = false

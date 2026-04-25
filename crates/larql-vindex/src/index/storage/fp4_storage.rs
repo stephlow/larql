@@ -276,6 +276,7 @@ mod tests {
     use crate::config::types::{
         ComplianceGate, Fp4Config as Cfg, Projections,
     };
+    use crate::format::filenames::*;
     use crate::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 
     /// Tempdir that cleans up on drop; stdlib-only so tests don't need a crate.
@@ -584,7 +585,7 @@ mod tests {
         let mut cfg = Cfg::option_b_default();
         cfg.projections.down = crate::config::types::ProjectionFormat {
             precision: Precision::F16,
-            file: "down_features.bin".into(),
+            file: DOWN_FEATURES_BIN.into(),
         };
         // Explicitly drop the default compliance gate — irrelevant here.
         cfg.compliance_gate = ComplianceGate {

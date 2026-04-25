@@ -7,6 +7,8 @@
 //! conversions), it's silently skipped. Failing to snapshot shouldn't abort
 //! an otherwise-successful vindex build.
 
+use crate::format::filenames::*;
+
 use std::path::Path;
 
 /// Files we opportunistically copy from the HF source directory. Names
@@ -19,7 +21,7 @@ use std::path::Path;
 /// - `generation_config.json` supplies default sampling params (temperature,
 ///   top_p, max_new_tokens). Runtime can read it for sensible defaults.
 pub const SNAPSHOT_FILES: &[&str] = &[
-    "tokenizer_config.json",
+    TOKENIZER_CONFIG_JSON,
     "special_tokens_map.json",
     "generation_config.json",
     // Newer HF convention (Gemma 4, etc.): the chat template is a
@@ -60,13 +62,13 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::create_dir_all(&dst).unwrap();
 
-        fs::write(src.join("tokenizer_config.json"), r#"{"k":"v"}"#).unwrap();
+        fs::write(src.join(TOKENIZER_CONFIG_JSON), r#"{"k":"v"}"#).unwrap();
         // special_tokens_map.json intentionally missing — should be skipped.
         fs::write(src.join("generation_config.json"), r#"{"t":1.0}"#).unwrap();
 
         let copied = snapshot_hf_metadata(&src, &dst).unwrap();
-        assert_eq!(copied, vec!["tokenizer_config.json".to_string(), "generation_config.json".to_string()]);
-        assert!(dst.join("tokenizer_config.json").exists());
+        assert_eq!(copied, vec![TOKENIZER_CONFIG_JSON.to_string(), "generation_config.json".to_string()]);
+        assert!(dst.join(TOKENIZER_CONFIG_JSON).exists());
         assert!(!dst.join("special_tokens_map.json").exists());
         assert!(dst.join("generation_config.json").exists());
     }

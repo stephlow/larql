@@ -15,26 +15,27 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 
 /// The files that make up a vindex, in priority order for lazy loading.
 const VINDEX_CORE_FILES: &[&str] = &[
-    "index.json",
-    "tokenizer.json",
-    "gate_vectors.bin",
-    "embeddings.bin",
-    "down_meta.bin",
+    INDEX_JSON,
+    TOKENIZER_JSON,
+    GATE_VECTORS_BIN,
+    EMBEDDINGS_BIN,
+    DOWN_META_BIN,
     "down_meta.jsonl",
     "relation_clusters.json",
     "feature_labels.json",
 ];
 
 const VINDEX_WEIGHT_FILES: &[&str] = &[
-    "attn_weights.bin",
-    "norms.bin",
+    ATTN_WEIGHTS_BIN,
+    NORMS_BIN,
     "up_weights.bin",
     "down_weights.bin",
     "lm_head.bin",
-    "weight_manifest.json",
+    WEIGHT_MANIFEST_JSON,
 ];
 
 /// Resolve an `hf://` path to a local directory, downloading if needed.
@@ -74,7 +75,7 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
     };
 
     // Download index.json first (small, tells us what we need)
-    let index_path = repo.get("index.json")
+    let index_path = repo.get(INDEX_JSON)
         .map_err(|e| VindexError::Parse(format!(
             "failed to download index.json from hf://{}: {e}", repo_id
         )))?;
@@ -85,7 +86,7 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
 
     // Download core files (needed for browse)
     for filename in VINDEX_CORE_FILES {
-        if *filename == "index.json" {
+        if *filename == INDEX_JSON {
             continue; // already downloaded
         }
         let _ = repo.get(filename); // optional file, skip if missing
@@ -349,7 +350,7 @@ where
 
     // index.json drives everything — we need its snapshot dir to know
     // where the rest of the files live. Cache-hit or download.
-    let index_path = fetch("index.json", "index.json").ok_or_else(|| {
+    let index_path = fetch(INDEX_JSON, INDEX_JSON).ok_or_else(|| {
         VindexError::Parse(format!(
             "failed to fetch index.json from hf://{repo_id}"
         ))
@@ -360,7 +361,7 @@ where
         .to_path_buf();
 
     for filename in VINDEX_CORE_FILES {
-        if *filename == "index.json" {
+        if *filename == INDEX_JSON {
             continue;
         }
         // Optional files — ignore failures (missing from repo is fine).
@@ -434,7 +435,7 @@ pub fn publish_vindex_with_opts(
     if !vindex_dir.is_dir() {
         return Err(VindexError::NotADirectory(vindex_dir.to_path_buf()));
     }
-    let index_path = vindex_dir.join("index.json");
+    let index_path = vindex_dir.join(INDEX_JSON);
     if !index_path.exists() {
         return Err(VindexError::Parse(format!(
             "not a vindex directory (no index.json): {}",

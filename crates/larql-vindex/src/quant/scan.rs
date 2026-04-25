@@ -28,6 +28,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 
 /// Fixed block geometry for v1. `sub_block` matches MXFP4's 1×32.
 pub const SUB_BLOCK_SIZE: usize = 32;
@@ -48,9 +49,9 @@ pub const DEFAULT_TOP_K_OFFENDERS: usize = 32;
 
 /// Projections scanned. Missing files are skipped (not an error).
 pub const PROJECTIONS: &[(&str, &str)] = &[
-    ("gate", "gate_vectors.bin"),
-    ("up", "up_features.bin"),
-    ("down", "down_features.bin"),
+    ("gate", GATE_VECTORS_BIN),
+    ("up", UP_FEATURES_BIN),
+    ("down", DOWN_FEATURES_BIN),
 ];
 
 /// Source dtype on disk. Q1 is always run on raw-float inputs; FP4
@@ -452,7 +453,7 @@ pub fn scan_vindex(
     config: &ScanConfig,
 ) -> Result<VindexComplianceReport, VindexError> {
     let index_json: Value = serde_json::from_str(
-        &std::fs::read_to_string(vindex_dir.join("index.json"))
+        &std::fs::read_to_string(vindex_dir.join(INDEX_JSON))
             .map_err(|e| VindexError::Parse(format!("read index.json: {e}")))?,
     )
     .map_err(|e| VindexError::Parse(format!("parse index.json: {e}")))?;

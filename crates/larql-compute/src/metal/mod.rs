@@ -35,10 +35,8 @@ mod prefill;
 mod trait_impl;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use ndarray::{Array2, ArrayView2};
 use metal::*;
 
-use crate::backend::{ComputeBackend, MatMulOp};
 use buffers::BufferCache;
 use f32_ops::F32Ops;
 use kernel::KernelHandle;
@@ -57,28 +55,28 @@ pub struct MetalBackend {
     q8_quant_pipeline: ComputePipelineState,
     pub kv_attend_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
-    q8_matvec_pipeline: ComputePipelineState,
+    pub q8_matvec_pipeline: KernelHandle,
     pub rms_norm_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
     q8_qkv_proj_pipeline: ComputePipelineState,
-    q4k_matvec_pipeline: ComputePipelineState,
-    pub q4k_ffn_gate_up_pipeline: ComputePipelineState,
-    pub q4kf_ffn_gate_up_pipeline: ComputePipelineState,
-    pub q4k_geglu_silu_down_pipeline: ComputePipelineState,
-    pub q4k_geglu_gelu_tanh_down_pipeline: ComputePipelineState,
-    q6k_matvec_pipeline: ComputePipelineState,
+    pub q4k_matvec_pipeline: KernelHandle,
+    pub q4k_ffn_gate_up_pipeline: KernelHandle,
+    pub q4kf_ffn_gate_up_pipeline: KernelHandle,
+    pub q4k_geglu_silu_down_pipeline: KernelHandle,
+    pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
+    pub q6k_matvec_pipeline: KernelHandle,
     #[allow(dead_code)]
     rope_pipeline: ComputePipelineState,
     pub rope_at_pos_pipeline: ComputePipelineState,
     pub rope_at_pos_batched_pipeline: ComputePipelineState,
-    pub q4k_qkv_proj_pipeline: ComputePipelineState,
+    pub q4k_qkv_proj_pipeline: KernelHandle,
     /// Fused mixed-quant QKV: Q4_K Q/K rows + Q6_K V rows in one dispatch.
     /// Gemma 3 4B / Gemma 4 ship `V` as Q6_K; without this shader decode
     /// falls through to three per-projection dispatches per layer.
-    pub q4k_q6k_qkv_proj_pipeline: ComputePipelineState,
-    q4k_proj_pipeline: ComputePipelineState,
-    pub q4kf_qkv_proj_pipeline: ComputePipelineState,
-    pub q4kf_proj_pipeline: ComputePipelineState,
+    pub q4k_q6k_qkv_proj_pipeline: KernelHandle,
+    pub q4k_proj_pipeline: KernelHandle,
+    pub q4kf_qkv_proj_pipeline: KernelHandle,
+    pub q4kf_proj_pipeline: KernelHandle,
     // Standalone activations (non-gated FFN)
     pub silu_pipeline: ComputePipelineState,
     pub gelu_tanh_pipeline: ComputePipelineState,
@@ -99,11 +97,11 @@ pub struct MetalBackend {
     /// Dedicated row-per-simdgroup f32 gemv for the LM head. Used in
     /// autoregressive decode where `matmul_transb(query, lm_head)` shows
     /// up as the dominant per-token cost.
-    pub f32_gemv_pipeline: ComputePipelineState,
+    pub f32_gemv_pipeline: KernelHandle,
     /// Same layout as [`Self::f32_gemv_pipeline`], but with a `half`
     /// weight matrix. Halves bandwidth for tied-embedding models whose
     /// lm_head would otherwise live as a 5.6 GB f32 clone on 31B.
-    pub f16_gemv_pipeline: ComputePipelineState,
+    pub f16_gemv_pipeline: KernelHandle,
     flop_threshold: AtomicUsize,
 }
 
@@ -160,9 +158,8 @@ impl MetalBackend {
         let geglu_gelu_tanh_pipeline = device.new_compute_pipeline_state_with_function(&geglu_gelu_tanh_fn).ok()?;
         let q8_quant_pipeline = device.new_compute_pipeline_state_with_function(&q8_quant_fn).ok()?;
 
-        // Q8 matvec for attention projections
-        let q8_matvec_fn = library.get_function("q8_matvec", None).ok()?;
-        let q8_matvec_pipeline = device.new_compute_pipeline_state_with_function(&q8_matvec_fn).ok()?;
+        // Q8 matvec for attention projections (KernelHandle — geometry travels with kernel).
+        let q8_matvec_pipeline = KernelHandle::from_kernel::<shaders::q8_matvec::Kernel>(&device, &library)?;
 
         // Norm and residual ops
         let rms_norm_fn = library.get_function("rms_norm", None).ok()?;
@@ -170,19 +167,16 @@ impl MetalBackend {
         let rms_norm_pipeline = device.new_compute_pipeline_state_with_function(&rms_norm_fn).ok()?;
         let residual_add_pipeline = device.new_compute_pipeline_state_with_function(&residual_add_fn).ok()?;
 
-        // Q4_K and Q6_K matvec (Ollama-compatible quantization)
-        let q4k_fn = library.get_function("q4k_matvec", None).ok()?;
-        let q4k_ffn_gate_up_fn = library.get_function("q4k_ffn_gate_up", None).ok()?;
-        let q6k_fn = library.get_function("q6k_matvec", None).ok()?;
-        let q4k_matvec_pipeline = device.new_compute_pipeline_state_with_function(&q4k_fn).ok()?;
-        let q4k_ffn_gate_up_pipeline = device.new_compute_pipeline_state_with_function(&q4k_ffn_gate_up_fn).ok()?;
-        let q4kf_ffn_gate_up_fn = library.get_function("q4kf_ffn_gate_up", None).ok()?;
-        let q4kf_ffn_gate_up_pipeline = device.new_compute_pipeline_state_with_function(&q4kf_ffn_gate_up_fn).ok()?;
-        let q4k_geglu_silu_down_fn = library.get_function("q4k_geglu_silu_down", None).ok()?;
-        let q4k_geglu_silu_down_pipeline = device.new_compute_pipeline_state_with_function(&q4k_geglu_silu_down_fn).ok()?;
-        let q4k_geglu_gelu_tanh_down_fn = library.get_function("q4k_geglu_gelu_tanh_down", None).ok()?;
-        let q4k_geglu_gelu_tanh_down_pipeline = device.new_compute_pipeline_state_with_function(&q4k_geglu_gelu_tanh_down_fn).ok()?;
-        let q6k_matvec_pipeline = device.new_compute_pipeline_state_with_function(&q6k_fn).ok()?;
+        // Q4_K + Q6_K matvec (KernelHandle).
+        let q4k_matvec_pipeline = KernelHandle::from_kernel::<shaders::q4k_matvec::Kernel>(&device, &library)?;
+        let q6k_matvec_pipeline = KernelHandle::from_kernel::<shaders::q6k_matvec::Kernel>(&device, &library)?;
+
+        // Fused Q4_K / Q4_KF FFN gate+up (KernelHandle).
+        let q4k_ffn_gate_up_pipeline = KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up::Kernel>(&device, &library)?;
+        let q4kf_ffn_gate_up_pipeline = KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(&device, &library)?;
+        // Fused activation+down (KernelHandle).
+        let q4k_geglu_silu_down_pipeline = KernelHandle::from_kernel::<shaders::q4k_geglu_down::SiluKernel>(&device, &library)?;
+        let q4k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<shaders::q4k_geglu_down::GeluTanhKernel>(&device, &library)?;
 
         // Fused Q8 QKV projection (all 3 in one dispatch)
         let q8_qkv_fn = library.get_function("q8_qkv_proj", None).ok()?;
@@ -196,12 +190,9 @@ impl MetalBackend {
         let residual_norm_pipeline = device.new_compute_pipeline_state_with_function(&residual_norm_fn).ok()?;
         let residual_norm_q8_pipeline = device.new_compute_pipeline_state_with_function(&residual_norm_q8_fn).ok()?;
 
-        // Dedicated f32 gemv for the LM head.
-        let f32_gemv_fn = library.get_function("f32_gemv", None).ok()?;
-        let f32_gemv_pipeline = device.new_compute_pipeline_state_with_function(&f32_gemv_fn).ok()?;
-        // f16 counterpart — half the memory, same shader topology.
-        let f16_gemv_fn = library.get_function("f16_gemv", None).ok()?;
-        let f16_gemv_pipeline = device.new_compute_pipeline_state_with_function(&f16_gemv_fn).ok()?;
+        // Dedicated f32 / f16 gemv for the LM head (KernelHandle).
+        let f32_gemv_pipeline = KernelHandle::from_kernel::<shaders::f32_gemv::Kernel>(&device, &library)?;
+        let f16_gemv_pipeline = KernelHandle::from_kernel::<shaders::f16_gemv::Kernel>(&device, &library)?;
 
         // RoPE (standalone, for prefill KV cache population)
         let rope_fn = library.get_function("rope_apply", None).ok()?;
@@ -213,19 +204,14 @@ impl MetalBackend {
         let rope_at_pos_batched_fn = library.get_function("rope_at_pos_batched", None).ok()?;
         let rope_at_pos_batched_pipeline = device.new_compute_pipeline_state_with_function(&rope_at_pos_batched_fn).ok()?;
 
-        // Fused Q4_K QKV projection (one dispatch for Q+K+V)
-        let q4k_qkv_fn = library.get_function("q4k_qkv_proj", None).ok()?;
-        let q4k_qkv_proj_pipeline = device.new_compute_pipeline_state_with_function(&q4k_qkv_fn).ok()?;
-        let q4k_q6k_qkv_fn = library.get_function("q4k_q6k_qkv_proj", None).ok()?;
-        let q4k_q6k_qkv_proj_pipeline = device.new_compute_pipeline_state_with_function(&q4k_q6k_qkv_fn).ok()?;
-        let q4k_proj_fn = library.get_function("q4k_proj", None).ok()?;
-        let q4k_proj_pipeline = device.new_compute_pipeline_state_with_function(&q4k_proj_fn).ok()?;
+        // Fused Q4_K QKV projection (KernelHandle).
+        let q4k_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q4k_qkv_proj::QkvKernel>(&device, &library)?;
+        let q4k_q6k_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q4k_q6k_qkv_proj::Kernel>(&device, &library)?;
+        let q4k_proj_pipeline = KernelHandle::from_kernel::<shaders::q4k_qkv_proj::ProjKernel>(&device, &library)?;
 
-        // Q4_KF: pre-baked scales (faster inference)
-        let q4kf_qkv_fn = library.get_function("q4kf_qkv_proj", None).ok()?;
-        let q4kf_qkv_proj_pipeline = device.new_compute_pipeline_state_with_function(&q4kf_qkv_fn).ok()?;
-        let q4kf_proj_fn = library.get_function("q4kf_proj", None).ok()?;
-        let q4kf_proj_pipeline = device.new_compute_pipeline_state_with_function(&q4kf_proj_fn).ok()?;
+        // Q4_KF: pre-baked scales (faster inference) — KernelHandle.
+        let q4kf_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q4kf_qkv_proj::QkvKernel>(&device, &library)?;
+        let q4kf_proj_pipeline = KernelHandle::from_kernel::<shaders::q4kf_qkv_proj::ProjKernel>(&device, &library)?;
 
         // Fused attention (RoPE + GQA + softcap)
         let fused_attn_fn = library.get_function("fused_attention", None).ok()?;

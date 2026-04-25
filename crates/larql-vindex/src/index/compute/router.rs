@@ -80,7 +80,7 @@ impl RouterIndex {
         let hidden = embedding.len();
         let x = embedding.view().into_shape_with_order((1, hidden)).unwrap();
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::ComputeBackend;
+        use larql_compute::{ComputeBackend, MatMul};
         let proj = cpu.matmul(x, self.weights[layer].view()); // [1, num_classes]
         let scores_1d = ndarray::Array1::from_vec(proj.into_raw_vec_and_offset().0);
         let scores_raw = scores_1d + &self.biases[layer];

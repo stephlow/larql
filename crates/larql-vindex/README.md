@@ -353,7 +353,7 @@ Load dequantises to f32 at mmap time and inserts into `weights.tensors`.
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 106 tests (lib + 1 integration + doc)
+cargo test -p larql-vindex                                                      # 306 tests (169 unit + 137 integration; all green as of 2026-04-25)
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -392,7 +392,7 @@ cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 
-Test coverage (104 tests):
+Test coverage (306 tests):
 - Construction, dimensions, layer counts, feature counts
 - Gate KNN: brute-force, f32, Q4 via compute backend, top-K ordering
 - Gate walk: BLAS gemv path matches brute-force KNN

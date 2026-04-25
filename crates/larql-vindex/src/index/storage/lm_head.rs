@@ -16,14 +16,15 @@
 use std::sync::Arc;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::mmap_util::mmap_optimized;
 
-use super::core::VectorIndex;
+use crate::index::core::VectorIndex;
 
 impl VectorIndex {
     /// Load Q4 lm_head for GPU logits (replaces CPU f32 lm_head KNN).
     pub fn load_lm_head_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("lm_head_q4.bin");
+        let path = dir.join(LM_HEAD_Q4_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("lm_head_q4.bin not found".into()));
         }
@@ -198,7 +199,7 @@ impl VectorIndex {
         let hidden = self.hidden_size;
         let x = query.view().into_shape_with_order((1, hidden)).unwrap();
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::ComputeBackend;
+        use larql_compute::{ComputeBackend, MatMul};
         let result = cpu.matmul_transb(x, lm_view); // [1, hidden] @ [vocab, hidden]^T → [1, vocab]
         let scores = ndarray::Array1::from_vec(result.into_raw_vec_and_offset().0);
 

@@ -37,7 +37,7 @@ extern crate blas_src;
 mod common;
 use common::{cos_sim, get_metal, max_diff};
 
-use larql_compute::backend::ComputeBackend;
+use larql_compute::prelude::*;
 
 fn synth_matrix(rows: usize, cols: usize, seed: f32) -> Vec<f32> {
     (0..rows * cols)
@@ -89,7 +89,7 @@ fn assert_q4k_ffn_gate_up_matches_per_matrix(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_ffn_gate_up_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4k_ffn_gate_up_pipeline.state);
     enc.set_buffer(0, Some(&gate_w_buf), 0);
     enc.set_buffer(1, Some(&up_w_buf), 0);
     enc.set_buffer(2, Some(&x_buf), 0);
@@ -210,7 +210,7 @@ fn q4k_ffn_gate_up_zero_input() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_ffn_gate_up_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4k_ffn_gate_up_pipeline.state);
     enc.set_buffer(0, Some(&gate_w_buf), 0);
     enc.set_buffer(1, Some(&up_w_buf), 0);
     enc.set_buffer(2, Some(&x_buf), 0);

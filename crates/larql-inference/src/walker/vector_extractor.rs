@@ -10,6 +10,7 @@
 //!
 //! Zero forward passes. Pure matrix multiplication.
 
+use larql_vindex::format::filenames::*;
 use std::collections::HashSet;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -185,7 +186,7 @@ impl VectorExtractor {
         let model_path = resolve_model_path(model)?;
         let weights = load_model_dir(&model_path)?;
 
-        let tokenizer_path = model_path.join("tokenizer.json");
+        let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {
             return Err(InferenceError::MissingTensor(
                 "tokenizer.json not found".into(),

@@ -1,5 +1,6 @@
 //! larql-server — HTTP server for vindex knowledge queries.
 
+use larql_vindex::format::filenames::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -365,7 +366,7 @@ fn discover_vindexes(dir: &PathBuf) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() && p.join("index.json").exists() {
+            if p.is_dir() && p.join(INDEX_JSON).exists() {
                 paths.push(p);
             }
         }

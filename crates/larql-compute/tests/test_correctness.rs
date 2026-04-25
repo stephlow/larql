@@ -88,3 +88,37 @@ fn default_backend_has_name() {
     assert!(!be.name().is_empty());
 }
 
+/// Pin the unified `quant_matvec` dispatch: every supported format on
+/// the CPU backend must produce the same output as its per-format
+/// helper. This is the contract callers depend on when migrating off
+/// `q4_matvec` / `q4k_matvec` / `q6k_matvec` (see ROADMAP P1a).
+#[test]
+fn cpu_quant_matvec_matches_per_format_helpers() {
+    use larql_compute::cpu::q4;
+    use larql_compute::QuantFormat;
+
+    // K must be a multiple of 256 for Q4_K / Q6_K super-block layout.
+    let hidden = 256usize;
+    let rows = 128usize;
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin() + 0.5).collect();
+    let matrix: Vec<f32> = (0..rows * hidden)
+        .map(|i| (i as f32 * 0.001).cos() + 0.5).collect();
+
+    let cpu = cpu_backend();
+
+    // Q4_0: per-format helper takes pre-quantised Q8 input; unified
+    // method takes f32 and quantises internally. Same output expected.
+    let q4_0 = quantize_q4_0(&matrix);
+    let (q8_x, q8s) = q4::quantize_to_q8(&x);
+    let helper = cpu.q4_matvec(&q4_0, &q8_x, &q8s, rows, hidden).unwrap();
+    let unified = cpu.quant_matvec(QuantFormat::Q4_0, &q4_0, &x, rows, hidden).unwrap();
+    assert_eq!(helper.len(), rows);
+    assert_eq!(unified.len(), rows);
+    let max_diff: f32 = helper.iter().zip(&unified)
+        .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    assert!(
+        max_diff < 1e-5,
+        "Q4_0 quant_matvec diverges from q4_matvec helper: max_diff={max_diff}"
+    );
+}
+

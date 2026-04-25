@@ -1,5 +1,6 @@
 //! Tokenizer loading and helpers.
 
+use larql_vindex::format::filenames::*;
 use std::path::Path;
 
 use larql_models::ModelArchitecture;
@@ -8,7 +9,7 @@ use crate::error::InferenceError;
 
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer, InferenceError> {
-    let path = model_dir.join("tokenizer.json");
+    let path = model_dir.join(TOKENIZER_JSON);
     if !path.exists() {
         return Err(InferenceError::MissingTensor(
             "tokenizer.json not found".into(),

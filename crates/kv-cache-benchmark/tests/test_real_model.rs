@@ -815,3 +815,72 @@ fn test_conflict_context_overrides_parametric() {
     println!("Markov RS follows context IF in bounded window, parametric if outside.");
     println!("Graph Walk always follows parametric (graph is weights, not context).");
 }
+
+/// Engine performance benchmark: times each KvEngine on a suite of prompts,
+/// reports prefill ms, memory breakdown, compression ratio vs Standard KV.
+///
+/// Run with:
+///   cargo test --features real-model -p kv-cache-benchmark \
+///       --test test_real_model test_engine_performance -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_engine_performance() {
+    let (model, _index) = load_test_model().expect("Model not available");
+    let backend = larql_inference::default_backend();
+
+    let prompts = [
+        "The capital of France is",
+        "The population of Tokyo is approximately",
+        "In the beginning God created the heavens and the",
+    ];
+
+    for prompt in &prompts {
+        let results = kv_cache_benchmark::real_model::runner::run_all_engines_bench(
+            model.weights(),
+            model.tokenizer(),
+            prompt,
+            512,
+            backend.as_ref(),
+        );
+        println!("{}", kv_cache_benchmark::real_model::runner::format_engine_results(&results));
+
+        for r in &results {
+            // Accuracy: hidden cosine must be high (same forward path as Standard KV)
+            assert!(
+                r.hidden_cosine > 0.99,
+                "{}: cosine {:.4} < 0.99 for {:?}",
+                r.engine, r.hidden_cosine, prompt,
+            );
+            // Memory: engine state should be smaller than Standard KV reference
+            assert!(
+                r.total_bytes < r.kv_ref_bytes,
+                "{}: engine mem {}B >= kv_ref {}B",
+                r.engine, r.total_bytes, r.kv_ref_bytes,
+            );
+        }
+    }
+}
+
+/// Side-by-side prefill timing: Standard KV (via run_all_strategies) vs all KvEngines.
+/// Useful for measuring the cost of the residual-recompute path vs straight KV capture.
+#[test]
+#[ignore]
+fn test_prefill_timing_comparison() {
+    let (model, index) = load_test_model().expect("Model not available");
+    let backend = larql_inference::default_backend();
+    let bench = kv_cache_benchmark::real_model::runner::RealModelBenchmark::new(
+        model.weights(), model.tokenizer(), &index, backend.as_ref(),
+    );
+
+    let prompt = "The capital of France is";
+
+    let strategies = kv_cache_benchmark::real_model::runner::run_all_strategies(
+        &bench, prompt, 5, 512,
+    );
+    println!("{}", kv_cache_benchmark::real_model::runner::format_results(&strategies));
+
+    let engines = kv_cache_benchmark::real_model::runner::run_all_engines_bench(
+        model.weights(), model.tokenizer(), prompt, 512, backend.as_ref(),
+    );
+    println!("{}", kv_cache_benchmark::real_model::runner::format_engine_results(&engines));
+}

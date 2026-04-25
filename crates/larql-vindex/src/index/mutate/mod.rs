@@ -1,12 +1,18 @@
-/// VectorIndex mutation and persistence methods
-///
-/// Adds INSERT/DELETE/UPDATE support and the ability to save a modified vindex back to disk.
+//! VectorIndex mutation and persistence methods.
+//!
+//! Adds INSERT/DELETE/UPDATE support and the ability to save a
+//! modified vindex back to disk. NDJSON heap loaders live in the
+//! sibling `loaders` module.
+
+pub mod loaders;
+
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use ndarray::Array1;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::config::VindexConfig;
 use crate::index::{FeatureMeta, VectorIndex};
 
@@ -242,7 +248,7 @@ impl VectorIndex {
         &self,
         dir: &Path,
     ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
-        let path = dir.join("gate_vectors.bin");
+        let path = dir.join(GATE_VECTORS_BIN);
         let tmp_path = dir.join("gate_vectors.bin.tmp");
         let file = std::fs::File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
@@ -302,7 +308,7 @@ impl VectorIndex {
 
     /// Save config (index.json) to disk.
     pub fn save_config(config: &VindexConfig, dir: &Path) -> Result<(), VindexError> {
-        let path = dir.join("index.json");
+        let path = dir.join(INDEX_JSON);
         let json = serde_json::to_string_pretty(config)
             .map_err(|e| VindexError::Parse(e.to_string()))?;
         std::fs::write(path, json)?;

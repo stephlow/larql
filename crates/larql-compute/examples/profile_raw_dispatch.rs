@@ -44,7 +44,7 @@ fn main() {
             let buf_vo = metal.bufs().output((kv_dim * 4) as u64);
             let cmd = metal.queue().new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline);
+            enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state);
             enc.set_buffer(0, Some(&buf_wq), 0);
             enc.set_buffer(1, Some(&buf_wk), 0);
             enc.set_buffer(2, Some(&buf_wv), 0);
@@ -71,7 +71,7 @@ fn main() {
             let buf_vo = metal.bufs().output((kv_dim * 4) as u64);
             let cmd = metal.queue().new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline);
+            enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state);
             enc.set_buffer(0, Some(&buf_wq), 0); enc.set_buffer(1, Some(&buf_wk), 0);
             enc.set_buffer(2, Some(&buf_wv), 0); enc.set_buffer(3, Some(&buf_x), 0);
             enc.set_buffer(4, Some(&buf_qo), 0); enc.set_buffer(5, Some(&buf_ko), 0);
@@ -97,7 +97,7 @@ fn main() {
                 let buf_ko = metal.bufs().output((kv_dim * 4) as u64);
                 let buf_vo = metal.bufs().output((kv_dim * 4) as u64);
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline);
+                enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state);
                 enc.set_buffer(0, Some(&buf_wq), 0); enc.set_buffer(1, Some(&buf_wk), 0);
                 enc.set_buffer(2, Some(&buf_wv), 0); enc.set_buffer(3, Some(&buf_x), 0);
                 enc.set_buffer(4, Some(&buf_qo), 0); enc.set_buffer(5, Some(&buf_ko), 0);

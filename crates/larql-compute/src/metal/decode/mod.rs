@@ -349,9 +349,9 @@ impl MetalBackend {
                 // Q4_K / Q4_KF / Q6_K O-projection via the stage helper.
                 use crate::metal::stages::quant_matvec::Pipelines;
                 let pipes = Pipelines {
-                    q4kf_proj: Some(&self.q4kf_proj_pipeline),
-                    q4k_matvec_fallback: &self.q4k_proj_pipeline,
-                    q6k_matvec: &self.q6k_matvec_pipeline,
+                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                    q4k_matvec_fallback: &self.q4k_proj_pipeline.state,
+                    q6k_matvec: &self.q6k_matvec_pipeline.state,
                     q4_matvec: &self.q4.matvec,
                 };
                 crate::metal::stages::o_proj::encode(
@@ -380,7 +380,7 @@ impl MetalBackend {
 
                 let o_rows = hidden as u32;
                 let o_k = layer_q_dim as u32;
-                enc.set_compute_pipeline_state(&self.q8_matvec_pipeline);
+                enc.set_compute_pipeline_state(&self.q8_matvec_pipeline.state);
                 enc.set_buffer(0, Some(&wo_bufs[l]), 0);
                 enc.set_buffer(1, Some(o_q8), 0);
                 enc.set_buffer(2, Some(&wo_scale_bufs[l]), 0);

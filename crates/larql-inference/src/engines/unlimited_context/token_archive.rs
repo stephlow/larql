@@ -31,3 +31,44 @@ impl TokenArchive {
     pub fn total_tokens(&self) -> usize { self.tokens.values().map(|t| t.len()).sum() }
     pub fn total_bytes(&self) -> usize { self.tokens.values().map(|t| t.len() * 4).sum() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_and_retrieve_roundtrip() {
+        let mut archive = TokenArchive::new();
+        archive.archive(0, vec![1, 2, 3, 4, 5], 0);
+        archive.archive(1, vec![6, 7, 8], 5);
+        let (t0, o0) = archive.retrieve(0).unwrap();
+        assert_eq!(t0, &[1, 2, 3, 4, 5]);
+        assert_eq!(o0, 0);
+        let (t1, o1) = archive.retrieve(1).unwrap();
+        assert_eq!(t1, &[6, 7, 8]);
+        assert_eq!(o1, 5);
+    }
+
+    #[test]
+    fn total_accounting() {
+        let mut archive = TokenArchive::new();
+        archive.archive(0, vec![0u32; 512], 0);
+        archive.archive(1, vec![0u32; 512], 512);
+        assert_eq!(archive.total_tokens(), 1024);
+        assert_eq!(archive.total_bytes(), 1024 * 4);
+    }
+
+    #[test]
+    fn retrieve_missing_returns_none() {
+        let archive = TokenArchive::new();
+        assert!(archive.retrieve(42).is_none());
+    }
+
+    #[test]
+    fn is_empty_on_new() {
+        let archive = TokenArchive::new();
+        assert!(archive.is_empty());
+        assert_eq!(archive.len(), 0);
+        assert_eq!(archive.total_tokens(), 0);
+    }
+}

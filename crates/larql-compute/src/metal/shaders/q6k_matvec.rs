@@ -76,3 +76,11 @@ kernel void q6k_matvec(
 
 pub const ROWS_PER_TG: u64 = 4;
 pub const THREADS_PER_TG: u64 = 128;
+
+/// Marker for the kernel-handle binding. See `metal::kernel::TiledKernel`.
+pub struct Kernel;
+impl crate::metal::kernel::TiledKernel for Kernel {
+    const KERNEL_NAME: &'static str = "q6k_matvec";
+    const ROWS_PER_TG: u64 = ROWS_PER_TG;
+    const THREADS_PER_TG: u64 = THREADS_PER_TG;
+}

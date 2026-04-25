@@ -144,7 +144,7 @@ impl MetalBackend {
                 &self.q4k_qkv_proj_pipeline
             };
             crate::metal::stages::qkv_proj::encode_fused_f32(
-                enc, fused_pipe,
+                enc, &fused_pipe.state,
                 bufs.wq, bufs.wk, bufs.wv,
                 bufs.norm_out, 0,
                 bufs.q_out, 0, bufs.k_out, 0, bufs.v_out, 0,
@@ -158,7 +158,7 @@ impl MetalBackend {
             let k_rows_u = layer_kv_dim as u32;
             let v_rows_u = layer_kv_dim as u32;
             let k_u = hidden as u32;
-            enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_pipeline);
+            enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_pipeline.state);
             enc.set_buffer(0, Some(bufs.wq), 0);
             enc.set_buffer(1, Some(bufs.wk), 0);
             enc.set_buffer(2, Some(bufs.wv), 0);
@@ -180,9 +180,9 @@ impl MetalBackend {
             use crate::metal::stages::qkv_proj::{self, Proj};
             use crate::metal::stages::quant_matvec::Pipelines;
             let pipes = Pipelines {
-                q4kf_proj: Some(&self.q4kf_proj_pipeline),
-                q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                q6k_matvec: &self.q6k_matvec_pipeline,
+                q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                q4k_matvec_fallback: &self.q4k_matvec_pipeline.state,
+                q6k_matvec: &self.q6k_matvec_pipeline.state,
                 q4_matvec: &self.q4.matvec,
             };
             qkv_proj::encode_per_proj(

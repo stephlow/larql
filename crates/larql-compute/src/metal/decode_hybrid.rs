@@ -91,7 +91,7 @@ impl MetalBackend {
             } else {
                 &self.q4k_qkv_proj_pipeline
             };
-            enc_a.set_compute_pipeline_state(qkv_pipeline);
+            enc_a.set_compute_pipeline_state(&qkv_pipeline.state);
             enc_a.set_buffer(0, Some(&wq_buf), 0);
             enc_a.set_buffer(1, Some(&wk_buf), 0);
             enc_a.set_buffer(2, Some(&wv_buf), 0);
@@ -232,7 +232,7 @@ impl MetalBackend {
             } else {
                 &self.q4k_proj_pipeline
             };
-            enc_c.set_compute_pipeline_state(o_pipeline);
+            enc_c.set_compute_pipeline_state(&o_pipeline.state);
             enc_c.set_buffer(0, Some(&wo_buf), 0);
             enc_c.set_buffer(1, Some(&attn_out), 0);
             enc_c.set_buffer(2, Some(&o_out), 0);
@@ -276,7 +276,7 @@ impl MetalBackend {
 
             let o_rows = hidden as u32;
             let o_k = layer_q_dim as u32;
-            enc_c.set_compute_pipeline_state(&self.q8_matvec_pipeline);
+            enc_c.set_compute_pipeline_state(&self.q8_matvec_pipeline.state);
             enc_c.set_buffer(0, Some(&wo_buf), 0);
             enc_c.set_buffer(1, Some(&o_q8), 0);
             enc_c.set_buffer(2, Some(&wo_scale_buf), 0);

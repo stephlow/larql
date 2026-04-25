@@ -147,3 +147,11 @@ kernel void q4k_q6k_qkv_proj(
 
 pub const ROWS_PER_TG: u64 = 4;
 pub const THREADS_PER_TG: u64 = 128; // 4 simdgroups × 32 lanes
+
+/// Marker for the kernel-handle binding. See `metal::kernel::TiledKernel`.
+pub struct Kernel;
+impl crate::metal::kernel::TiledKernel for Kernel {
+    const KERNEL_NAME: &'static str = "q4k_q6k_qkv_proj";
+    const ROWS_PER_TG: u64 = ROWS_PER_TG;
+    const THREADS_PER_TG: u64 = THREADS_PER_TG;
+}

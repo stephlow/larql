@@ -10,19 +10,22 @@
 //!   4. `stats()` — total bytes, windows, compression ratio vs full KV.
 //!
 //! Memory at 370K tokens (Gemma 3 4B, W=512):
-//!   Checkpoints ≈ W × 34 × 2 × (4 × 256) × 4 bytes ≈ 278 KB per window
+//!   Checkpoints ≈ 278 KB/window × N_windows
 //!   Token archive = 4 bytes/token
 //!   Total ≈ 30 MB  vs  25.8 GB for Standard KV  (≈2,000×)
 
 use ndarray::Array2;
 use serde::Serialize;
+use larql_compute::{ComputeBackend, cpu_backend};
 
 use crate::attention::SharedKV;
 use crate::model::ModelWeights;
 use super::checkpoint_store::CheckpointStore;
-use super::extend::{empty_prior, rs_extend_from_checkpoint};
+use super::extend::{empty_prior, rs_extend_from_checkpoint_backend};
 use super::token_archive::TokenArchive;
 use crate::engines::{EngineInfo, KvEngine};
+
+// ─── EngineStats ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineStats {
@@ -41,10 +44,12 @@ impl EngineStats {
     pub fn summary(&self) -> String {
         format!(
             "{} windows / {} tokens — {:.0}× compression vs full KV",
-            self.archived_windows, self.total_tokens, self.compression_ratio
+            self.archived_windows, self.total_tokens, self.compression_ratio,
         )
     }
 }
+
+// ─── Engine ──────────────────────────────────────────────────────────────────
 
 pub struct UnlimitedContextEngine {
     pub window_size: usize,
@@ -55,12 +60,17 @@ pub struct UnlimitedContextEngine {
     current_window_tokens: Vec<u32>,
     current_window_kv: Option<Vec<SharedKV>>,
     abs_offset: usize,
-    /// Hidden state at the last processed token; updated by `process()`.
+    /// Hidden state at the last processed token; set by `process()`.
     last_hidden: Option<Array2<f32>>,
+    backend: Box<dyn ComputeBackend>,
 }
 
 impl UnlimitedContextEngine {
     pub fn new(window_size: usize) -> Self {
+        Self::with_backend(window_size, cpu_backend())
+    }
+
+    pub fn with_backend(window_size: usize, backend: Box<dyn ComputeBackend>) -> Self {
         Self {
             window_size,
             checkpoints: CheckpointStore::new(),
@@ -70,6 +80,7 @@ impl UnlimitedContextEngine {
             current_window_kv: None,
             abs_offset: 0,
             last_hidden: None,
+            backend,
         }
     }
 
@@ -112,7 +123,7 @@ impl UnlimitedContextEngine {
             empty_prior(weights)
         };
 
-        let out = rs_extend_from_checkpoint(weights, tokens, &prior, abs_offset)?;
+        let out = rs_extend_from_checkpoint_backend(weights, tokens, &prior, abs_offset, self.backend.as_ref())?;
         let abs_end = abs_offset + tokens.len() - 1;
         Some((out.kv_cache, abs_end))
     }
@@ -162,7 +173,9 @@ impl UnlimitedContextEngine {
         if chunk.is_empty() { return Some(()); }
 
         let prior = if self.current_window_tokens.is_empty() {
-            if self.current_window_id > 0 && self.checkpoints.contains(self.current_window_id - 1) {
+            if self.current_window_id > 0
+                && self.checkpoints.contains(self.current_window_id - 1)
+            {
                 let (ckpt, _) = self.checkpoints.load(self.current_window_id - 1)?;
                 ckpt
             } else {
@@ -175,7 +188,7 @@ impl UnlimitedContextEngine {
         };
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
-        let out = rs_extend_from_checkpoint(weights, chunk, &prior, abs_start)?;
+        let out = rs_extend_from_checkpoint_backend(weights, chunk, &prior, abs_start, self.backend.as_ref())?;
 
         self.last_hidden = Some(out.last_hidden);
         self.current_window_kv = Some(out.kv_cache);
@@ -223,12 +236,13 @@ impl KvEngine for UnlimitedContextEngine {
         EngineInfo {
             name: "unlimited-context".into(),
             description: format!(
-                "window-boundary KV checkpoints + token replay (windows={}, tokens={}, mem={:.1}MB)",
+                "window-boundary KV checkpoints + token replay \
+                 (windows={}, tokens={}, mem={:.1}MB)",
                 self.archive.len(),
                 self.archive.total_tokens() + self.current_window_tokens.len(),
                 mem as f64 / 1_048_576.0,
             ),
-            backend: "cpu".into(),
+            backend: self.backend.name().to_string(),
             config: format!("window={}", self.window_size),
         }
     }
@@ -247,5 +261,52 @@ impl KvEngine for UnlimitedContextEngine {
         self.checkpoints.total_bytes()
             + self.archive.total_bytes()
             + self.current_kv_bytes()
+    }
+
+    fn window_tokens(&self) -> usize { self.current_window_tokens.len() }
+
+    fn cold_bytes(&self) -> usize {
+        self.checkpoints.total_bytes() + self.archive.total_bytes()
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_engine_is_empty() {
+        let eng = UnlimitedContextEngine::new(512);
+        assert_eq!(eng.window_size, 512);
+        assert_eq!(eng.archive.len(), 0);
+        assert_eq!(eng.checkpoints.len(), 0);
+        assert_eq!(eng.current_window_id, 0);
+        assert_eq!(eng.memory_bytes(), 0);
+    }
+
+    #[test]
+    fn engine_info_backend_is_cpu() {
+        let eng = UnlimitedContextEngine::new(256);
+        let info = eng.info();
+        assert_eq!(info.name, "unlimited-context");
+        assert!(info.backend.starts_with("cpu"), "expected cpu backend, got {:?}", info.backend);
+        assert_eq!(info.config, "window=256");
+        assert!(info.summary().contains("unlimited-context"));
+        assert!(info.summary().contains("cpu"));
+    }
+
+    #[test]
+    fn engine_info_config_contains_window_size() {
+        let eng = UnlimitedContextEngine::new(1024);
+        assert!(eng.info().config.contains("1024"));
+    }
+
+    #[test]
+    fn window_tokens_and_cold_bytes_start_zero() {
+        let eng = UnlimitedContextEngine::new(512);
+        assert_eq!(eng.window_tokens(), 0);
+        assert_eq!(eng.cold_bytes(), 0);
     }
 }

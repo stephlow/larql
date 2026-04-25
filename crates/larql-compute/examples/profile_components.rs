@@ -10,7 +10,7 @@ fn main() {
     {
         use std::time::Instant;
         use std::ffi::c_void;
-        use larql_compute::ComputeBackend;
+        use larql_compute::prelude::*;
         use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q4_0, quantize_to_q8};
 
         let metal = larql_compute::metal::MetalBackend::new().expect("Metal required");
@@ -53,7 +53,12 @@ fn main() {
         let norm_off = 1.0f32;
 
         use larql_compute::metal::shaders::q4k_qkv_proj as qkv_sh;
-        use larql_compute::metal::shaders::q4_matvec as q4mv;
+        // Q4_0 matvec geometry travels with the live KernelHandle on
+        // `metal.q4.matvec`. Read both rows-per-TG and threads-per-TG
+        // off the same handle so this profiler is immune to the
+        // geometry-mismatch class of bugs.
+        let q4mv_rows = metal.q4.matvec.rows_per_tg;
+        let q4mv_threads = metal.q4.matvec.threads_per_tg;
 
         macro_rules! bench {
             ($name:expr, $body:expr) => {{
@@ -91,7 +96,7 @@ fn main() {
                 let ko = metal.bufs().output((kv_dim*4) as u64);
                 let vo = metal.bufs().output((kv_dim*4) as u64);
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline);
+                enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state);
                 enc.set_buffer(0, Some(&buf_wq), 0); enc.set_buffer(1, Some(&buf_wk), 0);
                 enc.set_buffer(2, Some(&buf_wv), 0); enc.set_buffer(3, Some(&buf_x), 0);
                 enc.set_buffer(4, Some(&qo), 0); enc.set_buffer(5, Some(&ko), 0); enc.set_buffer(6, Some(&vo), 0);
@@ -141,7 +146,7 @@ fn main() {
             for _ in 0..layers {
                 let oo = metal.bufs().output((hidden*4) as u64);
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline); // reuse for single proj
+                enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state); // reuse for single proj
                 enc.set_buffer(0, Some(&buf_wo), 0); enc.set_buffer(1, Some(&buf_wo), 0);
                 enc.set_buffer(2, Some(&buf_wo), 0); enc.set_buffer(3, Some(&buf_x), 0);
                 enc.set_buffer(4, Some(&oo), 0); enc.set_buffer(5, Some(&oo), 0); enc.set_buffer(6, Some(&oo), 0);
@@ -180,7 +185,7 @@ fn main() {
 
         let ffn_ms = bench!("Q4 FFN (gate+up+geglu+down)", {
             let cmd = metal.queue().new_command_buffer();
-            let n_tgs = (inter as u64).div_ceil(q4mv::ROWS_PER_TG);
+            let n_tgs = (inter as u64).div_ceil(q4mv_rows);
             for _ in 0..layers {
                 let go = metal.bufs().output((inter*4) as u64);
                 let uo = metal.bufs().output((inter*4) as u64);
@@ -188,15 +193,15 @@ fn main() {
                 let do_ = metal.bufs().output((hidden*4) as u64);
                 let enc = cmd.new_compute_command_encoder();
                 // gate
-                enc.set_compute_pipeline_state(&metal.q4.matvec);
+                enc.set_compute_pipeline_state(&metal.q4.matvec.state);
                 enc.set_buffer(0, Some(&buf_gate), 0); enc.set_buffer(1, Some(&buf_q8), 0);
                 enc.set_buffer(2, Some(&buf_q8s), 0); enc.set_buffer(3, Some(&go), 0);
                 enc.set_bytes(4, 4, &inter_val as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &hidden_val as *const u32 as *const c_void);
-                enc.dispatch_thread_groups(metal::MTLSize::new(n_tgs, 1, 1), metal::MTLSize::new(q4mv::THREADS_PER_TG, 1, 1));
+                enc.dispatch_thread_groups(metal::MTLSize::new(n_tgs, 1, 1), metal::MTLSize::new(q4mv_threads, 1, 1));
                 // up
                 enc.set_buffer(0, Some(&buf_up), 0); enc.set_buffer(3, Some(&uo), 0);
-                enc.dispatch_thread_groups(metal::MTLSize::new(n_tgs, 1, 1), metal::MTLSize::new(q4mv::THREADS_PER_TG, 1, 1));
+                enc.dispatch_thread_groups(metal::MTLSize::new(n_tgs, 1, 1), metal::MTLSize::new(q4mv_threads, 1, 1));
                 // geglu
                 enc.set_compute_pipeline_state(&metal.geglu_pipeline);
                 enc.set_buffer(0, Some(&go), 0); enc.set_buffer(1, Some(&uo), 0); enc.set_buffer(2, Some(&ao), 0);

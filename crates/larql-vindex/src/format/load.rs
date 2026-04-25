@@ -8,6 +8,11 @@ use ndarray::Array2;
 
 use crate::error::VindexError;
 use crate::config::VindexConfig;
+use crate::format::filenames::{
+    DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON,
+    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_Q4_BIN,
+    TOKENIZER_JSON,
+};
 use crate::index::{IndexLoadCallbacks, VectorIndex};
 
 impl VectorIndex {
@@ -38,7 +43,7 @@ impl VectorIndex {
         layer_range: Option<(usize, usize)>,
     ) -> Result<Self, VindexError> {
         // Read config
-        let config_path = dir.join("index.json");
+        let config_path = dir.join(INDEX_JSON);
         let config_text = std::fs::read_to_string(&config_path)?;
         let config: VindexConfig = serde_json::from_str(&config_text)
             .map_err(|e| VindexError::Parse(e.to_string()))?;
@@ -51,8 +56,8 @@ impl VectorIndex {
         // anonymous mmap by dequantizing the Q4K gate slices at f16 —
         // that's dedup #2 in action (a Q4K vindex extracted with
         // `--drop-gate-vectors` carries gate weights only once, Q4K).
-        let gate_path = dir.join("gate_vectors.bin");
-        let interleaved_q4k_path = dir.join("interleaved_q4k.bin");
+        let gate_path = dir.join(GATE_VECTORS_BIN);
+        let interleaved_q4k_path = dir.join(INTERLEAVED_Q4K_BIN);
 
         let (gate_mmap, gate_slices, gate_dtype) = if gate_path.exists() {
             callbacks.on_file_start(
@@ -134,7 +139,7 @@ impl VectorIndex {
         let down_meta_mmap = if crate::format::down_meta::has_binary(dir) {
             match load_vindex_tokenizer(dir) {
                 Ok(tokenizer) => {
-                    callbacks.on_file_start("down_meta", &dir.join("down_meta.bin").display().to_string());
+                    callbacks.on_file_start("down_meta", &dir.join(DOWN_META_BIN).display().to_string());
                     let tok = std::sync::Arc::new(tokenizer);
                     match crate::format::down_meta::mmap_binary(dir, tok) {
                         Ok(dm) => {
@@ -194,9 +199,9 @@ impl VectorIndex {
         // untied models that ship those files are always extracted with
         // one of them, so presence is a reliable untied-signal.
         let has_separate_lm_head = dir.join("lm_head.bin").exists()
-            || dir.join("lm_head_q4.bin").exists();
+            || dir.join(LM_HEAD_Q4_BIN).exists();
         if !has_separate_lm_head {
-            if let Ok(f) = std::fs::File::open(dir.join("embeddings.bin")) {
+            if let Ok(f) = std::fs::File::open(dir.join(EMBEDDINGS_BIN)) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
                     let expected_f16 = config.vocab_size * config.hidden_size * 2;
                     if mmap.len() >= expected_f16 && mmap.len() < expected_f16 * 2 {
@@ -230,8 +235,8 @@ fn synthesize_gate_from_q4k(
     ),
     VindexError,
 > {
-    let interleaved_path = dir.join("interleaved_q4k.bin");
-    let manifest_path = dir.join("interleaved_q4k_manifest.json");
+    let interleaved_path = dir.join(INTERLEAVED_Q4K_BIN);
+    let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
     if !manifest_path.exists() {
         return Err(VindexError::Parse(format!(
             "interleaved_q4k_manifest.json missing alongside {}",
@@ -316,11 +321,11 @@ fn synthesize_gate_from_q4k(
 
 /// Load embeddings from a .vindex directory.
 pub fn load_vindex_embeddings(dir: &Path) -> Result<(Array2<f32>, f32), VindexError> {
-    let config_text = std::fs::read_to_string(dir.join("index.json"))?;
+    let config_text = std::fs::read_to_string(dir.join(INDEX_JSON))?;
     let config: VindexConfig = serde_json::from_str(&config_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
 
-    let embed_file = std::fs::File::open(dir.join("embeddings.bin"))?;
+    let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
     // Detect actual dtype from file size (may differ from index.json global dtype
     // if gate vectors were converted to f32 but embeddings remain f16).
@@ -340,13 +345,13 @@ pub fn load_vindex_embeddings(dir: &Path) -> Result<(Array2<f32>, f32), VindexEr
 
 /// Load tokenizer from a .vindex directory.
 pub fn load_vindex_tokenizer(dir: &Path) -> Result<tokenizers::Tokenizer, VindexError> {
-    let path = dir.join("tokenizer.json");
+    let path = dir.join(TOKENIZER_JSON);
     tokenizers::Tokenizer::from_file(&path).map_err(|e| VindexError::Parse(e.to_string()))
 }
 
 /// Load the vindex config.
 pub fn load_vindex_config(dir: &Path) -> Result<VindexConfig, VindexError> {
-    let text = std::fs::read_to_string(dir.join("index.json"))?;
+    let text = std::fs::read_to_string(dir.join(INDEX_JSON))?;
     serde_json::from_str(&text).map_err(|e| VindexError::Parse(e.to_string()))
 }
 

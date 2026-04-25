@@ -1,6 +1,47 @@
 # Performance — larql-vindex
 
-Machine: M3 Max, macOS. All numbers from fresh runs (2026-04-07).
+Machine: M3 Max, macOS. Tables below split by audit date — older
+sections preserved for diff continuity. The 2026-04-25 audit added
+end-to-end Q4K decode numbers (was synthetic-only) plus a confirmed
+mmap residency map.
+
+## End-to-end decode (2026-04-25, real Q4K Gemma 3 4B)
+
+`larql bench /path/to/gemma3-4b-q4k-streaming.vindex --tokens 30
+--warmup 3 --backends metal -v`
+
+| Backend | tok/s | ms/tok | GPU fwd | lm_head | Peak footprint |
+|---------|-------|--------|---------|---------|----------------|
+| metal   | **68.7** | 14.56 | 13.60 ms (86.7%) | 2.08 ms (13.3%) | 6.59 GB |
+| cpu     |   0.4 | 2787 | 2777 ms | — | 3.70 GB |
+
+68.7 tok/s on Metal Q4K is up from 51.9 in the 2026-04-19 PERFORMANCE
+section. GPU forward is still 86.7 % of decode → the kernel-compute
+work in the `gpu_forward_gap` memo is still the next-biggest lever.
+
+## mmap residency (live decode pid, vmmap)
+
+Real Q4K Gemma 3 4B during decode:
+
+```
+File                              VSIZE   RSDNT   madvise
+gate_vectors.bin            1.7 GB     0 K   RANDOM       ← pure demand-paged
+down_meta.bin                29 M    544 K   RANDOM       ← only touched layers paged
+embeddings.bin              1.3 G    1.3 G   SEQ+WILLNEED ← prefaulted
+interleaved_q4k.bin         1.6 G    1.6 G   RANDOM (warmed by decode)
+attn_weights_q4k.bin       309 M    309 M   SEQ+WILLNEED
+heap (MALLOC_LARGE)          3.0 G   3.0 G   ← KV cache + GPU intermediates
+                             ─────
+Physical footprint            3.1 G   (peak 3.4 G)
+```
+
+The 3.0 GB MALLOC_LARGE is **not** the Q4K dequant cache — confirmed
+by `larql bench -v` reporting `q4k_ffn_cache after larql-metal: 0
+populated slots, 0.0 MB`. The Metal full-K fast path streams Q4_K
+bytes through `q4k_matmul_transb` and bypasses the dequant cache
+entirely. The cache only fires on the CPU per-position fallback (where
+it's a 30× win because one 614 ms layer-dequant is amortised across
+many feature reads).
 
 ## Core Operations (synthetic, 1024 features × 256 hidden, 8 layers)
 

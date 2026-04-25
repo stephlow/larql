@@ -13,6 +13,7 @@ use ndarray::Array2;
 use larql_models::ModelWeights;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::format::load::load_vindex_config;
 use crate::index::core::IndexLoadCallbacks;
 
@@ -152,8 +153,8 @@ pub fn load_model_weights_with_opts(
         callbacks.on_file_start("embeddings (skipped)", "opts.skip_embed=true");
         Array2::<f32>::zeros((0, 0))
     } else {
-        callbacks.on_file_start("embeddings", &dir.join("embeddings.bin").display().to_string());
-        let embed_file = std::fs::File::open(dir.join("embeddings.bin"))?;
+        callbacks.on_file_start("embeddings", &dir.join(EMBEDDINGS_BIN).display().to_string());
+        let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
         let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
         let expected_embed_f32 = config.vocab_size * config.hidden_size * 4;
         let embed_dtype = if embed_mmap.len() == expected_embed_f32 {
@@ -167,12 +168,12 @@ pub fn load_model_weights_with_opts(
     };
     callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
 
-    let manifest_path = dir.join("weight_manifest.json");
+    let manifest_path = dir.join(WEIGHT_MANIFEST_JSON);
     if !manifest_path.exists() {
         return Err(VindexError::Parse("weight_manifest.json not found".into()));
     }
 
-    callbacks.on_file_start("model_weights", "weight_manifest.json");
+    callbacks.on_file_start("model_weights", WEIGHT_MANIFEST_JSON);
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
     let entries: Vec<WeightEntry> = serde_json::from_str(&manifest_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
@@ -251,7 +252,7 @@ pub fn load_model_weights_with_opts(
     // gate_vectors → FFN gate tensors. Skip when the caller doesn't
     // want FFN weights (saves ~3-14 GB heap for a 4B/31B client).
     if config.quant == crate::config::types::QuantFormat::None && !opts.skip_ffn {
-        let gate_file = std::fs::File::open(dir.join("gate_vectors.bin"))?;
+        let gate_file = std::fs::File::open(dir.join(GATE_VECTORS_BIN))?;
         let gate_mmap = unsafe { memmap2::Mmap::map(&gate_file)? };
         let gate_floats = crate::config::dtype::decode_floats(&gate_mmap, config.dtype);
         let bpf = crate::config::dtype::bytes_per_float(config.dtype);
@@ -273,7 +274,7 @@ pub fn load_model_weights_with_opts(
     // final logits projection. Falls through to embed-tied derivation below
     // if the file is absent (or dequantisation fails).
     if lm_head_loaded.is_none() && !opts.skip_lm_head {
-        let lm_q4_path = dir.join("lm_head_q4.bin");
+        let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);
         if lm_q4_path.exists() {
             if let Some(model_cfg) = config.model_config.as_ref() {
                 // lm_head shape is (vocab_size, hidden_size) — same as embed.
@@ -400,8 +401,8 @@ pub fn load_model_weights_q4k(
     let arch = larql_models::detect_from_json(&arch_obj);
 
     // Embeddings — required for token lookup at layer 0.
-    callbacks.on_file_start("embeddings", &dir.join("embeddings.bin").display().to_string());
-    let embed_file = std::fs::File::open(dir.join("embeddings.bin"))?;
+    callbacks.on_file_start("embeddings", &dir.join(EMBEDDINGS_BIN).display().to_string());
+    let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
     let expected_f32 = config.vocab_size * config.hidden_size * 4;
     let embed_dtype = if embed_mmap.len() == expected_f32 {
@@ -415,7 +416,7 @@ pub fn load_model_weights_q4k(
     callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
 
     // norms.bin (f32) — loaded via weight_manifest.json, filtered to vector entries.
-    let manifest_path = dir.join("weight_manifest.json");
+    let manifest_path = dir.join(WEIGHT_MANIFEST_JSON);
     let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
     let mut tensors: HashMap<String, larql_models::WeightArray> = HashMap::new();
     let mut packed_mmaps: HashMap<String, memmap2::Mmap> = HashMap::new();
@@ -511,7 +512,7 @@ pub fn load_model_weights_q4k(
 
     // lm_head_q4.bin (Q4_K of the output projection) — dequant to f32. If
     // absent (tied embeddings), fall back to embed.clone() below.
-    let lm_q4_path = dir.join("lm_head_q4.bin");
+    let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);
     if lm_q4_path.exists() {
         let bytes = std::fs::read(&lm_q4_path)?;
         let num_floats = config.vocab_size * config.hidden_size;
@@ -554,10 +555,10 @@ pub fn load_model_weights_q4k(
 
 /// Find the tokenizer path near a model or vindex directory.
 pub fn find_tokenizer_path(dir: &Path) -> Option<std::path::PathBuf> {
-    let p = dir.join("tokenizer.json");
+    let p = dir.join(TOKENIZER_JSON);
     if p.exists() { return Some(p); }
     if let Some(parent) = dir.parent() {
-        let p = parent.join("tokenizer.json");
+        let p = parent.join(TOKENIZER_JSON);
         if p.exists() { return Some(p); }
     }
     None

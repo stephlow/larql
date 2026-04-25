@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 
 use super::build::IndexBuildCallbacks;
 use crate::config::{
@@ -97,7 +98,7 @@ use crate::config::{
         gate_records.sort_unstable_by_key(|r| (r.0, r.1));
 
         // Write binary
-        let bin_path = output_dir.join("gate_vectors.bin");
+        let bin_path = output_dir.join(GATE_VECTORS_BIN);
         let mut bin_file = BufWriter::new(std::fs::File::create(&bin_path)?);
         let mut layer_infos: Vec<VindexLayerInfo> = Vec::new();
         let mut offset: u64 = 0;
@@ -137,7 +138,7 @@ use crate::config::{
         callbacks.on_stage("embeddings");
         let start = std::time::Instant::now();
 
-        let embed_bin_path = output_dir.join("embeddings.bin");
+        let embed_bin_path = output_dir.join(EMBEDDINGS_BIN);
         let mut embed_out = BufWriter::new(std::fs::File::create(&embed_bin_path)?);
 
         let embed_file = std::fs::File::open(&embed_path)?;
@@ -253,7 +254,7 @@ use crate::config::{
         let tokenizer_src = find_tokenizer(vectors_dir);
         if let Some(ref src) = tokenizer_src {
             callbacks.on_stage("tokenizer");
-            std::fs::copy(src, output_dir.join("tokenizer.json"))?;
+            std::fs::copy(src, output_dir.join(TOKENIZER_JSON))?;
             callbacks.on_stage_done("tokenizer", 0.0);
         }
 
@@ -298,7 +299,7 @@ use crate::config::{
 
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| VindexError::Parse(e.to_string()))?;
-        std::fs::write(output_dir.join("index.json"), config_json)?;
+        std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
 
         Ok(())
     }
@@ -307,15 +308,15 @@ use crate::config::{
 fn find_tokenizer(vectors_dir: &Path) -> Option<std::path::PathBuf> {
     // Check parent directory
     if let Some(parent) = vectors_dir.parent() {
-        let p = parent.join("tokenizer.json");
+        let p = parent.join(TOKENIZER_JSON);
         if p.exists() { return Some(p); }
     }
     // Check vectors dir itself
-    let p = vectors_dir.join("tokenizer.json");
+    let p = vectors_dir.join(TOKENIZER_JSON);
     if p.exists() { return Some(p); }
     // Check sibling
     if let Some(parent) = vectors_dir.parent() {
-        let p = parent.join("vectors").join("tokenizer.json");
+        let p = parent.join("vectors").join(TOKENIZER_JSON);
         if p.exists() { return Some(p); }
     }
     None

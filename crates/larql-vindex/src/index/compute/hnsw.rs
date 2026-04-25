@@ -80,7 +80,7 @@ impl HnswLayer {
         // Random projection: dim -> PROJ_DIM
         let proj_matrix = Self::random_projection_matrix(dim, PROJ_DIM);
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::ComputeBackend;
+        use larql_compute::{ComputeBackend, MatMul};
         let projected = cpu.matmul(vectors.view(), proj_matrix.view());
 
         // Assign random levels
@@ -169,7 +169,7 @@ impl HnswLayer {
         // Project query to low-dim (PROJ_DIM) for fast graph traversal
         let proj_view = self.projected.view();
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::ComputeBackend;
+        use larql_compute::{ComputeBackend, MatMul};
         let x = query.view().into_shape_with_order((1, query.len())).unwrap();
         let proj_2d = cpu.matmul(x, self.proj_matrix.view());
         let proj_query = Array1::from_vec(proj_2d.into_raw_vec_and_offset().0);

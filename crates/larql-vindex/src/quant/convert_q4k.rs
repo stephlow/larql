@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::types::VindexConfig;
+use crate::format::filenames::*;
 use crate::error::VindexError;
 use crate::format::weights::{
     load_model_weights, write_model_weights_q4k_with_opts, Q4kWriteOptions,
@@ -100,7 +101,7 @@ pub fn vindex_to_q4k(
 
     // Parse source config and verify preconditions.
     let src_config: VindexConfig = serde_json::from_str(
-        &std::fs::read_to_string(src.join("index.json"))
+        &std::fs::read_to_string(src.join(INDEX_JSON))
             .map_err(|e| VindexError::Parse(format!("read src index.json: {e}")))?,
     )
     .map_err(|e| VindexError::Parse(format!("parse src index.json: {e}")))?;
@@ -131,7 +132,7 @@ pub fn vindex_to_q4k(
     // Seed the staging dir with the source's index.json. The Q4K writer
     // reads dir/index.json to update it in-place (sets has_model_weights
     // and quant=q4k), so the file must exist before write is called.
-    std::fs::copy(src.join("index.json"), dst_tmp.join("index.json"))
+    std::fs::copy(src.join(INDEX_JSON), dst_tmp.join(INDEX_JSON))
         .map_err(|e| VindexError::Parse(format!("seed staging index.json: {e}")))?;
 
     // Write Q4K files into the staging directory. Produces
@@ -148,28 +149,28 @@ pub fn vindex_to_q4k(
     // float matrix), embeddings, down_meta, tokenizer, feature_labels.
     // Excludes the f32 weight files that the Q4K path replaces.
     let handled_by_writer: std::collections::HashSet<&str> = [
-        "index.json",
+        INDEX_JSON,
         // Written by write_model_weights_q4k:
-        "attn_weights_q4k.bin",
-        "attn_weights_q4k_manifest.json",
-        "interleaved_q4k.bin",
-        "interleaved_q4k_manifest.json",
-        "lm_head_q4.bin",
-        "norms.bin",
+        ATTN_WEIGHTS_Q4K_BIN,
+        ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+        INTERLEAVED_Q4K_BIN,
+        INTERLEAVED_Q4K_MANIFEST_JSON,
+        LM_HEAD_Q4_BIN,
+        NORMS_BIN,
     ].iter().copied().collect();
     let skip_from_src: std::collections::HashSet<&str> = [
         // The f32 weight files that the Q4K path replaces — don't
         // hard-link these, they'd bloat the output and be unused.
-        "attn_weights.bin",
+        ATTN_WEIGHTS_BIN,
         "up_weights.bin",
         "down_weights.bin",
-        "up_features.bin",
-        "down_features.bin",
-        "interleaved.bin",
+        UP_FEATURES_BIN,
+        DOWN_FEATURES_BIN,
+        INTERLEAVED_BIN,
         "lm_head.bin",
-        "norms.bin",
-        "weight_manifest.json",
-        "index.json",
+        NORMS_BIN,
+        WEIGHT_MANIFEST_JSON,
+        INDEX_JSON,
     ].iter().copied().collect();
 
     let mut aux_linked = 0usize;
@@ -196,13 +197,13 @@ pub fn vindex_to_q4k(
     // The Q4K writer rewrote index.json (quant=q4k, has_model_weights=true).
     // Clear stale checksums — the source's checksums no longer apply to the
     // quantised files. `larql verify` can recompute on demand.
-    let written_text = std::fs::read_to_string(dst_tmp.join("index.json"))
+    let written_text = std::fs::read_to_string(dst_tmp.join(INDEX_JSON))
         .map_err(|e| VindexError::Parse(format!("re-read index.json: {e}")))?;
     let mut written_cfg: VindexConfig = serde_json::from_str(&written_text)
         .map_err(|e| VindexError::Parse(format!("parse written index.json: {e}")))?;
     written_cfg.checksums = None;
     std::fs::write(
-        dst_tmp.join("index.json"),
+        dst_tmp.join(INDEX_JSON),
         serde_json::to_string_pretty(&written_cfg)
             .map_err(|e| VindexError::Parse(format!("serialise config: {e}")))?,
     )
@@ -218,9 +219,9 @@ pub fn vindex_to_q4k(
     // (already dense f32). FFN dst = interleaved_q4k.bin.
     let src_ffn_bytes = size_of(&src.join("up_weights.bin")).unwrap_or(0)
         + size_of(&src.join("down_weights.bin")).unwrap_or(0)
-        + size_of(&src.join("gate_vectors.bin")).unwrap_or(0);
-    let dst_ffn_bytes = size_of(&dst.join("interleaved_q4k.bin")).unwrap_or(0)
-        + size_of(&dst.join("gate_vectors.bin")).unwrap_or(0);
+        + size_of(&src.join(GATE_VECTORS_BIN)).unwrap_or(0);
+    let dst_ffn_bytes = size_of(&dst.join(INTERLEAVED_Q4K_BIN)).unwrap_or(0)
+        + size_of(&dst.join(GATE_VECTORS_BIN)).unwrap_or(0);
     let compression = if dst_ffn_bytes == 0 { 1.0 } else {
         src_ffn_bytes as f64 / dst_ffn_bytes as f64
     };

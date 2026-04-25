@@ -18,6 +18,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::config::{VindexConfig, VindexModelConfig};
 use crate::format::load::load_vindex_config;
@@ -263,7 +264,7 @@ pub fn write_model_weights_with_opts(
     let write_lm_head = opts.level.writes_lm_head();
 
     if write_attn {
-    let attn_path = dir.join("attn_weights.bin");
+    let attn_path = dir.join(ATTN_WEIGHTS_BIN);
     let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
     let mut attn_offset: u64 = 0;
 
@@ -281,7 +282,7 @@ pub fn write_model_weights_with_opts(
                     key: key.clone(), kind: "tensor".into(),
                     shape: vec![rows, cols],
                     offset: attn_offset, length: len,
-                    file: "attn_weights.bin".into(),
+                    file: ATTN_WEIGHTS_BIN.into(),
                 });
                 attn_offset += len;
             }
@@ -296,7 +297,7 @@ pub fn write_model_weights_with_opts(
                     key: key.clone(), kind: "vector".into(),
                     shape: vec![data.len()],
                     offset: attn_offset, length: bytes.len() as u64,
-                    file: "attn_weights.bin".into(),
+                    file: ATTN_WEIGHTS_BIN.into(),
                 });
                 attn_offset += bytes.len() as u64;
             }
@@ -409,7 +410,7 @@ pub fn write_model_weights_with_opts(
 
     // ── Norms ── (paired with attention; skipped when level < Attention)
     if write_attn {
-        let norms_path = dir.join("norms.bin");
+        let norms_path = dir.join(NORMS_BIN);
         let mut norms_file = BufWriter::new(std::fs::File::create(&norms_path)?);
         let mut norms_offset: u64 = 0;
 
@@ -445,7 +446,7 @@ pub fn write_model_weights_with_opts(
                         key, kind: "vector".into(),
                         shape: vec![data.len()],
                         offset: norms_offset, length: bytes.len() as u64,
-                        file: "norms.bin".into(),
+                        file: NORMS_BIN.into(),
                     });
                     norms_offset += bytes.len() as u64;
                 }
@@ -460,7 +461,7 @@ pub fn write_model_weights_with_opts(
                 key: "norm.weight".into(), kind: "vector".into(),
                 shape: vec![data.len()],
                 offset: norms_offset, length: bytes.len() as u64,
-                file: "norms.bin".into(),
+                file: NORMS_BIN.into(),
             });
         }
         norms_file.flush()?;
@@ -483,10 +484,10 @@ pub fn write_model_weights_with_opts(
     // ── Manifest ──
     let manifest_json = serde_json::to_string_pretty(&entries)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join("weight_manifest.json"), manifest_json)?;
+    std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
 
     // ── Update index.json ──
-    let config_path = dir.join("index.json");
+    let config_path = dir.join(INDEX_JSON);
     let config_text = std::fs::read_to_string(&config_path)?;
     let mut config: VindexConfig = serde_json::from_str(&config_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
@@ -666,7 +667,7 @@ pub fn write_model_weights_q4k_with_opts(
     let num_layers = source.num_layers();
 
     // ── attn_weights_q4k.bin ──
-    let attn_path = dir.join("attn_weights_q4k.bin");
+    let attn_path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
     let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
     let mut attn_offset: u64 = 0;
     let mut attn_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 4);
@@ -736,7 +737,7 @@ pub fn write_model_weights_q4k_with_opts(
 
     let manifest_json = serde_json::to_string_pretty(&attn_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join("attn_weights_q4k_manifest.json"), manifest_json)?;
+    std::fs::write(dir.join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON), manifest_json)?;
 
     // ── interleaved_q4k.bin (FFN gate/up/down) + manifest ──
     //
@@ -747,7 +748,7 @@ pub fn write_model_weights_q4k_with_opts(
     // Downstream readers resolve by key + layer instead of recomputing
     // byte offsets; a shape/stride mismatch now fails at load rather
     // than silently corrupting.
-    let ff_path = dir.join("interleaved_q4k.bin");
+    let ff_path = dir.join(INTERLEAVED_Q4K_BIN);
     let mut ff_file = BufWriter::new(std::fs::File::create(&ff_path)?);
     let mut ff_offset: u64 = 0;
     let mut ff_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 3);
@@ -791,7 +792,7 @@ pub fn write_model_weights_q4k_with_opts(
 
     let ff_manifest_json = serde_json::to_string_pretty(&ff_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join("interleaved_q4k_manifest.json"), ff_manifest_json)?;
+    std::fs::write(dir.join(INTERLEAVED_Q4K_MANIFEST_JSON), ff_manifest_json)?;
 
     // ── experts_packed.bin (hybrid MoE PackedBF16, e.g. Gemma 4 26B A4B) ──
     //
@@ -846,7 +847,7 @@ pub fn write_model_weights_q4k_with_opts(
     }
 
     // ── norms.bin (f32, small) ──
-    let norms_path = dir.join("norms.bin");
+    let norms_path = dir.join(NORMS_BIN);
     let mut norms_file = BufWriter::new(std::fs::File::create(&norms_path)?);
     let norms_dtype = crate::config::dtype::StorageDtype::F32;
     let mut norms_offset: u64 = 0;
@@ -883,7 +884,7 @@ pub fn write_model_weights_q4k_with_opts(
                     shape: vec![data.len()],
                     offset: norms_offset,
                     length: bytes.len() as u64,
-                    file: "norms.bin".into(),
+                    file: NORMS_BIN.into(),
                 });
                 norms_offset += bytes.len() as u64;
             }
@@ -904,7 +905,7 @@ pub fn write_model_weights_q4k_with_opts(
                         shape: vec![data.len()],
                         offset: norms_offset,
                         length: bytes.len() as u64,
-                        file: "norms.bin".into(),
+                        file: NORMS_BIN.into(),
                     });
                     norms_offset += bytes.len() as u64;
                 }
@@ -932,7 +933,7 @@ pub fn write_model_weights_q4k_with_opts(
                         shape: vec![data.len()],
                         offset: norms_offset,
                         length: bytes.len() as u64,
-                        file: "norms.bin".into(),
+                        file: NORMS_BIN.into(),
                     });
                     norms_offset += bytes.len() as u64;
                 }
@@ -950,7 +951,7 @@ pub fn write_model_weights_q4k_with_opts(
             shape: vec![data.len()],
             offset: norms_offset,
             length: bytes.len() as u64,
-            file: "norms.bin".into(),
+            file: NORMS_BIN.into(),
         });
         norms_offset += bytes.len() as u64;
     }
@@ -966,7 +967,7 @@ pub fn write_model_weights_q4k_with_opts(
                 shape: vec![data.len()],
                 offset: norms_offset,
                 length: bytes.len() as u64,
-                file: "norms.bin".into(),
+                file: NORMS_BIN.into(),
             });
         }
     }
@@ -1063,7 +1064,7 @@ pub fn write_model_weights_q4k_with_opts(
     if let Some((data, rows, cols)) = source.lm_head() {
         let (padded, padded_cols) = pad_rows_to_256(&data, rows, cols);
         let q_bytes = quantize_q4_k(&padded);
-        std::fs::write(dir.join("lm_head_q4.bin"), &q_bytes)?;
+        std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
         // Record in norms manifest so a single weight_manifest.json references
         // everything non-quantised-via-layout. Shape records the stored
         // `padded_cols` — callers route through the matvec dispatch which
@@ -1075,7 +1076,7 @@ pub fn write_model_weights_q4k_with_opts(
             shape: vec![rows, padded_cols],
             offset: 0,
             length: q_bytes.len() as u64,
-            file: "lm_head_q4.bin".into(),
+            file: LM_HEAD_Q4_BIN.into(),
         });
     }
 
@@ -1084,10 +1085,10 @@ pub fn write_model_weights_q4k_with_opts(
     all_entries.extend(packed_entries);
     let manifest_json = serde_json::to_string_pretty(&all_entries)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join("weight_manifest.json"), manifest_json)?;
+    std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
 
     // ── Update index.json: has_model_weights=true, quant=q4k ──
-    let config_path = dir.join("index.json");
+    let config_path = dir.join(INDEX_JSON);
     let config_text = std::fs::read_to_string(&config_path)?;
     let mut config: VindexConfig = serde_json::from_str(&config_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;

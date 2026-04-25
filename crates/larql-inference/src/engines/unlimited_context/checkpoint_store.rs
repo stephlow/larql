@@ -51,3 +51,79 @@ impl CheckpointStore {
             .sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn mk_kv(layers: usize, kv_dim: usize) -> Vec<SharedKV> {
+        (0..layers)
+            .map(|l| {
+                let mut k = Array2::<f32>::zeros((1, kv_dim));
+                let mut v = Array2::<f32>::zeros((1, kv_dim));
+                for j in 0..kv_dim {
+                    k[[0, j]] = l as f32 + j as f32 * 0.01;
+                    v[[0, j]] = l as f32 * 2.0 + j as f32 * 0.01;
+                }
+                (k, v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let mut store = CheckpointStore::new();
+        let kv = mk_kv(4, 8);
+        store.save(0, kv, 511);
+        assert!(store.contains(0));
+        assert_eq!(store.len(), 1);
+        let (loaded, pos) = store.load(0).expect("should load");
+        assert_eq!(pos, 511);
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded[0].0.shape(), &[1, 8]);
+    }
+
+    #[test]
+    fn evict_removes_window() {
+        let mut store = CheckpointStore::new();
+        store.save(0, mk_kv(2, 4), 0);
+        store.save(1, mk_kv(2, 4), 511);
+        assert_eq!(store.len(), 2);
+        store.evict(&[0]);
+        assert_eq!(store.len(), 1);
+        assert!(!store.contains(0));
+        assert!(store.contains(1));
+    }
+
+    #[test]
+    fn total_bytes_scales_with_layers_and_dim() {
+        let mut store = CheckpointStore::new();
+        store.save(0, mk_kv(4, 8), 0);
+        // 4 layers × (K + V each 1×8 f32) = 4 × 2 × 8 × 4 = 256 bytes
+        assert_eq!(store.total_bytes(), 4 * 2 * 8 * 4);
+    }
+
+    #[test]
+    fn is_empty_on_new_store() {
+        let store = CheckpointStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn load_missing_returns_none() {
+        let store = CheckpointStore::new();
+        assert!(store.load(42).is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn save_rejects_multi_row_kv_in_debug() {
+        let mut store = CheckpointStore::new();
+        let multi: Vec<SharedKV> = (0..2)
+            .map(|_| (Array2::<f32>::zeros((3, 8)), Array2::<f32>::zeros((3, 8))))
+            .collect();
+        store.save(0, multi, 0);
+    }
+}

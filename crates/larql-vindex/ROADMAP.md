@@ -9,6 +9,178 @@
 - Q4_K dequant cache LRU-bounded via `--max-q4k-cache-layers`
 - Patch system for editable knowledge
 
+## P0: Code-quality cleanup (2026-04-25 audit)
+
+Findings from the codebase-wide audit (six parallel agents covering
+quant extensibility, magic strings, modularity, folder layout, test
+coverage, and docs). Verdict: well-engineered crate with three
+concentrated structural debts.
+
+### `quant::registry` — single dispatch table for all GGML formats
+**Impact**: Adding the next quant (Q5_K / Q3_K / …) drops from 8 files
+to 3; deletes ~12 silent-fallback `_ => None` match arms in walk.rs
+**Effort**: Medium
+**Status**: Not started
+
+Today three separate format enums coexist (`QuantFormat` in
+`config/types.rs`, `QuantBlockFormat` in `format/weights/write.rs`, a
+third in `larql-compute/pipeline.rs`). Block-byte sizes (144 for Q4_K,
+210 for Q6_K) appear inline as magic numbers across `walk.rs`. 25+
+bare `"Q4_K"` / `"Q6_K"` literals across the workspace.
+
+Build a `crates/larql-vindex/src/quant/registry.rs` carrying a
+`QuantFormatInfo` table: `tag`, `block_elements`, `bytes_per_block`,
+function pointers for `dequantize` / `row_dot` / `row_scaled_add`.
+`walk.rs` match arms collapse to `registry::lookup(tag)?` calls.
+Adding Q5_K = one new entry plus the codec functions.
+
+### `format::filenames` — one home for the 244 filename literals
+**Impact**: Eliminates the "wrong filename → silent fallback" class
+**Effort**: Low
+**Status**: Not started
+
+`"index.json"` (77 occurrences), `"tokenizer.json"` (56),
+`"gate_vectors.bin"` (49), and friends are scattered across vindex,
+cli, server, inference. A typo today silently triggers a fallback
+codepath. Consolidate into `crates/larql-vindex/src/format/filenames.rs`
+and migrate callers.
+
+### Doc + bench freshness
+**Impact**: README / PERFORMANCE / SPEC currently lag code by ~3 weeks
+**Effort**: Low
+**Status**: Not started
+
+- README: test counts say "106 / 104"; actual is **304** (167 unit +
+  137 integration)
+- PERFORMANCE.md: still cites 51.9 tok/s; current `larql bench` is
+  **68.7 tok/s** Gemma 3 4B Metal Q4K
+- FFN_VINDEX_UNIFICATION_SPEC.md: aspirational, not flagged as such
+  (KnnStore is still in `lib.rs`)
+- Inline rustdoc + ADRs are current (no action needed)
+
+## P1: Modularity + test depth
+
+### Split `index/` along storage / compute / mutate seams — PARTIAL
+**Impact**: Unblocks the god-struct extraction; no behaviour change
+**Effort**: Medium (move-only) for the directory creation; impl-block
+surgery for gate.rs/walk.rs is a separate pass.
+**Status**: ✅ Pass 1+2 complete (2026-04-25); gate.rs / walk.rs split
+deferred as P1-1b.
+
+Done:
+- `storage/` (mmap loaders, decode caches, residency)
+- `compute/` (HNSW, MoE router)
+- `mutate/` (INSERT/DELETE, NDJSON loaders, persistence)
+- 9 files moved (`residency`, `hnsw`, `router`, `accessors`, `attn`,
+  `lm_head`, `fp4_storage`, `mutate`, `loaders`)
+- 321 tests pass; backwards-compatible re-exports keep
+  `crate::index::{hnsw,attn,lm_head,…}` resolving
+
+Remaining (P1-1b):
+- `gate.rs` (992 L) → split into `compute/gate_knn.rs` +
+  `storage/gate_store.rs` (resolve_gate / mmap fast path / LRU)
+- `walk.rs` (862 L) → split into `storage/ffn_store.rs` (mmap +
+  prefetch) + `compute/q4k_dispatch.rs` (matmul/row helpers via
+  the new registry)
+
+`index/` is partitioned by *operation* (`gate.rs`, `walk.rs`, `attn.rs`,
+`lm_head.rs`) but those files mix mmap slicing, KNN compute, and
+caching. `gate.rs` is 992 lines covering all three concerns; `walk.rs`
+is 912 the same way. Proposed layout:
+
+```
+index/
+├── core.rs            — slimmed VectorIndex (composes substores)
+├── types.rs / gate_trait.rs / mod.rs
+├── storage/           — mmap + slicing + caches + LRU bookkeeping
+│   ├── mmap_util.rs   (moved from src/)
+│   ├── gate_store.rs
+│   ├── ffn_store.rs
+│   ├── projection_store.rs   (lm_head + attn)
+│   └── caches.rs
+├── compute/           — pure dispatch
+│   ├── gate_knn.rs
+│   ├── gate_walk.rs
+│   ├── hnsw_dispatch.rs
+│   └── lm_head_knn.rs
+└── mutate/            — INSERT / DELETE / heap promotion
+```
+
+### `VectorIndex` god struct → composed substores
+**Impact**: 35+ Option<Arc<Mmap>> fields collapse to four typed stores
+**Effort**: Large
+**Status**: Blocked by index/ split
+
+```rust
+pub struct VectorIndex {
+    config:      VindexConfigCore,
+    gate:        GateStore,
+    ffn:         FfnStore,
+    projections: ProjectionStore,
+    metadata:    MetadataStore,
+    fp4_storage: Option<Arc<Fp4Storage>>,
+}
+```
+
+`gate_trait.rs` stops being a thin pass-through over field accesses;
+each store owns its caches and LRU.
+
+### GGML quant round-trip tests
+**Impact**: Catches the silent-fallback class via codec checks
+**Effort**: Small
+**Status**: Not started
+
+Today there are zero round-trip tests for Q4_0 / Q4_K / Q6_K / Q8.
+FP4 / FP8 have them via `larql-models`. Add
+`crates/larql-vindex/tests/quant_roundtrip.rs`: quantize → dequantize
+→ assert close-enough per format with frozen tolerance bounds.
+
+### End-to-end golden pipeline test
+**Impact**: One assertion catches all serialization regressions
+**Effort**: Medium
+**Status**: Not started
+
+Fixture under `crates/larql-vindex/tests/golden/`: 3-layer synthetic
+safetensors → extract → save → load (mmap) → KNN → patch → save →
+reload → re-run KNN. Frozen SHA256 of bytes + bit-exact KNN result.
+Also add: mmap-zero-copy regression (`assert_eq!(gate_heap_bytes(),
+0)` after f16 mmap load), LRU-eviction-under-load (1000 random
+queries, cap=4, 60 layers, observe never > 4).
+
+### Benches for the 2026-04-25 work
+**Impact**: Numbers behind ROADMAP claims become measurable
+**Effort**: Small
+**Status**: Not started
+
+- `benches/hnsw_decode.rs` — brute vs HNSW at 10K / 28K / 131K
+  features, recall %, build cost
+- `benches/q4k_cache.rs` — cold dequant vs cached hit per layer, LRU
+  eviction overhead (validates the "30× win" amortisation claim)
+- `benches/q4k_prefetch.rs` — first-token cold-page latency with /
+  without `prefetch_interleaved_q4k_layer`
+
+## P2: Ergonomics + cosmetics
+
+### Split oversized files
+- `format/huggingface.rs` (1366 L) → `huggingface/{download,publish,cache,discovery}.rs`
+- `format/weights/write.rs` (1249 L) → `weights/{write_f32,write_q4_0,write_q4k}.rs`
+- `larql-models/src/quant/ggml.rs` (1352 L) → `quant/ggml/{q4_0,q4_k,q6_k,q8}.rs`
+
+Move-only; mirrors the registry shape.
+
+### Naming pass — one referent per format concept
+- Rust types: `Q4K` (no `Q4k`)
+- Snake-case identifiers: `q4k`
+- Serialized strings: `"Q4_K"` (only in registry)
+
+Today `Q4k`, `Q4K`, and `q4k` all appear in the same crate for the
+same format. Workspace-wide find-and-replace.
+
+### Coverage tooling
+Add `cargo-llvm-cov` (or tarpaulin) + `make coverage` target. Output
+to `coverage/`. No CI integration yet — local-only is fine. Makes the
+next coverage audit data-driven instead of grep-based.
+
 ## P0: Decode-path performance
 
 Items raised by the 2026-04-25 perf audit (see PERFORMANCE.md and the

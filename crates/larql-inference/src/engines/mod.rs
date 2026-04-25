@@ -2,17 +2,22 @@
 //!
 //! Each engine implements the full prefill + autoregressive decode loop but
 //! manages its persistent inference state differently. Engines are selected
-//! via [`EngineKind`] and bench via `larql bench --engine`.
+//! via [`EngineKind`] and benched via `larql bench --engine`.
 //!
 //! Correctness contract: `prefill` and `decode_step` return the pre-lm_head
 //! hidden state (shape `[1, hidden_dim]`). The caller applies `final_norm +
-//! lm_head` to get logits — see `larql_inference::forward::hidden_to_raw_logits`.
+//! lm_head` to get logits — see `crate::forward::hidden_to_raw_logits`.
 
+pub mod accuracy;
 pub mod markov_residual;
+pub mod profiler;
 pub mod unlimited_context;
 
 use ndarray::Array2;
+use larql_compute::prelude::*;
 use crate::model::ModelWeights;
+
+// ─── EngineInfo ───────────────────────────────────────────────────────────────
 
 /// Runtime diagnostics reported by each engine.
 #[derive(Debug, Clone)]
@@ -21,9 +26,9 @@ pub struct EngineInfo {
     pub name: String,
     /// Human-readable description of the engine's state management strategy.
     pub description: String,
-    /// Hardware backend: `"cpu"`, `"metal"`, etc.
+    /// Hardware backend name from [`ComputeBackend::name`]: `"cpu"`, `"metal"`, etc.
     pub backend: String,
-    /// Key config parameters (e.g. `"window=512"`), empty if unconfigured.
+    /// Key config parameters (e.g. `"window=512"`), empty string if unconfigured.
     pub config: String,
 }
 
@@ -37,6 +42,8 @@ impl EngineInfo {
     }
 }
 
+// ─── KvEngine trait ───────────────────────────────────────────────────────────
+
 /// Common interface shared by all KV-cache engines.
 pub trait KvEngine: Send {
     fn name(&self) -> &str;
@@ -45,16 +52,27 @@ pub trait KvEngine: Send {
     fn info(&self) -> EngineInfo;
 
     /// Run the prefill forward pass over all prompt tokens.
-    /// Returns the hidden state at the final token position (shape [1, hidden_dim]).
+    /// Returns the hidden state at the final token position (shape `[1, hidden_dim]`).
     fn prefill(&mut self, weights: &ModelWeights, token_ids: &[u32]) -> Option<Array2<f32>>;
 
     /// Run one autoregressive decode step for a single new token.
-    /// Returns the hidden state (shape [1, hidden_dim]).
+    /// Returns the hidden state (shape `[1, hidden_dim]`).
     fn decode_step(&mut self, weights: &ModelWeights, token_id: u32) -> Option<Array2<f32>>;
 
     /// Bytes of persistent engine state (excludes model weights).
     fn memory_bytes(&self) -> usize;
+
+    /// Token count in the active hot window (varies by engine type).
+    fn window_tokens(&self) -> usize { 0 }
+
+    /// Cold-tier bytes (residuals or token IDs past the hot window).
+    fn cold_bytes(&self) -> usize { 0 }
+
+    /// Per-stage timing summary. Returns `None` if profiling was not enabled.
+    fn stage_summary(&self) -> Option<profiler::DecodeStageSummary> { None }
 }
+
+// ─── EngineKind ───────────────────────────────────────────────────────────────
 
 /// Engine selector. Parse with [`EngineKind::from_name`]; build with [`EngineKind::build`].
 #[derive(Debug, Clone)]
@@ -64,7 +82,7 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
-    /// Parse a CLI name into an `EngineKind`. Accepted names:
+    /// Parse a CLI engine name. Accepted values:
     /// - `markov-rs`, `markov-residual` → [`EngineKind::MarkovResidual`]
     /// - `unlimited`, `unlimited-context` → [`EngineKind::UnlimitedContext`]
     pub fn from_name(s: &str) -> Option<Self> {
@@ -86,14 +104,68 @@ impl EngineKind {
         }
     }
 
-    pub fn build(self) -> Box<dyn KvEngine> {
+    /// Build a boxed engine, dispatching compute through `backend`.
+    pub fn build(self, backend: Box<dyn ComputeBackend>) -> Box<dyn KvEngine> {
         match self {
             EngineKind::MarkovResidual { window_size } => {
-                Box::new(markov_residual::MarkovResidualEngine::new(window_size))
+                Box::new(markov_residual::MarkovResidualEngine::with_backend(
+                    window_size, backend,
+                ))
             }
             EngineKind::UnlimitedContext { window_size } => {
-                Box::new(unlimited_context::UnlimitedContextEngine::new(window_size))
+                Box::new(unlimited_context::UnlimitedContextEngine::with_backend(
+                    window_size, backend,
+                ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_kind_from_name_roundtrip() {
+        for name in &["markov-rs", "markov_rs", "markov-residual", "markov_residual"] {
+            assert!(
+                matches!(EngineKind::from_name(name), Some(EngineKind::MarkovResidual { .. })),
+                "failed to parse {name:?}"
+            );
+        }
+        for name in &["unlimited", "unlimited-context", "unlimited_context"] {
+            assert!(
+                matches!(EngineKind::from_name(name), Some(EngineKind::UnlimitedContext { .. })),
+                "failed to parse {name:?}"
+            );
+        }
+        assert!(EngineKind::from_name("unknown").is_none());
+        assert!(EngineKind::from_name("").is_none());
+    }
+
+    #[test]
+    fn engine_info_summary_with_config() {
+        let info = EngineInfo {
+            name: "markov-rs".into(),
+            description: "residual KV".into(),
+            backend: "cpu".into(),
+            config: "window=512".into(),
+        };
+        let s = info.summary();
+        assert!(s.contains("markov-rs"));
+        assert!(s.contains("cpu"));
+        assert!(s.contains("window=512"));
+    }
+
+    #[test]
+    fn engine_info_summary_no_config() {
+        let info = EngineInfo {
+            name: "test".into(),
+            description: "desc".into(),
+            backend: "metal".into(),
+            config: String::new(),
+        };
+        let s = info.summary();
+        assert!(!s.contains("()"));
     }
 }

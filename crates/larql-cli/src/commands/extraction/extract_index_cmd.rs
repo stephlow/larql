@@ -1,3 +1,4 @@
+use larql_vindex::format::filenames::*;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -252,7 +253,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         let output = &args.output;
 
         // Find or create tokenizer
-        let tok_path = model_path.join("tokenizer.json");
+        let tok_path = model_path.join(TOKENIZER_JSON);
         let tokenizer = if tok_path.exists() {
             larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
                 .map_err(|e| format!("failed to load tokenizer: {e}"))?
@@ -318,18 +319,18 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for name in &[
-        "index.json",
-        "gate_vectors.bin",
-        "embeddings.bin",
+        INDEX_JSON,
+        GATE_VECTORS_BIN,
+        EMBEDDINGS_BIN,
         "down_meta.jsonl",
-        "down_meta.bin",
-        "tokenizer.json",
-        "attn_weights.bin",
+        DOWN_META_BIN,
+        TOKENIZER_JSON,
+        ATTN_WEIGHTS_BIN,
         "up_weights.bin",
         "down_weights.bin",
-        "norms.bin",
+        NORMS_BIN,
         "lm_head.bin",
-        "weight_manifest.json",
+        WEIGHT_MANIFEST_JSON,
     ] {
         let path = args.output.join(name);
         if let Ok(meta) = std::fs::metadata(&path) {

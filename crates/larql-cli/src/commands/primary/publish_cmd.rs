@@ -18,6 +18,7 @@
 //!
 //! Requires `HF_TOKEN` (or `~/.huggingface/token`) just like `larql hf publish`.
 
+use larql_vindex::format::filenames::*;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -128,7 +129,7 @@ pub fn run(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !src.is_dir() {
         return Err(format!("source vindex not a directory: {}", src.display()).into());
     }
-    if !src.join("index.json").exists() {
+    if !src.join(INDEX_JSON).exists() {
         return Err(format!(
             "source vindex missing index.json: {}",
             src.display()

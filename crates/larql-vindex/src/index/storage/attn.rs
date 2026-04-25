@@ -8,9 +8,10 @@
 use std::sync::Arc;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::mmap_util::mmap_optimized;
 
-use super::core::VectorIndex;
+use crate::index::core::VectorIndex;
 
 impl VectorIndex {
     /// Load Q8 attention weights + manifest for GPU full pipeline.
@@ -70,14 +71,14 @@ impl VectorIndex {
 
     /// Load Q4_K/Q6_K attention weights for Ollama-compatible GPU pipeline.
     pub fn load_attn_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("attn_weights_q4k.bin");
+        let path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("attn_weights_q4k.bin not found".into()));
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };
 
-        let manifest_path = dir.join("attn_weights_q4k_manifest.json");
+        let manifest_path = dir.join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON);
         if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)

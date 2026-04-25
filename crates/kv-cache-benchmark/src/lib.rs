@@ -15,7 +15,7 @@ pub mod accuracy_suite;
 #[cfg(feature = "real-model")]
 pub mod real_model;
 
-#[cfg(feature = "real-model")]
+// unlimited_context re-exports from larql_inference::engines — always available.
 pub mod unlimited_context;
 
 #[cfg(feature = "real-model")]

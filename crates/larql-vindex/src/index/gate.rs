@@ -4,7 +4,7 @@
 //! score computation, HNSW integration, and top-K selection.
 
 use ndarray::{Array1, Array2, ArrayView2};
-use larql_compute::ComputeBackend;
+use larql_compute::{ComputeBackend, MatMul};
 
 use super::core::VectorIndex;
 use super::types::*;

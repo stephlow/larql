@@ -1,3 +1,4 @@
+use larql_vindex::format::filenames::*;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -353,7 +354,7 @@ fn run_gguf_to_vindex(
     // Find tokenizer — check same directory as GGUF file
     let tokenizer = input.parent()
         .and_then(|dir| {
-            let tok_path = dir.join("tokenizer.json");
+            let tok_path = dir.join(TOKENIZER_JSON);
             if tok_path.exists() {
                 larql_vindex::tokenizers::Tokenizer::from_file(&tok_path).ok()
             } else {
@@ -403,7 +404,7 @@ fn run_safetensors_to_vindex(
     let tokenizer = larql_vindex::load_vindex_tokenizer(input)
         .or_else(|_| {
             // Try to load from the model directory
-            let tok_path = input.join("tokenizer.json");
+            let tok_path = input.join(TOKENIZER_JSON);
             larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
                 .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
         })?;

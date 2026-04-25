@@ -33,7 +33,7 @@ pub trait FfnBackend {
 
 // ── Re-exports ──
 
-pub use weight::WeightFfn;
+pub use weight::{WeightFfn, BackendFfn, dense_ffn_forward_backend};
 pub use sparse::SparseFfn;
 pub use remote::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend, RemoteLatencyStats};
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};

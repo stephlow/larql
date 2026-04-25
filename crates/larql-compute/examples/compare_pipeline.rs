@@ -12,7 +12,7 @@ fn main() {
     #[cfg(feature = "metal")]
     {
         use std::time::Instant;
-        use larql_compute::ComputeBackend;
+        use larql_compute::prelude::*;
         use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q4_0, quantize_to_q8};
 
         let metal = larql_compute::metal::MetalBackend::new().expect("Metal required");

@@ -13,6 +13,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::index::FeatureMeta;
 
 const MAGIC: u32 = 0x444D4554; // "DMET"
@@ -24,7 +25,7 @@ pub fn write_binary(
     down_meta: &[Option<Vec<Option<FeatureMeta>>>],
     top_k_count: usize,
 ) -> Result<usize, VindexError> {
-    let path = dir.join("down_meta.bin");
+    let path = dir.join(DOWN_META_BIN);
     let file = std::fs::File::create(&path)?;
     let mut w = BufWriter::new(file);
     let mut total = 0usize;
@@ -91,7 +92,7 @@ pub fn read_binary(
     dir: &Path,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Result<(Vec<Option<Vec<Option<FeatureMeta>>>>, usize), VindexError> {
-    let path = dir.join("down_meta.bin");
+    let path = dir.join(DOWN_META_BIN);
     let file = std::fs::File::open(&path)?;
     let mut r = BufReader::new(file);
 
@@ -170,7 +171,7 @@ pub fn read_binary(
 
 /// Check if a binary down_meta.bin exists in the directory.
 pub fn has_binary(dir: &Path) -> bool {
-    dir.join("down_meta.bin").exists()
+    dir.join(DOWN_META_BIN).exists()
 }
 
 /// Mmap down_meta.bin and build a lazy reader (zero heap for feature data).
@@ -179,7 +180,7 @@ pub fn mmap_binary(
     dir: &Path,
     tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
 ) -> Result<crate::index::core::DownMetaMmap, VindexError> {
-    let path = dir.join("down_meta.bin");
+    let path = dir.join(DOWN_META_BIN);
     let file = std::fs::File::open(&path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
 

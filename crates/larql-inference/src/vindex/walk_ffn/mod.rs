@@ -38,7 +38,7 @@
 
 use ndarray::Array2;
 
-use larql_compute::ComputeBackend;
+use larql_compute::prelude::*;
 use crate::ffn::FfnBackend;
 use crate::ffn::sparse_compute::sparse_ffn_forward;
 use crate::model::ModelWeights;

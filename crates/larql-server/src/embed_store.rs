@@ -11,6 +11,7 @@
 //! Once the cap is reached, subsequent cache misses decode fresh from the mmap
 //! on every call — still only 1–2 µs, negligible vs network overhead.
 
+use larql_vindex::format::filenames::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -42,7 +43,7 @@ impl EmbedStoreF16 {
         hidden_size: usize,
         l1_cap: usize,
     ) -> Result<Self, String> {
-        let path = dir.join("embeddings.bin");
+        let path = dir.join(EMBEDDINGS_BIN);
         let file = std::fs::File::open(&path)
             .map_err(|e| format!("open {}: {e}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }

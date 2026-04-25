@@ -60,6 +60,10 @@ pub struct BenchArgs {
     #[arg(long, value_name = "ENGINE,...")]
     pub engine: Option<String>,
 
+    /// Print per-stage timing breakdown for each engine (markov-rs only for now).
+    #[arg(long)]
+    pub profile: bool,
+
     /// Verbose load / warmup logging.
     #[arg(short, long)]
     pub verbose: bool,
@@ -118,22 +122,31 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         rows.push(run_ollama(ollama_model, &args.prompt, args.tokens));
     }
 
-    // KV engine rows (CPU forward path, all engines comparable).
+    // KV engine rows — load weights once, shared across all selected engines.
     if let Some(ref engine_list) = args.engine {
-        let token_ids: Vec<u32> = {
-            let mut cb = larql_vindex::SilentLoadCallbacks;
-            let weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
-            let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
-            larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
-                .map_err(|e| format!("tokenize: {e}"))?
-        };
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
+        let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
+        let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+            .map_err(|e| format!("tokenize: {e}"))?;
+
+        // Standard-KV equivalent bytes for this prompt (FP16) — used to compute
+        // compression ratio in each engine row.
+        let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
+            &weights, token_ids.len(),
+        );
 
         for engine_name in engine_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
             match EngineKind::from_name(engine_name) {
                 Some(kind) => {
-                    rows.push(run_engine(&weights, &token_ids, kind, &args)?);
+                    // Engines dispatch through the Metal backend where available
+                    // (K/V projection matmuls in recompute_kv, FFN gate/up/down).
+                    let backend = if want_metal {
+                        larql_inference::default_backend()
+                    } else {
+                        larql_inference::cpu_backend()
+                    };
+                    rows.push(run_engine(&weights, &token_ids, kv_ref_bytes, kind, backend, &args)?);
                 }
                 None => {
                     eprintln!("unknown engine {:?} — supported: markov-rs, unlimited-context", engine_name);
@@ -282,17 +295,19 @@ fn backend_name_for(metal: bool) -> &'static str {
 fn run_engine(
     weights: &larql_inference::ModelWeights,
     token_ids: &[u32],
+    kv_ref_bytes: usize,
     kind: EngineKind,
+    backend: Box<dyn larql_inference::ComputeBackend>,
     args: &BenchArgs,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     use larql_inference::forward::hidden_to_raw_logits;
 
-    let mut engine = kind.build();
+    let mut engine = kind.build(backend);
     let info = engine.info();
     let label = format!("{} [{}]", info.name, info.backend);
 
     if args.verbose {
-        eprintln!("[bench] engine: {}", info.summary());
+        eprintln!("[bench] {}", info.summary());
     }
 
     // Prefill.
@@ -313,11 +328,8 @@ fn run_engine(
         let t = Instant::now();
         hidden = engine.decode_step(weights, last_token)
             .ok_or("engine decode_step failed")?;
-        let step_ms = t.elapsed().as_secs_f64() * 1000.0;
-        decode_ms_all.push(step_ms);
-
-        let logits = hidden_to_raw_logits(weights, &hidden);
-        last_token = argmax_token(&logits);
+        decode_ms_all.push(t.elapsed().as_secs_f64() * 1000.0);
+        last_token = argmax_token(&hidden_to_raw_logits(weights, &hidden));
     }
 
     let n_warm = args.warmup.min(decode_ms_all.len());
@@ -330,11 +342,24 @@ fn run_engine(
         (avg, 1000.0 / avg)
     };
 
-    let mem_mb = engine.memory_bytes() as f64 / 1_048_576.0;
-    let note = format!("engine-mem={:.1}MB", mem_mb);
+    // Memory breakdown and compression ratio vs Standard KV (FP16).
+    let total_mem = engine.memory_bytes();
+    let cold_mem  = engine.cold_bytes();
+    let hot_mem   = total_mem.saturating_sub(cold_mem);
+    let ratio = if total_mem > 0 {
+        kv_ref_bytes as f64 / total_mem as f64
+    } else {
+        0.0
+    };
+    let note = format!(
+        "hot={:.1}MB cold={:.1}MB  {:.0}× vs std-kv",
+        hot_mem as f64 / 1_048_576.0,
+        cold_mem as f64 / 1_048_576.0,
+        ratio,
+    );
 
     if args.verbose {
-        eprintln!("[bench] {} after decode: {}", info.name, engine.info().description);
+        eprintln!("[bench] {} post-decode: {}", info.name, engine.info().description);
     }
 
     Ok(BenchRow {

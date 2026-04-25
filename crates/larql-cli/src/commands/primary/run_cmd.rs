@@ -18,6 +18,7 @@
 //! All other walk tuning (top-K, layers, compare, metal opt-in) lives
 //! under `larql dev walk` for power users.
 
+use larql_vindex::format::filenames::*;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -488,7 +489,7 @@ mod experts {
     /// model dirs, then to `Plain` if neither resolves.
     fn detect_template(vindex_path: &Path) -> ChatTemplate {
         // Try vindex index.json first.
-        let index_path = vindex_path.join("index.json");
+        let index_path = vindex_path.join(INDEX_JSON);
         if let Ok(text) = std::fs::read_to_string(&index_path) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(family) = value.get("family").and_then(|v| v.as_str()) {

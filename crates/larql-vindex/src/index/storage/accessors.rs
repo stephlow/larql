@@ -13,8 +13,8 @@
 
 use ndarray::Array2;
 
-use super::core::VectorIndex;
-use super::types::*;
+use crate::index::core::VectorIndex;
+use crate::index::types::*;
 
 impl VectorIndex {
     /// Look up metadata for a specific feature.
@@ -337,8 +337,8 @@ impl VectorIndex {
 
 #[cfg(test)]
 mod release_mmap_pages_tests {
-    use super::super::core::VectorIndex;
-    use super::super::types::GateLayerSlice;
+    use crate::index::core::VectorIndex;
+    use crate::index::types::GateLayerSlice;
     use crate::config::dtype::StorageDtype;
     use ndarray::{Array1, Array2};
 

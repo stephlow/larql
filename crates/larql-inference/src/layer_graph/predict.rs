@@ -7,7 +7,7 @@
 
 use ndarray::Array2;
 
-use larql_compute::ComputeBackend;
+use larql_compute::prelude::*;
 use crate::model::ModelWeights;
 use super::{LayerGraph, DenseLayerGraph, CachedLayerGraph};
 

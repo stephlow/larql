@@ -32,6 +32,7 @@ use crate::config::types::{
     ComplianceGate, Fp4Config, Precision, ProjectionFormat, Projections,
     VindexConfig,
 };
+use crate::format::filenames::*;
 use crate::error::VindexError;
 use crate::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 
@@ -232,12 +233,12 @@ pub fn vindex_to_fp4(
 
     // Parse source config.
     let mut src_config: VindexConfig = serde_json::from_str(
-        &std::fs::read_to_string(src.join("index.json"))
+        &std::fs::read_to_string(src.join(INDEX_JSON))
             .map_err(|e| VindexError::Parse(format!("read src index.json: {e}")))?,
     )
     .map_err(|e| VindexError::Parse(format!("parse src index.json: {e}")))?;
     let src_index_raw: Value = serde_json::from_str(
-        &std::fs::read_to_string(src.join("index.json"))
+        &std::fs::read_to_string(src.join(INDEX_JSON))
             .map_err(|e| VindexError::Parse(format!("re-read src index.json: {e}")))?,
     ).map_err(|e| VindexError::Parse(format!("parse raw src index.json: {e}")))?;
     let src_dtype_str = src_index_raw["dtype"].as_str().unwrap_or("f32");
@@ -257,7 +258,7 @@ pub fn vindex_to_fp4(
     }
 
     // Verify required input files exist before running the scan.
-    for name in ["gate_vectors.bin", "up_features.bin", "down_features.bin"] {
+    for name in [GATE_VECTORS_BIN, UP_FEATURES_BIN, DOWN_FEATURES_BIN] {
         if !src.join(name).exists() {
             return Err(VindexError::Parse(format!(
                 "{name} missing from src vindex; quantize fp4 requires the full \
@@ -283,9 +284,9 @@ pub fn vindex_to_fp4(
     let (policy_g, policy_u, policy_d) = config.policy.precisions(gate_source);
 
     let projections: [(&str, &str, Precision); 3] = [
-        ("gate", "gate_vectors.bin", policy_g),
-        ("up", "up_features.bin", policy_u),
-        ("down", "down_features.bin", policy_d),
+        ("gate", GATE_VECTORS_BIN, policy_g),
+        ("up", UP_FEATURES_BIN, policy_u),
+        ("down", DOWN_FEATURES_BIN, policy_d),
     ];
 
     // Per-projection: read source, decide final precision, write output.
@@ -400,7 +401,7 @@ pub fn vindex_to_fp4(
 
     let out_index_json = serde_json::to_string_pretty(&src_config)
         .map_err(|e| VindexError::Parse(format!("serialise: {e}")))?;
-    std::fs::write(dst_tmp.join("index.json"), out_index_json)
+    std::fs::write(dst_tmp.join(INDEX_JSON), out_index_json)
         .map_err(|e| VindexError::Parse(format!("write index.json: {e}")))?;
 
     // Compliance sidecar.
@@ -426,10 +427,10 @@ pub fn vindex_to_fp4(
 
     // Hard-link auxiliary files.
     let handled: std::collections::HashSet<&str> = [
-        "index.json",
-        "gate_vectors.bin",
-        "up_features.bin",
-        "down_features.bin",
+        INDEX_JSON,
+        GATE_VECTORS_BIN,
+        UP_FEATURES_BIN,
+        DOWN_FEATURES_BIN,
         "fp4_compliance.json",
     ].iter().copied().collect();
 

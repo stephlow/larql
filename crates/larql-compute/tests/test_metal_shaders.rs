@@ -11,8 +11,9 @@
 extern crate blas_src;
 
 use ndarray::Array2;
-use larql_compute::{ComputeBackend, cpu::q4};
+use larql_compute::cpu::q4;
 use larql_compute::cpu::q4::quantize_q4_0;
+use larql_compute::prelude::*;
 
 // ── Test helpers ──
 
@@ -55,8 +56,8 @@ fn all_kernel_functions_exist() {
     let names = [
         // f32 matmul
         "sgemm", "sgemm_transb",
-        // Q4_0 matvec variants
-        "q4_matvec", "q4_vecmat", "q4_f32_matvec",
+        // Q4_0 matvec
+        "q4_matvec_v4", "q4_vecmat", "q4_f32_matvec",
         // Q4_K / Q4_KF matvec
         "q4k_matvec", "q4k_qkv_proj", "q4k_proj",
         "q4kf_qkv_proj", "q4kf_proj",
@@ -298,7 +299,6 @@ fn buffer_cache_reuses_same_pointer() {
 
 #[test]
 fn metal_backend_implements_trait() {
-    use larql_compute::ComputeBackend;
     let metal = get_metal();
 
     assert!(metal.has_q4());
@@ -492,7 +492,7 @@ fn all_new_kernel_functions_exist() {
 
     let names = [
         "sgemm", "sgemm_transb",
-        "q4_matvec", "q4_matvec_v2", "q4_matvec_v3", "q4_matvec_v4", "q4_matvec_v5",
+        "q4_matvec_v4",
         "q4_vecmat", "q4_f32_matvec", "q4_sparse_matvec",
         "q8_matvec",
         "geglu_silu", "quantize_q8",
@@ -2318,7 +2318,7 @@ fn q4kf_proj_matches_cpu_reference() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline.state);
     enc.set_buffer(0, Some(&w_buf), 0);
     enc.set_buffer(1, Some(&x_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -2384,7 +2384,7 @@ fn q4kf_proj_matches_cpu_reference_gemma3_shape() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline.state);
     enc.set_buffer(0, Some(&w_buf), 0);
     enc.set_buffer(1, Some(&x_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -2460,7 +2460,7 @@ fn q4kf_qkv_proj_matches_individual_projections() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_qkv_proj_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4kf_qkv_proj_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);
@@ -2635,7 +2635,7 @@ fn q4kf_proj_matches_cpu_on_real_vindex_bytes() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline.state);
     enc.set_buffer(0, Some(&w_buf), 0);
     enc.set_buffer(1, Some(&x_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -2944,11 +2944,17 @@ fn stage_post_ffn_post_norm_matches_cpu() {
 /// is what pins down the `match format` arm selection in the helper.
 #[test]
 fn stage_quant_matvec_routes_format_to_correct_shader() {
+    use larql_compute::metal::kernel::KernelHandle;
+    use larql_compute::metal::shaders::q4_matvec_v4;
+
     let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let library = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+
     let q4kf_proj = build_pipeline(&device, "q4kf_proj");
     let q4k_matvec = build_pipeline(&device, "q4k_matvec");
     let q6k_matvec = build_pipeline(&device, "q6k_matvec");
-    let q4_matvec = build_pipeline(&device, "q4_matvec");
+    let q4_matvec = KernelHandle::from_kernel::<q4_matvec_v4::Kernel>(&device, &library).unwrap();
     let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
     let queue = device.new_command_queue();
 
@@ -3202,7 +3208,7 @@ fn q4k_qkv_proj_matches_per_proj_dispatch() {
     let hidden_u = hidden as u32;
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);
@@ -3289,7 +3295,7 @@ fn q4k_q6k_qkv_proj_matches_per_proj_dispatch() {
     let hidden_u = hidden as u32;
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_pipeline);
+    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);

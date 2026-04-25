@@ -10,7 +10,6 @@ use std::ffi::c_void;
 use metal::*;
 
 use crate::metal::buffers::BufferCache;
-use crate::metal::shaders::q4_matvec as q4mv_shader;
 use super::ops::q4_common::Q4Pipelines;
 use super::ops::full_pipeline::{encode_rms_norm, encode_residual_add};
 
@@ -74,16 +73,20 @@ fn encode_quant_matvec_at_offset(
         crate::QuantFormat::Q4_0 => {
             let n = num_rows as u32;
             let k = hidden as u32;
-            let num_tgs = (num_rows as u64).div_ceil(q4mv_shader::ROWS_PER_TG);
-            // Q4_0 needs Q8 input — but for prefill we use Q4_K/Q6_K path only.
-            // Fallback: use f32 input path (q4_f32_matvec)
+            // Prefill's Q4_0 path uses the f32-input matvec kernel
+            // (`q4_f32_matvec`), which is one thread per output row —
+            // flat dispatch, no per-TG row tiling. 256 threads/TG is
+            // a generic occupancy-friendly default.
             enc.set_compute_pipeline_state(q4_pipeline);
             enc.set_buffer(0, Some(buf_w), 0);
             enc.set_buffer(1, Some(buf_input), in_offset);
             enc.set_buffer(2, Some(buf_out), out_offset);
             enc.set_bytes(3, 4, &n as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &k as *const u32 as *const c_void);
-            enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), MTLSize::new(q4mv_shader::THREADS_PER_TG, 1, 1));
+            enc.dispatch_threads(
+                MTLSize::new(num_rows as u64, 1, 1),
+                MTLSize::new(256.min(num_rows as u64), 1, 1),
+            );
         }
         crate::QuantFormat::Q8_0 => {
             // Q8_0 needs Q8 input — not supported in prefill offset mode

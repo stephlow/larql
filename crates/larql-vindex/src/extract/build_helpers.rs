@@ -104,7 +104,7 @@ pub(super) fn compute_gate_top_tokens(
         let gend = (gstart + gbatch).min(num_features);
         let chunk = w_gate.slice(ndarray::s![gstart..gend, ..]);
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::ComputeBackend;
+        use larql_compute::{ComputeBackend, MatMul};
         let proj = cpu.matmul_transb(ww_embed.view(), chunk.view());
         for f in 0..(gend - gstart) {
             let col = proj.column(f);

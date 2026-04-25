@@ -52,7 +52,8 @@ extern crate blas_src;
 mod common;
 use common::get_metal;
 
-use larql_compute::{ComputeBackend, CpuBackend};
+use larql_compute::CpuBackend;
+use larql_compute::prelude::*;
 use ndarray::Array2;
 
 fn run_enabled() -> bool {
@@ -178,27 +179,27 @@ fn f32_gemv_cpu_vs_metal_at_vocab_scale() {
 #[test]
 fn q4_matvec_pipeline_max_threads_per_tg() {
     let metal = get_metal();
-    // Access the underlying pipeline through the Q4 family.
-    let pipeline = &metal.q4.matvec;
-    let limit = pipeline.max_total_threads_per_threadgroup() as u64;
-    let requested = larql_compute::metal::shaders::q4_matvec_v4::THREADS_PER_TG;
+    // The KernelHandle constructor already runs this check at startup
+    // (returns `None` if the pipeline cap is below the requested
+    // threads_per_tg). This test mirrors the same assertion at the
+    // test surface so a regression in the cap → row-drop chain is
+    // visible in a focused per-kernel test, not just at backend init.
+    let kernel = &metal.q4.matvec;
+    let limit = kernel.state.max_total_threads_per_threadgroup() as u64;
     eprintln!(
-        "  q4_matvec_v4 pipeline maxTotalThreadsPerThreadgroup = {limit} \
-         (dispatch requests {requested})"
+        "  {} pipeline maxTotalThreadsPerThreadgroup = {limit} \
+         (handle requests {})",
+        kernel.kernel_name, kernel.threads_per_tg,
     );
     assert!(
-        limit >= requested,
-        "pipeline limit ({limit}) < requested TG size ({requested}). \
-         Each TG would silently run only {limit} threads ({} simdgroups \
-         out of {}), so each TG covers only {} rows out of ROWS_PER_TG={} \
-         — that's the 75 %-row-drop pattern in `q4_matvec_cutoff_sweep`. \
-         Either drop ROWS_PER_TG/THREADS_PER_TG in the v4 shader, or \
-         simplify its register/threadgroup usage so the pipeline cap \
-         comes back up.",
-        limit / 32,
-        requested / 32,
-        limit / 32,
-        larql_compute::metal::shaders::q4_matvec_v4::ROWS_PER_TG,
+        limit >= kernel.threads_per_tg,
+        "pipeline cap ({limit}) < KernelHandle threads_per_tg ({}). \
+         Metal would silently dispatch only {limit} threads/TG → fewer \
+         simdgroups → rows dropped. (rows_per_tg={}). Either lower the \
+         handle's threads_per_tg, or simplify the kernel's per-thread \
+         register / threadgroup-memory pressure to raise the cap.",
+        kernel.threads_per_tg,
+        kernel.rows_per_tg,
     );
 }
 
@@ -344,34 +345,54 @@ fn q4_matvec_metal_writes_every_row_misaligned_n() {
     );
 }
 
-/// Pin the contract between `ops::q4_matvec::dispatch` and the
-/// `q4_matvec_v4` kernel that's actually loaded into the pipeline.
+/// Pin the contract between the live `KernelHandle` carried in
+/// `MetalBackend.q4.matvec` and the `q4_matvec_v4` shader's
+/// hard-coded row map.
 ///
-/// `dispatch` computes `num_tgs = num_rows.div_ceil(ROWS_PER_TG)` and
-/// requests `THREADS_PER_TG` threads per TG. The kernel hardcodes
-/// `ROWS_PER_TG_V4 = 8` and assumes 256 threads (8 simdgroups × 32
-/// lanes). If the dispatch's constants drift from the kernel's
-/// expectations, num_tgs over-divides and rows silently drop.
+/// Pre-2026-04-25 the dispatcher imported geometry constants from a
+/// *different* shader module than the pipeline was built from — so
+/// `num_tgs = num_rows / 32` over-divided and 75 % of rows dropped.
+/// Post-fix, geometry travels with the pipeline via `KernelHandle`
+/// (see `metal::kernel`), and a misnamed shader-module path simply
+/// wouldn't compile.
 ///
 /// Tested with N=64: post-fix `num_tgs = div_ceil(64, 8) = 8` so all
-/// 64 rows are written. Pre-fix the dispatcher used the *wrong*
-/// shader's ROWS_PER_TG=32, computing `num_tgs = div_ceil(64, 32) = 2`;
-/// the v4 kernel's 32 simdgroups (under 1024 threads) only cover rows
-/// `tg_id * 8 + sg_id ∈ [0, 39]`, leaving rows 40..63 at zero.
+/// 64 rows are written. With the old (32, 1024) constants the v4
+/// kernel would only cover rows 0..39 and rows 40..63 would stay at
+/// zero. The handle on `metal.q4.matvec` is checked to expose the
+/// correct geometry.
 #[test]
 fn q4_matvec_dispatch_geometry_matches_v4_kernel() {
-    use larql_compute::metal::shaders::q4_matvec_v4 as v4;
+    use larql_compute::metal::kernel::TiledKernel;
+    use larql_compute::metal::shaders::q4_matvec_v4;
+
+    // Compile-time contract: shader module's `Kernel` marker matches
+    // the documented constants in the same file.
     assert_eq!(
-        v4::ROWS_PER_TG, 8,
-        "q4_matvec_v4 kernel hardcodes `row_idx = tg_id * 8 + sg_id`; \
-         the exported ROWS_PER_TG must stay 8"
+        <q4_matvec_v4::Kernel as TiledKernel>::ROWS_PER_TG,
+        8,
+        "q4_matvec_v4 hard-codes `row_idx = tg_id * 8 + sg_id`",
     );
     assert_eq!(
-        v4::THREADS_PER_TG, 256,
-        "q4_matvec_v4 covers 8 rows × 32 lanes = 256 threads per TG"
+        <q4_matvec_v4::Kernel as TiledKernel>::THREADS_PER_TG,
+        256,
+        "q4_matvec_v4 covers 8 rows × 32 lanes = 256 threads per TG",
+    );
+    assert_eq!(
+        <q4_matvec_v4::Kernel as TiledKernel>::KERNEL_NAME,
+        "q4_matvec_v4",
     );
 
+    // Runtime contract: the live KernelHandle exposes the same values.
     let metal = get_metal();
+    let kernel = &metal.q4.matvec;
+    assert_eq!(kernel.kernel_name, "q4_matvec_v4");
+    assert_eq!(kernel.rows_per_tg, 8);
+    assert_eq!(kernel.threads_per_tg, 256);
+
+    // Behavioural contract: at N=64 every row gets written. With the
+    // pre-fix (32, 1024) geometry the v4 kernel would cover rows 0..39
+    // only, leaving rows 40..63 zero.
     metal.set_flop_threshold(1);
     use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
     let n = 64usize;
@@ -384,11 +405,7 @@ fn q4_matvec_dispatch_geometry_matches_v4_kernel() {
     for (i, &v) in metal_scores.iter().enumerate() {
         assert!(
             v.abs() > 1e-9,
-            "row {i} dropped at N={n}; under the pre-fix bug \
-             (dispatcher imports ROWS_PER_TG=32 from the wrong shader \
-             module while the pipeline runs the v4 kernel with \
-             ROWS_PER_TG_V4=8), num_tgs would be 2 and rows 40..63 \
-             stay at zero. metal_scores[40..]={:?}",
+            "row {i} dropped at N={n}; metal_scores[40..]={:?}",
             &metal_scores[40..],
         );
     }

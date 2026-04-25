@@ -1,6 +1,6 @@
 //! Token generation loop — GPU prefill + KV-cached decode
 
-use larql_compute::ComputeBackend;
+use larql_compute::prelude::*;
 use crate::model::ModelWeights;
 use super::CachedLayerGraph;
 

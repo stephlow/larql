@@ -3,6 +3,7 @@
 
 pub mod checksums;
 pub mod down_meta;
+pub mod filenames;
 pub mod fp4_storage;
 pub mod huggingface;
 pub mod load;

@@ -111,7 +111,7 @@ fn main() {
     // ── Metal shaders ──
     #[cfg(feature = "metal")]
     {
-        use larql_compute::ComputeBackend;
+        use larql_compute::prelude::*;
 
         let metal = match larql_compute::metal::MetalBackend::new() {
             Some(m) => m,

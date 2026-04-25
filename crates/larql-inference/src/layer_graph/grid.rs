@@ -8,7 +8,7 @@
 //! where `moe_fn(layer, h_post_attn) -> Vec<f32>` calls
 //! `RemoteMoeBackend::forward_moe`.
 
-use larql_compute::ComputeBackend;
+use larql_compute::prelude::*;
 use larql_models::ModelWeights;
 use larql_vindex::VectorIndex;
 

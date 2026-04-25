@@ -9,7 +9,7 @@
 //!
 //! Requires `--features metal` for GPU attention.
 
-use larql_compute::ComputeBackend;
+use larql_compute::prelude::*;
 use crate::model::ModelWeights;
 #[allow(unused_imports)]
 use super::LayerGraph;

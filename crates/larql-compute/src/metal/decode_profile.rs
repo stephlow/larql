@@ -151,7 +151,7 @@ impl MetalBackend {
                             &self.q4k_qkv_proj_pipeline
                         };
                         crate::metal::stages::qkv_proj::encode_fused_f32(
-                            enc, fused_pipe,
+                            enc, &fused_pipe.state,
                             &wq_bufs[l], &wk_bufs[l], &wv_bufs[l],
                             &norm_f32_buf, 0,
                             &q_out, 0, &k_out, 0, &v_out, 0,
@@ -162,7 +162,7 @@ impl MetalBackend {
                         let total_rows = (q_dim + kv_dim + kv_dim) as u64;
                         let num_tgs = total_rows.div_ceil(sh::ROWS_PER_TG);
                         let (q_rows_u, k_rows_u, v_rows_u, k_u) = (q_dim as u32, kv_dim as u32, kv_dim as u32, hidden as u32);
-                        enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_pipeline.state);
                         enc.set_buffer(0, Some(&wq_bufs[l]), 0);
                         enc.set_buffer(1, Some(&wk_bufs[l]), 0);
                         enc.set_buffer(2, Some(&wv_bufs[l]), 0);
@@ -179,9 +179,9 @@ impl MetalBackend {
                         use crate::metal::stages::qkv_proj::{self, Proj};
                         use crate::metal::stages::quant_matvec::Pipelines;
                         let pipes = Pipelines {
-                            q4kf_proj: Some(&self.q4kf_proj_pipeline),
-                            q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                            q6k_matvec: &self.q6k_matvec_pipeline,
+                            q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                            q4k_matvec_fallback: &self.q4k_matvec_pipeline.state,
+                            q6k_matvec: &self.q6k_matvec_pipeline.state,
                             q4_matvec: &self.q4.matvec,
                         };
                         qkv_proj::encode_per_proj(
@@ -289,9 +289,9 @@ impl MetalBackend {
                 if uses_q4k {
                     use crate::metal::stages::quant_matvec::Pipelines;
                     let pipes = Pipelines {
-                        q4kf_proj: Some(&self.q4kf_proj_pipeline),
-                        q4k_matvec_fallback: &self.q4k_proj_pipeline,
-                        q6k_matvec: &self.q6k_matvec_pipeline,
+                        q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                        q4k_matvec_fallback: &self.q4k_proj_pipeline.state,
+                        q6k_matvec: &self.q6k_matvec_pipeline.state,
                         q4_matvec: &self.q4.matvec,
                     };
                     crate::metal::stages::o_proj::encode(enc, &pipes, &self.q8_quant_pipeline, layer.wo.format, &wo_bufs[l], &attn_out_buf, 0, &o_q8_scratch, 0, &o_q8s_scratch, 0, &o_out_buf, 0, layer_q_dim, hidden);
@@ -303,7 +303,7 @@ impl MetalBackend {
                     enc.set_bytes(3, 4, &dim_val as *const u32 as *const std::ffi::c_void);
                     enc.dispatch_threads(MTLSize::new(blocks as u64, 1, 1), MTLSize::new(256.min(blocks as u64), 1, 1));
                     let (o_rows, o_k) = (hidden as u32, layer_q_dim as u32);
-                    enc.set_compute_pipeline_state(&self.q8_matvec_pipeline);
+                    enc.set_compute_pipeline_state(&self.q8_matvec_pipeline.state);
                     enc.set_buffer(0, Some(&wo_bufs[l]), 0); enc.set_buffer(1, Some(&o_q8_scratch), 0);
                     enc.set_buffer(2, Some(&wo_scale_bufs[l]), 0); enc.set_buffer(3, Some(&o_q8s_scratch), 0);
                     enc.set_buffer(4, Some(&o_out_buf), 0);
@@ -377,7 +377,7 @@ impl MetalBackend {
                     if layer.is_gated() {
                         use crate::metal::shaders::q4kf_ffn_gate_up as q4kf_gu;
                         let n_tgs_per_mat = (inter as u64).div_ceil(q4kf_gu::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4kf_ffn_gate_up_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4kf_ffn_gate_up_pipeline.state);
                         enc.set_buffer(0, Some(&gate_bufs[l]), 0); enc.set_buffer(1, Some(&up_bufs[l]), 0);
                         enc.set_buffer(2, Some(&ffn_norm_out), 0); enc.set_buffer(3, Some(&gate_out_scratch), 0);
                         enc.set_buffer(4, Some(&up_out), 0);
@@ -392,7 +392,7 @@ impl MetalBackend {
                     } else {
                         use crate::metal::shaders::q4kf_qkv_proj as q4kf;
                         let n_tgs_up = (inter as u64).div_ceil(q4kf::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
                         enc.set_buffer(0, Some(&up_bufs[l]), 0); enc.set_buffer(1, Some(&ffn_norm_out), 0); enc.set_buffer(2, Some(&up_out), 0);
                         enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
@@ -408,7 +408,7 @@ impl MetalBackend {
                         use crate::metal::shaders::q4k_matvec as q4k;
                         use crate::metal::shaders::q4k_ffn_gate_up as q4k_gu;
                         let n_tgs_per_mat = (inter as u64).div_ceil(q4k_gu::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
                         enc.set_buffer(0, Some(&gate_bufs[l]), 0); enc.set_buffer(1, Some(&up_bufs[l]), 0);
                         enc.set_buffer(2, Some(&ffn_norm_out), 0); enc.set_buffer(3, Some(&gate_out_scratch), 0);
                         enc.set_buffer(4, Some(&up_out), 0);
@@ -424,7 +424,7 @@ impl MetalBackend {
                     } else {
                         use crate::metal::shaders::q4k_matvec as q4k;
                         let n_tgs_up = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
                         enc.set_buffer(0, Some(&up_bufs[l]), 0); enc.set_buffer(1, Some(&ffn_norm_out), 0); enc.set_buffer(2, Some(&up_out), 0);
                         enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
@@ -436,32 +436,31 @@ impl MetalBackend {
                         enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
                     }
                 } else {
-                    // Geometry constants must come from the same shader the
-                    // q4.matvec pipeline is built from in metal/mod.rs (v4);
-                    // see ops/q4_matvec.rs for the row-drop regression history.
-                    use crate::metal::shaders::q4_matvec_v4 as q4mv;
-                    let n_tgs_ffn = (inter as u64).div_ceil(q4mv::ROWS_PER_TG);
+                    // Geometry travels with the q4 matvec KernelHandle.
+                    let kernel = &self.q4.matvec;
+                    let n_tgs_ffn = (inter as u64).div_ceil(kernel.rows_per_tg);
+                    let tg_size = MTLSize::new(kernel.threads_per_tg, 1, 1);
                     if layer.is_gated() {
-                        enc.set_compute_pipeline_state(&self.q4.matvec);
+                        enc.set_compute_pipeline_state(&kernel.state);
                         enc.set_buffer(0, Some(&gate_bufs[l]), 0); enc.set_buffer(1, Some(&ffn_q8), 0);
                         enc.set_buffer(2, Some(&ffn_q8s), 0); enc.set_buffer(3, Some(&gate_out_scratch), 0);
                         enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), MTLSize::new(q4mv::THREADS_PER_TG, 1, 1));
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), tg_size);
                         enc.set_buffer(0, Some(&up_bufs[l]), 0); enc.set_buffer(3, Some(&up_out), 0);
-                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), MTLSize::new(q4mv::THREADS_PER_TG, 1, 1));
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), tg_size);
                         let geglu = match layer.activation { crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline, _ => &self.geglu_pipeline };
                         enc.set_compute_pipeline_state(geglu);
                         enc.set_buffer(0, Some(&gate_out_scratch), 0); enc.set_buffer(1, Some(&up_out), 0); enc.set_buffer(2, Some(&act_buf), 0);
                         enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
                     } else {
-                        enc.set_compute_pipeline_state(&self.q4.matvec);
+                        enc.set_compute_pipeline_state(&kernel.state);
                         enc.set_buffer(0, Some(&up_bufs[l]), 0); enc.set_buffer(1, Some(&ffn_q8), 0);
                         enc.set_buffer(2, Some(&ffn_q8s), 0); enc.set_buffer(3, Some(&up_out), 0);
                         enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), MTLSize::new(q4mv::THREADS_PER_TG, 1, 1));
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), tg_size);
                         let act_pipe = match layer.activation { crate::Activation::GeluTanh => &self.gelu_tanh_pipeline, _ => &self.silu_pipeline };
                         enc.set_compute_pipeline_state(act_pipe);
                         enc.set_buffer(0, Some(&up_out), 0); enc.set_buffer(1, Some(&act_buf), 0);
@@ -477,16 +476,16 @@ impl MetalBackend {
                     if layer.is_gated() {
                         use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
                         let pipes = Pipelines {
-                            q4kf_proj: Some(&self.q4kf_proj_pipeline),
-                            q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                            q6k_matvec: &self.q6k_matvec_pipeline,
+                            q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                            q4k_matvec_fallback: &self.q4k_matvec_pipeline.state,
+                            q6k_matvec: &self.q6k_matvec_pipeline.state,
                             q4_matvec: &self.q4.matvec,
                         };
                         qmv::encode(enc, layer.down.format, &down_bufs[l], &act_buf, 0, &act_buf, 0, &act_buf, 0, &down_out, 0, &pipes, hidden, inter);
                     } else {
                         use crate::metal::shaders::q4kf_qkv_proj as q4kf;
                         let n_tgs_down = (hidden as u64).div_ceil(q4kf::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
                         enc.set_buffer(0, Some(&down_bufs[l]), 0); enc.set_buffer(1, Some(&act_buf), 0); enc.set_buffer(2, Some(&down_out), 0);
                         enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
@@ -496,16 +495,16 @@ impl MetalBackend {
                     if layer.is_gated() {
                         use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
                         let pipes = Pipelines {
-                            q4kf_proj: Some(&self.q4kf_proj_pipeline),
-                            q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                            q6k_matvec: &self.q6k_matvec_pipeline,
+                            q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                            q4k_matvec_fallback: &self.q4k_matvec_pipeline.state,
+                            q6k_matvec: &self.q6k_matvec_pipeline.state,
                             q4_matvec: &self.q4.matvec,
                         };
                         qmv::encode(enc, layer.down.format, &down_bufs[l], &act_buf, 0, &act_buf, 0, &act_buf, 0, &down_out, 0, &pipes, hidden, inter);
                     } else {
                         use crate::metal::shaders::q4k_matvec as q4k;
                         let n_tgs_down = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
                         enc.set_buffer(0, Some(&down_bufs[l]), 0); enc.set_buffer(1, Some(&act_buf), 0); enc.set_buffer(2, Some(&down_out), 0);
                         enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);

@@ -22,6 +22,7 @@
 //! vindex this repo produces. See `docs/adr/0006-q4k-remote-ffn.md` for the
 //! dense-remote topology these presets were cut to serve.
 
+use larql_vindex::format::filenames::*;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -75,24 +76,24 @@ impl Part {
     /// `attn_weights_` etc. pick up quantisation variants (q4, q4k, q8).
     fn matches(self, filename: &str) -> bool {
         match self {
-            Self::Embed => filename == "embeddings.bin",
-            Self::Norms => filename == "norms.bin",
+            Self::Embed => filename == EMBEDDINGS_BIN,
+            Self::Norms => filename == NORMS_BIN,
             Self::Attn => filename.starts_with("attn_weights"),
             Self::Gate => {
-                filename == "gate_vectors.bin" || filename.starts_with("gate_vectors_")
+                filename == GATE_VECTORS_BIN || filename.starts_with("gate_vectors_")
             }
-            Self::DownMeta => filename == "down_meta.bin" || filename == "down_meta.jsonl",
+            Self::DownMeta => filename == DOWN_META_BIN || filename == "down_meta.jsonl",
             Self::Ffn => {
                 filename.starts_with("interleaved")
                     || filename == "up_weights.bin"
                     || filename == "down_weights.bin"
-                    || filename == "up_features.bin"
-                    || filename == "down_features.bin"
+                    || filename == UP_FEATURES_BIN
+                    || filename == DOWN_FEATURES_BIN
             }
             Self::LmHead => filename.starts_with("lm_head"),
             Self::Router => filename == "router_weights.bin",
-            Self::Tokenizer => filename == "tokenizer.json",
-            Self::Manifest => filename == "weight_manifest.json",
+            Self::Tokenizer => filename == TOKENIZER_JSON,
+            Self::Manifest => filename == WEIGHT_MANIFEST_JSON,
             Self::Labels => {
                 filename == "feature_labels.json"
                     || filename == "feature_clusters.jsonl"
@@ -218,7 +219,7 @@ pub fn slice_vindex(
     if !src.is_dir() {
         return Err(format!("source vindex not a directory: {}", src.display()).into());
     }
-    if !src.join("index.json").exists() {
+    if !src.join(INDEX_JSON).exists() {
         return Err(format!(
             "source vindex missing index.json: {}",
             src.display()
@@ -254,7 +255,7 @@ pub fn slice_vindex(
             Some(s) => s.to_string(),
             None => continue,
         };
-        let kept = name == "index.json" || parts.iter().any(|p| p.matches(&name));
+        let kept = name == INDEX_JSON || parts.iter().any(|p| p.matches(&name));
         if kept {
             copy_paths.push(entry.path());
             copied.push((name, meta.len()));
@@ -303,7 +304,7 @@ pub fn slice_vindex(
     for src_path in &copy_paths {
         let name = src_path.file_name().unwrap();
         let dst_path = dst.join(name);
-        if name == std::ffi::OsStr::new("index.json") {
+        if name == std::ffi::OsStr::new(INDEX_JSON) {
             let mut new_cfg = cfg.clone();
             new_cfg.extract_level = new_level;
             new_cfg.has_model_weights = new_has_weights;
@@ -458,21 +459,21 @@ mod tests {
 
     #[test]
     fn attn_matches_quant_variants() {
-        assert!(Part::Attn.matches("attn_weights.bin"));
+        assert!(Part::Attn.matches(ATTN_WEIGHTS_BIN));
         assert!(Part::Attn.matches("attn_weights_q4.bin"));
-        assert!(Part::Attn.matches("attn_weights_q4k.bin"));
-        assert!(Part::Attn.matches("attn_weights_q4k_manifest.json"));
-        assert!(!Part::Attn.matches("gate_vectors.bin"));
+        assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4K_BIN));
+        assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4K_MANIFEST_JSON));
+        assert!(!Part::Attn.matches(GATE_VECTORS_BIN));
     }
 
     #[test]
     fn ffn_matches_interleaved_and_hidden_major() {
-        assert!(Part::Ffn.matches("interleaved.bin"));
-        assert!(Part::Ffn.matches("interleaved_q4k.bin"));
+        assert!(Part::Ffn.matches(INTERLEAVED_BIN));
+        assert!(Part::Ffn.matches(INTERLEAVED_Q4K_BIN));
         assert!(Part::Ffn.matches("up_weights.bin"));
-        assert!(Part::Ffn.matches("down_features.bin"));
+        assert!(Part::Ffn.matches(DOWN_FEATURES_BIN));
         // Gate vectors are their own part even though they share the FFN role.
-        assert!(!Part::Ffn.matches("gate_vectors.bin"));
+        assert!(!Part::Ffn.matches(GATE_VECTORS_BIN));
     }
 
     #[test]
