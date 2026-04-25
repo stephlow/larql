@@ -51,6 +51,14 @@ fn build_index(features: usize, hidden: usize) -> VectorIndex {
     )
 }
 
+fn build_multi_layer_index(num_layers: usize, features: usize, hidden: usize) -> VectorIndex {
+    let layers: Vec<_> = (0..num_layers)
+        .map(|_| Some(synth_matrix(features, hidden)))
+        .collect();
+    let metas: Vec<_> = (0..num_layers).map(|_| None).collect();
+    VectorIndex::new(layers, metas, num_layers, hidden)
+}
+
 fn bench_gate_knn(c: &mut Criterion) {
     let mut group = c.benchmark_group("gate_knn_brute_vs_hnsw");
     let configs: &[(&str, usize, usize)] = &[
@@ -112,5 +120,60 @@ fn bench_hnsw_build(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_gate_knn, bench_hnsw_build);
+/// Cross-layer parallel HNSW warmup. Compares
+/// `warmup_hnsw_all_layers` (rayon-parallel across layers) vs the
+/// equivalent serial loop of lazy `gate_knn` triggers. Models
+/// production startup for grid servers / interp pipelines that will
+/// query every layer — N × per-layer-build collapses to ≈
+/// `slowest_layer / num_threads`.
+fn bench_hnsw_warmup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hnsw_warmup");
+    group.sample_size(10);
+    let configs: &[(&str, usize, usize, usize)] = &[
+        // (label, num_layers, features, hidden)
+        ("dense-8L-10240x2560", 8, 10_240, 2560),
+        ("moe-4L-32768x2560", 4, 32_768, 2560),
+    ];
+
+    for &(label, num_layers, features, hidden) in configs {
+        // `iter_batched` rebuilds the index per iteration (HNSW caches
+        // are sticky), but only the build phase is timed.
+        let setup = || {
+            let idx = build_multi_layer_index(num_layers, features, hidden);
+            idx.enable_hnsw(200);
+            idx
+        };
+
+        // Serial baseline: lazy-build every layer one at a time via
+        // gate_knn. Times only the per-layer trigger loop, not setup.
+        group.bench_with_input(
+            BenchmarkId::new("serial", label),
+            &(num_layers, hidden),
+            |b, &(nl, h)| {
+                let q = random_query(h);
+                b.iter_batched(
+                    setup,
+                    |idx| {
+                        for layer in 0..nl {
+                            let _ = idx.gate_knn(layer, &q, 10);
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+
+        // Parallel warmup. Times only the warmup call.
+        group.bench_function(BenchmarkId::new("parallel", label), |b| {
+            b.iter_batched(
+                setup,
+                |idx| idx.warmup_hnsw_all_layers(),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_gate_knn, bench_hnsw_build, bench_hnsw_warmup);
 criterion_main!(benches);

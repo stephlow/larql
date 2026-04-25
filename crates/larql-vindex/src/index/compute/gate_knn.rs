@@ -93,16 +93,7 @@ impl VectorIndex {
         // Single BLAS gemv: gate[N, hidden] × residual[hidden] → scores[N].
         let gate_view = ArrayView2::from_shape((num_features, hidden), gate_data).unwrap();
         let scores = gemv(&gate_view, residual);
-
-        // Top-K selection
-        let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-        let k = top_k.min(indexed.len());
-        if k > 0 && k < indexed.len() {
-            indexed.select_nth_unstable_by(k, |a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-            indexed.truncate(k);
-        }
-        indexed.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-        Some(indexed)
+        Some(Self::top_k_from_scores(&scores, top_k))
     }
 
     /// Gate KNN within a specific feature range (for MoE expert-scoped queries).
@@ -178,15 +169,13 @@ impl VectorIndex {
             .collect()
     }
 
-    fn top_k_from_scores(scores: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
-        let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-        let k = top_k.min(indexed.len());
-        if k > 0 && k < indexed.len() {
-            indexed.select_nth_unstable_by(k, |a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-            indexed.truncate(k);
-        }
-        indexed.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-        indexed
+    /// Pick the K scores with the largest absolute value out of N. Single
+    /// scan with a min-heap of capacity K; allocation is O(K), not O(N).
+    /// On Gemma 4B (N=10240, K=10, 34-layer walk) this is ~5.4 MB less
+    /// allocation per token vs the previous Vec+select_nth approach. Mmap
+    /// stays untouched — only the score-extract heap shrinks.
+    pub(crate) fn top_k_from_scores(scores: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
+        top_k_by_abs(scores.iter().copied(), top_k)
     }
 
     /// Full walk: gate KNN at each layer, annotated with down token metadata.
@@ -250,15 +239,10 @@ impl VectorIndex {
 
         for s in 0..seq_len {
             let col = scores_2d.column(s);
-            let mut indexed: Vec<(usize, f32)> = col.iter().copied().enumerate().collect();
-            let k = top_k.min(num_features);
-            if k > 0 && k < indexed.len() {
-                indexed.select_nth_unstable_by(k, |a, b| {
-                    b.1.abs().partial_cmp(&a.1.abs()).unwrap()
-                });
-                indexed.truncate(k);
-            }
-            feature_set.extend(indexed.iter().map(|(idx, _)| *idx));
+            // Min-heap-of-K — same allocation profile as `top_k_from_scores`,
+            // but we throw away the values and only keep indices for the union.
+            let hits = top_k_by_abs(col.iter().copied(), top_k.min(num_features));
+            feature_set.extend(hits.iter().map(|(idx, _)| *idx));
         }
 
         feature_set.into_iter().collect()
@@ -459,22 +443,76 @@ impl VectorIndex {
         Some((gate.data, gate.num_features))
     }
 
-    /// Get or build the HNSW index for a layer (lazy).
-    fn get_or_build_hnsw(&self, layer: usize) -> bool {
+    /// Build a fresh HNSW for `layer` *without* holding the cache lock.
+    /// Returns `None` when the layer has no gate data (caller decides
+    /// what to do). Two callers race-safely concurrent on different
+    /// layers since this never touches `hnsw_cache`.
+    fn build_hnsw_layer(&self, layer: usize) -> Option<super::hnsw::HnswLayer> {
+        let (data, num_features) = self.gate_matrix_f32(layer)?;
+        let view = ArrayView2::from_shape(
+            (num_features, self.hidden_size), &data,
+        ).unwrap();
+        Some(super::hnsw::HnswLayer::build(&view, 8, 32))
+    }
+
+    /// Atomically install `hnsw` at `layer` if no other thread already
+    /// did. A concurrent racer's index is dropped — the loss is one
+    /// duplicated build, not a corrupted cache.
+    fn install_hnsw_layer(&self, layer: usize, hnsw: super::hnsw::HnswLayer) {
         let mut cache = self.gate.hnsw_cache.lock().unwrap();
         if cache.len() <= layer { cache.resize_with(layer + 1, || None); }
-        if cache[layer].is_some() { return true; }
-
-        // Build from gate vectors
-        if let Some((data, num_features)) = self.gate_matrix_f32(layer) {
-            let view = ArrayView2::from_shape(
-                (num_features, self.hidden_size), &data
-            ).unwrap();
-            let hnsw = super::hnsw::HnswLayer::build(&view, 8, 32);
+        if cache[layer].is_none() {
             cache[layer] = Some(hnsw);
-            true
-        } else {
-            false
+        }
+    }
+
+    /// Get or build the HNSW index for a layer (lazy). Holds the cache
+    /// lock only briefly at check + install — the ~76 ms build itself
+    /// runs lock-free, so concurrent KNN queries on other layers don't
+    /// block on this layer's build.
+    fn get_or_build_hnsw(&self, layer: usize) -> bool {
+        {
+            let cache = self.gate.hnsw_cache.lock().unwrap();
+            if cache.get(layer).and_then(|s| s.as_ref()).is_some() {
+                return true;
+            }
+        }
+        let Some(hnsw) = self.build_hnsw_layer(layer) else { return false; };
+        self.install_hnsw_layer(layer, hnsw);
+        true
+    }
+
+    /// Eager-build HNSW for every layer, in parallel. One-shot startup
+    /// helper for grid servers and interp pipelines that will query all
+    /// layers — single call replaces N × ~76 ms lazy builds with one
+    /// parallel batch (≈ 76 ms ÷ N_threads on the slowest layer's bound).
+    /// Already-built layers are skipped.
+    ///
+    /// Holds the cache lock only at the snapshot + install boundaries;
+    /// the per-layer build runs lock-free across rayon's pool. Memory
+    /// note — each parallel build clones its layer's gate data
+    /// (`gate_matrix_f32`), so peak transient RSS is ≈
+    /// `min(num_layers, num_threads) × layer_gate_bytes`. Shrink with
+    /// `rayon::ThreadPoolBuilder::num_threads(...).build_scoped(...)`
+    /// if you need to bound it.
+    pub fn warmup_hnsw_all_layers(&self) {
+        use rayon::prelude::*;
+        let num_layers = self.num_layers;
+        let to_build: Vec<usize> = {
+            let cache = self.gate.hnsw_cache.lock().unwrap();
+            (0..num_layers)
+                .filter(|&l| cache.get(l).and_then(|s| s.as_ref()).is_none())
+                .collect()
+        };
+        if to_build.is_empty() {
+            return;
+        }
+        let built: Vec<(usize, super::hnsw::HnswLayer)> = to_build
+            .par_iter()
+            .filter_map(|&l| self.build_hnsw_layer(l).map(|h| (l, h)))
+            .collect();
+        for (layer, hnsw) in built {
+            self.install_hnsw_layer(layer, hnsw);
         }
     }
 
@@ -611,4 +649,66 @@ impl VectorIndex {
         Some(Self::top_k_from_scores(&scores, top_k))
     }
 
+}
+
+/// Walk an iterator of f32 scores once, keep the K with largest |value|,
+/// return them sorted by |value| descending (matching the prior Vec+select
+/// behaviour at the call sites). Does not allocate beyond a `BinaryHeap`
+/// of capacity K — for K=10 that's 240 B regardless of input length.
+///
+/// Panics on NaN inputs to preserve the previous `partial_cmp(...).unwrap()`
+/// contract — gate scores from BLAS gemv are NaN-free as long as the
+/// inputs are.
+fn top_k_by_abs<I>(scores: I, top_k: usize) -> Vec<(usize, f32)>
+where
+    I: IntoIterator<Item = f32>,
+{
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    /// Wrapper that orders by `|val|`. Inverted `Ord` so `BinaryHeap`
+    /// (max-heap by default) acts as a *min-heap on |val|*: `peek()`
+    /// gives the smallest |val| currently in the heap, which is the
+    /// candidate to evict when a bigger |val| arrives.
+    #[derive(Copy, Clone)]
+    struct AbsScore {
+        idx: usize,
+        val: f32,
+    }
+    impl PartialEq for AbsScore {
+        fn eq(&self, other: &Self) -> bool {
+            self.val.abs() == other.val.abs()
+        }
+    }
+    impl Eq for AbsScore {}
+    impl PartialOrd for AbsScore {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for AbsScore {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Reversed: smaller |val| ranks higher → max-heap pops it first.
+            other.val.abs().partial_cmp(&self.val.abs()).unwrap()
+        }
+    }
+
+    let mut heap: BinaryHeap<AbsScore> = BinaryHeap::with_capacity(top_k);
+    for (i, v) in scores.into_iter().enumerate() {
+        if heap.len() < top_k {
+            heap.push(AbsScore { idx: i, val: v });
+        } else if v.abs() > heap.peek().unwrap().val.abs() {
+            heap.pop();
+            heap.push(AbsScore { idx: i, val: v });
+        }
+    }
+
+    let mut out: Vec<(usize, f32)> =
+        heap.into_iter().map(|a| (a.idx, a.val)).collect();
+    out.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+    out
 }

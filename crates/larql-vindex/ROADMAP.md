@@ -45,6 +45,94 @@ have landed.
 
 ## P1: Active
 
+### Perf round-4 (2026-04-25): three concrete wins identified
+
+End-to-end decode is 86.7 % GPU forward — vindex itself is a thin
+mmap shim during real decode. But the bench survey found three
+measurable vindex-side wins. All have benches already wired; record
+before/after numbers in commit messages.
+
+**Mmap design constraint** — keep the mmap zero-copy path the production
+fast lane. MoE experts (Kimi K-series, DeepSeek-V3+) and multi-shard
+grid servers (`larql-router` + per-layer-range `larql-server` shards)
+depend on each shard mmaping its slice without paying for full-tensor
+heap clones. Anything that adds heap-side caching on the hot path is a
+regression for those workloads — wins below either delete heap caches
+(W2) or live entirely outside the mmap lane (W1, W3).
+
+#### W1. `top_k_from_scores` → bounded min-heap ✅ shipped 2026-04-25
+**Impact**: 5.4 MB → 16 KB allocation per walk on Gemma 4B shape;
+**-18 % gate_knn @ 4096×512**, **-62 % walk @ 14L×4096×512**;
+flat at 10240×2560 (BLAS dominates)
+**Effort**: 2 hours actual
+**Bench**: `cargo bench -p larql-vindex --bench vindex_ops -- gate_knn_per_layer`
+(also `walk_all_layers`)
+**Status**: ✅ Shipped — `top_k_by_abs` free fn at `gate_knn.rs`,
+inline copies in `gate_walk` and `gate_knn_top_per_position` routed
+through it. Full 330-test suite green; clippy clean.
+
+| Bench | Before | After | Δ |
+|---|---|---|---|
+| gate_knn 4096×512 | 425 µs | 352 µs | -18 % |
+| walk 14L×4096×512 | 5.79 ms | 2.20 ms | -62 % |
+| gate_knn 10240×2560 | 2.66 ms | 2.65 ms | flat |
+
+`gate_knn.rs:181` allocates a `Vec<(usize, f32)>` of size N (full
+score vector) and runs `select_nth_unstable_by` to get K. For walks
+with K ≪ N, replace with a fixed-size min-heap (K = top_k) walked
+once over the scores. Same comparator (`abs` order); allocation drops
+from O(N) to O(K).
+
+#### W2. Q4K down cache — investigate, don't blindly delete
+**Impact**: Up to ~840 MB potential RSS removal, plus a hot-path
+mutex — *if* a transposed-row alternative can be built. Premise of
+the bench was wrong: `q4k_cache` measures `[intermediate, hidden]`
+(gate/up shape) where row beats cache 230× at K=100. But the cache
+*only* fires on down, which is `[hidden, intermediate]` on disk
+(PyTorch `nn.Linear` orientation). There is no per-feature down
+decode without either (a) a new transposed-block kernel, or (b) a
+new on-disk feature-major Q4K down file.
+**Effort**: 1–2 days for option (a); larger with format change for (b)
+**Bench**: Need a new bench that decodes one feature's down vector
+from `[hidden, intermediate]` Q4K bytes — both the cache path and
+any new transposed-row path — to measure the actual trade-off
+**Status**: Investigation. Don't delete the cache until the
+replacement kernel exists.
+
+Side findings — even without removing the cache, these are cheap
+cleanups worth doing:
+- `q4k_ffn_row_dot_via_cache` is documented as "currently unused";
+  delete if grep confirms.
+- `q4k_ffn_row_scaled_add` for `component == 2` uses
+  `bytes_per_row(hidden)` which is wrong for the transposed layout.
+  It's never called via `ffn_row_scaled_add` (the dispatch routes
+  down to the cache path) but the dead branch is a footgun. Either
+  delete it for `component == 2` or document the constraint.
+
+#### W3. Parallelize HNSW warmup (across layers) ✅ shipped 2026-04-25
+**Impact**: 8-layer dense HNSW warmup **3.6×** (395 → 109 ms); 4-layer
+MoE warmup **2.8×** (785 → 276 ms). Estimated 34-layer Gemma 4B
+warmup goes from ~2.6 s serial to ~700 ms.
+**Effort**: half-day actual
+**Bench**: `cargo bench -p larql-vindex --bench hnsw_decode -- hnsw_warmup`
+(new bench shipped with this change)
+**Status**: ✅ Shipped — added `warmup_hnsw_all_layers()` API:
+parallel-builds across layers via rayon, with the cache lock held
+only at the snapshot + install boundaries. Per-layer HNSW build
+remains serial (algorithm requires it). Side-fix: `get_or_build_hnsw`
+no longer holds the cache lock across the ~76 ms build, so concurrent
+KNN queries on different layers don't block.
+
+| Bench | Serial | Parallel | Speedup |
+|---|---|---|---|
+| dense-8L (10240×2560) | 395 ms | 109 ms | 3.6× |
+| moe-4L (32768×2560) | 785 ms | 276 ms | 2.8× |
+
+Speedup is sub-linear in cores because BLAS itself spawns threads
+inside each parallel HNSW build (oversubscription). Future: bound
+BLAS to 1 thread inside the warmup pool to recover the missing
+factor.
+
 ### Cached layer decode for template-fixed layers (L0–12) — parked
 **Impact**: 155+ tok/s decode (skip 13 of 21 layers)
 **Effort**: Medium
