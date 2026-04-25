@@ -412,3 +412,195 @@ pub fn load_feature_labels(path: &Path) -> Result<HashMap<(usize, usize), String
 
     Ok(labels)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── helpers ─────────────────────────────────────────────────────────
+
+    /// Write a minimal valid index.json into `dir`.
+    fn write_minimal_index_json(dir: &std::path::Path, num_layers: usize, hidden: usize) {
+        let json = serde_json::json!({
+            "version": 2,
+            "model": "test/unit",
+            "family": "llama",
+            "num_layers": num_layers,
+            "hidden_size": hidden,
+            "intermediate_size": 4,
+            "vocab_size": 16,
+            "embed_scale": 1.0,
+            "layers": [],
+            "down_top_k": 5,
+            "has_model_weights": false,
+            "extract_level": "browse",
+            "dtype": "f32",
+            "quant": "none"
+        });
+        std::fs::write(dir.join("index.json"), json.to_string()).unwrap();
+    }
+
+    // ── load_vindex_config ──────────────────────────────────────────────
+
+    #[test]
+    fn load_vindex_config_parses_valid_json() {
+        let dir = TempDir::new().unwrap();
+        write_minimal_index_json(dir.path(), 2, 8);
+        let cfg = load_vindex_config(dir.path()).unwrap();
+        assert_eq!(cfg.num_layers, 2);
+        assert_eq!(cfg.hidden_size, 8);
+        assert_eq!(cfg.model, "test/unit");
+        assert_eq!(cfg.family, "llama");
+    }
+
+    #[test]
+    fn load_vindex_config_missing_file_errors() {
+        let dir = TempDir::new().unwrap();
+        let result = load_vindex_config(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_vindex_config_malformed_json_errors() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("index.json"), b"{not valid json}").unwrap();
+        let result = load_vindex_config(dir.path());
+        assert!(result.is_err());
+    }
+
+    // ── load_feature_labels ─────────────────────────────────────────────
+
+    #[test]
+    fn load_feature_labels_compact_format() {
+        let dir = TempDir::new().unwrap();
+        let jsonl = r#"{"l":0,"f":0,"t":"Paris"}
+{"l":0,"f":1,"t":"French"}
+{"l":1,"f":0,"t":"Berlin"}
+"#;
+        let path = dir.path().join("down_meta.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let labels = load_feature_labels(&path).unwrap();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[&(0, 0)], "Paris");
+        assert_eq!(labels[&(0, 1)], "French");
+        assert_eq!(labels[&(1, 0)], "Berlin");
+    }
+
+    #[test]
+    fn load_feature_labels_full_format() {
+        let dir = TempDir::new().unwrap();
+        let jsonl = r#"{"layer":2,"feature":5,"top_token":"Spain"}
+"#;
+        let path = dir.path().join("down_meta.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let labels = load_feature_labels(&path).unwrap();
+        assert_eq!(labels[&(2, 5)], "Spain");
+    }
+
+    #[test]
+    fn load_feature_labels_skips_header_lines() {
+        let dir = TempDir::new().unwrap();
+        let jsonl = r#"{"_header":true,"version":1}
+{"l":0,"f":0,"t":"Rome"}
+"#;
+        let path = dir.path().join("down_meta.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let labels = load_feature_labels(&path).unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[&(0, 0)], "Rome");
+    }
+
+    #[test]
+    fn load_feature_labels_skips_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let jsonl = "  \n{\"l\":0,\"f\":0,\"t\":\"Tokyo\"}\n\n";
+        let path = dir.path().join("down_meta.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let labels = load_feature_labels(&path).unwrap();
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn load_feature_labels_missing_file_errors() {
+        let result = load_feature_labels(std::path::Path::new("/no/such/file.jsonl"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_feature_labels_empty_file_returns_empty_map() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let labels = load_feature_labels(&path).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    // ── VectorIndex::load_vindex — minimal fixture ──────────────────────
+
+    /// Write a zero-byte gate_vectors.bin and a matching index.json
+    /// for a model with no features (all-zero slices). This lets us test
+    /// `load_vindex` without running the full extract pipeline.
+    fn write_minimal_loadable_vindex(dir: &std::path::Path, num_layers: usize, hidden: usize) {
+        // Empty gate_vectors.bin (0 features per layer → 0 bytes)
+        std::fs::write(dir.join("gate_vectors.bin"), b"").unwrap();
+        let json = serde_json::json!({
+            "version": 2,
+            "model": "test/unit",
+            "family": "llama",
+            "num_layers": num_layers,
+            "hidden_size": hidden,
+            "intermediate_size": 4,
+            "vocab_size": 16,
+            "embed_scale": 1.0,
+            "layers": [],   // no layers → gate_slices all-zero
+            "down_top_k": 5,
+            "has_model_weights": false,
+            "extract_level": "browse",
+            "dtype": "f32",
+            "quant": "none"
+        });
+        std::fs::write(dir.join("index.json"), json.to_string()).unwrap();
+    }
+
+    #[test]
+    fn load_vindex_missing_dir_errors() {
+        let mut cb = crate::index::SilentLoadCallbacks;
+        let result = VectorIndex::load_vindex(
+            std::path::Path::new("/nonexistent/vindex"),
+            &mut cb,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_vindex_missing_index_json_errors() {
+        let dir = TempDir::new().unwrap();
+        // No index.json written
+        let mut cb = crate::index::SilentLoadCallbacks;
+        let result = VectorIndex::load_vindex(dir.path(), &mut cb);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_vindex_minimal_fixture_succeeds() {
+        let dir = TempDir::new().unwrap();
+        write_minimal_loadable_vindex(dir.path(), 3, 8);
+        let mut cb = crate::index::SilentLoadCallbacks;
+        let index = VectorIndex::load_vindex(dir.path(), &mut cb).unwrap();
+        assert_eq!(index.num_layers, 3);
+        assert_eq!(index.hidden_size, 8);
+    }
+
+    #[test]
+    fn load_vindex_with_range_sets_layer_range() {
+        let dir = TempDir::new().unwrap();
+        write_minimal_loadable_vindex(dir.path(), 4, 8);
+        let mut cb = crate::index::SilentLoadCallbacks;
+        let index = VectorIndex::load_vindex_with_range(dir.path(), &mut cb, Some((1, 3))).unwrap();
+        assert!(index.is_layer_owned(1));
+        assert!(index.is_layer_owned(2));
+        assert!(!index.is_layer_owned(0));
+        assert!(!index.is_layer_owned(3));
+    }
+}

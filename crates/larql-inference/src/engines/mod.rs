@@ -9,14 +9,17 @@
 //! lm_head` to get logits — see `crate::forward::hidden_to_raw_logits`.
 
 pub mod accuracy;
-pub mod apollo;
-pub mod markov_residual;
+pub mod kv_engines;
 pub mod profiler;
-pub mod turbo_quant;
-pub mod unlimited_context;
+
+// Convenience re-exports so existing `engines::markov_residual::*` paths keep working.
+pub use kv_engines::apollo;
+pub use kv_engines::markov_residual;
+pub use kv_engines::turbo_quant;
+pub use kv_engines::unlimited_context;
 
 use ndarray::Array2;
-use larql_compute::prelude::*;
+use larql_compute::ComputeBackend;
 use crate::model::ModelWeights;
 
 // ─── EngineInfo ───────────────────────────────────────────────────────────────
@@ -121,27 +124,51 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
-    /// Parse a CLI engine name. Accepted values:
-    /// - `markov-rs`, `markov-residual` → [`EngineKind::MarkovResidual`]
-    /// - `unlimited`, `unlimited-context` → [`EngineKind::UnlimitedContext`]
-    pub fn from_name(s: &str) -> Option<Self> {
-        match s {
+    /// Parse a CLI engine spec. Accepts `name` or `name:key=value[,key=value]`.
+    ///
+    /// Examples:
+    /// ```text
+    /// markov-rs
+    /// markov-rs:window=1024
+    /// unlimited-context:window=256
+    /// turbo-quant:bits=3
+    /// tq4
+    /// apollo:layer=25,coef=8.0,top_k=12
+    /// ```
+    pub fn from_name(spec: &str) -> Option<Self> {
+        // Split "name:key=val,key=val" into name + param pairs.
+        let (name, params_str) = spec.split_once(':').unwrap_or((spec, ""));
+        let params: std::collections::HashMap<&str, &str> = params_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|kv| kv.split_once('='))
+            .collect();
+
+        let get_usize = |key: &str, default: usize| -> usize {
+            params.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            params.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+
+        match name.trim() {
             "markov-rs" | "markov_rs" | "markov-residual" | "markov_residual" => {
-                Some(EngineKind::MarkovResidual { window_size: None })
+                let window_size = params.get("window").and_then(|v| v.parse().ok());
+                Some(EngineKind::MarkovResidual { window_size })
             }
             "unlimited" | "unlimited-context" | "unlimited_context" => {
-                Some(EngineKind::UnlimitedContext { window_size: 512 })
+                Some(EngineKind::UnlimitedContext { window_size: get_usize("window", 512) })
             }
             "turbo-quant" | "turbo_quant" | "turboquant" | "tq4" => {
-                Some(EngineKind::TurboQuant { bits: 4 })
+                Some(EngineKind::TurboQuant { bits: get_usize("bits", 4) as u8 })
             }
             "tq3" => Some(EngineKind::TurboQuant { bits: 3 }),
             "apollo" => {
                 let cfg = apollo::entry::InjectionConfig::default();
                 Some(EngineKind::Apollo {
-                    injection_layer: cfg.injection_layer,
-                    inject_coefficient: cfg.inject_coefficient,
-                    top_k: cfg.top_k,
+                    injection_layer:    get_usize("layer", cfg.injection_layer),
+                    inject_coefficient: get_f32("coef", cfg.inject_coefficient),
+                    top_k:              get_usize("top_k", cfg.top_k),
                 })
             }
             _ => None,
@@ -204,6 +231,35 @@ mod tests {
         }
         assert!(EngineKind::from_name("unknown").is_none());
         assert!(EngineKind::from_name("").is_none());
+    }
+
+    #[test]
+    fn engine_kind_from_name_with_params() {
+        // window param
+        match EngineKind::from_name("markov-rs:window=1024") {
+            Some(EngineKind::MarkovResidual { window_size: Some(1024) }) => {}
+            other => panic!("expected MarkovResidual{{window=1024}}, got {other:?}"),
+        }
+        // unlimited window
+        match EngineKind::from_name("unlimited-context:window=256") {
+            Some(EngineKind::UnlimitedContext { window_size: 256 }) => {}
+            other => panic!("expected UnlimitedContext{{window=256}}, got {other:?}"),
+        }
+        // turbo-quant bits
+        match EngineKind::from_name("turbo-quant:bits=3") {
+            Some(EngineKind::TurboQuant { bits: 3 }) => {}
+            other => panic!("expected TurboQuant{{bits=3}}, got {other:?}"),
+        }
+        // apollo params
+        match EngineKind::from_name("apollo:layer=25,coef=8.0,top_k=12") {
+            Some(EngineKind::Apollo { injection_layer: 25, top_k: 12, .. }) => {}
+            other => panic!("expected Apollo{{layer=25,top_k=12}}, got {other:?}"),
+        }
+        // unknown param is silently ignored, defaults apply
+        match EngineKind::from_name("markov-rs:unknown=999") {
+            Some(EngineKind::MarkovResidual { window_size: None }) => {}
+            other => panic!("expected MarkovResidual{{window=None}}, got {other:?}"),
+        }
     }
 
     #[test]

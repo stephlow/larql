@@ -2,7 +2,7 @@
 
 ## Current state (as of 2026-04-25)
 
-- **338 tests passing** on `larql-vindex` (187 unit + 151 integration);
+- **457 tests passing** on `larql-vindex` (306 unit + 151 integration);
   211 on `larql-models`. Workspace builds clean. 0 clippy warnings
   under `--lib --all-targets`. Coverage: **61 % lines / 57 % functions**
   (cargo-llvm-cov; new W2 files at 95–100 %).

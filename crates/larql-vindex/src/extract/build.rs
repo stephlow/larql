@@ -748,3 +748,249 @@ pub fn build_vindex_resume(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use ndarray::ArcArray2;
+    use tempfile::TempDir;
+
+    use crate::{ExtractLevel, SilentBuildCallbacks, SilentLoadCallbacks, StorageDtype, VectorIndex};
+    use super::build_vindex;
+
+    // ── synthetic model fixture ──────────────────────────────────────────
+
+    const NUM_LAYERS: usize = 2;
+    const HIDDEN: usize = 8;
+    const INTERMEDIATE: usize = 4;
+    const VOCAB: usize = 16;
+
+    fn make_weights() -> larql_models::ModelWeights {
+        let mut tensors: HashMap<String, ArcArray2<f32>> = HashMap::new();
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+        for layer in 0..NUM_LAYERS {
+            let mut gate = ndarray::Array2::<f32>::zeros((INTERMEDIATE, HIDDEN));
+            for i in 0..INTERMEDIATE { gate[[i, i % HIDDEN]] = 1.0; }
+            tensors.insert(format!("layers.{layer}.mlp.gate_proj.weight"), gate.into_shared());
+
+            let mut up = ndarray::Array2::<f32>::zeros((INTERMEDIATE, HIDDEN));
+            for i in 0..INTERMEDIATE { up[[i, (i + 1) % HIDDEN]] = 0.5; }
+            tensors.insert(format!("layers.{layer}.mlp.up_proj.weight"), up.into_shared());
+
+            let mut down = ndarray::Array2::<f32>::zeros((HIDDEN, INTERMEDIATE));
+            for i in 0..INTERMEDIATE { down[[i % HIDDEN, i]] = 0.3; }
+            tensors.insert(format!("layers.{layer}.mlp.down_proj.weight"), down.into_shared());
+
+            for suffix in &["q_proj", "k_proj", "v_proj", "o_proj"] {
+                let mut a = ndarray::Array2::<f32>::zeros((HIDDEN, HIDDEN));
+                for i in 0..HIDDEN { a[[i, i]] = 1.0; }
+                tensors.insert(format!("layers.{layer}.self_attn.{suffix}.weight"), a.into_shared());
+            }
+            vectors.insert(format!("layers.{layer}.input_layernorm.weight"), vec![1.0; HIDDEN]);
+            vectors.insert(format!("layers.{layer}.post_attention_layernorm.weight"), vec![1.0; HIDDEN]);
+        }
+        vectors.insert("norm.weight".into(), vec![1.0; HIDDEN]);
+
+        let mut embed = ndarray::Array2::<f32>::zeros((VOCAB, HIDDEN));
+        for i in 0..VOCAB { embed[[i, i % HIDDEN]] = 1.0; }
+        let embed = embed.into_shared();
+        let lm_head = embed.clone();
+
+        let arch = larql_models::detect_from_json(&serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": HIDDEN,
+            "num_hidden_layers": NUM_LAYERS,
+            "intermediate_size": INTERMEDIATE,
+            "head_dim": HIDDEN,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rope_theta": 10000.0,
+            "vocab_size": VOCAB,
+        }));
+        larql_models::ModelWeights {
+            tensors,
+            vectors,
+            raw_bytes: HashMap::new(),
+            packed_mmaps: HashMap::new(),
+            packed_byte_ranges: HashMap::new(),
+            embed,
+            lm_head,
+            num_layers: NUM_LAYERS,
+            hidden_size: HIDDEN,
+            intermediate_size: INTERMEDIATE,
+            vocab_size: VOCAB,
+            head_dim: HIDDEN,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            rope_base: 10000.0,
+            arch,
+        }
+    }
+
+    const TOK_JSON: &str =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+
+    fn tokenizer() -> tokenizers::Tokenizer {
+        tokenizers::Tokenizer::from_bytes(TOK_JSON).unwrap()
+    }
+
+    fn run_build(dir: &std::path::Path, level: ExtractLevel, dtype: StorageDtype) {
+        let weights = make_weights();
+        let tok = tokenizer();
+        let mut cb = SilentBuildCallbacks;
+        build_vindex(&weights, &tok, "test/unit", dir, 3, level, dtype, &mut cb).unwrap();
+    }
+
+    // ── build output file inventory ──────────────────────────────────────
+
+    #[test]
+    fn build_browse_writes_required_files() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        assert!(dir.path().join("gate_vectors.bin").exists(), "gate_vectors.bin missing");
+        assert!(dir.path().join("embeddings.bin").exists(), "embeddings.bin missing");
+        assert!(dir.path().join("down_meta.bin").exists(), "down_meta.bin missing");
+        assert!(dir.path().join("index.json").exists(), "index.json missing");
+        assert!(dir.path().join("tokenizer.json").exists(), "tokenizer.json missing");
+    }
+
+    #[test]
+    fn build_browse_does_not_write_weight_files() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        // Browse level: no model weights
+        assert!(!dir.path().join("attn_weights.bin").exists());
+        assert!(!dir.path().join("up_weights.bin").exists());
+        assert!(!dir.path().join("down_weights.bin").exists());
+    }
+
+    #[test]
+    fn build_all_writes_weight_files() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::All, StorageDtype::F32);
+        assert!(dir.path().join("attn_weights.bin").exists(), "attn_weights.bin missing");
+        assert!(dir.path().join("up_weights.bin").exists(), "up_weights.bin missing");
+        assert!(dir.path().join("down_weights.bin").exists(), "down_weights.bin missing");
+    }
+
+    // ── index.json content ───────────────────────────────────────────────
+
+    #[test]
+    fn build_index_json_has_correct_shape() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        assert_eq!(cfg.num_layers, NUM_LAYERS);
+        assert_eq!(cfg.hidden_size, HIDDEN);
+        assert_eq!(cfg.intermediate_size, INTERMEDIATE);
+        assert_eq!(cfg.vocab_size, VOCAB);
+        assert_eq!(cfg.model, "test/unit");
+        assert_eq!(cfg.version, 2);
+    }
+
+    #[test]
+    fn build_browse_has_model_weights_false() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        assert!(!cfg.has_model_weights);
+    }
+
+    #[test]
+    fn build_all_has_model_weights_true() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::All, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        assert!(cfg.has_model_weights);
+    }
+
+    #[test]
+    fn build_records_source_provenance() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        let src = cfg.source.unwrap();
+        assert_eq!(src.huggingface_repo.as_deref(), Some("test/unit"));
+        assert!(!src.larql_version.is_empty());
+    }
+
+    #[test]
+    fn build_records_checksums() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        let checksums = cfg.checksums.unwrap();
+        assert!(checksums.contains_key("gate_vectors.bin"), "gate_vectors.bin not in checksums");
+    }
+
+    #[test]
+    fn build_layer_infos_match_num_layers() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        assert_eq!(cfg.layers.len(), NUM_LAYERS);
+        for (i, info) in cfg.layers.iter().enumerate() {
+            assert_eq!(info.layer, i, "layer index mismatch at position {i}");
+            assert_eq!(info.num_features, INTERMEDIATE, "wrong feature count at layer {i}");
+        }
+    }
+
+    // ── gate_vectors.bin content ─────────────────────────────────────────
+
+    #[test]
+    fn build_gate_vectors_bin_size_matches_config() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        let expected: u64 = cfg.layers.iter().map(|l| l.length).sum();
+        let actual = std::fs::metadata(dir.path().join("gate_vectors.bin")).unwrap().len();
+        assert_eq!(actual, expected, "gate_vectors.bin size mismatch");
+    }
+
+    // ── round-trip: build then load ──────────────────────────────────────
+
+    #[test]
+    fn build_then_load_vindex_succeeds() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let mut cb = SilentLoadCallbacks;
+        let index = VectorIndex::load_vindex(dir.path(), &mut cb).unwrap();
+        assert_eq!(index.num_layers, NUM_LAYERS);
+        assert_eq!(index.hidden_size, HIDDEN);
+        assert_eq!(index.total_gate_vectors(), NUM_LAYERS * INTERMEDIATE);
+    }
+
+    #[test]
+    fn build_then_load_gate_knn_returns_results() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let mut cb = SilentLoadCallbacks;
+        let index = VectorIndex::load_vindex(dir.path(), &mut cb).unwrap();
+        let query = ndarray::Array1::from_vec(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let hits = index.gate_knn(0, &query, 2);
+        assert!(!hits.is_empty(), "gate_knn returned no results after build");
+    }
+
+    #[test]
+    fn build_f16_dtype_round_trips() {
+        let dir = TempDir::new().unwrap();
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F16);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        assert_eq!(cfg.dtype, StorageDtype::F16);
+        let mut cb = SilentLoadCallbacks;
+        let index = VectorIndex::load_vindex(dir.path(), &mut cb).unwrap();
+        assert_eq!(index.num_layers, NUM_LAYERS);
+    }
+
+    #[test]
+    fn build_idempotent_on_existing_dir() {
+        let dir = TempDir::new().unwrap();
+        // First build
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        // Second build into same directory should overwrite cleanly
+        run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
+        let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
+        assert_eq!(cfg.num_layers, NUM_LAYERS);
+    }
+}

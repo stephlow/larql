@@ -26,7 +26,7 @@ use super::routing::{RoutingIndex, RoutingQuery};
 use super::store::ApolloStore;
 use crate::model::ModelWeights;
 use crate::forward::{embed_tokens_pub, forward_raw_logits};
-use super::super::{EngineInfo, KvEngine};
+use crate::engines::{EngineInfo, KvEngine};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 

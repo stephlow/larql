@@ -21,8 +21,8 @@ use crate::ffn::BackendFfn;
 use crate::attention::SharedKV;
 use crate::vindex::{WalkFfn, WalkFfnConfig};
 use larql_vindex::VectorIndex;
-use super::{EngineInfo, KvEngine};
-use super::profiler::{DecodeStageSummary, EngineProfiler};
+use crate::engines::{EngineInfo, KvEngine};
+use crate::engines::profiler::{DecodeStageSummary, EngineProfiler};
 
 // ─── RsStore ─────────────────────────────────────────────────────────────────
 
@@ -197,7 +197,7 @@ impl KvEngine for MarkovResidualEngine {
         token_ids: &[u32],
         backend: &dyn ComputeBackend,
     ) -> Option<Array2<f32>> {
-        use super::unlimited_context::engine::q4k_prefill_metal;
+        use crate::engines::unlimited_context::engine::q4k_prefill_metal;
         // Try Metal full pipeline first. Returns None for CpuBackend or when
         // Q4K data is absent — fall through to CPU path in that case.
         if let Some(h) = q4k_prefill_metal(weights, index, token_ids, backend) {
@@ -222,7 +222,7 @@ impl KvEngine for MarkovResidualEngine {
         token_id: u32,
         backend: &dyn ComputeBackend,
     ) -> Option<Array2<f32>> {
-        use super::unlimited_context::engine::q4k_decode_token;
+        use crate::engines::unlimited_context::engine::q4k_decode_token;
         if self.metal_prefill_done {
             // Metal path: decode_token manages KV state in GPU buffers.
             // Returns None only on a GPU-side error; if that happens fall

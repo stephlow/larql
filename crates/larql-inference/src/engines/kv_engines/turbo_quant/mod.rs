@@ -19,13 +19,16 @@ pub mod rotation;
 
 use ndarray::{s, Array2};
 use larql_compute::{ComputeBackend, cpu_backend};
+use larql_vindex::VectorIndex;
 
 use crate::model::ModelWeights;
 use crate::attention::{run_attention_with_kv_backend, run_attention_block_decode_step_backend};
 use crate::ffn::BackendFfn;
+use crate::vindex::{WalkFfn, WalkFfnConfig};
 use crate::forward::{embed_tokens_pub, run_ffn};
 use crate::attention::SharedKV;
-use super::{EngineInfo, KvEngine};
+use crate::engines::{EngineInfo, KvEngine};
+use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 
 // ─── TurboQuant codec ────────────────────────────────────────────────────────
 
@@ -245,6 +248,72 @@ impl KvEngine for TurboQuantEngine {
 
     fn memory_bytes(&self) -> usize {
         self.layers.iter().map(|l| l.memory_bytes()).sum()
+    }
+
+    /// Q4K path: dequantise attention tensors once (idempotent), use WalkFfn
+    /// for FFN. Same approach as MarkovRS CPU Q4K — compresses the resulting
+    /// K/V rather than storing raw residuals.
+    fn prefill_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        index: &VectorIndex,
+        token_ids: &[u32],
+        backend: &dyn ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        ensure_attn_tensors_dequantised(weights, index);
+        let num_layers = weights.num_layers;
+        let be = Some(backend);
+        let mut h = embed_tokens_pub(weights, token_ids);
+        self.layers.clear();
+
+        for layer in 0..num_layers {
+            let (h_post_attn, k, v) = run_attention_with_kv_backend(weights, &h, layer, be)?;
+            self.layers.push(CompressedLayer::compress(&(k, v), &self.tq));
+
+            let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+                .with_backend(backend);
+            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            h = h_out;
+        }
+
+        self.abs_position = token_ids.len();
+        Some(last_row(&h))
+    }
+
+    fn decode_step_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        index: &VectorIndex,
+        token_id: u32,
+        backend: &dyn ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        ensure_attn_tensors_dequantised(weights, index);
+        let num_layers = weights.num_layers;
+        let abs_position = self.abs_position;
+        let mut h = embed_tokens_pub(weights, &[token_id]);
+
+        for layer in 0..num_layers {
+            let prior_kv = self.layers[layer].decompress(&self.tq);
+            let (h_post_attn, updated_kv) = run_attention_block_decode_step_backend(
+                weights, &h, layer, Some(&prior_kv), abs_position, Some(backend),
+            )?;
+            let arch = &*weights.arch;
+            let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
+            self.layers[layer] = CompressedLayer {
+                compressed_k: compress_matrix(&updated_kv.0, &self.tq, detect_head_dim(kv_dim)),
+                compressed_v: compress_matrix(&updated_kv.1, &self.tq, detect_head_dim(kv_dim)),
+                num_vecs: updated_kv.0.shape()[0],
+                kv_dim,
+                head_dim: detect_head_dim(kv_dim),
+            };
+            let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+                .with_backend(backend);
+            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            h = h_out;
+        }
+
+        self.abs_position += 1;
+        Some(last_row(&h))
     }
 }
 

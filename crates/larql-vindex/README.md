@@ -500,7 +500,7 @@ grid intentionally, set `LARQL_BENCH_ALLOW_DAEMONS=1`.
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 338 tests (187 unit + 151 integration; all green as of 2026-04-25)
+cargo test -p larql-vindex                                                      # 457 tests (306 unit + 151 integration; all green as of 2026-04-26)
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -509,12 +509,15 @@ cargo run --release -p larql-vindex --example q4k_demo                          
 cargo run --release -p larql-vindex --example demo_memit_solve                  # MEMIT closed-form decomposition + MemitStore round-trip
 
 # Criterion benches (run with --quick for a fast sweep, omit for full sample)
-cargo bench  -p larql-vindex --bench vindex_ops                                 # KNN, walk, save/load, mutate, MoE
-cargo bench  -p larql-vindex --bench vindex_scaling                             # Production dims (CPU)
-cargo bench  -p larql-vindex --features metal --bench vindex_scaling            # Production dims (Metal)
+cargo bench  -p larql-vindex --bench vindex_ops                                 # KNN, walk, save/load, mutate, MoE, batch top-K
+cargo bench  -p larql-vindex --bench vindex_scaling                             # Production dims (CPU only — Metal in cpu_vs_gpu below)
+cargo bench  -p larql-vindex --bench cpu_vs_gpu                                 # CPU only (Accelerate)
+cargo bench  -p larql-vindex --features metal --bench cpu_vs_gpu                # CPU + Metal side-by-side at production dims
 cargo bench  -p larql-vindex --bench memit_solve                                # Ridge decomposition throughput
-cargo bench  -p larql-vindex --bench extract_throughput                         # Streaming extract: f32 vs Q4K write-path time
+cargo bench  -p larql-vindex --bench extract_throughput                         # Streaming extract: f32 vs Q4K vs Q4K-resume
 cargo bench  -p larql-vindex --bench q4k_vs_f32                                 # Per-layer attn retrieval: mmap memcpy vs mmap + dequant
+cargo bench  -p larql-vindex --bench q4k_cache                                  # Q4_K dequant cache vs row + W2 down feature-major
+cargo bench  -p larql-vindex --bench hnsw_decode                                # HNSW vs brute + parallel warmup_hnsw_all_layers
 
 # Streaming build (one-shot, skips f32 intermediate)
 larql extract-index <model> -o <vindex> --quant q4k                             # Q4_K/Q6_K attn + FFN + norms + lm_head in one pass
@@ -663,7 +666,7 @@ pinned layers skip PCIe transfers and the gradient steepens.
 ## Status
 
 ```
-Tests:      338 passing (187 unit + 151 integration; clippy clean as of 2026-04-25)
+Tests:      457 passing (306 unit + 151 integration; clippy clean as of 2026-04-26)
 Coverage:   61% lines / 57% functions (cargo-llvm-cov; W2 files 95–100%)
 Warnings:   0 (build), 0 (clippy --all-targets)
 Formats:    f32, Q8_0, Q4_K, Q6_K, Q4_0, FP4, FP8

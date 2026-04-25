@@ -353,7 +353,7 @@ fn run_engine(
 
     let mut engine = kind.build_with_profiling(backend, args.profile);
     let info = engine.info();
-    let label = format!("{} [{}]", info.name, info.backend);
+    let label = if info.config.is_empty() { format!("{} [{}]", info.name, info.backend) } else { format!("{} [{}] ({})", info.name, info.backend, info.config) };
 
     if args.verbose {
         eprintln!("[bench] {}", info.summary());
@@ -459,7 +459,7 @@ fn run_engine_q4k(
     };
     let mut engine = kind.build_with_profiling(backend, args.profile);
     let info = engine.info();
-    let label = format!("{} [{}] (Q4K)", info.name, info.backend);
+    let label = if info.config.is_empty() { format!("{} [{}] Q4K", info.name, info.backend) } else { format!("{} [{}] ({}) Q4K", info.name, info.backend, info.config) };
 
     if args.verbose {
         eprintln!("[bench] Q4K engine: {}", info.summary());
