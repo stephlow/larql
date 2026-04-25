@@ -390,6 +390,55 @@ Worth doing for the Act 2 demo but non-trivial. See
 
 ## P1 — Loose ends in shipped features
 
+### CPU vs Metal disagree on LM-head top-5 for tied-embedding models (open)
+
+Surfaced 2026-04-25 by `test_logits_goldens.rs` while baking the
+per-backend goldens. On the prompt `"The capital of France is"`:
+
+- **Llama 2 7B / Mistral 7B v0.1**: CPU and Metal produce
+  bit-identical top-5 (`[263, 278, 697, 3681, 884]` for Llama;
+  `[5465, 264, 272, 5651, 624]` for Mistral). Same top-1 logit
+  (29.99 / 1.45) on both backends.
+- **Gemma 3 4B / Gemma 4 31B (tied embed)**: CPU and Metal produce
+  *completely different* top-5 sets and top-1 logits. e.g. Gemma 3 4B:
+  Metal top-1 token 50429 (logit 2874); CPU top-1 token 256240 (logit
+  3632) — different magnitudes, different parts of the 262K vocab.
+
+Earlier parity tests (`test_cpu_metal_parity` per-layer end-of-layer,
+`test_decode_consistency`, `test_decode_stage_bisect` per-stage L0)
+all pass on Gemma 3 4B / Gemma 4 31B with `cos=1.0`. So the prefill
+through to `h_post_attn` and `down_out` is bit-clean across backends.
+The divergence is downstream — between the final-layer hidden and the
+top-K argsort that `lm_head_topk` returns. Most likely culprit: the
+LM-head `f32_gemv` over the full `[vocab=262144, hidden=2560]` matrix
+on Metal vs CPU, on the **tied-embedding** path (where `weights.lm_head`
+is cloned from `embed`). Llama / Mistral have *separate* lm_head
+matrices and don't show this — supporting the tied-clone hypothesis.
+
+**What this affects.** `larql run` / `larql chat` against Gemma 3 4B
+or Gemma 4 31B may produce different first tokens depending on which
+backend was selected by the auto-router. Behaviour stays
+in-distribution (the architecture goldens still pass — the model
+emits sensible tokens either way) but the two backends aren't
+reproducing each other's argmax.
+
+**Pinned by.** `test_logits_goldens` records per-backend goldens, so
+each backend's regression is detected independently. The goldens
+also serve as the bisect baseline: once this is fixed, the goldens
+should converge between CPU and Metal for tied-embedding models, and
+the test file's per-backend split collapses to a single golden per
+arch.
+
+**Path forward.** The `lm_head_topk` path goes through
+`backend.f32_gemv(lm.view(), query)` for both backends — same kernel
+shape, different implementation. Bisect with a fixed query vector
+(skip the prefill so we know the input is identical), compare top-5
+of CPU vs Metal `f32_gemv` directly. If they diverge at that level,
+it's a Metal `f32_gemv` shader issue at vocab-scale K. If they
+converge, the divergence is upstream (last-layer hidden state
+between the two paths — possibly the embed-table tie cloning the
+wrong tensor).
+
 ### `--compact` loader reconstruction — WalkFfn-only today
 
 `larql extract --compact` drops `up_weights.bin` + `down_weights.bin`
@@ -453,59 +502,6 @@ vindexes in the local cache that's ~200 MB of duplicate data. Low
 priority — worth doing as a content-addressed store if the cache
 grows, otherwise skip.
 
-### Decode-vs-prefill parity on Gemma 4 31B (open)
-
-`test_decode_consistency::decode_consistency_gemma4_31b_dense` is the
-single failing test in the new parity suite. **The Metal KV-cached
-`decode_token` produces a different L0 hidden state than a fresh
-Metal/CPU prefill at the same effective sequence length** —
-`cos=0.996586, max_abs=1.270` (2.7 % of the reference layer norm) at
-L0, compounding to `cos≈0.76` at L59. The other three architectures
-in the suite (Gemma 3 4B, Llama 2 7B, Mistral 7B) match cleanly.
-
-**What this affects.** Gemma 4 31B-it produces a coherent first token
-("Paris") then drifts on every subsequent decoded token versus what a
-full re-prefill would produce. End-to-end tokens stay in-distribution
-(the architecture goldens still pass) but they aren't the
-mathematically-correct continuation of the prompt.
-
-**Cleared as the cause.** Each of these has a kernel-level test that
-passes at the failing geometry (Gemma 4 31B global: `head_dim=512`,
-`num_kv=4`, partial RoPE 25 %, `rope_base=500000`):
-
-- `fused_attention`              — `test_metal_shaders::fused_attention_head_dim_512`
-- `v_norm_batched`               — `test_kernel_v_norm` (caught + fixed two
-   shader bugs along the way; see ship log)
-- `kv_attention`                 — `test_kernel_kv_attention`
-- `rope_at_pos_batched`          — `test_kernel_rope`
-- Mixed-Q4K+Q6K fused QKV proj   — forced-disable test in decode shows
-   identical drift, so it's not the cause.
-
-**Remaining suspects.** What hasn't been kernel-tested yet:
-
-1. `kv_cache_append` shader + the prefill→decode KV cache layout/stride
-   hand-off. Cheapest next test — write a kernel test that prefills 18
-   tokens, decodes 1, then reads `kv_cache.layers[0].k_cache` directly
-   and compares position-by-position to a CPU reference of the same
-   computation.
-2. K/V buffers post-RoPE inside Metal prefill vs CPU prefill. Prefill
-   `h_out` matches end-to-end, but it's possible the intermediate
-   K/V values that get *copied into the cache* are off (and the
-   prefill's own `fused_attention` happens to compensate via a
-   different but-also-wrong calculation that lands at the right
-   `h_out`).
-3. Per-stage residual capture in `residual_diff::ResidualCapture` —
-   currently captures end-of-layer only. Extending to per-stage
-   (`q_out`, `k_out`, `v_out`, `attn_out`, `o_out`, `ffn_norm_out`,
-   …) for both prefill and decode would localise this in one shot.
-
-**Path forward.** Do (1) → (2) → (3) in order. The drift value is
-*exactly* `cos=0.996586` regardless of which fix I apply, which
-strongly suggests a single structural difference (off-by-one in cache
-stride, missing application of one shader stage, or similar) rather
-than accumulated per-kernel error. Once localised, the fix should be
-small.
-
 ---
 
 ## P2 — Demo production
@@ -545,6 +541,69 @@ the attention weights taking a third of RAM.
 
 ## Done (ship log)
 
+### Decode-vs-prefill parity on Gemma 4 31B — closed (2026-04-25)
+
+`test_decode_consistency::decode_consistency_gemma4_31b_dense` was the
+single failing test in the parity suite. Metal KV-cached `decode_token`
+produced an L0 hidden state with `cos=0.996586, max_abs=1.270`
+(2.7 % of the reference layer norm) versus a fresh CPU prefill at the
+same effective sequence length, compounding to `cos≈0.76` at L59. Now
+matches across all four architectures.
+
+**Diagnosis path.** Built coverage outward from the parity suite until
+the gap localised to a single file pair:
+
+1. **kv_cache_append + cache layout/stride hand-off** —
+   `test_kernel_kv_cache_append.rs` (14 tests). Pinned the writer
+   shader byte-for-byte and the prefill→decode bulk-copy contract
+   end-to-end. Cleared as the cause.
+2. **rope_at_pos vs rope_at_pos_batched** —
+   `test_kernel_rope_at_pos.rs` (6 tests). The two RoPE shaders prefill
+   and decode use are bit-identical at the parity-bug geometry
+   (head_dim=512, partial 25 %, base=500 000). Cleared.
+3. **qk_norm-as-V-norm vs v_norm_batched** — `test_kernel_qk_norm.rs`
+   (7 tests). Prefill applies V-norm via the qk_norm shader with
+   weight=1, offset=0; decode uses the dedicated v_norm_batched
+   shader. Pinned bit-equal at the parity-bug geometry. Cleared.
+4. **Per-stage residual capture** —
+   `larql_inference::residual_diff::stages::StageCapture` +
+   `compare_stages` + `test_decode_stage_bisect.rs`. Extended Metal
+   decode with a stage-dump hook (`LARQL_DECODE_DUMP_LAYERS=<dir>` +
+   `LARQL_STAGE_DUMP_LAYER=<L>` writes `decode_layer_NN_<stage>.f32`,
+   names matching the existing Metal-prefill set). The bisect test
+   localised the divergence: every attention-side stage matched at
+   `cos=1.0`; the first divergence was at `ffn_out_raw` / `down_out`
+   with `cos=0.97 max_abs=5.7 (rel 4.4 %)`.
+5. **Kernel test for q4k_ffn_gate_up** —
+   `test_kernel_q4k_ffn_gate_up.rs`. Showed catastrophic divergence
+   (`cos=-0.08`) at K > 4096 in synthetic, traced to the
+   `Q4K_GU_MAX_K = 4096` shared-memory cap.
+
+**Root cause.** Two Metal shaders — `q4k_matvec` and
+`q4k_ffn_gate_up` — cached the input vector X in a
+`threadgroup float Xsh[4096]` tile. For any `K > 4096` (Gemma 4 31B's
+`hidden = 5376`) the tile-load loop wrote past the buffer (Metal UB)
+and the dot product later read garbage from those slots. The sibling
+`q4k_qkv_proj` had always read X directly from device memory and ran
+cleanly at the same K — confirming the fix shape.
+
+**Fix.** Drop the `Xsh[]` tile from both shaders, read X directly
+from device memory inside the inner loop. Apple Silicon's L1/L2
+cache amortises the repeated reads across the threadgroup's
+8 simdgroups. `crates/larql-compute/src/metal/shaders/q4k_matvec.rs`
++ `q4k_ffn_gate_up.rs`, ~10 lines removed each.
+
+**Pinned by.** `test_kernel_q4k_ffn_gate_up::q4k_ffn_gate_up_just_past_max_k_4352`
+(one super-block past the old cap) and `..._gemma4_31b_dense`
+(production geometry). The previously-`#[ignore]`d cases now pass.
+
+**Decode-side modularisation that fell out of this work.** Pulling
+the per-stage dump in cleanly required `decode/mod.rs` to host a few
+helper modules: extracted Step 1 (input norm + fused QKV) into
+`decode/encode_qkv.rs` and Step 6 (format-aware FFN) into
+`decode/encode_ffn.rs`. Behaviour byte-identical; `decode/mod.rs`
+went from 1080 → 707 lines.
+
 ### Backend parity testing infrastructure + 2 shader fixes (2026-04-24)
 
 Replaced the ad-hoc env-var-driven dump scaffolding (`LARQL_CPU_DUMP_LAYERS`,
@@ -572,10 +631,12 @@ real shader bugs surfaced and got fixed in the process.
   refactored. No more env-var setup in the test body. Asserts
   per-layer cos ≥ 0.99995 / rel max_abs ≤ 1 % across all four test
   vindexes.
-- `larql-inference/tests/test_decode_consistency.rs` (4 tests, 1
-  expected-fail) — NEW. Asserts `Metal prefill(N) + decode(1) ==
-  CPU prefill(N+1).last_position()` per layer. Currently fails for
-  Gemma 4 31B; see P1 "Decode-vs-prefill parity" above.
+- `larql-inference/tests/test_decode_consistency.rs` (4 tests) —
+  NEW. Asserts `Metal prefill(N) + decode(1) ==
+  CPU prefill(N+1).last_position()` per layer. Initially failed for
+  Gemma 4 31B; closed 2026-04-25 by the q4k_matvec / q4k_ffn_gate_up
+  shared-memory-cap fix (see "Decode-vs-prefill parity on Gemma 4 31B —
+  closed" entry above).
 - `larql-compute/tests/common/mod.rs` — `get_metal`, `max_diff`,
   `cos_sim` shared helpers across kernel test files.
 - `larql-compute/tests/test_kernel_v_norm.rs` (3 tests) — see fixes

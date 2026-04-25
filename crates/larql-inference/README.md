@@ -130,6 +130,17 @@ cargo run --release -p larql-inference --example inference_demo
 # Clustering and pair matching demos
 cargo run -p larql-inference --example clustering_demo
 cargo run -p larql-inference --example pair_matching_demo
+
+# Per-layer residual diff: CPU prefill vs Metal prefill (end of every layer)
+cargo run --release --features metal -p larql-inference \
+    --example residual_diff -- <vindex> "The capital of France is"
+
+# Per-stage L0 bisect: CPU prefill vs Metal KV-cached decode. Locates
+# which sub-stage (norm / Q / K / V / attn / O / FFN) first diverges.
+# Closed the open Gemma 4 31B parity gap (2026-04-25 ship log) by
+# pointing at the FFN block when every attention stage matched at cos=1.0.
+cargo run --release --features metal -p larql-inference \
+    --example stage_bisect -- <vindex> "The capital of France is" 0
 ```
 
 ### Vindex tools

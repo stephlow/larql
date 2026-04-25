@@ -110,17 +110,37 @@ fn fp4_row_dot_matches_source_f32_baseline() {
 
     // Per-projection expected tolerances (loose upper bounds measured
     // from fp4_verify on Gemma 3 4B). Normalised by |source| × |x|.
-    let projections: [(usize, &str, &str, f64); 3] = [
-        (0, "gate_vectors.bin", "fp4", 0.04),  // ~12-13% elementwise → ~4% dot with cancellations
-        (1, "up_features.bin",  "fp4", 0.04),
-        (2, "down_features.bin", "fp8", 0.01), // FP8 is ~10× tighter
+    // The (component, source-file, default-tolerance) trio covers all three
+    // projections; per-component precision is read from the manifest below
+    // and components stored at source dtype (currently gate under all
+    // policies — gate KNN still wants the dense f32 matrix) are skipped:
+    // `fp4_ffn_row_dot` returns None for non-FP4/FP8 components.
+    let projections: [(usize, &str, f64, f64); 3] = [
+        (0, "gate_vectors.bin",  0.04, 0.0001), // fp4 tol vs f32 tol (perfect when source-dtype)
+        (1, "up_features.bin",   0.04, 0.0001),
+        (2, "down_features.bin", 0.01, 0.0001), // FP8 ~10× tighter
     ];
 
     let sample_layers = [0usize, 12, 33];
     let sample_feats = [0usize, 1000, 8000];
 
     let mut all_ok = true;
-    for (comp, src_file, _prec_name, tol_frac) in projections.iter() {
+    for (comp, src_file, fp4_tol, _src_tol) in projections.iter() {
+        // Read the component's stored precision from the manifest. f16/f32
+        // means the converter linked the source dtype through (gate today)
+        // and `fp4_ffn_row_dot` will return None — skip and let the legacy
+        // KNN path own that case.
+        let prec = tgt_config_json["fp4"]["projections"]
+            [match *comp { 0 => "gate", 1 => "up", _ => "down" }]
+            ["precision"].as_str().unwrap_or("");
+        if prec != "fp4" && prec != "fp8" {
+            assert!(
+                index.fp4_ffn_row_dot(*sample_layers.first().unwrap(), *comp, 0, &x).is_none(),
+                "component {comp} stored as {prec} should return None from fp4_ffn_row_dot"
+            );
+            continue;
+        }
+        let tol_frac = *fp4_tol;
         for &layer in &sample_layers {
             for &feat in &sample_feats {
                 if feat >= per_layer_features[layer] { continue; }

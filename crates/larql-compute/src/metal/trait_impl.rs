@@ -318,6 +318,18 @@ impl ComputeBackend for MetalBackend {
             *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
+        // Grow if a later call uses a larger model than the first one
+        // sized the cache for. Mirrors `prefill_q4`'s grow-loop and
+        // matches the per-layer-shape contract — kv_cache layers are
+        // sized to the layer's *own* (num_kv, head_dim), not the outer
+        // signature scalars (which only reflect the first layer on
+        // hetero-attention models like Gemma 4 31B).
+        while kv.layers.len() < num_layers {
+            let l = &layers[kv.layers.len()];
+            kv.layers.push(ops::kv_cache::LayerKVCache::new(
+                &self.bufs, 4096, l.num_kv_heads, l.head_dim,
+            ));
+        }
         Some(MetalBackend::decode_token(self, kv, layers, x, hidden, inter, q_dim, kv_dim,
             num_q_heads, num_kv_heads, head_dim, rope_base))
     }
@@ -338,6 +350,12 @@ impl ComputeBackend for MetalBackend {
             *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
+        while kv.layers.len() < num_layers {
+            let l = &layers[kv.layers.len()];
+            kv.layers.push(ops::kv_cache::LayerKVCache::new(
+                &self.bufs, 4096, l.num_kv_heads, l.head_dim,
+            ));
+        }
         Some(MetalBackend::decode_token_with_moe_fn(self, kv, layers, x,
             hidden, inter, q_dim, kv_dim,
             num_q_heads, num_kv_heads, head_dim, rope_base, Some(moe_fn)))

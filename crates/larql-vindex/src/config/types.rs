@@ -62,7 +62,7 @@ pub struct VindexConfig {
     /// Optional FP4/FP8 block-storage manifest. Set when one or more FFN
     /// projections are stored in the block-quantised format described
     /// in `docs/specs/vindex-format-spec.md` §5.10 and
-    /// `experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md`.
+    /// `docs/specs/fp4-format-spec.md`.
     /// Absent or null → legacy f16/f32 projection files are
     /// authoritative and loaders use the legacy codepath.
     #[serde(default, skip_serializing_if = "Option::is_none")]

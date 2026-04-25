@@ -17,7 +17,7 @@ fn main() {
     {
         use std::time::Instant;
         use larql_compute::ComputeBackend;
-        use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_to_q8};
+        use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q4_kf, quantize_to_q8};
 
         let metal_raw = larql_compute::metal::MetalBackend::new().expect("Metal required");
         let metal: &dyn ComputeBackend = &metal_raw;
@@ -40,6 +40,7 @@ fn main() {
 
         // ── Build layer data ──
         struct Layer { wq: Vec<u8>, wk: Vec<u8>, wv: Vec<u8>, wo: Vec<u8>,
+                       wq_kf: Vec<u8>, wk_kf: Vec<u8>, wv_kf: Vec<u8>, wo_kf: Vec<u8>,
                        wq8: Vec<u8>, wk8: Vec<u8>, wv8: Vec<u8>, wo8: Vec<u8>,
                        wq8s: Vec<f32>, wk8s: Vec<f32>, wv8s: Vec<f32>, wo8s: Vec<f32>,
                        g: Vec<u8>, u: Vec<u8>, d: Vec<u8>, norm: Vec<f32> }
@@ -55,6 +56,10 @@ fn main() {
                 Layer {
                     wq: quantize_q4_k(&pad(&wq_f)), wk: quantize_q4_k(&pad(&wk_f)),
                     wv: quantize_q4_k(&pad(&wv_f)), wo: quantize_q4_k(&pad(&wo_f)),
+                    // Q4_KF byte layout (160B/256 — pre-baked half scales)
+                    // for the all-Q4_KF attention variant.
+                    wq_kf: quantize_q4_kf(&pad(&wq_f)), wk_kf: quantize_q4_kf(&pad(&wk_f)),
+                    wv_kf: quantize_q4_kf(&pad(&wv_f)), wo_kf: quantize_q4_kf(&pad(&wo_f)),
                     wq8: q8q.iter().map(|&x| x as u8).collect(), wk8: q8k.iter().map(|&x| x as u8).collect(),
                     wv8: q8v.iter().map(|&x| x as u8).collect(), wo8: q8o.iter().map(|&x| x as u8).collect(),
                     wq8s: q8qs, wk8s: q8ks, wv8s: q8vs, wo8s: q8os,
@@ -189,6 +194,73 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..n { let _ = metal.decode_token(&q4k_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0); }
         let q4k_34_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        // ── LARQL Q4_KF (full attention) decode (21 + 34 layers) ──
+        //
+        // The headline-fastest path on Gemma 3 4B per the README — uses
+        // the llama.cpp-exact `q4kf_proj` / `q4kf_qkv_proj` kernel for
+        // attention as well as FFN. The Q4_K variants above keep
+        // attention as the GGUF-default Q4_K layout; flipping to Q4_KF
+        // reuses the same f32-input fused matvec kernel for every
+        // projection, which on M3 measures faster than the Q4_K-attn
+        // dual-path.
+        let q4kf_21: Vec<larql_compute::FullPipelineLayer> = data_21.iter().map(|l| larql_compute::FullPipelineLayer {
+            wq: larql_compute::QuantWeight { data: &l.wq_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            wk: larql_compute::QuantWeight { data: &l.wk_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            wv: larql_compute::QuantWeight { data: &l.wv_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            wo: larql_compute::QuantWeight { data: &l.wo_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            gate: larql_compute::QuantWeight { data: &l.g, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            up: larql_compute::QuantWeight { data: &l.u, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            down: larql_compute::QuantWeight { data: &l.d, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            input_norm: &l.norm, post_attn_norm: &l.norm,
+            pre_ffn_norm: None, post_ffn_norm: None, norm_offset: 1.0, has_post_norms: false,
+            activation: larql_compute::Activation::Silu,
+            qk_norm_offset: 0.0, eps: 1e-6,
+            norm_type: larql_compute::NormType::RmsNorm,
+            ffn_type: larql_compute::FfnType::Gated,
+            attn_scale: 1.0 / (hd as f32).sqrt(),
+            head_dim: hd, num_q_heads: num_q, num_kv_heads: num_kv,
+            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
+            has_v_norm: false, layer_scalar: 0.0,
+            input_norm_bias: None, post_attn_norm_bias: None,
+            q_norm_weight: None, k_norm_weight: None,
+            ffn_up_bias: None, ffn_down_bias: None,
+            moe: None, moe_combined_output_norm: false, moe_outer_post_norm: None,
+        }).collect();
+        metal.reset_kv_cache();
+        for _ in 0..5 { let _ = metal.decode_token(&q4kf_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0); }
+        let t0 = Instant::now();
+        for _ in 0..n { let _ = metal.decode_token(&q4kf_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0); }
+        let q4kf_21_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        let q4kf_34: Vec<larql_compute::FullPipelineLayer> = data_34.iter().map(|l| larql_compute::FullPipelineLayer {
+            wq: larql_compute::QuantWeight { data: &l.wq_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            wk: larql_compute::QuantWeight { data: &l.wk_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            wv: larql_compute::QuantWeight { data: &l.wv_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            wo: larql_compute::QuantWeight { data: &l.wo_kf, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            gate: larql_compute::QuantWeight { data: &l.g, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            up: larql_compute::QuantWeight { data: &l.u, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            down: larql_compute::QuantWeight { data: &l.d, scales: None, format: larql_compute::QuantFormat::Q4_KF },
+            input_norm: &l.norm, post_attn_norm: &l.norm,
+            pre_ffn_norm: None, post_ffn_norm: None, norm_offset: 1.0, has_post_norms: false,
+            activation: larql_compute::Activation::Silu,
+            qk_norm_offset: 0.0, eps: 1e-6,
+            norm_type: larql_compute::NormType::RmsNorm,
+            ffn_type: larql_compute::FfnType::Gated,
+            attn_scale: 1.0 / (hd as f32).sqrt(),
+            head_dim: hd, num_q_heads: num_q, num_kv_heads: num_kv,
+            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
+            has_v_norm: false, layer_scalar: 0.0,
+            input_norm_bias: None, post_attn_norm_bias: None,
+            q_norm_weight: None, k_norm_weight: None,
+            ffn_up_bias: None, ffn_down_bias: None,
+            moe: None, moe_combined_output_norm: false, moe_outer_post_norm: None,
+        }).collect();
+        metal.reset_kv_cache();
+        for _ in 0..3 { let _ = metal.decode_token(&q4kf_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0); }
+        let t0 = Instant::now();
+        for _ in 0..n { let _ = metal.decode_token(&q4kf_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0); }
+        let q4kf_34_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
         // ── LARQL raw QKV kernel (34 layers, zero overhead) ──
         let buf_wq = metal_raw.bufs().get_bytes(&data_34[0].wq);
@@ -451,10 +523,14 @@ fn main() {
         println!("  ├─────────────────────────────────┼──────────┼─────────┼──────────┤");
         println!("  │ LARQL Q4_K decode (21L, KV)     │ {:>6.1}ms │ {:>5.0}   │  {:>5.2}x │",
             q4k_21_ms, 1000.0/q4k_21_ms, if ollama_ms > 0.0 { q4k_21_ms/ollama_ms } else { 0.0 });
+        println!("  │ LARQL Q4_KF decode (21L, KV)    │ {:>6.1}ms │ {:>5.0}   │  {:>5.2}x │",
+            q4kf_21_ms, 1000.0/q4kf_21_ms, if ollama_ms > 0.0 { q4kf_21_ms/ollama_ms } else { 0.0 });
         println!("  │ LARQL Q8   decode (21L, KV)     │ {:>6.1}ms │ {:>5.0}   │  {:>5.2}x │",
             q8_21_ms, 1000.0/q8_21_ms, if ollama_ms > 0.0 { q8_21_ms/ollama_ms } else { 0.0 });
         println!("  │ LARQL Q4_K decode (34L, KV)     │ {:>6.1}ms │ {:>5.0}   │  {:>5.2}x │",
             q4k_34_ms, 1000.0/q4k_34_ms, if ollama_ms > 0.0 { q4k_34_ms/ollama_ms } else { 0.0 });
+        println!("  │ LARQL Q4_KF decode (34L, KV)    │ {:>6.1}ms │ {:>5.0}   │  {:>5.2}x │",
+            q4kf_34_ms, 1000.0/q4kf_34_ms, if ollama_ms > 0.0 { q4kf_34_ms/ollama_ms } else { 0.0 });
         println!("  ├─────────────────────────────────┼──────────┼─────────┼──────────┤");
         println!("  │ LARQL raw QKV kernel (34L)      │ {:>6.1}ms │    —    │  {:>5.1}x  │",
             raw_34_ms, if ollama_ms > 0.0 { ollama_ms / raw_34_ms } else { 0.0 });

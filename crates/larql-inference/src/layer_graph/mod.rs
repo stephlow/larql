@@ -24,7 +24,7 @@ pub mod grid;
 pub mod hybrid;
 pub mod predict;
 
-pub use generate::{generate, generate_constrained, GenerateResult, StageTimings};
+pub use generate::{generate, generate_constrained, lm_head_topk, GenerateResult, StageTimings};
 
 use ndarray::Array2;
 

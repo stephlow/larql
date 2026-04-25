@@ -33,6 +33,7 @@ pub mod extract;
 pub mod format;
 pub mod index;
 pub mod patch;
+pub mod quant;
 pub mod storage;
 pub mod mmap_util;
 pub mod vindexfile;

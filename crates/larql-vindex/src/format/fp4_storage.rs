@@ -7,7 +7,7 @@
 //! `index.json` (supports non-uniform MoE widths without format change).
 //!
 //! See `docs/specs/vindex-format-spec.md` §5.10 and
-//! `experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md`.
+//! `docs/specs/fp4-format-spec.md`.
 
 use std::io::{Read, Write};
 use std::path::Path;

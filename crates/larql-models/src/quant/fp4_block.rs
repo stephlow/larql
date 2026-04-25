@@ -14,7 +14,7 @@
 //! resolution regardless of where each block sits in the overall
 //! weight distribution.
 //!
-//! Format reference: `experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md`.
+//! Format reference: `docs/specs/fp4-format-spec.md`.
 
 use super::fp4;
 use super::fp8;

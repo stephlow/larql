@@ -5,7 +5,7 @@
 **Status:** Implemented (~98%); FP4/FP8 storage in progress (exp 26)
 **Implementation:** `larql-vindex` crate (Rust)
 **Companion specs:** [Operations](vindex-operations-spec.md), [Ecosystem](vindex-ecosystem-spec.md), [LQL](lql-spec.md)
-**Experiment references:** [FP4 format](../../experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md), [FP4 precision policy](../../experiments/26_fp4_quantisation/FP4_PRECISION_POLICY.md)
+**FP4 companion specs:** [FP4 format](fp4-format-spec.md), [FP4 precision policy](fp4-precision-policy.md), [Quantize CLI](quantize-cli-spec.md)
 
 **Implementation coverage:** File layout, binary formats, extract levels, f16 storage, checksums, mmap loading, streaming extraction, `larql verify`, Q4_K quantisation — all implemented. **FP4/FP8 block storage** — codec layer landed (see §5.10), writer and walk-kernel dispatch in progress.
 
@@ -340,11 +340,11 @@ legacy f16 layout.
 `down` projection carries FFN's heaviest-tailed per-feature magnitude
 distribution (exp 26 cross-model data); FP8 E4M3 absorbs that tail
 without any distributional assumption, at an ~8% FFN-vindex cost vs
-uniform FP4. See [precision policy](../../experiments/26_fp4_quantisation/FP4_PRECISION_POLICY.md) §5.
+uniform FP4. See [precision policy](fp4-precision-policy.md) §5.
 
 **Full byte-layout specification** including nibble-order, E2M1 table,
 and E4M3 encoding detail is in the experiment format spec:
-[FP4_FORMAT_SPEC.md](../../experiments/26_fp4_quantisation/FP4_FORMAT_SPEC.md).
+[fp4-format-spec.md](fp4-format-spec.md).
 
 ### 5.11 fp4_compliance.json
 

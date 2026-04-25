@@ -19,7 +19,7 @@ use super::CachedLayerGraph;
 /// a one-shot matvec per generated token — negligible compared to the
 /// per-layer attention + FFN. It lets every model generate tokens through
 /// the Metal pipeline regardless of how its vindex was packaged.
-pub(crate) fn lm_head_topk(
+pub fn lm_head_topk(
     index: &larql_vindex::VectorIndex,
     weights: &ModelWeights,
     query: &ndarray::Array1<f32>,

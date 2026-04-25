@@ -2679,29 +2679,50 @@ fn streaming_extract_q4k_from_safetensors() {
         .map(|i| (i as f32) * 0.01)
         .collect();
 
-    let q_dequant = larql_models::quant::ggml::dequantize_q4_k(slices[0].0, 256).unwrap();
-    for (i, &v) in expected.iter().enumerate() {
-        assert!(
-            (q_dequant[i] - v).abs() < 0.03,
-            "Q[{i}] round-trip diverged: got {}, expected {v}",
-            q_dequant[i]
-        );
-    }
-    // Padded tail zeroes → dequantise to ~0 within block error.
-    for (i, &v) in q_dequant[(hidden * hidden)..].iter().enumerate() {
-        assert!(
-            v.abs() < 0.05,
-            "Q padding[{i}] expected ~0, got {v}"
-        );
+    // The writer's `pad_rows_to_256` zero-extends each row from `hidden`
+    // to 256 cols before quantising, so the dequantised output is a
+    // [hidden × 256] padded matrix, not a flat copy of `expected`.
+    // Map (row, col) of the original to the padded layout for comparison.
+    let padded_cols = 256;
+    let padded_at = |row: usize, col: usize| -> usize { row * padded_cols + col };
+
+    let q_dequant = larql_models::quant::ggml::dequantize_q4_k(
+        slices[0].0, hidden * padded_cols,
+    ).unwrap();
+    for row in 0..hidden {
+        for col in 0..hidden {
+            let i = row * hidden + col;
+            let v = expected[i];
+            let got = q_dequant[padded_at(row, col)];
+            assert!(
+                (got - v).abs() < 0.03,
+                "Q[r{row} c{col}] round-trip diverged: got {got}, expected {v}",
+            );
+        }
+        // Per-row zero pad: cols [hidden..256] should dequantise near zero
+        // (within block error — the row's value range sets the scale).
+        for col in hidden..padded_cols {
+            let got = q_dequant[padded_at(row, col)];
+            assert!(
+                got.abs() < 0.05,
+                "Q padding[r{row} c{col}] expected ~0, got {got}",
+            );
+        }
     }
 
-    let v_dequant = larql_models::quant::ggml::dequantize_q6_k(slices[2].0, 256).unwrap();
-    for (i, &v) in expected.iter().enumerate() {
-        assert!(
-            (v_dequant[i] - v).abs() < 0.01,
-            "V[{i}] round-trip diverged (Q6_K, tighter tolerance): got {}, expected {v}",
-            v_dequant[i]
-        );
+    let v_dequant = larql_models::quant::ggml::dequantize_q6_k(
+        slices[2].0, hidden * padded_cols,
+    ).unwrap();
+    for row in 0..hidden {
+        for col in 0..hidden {
+            let i = row * hidden + col;
+            let v = expected[i];
+            let got = v_dequant[padded_at(row, col)];
+            assert!(
+                (got - v).abs() < 0.01,
+                "V[r{row} c{col}] round-trip diverged (Q6_K): got {got}, expected {v}",
+            );
+        }
     }
 
     let _ = std::fs::remove_dir_all(&model_dir);

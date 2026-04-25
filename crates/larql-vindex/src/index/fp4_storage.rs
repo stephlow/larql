@@ -279,13 +279,22 @@ mod tests {
     use crate::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 
     /// Tempdir that cleans up on drop; stdlib-only so tests don't need a crate.
+    /// Disambiguates with a process-wide atomic counter so parallel tests
+    /// using the same label can't collide (SystemTime::now().as_nanos()
+    /// alone is not granular enough on macOS — we observed two parallel
+    /// tests reading the same nanosecond and stomping each other's files).
     struct TempDir(std::path::PathBuf);
+    static TEMPDIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     impl TempDir {
         fn new(label: &str) -> Self {
             let base = std::env::temp_dir();
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let p = base.join(format!("fp4storage_{label}_{}_{}", std::process::id(), ts));
+            let seq = TEMPDIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = base.join(format!(
+                "fp4storage_{label}_{}_{}_{}",
+                std::process::id(), ts, seq,
+            ));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }

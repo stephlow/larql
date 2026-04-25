@@ -10,13 +10,18 @@
 //!
 //! Lanes stride over sub-blocks (32-value chunks). For K=2560 (80
 //! sub-blocks): 80/32=2.5 per lane → 100% utilisation.
-//! X is loaded cooperatively into 16 KB threadgroup shared memory.
+//! X is read directly from device memory inside the inner loop.
+//! Apple Silicon's L1/L2 cache makes the repeated reads cheap once
+//! X is touched by the first simdgroup; the alternative — caching X
+//! in a `threadgroup float Xsh[]` array — caps K at the
+//! threadgroup-memory limit (4096 floats = 16 KB) and silently
+//! produces garbage at higher K. Mirrors `q4k_qkv_proj` which has
+//! always read X directly and runs cleanly at K=5376 on Gemma 4 31B.
 //! ROWS_PER_TG = 8 (one row per simdgroup).
 
 pub const SHADER: &str = r#"
 constant uint Q4K_ROWS_PER_TG  = 8;
 constant uint Q4K_BLOCK_SIZE   = 144;
-constant uint Q4K_MAX_K        = 4096; // 16 KB threadgroup
 
 kernel void q4k_matvec(
     device const uchar*  W4K   [[buffer(0)]],
@@ -28,16 +33,6 @@ kernel void q4k_matvec(
     uint lane      [[thread_index_in_simdgroup]],
     uint sg_id     [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float Xsh[Q4K_MAX_K];
-    {
-        uint n_threads = Q4K_ROWS_PER_TG * 32u;
-        uint tid = sg_id * 32u + lane;
-        for (uint k = tid; k < K; k += n_threads) {
-            Xsh[k] = X[k];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     uint row_idx = tg_id * Q4K_ROWS_PER_TG + sg_id;
     if (row_idx >= N) return;
 
@@ -79,7 +74,7 @@ kernel void q4k_matvec(
         for (uint l = 0u; l < 32u; l++) {
             uchar byte = qs[l];
             float nib  = hi ? float((byte >> 4u) & 0x0Fu) : float(byte & 0x0Fu);
-            float x    = Xsh[x_base + l];
+            float x    = X[x_base + l];
             dot_acc   = fma(nib, x, dot_acc);
             sum_acc   += x;
         }

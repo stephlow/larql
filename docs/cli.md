@@ -854,6 +854,8 @@ larql convert <SUBCOMMAND>
 | `gguf-to-vindex` | Convert a GGUF model to a vindex (dequantized to f32) |
 | `safetensors-to-vindex` | Convert safetensors model to a vindex |
 | `gguf-info` | Show GGUF file metadata and detected architecture |
+| `quantize fp4` | Quantise an existing f32/f16 vindex to the LARQL FP4/FP8 format |
+| `quantize q4k` | Quantise an existing f32/f16 vindex to GGML Q4_K_M (Ollama-compatible) |
 
 **Examples:**
 
@@ -866,9 +868,27 @@ larql convert gguf-info model-Q4_K_M.gguf
 
 # Convert safetensors to vindex
 larql convert safetensors-to-vindex ./model/ -o model.vindex --level inference --f16
+
+# Quantise an existing f16 vindex to FP4 (Option B: source-dtype gate + FP4 up + FP8 down)
+larql convert quantize fp4 \
+    --input  output/gemma3-4b-f16.vindex \
+    --output output/gemma3-4b-fp4.vindex
+
+# Quantise an existing f16 vindex to Q4_K_M (attn Q/K/O + FFN gate/up at Q4_K, V + FFN down at Q6_K)
+larql convert quantize q4k \
+    --input  output/gemma3-4b-f16.vindex \
+    --output output/gemma3-4b-q4k.vindex
+
+# Q4_K_M with FFN down also at Q4_K (saves ~30 MB/layer on 31B at modest precision cost)
+larql convert quantize q4k \
+    --input  output/gemma4-31b-f16.vindex \
+    --output output/gemma4-31b-q4k.vindex \
+    --down-q4k
 ```
 
 Supported GGUF quantization types for reading: F32, F16, BF16, Q4_0, Q4_1, Q8_0. All tensors are dequantized to f32 during conversion.
+
+**`quantize` family** — see [`docs/specs/quantize-cli-spec.md`](specs/quantize-cli-spec.md) for the full surface (flags, exit codes, output layout, atomic-rename semantics). Both subcommands require the source vindex to carry full model weights (`--level inference` or `--level all`); browse-only sources are rejected with a clear error.
 
 ### `larql hf`
 

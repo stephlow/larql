@@ -2,13 +2,19 @@
 //!
 //! **Parallelism: sub-block stride, 1 row per simdgroup.**
 //!
-//! Lanes stride over sub-blocks. X loaded once into 16 KB shared memory.
+//! Lanes stride over sub-blocks. X is read directly from device memory.
+//! Apple Silicon's L1/L2 cache amortises the repeated reads across the
+//! threadgroup's 8 simdgroups; the alternative — caching X in a
+//! `threadgroup float Xsh[]` — caps K at the threadgroup-memory limit
+//! (4096 floats = 16 KB) and silently produces garbage at higher K.
+//! Mirrors `q4k_qkv_proj`, which has always used the direct-read pattern
+//! and runs cleanly at K=5376 on Gemma 4 31B.
+//!
 //! ROWS_PER_TG=8; dispatch = 2 × ceil(N/8) TGs (gate + up).
 
 pub const SHADER: &str = r#"
 constant uint Q4K_GU_ROWS_PER_TG = 8;
 constant uint Q4K_GU_BLOCK_SIZE  = 144;
-constant uint Q4K_GU_MAX_K       = 4096; // 16 KB
 
 kernel void q4k_ffn_gate_up(
     device const uchar*  Wg    [[buffer(0)]],
@@ -22,16 +28,6 @@ kernel void q4k_ffn_gate_up(
     uint lane      [[thread_index_in_simdgroup]],
     uint sg_id     [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float Xsh[Q4K_GU_MAX_K];
-    {
-        uint n_threads = Q4K_GU_ROWS_PER_TG * 32u;
-        uint tid = sg_id * 32u + lane;
-        for (uint k = tid; k < K; k += n_threads) {
-            Xsh[k] = X[k];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     uint tgs_per_mat = (N + Q4K_GU_ROWS_PER_TG - 1u) / Q4K_GU_ROWS_PER_TG;
     bool is_up  = (tg_id >= tgs_per_mat);
     uint mat_tg = is_up ? (tg_id - tgs_per_mat) : tg_id;
@@ -80,7 +76,7 @@ kernel void q4k_ffn_gate_up(
         for (uint l = 0u; l < 32u; l++) {
             uchar byte = qs[l];
             float nib  = hi ? float((byte >> 4u) & 0x0Fu) : float(byte & 0x0Fu);
-            float x    = Xsh[x_base + l];
+            float x    = X[x_base + l];
             dot_acc   = fma(nib, x, dot_acc);
             sum_acc   += x;
         }

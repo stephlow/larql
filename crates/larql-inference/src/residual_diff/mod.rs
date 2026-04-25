@@ -55,6 +55,8 @@
 
 mod capture;
 mod compare;
+mod stages;
 
 pub use capture::ResidualCapture;
 pub use compare::{compare_captures, LayerStat, ParityReport, ParityThreshold};
+pub use stages::{compare_stages, StageCapture, StagePair, StageReport};
