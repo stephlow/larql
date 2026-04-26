@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::architectures::deepseek::DeepSeekArch;
+use crate::architectures::deepseek_v4::DeepSeekV4Arch;
 use crate::architectures::gemma2::Gemma2Arch;
 use crate::architectures::gemma3::Gemma3Arch;
 use crate::architectures::gemma4::Gemma4Arch;
@@ -88,7 +89,9 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "gpt_oss" => Box::new(GptOssArch::from_config(model_config)),
         // Qwen family (dense and MoE share same keys)
         t if t.starts_with("qwen") => Box::new(QwenArch::from_config(model_config)),
-        // DeepSeek family (MoE + MLA)
+        // DeepSeek-V4 (MoE + MLA + MXFP4 + HCA attention; new tensor naming)
+        "deepseek_v4" => Box::new(DeepSeekV4Arch::from_config(model_config)),
+        // DeepSeek V2/V3 family (MoE + MLA, model.* prefixed keys)
         t if t.starts_with("deepseek") => Box::new(DeepSeekArch::from_config(model_config)),
         // StarCoder 2
         "starcoder2" => Box::new(StarCoder2Arch::from_config(model_config)),
