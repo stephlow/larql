@@ -217,6 +217,7 @@ fn drop_ffn_weights_removes_ffn_tensors() {
         tensors,
         vectors: HashMap::new(),
         raw_bytes: HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
@@ -278,6 +279,7 @@ fn drop_ffn_weights_removes_moe_experts() {
         tensors,
         vectors: HashMap::new(),
         raw_bytes: HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
@@ -886,4 +888,118 @@ fn q8_0_round_trip() {
         .fold(0.0f32, f32::max);
     // Q8 should be much more accurate than Q4
     assert!(max_err < 0.02, "Q8 round-trip max error {max_err} exceeds 0.02");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ModelWeights — drop_attn_weights, drop_lm_head, drop_embed, get_packed_bytes
+// ═══════════════════════════════════════════════════════════════
+
+fn minimal_weights() -> larql_models::ModelWeights {
+    use larql_models::{ModelWeights, WeightArray};
+    use std::collections::HashMap;
+
+    let arch = detect_from_json(&serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 8,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+    }));
+    let small = WeightArray::zeros((2, 4));
+    let mut tensors = HashMap::new();
+    tensors.insert("layers.0.self_attn.q_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.self_attn.k_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.self_attn.v_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.self_attn.o_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.self_attn.q_norm.weight".into(), small.clone());
+    tensors.insert("layers.0.mlp.gate_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.mlp.up_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.mlp.down_proj.weight".into(), small.clone());
+    tensors.insert("layers.0.input_layernorm.weight".into(), small.clone());
+    ModelWeights {
+        tensors,
+        vectors: HashMap::new(),
+        raw_bytes: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_mmaps: HashMap::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed: small.clone(),
+        lm_head: small.clone(),
+        arch,
+        num_layers: 1,
+        hidden_size: 4,
+        intermediate_size: 8,
+        vocab_size: 100,
+        head_dim: 2,
+        num_q_heads: 2,
+        num_kv_heads: 2,
+        rope_base: 10000.0,
+    }
+}
+
+#[test]
+fn drop_attn_weights_removes_qkvo_and_norms() {
+    let mut w = minimal_weights();
+    assert_eq!(w.tensors.len(), 9);
+    let freed = w.drop_attn_weights();
+    assert!(freed > 0);
+    // q/k/v/o + q_norm removed (5 tensors); FFN + norm remain (4)
+    assert_eq!(w.tensors.len(), 4, "expected ffn + layernorm to remain");
+    assert!(!w.tensors.contains_key("layers.0.self_attn.q_proj.weight"));
+    assert!(!w.tensors.contains_key("layers.0.self_attn.q_norm.weight"));
+    assert!(w.tensors.contains_key("layers.0.mlp.gate_proj.weight"));
+    assert!(w.tensors.contains_key("layers.0.input_layernorm.weight"));
+}
+
+#[test]
+fn drop_attn_weights_frees_correct_byte_count() {
+    let mut w = minimal_weights();
+    // 5 attn tensors × (2×4 elements) × 4 bytes = 160 bytes
+    let freed = w.drop_attn_weights();
+    assert_eq!(freed, 5 * 2 * 4 * 4);
+}
+
+#[test]
+fn drop_lm_head_zeroes_matrix_and_reports_freed() {
+    let mut w = minimal_weights();
+    let freed = w.drop_lm_head();
+    assert_eq!(freed, 2 * 4 * 4, "freed should be elem_count × sizeof(f32)");
+    assert_eq!(w.lm_head.shape(), &[0, 0]);
+}
+
+#[test]
+fn drop_embed_zeroes_matrix_and_reports_freed() {
+    let mut w = minimal_weights();
+    let freed = w.drop_embed();
+    assert_eq!(freed, 2 * 4 * 4);
+    assert_eq!(w.embed.shape(), &[0, 0]);
+}
+
+#[test]
+fn get_packed_bytes_from_raw_bytes() {
+    let mut w = minimal_weights();
+    w.raw_bytes.insert("experts.gate_up_proj".into(), vec![1u8, 2, 3, 4]);
+    let bytes = w.get_packed_bytes("experts.gate_up_proj").unwrap();
+    assert_eq!(bytes, &[1u8, 2, 3, 4]);
+}
+
+#[test]
+fn get_packed_bytes_missing_key_returns_none() {
+    let w = minimal_weights();
+    assert!(w.get_packed_bytes("nonexistent.key").is_none());
+}
+
+#[test]
+fn get_packed_bytes_mmap_range_missing_file_falls_through_to_raw() {
+    // packed_byte_ranges points to a file not in packed_mmaps → falls through to raw_bytes.
+    let mut w = minimal_weights();
+    w.raw_bytes.insert("tensor.key".into(), vec![9u8, 8]);
+    w.packed_byte_ranges.insert(
+        "tensor.key".into(),
+        ("missing_file.bin".into(), 0, 2),
+    );
+    // mmap file absent → fallback to raw_bytes
+    let bytes = w.get_packed_bytes("tensor.key").unwrap();
+    assert_eq!(bytes, &[9u8, 8]);
 }

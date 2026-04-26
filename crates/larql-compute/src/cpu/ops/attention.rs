@@ -95,4 +95,44 @@ mod tests {
         let out = causal_attention(&q, &k, &v, seq, dim, 1.0 / (dim as f32).sqrt());
         assert_eq!(out.len(), seq * dim);
     }
+
+    #[test]
+    fn uniform_keys_average_values() {
+        // When all Q and K vectors are identical, the last token attends equally
+        // to all preceding positions, so its output equals the mean of the V vectors.
+        let dim = 4;
+        let seq = 3;
+        let q = vec![1.0f32, 0.0, 0.0, 0.0,  // t=0
+                     1.0,    0.0, 0.0, 0.0,  // t=1
+                     1.0,    0.0, 0.0, 0.0]; // t=2
+        let k = q.clone();
+        let v = vec![
+            1.0, 0.0, 0.0, 0.0,  // v0
+            2.0, 0.0, 0.0, 0.0,  // v1
+            3.0, 0.0, 0.0, 0.0,  // v2
+        ];
+        let scale = 1.0 / (dim as f32).sqrt();
+        let out = causal_attention(&q, &k, &v, seq, dim, scale);
+        // t=2 attends uniformly to t=0,1,2 → dim-0 = (1+2+3)/3 = 2.0
+        let t2 = &out[2 * dim..3 * dim];
+        assert!((t2[0] - 2.0).abs() < 1e-4, "expected 2.0, got {}", t2[0]);
+        assert!(t2[1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn later_positions_cannot_see_future() {
+        // t=0 sees only itself. t=1 sees t=0 and t=1.
+        // Encode v0=[10,0], v1=[0,10] so we can tell which positions were attended.
+        let dim = 2;
+        let q = vec![1.0f32, 0.0,  1.0, 0.0];
+        let k = vec![1.0f32, 0.0,  1.0, 0.0];
+        let v = vec![10.0f32, 0.0,  0.0, 10.0];
+        let out = causal_attention(&q, &k, &v, 2, dim, 1.0);
+        // t=0 sees only v0 → [10, 0]
+        assert!((out[0] - 10.0).abs() < 1e-4);
+        assert!(out[1].abs() < 1e-4);
+        // t=1 sees v0 and v1 equally → [5, 5]
+        assert!((out[2] - 5.0).abs() < 1e-4);
+        assert!((out[3] - 5.0).abs() < 1e-4);
+    }
 }

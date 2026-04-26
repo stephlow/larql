@@ -206,6 +206,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
 
     let weights = ModelWeights {
         tensors, vectors, raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed, lm_head,

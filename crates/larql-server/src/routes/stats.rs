@@ -58,6 +58,27 @@ fn build_stats(model: &LoadedModel) -> serde_json::Value {
     })
 }
 
+/// Async wrapper for the Q4K cache + W2 surface. The base
+/// `build_stats` stays sync so the existing single-/multi-model
+/// handlers don't change shape; this overlay merges the `q4k_ffn`
+/// block in once we have an `.await`-friendly read guard.
+async fn add_q4k_ffn(model: &LoadedModel, mut stats: serde_json::Value) -> serde_json::Value {
+    let p = model.patched.read().await;
+    let (slots, bytes) = p.base.q4k_ffn_cache_stats();
+    let has_fm = p.base.has_down_features_q4k();
+    if let Some(obj) = stats.as_object_mut() {
+        obj.insert(
+            "q4k_ffn".into(),
+            serde_json::json!({
+                "cache_slots": slots,
+                "cache_bytes": bytes,
+                "feature_major_down": has_fm,
+            }),
+        );
+    }
+    stats
+}
+
 pub async fn handle_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
@@ -65,7 +86,8 @@ pub async fn handle_stats(
     let model = state
         .model(None)
         .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
-    Ok(Json(build_stats(model)))
+    let stats = build_stats(model);
+    Ok(Json(add_q4k_ffn(model, stats).await))
 }
 
 pub async fn handle_stats_multi(
@@ -76,5 +98,6 @@ pub async fn handle_stats_multi(
     let model = state
         .model(Some(&model_id))
         .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
-    Ok(Json(build_stats(model)))
+    let stats = build_stats(model);
+    Ok(Json(add_q4k_ffn(model, stats).await))
 }

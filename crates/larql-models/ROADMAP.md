@@ -1,27 +1,46 @@
 # Roadmap — larql-models
 
-## Current: 12 architectures, 130 tests, safetensors + GGUF loading
+## Current: 12 architectures, 221 tests, safetensors + GGUF loading
 
-## P0: Complete Gemma 4 Support
+## P0: Code Quality (from 2026-04-26 review)
 
-### Wire v_shares_k into inference forward pass
-**Impact**: Correct K=V handling without runtime tensor probing  
+### Fix silent dtype skip in safetensors loader
+**Impact**: Unsupported dtypes drop silently — no warning, no error  
+**Effort**: Tiny  
+**Status**: Done 2026-04-26
+
+Added `skipped_tensors: Vec<(String, String)>` to `ModelWeights`. Both silent-skip sites in `loading/safetensors.rs` now pattern-match `UnsupportedDtype` explicitly (collecting key + dtype name) and bubble up any other error with `return Err(e)` rather than swallowing it. Callers can inspect `weights.skipped_tensors` to see which tensors were skipped and why (integer tensors like attention masks are benign; unexpected entries indicate a format gap).
+
+### Tests for `q4k_row_scaled_add` / `q6k_row_scaled_add` / NEON vs scalar parity
+**Impact**: NEON paths on hot decode path are untested  
 **Effort**: Low  
-**Status**: Trait method done (returns `config.attention_k_eq_v`), inference wiring pending
+**Status**: Done 2026-04-26 — 10 new tests added; `q4k_row_dot_scalar` exposed as `pub(super)` to match q6k pattern
 
-Currently the inference crate detects K=V by checking for missing v_proj tensors at runtime. Now that `v_shares_k()` exposes the config flag, the forward pass should use it directly.
+Tests added:
+- `q4k_row_dot_neon_matches_scalar_{single,multi}_block`
+- `q4k_row_dot_matches_dequantized_dot`
+- `q4_k_dequantize_known_nonzero_values` (verifies exact decoded values, not just shape)
+- `q4k_row_scaled_add_matches_alpha_times_deq`
+- `q6k_row_scaled_add_matches_alpha_times_deq`
+- `q{4,6}k_row_scaled_add_rejects_misaligned`
 
-### Validate PLE (per-layer embeddings) end-to-end
-**Impact**: Correct Gemma 4 E2B inference  
-**Effort**: Medium  
-**Status**: Keys and config parsed, forward pass not yet wired
+### Constants for config field name variants
+**Impact**: grep confusion when a new config alias appears  
+**Effort**: Tiny  
+**Status**: Done 2026-04-26 — `NUM_EXPERTS_KEYS`, `NUM_EXPERTS_PER_TOK_KEYS` consts + `field_u64` helper in `detect.rs`. Adding a new alias is a one-line change to the const.
 
-PLE adds a gated embedding lookup per layer. Keys (`per_layer_embed_key`, `per_layer_input_gate_key`, `per_layer_projection_key`, `post_per_layer_input_norm_key`) are all implemented. Need to wire into inference and verify against HuggingFace reference outputs.
+### `normalize_key` / `normalize_key_pub` duplication
+**Impact**: Dead indirection  
+**Effort**: Tiny  
+**Status**: Done 2026-04-26 — `normalize_key_pub` removed, `normalize_key` promoted to `pub(crate)`, `gguf.rs` call site updated.
 
-### KV layer sharing in inference
-**Impact**: Memory savings for Gemma 4 (20 shared layers = 20 fewer KV caches)  
-**Effort**: Medium  
-**Status**: `kv_shared_source_layer()` returns correct sources, KV cache not yet shared
+### Consolidate MXFP4 dequant into `quant/mxfp4.rs`
+**Impact**: Logical cohesion — MXFP4 decode is split between `loading/safetensors.rs:288–383` and `quant/mxfp4.rs`  
+**Effort**: Low  
+**Status**: Done 2026-04-26 — `split_gate_up_experts` added to `quant/mxfp4.rs` (GPT-OSS fused gate/up split logic + 2 tests). Loading function renamed `load_mxfp4_expert_tensors`, unused `_vectors` param removed, down projection loop uses `into_iter` to avoid `.clone()`.
+
+### Note on quant/dequant crate split
+**Decision**: `larql-models/quant/` is **format deserialization** (GGUF/safetensors → f32). `larql-compute` has **compute operations** (quantized matvec, Metal shaders). The split is correct. The `f16_to_f32` copies in `larql-compute/cpu/ops/q4k_matvec.rs` and `q6k_matvec.rs` are intentional — CPU reference impls for Metal shader testing, isolated by design. `larql-compute` is dev-only dep; don't flip that direction.
 
 ## P1: Architecture Coverage
 
@@ -103,6 +122,11 @@ Add a `validate()` method to `ModelArchitecture` that checks for inconsistencies
 | v_shares_k from config | 2026-04-07 | Uses attention_k_eq_v flag instead of hardcoded false |
 | Gemma 3 qk_norm_weight_offset | 2026-04-07 | Was missing (Gemma 2 had it, Gemma 3 didn't) |
 | Full test coverage (130 tests) | 2026-04-07 | All 12 architectures tested: Gemma 2/3/4, Llama, Mistral, Mixtral, Qwen, DeepSeek, GPT-OSS, Granite, StarCoder2, Generic |
+| GGML quant test gaps closed (51 tests) | 2026-04-26 | q4k_row_dot NEON≡scalar, q4k/q6k scaled_add correctness, Q4_K known nonzero values |
+| Silent dtype skip fixed | 2026-04-26 | `skipped_tensors` field on ModelWeights; UnsupportedDtype collected, other errors bubbled |
+| normalize_key_pub removed | 2026-04-26 | Dead wrapper gone; `normalize_key` is `pub(crate)` |
+| Config alias constants | 2026-04-26 | `NUM_EXPERTS_KEYS`, `NUM_EXPERTS_PER_TOK_KEYS`, `field_u64` helper in `detect.rs` |
+| MXFP4 consolidation | 2026-04-26 | `split_gate_up_experts` in `quant/mxfp4.rs`; loader thinned + renamed |
 | Clippy clean (zero warnings) | 2026-04-07 | lib + examples + tests all pass `-D warnings` |
 | Documentation suite | 2026-04-07 | README, ROADMAP, PERFORMANCE, 3 docs, 6 ADRs |
 | Example suite (3 demos) | 2026-04-07 | architecture_demo (all 12), demo_tensor_keys (all 12), demo_loading |

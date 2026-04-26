@@ -8,86 +8,78 @@ How `decode_token` processes one token through all layers with KV cache.
 Input: x[hidden] (embedded token)
 Output: h[hidden] (final hidden state for logit projection)
 
-Per layer (single encoder, ~10 dispatches):
-  1. Input norm
-  2. Fused QKV projection (Q4_K or Q4_KF)
-  3. Batched RoPE (all Q heads + all K heads = 2 dispatches)
+Per layer (~11 dispatches, all in a SINGLE Metal encoder):
+  1. Fused norm + QKV projection (q4k_q6k_qkv_proj_normed — 1 dispatch)
+     OR: rms_norm (1) + q4k_q6k_qkv_proj (1) = 2 dispatches
+  2. Fused QK-norm Q+K (qk_norm_qk — 1 dispatch, was 2)
+  3. Fused RoPE Q+K (rope_at_pos_batched_qk — 1 dispatch, was 2)
   4. Batched V-norm (optional, Gemma 4)
   5. KV cache append + attend (SIMD reductions)
-  6. O projection
-  7. Residual + norm (f32 for Q4_K/Q4_KF, +Q8 for Q4_0)
-  8. FFN: fused gate+up (or separate) + GEGLU + down
-  9. Post-FFN residual + optional layer scalar
+  6. O projection (q4k_matvec)
+  7. Fused residual+norm (residual_norm_store — 1 dispatch, writes both
+     ffn_norm_out and h_post_attn; was 2 dispatches)
+  8. FFN gate+up fused (q4k_ffn_gate_up — 1 dispatch)
+  9. GEGLU activation
+ 10. FFN down (q6k_matvec)
+ 11. Post-FFN residual add
 ```
+
+All layers run in a **single Metal command buffer with a single global encoder**.
+No per-layer encoder create/end overhead. Apple Silicon serialises compute
+dispatches within an encoder so no explicit barriers are needed.
+
+## Dispatch fusion history
+
+Starting from ~14 dispatches/layer (476/token), 5 fusions land in 2026-04-25:
+
+| Fusion | Dispatches saved | Technique |
+|---|---|---|
+| `qk_norm_qk` | 34/token | One dispatch for Q+K heads instead of two |
+| `rope_at_pos_batched_qk` | 34/token | One dispatch for Q+K heads |
+| `residual_norm_store` | 34/token | Writes normed + raw sum simultaneously |
+| `q4k_q6k_qkv_proj_normed` | 34/token | Norm computed inline in QKV TGs |
+
+Current: **~374 dispatches/token** (~1.9ms overhead at 5µs/dispatch).
+Ollama estimate: ~272 dispatches (~1.4ms).
 
 ## Dual-Path Architecture
 
-Weights are either Q4_K (Ollama strategy, smaller) or Q8_0 (higher precision).
-`decode_token` auto-detects from `FullPipelineLayer.wq.format`.
+`decode_token` auto-detects the weight format from `FullPipelineLayer.wq.format`.
 
-### Q4_KF Path (fastest — llama.cpp-exact kernel)
+### Q4_K + Q6_K Path (production — Gemma 3 / 4 Ollama extracts)
 
 ```
 h_buf [f32]
-  → rms_norm → norm_f32 [f32]
-  → q4kf_qkv_proj (fused, GGUF format) → Q, K, V [f32]
-  → rope_at_pos_batched (Q heads) + rope_at_pos_batched (K heads)
+  → q4k_q6k_qkv_proj_normed (RMS norm inline + fused Q4_K Q/K + Q6_K V)
+  → qk_norm_qk (fused Q+K norm)
+  → rope_at_pos_batched_qk (fused Q+K RoPE)
   → v_norm_batched (optional, Gemma 4)
-  → kv_cache_append + kv_attention (simd_max/simd_sum)
-  → q4kf_proj (O projection)
-  → residual_norm → ffn_norm_out [f32], residual_add → h_post_attn [f32]
-  → q4kf_proj (gate) + q4kf_proj (up) → geglu → q4kf_proj (down)
-  → residual_add → h_buf [f32] for next layer
+  → kv_cache_append + kv_attention
+  → q4k_matvec (O projection)
+  → residual_norm_store → ffn_norm_out [f32] + h_post_attn [f32]
+  → q4k_ffn_gate_up → geglu_gelu_tanh → q6k_matvec (down)
+  → residual_add → h_buf [f32]
 ```
 
-Advantages: llama.cpp-exact inner loop, register-cached input, native half reads, uint16 nibble masking. ~1.25x Ollama.
-
-### Q4_K Path
+### Q4_KF Path (fastest for Q4_KF vindexes)
 
 ```
 h_buf [f32]
   → rms_norm → norm_f32 [f32]
-  → q4k_qkv_proj (fused) → Q, K, V [f32]
-  → rope_at_pos_batched + kv_cache_append + kv_attention
-  → q4k_proj (O projection)
-  → residual_norm → ffn_norm_out [f32], residual_add → h_post_attn [f32]
-  → q4k_ffn_gate_up (fused, one dispatch) → geglu → q4k_matvec (down)
-  → residual_add → h_buf [f32] for next layer
+  → q4kf_qkv_proj → Q, K, V [f32]
+  → rope_at_pos_batched_qk + kv_attach
+  → q4kf_proj (O) → residual_norm_store → FFN via q4kf_proj
 ```
 
-Advantages: Fused gate+up (one dispatch), uint4 loads, 8 rows/TG, multi-row (nr0=2). ~2.0x Ollama.
-
-### Q8 Path
+### Q8 Path (legacy)
 
 ```
 h_buf [f32]
-  → rms_norm_q8 (fused) → q8_buf [int8], q8s_buf [f32]
-  → q8_qkv_proj (fused) → Q, K, V [f32]
-  → kv_cache_append → kv_attention → attn_out [f32]
-  → quantize_q8 → q8_attn [int8]
-  → q8_matvec (O proj) → o_out [f32]
-  → residual_norm_q8 (fused) → FFN path (same as Q4_K)
+  → rms_norm_q8 (fused) → q8_buf + q8s_buf
+  → q8_qkv_proj → Q, K, V → kv_attend
+  → quantize_q8 → q8_matvec (O)
+  → residual_norm_q8 → FFN (same as Q4_K)
 ```
-
-Advantages: Higher precision QKV. Established path with integer inner loop.
-
-## Metal Dispatch Structure
-
-Single Metal command buffer for all layers. One encoder per layer, no explicit memory barriers
-(Apple Silicon serialises compute dispatches within an encoder).
-
-Current dispatch count per layer: ~10
-- Input norm (1)
-- Fused QKV projection (1)
-- Batched RoPE Q + K (2)
-- Batched V-norm (0 or 1)
-- KV append + attend (2)
-- O projection (1)
-- Residual + norm (1)
-- FFN: gate+up fused or separate + GEGLU + down (2–3)
-- Post-FFN residual (1)
-
-Total for 34 layers: ~340 dispatches in 34 encoders, 1 command buffer, 1 commit+wait.
 
 ## KV Cache
 
@@ -99,43 +91,23 @@ pub struct KVCache {
 pub struct LayerKVCache {
     pub k_cache: Buffer,    // [max_seq, num_kv_heads, head_dim] f32
     pub v_cache: Buffer,    // same
-    pub current_len: usize, // tokens cached so far
-    pub max_seq: usize,     // capacity (default 4096)
+    pub current_len: usize,
+    pub max_seq: usize,     // default 4096
 }
 ```
 
-- Populated during prefill via `populate_kv_layer` (CPU → GPU copy)
-- Extended during decode via `kv_cache_append` shader
-- `kv_attention` shader attends Q against all cached K/V (positions 0..current_len)
+Populated during prefill; extended by `kv_cache_append` each decode step.
+`kv_attention` attends Q against all cached K/V (positions 0..current_len).
 
-## Prefill Pipeline (seq > 1)
+## Performance (M3 Max, Gemma 3 4B, 2026-04-25)
 
-`prefill_q4` in `metal/prefill.rs` handles multi-token prefill on GPU:
-- Per-position Q4_K projection dispatch within one command buffer
-- Fused attention with skip_rope and rotary_dim flags (partial RoPE for Gemma 4)
-- KV cache populated via CPU `prefill_with_kv` after GPU forward pass
+| Path | GPU fwd | tok/s | vs Ollama |
+|---|---|---|---|
+| **Q4_K+Q6_K decode (34L)** | **11.1ms** | **75–77** | **1.28–1.30×** |
+| Ollama gemma3:4b | ~8.5ms | 97–103 | 1.0× |
 
-## Performance (M3 Max, Gemma 3 4B, 2026-04-09)
+Per-stage: GPU fwd 83%, lm_head 17%.
 
-| Path | Time | tok/s | vs Ollama |
-|------|------|-------|-----------|
-| **Q4_KF decode (34L)** | **8.5ms** | **117** | **0.83x (17% faster)** |
-| Q4_K decode (21L) | 11.6ms | 86 | 1.13x |
-| Q8 decode (21L) | 19.3ms | 52 | — |
-| Ollama (34L) | 10.3ms | 98 | 1.0x |
-
-### Component Breakdown (34 layers)
-
-| Component | Time | Per-Layer | % |
-|-----------|------|-----------|---|
-| FFN (gate+up+GEGLU+down) | 6.1ms | 0.179ms | 33% |
-| QKV projection | 1.3ms | 0.037ms | 7% |
-| O projection | 0.8ms | 0.024ms | 5% |
-| KV attend + norms + residual | 0.5ms | 0.015ms | 3% |
-
-### Key: Cooperative SIMD Norms
-
-All norm kernels (rms_norm, residual_norm, residual_norm_q8) use cooperative SIMD
-reduction for sum_sq. Each thread computes a partial sum over a stripe of elements,
-then simd_sum + threadgroup reduction produces the global result. This is O(N) reads
-vs the previous O(N²) where every thread redundantly read all elements.
+Effective bandwidth: LARQL ~329 GB/s, Ollama ~348 GB/s.
+Total weight data per token: 3029 MB (34 layers × 89.1 MB/layer).
+See `PERFORMANCE.md` for the full bandwidth budget and gap analysis.

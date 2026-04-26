@@ -1,6 +1,6 @@
 # larql-compute examples
 
-Nine examples in three groups. Run any with:
+Examples in three groups. Run any with:
 
 ```
 cargo run --release --features metal -p larql-compute --example <name>
@@ -16,22 +16,18 @@ cargo run --release --features metal -p larql-compute --example <name>
 
 ## Compares — full-pipeline benchmarks
 
-These measure **end-to-end** decode/generation throughput. Different
-surface from `benches/quant_matvec.rs` (which measures *kernel*-level
-throughput). Run with `cargo run --release --features metal …`; they
-print tok/s + per-stage breakdowns.
+End-to-end decode/generation throughput. Different surface from `benches/quant_matvec.rs`
+(which measures kernel-level throughput). Run with `--release --features metal`.
 
 | Example | What it measures |
 |---|---|
 | `compare_decode` | Q4_K decode latency through `decode_token` with KV cache. The production decode path. |
-| `compare_formats` | Q4_KF (pre-baked scales) vs Q4_K vs Q8 — quant-format tradeoff inside the same model geometry. |
+| `compare_formats` | Q4_KF (pre-baked scales) vs Q4_K vs Q8 — quant-format tradeoff. |
 | `compare_generation` | End-to-end token generation throughput — the headline tok/s figure. |
-| `compare_ollama` | Head-to-head LARQL vs Ollama on the same machine, same model. The external benchmark. |
+| `compare_ollama` | Head-to-head LARQL vs Ollama on the same machine, same model. |
 | `compare_pipeline` | Q4_K fused-QKV vs Q8 fused-QKV through `full_pipeline_q4`. |
 
-For *kernel*-level throughput regressions (the bug class
-`q4_matvec_v4` 75 %-row drop fell into), use the criterion bench
-suite instead:
+For kernel-level throughput regressions, use the criterion bench suite:
 
 ```
 make bench           # run all kernel benches
@@ -39,18 +35,33 @@ make bench-save      # record baseline
 make bench-check     # fail if any cell regressed
 ```
 
-See `benches/quant_matvec.rs`.
+## Diagnostics (`diag_*`) — investigate production issues
 
-## Debug — diagnostic tools
+These are operational tools, not tutorials. They answer specific questions
+about where time goes or why output diverges. They require `--features metal`
+and a real vindex or production-shape synthetic data.
 
-| Example | What it does |
+| Example | Question it answers |
 |---|---|
-| `debug_decode_pipeline` | Per-stage buffer reads in the decode pipeline — useful for bisecting CPU/Metal divergence at a specific layer/stage. Pair with `LARQL_METAL_DUMP_LAYERS=<dir>` and the residual-diff test in `larql-inference`. |
+| `diag_profile_kernels` | **Where does GPU time go per kernel?** Measures each production kernel (q6k_matvec, q4k_ffn_gate_up, QKV, lm_head) in isolation and batched (34× in one command buffer). Reports GB/s vs theoretical peak, revealing compute-bound vs bandwidth-bound. |
+| `diag_decode_pipeline` | **Which layer/stage first diverges from CPU?** Per-stage buffer reads with `LARQL_METAL_DUMP_LAYERS=<dir>` for bisecting CPU/Metal divergence. |
 
-## Why so few?
+Usage:
 
-This crate used to ship 25 examples, mostly ad-hoc `Instant::now()`
-profilers (`profile_*.rs`, `best_*.rs`) that have been superseded by
-the proper criterion bench suite under `benches/`. Examples here
-should either *teach the API* (the demos) or *answer a measurement
-question that's outside criterion's surface* (the compares + debug).
+```bash
+# Per-kernel bandwidth profiler — runs 50 iterations per kernel, batched x34
+cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+
+# Decode pipeline stage bisect — dumps per-stage f32 files for diffing
+LARQL_METAL_DUMP_LAYERS=/tmp/decode_dump \
+cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
+```
+
+### When to use each
+
+| Symptom | Tool |
+|---|---|
+| Overall tok/s regressed | `larql bench` + criterion bench suite |
+| Specific kernel slower than expected | `diag_profile_kernels` |
+| Metal and CPU produce different outputs | `diag_decode_pipeline` + `larql-inference/tests/test_decode_stage_bisect.rs` |
+| NaN appearing in decode | `LARQL_DECODE_DIAG_LAYER=<n>` env var in `decode/diag.rs` |

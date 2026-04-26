@@ -524,6 +524,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
     let embed = embed.into_shared();
     larql_models::ModelWeights {
         tensors, vectors, raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed: embed.clone(), lm_head: embed.clone(),

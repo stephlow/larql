@@ -84,6 +84,21 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
     }
 }
 
+// ── Config field name aliases ────────────────────────────────────────────────
+// Different model families use different JSON keys for the same concept.
+// Ordering is priority: first match wins.
+
+/// Total routed expert count: DeepSeek, Qwen MoE, Mixtral variants.
+const NUM_EXPERTS_KEYS: &[&str] = &["n_routed_experts", "num_local_experts", "num_experts"];
+
+/// Experts activated per token: llama.cpp / HF spelling variants.
+const NUM_EXPERTS_PER_TOK_KEYS: &[&str] = &["num_experts_per_tok", "num_experts_per_token"];
+
+/// Return the first `u64` found under any of `keys` in `config`.
+fn field_u64(config: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| config[k].as_u64())
+}
+
 /// Parse ModelConfig from a config.json value.
 /// Handles both top-level and nested text_config (multimodal models).
 fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
@@ -135,15 +150,9 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let sliding_window = text_config["sliding_window"].as_u64().map(|v| v as usize);
 
     // MoE fields
-    let num_experts = text_config["n_routed_experts"]
-        .as_u64()
-        .or_else(|| text_config["num_local_experts"].as_u64())
-        .or_else(|| text_config["num_experts"].as_u64())
-        .map(|v| v as usize);
-    let num_experts_per_token = text_config["num_experts_per_tok"]
-        .as_u64()
-        .or_else(|| text_config["num_experts_per_token"].as_u64())
-        .map(|v| v as usize);
+    let num_experts = field_u64(text_config, NUM_EXPERTS_KEYS).map(|v| v as usize);
+    let num_experts_per_token =
+        field_u64(text_config, NUM_EXPERTS_PER_TOK_KEYS).map(|v| v as usize);
     let num_shared_experts = text_config["n_shared_experts"].as_u64().map(|v| v as usize);
     // Gemma 4 A4B hybrid MoE fields
     let enable_moe_block = text_config["enable_moe_block"].as_bool().unwrap_or(false);

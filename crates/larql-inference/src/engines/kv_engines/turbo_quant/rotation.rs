@@ -6,7 +6,6 @@
 ///
 /// Complexity: O(d log d) — d/2 butterfly operations per stage, log2(d) stages.
 /// For d=256: 8 stages × 128 butterflies = 1024 operations.
-
 /// In-place WHT on a power-of-2 length buffer.
 /// Applies deterministic sign flips before the transform for better decorrelation.
 /// Output is scaled by 1/sqrt(d) so the transform is orthonormal (self-inverse).

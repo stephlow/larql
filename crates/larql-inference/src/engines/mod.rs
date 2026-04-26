@@ -11,6 +11,8 @@
 pub mod accuracy;
 pub mod kv_engines;
 pub mod profiler;
+#[cfg(test)]
+pub mod test_utils;
 
 // Convenience re-exports so existing `engines::markov_residual::*` paths keep working.
 pub use kv_engines::apollo;
@@ -286,5 +288,105 @@ mod tests {
         };
         let s = info.summary();
         assert!(!s.contains("()"));
+    }
+}
+
+// ─── Cross-engine trait compliance ───────────────────────────────────────────
+
+#[cfg(test)]
+mod compliance_tests {
+    use super::*;
+    use larql_compute::cpu_backend;
+
+    fn all_kinds() -> Vec<EngineKind> {
+        vec![
+            EngineKind::MarkovResidual { window_size: None },
+            EngineKind::MarkovResidual { window_size: Some(32) },
+            EngineKind::UnlimitedContext { window_size: 64 },
+            EngineKind::TurboQuant { bits: 4 },
+            EngineKind::TurboQuant { bits: 3 },
+            EngineKind::Apollo { injection_layer: 30, inject_coefficient: 10.0, top_k: 8 },
+        ]
+    }
+
+    #[test]
+    fn all_engines_memory_zero_before_prefill() {
+        for kind in all_kinds() {
+            let engine = kind.clone().build(cpu_backend());
+            assert_eq!(engine.memory_bytes(), 0,
+                "{} should have 0 memory before prefill", kind.display_name());
+        }
+    }
+
+    #[test]
+    fn all_engines_have_valid_name() {
+        let expected = ["markov-rs", "markov-rs", "unlimited-context", "turbo-quant", "turbo-quant", "apollo"];
+        for (kind, expected_name) in all_kinds().into_iter().zip(expected.iter()) {
+            let engine = kind.build(cpu_backend());
+            assert_eq!(engine.name(), *expected_name);
+        }
+    }
+
+    #[test]
+    fn all_engines_info_has_nonempty_fields() {
+        for kind in all_kinds() {
+            let name = kind.display_name();
+            let engine = kind.build(cpu_backend());
+            let info = engine.info();
+            assert!(!info.name.is_empty(),    "{name}: empty name");
+            assert!(!info.backend.is_empty(), "{name}: empty backend");
+        }
+    }
+
+    #[test]
+    fn all_engines_window_tokens_zero_before_prefill() {
+        for kind in all_kinds() {
+            let engine = kind.clone().build(cpu_backend());
+            assert_eq!(engine.window_tokens(), 0,
+                "{} window_tokens should be 0 before prefill", kind.display_name());
+        }
+    }
+
+    #[test]
+    fn all_engines_cold_bytes_zero_before_prefill() {
+        for kind in all_kinds() {
+            let engine = kind.clone().build(cpu_backend());
+            assert_eq!(engine.cold_bytes(), 0,
+                "{} cold_bytes should be 0 before prefill", kind.display_name());
+        }
+    }
+
+    #[test]
+    fn all_engines_stage_summary_none_before_decode() {
+        for kind in all_kinds() {
+            let engine = kind.clone().build_with_profiling(cpu_backend(), true);
+            assert!(engine.stage_summary().is_none(),
+                "{} stage_summary should be None before decode", kind.display_name());
+        }
+    }
+
+    #[test]
+    fn from_name_unknown_param_ignored_defaults_apply() {
+        match EngineKind::from_name("unlimited-context:unknown=42") {
+            Some(EngineKind::UnlimitedContext { window_size: 512 }) => {}
+            other => panic!("unknown param should use default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_name_all_engines_parseable() {
+        let specs = [
+            ("markov-rs", "markov-rs"),
+            ("unlimited-context", "unlimited-context"),
+            ("turbo-quant", "turbo-quant"),
+            ("tq3", "turbo-quant"),
+            ("apollo", "apollo"),
+        ];
+        for (spec, expected_display) in specs {
+            let kind = EngineKind::from_name(spec)
+                .unwrap_or_else(|| panic!("{spec:?} failed to parse"));
+            assert_eq!(kind.display_name(), expected_display,
+                "{spec} parsed to wrong display_name");
+        }
     }
 }

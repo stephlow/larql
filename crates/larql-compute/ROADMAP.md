@@ -1,27 +1,41 @@
 # Roadmap — larql-compute
 
-## Current state (2026-04-25, M3 Max, real vindex)
+## Current state (2026-04-26, M3 Max, real vindex)
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **75–77** | 13.0 | 5 dispatch fusions + Q6K/Q4K interleaving |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **74–75** | 13.4 | measured 2026-04-26 |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **97–99** | 10.1 | reference |
-| **Gap** | LARQL is **1.28–1.30×** slower | +3.1ms/tok | per-stage decomposition below |
+| **Ollama** gemma3:4b | **100–103** | 9.97 | reference (same hardware, same prompt) |
+| **Gap** | LARQL is **1.34–1.35×** slower | +3.5ms/tok | per-stage decomposition below |
 
-Per-stage breakdown (larql-metal, gemma3-4b-q4k-v2, 120-token run):
+Per-stage (100-token run, 8 warmup):
 
-| Stage | ms/tok | % |
-|---|---|---|
-| GPU fwd | 11.2 | 83% |
-| lm_head | 2.27 | 17% |
+| Stage | LARQL | Ollama (est.) | Gap |
+|---|---|---|---|
+| GPU fwd | 11.26ms | ~8.7ms | ~2.6ms |
+| lm_head | 2.45ms | ~1.3ms | ~1.15ms |
+| **Total** | **13.44ms** | **9.97ms** | **3.47ms** |
 
-**Gap analysis (2026-04-25):**
-- LARQL dispatch: ~408 dispatches × 5µs ≈ 2.0ms (reduced from 2.4ms after QK-norm+RoPE fusion)
-- LARQL kernel time: 11.2 - 2.0 = **9.2ms** → **329 GB/s**
-- Ollama kernel time: ~10.1 - 1.4 = **8.7ms** → **348 GB/s**
-- Kernel gap: ~0.5ms. Dispatch gap: ~0.6ms. lm_head gap: ~0.8ms.
-See `PERFORMANCE.md` for the full bandwidth budget and llama.cpp comparison.
+**Gap analysis (2026-04-26, measured + per-kernel profiling):**
+
+| Source | LARQL | Ollama (est.) | Gap |
+|---|---|---|---|
+| Dispatch overhead | ~1.87ms (374 × 5µs) | ~1.36ms (272 × 5µs) | **0.51ms** |
+| Kernel compute | ~9.39ms | ~7.31ms | **2.08ms** |
+| lm_head overhead | 2.45ms | ~1.30ms | **1.15ms** |
+
+**Per-kernel profiler results** (run `diag_profile_kernels`, see PERFORMANCE.md):
+
+| Kernel | Batched GB/s | ms/tok | Bottleneck |
+|---|---|---|---|
+| q6k_matvec (down, K=10240) | 312 GB/s | 2.34ms | bandwidth-bound |
+| q4k_ffn_gate_up (gate+up, K=2560) | 272 GB/s | 3.68ms | **compute-bound** (dequant) |
+| f32_gemv (lm_head) | 370 GB/s | 7.4ms | bandwidth-bound (near peak) |
+
+Down + gate+up = **6.01ms/tok** of the ~11.7ms GPU fwd. Gate+up is compute-bound
+because Q4_K at K=2560 has the lowest bytes/element (0.5625 B/elem) — the GPU
+spends more cycles on nibble dequant arithmetic than waiting for LPDDR5X.
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
@@ -31,25 +45,25 @@ convention); the q4_KF fast-path doesn't apply to those.
 
 ## P0: Production gap closers
 
-Remaining gap: **1.33×** (72 vs 98 tok/s, 3.7ms/tok). Three sources ranked by size:
+Remaining gap: **1.34–1.35×** (74 vs 100 tok/s, 3.5ms/tok).
 
-| # | Item | Gap | Status |
-|---|---|---|---|
-| **6** | Q4_K matvec rewrite (llama.cpp interleave + preload) | **~1.5ms** | open |
-| **7** | Dispatch fusion (norm+QKV, QK-norm Q+K, RoPE Q+K) | **~1.0ms** | open |
-| **4** | LM head async readback + GPU top-k | **~0.5ms** | partial |
-| — | Other (attention, residuals, activation) | ~0.7ms | unclear |
+| Source | Gap | Actionable items |
+|---|---|---|
+| **Kernel compute** | **2.08ms** | llama.cpp Q4_K port (`yl[]/yh[]` + `float4`), Q6_K further tuning |
+| **lm_head overhead** | **1.15ms** | Async GPU readback, GPU-side top-k |
+| **Dispatch overhead** | **0.51ms** | Mostly addressed; few fusions remain |
 
-**Updated analysis (2026-04-25 post Q4_K rewrite):**
-- LARQL kernel time: 9.2ms → **328 GB/s** effective bandwidth
-- Ollama kernel time: 8.4ms → **359 GB/s** effective bandwidth
-- Kernel efficiency gap: 0.78ms → closing it reaches **102 tok/s** (Ollama parity)
-- Dispatch gap: 1.02ms → closing it alone reaches **~94 tok/s**
+**Achievable targets (additive):**
+- Fix dispatch only → **~77 tok/s**
+- Fix dispatch + lm_head → **~87 tok/s**
+- Fix all three → **~94 tok/s** (~Ollama parity; residual gap from measurement noise)
 
-**#7 (dispatch fusion) is now the highest-leverage remaining item.**
-#6 (Q4_K kernel) had limited gain because K=2560 fits in L1 cache — the
-inter-superblock optimization only helps when K is large enough to be DRAM-bound
-(Q6_K down with K=10240 was 4× larger and got the big gain).
+**Key finding from per-kernel profiler (`diag_profile_kernels`):**
+Gate+up is COMPUTE-BOUND at 272 GB/s (K=2560, 0.5625 B/elem = lowest ratio).
+q6k_matvec (down) is bandwidth-bound at 312 GB/s (K=10240, 0.82 B/elem).
+Ollama's effective rate is ~390 GB/s for both — they use format-specific
+`float4` vectorized accumulation to reduce per-element compute cost.
+See PERFORMANCE.md for the full per-kernel table and projected impact.
 
 ### #1 — Q6_K fused activation+down (closed — wrong fix, correct diagnosis)
 
@@ -146,10 +160,25 @@ Folded into #6 below with updated size estimate.
 
 ---
 
-### #6 — `q4k_matvec` inter-superblock rewrite (partial — shipped, limited gain)
+### #6 — Q4_K kernel optimization (explored 2026-04-26, blocked)
 
-**Actual gain: ~0.1ms/tok** (benchmarked 2026-04-25). Applied to `q4k_matvec`,
-`q4k_ffn_gate_up`, and Q/K branch of `q4k_q6k_qkv_proj`.
+**Tried:** (a) inter-superblock interleaving (ix=lane&1 stride-2, already applied).
+(b) 2 rows per simdgroup + 64 threads/TG (REGRESSED: halves total wavefronts,
+  hurts more than X-sharing helps for K=2560).
+(c) llama.cpp uint16 `float4` trick — INCOMPATIBLE: llama.cpp uses a
+  transposed nibble layout (qs[b] lo=elem b, hi=elem b+32) while LARQL uses
+  linear (qs[b] lo=elem 2b, hi=elem 2b+1). The uint16 accumulation trick only
+  works for the transposed layout.
+
+**Root cause unchanged:** K=2560 fits in GPU L1 cache (1440 bytes/row). The
+weight read bottleneck is not the X reads but the ~89 MB/layer weight data,
+and the main gap vs Ollama is in ALL-operations bandwidth (322 vs ~414 GB/s).
+
+**Remaining Q4_K opportunity:** `sumy[]` precomputation (saves 16 additions
+per superblock for the min correction term) and profiling to understand the
+full ~2ms kernel gap. For K=8192 (Wo, 4608 bytes/row = DRAM-bound),
+inter-superblock interleaving at stride 2 is already applied; stride-4
+(ix=lane/8) would add more DRAM bank parallelism.
 
 **Root cause of limited gain:** All Q4_K matvecs in Gemma 3 4B use K=2560 as
 input dimension (hidden size). K=2560 → 10 superblocks × 144 bytes = 1440 bytes
@@ -255,6 +284,34 @@ and `h_post_attn` (raw sum for post-FFN add) in one pass. Replaces the
 Dispatches 12+13 can be merged for Q4_K down (already done). For Q6_K down,
 fusion was attempted but regressed due to GELU-tanh recomputation cost
 (see #1 closed). Not viable unless activation is precomputed separately.
+
+---
+
+## P0: Diagnostic infrastructure (done 2026-04-26)
+
+Diagnostics were previously scattered across three locations:
+- `src/metal/decode/diag.rs` — NaN detection, residual dumps, per-layer bisect
+- `src/metal/decode/profile.rs` — stage-level `ProfileTimings`
+- `examples/debug_decode_pipeline.rs` — decode pipeline stage bisect entry point
+
+Now consolidated under `src/metal/diag/`:
+- `diag/mod.rs` — public API, re-exports `ProfileTimings`, documents all tools
+- `diag/kernel_profile.rs` — `KernelResult` + `profile_all()` for per-kernel
+  bandwidth measurement (isolated vs batched, GB/s, bottleneck classification)
+- Examples renamed to `diag_*` prefix for clarity
+
+**Key diagnostic commands:**
+```bash
+# Per-kernel bandwidth profiler (results go to PERFORMANCE.md)
+cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+
+# Decode pipeline stage bisect (bisect CPU/Metal divergence)
+LARQL_METAL_DUMP_LAYERS=/tmp/dump \
+  cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
+
+# NaN/divergence bisect at specific layer (env-gated, zero binary overhead)
+LARQL_DECODE_DIAG_LAYER=12 larql infer <vindex> "prompt"
+```
 
 ---
 

@@ -257,7 +257,16 @@ fn load_single_vindex(
         if warmup_hnsw {
             let t0 = std::time::Instant::now();
             index.warmup_hnsw_all_layers();
-            info!("  HNSW warmup: built {} layers in {:.2?}", config.num_layers, t0.elapsed());
+            // `warmup_hnsw_all_layers` walks 0..num_layers but the
+            // filter_map skips layers without gate data — on a sharded
+            // server (`--layers START-END`) only the owned range
+            // actually builds. Report the owned count so the log
+            // reflects reality.
+            let owned = match layer_range {
+                Some((s, e)) => e - s,
+                None => config.num_layers,
+            };
+            info!("  HNSW warmup: built {} owned layer(s) in {:.2?}", owned, t0.elapsed());
         }
     }
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
@@ -282,6 +291,13 @@ fn load_single_vindex(
             Err(_) => info!("  Down features: not available"),
         }
         if let Ok(()) = index.load_up_features(&path) { info!("  Up features: loaded (full mmap FFN)") }
+        // W2: feature-major Q4_K down. Loaded silently inside
+        // `load_vindex_with_range` when present; surface it explicitly
+        // so operators can confirm the per-feature cache-bypass path is
+        // active vs. the vindex falling back to the legacy cache.
+        if index.has_down_features_q4k() {
+            info!("  Down features Q4K: loaded (W2 — per-feature decode skips q4k_ffn_layer cache)");
+        }
     }
 
     // Warmup eagerly dequantises f16 gate vectors to f32 (~2x blowup). On a

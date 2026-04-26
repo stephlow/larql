@@ -314,6 +314,7 @@ pub fn load_model_weights_with_opts(
     Ok(ModelWeights {
         tensors, vectors,
         raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed, lm_head,
@@ -537,6 +538,7 @@ pub fn load_model_weights_q4k(
         tensors,
         vectors,
         raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps,
         packed_byte_ranges,
         embed,

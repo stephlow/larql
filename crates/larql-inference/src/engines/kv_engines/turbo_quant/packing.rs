@@ -2,7 +2,6 @@
 ///
 /// 4-bit: two values per byte (trivial nibble packing)
 /// 3-bit: 8 values into 3 bytes (24 bits)
-
 /// Pack quantized indices into a byte buffer.
 pub fn pack_indices(indices: &[u8], bits: u8, out: &mut Vec<u8>) {
     match bits {

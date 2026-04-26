@@ -1,7 +1,11 @@
 # Metal Shader Reference — larql-compute
 
-~48 Metal Shading Language kernels across ~30 shader files in `src/metal/shaders/`.
+~50 Metal Shading Language kernels across ~30 shader files in `src/metal/shaders/`.
 All compiled into a single Metal library via `all_shaders()`.
+
+Every production kernel exports a `ShaderKernel` or `TiledKernel` marker so
+`MetalBackend::new()` binds pipelines by type rather than raw strings. See
+`metal/kernel/traits.rs` for the trait definitions.
 
 ## f32 Matrix Multiply
 
@@ -14,28 +18,15 @@ Grid: `(ceil(N/32), ceil(M/32), 1)`, TG: `(32, 32, 1)`.
 
 ## Q4_0 Quantized Matvec (4-bit, 18 bytes per 32 values)
 
-### q4_matvec.rs — `q4_matvec` (v1)
-Simdgroup + threadgroup shared memory for Q8 input. Baseline implementation.
-Origin: LARQL original.
-
-### q4_matvec_v2.rs — `q4_matvec_v2`
-4 rows per thread, f32 input. Experimental variant.
-
-### q4_matvec_v3.rs — `q4_matvec_v3`
-8 rows unrolled. Slower due to register spilling. Experimental.
-
-### q4_matvec_v4.rs — `q4_matvec_v4` (PRODUCTION)
-**The fast Q4_0 kernel.** uint32 wide loads (4 bytes → 8 nibbles), Q8 input in threadgroup memory, integer multiply-accumulate, simd_sum reduction. 57-61 GB/s on M3 Max.
-Origin: LARQL original, iterative optimization from v1-v3.
+### q4_matvec_v4.rs — `q4_matvec` (PRODUCTION)
+**The fast Q4_0 kernel.** uint32 wide loads (4 bytes → 8 nibbles), Q8 input,
+integer multiply-accumulate, simd_sum reduction. 57-61 GB/s on M3 Max.
+Note: earlier v1/v2/v3/v5 variants were removed (2026-04-25) — only v4 ships.
 
 ```
-Performance: 0.26ms for [10240, 2560] = 14.7MB (57 GB/s)
 Technique: NIBBLE(w, shift) macro extracts nibbles via bitshift
 Grid: 8 rows per TG, 256 threads (8 simdgroups × 32 lanes)
 ```
-
-### q4_matvec_v5.rs — `q4_matvec_v5`
-256 rows per TG, no simd. Same speed as v4. Experimental.
 
 ### q4_vecmat.rs — `q4_vecmat`
 **out[K] = activation[N] @ Q4[N,K]**. Scatter-accumulate pattern (one thread per output element). Used for down projection alternatives.
@@ -207,3 +198,35 @@ Included by all shaders:
 - `struct block_q4_K` — 148-byte Q4_K superblock layout
 - `struct block_q4_K_gguf` — 144-byte GGUF-compatible layout
 - `struct block_q4_kf` — 160-byte pre-baked half scales layout
+
+## New Dispatch-Fusion Kernels (2026-04-25)
+
+These kernels reduce the per-layer dispatch count by combining operations
+that were previously separate dispatches.
+
+### qk_norm.rs — `qk_norm_qk` (fused Q+K norm)
+Applies per-head RMSNorm to both Q and K projections in one dispatch instead
+of two. Grid: `(num_q + num_kv, 1, 1)` TGs. TG index < num_q → Q buffer +
+q_weight; ≥ num_q → K buffer + k_weight.
+**Saves 34 dispatches/token** (1 dispatch/layer × 34 layers).
+
+### rope.rs — `rope_at_pos_batched_qk` (fused Q+K RoPE)
+Applies RoPE to all Q heads and then all K heads in one 2D dispatch.
+Grid: `(rotary_dim/2, num_q + num_kv, 1)`. Thread `h < num_q` → Q buffer,
+`h ≥ num_q` → K buffer. Saves 34 dispatches/token.
+
+### fused_ops.rs — `residual_norm_store` (fused residual add + norm, dual output)
+Like `residual_norm` but writes **two** outputs in one pass:
+- `norm_out[i] = (a[i]+b[i]) / rms * (weight[i] + offset)` — normed FFN input
+- `sum_out[i]  = a[i] + b[i]` — raw sum needed for post-FFN residual add
+
+Replaces the `residual_norm + residual_add` two-dispatch pair in the Q4_K
+hot path. Saves 34 dispatches/token.
+
+### q4k_q6k_qkv_proj.rs — `q4k_q6k_qkv_proj_normed` (fused norm + QKV)
+All 128 threads in each QKV TG cooperatively reduce `||h||²` (Phase 1,
+threadgroup barrier), then each simdgroup runs its row's matvec with inline
+normalization `h[i] * rms * (offset + norm_w[i])` (Phase 2). The separate
+`rms_norm` dispatch is eliminated. Fires when format is Q4_K Q/K + Q6_K V,
+standard RMS norm, no bias (Gemma 3/4 production extract).
+Saves 34 dispatches/token.

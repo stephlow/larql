@@ -3,7 +3,6 @@
 /// After WHT rotation, each coordinate follows Beta(d/2, d/2) ≈ N(0, 1/d).
 /// Lloyd-Max finds optimal centroids that minimise MSE for this distribution.
 /// The codebook is pre-computed offline (see `codebooks.rs`).
-
 /// A Lloyd-Max codebook: boundaries + centroids for a given bit-width.
 #[derive(Debug, Clone)]
 pub struct Codebook {

@@ -474,11 +474,20 @@ larql-router --shards 0-16=http://127.0.0.1:9181,17-33=http://127.0.0.1:9182 \
 
 Why each flag matters:
 - `--feature-major-down` (extract-time) — emits `down_features_q4k.bin`.
-  Per-feature down decode reads one row from the new file instead of
-  dequantising the whole layer + transposing through the cache.
-  Deletes the binding RSS constraint on per-shard memory budget. See
-  [docs/adr/009](docs/adr/009-feature-major-down.md) for the
-  architectural decision.
+  Activates when the FFN walk dispatches through the *sparse* path
+  (`walk_ffn_sparse` — INSERT-patched layers, explicit sparse-K, or
+  FP4 storage). On those paths, per-feature down decode reads one row
+  from the new file instead of dequantising the whole layer +
+  transposing through the cache; deletes the binding RSS constraint
+  on per-shard memory budget. The default dense Q4K HTTP walk
+  (`walk_ffn_q4k_dequant`) does its own one-shot whole-layer dequant
+  and uses neither the cache nor W2 — so for pure-dense grids
+  W2's value is the *capability* (you can attach a patch / switch on
+  sparse mode without the cache lighting up), not the ms saved on
+  every request. See [docs/adr/009](docs/adr/009-feature-major-down.md)
+  for the architectural decision and `/v1/stats.q4k_ffn` for live
+  status (`feature_major_down: true` + `cache_slots: 0` is the
+  healthy steady state).
 - `--max-q4k-cache-layers 1` — caps the legacy `q4k_ffn_layer` cache
   at one layer. With feature-major down loaded the cache is barely
   used; this just bounds it. (Set to 0 to disable entirely once

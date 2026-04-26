@@ -26,6 +26,9 @@ pub mod kernel;     // KernelHandle: pipeline + dispatch geometry, bundled
 pub mod ops;        // modular: ops/mod.rs → one file per operation
 pub mod stages;     // modular: stages/mod.rs → one file per pipeline stage
 pub mod calibrate;
+/// Diagnostic and profiling tools — kernel bandwidth, decode-stage timing,
+/// layer-level residual dumps. See `diag/mod.rs` for the full index.
+pub mod diag;
 mod direct_ops;
 mod decode;
 mod decode_hybrid;

@@ -31,45 +31,31 @@ Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec
 
 ## Performance vs Ollama
 
-Live `larql bench gemma3-4b-q4k-v2 --backends metal --tokens 50 --ollama gemma3:4b`
+Live `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b`
 on M3 Max (2026-04-25):
 
 ```
-  Backend                 prefill       ms/tok      tok/s  steps  notes
-  larql-metal               72.1ms      15.13ms      66.1      49
-  ollama gemma3:4b          49.3ms      10.26ms      97.5      23
-
-  Per-stage average (larql-metal):
-    embed      0.002ms   ( 0.0%)
-    GPU fwd   13.637ms   (85.6%)    ← decode hot path
-    final_norm 0.007ms   ( 0.0%)
-    lm_head    2.285ms   (14.3%)
-    detok      0.007ms   ( 0.0%)
+  larql-metal  75–77 tok/s   13.0ms/tok   (GPU fwd 11.1ms, lm_head 2.3ms)
+  ollama       97–103 tok/s  10.0ms/tok
+  gap          1.26–1.34×    +3ms/tok
 ```
 
-Reproduce: `larql bench <vindex-shorthand> --backends metal --tokens 50
---ollama <ollama-tag>`. CPU + Ollama variants via `--backends cpu,metal`.
+Reproduce: `larql bench <vindex> --backends metal --ollama <tag>`.
+See `PERFORMANCE.md` for full breakdown and gap analysis.
 
-### Q4_KF route (llama.cpp-exact kernel)
+### Key optimisations (62 → 75 tok/s, 2026-04-25)
 
-The 2026-04-08 optimization burst on the Q4_KF route hit **117 tok/s**
-on the same hardware (Gemma 3 4B Q4_KF vindex, decode-only, KV cached).
-That's still the best-case number once a Q4_KF vindex is loaded —
-`larql bench gemma3-4b-q4kf` reproduces it. The 66 tok/s number above
-is the Q4_K path (current default extract format).
-
-### Key optimisations
-
-| Optimization | Date | Savings | Technique |
-|-------------|------|---------|-----------|
-| **Q4K_*_MAX_K shared-tile fix** | 2026-04-25 | (correctness) | Drop 4096-float threadgroup tile in q4k_matvec / q4k_ffn_gate_up; closed Gemma 4 31B parity gap (cos 0.997→1.000) |
-| Cooperative SIMD norms | 2026-04-09 | ~10ms | O(N²)→O(N) reads in rms_norm / residual_norm |
-| Q4_KF FFN routing | 2026-04-09 | ~8ms | llama.cpp-exact kernel (q4kf_proj) for FFN |
-| Q4_K matvec rewrite | 2026-04-09 | ~3ms | uint4 loads, 8 rows/TG, multi-row (nr0=2) |
-| Buffer pre-allocation | 2026-04-08 | ~2ms | Eliminate 550 Metal allocs per decode |
-| Fused gate+up kernels | 2026-04-08 | ~1ms | q4k_ffn_gate_up + q4kf_ffn_gate_up |
-| Batched RoPE/V-norm | 2026-04-08 | ~0.5ms | 16 per-head dispatches → 3 batched |
-| SIMD KV attention | 2026-04-08 | ~1ms | simd_max/simd_sum, fewer barriers |
+| Optimization | Savings | Technique |
+|---|---|---|
+| `q6k_matvec` 4-element batching | +7 tok/s | Compile-time hi2 shifts, 2-pass layout |
+| `q6k_matvec` inter-superblock interleaving | +3 tok/s | Adjacent lanes read alternate superblocks; X preloaded; deferred scaling |
+| Fused QK-norm Q+K (`qk_norm_qk`) | −0.17ms | One dispatch instead of two per layer |
+| Fused RoPE Q+K (`rope_at_pos_batched_qk`) | −0.17ms | One dispatch instead of two |
+| Fused residual+norm (`residual_norm_store`) | −0.17ms | Writes both normed and raw sum |
+| Fused norm+QKV (`q4k_q6k_qkv_proj_normed`) | −0.17ms | Norm computed inline in QKV TGs |
+| Cooperative SIMD norms | −10ms | O(N²)→O(N) reads (2026-04-09) |
+| Q4_KF FFN routing | −8ms | llama.cpp-exact kernel (2026-04-09) |
+| Buffer pre-allocation | −2ms | Eliminated 550 allocs/decode (2026-04-08) |
 
 ### Architecture
 
@@ -87,18 +73,19 @@ the shader source is small and the bench harness still exercises them).
 |----------|---------|-------|
 | f32 matmul | sgemm, sgemm_transb | Tiled 32×32 |
 | f32/f16 gemv | **f32_gemv**, **f16_gemv** | LM head (large vocab × hidden) |
-| Q4_0 matvec | **q4_matvec_v4** (prod), q4_f32_matvec, q4_vecmat | v4: uint32 wide loads, 61 GB/s |
-| Q4_K / Q4_KF | **q4k_matvec**, **q4k_qkv_proj**, **q4k_q6k_qkv_proj**, **q4kf_qkv_proj**, **q4kf_proj** | All read X directly from device memory (no shared-memory tile cap) |
-| Q4_K fused FFN | **q4k_ffn_gate_up**, **q4kf_ffn_gate_up** | Fused gate+up, shared input |
-| Q6_K | **q6k_matvec** | Used for V proj on Gemma 3 / 4 (Q4_K Q/K + Q6_K V) and Q6_K down |
+| Q4_0 matvec | **q4_matvec_v4** (prod), q4_f32_matvec, q4_vecmat | v4: uint32 wide loads, sub-block stride |
+| Q4_K / Q4_KF | **q4k_matvec**, **q4k_qkv_proj**, **q4k_q6k_qkv_proj**, **q4k_q6k_qkv_proj_normed**, **q4kf_qkv_proj**, **q4kf_proj** | `_normed` variant computes RMS norm inline (saves 1 dispatch) |
+| Q4_K fused FFN | **q4k_ffn_gate_up**, **q4kf_ffn_gate_up** | Fused gate+up with inter-superblock interleaving |
+| Q4_K GEGLU+down | **q4k_geglu_silu_down**, **q4k_geglu_gelu_tanh_down** | Fused activation+down for all-Q4_K models |
+| Q6_K | **q6k_matvec** | 2-way inter-superblock interleaving, X preload, deferred scaling |
 | Q8 | **q8_matvec**, **q8_qkv_proj**, **quantize_q8** | Fused QKV, simdgroup reduction |
 | Attention | **fused_attention** (RoPE+GQA+softcap), **kv_attention** (decode), **kv_cache_append** | SIMD reductions, float4 dot |
-| Normalization | **rms_norm**, **layer_norm** / **layer_norm_no_bias**, **v_norm_batched**, **qk_norm** | Cooperative SIMD reduction |
+| Normalization | **rms_norm**, **layer_norm** / **layer_norm_no_bias**, **v_norm_batched**, **qk_norm**, **qk_norm_qk** | `qk_norm_qk` fuses Q+K heads in one dispatch |
 | Activation | **geglu_silu**, **geglu_gelu_tanh**, **silu**, **gelu_tanh** | Gated + standalone |
 | Element-wise | **residual_add**, **scale_vector** | |
-| RoPE | **rope_apply** (prefill multi-pos), **rope_at_pos** (prefill stage), **rope_at_pos_batched** (decode) | All bit-equal at the production geometries |
-| Fused ops | **rms_norm_q8**, **residual_norm**, **residual_norm_q8** | Multi-op fusion |
-| Experimental / unwired | causal_attention, q4_sparse_matvec, q8_proj_rope, q4k_geglu_silu_down, q4k_geglu_gelu_tanh_down, v_norm (singleton), turboquant_encode/decode, graph_walk_knn | Kept compiled; not dispatched in production decode/prefill |
+| RoPE | **rope_apply** (prefill), **rope_at_pos** (single-head), **rope_at_pos_batched** (all heads), **rope_at_pos_batched_qk** (Q+K fused) | `_qk` saves 1 dispatch/layer |
+| Fused residual+norm | **rms_norm_q8**, **residual_norm**, **residual_norm_q8**, **residual_norm_store** | `_store` writes both normed output AND raw sum in one dispatch |
+| Experimental / unwired | causal_attention, q4_sparse_matvec, q6k_geglu_silu_down, q6k_geglu_gelu_tanh_down, v_norm (singleton), turboquant_encode/decode, graph_walk_knn | Kept compiled; not dispatched in production |
 
 ## Safe Buffer Access
 
@@ -144,19 +131,15 @@ let h = backend.prefill_q4(&layers, &x, hidden, inter, q_dim, kv_dim,
     seq_len, num_q_heads, num_kv_heads, head_dim, rope_base, qk_norm, softcap);
 ```
 
-## KernelHandle: pipeline + dispatch geometry, bundled
+## KernelHandle and ShaderKernel: no raw strings at binding sites
 
-Every simdgroup-tiled Metal kernel exports a `Kernel` marker (impl
-`metal::kernel::TiledKernel`) carrying its name + `ROWS_PER_TG` +
-`THREADS_PER_TG`. `KernelHandle::from_kernel::<…::Kernel>(device, library)`
-compiles the pipeline and bundles those constants alongside it.
-Dispatchers read `kernel.rows_per_tg` / `kernel.threads_per_tg` — no
-parallel `shaders::*::ROWS_PER_TG` imports that could drift from the
-pipeline name. Construction also asserts
-`pipeline.maxTotalThreadsPerThreadgroup() >= threads_per_tg` so silent
-simdgroup drop is caught at startup, not at goldens-fail time. (See
-the `q4_matvec_v4` 75 %-row drop entry in `ROADMAP.md`'s ship log for
-the bug class this prevents.)
+Two traits in `metal::kernel`:
+
+**`TiledKernel`** — for kernels dispatched with `dispatch_thread_groups` that need row geometry. Each shader file exports a `Kernel` marker implementing `TiledKernel { KERNEL_NAME, ROWS_PER_TG, THREADS_PER_TG }`. `KernelHandle::from_kernel::<…::Kernel>(device, library)` bundles the pipeline + geometry. Dispatchers read `kernel.rows_per_tg` — no parallel constants that can drift.
+
+**`ShaderKernel`** — for flat-dispatch kernels (`dispatch_threads` or fixed-geometry `dispatch_thread_groups`) that don't need row geometry. Each shader file exports a marker implementing `ShaderKernel { KERNEL_NAME }`. `get_shader_pipeline::<T>(device, library)` looks up the kernel by that constant. All 31 previously magic-string `library.get_function("...")` calls in `MetalBackend::new()` now go through one of these two typed paths — renaming a shader without updating its marker is a compile error, not a silent runtime `None`.
+
+Construction asserts `pipeline.maxTotalThreadsPerThreadgroup() >= threads_per_tg` (TiledKernel) so silent simdgroup drop is caught at startup. (See the `q4_matvec_v4` 75 %-row drop entry in `ROADMAP.md`.)
 
 ## Linear algebra primitives (`cpu/ops/linalg.rs`)
 
@@ -243,22 +226,20 @@ cargo test -p larql-compute
 cargo test -p larql-compute --features metal
 ```
 
-180 tests with `--features metal` across:
+**241 tests** with `--features metal` across 18 test files:
 
-- `tests/test_metal_shaders.rs` — quantization round-trips, cross-backend
-  correctness (Metal vs CPU with tolerance), shader compilation, fused
-  attention, partial RoPE, KV cache, pipeline output verification,
-  activations (SiLU, GELU-tanh, GEGLU), LayerNorm, V-norm, scale_vector.
-- `tests/test_kernel_*.rs` — focused per-kernel suites pinning each
-  production shader at every architecture geometry (Llama 2 / Mistral /
-  Gemma 3 4B / Gemma 4 31B sliding+global). One file per shader family:
-  `kv_attention`, `kv_cache_append`, `qk_norm`, `rope_at_pos`, `rope`
-  (rope_at_pos_batched), `v_norm`, `q4k_ffn_gate_up`. Includes
-  prefill→decode KV-cache hand-off and the regression for the previously
-  silent `Q4K_GU_MAX_K=4096` shared-memory cap (now read X directly from
-  device memory; see ROADMAP ship log 2026-04-25).
-- `tests/test_correctness.rs` and `tests/test_q4_x86_correctness.rs` —
-  CPU-only quantization round-trips.
+- `test_metal_shaders.rs` — compilation, Q4/Q6 matvec, fused attention smoke, LayerNorm, qk_norm, q4kf projection
+- `test_kernel_fused_ops_norms.rs` — rms_norm, residual ops, cooperative SIMD reduction, quantize_q8
+- `test_kernel_fused_attention.rs` — fused RoPE+GQA+softcap attention at production geometries
+- `test_kernel_new_fused_kernels.rs` — `residual_norm_store` and `q4k_q6k_qkv_proj_normed` parity tests
+- `test_kernel_vindex_integration.rs` — stage routing, qkv_proj, vindex regression, real Q4_K bytes
+- `test_kernel_qk_norm.rs` — includes `qk_norm_qk` (fused Q+K) parity vs two separate calls
+- `test_kernel_rope.rs` — includes `rope_at_pos_batched_qk` (fused Q+K) parity vs CPU reference
+- `test_kernel_{kv_attention,kv_cache_append,lm_head_gemv,q4k_ffn_gate_up,q4k/q6k_geglu_down,v_norm,rope_at_pos}` — per-kernel suites at Llama 2 / Gemma 3 4B / Gemma 4 31B geometries
+- `test_correctness.rs`, `test_q4_x86_correctness.rs` — CPU-only round-trips
+- `test_kernel_handle_contract.rs` — every `TiledKernel` marker verified to compile and dispatch correctly
+
+Every production-dispatched kernel has a dedicated parity test.
 
 The cross-backend / cross-stage parity layer lives in `larql-inference`:
 

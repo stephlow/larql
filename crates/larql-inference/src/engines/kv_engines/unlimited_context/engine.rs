@@ -393,7 +393,7 @@ pub(crate) fn q4k_prefill_metal(
     } else {
         return None;
     };
-    if index.attn_q4k_layer_data(0).is_none() { return None; }
+    index.attn_q4k_layer_data(0)?;
 
     let arch = &*weights.arch;
     let hidden = weights.hidden_size;

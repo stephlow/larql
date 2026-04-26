@@ -13,7 +13,8 @@
 //!   sh = tid & 1  (0/1):  first or last 16 of those 32 elements
 //!
 //! X preloaded into `xl[16]` before weight reads for latency hiding.
-//! ROWS_PER_TG=4 (128 threads/TG) to halve register pressure.
+//! ROWS_PER_TG=4 (128 threads/TG): halves register pressure vs 256-thread
+//! design, doubling concurrent TG occupancy for better DRAM latency hiding.
 
 pub const SHADER: &str = r#"
 constant uint Q4K_GU_ROWS_PER_TG = 4;
@@ -47,8 +48,8 @@ kernel void q4k_ffn_gate_up(
 
     const uint ix  = lane & 1u;
     const uint tid = lane >> 1u;
-    const uint j   = tid >> 1u;    // 0..7: sub-block index
-    const uint sh  = tid & 1u;     // 0/1: first/last 16 of the sub-block
+    const uint j   = tid >> 1u;
+    const uint sh  = tid & 1u;
     const bool hi    = (j & 1u) != 0u;
     const uint group = j >> 1u;
 

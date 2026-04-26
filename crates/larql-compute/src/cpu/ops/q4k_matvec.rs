@@ -146,4 +146,41 @@ mod tests {
             out[0]
         );
     }
+
+    // ── local f16_to_f32 edge cases ──
+
+    #[test]
+    fn f16_to_f32_neg_zero() {
+        // bits=0x8000: sign=1, exp=0, mant=0 → negative zero
+        let v = super::f16_to_f32(0x8000);
+        assert!(v == 0.0 && v.is_sign_negative(), "0x8000 should be -0.0");
+    }
+
+    #[test]
+    fn f16_to_f32_subnormal_positive() {
+        // bits=0x0001: sign=0, exp=0, mant=1 → smallest positive subnormal ≈ 5.96e-8
+        let v = super::f16_to_f32(0x0001);
+        assert!(v > 0.0 && v < 1e-6, "0x0001 should be a tiny positive subnormal, got {v}");
+    }
+
+    #[test]
+    fn f16_to_f32_subnormal_negative() {
+        // bits=0x8001: sign=1, exp=0, mant=1 → smallest negative subnormal
+        let v = super::f16_to_f32(0x8001);
+        assert!(v < 0.0 && v > -1e-6, "0x8001 should be a tiny negative subnormal, got {v}");
+    }
+
+    #[test]
+    fn f16_to_f32_neg_infinity() {
+        // bits=0xFC00: sign=1, exp=31, mant=0 → negative infinity
+        let v = super::f16_to_f32(0xFC00);
+        assert!(v == f32::NEG_INFINITY, "0xFC00 should be -inf, got {v}");
+    }
+
+    #[test]
+    fn f16_to_f32_nan() {
+        // bits=0x7C01: sign=0, exp=31, mant=1 → NaN
+        let v = super::f16_to_f32(0x7C01);
+        assert!(v.is_nan(), "0x7C01 should be NaN, got {v}");
+    }
 }

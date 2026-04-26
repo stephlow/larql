@@ -206,3 +206,78 @@ impl From<bool> for Activation {
         if use_gelu_tanh { Activation::GeluTanh } else { Activation::Silu }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_qw(data: &[u8]) -> QuantWeight<'_> {
+        QuantWeight { data, scales: None, format: QuantFormat::Q4_0 }
+    }
+
+    fn minimal_layer<'a>(
+        data: &'a [u8],
+        norms: &'a [f32],
+        ffn_type: FfnType,
+        moe: Option<MoeLayerWeights<'a>>,
+    ) -> FullPipelineLayer<'a> {
+        let qw = minimal_qw(data);
+        FullPipelineLayer {
+            wq: qw, wk: qw, wv: qw, wo: qw,
+            gate: qw, up: qw, down: qw,
+            input_norm: norms, post_attn_norm: norms,
+            pre_ffn_norm: None, post_ffn_norm: None,
+            input_norm_bias: None, post_attn_norm_bias: None,
+            norm_offset: 0.0, qk_norm_offset: 0.0, eps: 1e-6,
+            has_post_norms: false, norm_type: NormType::RmsNorm,
+            ffn_type, activation: Activation::Silu,
+            attn_scale: 0.5, head_dim: 4, num_q_heads: 1, num_kv_heads: 1,
+            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
+            has_v_norm: false, layer_scalar: 0.0,
+            q_norm_weight: None, k_norm_weight: None,
+            ffn_up_bias: None, ffn_down_bias: None,
+            moe, moe_combined_output_norm: false, moe_outer_post_norm: None,
+        }
+    }
+
+    #[test]
+    fn activation_from_bool() {
+        assert_eq!(Activation::from(true), Activation::GeluTanh);
+        assert_eq!(Activation::from(false), Activation::Silu);
+    }
+
+    #[test]
+    fn is_gated_matches_ffn_type() {
+        let norms = [1.0f32; 4];
+        let gated = minimal_layer(&[], &norms, FfnType::Gated, None);
+        let standard = minimal_layer(&[], &norms, FfnType::Standard, None);
+        assert!(gated.is_gated());
+        assert!(!standard.is_gated());
+    }
+
+    #[test]
+    fn is_hybrid_moe_reflects_option() {
+        let norms = [1.0f32; 4];
+        let no_moe = minimal_layer(&[], &norms, FfnType::Gated, None);
+        assert!(!no_moe.is_hybrid_moe());
+
+        let moe = MoeLayerWeights {
+            experts_gate_up: &[], experts_down: &[],
+            router_proj: &[], router_scale: &[], router_per_expert_scale: &[],
+            router_norm: &[], router_norm_parameter_free: false,
+            router_input_scalar: 1.0, pre_experts_norm: &[],
+            post_ffn1_norm: &[], post_experts_norm: &[],
+            num_experts: 2, top_k: 1, intermediate_size: 4,
+            activation: Activation::Silu,
+        };
+        let with_moe = minimal_layer(&[], &norms, FfnType::Gated, Some(moe));
+        assert!(with_moe.is_hybrid_moe());
+    }
+
+    #[test]
+    fn quant_format_equality() {
+        assert_eq!(QuantFormat::Q4_K, QuantFormat::Q4_K);
+        assert_ne!(QuantFormat::Q4_K, QuantFormat::Q6_K);
+        assert_ne!(QuantFormat::Q4_0, QuantFormat::Q4_KF);
+    }
+}

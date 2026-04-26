@@ -213,6 +213,7 @@ fn make_loaded_model(
         tensors: HashMap::new(),
         vectors,
         raw_bytes,
+        skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),

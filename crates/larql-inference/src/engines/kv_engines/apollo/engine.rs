@@ -25,8 +25,11 @@ use super::entry::{InjectionConfig, VecInjectEntry};
 use super::routing::{RoutingIndex, RoutingQuery};
 use super::store::ApolloStore;
 use crate::model::ModelWeights;
-use crate::forward::{embed_tokens_pub, forward_raw_logits};
+use crate::forward::{embed_tokens_pub, forward_raw_logits, forward_from_layer};
 use crate::engines::{EngineInfo, KvEngine};
+
+/// (context_tokens, injection_delta, boundary_residual, crystal_layer)
+type InjectionPrep = (Vec<u32>, ndarray::Array1<f32>, Option<Vec<f32>>, usize);
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -65,6 +68,11 @@ pub struct ApolloEngine {
     /// State maintained between prefill and decode steps.
     context_tokens: Vec<u32>,
     injection_delta: Option<Array1<f32>>,
+    /// Boundary residual for the routed window (output of layer `crystal_layer - 1`).
+    /// When `Some`, `prefill` and `decode_step` use `forward_from_layer` instead of
+    /// running all 34 layers — ~8.5× faster on Gemma 3 4B (crystal_layer=30 → 4 layers).
+    boundary_residual: Option<Vec<f32>>,
+    crystal_layer: usize,
 }
 
 impl ApolloEngine {
@@ -75,6 +83,8 @@ impl ApolloEngine {
             config,
             context_tokens: Vec::new(),
             injection_delta: None,
+            boundary_residual: None,
+            crystal_layer: 0,
         }
     }
 
@@ -163,13 +173,14 @@ impl ApolloEngine {
         Ok(scored.into_iter().map(|(e, _)| e).collect())
     }
 
-    /// Build the injection delta and initial context for a set of query tokens.
-    /// Returns `(context_tokens, injection_delta)`.
+    /// Build the injection delta, context, and optional boundary residual
+    /// for a set of query tokens.
+    /// Returns `(context_tokens, injection_delta, boundary_residual, crystal_layer)`.
     fn prepare_injection(
         &self,
         weights: &ModelWeights,
         query_ids: &[u32],
-    ) -> Option<(Vec<u32>, Array1<f32>)> {
+    ) -> Option<InjectionPrep> {
         let store = self.store.as_ref()?;
         let q = RoutingQuery { token_ids: query_ids.to_vec() };
         let routed = self.routing.resolve(&q, 3);
@@ -178,12 +189,12 @@ impl ApolloEngine {
         let entries = self.retrieve_entries(query_ids, &[top_window]).ok()?;
         let window_tokens = store.window_tokens.get(top_window as usize)?;
 
-        // Context = window_tokens ++ query_tokens (drop leading BOS if present)
+        // Context = window_tokens ++ query_tokens (drop leading BOS if present).
         let mut context: Vec<u32> = window_tokens.clone();
-        let skip = if !query_ids.is_empty() && query_ids[0] == 2 { 1 } else { 0 }; // BOS=2 for Gemma
+        let skip = if !query_ids.is_empty() && query_ids[0] == 2 { 1 } else { 0 };
         context.extend_from_slice(&query_ids[skip..]);
 
-        // Injection delta: sum of answer-side entry embeddings (not question-side echoes)
+        // Injection delta: sum of answer-side entry embeddings.
         let hidden = weights.hidden_size;
         let mut delta = vec![0.0f32; hidden];
         let qset: std::collections::HashSet<u32> = query_ids.iter().copied().collect();
@@ -191,29 +202,38 @@ impl ApolloEngine {
             if qset.contains(&e.token_id) { continue; }
             let emb = embed_tokens_pub(weights, &[e.token_id]);
             let scale = e.coefficient * self.config.inject_coefficient;
-            for (i, v) in emb.row(0).iter().enumerate() {
-                delta[i] += v * scale;
-            }
+            for (i, v) in emb.row(0).iter().enumerate() { delta[i] += v * scale; }
         }
 
-        Some((context, Array1::from(delta)))
+        // Boundary residual: if the store has one for this window, the compressed
+        // path can skip layers 0..crystal_layer entirely.
+        let boundary = store.boundaries.get(top_window as usize).cloned();
+        let crystal = store.manifest.crystal_layer;
+
+        Some((context, Array1::from(delta), boundary, crystal))
     }
 
-    /// One-shot query: route → retrieve → inject → forward. For diagnostics.
+    /// One-shot query: route → retrieve → inject → forward. Uses the compressed
+    /// path (boundary + 4 layers) when the store has boundary residuals.
     pub fn query_greedy(
         &self,
         weights: &ModelWeights,
         query_ids: &[u32],
     ) -> Option<QueryTrace> {
-        let (context, delta) = self.prepare_injection(weights, query_ids)?;
+        let (context, delta, boundary, crystal) = self.prepare_injection(weights, query_ids)?;
         let perturb = Some((self.config.injection_layer, delta.view()));
-        let raw = forward_raw_logits(weights, &context, perturb);
+        let raw = if let Some(ref bnd) = boundary {
+            // Compressed: skip layers 0..crystal, run only crystal..34 (~4 layers)
+            forward_from_layer(weights, query_ids, bnd, crystal, perturb)
+        } else {
+            forward_raw_logits(weights, &context, perturb)
+        };
         let (top1_id, top1_logit) = raw.logits.iter().enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, &v)| (i as u32, v))?;
         let q = RoutingQuery { token_ids: query_ids.to_vec() };
         let routed = self.routing.resolve(&q, 3);
-        let entries = self.retrieve_entries(query_ids, &routed.get(..1).unwrap_or(&[])).unwrap_or_default();
+        let entries = self.retrieve_entries(query_ids, routed.get(..1).unwrap_or(&[])).unwrap_or_default();
         Some(QueryTrace {
             routed_windows: routed,
             injected_entries: entries,
@@ -221,6 +241,181 @@ impl ApolloEngine {
             top1_token_id: top1_id,
             top1_logit,
         })
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::kv_engines::apollo::store::{ArchConfig, StoreManifest};
+
+    /// Build a minimal in-memory ApolloStore with synthetic data.
+    fn mk_store(windows: usize, window_size: usize, hidden: usize) -> ApolloStore {
+        let window_tokens: Vec<Vec<u32>> = (0..windows)
+            .map(|w| (0..window_size).map(|i| (w * window_size + i) as u32).collect())
+            .collect();
+        let boundaries: Vec<Vec<f32>> = (0..windows)
+            .map(|w| vec![w as f32 * 0.1; hidden])
+            .collect();
+        let entries = vec![
+            VecInjectEntry { token_id: 42, coefficient: 5.0, window_id: 0, position_in_window: 10, fact_id: 1 },
+            VecInjectEntry { token_id: 43, coefficient: 3.0, window_id: 0, position_in_window: 11, fact_id: 1 },
+            VecInjectEntry { token_id: 99, coefficient: 4.0, window_id: 1, position_in_window: 5,  fact_id: 2 },
+        ];
+        ApolloStore {
+            manifest: StoreManifest {
+                version: 1,
+                num_entries: entries.len(),
+                num_windows: windows,
+                num_tokens: windows * window_size,
+                entries_per_window: 1,
+                crystal_layer: 30,
+                window_size,
+                arch_config: ArchConfig::default(),
+                has_residuals: true,
+            },
+            boundaries,
+            boundary_residual: None,
+            window_tokens,
+            entries,
+        }
+    }
+
+    fn mk_engine_with_store(windows: usize) -> ApolloEngine {
+        let store = mk_store(windows, 8, 16);
+        let mut engine = ApolloEngine::new(InjectionConfig::default()).with_store(store);
+        engine.build_routing_index().expect("index build failed");
+        engine
+    }
+
+    // ── Construction ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_engine_has_no_store() {
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        assert!(!engine.has_store());
+        assert!(engine.routing().is_empty());
+    }
+
+    #[test]
+    fn with_store_attaches_store() {
+        let store = mk_store(2, 8, 16);
+        let engine = ApolloEngine::new(InjectionConfig::default()).with_store(store);
+        assert!(engine.has_store());
+    }
+
+    #[test]
+    fn build_routing_index_populates_index() {
+        let store = mk_store(3, 8, 16);
+        let mut engine = ApolloEngine::new(InjectionConfig::default()).with_store(store);
+        engine.build_routing_index().unwrap();
+        assert!(!engine.routing().is_empty());
+    }
+
+    // ── EngineInfo ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn info_no_store_shows_zero_windows() {
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        let info = engine.info();
+        assert_eq!(info.name, "apollo");
+        assert!(info.description.contains("0 windows"));
+        assert!(info.config.contains("inject_layer=30"));
+    }
+
+    #[test]
+    fn info_with_store_shows_window_count() {
+        let engine = mk_engine_with_store(3);
+        let info = engine.info();
+        assert!(info.description.contains("3 windows"), "got: {}", info.description);
+        assert!(info.description.contains("3 entries"), "got: {}", info.description);
+    }
+
+    #[test]
+    fn info_shows_compressed_path_when_boundaries_present() {
+        let engine = mk_engine_with_store(2);
+        let info = engine.info();
+        assert!(info.description.contains("compressed(layer=30)"), "got: {}", info.description);
+    }
+
+    #[test]
+    fn info_shows_uncompressed_path_when_no_boundaries() {
+        let store = mk_store(2, 8, 16);
+        // Remove boundaries
+        let mut store = store;
+        store.boundaries.clear();
+        let mut engine = ApolloEngine::new(InjectionConfig::default()).with_store(store);
+        engine.build_routing_index().unwrap();
+        assert!(engine.info().description.contains("uncompressed"));
+    }
+
+    // ── retrieve_entries ─────────────────────────────────────────────────────
+
+    #[test]
+    fn retrieve_returns_err_when_no_store() {
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        assert!(engine.retrieve_entries(&[1], &[0]).is_err());
+    }
+
+    #[test]
+    fn retrieve_empty_query_returns_empty() {
+        let engine = mk_engine_with_store(2);
+        let entries = engine.retrieve_entries(&[], &[0]).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn retrieve_seed_token_matched() {
+        let engine = mk_engine_with_store(2);
+        // token_id=42 is in window 0 with coefficient 5.0
+        let entries = engine.retrieve_entries(&[42], &[0]).unwrap();
+        assert!(!entries.is_empty(), "expected at least one entry");
+        assert!(entries.iter().any(|e| e.token_id == 42), "seed token not in results");
+    }
+
+    #[test]
+    fn retrieve_proximity_neighbour_included() {
+        // token 43 is at position 11 — adjacent to token 42 at position 10.
+        // Querying [42] should include 43 via proximity (radius=10).
+        let engine = mk_engine_with_store(2);
+        let entries = engine.retrieve_entries(&[42], &[0]).unwrap();
+        assert!(entries.iter().any(|e| e.token_id == 43),
+            "adjacent entry (pos=11) not promoted via proximity");
+    }
+
+    #[test]
+    fn retrieve_scoped_to_candidate_windows() {
+        // token 99 is only in window 1; asking for window 0 should not return it.
+        let engine = mk_engine_with_store(2);
+        let entries = engine.retrieve_entries(&[1], &[0]).unwrap();
+        assert!(!entries.iter().any(|e| e.token_id == 99),
+            "entry from window 1 leaked into window 0 result");
+    }
+
+    #[test]
+    fn retrieve_backfills_to_top_k() {
+        // Query with no matching seeds → backfill to top_k by coefficient.
+        let engine = mk_engine_with_store(2);
+        let cfg = engine.config();
+        let entries = engine.retrieve_entries(&[9999], &[0]).unwrap();
+        // Should get up to top_k entries even with no seed match.
+        assert!(entries.len() <= cfg.top_k);
+    }
+
+    // ── memory_bytes ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_bytes_zero_without_store() {
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        assert_eq!(engine.memory_bytes(), 0);
+    }
+
+    #[test]
+    fn memory_bytes_nonzero_with_store() {
+        let engine = mk_engine_with_store(3);
+        assert!(engine.memory_bytes() > 0);
     }
 }
 
@@ -233,13 +428,20 @@ impl KvEngine for ApolloEngine {
         let windows = self.store.as_ref().map_or(0, |s| s.window_tokens.len());
         let entries = self.store.as_ref().map_or(0, |s| s.entries.len());
         let store_kb = self.store.as_ref().map_or(0, |s| s.total_bytes()) / 1024;
+        let crystal = self.store.as_ref().map_or(0, |s| s.manifest.crystal_layer);
+        let has_boundaries = self.store.as_ref().is_some_and(|s| !s.boundaries.is_empty());
+        let path = if has_boundaries {
+            format!("compressed(layer={crystal})")
+        } else {
+            "uncompressed".into()
+        };
         EngineInfo {
             name: "apollo".into(),
             description: format!(
-                "retrieval+injection: {windows} windows, {entries} entries, store={store_kb}KB",
+                "retrieval+injection [{path}]: {windows} windows, {entries} entries, {store_kb}KB",
             ),
             backend: "cpu".into(),
-            config: format!("layer={}, coef={}, top_k={}",
+            config: format!("inject_layer={}, coef={}, top_k={}",
                 self.config.injection_layer,
                 self.config.inject_coefficient,
                 self.config.top_k,
@@ -247,35 +449,57 @@ impl KvEngine for ApolloEngine {
         }
     }
 
-    /// Prefill routes the token_ids, builds the injection delta and context,
-    /// runs the initial forward pass with injection, and caches state for
-    /// subsequent decode steps.
+    /// Prefill routes token_ids, retrieves entries, builds the injection delta,
+    /// and runs the forward pass.
+    ///
+    /// **Compressed path** (when store has boundary residuals): runs only
+    /// `crystal_layer..num_layers` (~4 layers for Gemma 3 4B), ~8.5× faster.
+    ///
+    /// **Uncompressed path** (no boundaries): full forward over window+query tokens.
     fn prefill(&mut self, weights: &ModelWeights, token_ids: &[u32]) -> Option<Array2<f32>> {
         if self.routing.is_empty() {
-            // Auto-build routing index if store is loaded but index is stale.
             let store = self.store.as_ref()?;
             self.routing = RoutingIndex::from_store(store);
         }
 
-        let (context, delta) = self.prepare_injection(weights, token_ids)?;
+        let (context, delta, boundary, crystal) = self.prepare_injection(weights, token_ids)?;
         let perturb = Some((self.config.injection_layer, delta.view()));
-        let raw = forward_raw_logits(weights, &context, perturb);
 
-        // Cache state for decode steps.
-        self.context_tokens = context;
+        let raw = if let Some(ref bnd) = boundary {
+            // Compressed: boundary residual acts as position-0; skip layers 0..crystal.
+            forward_from_layer(weights, token_ids, bnd, crystal, perturb)
+        } else {
+            forward_raw_logits(weights, &context, perturb)
+        };
+
+        // Cache decode state.
+        self.context_tokens = if boundary.is_some() {
+            token_ids.to_vec() // compressed: just the query
+        } else {
+            context
+        };
         self.injection_delta = Some(delta);
+        self.boundary_residual = boundary;
+        self.crystal_layer = crystal;
 
         let last = raw.h_pre_norm.shape()[0] - 1;
         Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
     }
 
-    /// Extend context by one token and re-run the forward pass with the
-    /// same injection delta. O(N) per step (full re-forward, no K/V cache).
+    /// Extend by one token. Uses the boundary compressed path when available
+    /// (4 layers), otherwise full 34-layer re-forward.
     fn decode_step(&mut self, weights: &ModelWeights, token_id: u32) -> Option<Array2<f32>> {
         self.context_tokens.push(token_id);
         let delta = self.injection_delta.as_ref()?;
         let perturb = Some((self.config.injection_layer, delta.view()));
-        let raw = forward_raw_logits(weights, &self.context_tokens, perturb);
+
+        let raw = if let Some(ref bnd) = self.boundary_residual {
+            // Compressed: re-run only crystal_layer..num_layers over growing query.
+            forward_from_layer(weights, &self.context_tokens, bnd, self.crystal_layer, perturb)
+        } else {
+            forward_raw_logits(weights, &self.context_tokens, perturb)
+        };
+
         let last = raw.h_pre_norm.shape()[0] - 1;
         Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
     }

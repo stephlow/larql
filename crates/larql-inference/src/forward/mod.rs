@@ -123,7 +123,7 @@ pub use predict::{
     predict, predict_with_temperature, predict_with_ffn, predict_with_ffn_attention, predict_with_ffn_trace,
     predict_with_router, predict_with_strategy, predict_from_hidden, predict_from_hidden_with_ffn,
     logits_to_predictions_pub, logit_lens_top1,
-    forward_raw_logits, forward_raw_logits_with_prefix, RawForward,
+    forward_raw_logits, forward_raw_logits_with_prefix, forward_from_layer, RawForward,
     hidden_to_raw_logits,
 };
 pub use trace::{

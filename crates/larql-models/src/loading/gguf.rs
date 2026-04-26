@@ -324,7 +324,7 @@ pub fn load_gguf(path: &Path) -> Result<ModelWeights, ModelError> {
     // Re-normalize keys through the architecture's prefix stripping
     let mut normalized_tensors: HashMap<String, crate::WeightArray> = HashMap::new();
     for (k, v) in tensors.drain() {
-        let key = super::safetensors::normalize_key_pub(&k, prefixes);
+        let key = super::safetensors::normalize_key(&k, prefixes);
         normalized_tensors.insert(key, v);
     }
 
@@ -372,6 +372,7 @@ pub fn load_gguf(path: &Path) -> Result<ModelWeights, ModelError> {
         tensors: normalized_tensors,
         vectors,
         raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,

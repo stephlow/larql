@@ -928,6 +928,75 @@ mod tests {
         assert_eq!(rs.stored[0].shape()[0], window);
     }
 
+    // ── engine prefill / decode cycle ─────────────────────────────────────────
+
+    #[test]
+    fn prefill_populates_store() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(None);
+        assert_eq!(engine.memory_bytes(), 0);
+        let h = engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill failed");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(engine.memory_bytes() > 0);
+        assert_eq!(engine.window_tokens(), 3);
+    }
+
+    #[test]
+    fn decode_step_extends_window() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(None);
+        engine.prefill(&weights, &[0u32, 1]).expect("prefill");
+        let h = engine.decode_step(&weights, 2).expect("decode_step");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert_eq!(engine.window_tokens(), 3);
+    }
+
+    #[test]
+    fn multiple_decode_steps_grow_window() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(None);
+        engine.prefill(&weights, &[0u32]).expect("prefill");
+        for token in 1u32..5 {
+            engine.decode_step(&weights, token).expect("decode_step");
+        }
+        assert_eq!(engine.window_tokens(), 5);
+    }
+
+    #[test]
+    fn window_size_clips_hot_tier() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(Some(2));
+        engine.prefill(&weights, &[0u32, 1, 2, 3]).expect("prefill");
+        assert_eq!(engine.window_tokens(), 2);
+        assert!(engine.cold_bytes() > 0, "evicted rows should appear in cold tier");
+    }
+
+    #[test]
+    fn cold_kv_is_populated_after_window_clip() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(Some(2));
+        engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill"); // 3 > window=2
+        let store = engine.store.as_ref().expect("store not set");
+        assert!(store.cold_kv.is_some(), "cold_kv cache should exist after clipping");
+    }
+
+    #[test]
+    fn logits_are_finite() {
+        use crate::engines::test_utils::make_test_weights;
+        use crate::forward::hidden_to_raw_logits;
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(None);
+        let h_pre = engine.prefill(&weights, &[0u32, 1]).expect("prefill");
+        assert!(hidden_to_raw_logits(&weights, &h_pre).iter().all(|v| v.is_finite()));
+        let h_dec = engine.decode_step(&weights, 2).expect("decode");
+        assert!(hidden_to_raw_logits(&weights, &h_dec).iter().all(|v| v.is_finite()));
+    }
+
     // ── engine construction ────────────────────────────────────────────────────
 
     #[test]

@@ -20,6 +20,11 @@ pub struct ModelWeights {
     /// Memory-mapped files for large packed-byte tensors (experts_packed.bin, etc.).
     /// Each entry maps a file name to its Mmap handle so the OS can page-in on demand.
     pub packed_mmaps: HashMap<String, Mmap>,
+    /// Tensors skipped during loading because their dtype is not convertible to f32.
+    /// Each entry is `(tensor_key, dtype_name)`. Integer tensors (attention masks,
+    /// token type IDs) appear here and are benign; unexpected entries indicate a
+    /// model format the loader does not yet handle.
+    pub skipped_tensors: Vec<(String, String)>,
     /// Byte ranges into `packed_mmaps`: maps tensor key → (file_name, offset, length).
     pub packed_byte_ranges: HashMap<String, (String, usize, usize)>,
     pub embed: WeightArray,

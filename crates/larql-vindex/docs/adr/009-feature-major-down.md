@@ -47,17 +47,42 @@ typed struct rather than poking `serde_json::Value` with string keys.
 | Warm-cache decode | scaled-add only (fast) | scaled-add only (fast) |
 | Lock contention | Mutex on cache | none |
 
+## When the new path actually fires
+
+The W2 dispatch lives inside `ffn_row_scaled_add` for `component == 2`,
+which is called by `walk_ffn_sparse`. Sparse walk runs when at least
+one of:
+
+- the layer has overrides (post-INSERT patches),
+- `WalkFfnConfig::is_sparse(layer)` is true (explicit sparse-K),
+- the vindex has FP4 storage (FP4 always routes through sparse).
+
+The default dense Q4K walk (`walk_ffn_q4k_dequant`) does an inline
+full-layer dequant + dense matmul instead — it bypasses both the
+legacy `q4k_ffn_layer` cache *and* the W2 feature-major path. For
+pure-dense Q4K traffic the cache stays at 0 slots either way; the
+value of W2 there is the *capability* — you can hot-attach a patch or
+switch on sparse mode and still hit the per-feature path without
+lighting up an unbounded cache.
+
+Production Metal full-K decode goes through `q4k_matmul_transb` and
+also bypasses both paths.
+
 ## When to enable
 
 - **Yes**: CPU sparse walk, interpretability pipelines, multi-shard
-  grid servers, MoE experts (Kimi, DeepSeek-V3+) — anywhere the
-  cache never amortises or RSS bound matters.
-- **No**: Metal full-K decode workloads where production already
-  bypasses the cache (`q4k_matmul_transb` streams Q4_K bytes
-  through the GPU). The disk overhead buys nothing.
+  grid servers running INSERT-heavy workloads, MoE experts (Kimi,
+  DeepSeek-V3+) — anywhere the cache *would* fire and the RSS bound
+  matters.
+- **Yes (defensive)**: pure-dense Q4K grid servers where you might
+  later add patches or sparse-K. The disk overhead is the price of
+  preserving the cache-bounded RSS guarantee.
+- **No**: Metal-only decode farms with no patch traffic. The disk
+  overhead buys nothing today.
 
 Default is **off**. CLI flag `--feature-major-down` on
-`larql extract-index` and `larql convert quantize q4k`.
+`larql extract-index` and `larql convert quantize q4k`. Live status:
+`GET /v1/stats` → `q4k_ffn.feature_major_down`.
 
 ## Why not delete the legacy cache?
 

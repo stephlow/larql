@@ -55,7 +55,7 @@ pub fn q4k_row_dot(data: &[u8], x: &[f32]) -> Result<f32, ModelError> {
 /// Scalar reference used on non-aarch64 and by tests.
 #[inline]
 #[allow(dead_code)]
-fn q4k_row_dot_scalar(data: &[u8], x: &[f32], n_blocks: usize) -> f32 {
+pub(super) fn q4k_row_dot_scalar(data: &[u8], x: &[f32], n_blocks: usize) -> f32 {
     let mut acc = 0.0f32;
     for sb in 0..n_blocks {
         let block = &data[sb * 144..(sb + 1) * 144];

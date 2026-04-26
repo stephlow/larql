@@ -23,6 +23,42 @@ Per-stage breakdown (100-token run, 8 warmup):
 
 ---
 
+## Per-kernel profiling (2026-04-26, M3 Max, Gemma 3 4B shapes)
+
+Run: `cargo run --release --features metal -p larql-compute --example diag_profile_kernels`
+
+Two measurement modes:
+- **Isolated**: one commit+wait per call (includes ~20µs GPU spin-up overhead)
+- **Batched**: 34 calls per command buffer, single commit+wait (matches real decode pipeline)
+
+| Kernel | Data/layer | Batched GB/s | Batched ms/layer | ms/tok×34L | Bottleneck |
+|---|---|---|---|---|---|
+| q6k_matvec (FFN down, K=10240) | 21.5 MB | **312 GB/s** | 0.069ms | 2.34ms | bandwidth-bound |
+| q4k_ffn_gate_up (gate+up, K=2560) | 29.5 MB | **272 GB/s** | 0.108ms | 3.68ms | **compute-bound** |
+| f32_gemv (lm_head, 262K×2560) | 2680 MB | **370 GB/s** | — | 7.4ms | bandwidth-bound (near peak) |
+
+**These two kernels (down + gate+up) account for 6.01ms of the ~11.7ms GPU fwd.**
+
+### Why gate+up is compute-bound
+
+Q4_K at K=2560 has the lowest bytes-per-element ratio (0.5625 B/elem) of any kernel.
+The GPU spends more cycles on nibble dequant than waiting for LPDDR5X. Ollama closes
+this gap via vectorized `float4` accumulation in their `kernel_mul_mv_q4_K_f32_impl`,
+but that kernel assumes a transposed nibble layout (GGUF format: lo=elem b, hi=elem b+32)
+incompatible with LARQL's linear layout (lo=elem 2b, hi=elem 2b+1).
+
+### Projected impact of closing each gap
+
+| Gap | Current | Target (Ollama est.) | Savings |
+|---|---|---|---|
+| q6k_matvec: 312→390 GB/s | 2.34ms | 1.87ms | 0.47ms |
+| q4k_ffn_gate_up: 272→390 GB/s | 3.68ms | 2.57ms | 1.11ms |
+| lm_head overhead | 2.45ms | ~1.3ms | 1.15ms |
+| Dispatch overhead | ~1.87ms | ~1.36ms | 0.51ms |
+| **Total projected savings** | | | **~3.24ms** → ~85 tok/s |
+
+---
+
 ## llama.cpp / Ollama gap analysis (2026-04-25)
 
 ### Bandwidth budget

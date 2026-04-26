@@ -69,7 +69,7 @@ pub use forward::{
     TargetDelta, TargetDeltaOpts,
     apply_knn_override, infer_patched, infer_patched_q4k, walk_trace_from_residuals, InferPatchedResult,
     KnnOverride, KNN_COSINE_THRESHOLD,
-    forward_raw_logits, RawForward, hidden_to_raw_logits,
+    forward_raw_logits, forward_from_layer, RawForward, hidden_to_raw_logits,
     generate_cached_constrained,
 };
 pub use graph_ffn::{GateIndex, IndexBuildCallbacks, SilentIndexCallbacks};

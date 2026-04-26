@@ -679,4 +679,148 @@ mod tests {
             "gold={gold} dispatched={dispatched} tol={tol}"
         );
     }
+
+    // ── Q4_K row_dot NEON ≡ scalar ──
+
+    fn synth_q4k_block(seed: u32) -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        let mut s = seed;
+        for b in &mut block[4..144] {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (s >> 16) as u8;
+        }
+        // d = 0.0625 (f16 0x2C00), dmin = 0.0625 — small to keep values bounded.
+        block[0] = 0x00; block[1] = 0x2C;
+        block[2] = 0x00; block[3] = 0x2C;
+        block
+    }
+
+    #[test]
+    fn q4k_row_dot_neon_matches_scalar_single_block() {
+        use super::q4_k::q4k_row_dot_scalar;
+        let data = synth_q4k_block(42);
+        let x: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let scalar = q4k_row_dot_scalar(&data, &x, 1);
+        let dispatched = q4k_row_dot(&data, &x).unwrap();
+        assert!(
+            (scalar - dispatched).abs() < 1e-3,
+            "scalar={scalar} dispatched={dispatched}"
+        );
+    }
+
+    #[test]
+    fn q4k_row_dot_neon_matches_scalar_multi_block() {
+        use super::q4_k::q4k_row_dot_scalar;
+        let mut data = Vec::with_capacity(144 * 8);
+        for sb in 0..8u32 {
+            data.extend_from_slice(&synth_q4k_block(1000 + sb));
+        }
+        let x: Vec<f32> = (0..256 * 8)
+            .map(|i| (((i as f32) * 0.003).cos() - 0.5) * 0.2)
+            .collect();
+        let scalar = q4k_row_dot_scalar(&data, &x, 8);
+        let dispatched = q4k_row_dot(&data, &x).unwrap();
+        let tol = (scalar.abs() + dispatched.abs()).max(1.0) * 1e-5;
+        assert!(
+            (scalar - dispatched).abs() < tol,
+            "scalar={scalar} dispatched={dispatched} tol={tol}"
+        );
+    }
+
+    #[test]
+    fn q4k_row_dot_matches_dequantized_dot() {
+        let data = synth_q4k_block(7);
+        let deq = dequantize_q4_k(&data, 256).unwrap();
+        let x: Vec<f32> = (0..256).map(|i| (i as f32) * 0.001 - 0.05).collect();
+        let gold: f32 = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+        let dispatched = q4k_row_dot(&data, &x).unwrap();
+        let tol = (gold.abs() + dispatched.abs()).max(1.0) * 1e-4;
+        assert!(
+            (gold - dispatched).abs() < tol,
+            "gold={gold} dispatched={dispatched} tol={tol}"
+        );
+    }
+
+    // ── Q4_K dequantize with nonzero known values ──
+
+    #[test]
+    fn q4_k_dequantize_known_nonzero_values() {
+        // d=1.0, dmin=0.0, scales[0..4]=2, scales[4..8]=0, mins all 0.
+        // All quant bytes = 0x53 → lo nibble=3, hi nibble=5.
+        //
+        // Expected output per sub-block group:
+        //   g=0: base_lo=0..32   → d*scales[0]*3 = 6.0
+        //         base_hi=32..64  → d*scales[1]*5 = 10.0
+        //   g=1: base_lo=64..96  → 6.0
+        //         base_hi=96..128 → 10.0
+        //   g=2/3: scales[4..8]=0  → 0.0
+        let mut block = vec![0u8; 144];
+        block[0] = 0x00; block[1] = 0x3C; // d = 1.0 (f16)
+        block[2] = 0x00; block[3] = 0x00; // dmin = 0.0
+        // scales_bytes[0..4] = 0x02 → scales[0..4] = 2, mins[0..4] = 0
+        block[4] = 0x02; block[5] = 0x02; block[6] = 0x02; block[7] = 0x02;
+        // scales_bytes[4..12] = 0x00 → mins[0..4] = 0, scales[4..8] = 0
+        block[8..16].fill(0x00);
+        block[16..144].fill(0x53);
+
+        let out = dequantize_q4_k(&block, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for (i, &v) in out.iter().enumerate().take(32)            { assert!((v -  6.0).abs() < 1e-6, "i={i} got {v}"); }
+        for (i, &v) in out.iter().enumerate().take(64).skip(32)   { assert!((v - 10.0).abs() < 1e-6, "i={i} got {v}"); }
+        for (i, &v) in out.iter().enumerate().take(96).skip(64)   { assert!((v -  6.0).abs() < 1e-6, "i={i} got {v}"); }
+        for (i, &v) in out.iter().enumerate().take(128).skip(96)  { assert!((v - 10.0).abs() < 1e-6, "i={i} got {v}"); }
+        for (i, &v) in out.iter().enumerate().skip(128)           { assert!((v -  0.0).abs() < 1e-6, "i={i} got {v}"); }
+    }
+
+    // ── scaled_add correctness (q4k and q6k) ──
+
+    #[test]
+    fn q4k_row_scaled_add_matches_alpha_times_deq() {
+        let data = synth_q4k_block(13);
+        let alpha = 0.25_f32;
+        let deq = dequantize_q4_k(&data, 256).unwrap();
+        let mut out = vec![0.0f32; 256];
+        q4k_row_scaled_add(&data, alpha, &mut out).unwrap();
+        for (i, (&o, &d)) in out.iter().zip(&deq).enumerate() {
+            let expected = alpha * d;
+            assert!(
+                (o - expected).abs() < 1e-5,
+                "idx {i}: got {o} expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q6k_row_scaled_add_matches_alpha_times_deq() {
+        let data = synth_q6k_block(21);
+        let alpha = 0.5_f32;
+        let deq = dequantize_q6_k(&data, 256).unwrap();
+        let mut out = vec![0.0f32; 256];
+        q6k_row_scaled_add(&data, alpha, &mut out).unwrap();
+        for (i, (&o, &d)) in out.iter().zip(&deq).enumerate() {
+            let expected = alpha * d;
+            assert!(
+                (o - expected).abs() < 1e-5,
+                "idx {i}: got {o} expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4k_row_scaled_add_rejects_misaligned() {
+        let mut out = vec![0.0f32; 300]; // not a multiple of 256
+        match q4k_row_scaled_add(&[0u8; 144], 1.0, &mut out) {
+            Err(ModelError::Parse(msg)) => assert!(msg.contains("not a multiple of"), "got: {msg}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn q6k_row_scaled_add_rejects_misaligned() {
+        let mut out = vec![0.0f32; 300];
+        match q6k_row_scaled_add(&[0u8; 210], 1.0, &mut out) {
+            Err(ModelError::Parse(msg)) => assert!(msg.contains("not a multiple of"), "got: {msg}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
 }

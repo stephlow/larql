@@ -143,6 +143,39 @@ pub fn dequantize_all_experts(
         .collect()
 }
 
+/// Per-expert weight matrix: one inner `Vec<f32>` per expert, row-major.
+pub type ExpertWeights = Vec<Vec<f32>>;
+
+/// Dequantize and split a GPT-OSS fused gate_up packed tensor into separate
+/// gate (w1) and up (w3) per-expert matrices.
+///
+/// GPT-OSS stores gate and up projections fused row-wise into a single MXFP4
+/// tensor of shape `[num_experts, 2*hidden, groups, 16]`. This function
+/// dequantizes it and splits at the midpoint: rows `[0..half]` = gate,
+/// rows `[half..]` = up.
+///
+/// Returns `(gate_experts, up_experts)` each an `ExpertWeights` of length
+/// `num_experts`, where each inner `Vec` holds one expert's weight matrix
+/// in row-major order with shape `[out_features/2, groups*32]`.
+pub fn split_gate_up_experts(
+    blocks: &[u8],
+    scales: &[u8],
+    num_experts: usize,
+    out_features: usize,
+    groups: usize,
+) -> Result<(ExpertWeights, ExpertWeights), ModelError> {
+    let expert_data = dequantize_all_experts(blocks, scales, num_experts, out_features, groups)?;
+    let in_features = groups * 32;
+    let half = out_features / 2;
+    let mut gates = Vec::with_capacity(num_experts);
+    let mut ups = Vec::with_capacity(num_experts);
+    for data in expert_data {
+        gates.push(data[..half * in_features].to_vec());
+        ups.push(data[half * in_features..].to_vec());
+    }
+    Ok((gates, ups))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +321,38 @@ mod tests {
     fn dequant_zero_experts_ok() {
         let results = dequantize_all_experts(&[], &[], 0, 1, 1).unwrap();
         assert!(results.is_empty());
+    }
+
+    // ── split_gate_up_experts ──
+
+    #[test]
+    fn split_gate_up_even_split() {
+        // 1 expert, out_features=2 (half=1), 1 group → 32 elements total.
+        // gate = first 32 values (scale 1.0, nibble 2 → 1.0 each).
+        // up   = second 32 values (scale 2.0, nibble 2 → 2.0 each).
+        let blocks = vec![0x22u8; 32]; // 2 groups × 16 bytes
+        let scales = vec![127u8, 128u8]; // [1.0, 2.0]
+        let (gates, ups) = split_gate_up_experts(&blocks, &scales, 1, 2, 1).unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(ups.len(), 1);
+        assert_eq!(gates[0].len(), 32); // half=1, in_features=32
+        assert_eq!(ups[0].len(), 32);
+        assert!(gates[0].iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(ups[0].iter().all(|&v| (v - 2.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn split_gate_up_two_experts() {
+        // 2 experts, out_features=2, 1 group each.
+        // Expert 0 scale=1.0, expert 1 scale=2.0 (both use nibble 2 = 1.0).
+        let blocks = vec![0x22u8; 64]; // 2 experts × 2 groups × 16 bytes
+        let scales = vec![127u8, 127u8, 128u8, 128u8]; // e0:[1.0,1.0], e1:[2.0,2.0]
+        let (gates, ups) = split_gate_up_experts(&blocks, &scales, 2, 2, 1).unwrap();
+        assert_eq!(gates.len(), 2);
+        assert!(gates[0].iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(gates[1].iter().all(|&v| (v - 2.0).abs() < 1e-6));
+        assert!(ups[0].iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(ups[1].iter().all(|&v| (v - 2.0).abs() < 1e-6));
     }
 
     #[test]
