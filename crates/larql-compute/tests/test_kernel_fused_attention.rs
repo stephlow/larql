@@ -22,15 +22,19 @@ use common::{get_metal, max_diff};
 fn fused_attention_matches_cpu_reference() {
     let device = metal::Device::system_default().unwrap();
     let src = larql_compute::metal::shaders::all_shaders();
-    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
-    let pipeline = device.new_compute_pipeline_state_with_function(
-        &lib.get_function("fused_attention", None).unwrap()
-    ).unwrap();
+    let lib = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(
+            &lib.get_function("fused_attention", None).unwrap(),
+        )
+        .unwrap();
     let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
     let queue = device.new_command_queue();
 
     let seq_len = 3u32;
-    let head_dim = 8u32;  // small for easy debugging
+    let head_dim = 8u32; // small for easy debugging
     let num_q = 2u32;
     let num_kv = 2u32;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -42,9 +46,15 @@ fn fused_attention_matches_cpu_reference() {
     let kv_total = (seq_len * num_kv * head_dim) as usize;
 
     // Deterministic test data
-    let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.37 + 1.0).sin() * 0.5).collect();
-    let k: Vec<f32> = (0..kv_total).map(|i| (i as f32 * 0.23 + 2.0).cos() * 0.5).collect();
-    let v: Vec<f32> = (0..kv_total).map(|i| (i as f32 * 0.11 + 3.0).sin() * 0.3).collect();
+    let q: Vec<f32> = (0..total)
+        .map(|i| (i as f32 * 0.37 + 1.0).sin() * 0.5)
+        .collect();
+    let k: Vec<f32> = (0..kv_total)
+        .map(|i| (i as f32 * 0.23 + 2.0).cos() * 0.5)
+        .collect();
+    let v: Vec<f32> = (0..kv_total)
+        .map(|i| (i as f32 * 0.11 + 3.0).sin() * 0.3)
+        .collect();
 
     // ── CPU reference: apply RoPE then causal attention ──
     let hd = head_dim as usize;
@@ -139,9 +149,17 @@ fn fused_attention_matches_cpu_reference() {
     enc.set_bytes(10, 4, &use_qk_norm as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(11, 4, &softcap as *const f32 as *const std::ffi::c_void);
     let skip_rope_val = 0u32;
-    enc.set_bytes(12, 4, &skip_rope_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        12,
+        4,
+        &skip_rope_val as *const u32 as *const std::ffi::c_void,
+    );
     let rotary_dim_val = 0u32; // 0 = full head_dim rotation
-    enc.set_bytes(13, 4, &rotary_dim_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        13,
+        4,
+        &rotary_dim_val as *const u32 as *const std::ffi::c_void,
+    );
     enc.dispatch_thread_groups(
         metal::MTLSize::new(num_q as u64, seq_len as u64, 1),
         metal::MTLSize::new(256, 1, 1),
@@ -155,8 +173,12 @@ fn fused_attention_matches_cpu_reference() {
 
     // Compare
     let diff = max_diff(&cpu_out, &metal_result);
-    assert!(diff < 0.01, "fused_attention max diff {diff} (expected < 0.01).\nCPU[0..8]: {:?}\nGPU[0..8]: {:?}",
-        &cpu_out[..8.min(total)], &metal_result[..8.min(total)]);
+    assert!(
+        diff < 0.01,
+        "fused_attention max diff {diff} (expected < 0.01).\nCPU[0..8]: {:?}\nGPU[0..8]: {:?}",
+        &cpu_out[..8.min(total)],
+        &metal_result[..8.min(total)]
+    );
 }
 
 // ── fused_attention at head_dim=512 (Gemma 4 global layers) ──
@@ -187,7 +209,9 @@ fn fused_attention_head_dim_512() {
         .new_library_with_source(&src, &metal::CompileOptions::new())
         .unwrap();
     let pipeline = device
-        .new_compute_pipeline_state_with_function(&lib.get_function("fused_attention", None).unwrap())
+        .new_compute_pipeline_state_with_function(
+            &lib.get_function("fused_attention", None).unwrap(),
+        )
         .unwrap();
     let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
     let queue = device.new_command_queue();

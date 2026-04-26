@@ -20,9 +20,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use larql_inference::attention::SharedKV;
-use larql_inference::forward::{
-    embed_tokens_pub, hidden_to_raw_logits, run_layer_with_ffn,
-};
+use larql_inference::forward::{embed_tokens_pub, hidden_to_raw_logits, run_layer_with_ffn};
 use larql_inference::model::ModelWeights;
 use larql_inference::vindex::WalkFfn;
 use larql_vindex::VectorIndex;
@@ -40,7 +38,11 @@ pub struct ComparisonConfig {
 
 impl Default for ComparisonConfig {
     fn default() -> Self {
-        Self { top_k: 5, max_seq_len: None, max_layers: None }
+        Self {
+            top_k: 5,
+            max_seq_len: None,
+            max_layers: None,
+        }
     }
 }
 
@@ -100,7 +102,11 @@ pub struct ComparisonConfigSerde {
 
 impl From<&ComparisonConfig> for ComparisonConfigSerde {
     fn from(c: &ComparisonConfig) -> Self {
-        Self { top_k: c.top_k, max_seq_len: c.max_seq_len, max_layers: c.max_layers }
+        Self {
+            top_k: c.top_k,
+            max_seq_len: c.max_seq_len,
+            max_layers: c.max_layers,
+        }
     }
 }
 
@@ -152,9 +158,9 @@ pub fn forward_to_logits_traced(
         // positions are processed.
         let walk_ffn = WalkFfn::new_unlimited(weights, index).with_dispatch_trace();
 
-        if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
-            weights, &h, layer, &walk_ffn, false, None, shared_kv,
-        ) {
+        if let Some((h_new, _, kv_out)) =
+            run_layer_with_ffn(weights, &h, layer, &walk_ffn, false, None, shared_kv)
+        {
             h = h_new;
             if let Some(kv) = kv_out {
                 kv_cache.insert(layer, kv);
@@ -188,7 +194,13 @@ pub fn compare_prompt(
 ) -> PromptReport {
     let logits_ref = forward_to_logits(weights, reference, token_ids, config);
     let logits_cand = forward_to_logits(weights, candidate, token_ids, config);
-    metrics_from_logits(prompt, token_ids.len(), &logits_ref, &logits_cand, config.top_k)
+    metrics_from_logits(
+        prompt,
+        token_ids.len(),
+        &logits_ref,
+        &logits_cand,
+        config.top_k,
+    )
 }
 
 /// Compare a whole prompt set. Returns an `AggregateReport`.
@@ -208,9 +220,13 @@ pub fn compare_many(
     for (prompt, token_ids) in prompts_and_tokens {
         let mut ids = token_ids.clone();
         if let Some(cap) = config.max_seq_len {
-            if ids.len() > cap { ids.truncate(cap); }
+            if ids.len() > cap {
+                ids.truncate(cap);
+            }
         }
-        per_prompt.push(compare_prompt(weights, reference, candidate, prompt, &ids, config));
+        per_prompt.push(compare_prompt(
+            weights, reference, candidate, prompt, &ids, config,
+        ));
     }
     aggregate(per_prompt, reference_label, candidate_label, config)
 }
@@ -224,8 +240,11 @@ fn metrics_from_logits(
     logits_cand: &[f32],
     top_k: usize,
 ) -> PromptReport {
-    assert_eq!(logits_ref.len(), logits_cand.len(),
-               "logit vectors must have the same vocab size");
+    assert_eq!(
+        logits_ref.len(),
+        logits_cand.len(),
+        "logit vectors must have the same vocab size"
+    );
 
     let argmax_ref = argmax(logits_ref);
     let argmax_cand = argmax(logits_cand);
@@ -311,7 +330,10 @@ fn argmax(xs: &[f32]) -> u32 {
     let mut idx = 0usize;
     let mut best = f32::NEG_INFINITY;
     for (i, &v) in xs.iter().enumerate() {
-        if v > best { best = v; idx = i; }
+        if v > best {
+            best = v;
+            idx = i;
+        }
     }
     idx as u32
 }
@@ -328,12 +350,18 @@ fn top_k_ids(xs: &[f32], k: usize) -> Vec<u32> {
 }
 
 fn jaccard(a: &[u32], b: &[u32]) -> f64 {
-    if a.is_empty() && b.is_empty() { return 1.0; }
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
     let sa: std::collections::BTreeSet<u32> = a.iter().copied().collect();
     let sb: std::collections::BTreeSet<u32> = b.iter().copied().collect();
     let intersect = sa.intersection(&sb).count() as f64;
     let union = sa.union(&sb).count() as f64;
-    if union == 0.0 { 1.0 } else { intersect / union }
+    if union == 0.0 {
+        1.0
+    } else {
+        intersect / union
+    }
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -346,14 +374,20 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
         nb += y as f64 * y as f64;
     }
     let denom = (na.sqrt()) * (nb.sqrt());
-    if denom == 0.0 { 1.0 } else { num / denom }
+    if denom == 0.0 {
+        1.0
+    } else {
+        num / denom
+    }
 }
 
 fn softmax(logits: &[f32]) -> Vec<f64> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f64> = logits.iter().map(|&v| ((v - max) as f64).exp()).collect();
     let sum: f64 = exps.iter().sum();
-    if sum == 0.0 { return vec![1.0 / logits.len() as f64; logits.len()]; }
+    if sum == 0.0 {
+        return vec![1.0 / logits.len() as f64; logits.len()];
+    }
     exps.into_iter().map(|e| e / sum).collect()
 }
 
@@ -363,7 +397,9 @@ fn kl_divergence(p: &[f64], q: &[f64]) -> f64 {
     const EPS: f64 = 1e-12;
     let mut kl = 0.0f64;
     for (&pi, &qi) in p.iter().zip(q.iter()) {
-        if pi <= 0.0 { continue; }
+        if pi <= 0.0 {
+            continue;
+        }
         let qi_safe = qi.max(EPS);
         kl += pi * (pi.ln() - qi_safe.ln());
     }
@@ -371,7 +407,9 @@ fn kl_divergence(p: &[f64], q: &[f64]) -> f64 {
 }
 
 fn percentile(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() { return f64::NAN; }
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
     let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
@@ -463,18 +501,32 @@ mod tests {
         // argmax_agreement = 0.5.
         let prompts = vec![
             PromptReport {
-                prompt: "a".into(), seq_len: 1,
-                logit_cos: 0.9, argmax_match: true,
-                top_k_jaccard: 0.8, kl_forward: 0.01, kl_reverse: 0.01, kl_symmetric: 0.01,
-                ref_top_token_id: 42, cand_top_token_id: 42,
-                ref_top_token: None, cand_top_token: None,
+                prompt: "a".into(),
+                seq_len: 1,
+                logit_cos: 0.9,
+                argmax_match: true,
+                top_k_jaccard: 0.8,
+                kl_forward: 0.01,
+                kl_reverse: 0.01,
+                kl_symmetric: 0.01,
+                ref_top_token_id: 42,
+                cand_top_token_id: 42,
+                ref_top_token: None,
+                cand_top_token: None,
             },
             PromptReport {
-                prompt: "b".into(), seq_len: 2,
-                logit_cos: 0.7, argmax_match: false,
-                top_k_jaccard: 0.4, kl_forward: 0.05, kl_reverse: 0.05, kl_symmetric: 0.05,
-                ref_top_token_id: 1, cand_top_token_id: 7,
-                ref_top_token: None, cand_top_token: None,
+                prompt: "b".into(),
+                seq_len: 2,
+                logit_cos: 0.7,
+                argmax_match: false,
+                top_k_jaccard: 0.4,
+                kl_forward: 0.05,
+                kl_reverse: 0.05,
+                kl_symmetric: 0.05,
+                ref_top_token_id: 1,
+                cand_top_token_id: 7,
+                ref_top_token: None,
+                cand_top_token: None,
             },
         ];
         let r = aggregate(prompts, "r", "c", &ComparisonConfig::default());

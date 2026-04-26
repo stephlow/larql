@@ -1,9 +1,9 @@
 use ndarray::Array2;
 
-use larql_compute::prelude::*;
+use super::{LayerGraph, LayerOutput};
 use crate::ffn::FfnBackend;
 use crate::model::ModelWeights;
-use super::{LayerGraph, LayerOutput};
+use larql_compute::prelude::*;
 
 // ── Walk: dense attention + vindex walk FFN ──
 
@@ -24,10 +24,16 @@ impl<'a> LayerGraph for WalkLayerGraph<'a> {
         let (h_post_attn, _attn_proj, _) =
             crate::attention::run_attention_block_gpu(weights, h, layer, false, self.backend)?;
         let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, self.ffn, false);
-        Some(LayerOutput { residual: h_out, activation: None, attention: None })
+        Some(LayerOutput {
+            residual: h_out,
+            activation: None,
+            attention: None,
+        })
     }
 
-    fn name(&self) -> &str { "walk" }
+    fn name(&self) -> &str {
+        "walk"
+    }
 }
 
 // ── Pipelined: CPU attention + batched GPU Q4 FFN ──
@@ -68,24 +74,29 @@ impl<'a> LayerGraph for PipelinedLayerGraph<'a> {
         // WalkFfn checks for Q4 interleaved data and routes to Metal Q4
         // when backend.has_q4(), falling back to f32 BLAS otherwise.
         // This ensures the norm/residual logic matches exactly.
-        let walk_ffn = crate::vindex::WalkFfn::new_unlimited_with_backend(
-            weights, self.index, self.backend,
-        );
+        let walk_ffn =
+            crate::vindex::WalkFfn::new_unlimited_with_backend(weights, self.index, self.backend);
         let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
-        Some(LayerOutput { residual: h_out, activation: None, attention: None })
+        Some(LayerOutput {
+            residual: h_out,
+            activation: None,
+            attention: None,
+        })
     }
 
-    fn name(&self) -> &str { "pipelined" }
+    fn name(&self) -> &str {
+        "pipelined"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
-    use std::sync::OnceLock;
     use crate::engines::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
     use larql_models::ModelWeights;
+    use ndarray::Array2;
+    use std::sync::OnceLock;
 
     fn weights() -> &'static ModelWeights {
         static W: OnceLock<ModelWeights> = OnceLock::new();
@@ -103,7 +114,10 @@ mod tests {
     fn walk_name() {
         let w = weights();
         let ffn = WeightFfn { weights: w };
-        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
         assert_eq!(g.name(), "walk");
     }
 
@@ -111,7 +125,10 @@ mod tests {
     fn walk_forward_shape_single_token() {
         let w = weights();
         let ffn = WeightFfn { weights: w };
-        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
         let h = input(1, w.hidden_size);
         let out = g.forward_layer(w, &h, 0).expect("layer 0");
         assert_eq!(out.residual.shape(), &[1, w.hidden_size]);
@@ -122,7 +139,10 @@ mod tests {
     fn walk_forward_all_layers() {
         let w = weights();
         let ffn = WeightFfn { weights: w };
-        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
         let h = input(1, w.hidden_size);
         for layer in 0..w.num_layers {
             let out = g.forward_layer(w, &h, layer).expect("layer {layer}");
@@ -134,7 +154,10 @@ mod tests {
     fn walk_never_captures_activation_or_attention() {
         let w = weights();
         let ffn = WeightFfn { weights: w };
-        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
         let out = g.forward_layer(w, &input(2, w.hidden_size), 0).unwrap();
         assert!(out.activation.is_none());
         assert!(out.attention.is_none());

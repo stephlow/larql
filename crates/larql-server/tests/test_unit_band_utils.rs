@@ -3,15 +3,17 @@
 //! No HTTP server is needed — all tests call the functions directly.
 
 use larql_server::band_utils::{
-    BAND_ALL, BAND_KNOWLEDGE, BAND_OUTPUT, BAND_SYNTAX,
-    INFER_MODE_COMPARE, INFER_MODE_DENSE, INFER_MODE_WALK,
-    INSERT_MODE_CONSTELLATION, INSERT_MODE_EMBEDDING,
-    filter_layers_by_band, get_layer_bands,
+    filter_layers_by_band, get_layer_bands, BAND_ALL, BAND_KNOWLEDGE, BAND_OUTPUT, BAND_SYNTAX,
+    INFER_MODE_COMPARE, INFER_MODE_DENSE, INFER_MODE_WALK, INSERT_MODE_CONSTELLATION,
+    INSERT_MODE_EMBEDDING,
 };
-use larql_vindex::{LayerBands, PatchedVindex, VectorIndex, VindexConfig, VindexLayerInfo, ExtractLevel, QuantFormat};
-use larql_vindex::ndarray::Array2;
-use larql_server::state::LoadedModel;
 use larql_server::ffn_l2_cache::FfnL2Cache;
+use larql_server::state::LoadedModel;
+use larql_vindex::ndarray::Array2;
+use larql_vindex::{
+    ExtractLevel, LayerBands, PatchedVindex, QuantFormat, VectorIndex, VindexConfig,
+    VindexLayerInfo,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,7 +48,11 @@ fn insert_mode_constants_correct_values() {
 // ══════════════════════════════════════════════════════════════
 
 fn sample_bands() -> LayerBands {
-    LayerBands { syntax: (0, 1), knowledge: (2, 3), output: (4, 4) }
+    LayerBands {
+        syntax: (0, 1),
+        knowledge: (2, 3),
+        output: (4, 4),
+    }
 }
 
 fn all_layers() -> Vec<usize> {
@@ -111,7 +117,8 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
     let gate = Array2::<f32>::zeros((2, hidden));
     let index = VectorIndex::new(vec![Some(gate)], vec![None], 1, hidden);
     let patched = PatchedVindex::new(index);
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json).unwrap();
     Arc::new(LoadedModel {
         id: "band-test".into(),
@@ -132,8 +139,12 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
             quant: QuantFormat::None,
             layer_bands,
             layers: vec![VindexLayerInfo {
-                layer: 0, num_features: 2, offset: 0, length: 32,
-                num_experts: None, num_features_per_expert: None,
+                layer: 0,
+                num_features: 2,
+                offset: 0,
+                length: 32,
+                num_experts: None,
+                num_features_per_expert: None,
             }],
             down_top_k: 2,
             has_model_weights: false,
@@ -159,7 +170,11 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
 
 #[test]
 fn get_layer_bands_uses_config_bands_when_present() {
-    let explicit_bands = LayerBands { syntax: (0, 1), knowledge: (2, 3), output: (4, 4) };
+    let explicit_bands = LayerBands {
+        syntax: (0, 1),
+        knowledge: (2, 3),
+        output: (4, 4),
+    };
     let model = make_minimal_model(Some(explicit_bands.clone()));
     let bands = get_layer_bands(&model);
     assert_eq!(bands.syntax, explicit_bands.syntax);
@@ -182,7 +197,11 @@ fn get_layer_bands_falls_back_when_none() {
 #[test]
 fn filter_knowledge_with_zero_width_band() {
     // Edge case: knowledge band covers only layer 2 (start == end).
-    let bands = LayerBands { syntax: (0, 0), knowledge: (2, 2), output: (3, 3) };
+    let bands = LayerBands {
+        syntax: (0, 0),
+        knowledge: (2, 2),
+        output: (3, 3),
+    };
     let all = vec![0, 1, 2, 3, 4];
     let result = filter_layers_by_band(all, BAND_KNOWLEDGE, &bands);
     assert_eq!(result, vec![2]);

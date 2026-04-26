@@ -8,17 +8,29 @@ use ndarray::Array2;
 /// Cosine similarity between two equal-length vectors. Returns 0.0 for zero vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum();
     let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 /// Mean squared error between two equal-length vectors.
 pub fn mse(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
-    if a.is_empty() { return 0.0; }
-    let sum: f64 = a.iter().zip(b.iter())
+    if a.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = a
+        .iter()
+        .zip(b.iter())
         .map(|(x, y)| ((*x as f64) - (*y as f64)).powi(2))
         .sum();
     sum / a.len() as f64
@@ -31,7 +43,8 @@ pub use crate::forward::softmax;
 /// `p` and `q` must be valid probability distributions (sum to ~1, all ≥ 0).
 pub fn kl_divergence(p: &[f32], q: &[f32]) -> f64 {
     debug_assert_eq!(p.len(), q.len());
-    p.iter().zip(q.iter())
+    p.iter()
+        .zip(q.iter())
         .filter(|(&pi, _)| pi > 0.0)
         .map(|(&pi, &qi)| {
             let pi = pi as f64;
@@ -44,7 +57,11 @@ pub fn kl_divergence(p: &[f32], q: &[f32]) -> f64 {
 /// Jensen-Shannon divergence (symmetric, bounded [0, ln2]).
 pub fn js_divergence(p: &[f32], q: &[f32]) -> f64 {
     debug_assert_eq!(p.len(), q.len());
-    let m: Vec<f32> = p.iter().zip(q.iter()).map(|(&a, &b)| (a + b) / 2.0).collect();
+    let m: Vec<f32> = p
+        .iter()
+        .zip(q.iter())
+        .map(|(&a, &b)| (a + b) / 2.0)
+        .collect();
     (kl_divergence(p, &m) + kl_divergence(q, &m)) / 2.0
 }
 
@@ -61,7 +78,8 @@ impl HiddenAccuracy {
         assert!(
             self.cosine >= threshold,
             "{label}: cosine {:.6} < threshold {:.6}",
-            self.cosine, threshold,
+            self.cosine,
+            threshold,
         );
     }
 
@@ -70,7 +88,8 @@ impl HiddenAccuracy {
         assert!(
             self.mse <= threshold,
             "{label}: MSE {:.6e} > threshold {:.6e}",
-            self.mse, threshold,
+            self.mse,
+            threshold,
         );
     }
 }
@@ -134,7 +153,13 @@ mod tests {
     fn softmax_max_index_preserved() {
         let logits = vec![0.0f32, 0.0, 5.0, 0.0];
         let p = softmax(&logits);
-        assert_eq!(p.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i), Some(2));
+        assert_eq!(
+            p.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i),
+            Some(2)
+        );
     }
 
     #[test]
@@ -150,7 +175,10 @@ mod tests {
         let p = vec![0.9f32, 0.1];
         let q = vec![0.1f32, 0.9];
         let kl = kl_divergence(&p, &q);
-        assert!(kl > 0.5, "KL of very different distributions should be large, got {kl}");
+        assert!(
+            kl > 0.5,
+            "KL of very different distributions should be large, got {kl}"
+        );
     }
 
     #[test]
@@ -159,7 +187,10 @@ mod tests {
         let q = vec![0.2f32, 0.8];
         let js_pq = js_divergence(&p, &q);
         let js_qp = js_divergence(&q, &p);
-        assert!((js_pq - js_qp).abs() < 1e-6, "JSD not symmetric: {js_pq} vs {js_qp}");
+        assert!(
+            (js_pq - js_qp).abs() < 1e-6,
+            "JSD not symmetric: {js_pq} vs {js_qp}"
+        );
     }
 
     #[test]

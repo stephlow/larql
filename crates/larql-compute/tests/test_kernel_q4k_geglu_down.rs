@@ -115,12 +115,7 @@ fn metal_fused_geglu_down(
 }
 
 /// Run the fused-vs-separated parity test for one geometry + activation.
-fn assert_fused_geglu_down_matches_separated(
-    label: &str,
-    n: usize,
-    inter: usize,
-    silu: bool,
-) {
+fn assert_fused_geglu_down_matches_separated(label: &str, n: usize, inter: usize, silu: bool) {
     assert_eq!(inter % 256, 0, "Q4_K requires inter divisible by 256");
     let metal = get_metal();
     let cpu = larql_compute::cpu::CpuBackend;
@@ -168,23 +163,17 @@ fn q4k_geglu_gelu_tanh_down_smoke() {
 /// decode token.
 #[test]
 fn q4k_geglu_silu_down_gemma3_4b_ffn() {
-    assert_fused_geglu_down_matches_separated(
-        "gemma3-4b ffn (silu)", 2560, 10240, true,
-    );
+    assert_fused_geglu_down_matches_separated("gemma3-4b ffn (silu)", 2560, 10240, true);
 }
 
 #[test]
 fn q4k_geglu_gelu_tanh_down_gemma3_4b_ffn() {
-    assert_fused_geglu_down_matches_separated(
-        "gemma3-4b ffn (gelu_tanh)", 2560, 10240, false,
-    );
+    assert_fused_geglu_down_matches_separated("gemma3-4b ffn (gelu_tanh)", 2560, 10240, false);
 }
 
 /// Larger geometry (Gemma 4 31B sliding FFN): hidden=5376,
 /// inter=21504. Catches "shader sized for K=4096" type bugs at scale.
 #[test]
 fn q4k_geglu_silu_down_gemma4_31b_ffn() {
-    assert_fused_geglu_down_matches_separated(
-        "gemma4-31b ffn (silu)", 5376, 21504, true,
-    );
+    assert_fused_geglu_down_matches_separated("gemma4-31b ffn (silu)", 5376, 21504, true);
 }

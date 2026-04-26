@@ -16,7 +16,15 @@ impl PatchedVindex {
     pub fn apply_patch(&mut self, patch: VindexPatch) {
         for op in &patch.operations {
             match op {
-                PatchOp::InsertKnn { layer, entity, relation, target, target_id, confidence, key_vector_b64 } => {
+                PatchOp::InsertKnn {
+                    layer,
+                    entity,
+                    relation,
+                    target,
+                    target_id,
+                    confidence,
+                    key_vector_b64,
+                } => {
                     if let Ok(key_vec) = decode_gate_vector(key_vector_b64) {
                         self.knn_store.add(
                             *layer,
@@ -38,7 +46,13 @@ impl PatchedVindex {
             }
             let key = op.key().unwrap(); // safe: only Arch A ops reach here
             match op {
-                PatchOp::Insert { target, confidence, gate_vector_b64, down_meta, .. } => {
+                PatchOp::Insert {
+                    target,
+                    confidence,
+                    gate_vector_b64,
+                    down_meta,
+                    ..
+                } => {
                     let meta = if let Some(dm) = down_meta {
                         FeatureMeta {
                             top_token: dm.top_token.clone(),
@@ -66,7 +80,11 @@ impl PatchedVindex {
                         }
                     }
                 }
-                PatchOp::Update { gate_vector_b64, down_meta, .. } => {
+                PatchOp::Update {
+                    gate_vector_b64,
+                    down_meta,
+                    ..
+                } => {
                     if let Some(dm) = down_meta {
                         let meta = FeatureMeta {
                             top_token: dm.top_token.clone(),
@@ -211,7 +229,11 @@ mod tests {
     #[test]
     fn apply_delete_tombstones_feature() {
         let mut pv = empty_pv();
-        let patch = make_patch(vec![PatchOp::Delete { layer: 0, feature: 3, reason: None }]);
+        let patch = make_patch(vec![PatchOp::Delete {
+            layer: 0,
+            feature: 3,
+            reason: None,
+        }]);
         pv.apply_patch(patch);
         assert!(pv.deleted.contains(&(0, 3)));
         assert!(pv.overrides_meta[&(0, 3)].is_none());
@@ -223,14 +245,23 @@ mod tests {
         let gv = vec![1.0f32, 2.0];
         let b64 = encode_gate_vector(&gv);
         let insert_patch = make_patch(vec![PatchOp::Insert {
-            layer: 0, feature: 1, relation: None,
-            entity: "A".into(), target: "B".into(),
-            confidence: None, gate_vector_b64: Some(b64), down_meta: None,
+            layer: 0,
+            feature: 1,
+            relation: None,
+            entity: "A".into(),
+            target: "B".into(),
+            confidence: None,
+            gate_vector_b64: Some(b64),
+            down_meta: None,
         }]);
         pv.apply_patch(insert_patch);
         assert!(pv.overrides_gate.contains_key(&(0, 1)));
 
-        let delete_patch = make_patch(vec![PatchOp::Delete { layer: 0, feature: 1, reason: None }]);
+        let delete_patch = make_patch(vec![PatchOp::Delete {
+            layer: 0,
+            feature: 1,
+            reason: None,
+        }]);
         pv.apply_patch(delete_patch);
         assert!(!pv.overrides_gate.contains_key(&(0, 1)));
         assert!(pv.deleted.contains(&(0, 1)));
@@ -240,9 +271,14 @@ mod tests {
     fn apply_update_sets_meta_only() {
         let mut pv = empty_pv();
         let patch = make_patch(vec![PatchOp::Update {
-            layer: 0, feature: 2,
+            layer: 0,
+            feature: 2,
             gate_vector_b64: None,
-            down_meta: Some(PatchDownMeta { top_token: "updated".into(), top_token_id: 99, c_score: 0.5 }),
+            down_meta: Some(PatchDownMeta {
+                top_token: "updated".into(),
+                top_token_id: 99,
+                c_score: 0.5,
+            }),
         }]);
         pv.apply_patch(patch);
         let meta = pv.overrides_meta[&(0, 2)].as_ref().unwrap();
@@ -255,12 +291,24 @@ mod tests {
     fn apply_patches_accumulate_in_order() {
         let mut pv = empty_pv();
         let p1 = make_patch(vec![PatchOp::Insert {
-            layer: 0, feature: 0, relation: None, entity: "X".into(), target: "Y".into(),
-            confidence: Some(0.5), gate_vector_b64: None, down_meta: None,
+            layer: 0,
+            feature: 0,
+            relation: None,
+            entity: "X".into(),
+            target: "Y".into(),
+            confidence: Some(0.5),
+            gate_vector_b64: None,
+            down_meta: None,
         }]);
         let p2 = make_patch(vec![PatchOp::Insert {
-            layer: 0, feature: 1, relation: None, entity: "A".into(), target: "B".into(),
-            confidence: Some(0.9), gate_vector_b64: None, down_meta: None,
+            layer: 0,
+            feature: 1,
+            relation: None,
+            entity: "A".into(),
+            target: "B".into(),
+            confidence: Some(0.9),
+            gate_vector_b64: None,
+            down_meta: None,
         }]);
         pv.apply_patch(p1);
         pv.apply_patch(p2);
@@ -273,12 +321,24 @@ mod tests {
     fn remove_patch_rebuilds_overrides() {
         let mut pv = empty_pv();
         let p1 = make_patch(vec![PatchOp::Insert {
-            layer: 0, feature: 5, relation: None, entity: "X".into(), target: "first".into(),
-            confidence: None, gate_vector_b64: None, down_meta: None,
+            layer: 0,
+            feature: 5,
+            relation: None,
+            entity: "X".into(),
+            target: "first".into(),
+            confidence: None,
+            gate_vector_b64: None,
+            down_meta: None,
         }]);
         let p2 = make_patch(vec![PatchOp::Insert {
-            layer: 0, feature: 6, relation: None, entity: "Y".into(), target: "second".into(),
-            confidence: None, gate_vector_b64: None, down_meta: None,
+            layer: 0,
+            feature: 6,
+            relation: None,
+            entity: "Y".into(),
+            target: "second".into(),
+            confidence: None,
+            gate_vector_b64: None,
+            down_meta: None,
         }]);
         pv.apply_patch(p1);
         pv.apply_patch(p2);
@@ -329,7 +389,9 @@ mod tests {
             confidence: None,
             key_vector_b64: kv,
         }]);
-        let delete = make_patch(vec![PatchOp::DeleteKnn { entity: "France".into() }]);
+        let delete = make_patch(vec![PatchOp::DeleteKnn {
+            entity: "France".into(),
+        }]);
         pv.apply_patch(insert);
         assert_eq!(pv.knn_store.len(), 1);
         pv.apply_patch(delete);

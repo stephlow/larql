@@ -77,8 +77,7 @@ mod tests {
 
     #[test]
     fn matches_mistral_instruct() {
-        let (label, tmpl) =
-            fallback_template_for("mistralai/Mistral-7B-Instruct-v0.3").unwrap();
+        let (label, tmpl) = fallback_template_for("mistralai/Mistral-7B-Instruct-v0.3").unwrap();
         assert_eq!(label, "mistral-instruct");
         assert!(tmpl.contains("[INST]"));
     }

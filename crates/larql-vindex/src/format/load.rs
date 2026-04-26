@@ -6,12 +6,11 @@ use std::path::Path;
 
 use ndarray::Array2;
 
-use crate::error::VindexError;
 use crate::config::VindexConfig;
+use crate::error::VindexError;
 use crate::format::filenames::{
-    DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON,
-    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON,
-    LM_HEAD_BIN, LM_HEAD_Q4_BIN, TOKENIZER_JSON,
+    DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON, INTERLEAVED_Q4K_BIN,
+    INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN, TOKENIZER_JSON,
 };
 use crate::index::{IndexLoadCallbacks, VectorIndex};
 
@@ -45,8 +44,8 @@ impl VectorIndex {
         // Read config
         let config_path = dir.join(INDEX_JSON);
         let config_text = std::fs::read_to_string(&config_path)?;
-        let config: VindexConfig = serde_json::from_str(&config_text)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let config: VindexConfig =
+            serde_json::from_str(&config_text).map_err(|e| VindexError::Parse(e.to_string()))?;
 
         let num_layers = config.num_layers;
         let hidden_size = config.hidden_size;
@@ -60,10 +59,7 @@ impl VectorIndex {
         let interleaved_q4k_path = dir.join(INTERLEAVED_Q4K_BIN);
 
         let (gate_mmap, gate_slices, gate_dtype) = if gate_path.exists() {
-            callbacks.on_file_start(
-                "gate_vectors",
-                &gate_path.display().to_string(),
-            );
+            callbacks.on_file_start("gate_vectors", &gate_path.display().to_string());
             let start = std::time::Instant::now();
             let gate_file = std::fs::File::open(&gate_path)?;
             // Demand-paged: gate_vectors are large and only a fraction of
@@ -106,7 +102,11 @@ impl VectorIndex {
                 total,
                 start.elapsed().as_secs_f64() * 1000.0,
             );
-            (gate_mmap, gate_slices, crate::config::dtype::StorageDtype::F16)
+            (
+                gate_mmap,
+                gate_slices,
+                crate::config::dtype::StorageDtype::F16,
+            )
         } else {
             // Neither gate_vectors.bin nor interleaved_q4k.bin present.
             // This is the attention-only client-side slice (produced by
@@ -125,11 +125,7 @@ impl VectorIndex {
                 crate::index::core::GateLayerSlice { float_offset: 0, num_features: 0 };
                 num_layers
             ];
-            callbacks.on_file_done(
-                "gate_vectors (absent — client-only slice)",
-                0,
-                0.0,
-            );
+            callbacks.on_file_done("gate_vectors (absent — client-only slice)", 0, 0.0);
             (empty, gate_slices, crate::config::dtype::StorageDtype::F16)
         };
 
@@ -139,12 +135,17 @@ impl VectorIndex {
         let down_meta_mmap = if crate::format::down_meta::has_binary(dir) {
             match load_vindex_tokenizer(dir) {
                 Ok(tokenizer) => {
-                    callbacks.on_file_start("down_meta", &dir.join(DOWN_META_BIN).display().to_string());
+                    callbacks
+                        .on_file_start("down_meta", &dir.join(DOWN_META_BIN).display().to_string());
                     let tok = std::sync::Arc::new(tokenizer);
                     match crate::format::down_meta::mmap_binary(dir, tok) {
                         Ok(dm) => {
                             let count = dm.total_features();
-                            callbacks.on_file_done("down_meta", count, start.elapsed().as_secs_f64() * 1000.0);
+                            callbacks.on_file_done(
+                                "down_meta",
+                                count,
+                                start.elapsed().as_secs_f64() * 1000.0,
+                            );
                             Some(dm)
                         }
                         Err(_) => None,
@@ -156,7 +157,14 @@ impl VectorIndex {
             None
         };
 
-        let mut index = VectorIndex::new_mmap(gate_mmap, gate_slices, gate_dtype, down_meta_mmap, num_layers, hidden_size);
+        let mut index = VectorIndex::new_mmap(
+            gate_mmap,
+            gate_slices,
+            gate_dtype,
+            down_meta_mmap,
+            num_layers,
+            hidden_size,
+        );
 
         // Opportunistically wire up FFN payload mmaps so walk_ffn_sparse can
         // find up/down data without callers needing to know which flavour
@@ -201,14 +209,16 @@ impl VectorIndex {
         // `lm_head_q4.bin` is present in the vindex directory. The
         // untied models that ship those files are always extracted with
         // one of them, so presence is a reliable untied-signal.
-        let has_separate_lm_head = dir.join(LM_HEAD_BIN).exists()
-            || dir.join(LM_HEAD_Q4_BIN).exists();
+        let has_separate_lm_head =
+            dir.join(LM_HEAD_BIN).exists() || dir.join(LM_HEAD_Q4_BIN).exists();
         if !has_separate_lm_head {
             if let Ok(f) = std::fs::File::open(dir.join(EMBEDDINGS_BIN)) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
                     let expected_f16 = config.vocab_size * config.hidden_size * 2;
                     if mmap.len() >= expected_f16 && mmap.len() < expected_f16 * 2 {
-                        if index.vocab_size == 0 { index.vocab_size = config.vocab_size; }
+                        if index.vocab_size == 0 {
+                            index.vocab_size = config.vocab_size;
+                        }
                         index.set_lm_head_f16_mmap(std::sync::Arc::new(mmap));
                         index.synthesize_lm_head_q4();
                     }
@@ -231,13 +241,7 @@ fn synthesize_gate_from_q4k(
     config: &VindexConfig,
     hidden_size: usize,
     layer_range: Option<(usize, usize)>,
-) -> Result<
-    (
-        memmap2::Mmap,
-        Vec<crate::index::core::GateLayerSlice>,
-    ),
-    VindexError,
-> {
+) -> Result<(memmap2::Mmap, Vec<crate::index::core::GateLayerSlice>), VindexError> {
     let interleaved_path = dir.join(INTERLEAVED_Q4K_BIN);
     let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
     if !manifest_path.exists() {
@@ -249,10 +253,9 @@ fn synthesize_gate_from_q4k(
     // Open the Q4K file and the manifest.
     let iq4_file = std::fs::File::open(&interleaved_path)?;
     let iq4_mmap = unsafe { crate::mmap_util::mmap_optimized(&iq4_file)? };
-    let manifest_json: Vec<serde_json::Value> = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path)?,
-    )
-    .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let manifest_json: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
 
     let num_layers = config.num_layers;
     // Allocate one anon MmapMut sized for owned layers only (f16, 2 bytes/float).
@@ -267,11 +270,16 @@ fn synthesize_gate_from_q4k(
     };
     let mut byte_offset: u64 = 0;
     let mut gate_slices = vec![
-        crate::index::core::GateLayerSlice { float_offset: 0, num_features: 0 };
+        crate::index::core::GateLayerSlice {
+            float_offset: 0,
+            num_features: 0
+        };
         num_layers
     ];
     for info in &config.layers {
-        if !is_owned(info.layer) { continue; }
+        if !is_owned(info.layer) {
+            continue;
+        }
         gate_slices[info.layer] = crate::index::core::GateLayerSlice {
             // Offset measured in floats (f16 → bpf=2).
             float_offset: (byte_offset as usize) / 2,
@@ -285,7 +293,9 @@ fn synthesize_gate_from_q4k(
         .map_err(|e| VindexError::Parse(format!("anon mmap: {e}")))?;
 
     for info in &config.layers {
-        if !is_owned(info.layer) { continue; }
+        if !is_owned(info.layer) {
+            continue;
+        }
         // Manifest entries per layer are [gate, up, down] in order.
         let base = info.layer * 3;
         let gate_entry = manifest_json.get(base).ok_or_else(|| {
@@ -333,8 +343,8 @@ fn synthesize_gate_from_q4k(
 /// Load embeddings from a .vindex directory.
 pub fn load_vindex_embeddings(dir: &Path) -> Result<(Array2<f32>, f32), VindexError> {
     let config_text = std::fs::read_to_string(dir.join(INDEX_JSON))?;
-    let config: VindexConfig = serde_json::from_str(&config_text)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let config: VindexConfig =
+        serde_json::from_str(&config_text).map_err(|e| VindexError::Parse(e.to_string()))?;
 
     let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
@@ -566,10 +576,7 @@ mod tests {
     #[test]
     fn load_vindex_missing_dir_errors() {
         let mut cb = crate::index::SilentLoadCallbacks;
-        let result = VectorIndex::load_vindex(
-            std::path::Path::new("/nonexistent/vindex"),
-            &mut cb,
-        );
+        let result = VectorIndex::load_vindex(std::path::Path::new("/nonexistent/vindex"), &mut cb);
         assert!(result.is_err());
     }
 

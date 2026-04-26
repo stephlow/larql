@@ -52,8 +52,8 @@ extern crate blas_src;
 mod common;
 use common::get_metal;
 
-use larql_compute::CpuBackend;
 use larql_compute::prelude::*;
+use larql_compute::CpuBackend;
 use ndarray::Array2;
 
 fn run_enabled() -> bool {
@@ -80,8 +80,12 @@ fn synth_inputs(n: usize, k: usize) -> (Array2<f32>, Vec<f32>) {
 }
 
 fn top5(scores: &[f32]) -> [(u32, f32); 5] {
-    let mut indexed: Vec<(u32, f32)> = scores.iter().copied().enumerate()
-        .map(|(i, s)| (i as u32, s)).collect();
+    let mut indexed: Vec<(u32, f32)> = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s))
+        .collect();
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     std::array::from_fn(|i| indexed[i])
 }
@@ -102,9 +106,11 @@ fn f32_gemv_cpu_vs_metal_at_vocab_scale() {
 
     // Gemma 3 4B tied-embedding LM head shape.
     let n = 262_144usize; // vocab
-    let k = 2_560usize;   // hidden
-    eprintln!("Synthesising W [{n}, {k}] = {:.2} GB and x [{k}]…",
-        (n * k * 4) as f64 / 1e9);
+    let k = 2_560usize; // hidden
+    eprintln!(
+        "Synthesising W [{n}, {k}] = {:.2} GB and x [{k}]…",
+        (n * k * 4) as f64 / 1e9
+    );
     let (w, x) = synth_inputs(n, k);
 
     // CPU has no `f32_gemv` specialisation (returns `None`); production
@@ -115,10 +121,14 @@ fn f32_gemv_cpu_vs_metal_at_vocab_scale() {
         Some(s) => s,
         None => {
             let q_row = ndarray::Array2::from_shape_vec((1, k), x.clone()).unwrap();
-            CpuBackend.matmul_transb(q_row.view(), w.view()).row(0).to_vec()
+            CpuBackend
+                .matmul_transb(q_row.view(), w.view())
+                .row(0)
+                .to_vec()
         }
     };
-    let metal_scores = metal.f32_gemv(w.view(), &x)
+    let metal_scores = metal
+        .f32_gemv(w.view(), &x)
         .expect("Metal f32_gemv should dispatch above threshold");
 
     let cpu_top5 = top5(&cpu_scores);
@@ -149,12 +159,18 @@ fn f32_gemv_cpu_vs_metal_at_vocab_scale() {
     );
 
     let logit_diff = (cpu_top1.1 - metal_top1.1).abs();
-    let max_abs = cpu_scores.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let max_abs = cpu_scores
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let rel = logit_diff / max_abs;
     assert!(
         rel < 1e-3,
         "top-1 logit diverges: cpu={:.6} metal={:.6} (rel={:.3e})",
-        cpu_top1.1, metal_top1.1, rel,
+        cpu_top1.1,
+        metal_top1.1,
+        rel,
     );
 
     eprintln!(
@@ -229,10 +245,16 @@ fn q4_matvec_cutoff_sweep() {
     // Sweep N at and around 8/32-row boundaries: 8000 (1000 TGs of 8),
     // 32K (4000), 65520 (8190), 65536 (8192), 65560 (8195 — first N
     // beyond the pre-fix wrap-around), 70000, 100000, 262144 (vocab).
-    for &n in &[8000usize, 32000, 65520, 65536, 65560, 65600, 70000, 100000, 200000, 262144] {
-        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.0001).sin() + 0.5).collect();
+    for &n in &[
+        8000usize, 32000, 65520, 65536, 65560, 65600, 70000, 100000, 200000, 262144,
+    ] {
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.0001).sin() + 0.5)
+            .collect();
         let q4 = quantize_q4_0(&w);
-        let cpu_scores = CpuBackend.q4_matvec(&q4, &q8_x_i8, &q8_scales, n, k).unwrap();
+        let cpu_scores = CpuBackend
+            .q4_matvec(&q4, &q8_x_i8, &q8_scales, n, k)
+            .unwrap();
         let metal_scores = metal.q4_matvec(&q4, &q8_x_i8, &q8_scales, n, k).unwrap();
         let metal_nonzero = metal_scores.iter().filter(|&&v| v.abs() > 1e-9).count();
         let cpu_nonzero = cpu_scores.iter().filter(|&&v| v.abs() > 1e-9).count();
@@ -248,7 +270,8 @@ fn q4_matvec_cutoff_sweep() {
              should be all non-zero (got {cpu_nonzero}/{n} at N={n})"
         );
         assert_eq!(
-            metal_nonzero, n,
+            metal_nonzero,
+            n,
             "Metal q4_matvec dropped {} rows at N={n} (first zero at {first_zero:?}). \
              Pre-fix ratio: ~num_rows/4 covered. Post-fix expectation: every row written.",
             n - metal_nonzero,
@@ -286,15 +309,24 @@ fn q4_matvec_metal_writes_every_row_small_n() {
     let metal_scores = metal.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
     let cpu_scores = CpuBackend.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
 
-    let metal_zeros: Vec<usize> = metal_scores.iter().enumerate()
-        .filter(|(_, &v)| v.abs() <= 1e-9).map(|(i, _)| i).collect();
-    let cpu_zeros: Vec<usize> = cpu_scores.iter().enumerate()
-        .filter(|(_, &v)| v.abs() <= 1e-9).map(|(i, _)| i).collect();
+    let metal_zeros: Vec<usize> = metal_scores
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v.abs() <= 1e-9)
+        .map(|(i, _)| i)
+        .collect();
+    let cpu_zeros: Vec<usize> = cpu_scores
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v.abs() <= 1e-9)
+        .map(|(i, _)| i)
+        .collect();
 
     assert!(
         cpu_zeros.is_empty(),
         "test invariant violated: CPU output should be all non-zero, \
-         {} rows are zero (synth bias broken)", cpu_zeros.len(),
+         {} rows are zero (synth bias broken)",
+        cpu_zeros.len(),
     );
     let preview = &metal_zeros[..metal_zeros.len().min(10)];
     assert!(
@@ -330,14 +362,20 @@ fn q4_matvec_metal_writes_every_row_misaligned_n() {
 
     assert_eq!(metal_scores.len(), n, "output length must equal num_rows");
     for (i, &v) in metal_scores.iter().enumerate() {
-        assert!(v.abs() > 1e-9, "metal_scores[{i}] = {v} (should be non-zero)");
+        assert!(
+            v.abs() > 1e-9,
+            "metal_scores[{i}] = {v} (should be non-zero)"
+        );
     }
     // Q4 quantisation is lossy on both sides; agreement to ~1 % of
     // peak value is the kernel-equality bar (matches the rel<1e-2 check
     // in q4_matvec_cpu_vs_metal_at_vocab_scale).
     let max_abs = cpu_scores.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let max_diff = metal_scores.iter().zip(&cpu_scores)
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = metal_scores
+        .iter()
+        .zip(&cpu_scores)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     assert!(
         max_diff < max_abs * 1e-2,
         "metal vs cpu max_diff = {max_diff} (peak = {max_abs}, rel = {:.3e})",
@@ -446,12 +484,16 @@ fn q4_matvec_cpu_vs_metal_at_vocab_scale() {
     let (q8_x_i8, q8_scales) = quantize_to_q8(&x);
     eprintln!(
         "  Q4 bytes: {:.2} GB, Q8 input: {} elements, scales: {} blocks",
-        q4_data.len() as f64 / 1e9, q8_x_i8.len(), q8_scales.len(),
+        q4_data.len() as f64 / 1e9,
+        q8_x_i8.len(),
+        q8_scales.len(),
     );
 
-    let cpu_scores = CpuBackend.q4_matvec(&q4_data, &q8_x_i8, &q8_scales, n, k)
+    let cpu_scores = CpuBackend
+        .q4_matvec(&q4_data, &q8_x_i8, &q8_scales, n, k)
         .expect("CpuBackend.q4_matvec should always return Some");
-    let metal_scores = metal.q4_matvec(&q4_data, &q8_x_i8, &q8_scales, n, k)
+    let metal_scores = metal
+        .q4_matvec(&q4_data, &q8_x_i8, &q8_scales, n, k)
         .expect("MetalBackend.q4_matvec should always return Some");
 
     let cpu_top5 = top5(&cpu_scores);
@@ -480,19 +522,30 @@ fn q4_matvec_cpu_vs_metal_at_vocab_scale() {
              metal_scores[65535]={:.6} metal_scores[65536]={:.6}\n    \
              metal_scores[65537]={:.6} metal_scores[131072]={:.6}\n    \
              metal_scores[200000]={:.6} metal_scores[262143]={:.6}",
-            metal_scores[65535], metal_scores[65536],
-            metal_scores[65537], metal_scores[131072],
-            metal_scores[200000], metal_scores[262143],
+            metal_scores[65535],
+            metal_scores[65536],
+            metal_scores[65537],
+            metal_scores[131072],
+            metal_scores[200000],
+            metal_scores[262143],
         );
         let cpu_score_at = |id: u32| cpu_scores[id as usize];
         let metal_score_at = |id: u32| metal_scores[id as usize];
         eprintln!("\n  Score on CPU at IDs Metal returned:");
         for &(id, _s) in metal_top5.iter() {
-            eprintln!("    id {id}: cpu={:.4} metal={:.4}", cpu_score_at(id), metal_score_at(id));
+            eprintln!(
+                "    id {id}: cpu={:.4} metal={:.4}",
+                cpu_score_at(id),
+                metal_score_at(id)
+            );
         }
         eprintln!("  Score on Metal at IDs CPU returned:");
         for &(id, _s) in cpu_top5.iter() {
-            eprintln!("    id {id}: cpu={:.4} metal={:.4}", cpu_score_at(id), metal_score_at(id));
+            eprintln!(
+                "    id {id}: cpu={:.4} metal={:.4}",
+                cpu_score_at(id),
+                metal_score_at(id)
+            );
         }
     }
 
@@ -506,12 +559,18 @@ fn q4_matvec_cpu_vs_metal_at_vocab_scale() {
     );
 
     let logit_diff = (cpu_top1.1 - metal_top1.1).abs();
-    let max_abs = cpu_scores.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let max_abs = cpu_scores
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let rel = logit_diff / max_abs;
     assert!(
         rel < 1e-2,
         "Q4 top-1 logit diverges: cpu={:.6} metal={:.6} (rel={:.3e})",
-        cpu_top1.1, metal_top1.1, rel,
+        cpu_top1.1,
+        metal_top1.1,
+        rel,
     );
 
     eprintln!(

@@ -1,7 +1,7 @@
 //! LM-head top-K helpers and constrained-decode token sampling.
 
-use larql_compute::prelude::*;
 use crate::model::ModelWeights;
+use larql_compute::prelude::*;
 
 /// Top-K logits lookup that transparently handles models with tied
 /// input/output embeddings (Gemma 2/3/4) whose vindex has no dedicated
@@ -48,10 +48,14 @@ pub(super) fn backend_lm_head_topk(
     backend: &dyn ComputeBackend,
 ) -> Vec<(u32, f32)> {
     let lm = &weights.lm_head;
-    if lm.is_empty() || query.is_empty() { return Vec::new(); }
+    if lm.is_empty() || query.is_empty() {
+        return Vec::new();
+    }
     let vocab = lm.shape()[0];
     let hidden = lm.shape()[1];
-    if hidden != query.len() { return Vec::new(); }
+    if hidden != query.len() {
+        return Vec::new();
+    }
 
     let query_slice = match query.as_slice() {
         Some(s) => s,
@@ -71,7 +75,8 @@ pub(super) fn backend_lm_head_topk(
         s
     } else {
         let q_row = match query.view().into_shape_with_order((1, hidden)) {
-            Ok(r) => r, Err(_) => return Vec::new(),
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
         };
         backend.matmul_transb(q_row, lm.view()).row(0).to_vec()
     };
@@ -79,12 +84,21 @@ pub(super) fn backend_lm_head_topk(
     // Fast path for greedy decode (top_k=1): a single linear scan avoids
     // allocating the full 262K×8=2MB indexed Vec and the select_nth pass.
     if top_k == 1 {
-        let best = scores_vec.iter().copied().enumerate()
+        let best = scores_vec
+            .iter()
+            .copied()
+            .enumerate()
             .filter(|(_, s)| s.is_finite())
             .fold(None::<(usize, f32)>, |acc, (i, s)| {
                 Some(match acc {
                     None => (i, s),
-                    Some((bi, bs)) => if s > bs { (i, s) } else { (bi, bs) },
+                    Some((bi, bs)) => {
+                        if s > bs {
+                            (i, s)
+                        } else {
+                            (bi, bs)
+                        }
+                    }
                 })
             });
         let _ = vocab;
@@ -107,21 +121,31 @@ pub(super) fn backend_lm_head_topk(
             let mut smallest = i;
             let l = 2 * i + 1;
             let r = 2 * i + 2;
-            if l < n && h[l].0 < h[smallest].0 { smallest = l; }
-            if r < n && h[r].0 < h[smallest].0 { smallest = r; }
-            if smallest == i { break; }
+            if l < n && h[l].0 < h[smallest].0 {
+                smallest = l;
+            }
+            if r < n && h[r].0 < h[smallest].0 {
+                smallest = r;
+            }
+            if smallest == i {
+                break;
+            }
             h.swap(i, smallest);
             i = smallest;
         }
     }
 
     for (i, &s) in scores_vec.iter().enumerate() {
-        if !s.is_finite() { continue; }
+        if !s.is_finite() {
+            continue;
+        }
         if heap.len() < k {
             heap.push((s, i as u32));
             if heap.len() == k {
                 // Build min-heap in O(k)
-                for j in (0..k / 2).rev() { sift_down(&mut heap, j); }
+                for j in (0..k / 2).rev() {
+                    sift_down(&mut heap, j);
+                }
             }
         } else if s > heap[0].0 {
             heap[0] = (s, i as u32);
@@ -130,7 +154,9 @@ pub(super) fn backend_lm_head_topk(
     }
     // If we gathered fewer than k finite values, still heapify.
     if heap.len() < k && heap.len() > 1 {
-        for j in (0..heap.len() / 2).rev() { sift_down(&mut heap, j); }
+        for j in (0..heap.len() / 2).rev() {
+            sift_down(&mut heap, j);
+        }
     }
 
     heap.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -158,9 +184,13 @@ pub(super) fn backend_lm_head_scores(
     backend: &dyn ComputeBackend,
 ) -> Vec<f32> {
     let lm = &weights.lm_head;
-    if lm.is_empty() || query.is_empty() { return Vec::new(); }
+    if lm.is_empty() || query.is_empty() {
+        return Vec::new();
+    }
     let hidden = lm.shape()[1];
-    if hidden != query.len() { return Vec::new(); }
+    if hidden != query.len() {
+        return Vec::new();
+    }
     let query_slice = match query.as_slice() {
         Some(s) => s,
         None => &query.to_vec(),

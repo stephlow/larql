@@ -33,7 +33,9 @@ impl VectorIndex {
         x_rows: usize,
         backend: Option<&dyn larql_compute::ComputeBackend>,
     ) -> Option<Vec<f32>> {
-        if component > 2 { return None; }
+        if component > 2 {
+            return None;
+        }
         let slices = self.interleaved_q4k_layer_data(layer)?;
         let (bytes, format) = slices[component];
 
@@ -41,11 +43,15 @@ impl VectorIndex {
         let hidden = self.hidden_size;
         let (w_rows, w_cols) = match component {
             0 | 1 => (intermediate, hidden),
-            2     => (hidden, intermediate),
-            _     => return None,
+            2 => (hidden, intermediate),
+            _ => return None,
         };
-        if x.len() != x_rows * w_cols { return None; }
-        if w_cols % 256 != 0 { return None; }
+        if x.len() != x_rows * w_cols {
+            return None;
+        }
+        if w_cols % 256 != 0 {
+            return None;
+        }
 
         // Backend per-row dispatch is *slower* than CPU-NEON here because
         // each q4k_matvec call pays a Metal submission (~15 ms). With x_rows
@@ -62,14 +68,16 @@ impl VectorIndex {
 
         // CPU fallback: rayon over W rows, NEON per-row dot.
         let mut y_t = vec![0.0f32; w_rows * x_rows];
-        y_t.par_chunks_mut(x_rows).enumerate().for_each(|(j, slot)| {
-            let w_row_start = j * bytes_per_w_row;
-            let w_row = &bytes[w_row_start..w_row_start + bytes_per_w_row];
-            for i in 0..x_rows {
-                let x_row = &x[i * w_cols..(i + 1) * w_cols];
-                slot[i] = row_dot(w_row, x_row).unwrap_or(0.0);
-            }
-        });
+        y_t.par_chunks_mut(x_rows)
+            .enumerate()
+            .for_each(|(j, slot)| {
+                let w_row_start = j * bytes_per_w_row;
+                let w_row = &bytes[w_row_start..w_row_start + bytes_per_w_row];
+                for i in 0..x_rows {
+                    let x_row = &x[i * w_cols..(i + 1) * w_cols];
+                    slot[i] = row_dot(w_row, x_row).unwrap_or(0.0);
+                }
+            });
         let mut y = vec![0.0f32; x_rows * w_rows];
         for j in 0..w_rows {
             let src_base = j * x_rows;
@@ -93,17 +101,23 @@ impl VectorIndex {
         feat: usize,
         x: &[f32],
     ) -> Option<f32> {
-        if component > 2 || x.len() != self.hidden_size { return None; }
+        if component > 2 || x.len() != self.hidden_size {
+            return None;
+        }
         let slices = self.interleaved_q4k_layer_data(layer)?;
         let (bytes, format) = slices[component];
         let hidden = self.hidden_size;
-        if feat >= self.num_features(layer) { return None; }
+        if feat >= self.num_features(layer) {
+            return None;
+        }
         let info = crate::quant::registry::lookup(format)?;
         let row_dot = info.row_dot?;
         let bytes_per_row = info.bytes_per_row(hidden)?;
         let start = feat * bytes_per_row;
         let end = start + bytes_per_row;
-        if end > bytes.len() { return None; }
+        if end > bytes.len() {
+            return None;
+        }
         row_dot(&bytes[start..end], x).ok()
     }
 
@@ -126,17 +140,31 @@ impl VectorIndex {
         alpha: f32,
         out: &mut [f32],
     ) -> bool {
-        if component >= 2 || out.len() != self.hidden_size { return false; }
-        let Some(slices) = self.interleaved_q4k_layer_data(layer) else { return false; };
+        if component >= 2 || out.len() != self.hidden_size {
+            return false;
+        }
+        let Some(slices) = self.interleaved_q4k_layer_data(layer) else {
+            return false;
+        };
         let (bytes, format) = slices[component];
         let hidden = self.hidden_size;
-        if feat >= self.num_features(layer) { return false; }
-        let Some(info) = crate::quant::registry::lookup(format) else { return false; };
-        let Some(scaled_add) = info.row_scaled_add else { return false; };
-        let Some(bytes_per_row) = info.bytes_per_row(hidden) else { return false; };
+        if feat >= self.num_features(layer) {
+            return false;
+        }
+        let Some(info) = crate::quant::registry::lookup(format) else {
+            return false;
+        };
+        let Some(scaled_add) = info.row_scaled_add else {
+            return false;
+        };
+        let Some(bytes_per_row) = info.bytes_per_row(hidden) else {
+            return false;
+        };
         let start = feat * bytes_per_row;
         let end = start + bytes_per_row;
-        if end > bytes.len() { return false; }
+        if end > bytes.len() {
+            return false;
+        }
         scaled_add(&bytes[start..end], alpha, out).is_ok()
     }
 
@@ -161,20 +189,33 @@ impl VectorIndex {
         out: &mut [f32],
     ) -> bool {
         let hidden = self.hidden_size;
-        if out.len() != hidden { return false; }
-        let Some((bytes, format, padded_width)) = self.down_features_q4k_layer_data(layer)
-        else { return false; };
-        if feat >= self.num_features(layer) { return false; }
-        let Some(info) = crate::quant::registry::lookup(format) else { return false; };
-        let Some(bytes_per_row) = info.bytes_per_row(padded_width) else { return false; };
+        if out.len() != hidden {
+            return false;
+        }
+        let Some((bytes, format, padded_width)) = self.down_features_q4k_layer_data(layer) else {
+            return false;
+        };
+        if feat >= self.num_features(layer) {
+            return false;
+        }
+        let Some(info) = crate::quant::registry::lookup(format) else {
+            return false;
+        };
+        let Some(bytes_per_row) = info.bytes_per_row(padded_width) else {
+            return false;
+        };
         let start = feat * bytes_per_row;
         let end = start + bytes_per_row;
-        if end > bytes.len() { return false; }
+        if end > bytes.len() {
+            return false;
+        }
 
         if padded_width == hidden {
             // Production fast path: row width matches hidden, fused
             // scaled-add writes straight into `out`.
-            let Some(scaled_add) = info.row_scaled_add else { return false; };
+            let Some(scaled_add) = info.row_scaled_add else {
+                return false;
+            };
             return scaled_add(&bytes[start..end], alpha, out).is_ok();
         }
         // Padded path: dequant the full padded row, accumulate the
@@ -206,19 +247,34 @@ impl VectorIndex {
         feat: usize,
         out: &mut [f32],
     ) -> bool {
-        if component > 2 || out.len() != self.hidden_size { return false; }
-        let Some(slices) = self.interleaved_q4k_layer_data(layer) else { return false; };
+        if component > 2 || out.len() != self.hidden_size {
+            return false;
+        }
+        let Some(slices) = self.interleaved_q4k_layer_data(layer) else {
+            return false;
+        };
         let (bytes, format) = slices[component];
         let hidden = self.hidden_size;
-        if feat >= self.num_features(layer) { return false; }
+        if feat >= self.num_features(layer) {
+            return false;
+        }
 
-        let Some(info) = crate::quant::registry::lookup(format) else { return false; };
-        let Some(bytes_per_row) = info.bytes_per_row(hidden) else { return false; };
+        let Some(info) = crate::quant::registry::lookup(format) else {
+            return false;
+        };
+        let Some(bytes_per_row) = info.bytes_per_row(hidden) else {
+            return false;
+        };
         let start = feat * bytes_per_row;
         let end = start + bytes_per_row;
-        if end > bytes.len() { return false; }
+        if end > bytes.len() {
+            return false;
+        }
         match (info.dequantize)(&bytes[start..end], hidden) {
-            Ok(v) => { out.copy_from_slice(&v[..hidden]); true }
+            Ok(v) => {
+                out.copy_from_slice(&v[..hidden]);
+                true
+            }
             Err(_) => false,
         }
     }

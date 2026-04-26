@@ -59,5 +59,5 @@ pub(crate) mod codec;
 mod http;
 
 pub use codec::RemoteLatencyStats;
+pub(crate) use codec::{decode_binary_batch, decode_binary_single, encode_binary_request};
 pub use http::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend};
-pub(crate) use codec::{encode_binary_request, decode_binary_single, decode_binary_batch};

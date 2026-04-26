@@ -10,13 +10,13 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use larql_vindex::{
-    PatchedVindex, SilentLoadCallbacks, VectorIndex,
-    load_vindex_config, load_vindex_embeddings, load_vindex_tokenizer,
+    load_vindex_config, load_vindex_embeddings, load_vindex_tokenizer, PatchedVindex,
+    SilentLoadCallbacks, VectorIndex,
 };
 
 use larql_server::cache::DescribeCache;
 use larql_server::session::SessionManager;
-use larql_server::state::{AppState, LoadedModel, model_id_from_name, load_probe_labels};
+use larql_server::state::{load_probe_labels, model_id_from_name, AppState, LoadedModel};
 use larql_server::{announce, auth, grpc, ratelimit, routes};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -163,6 +163,13 @@ struct Cli {
     #[arg(long)]
     rate_limit: Option<String>,
 
+    /// Trust X-Forwarded-For when rate limiting.
+    ///
+    /// Enable only when the server is behind a trusted reverse proxy that
+    /// strips untrusted client-supplied forwarding headers.
+    #[arg(long)]
+    trust_forwarded_for: bool,
+
     /// Max concurrent requests.
     #[arg(long, default_value = "100")]
     max_concurrent: usize,
@@ -211,9 +218,13 @@ fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
     if parts.len() != 2 {
         return Err(format!("--layers: expected 'START-END' (e.g. '0-19'), got '{s}'").into());
     }
-    let start: usize = parts[0].trim().parse()
+    let start: usize = parts[0]
+        .trim()
+        .parse()
         .map_err(|_| format!("--layers: invalid start '{}'", parts[0]))?;
-    let end: usize = parts[1].trim().parse()
+    let end: usize = parts[1]
+        .trim()
+        .parse()
         .map_err(|_| format!("--layers: invalid end '{}'", parts[1]))?;
     if end < start {
         return Err(format!("--layers: end ({end}) must be >= start ({start})").into());
@@ -222,11 +233,8 @@ fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
     Ok((start, end + 1))
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn load_single_vindex(
-    path_str: &str,
+#[derive(Clone, Copy)]
+struct LoadVindexOptions {
     no_infer: bool,
     ffn_only: bool,
     embed_only: bool,
@@ -237,7 +245,9 @@ fn load_single_vindex(
     warmup_hnsw: bool,
     release_mmap_after_request: bool,
     expert_filter: Option<(usize, usize)>,
-) -> Result<LoadedModel, BoxError> {
+}
+
+fn load_single_vindex(path_str: &str, opts: LoadVindexOptions) -> Result<LoadedModel, BoxError> {
     let path = if larql_vindex::is_hf_path(path_str) {
         info!("Resolving HuggingFace path: {}", path_str);
         larql_vindex::resolve_hf_vindex(path_str)?
@@ -252,19 +262,25 @@ fn load_single_vindex(
     let id = model_id_from_name(&model_name);
 
     let mut cb = SilentLoadCallbacks;
-    let mut index = VectorIndex::load_vindex_with_range(&path, &mut cb, layer_range)?;
-    if max_gate_cache_layers > 0 {
-        index.set_gate_cache_max_layers(max_gate_cache_layers);
-        info!("  Gate cache: LRU, max {} layers", max_gate_cache_layers);
+    let mut index = VectorIndex::load_vindex_with_range(&path, &mut cb, opts.layer_range)?;
+    if opts.max_gate_cache_layers > 0 {
+        index.set_gate_cache_max_layers(opts.max_gate_cache_layers);
+        info!(
+            "  Gate cache: LRU, max {} layers",
+            opts.max_gate_cache_layers
+        );
     }
-    if max_q4k_cache_layers > 0 {
-        index.set_q4k_ffn_cache_max_layers(max_q4k_cache_layers);
-        info!("  Q4K FFN cache: LRU, max {} layers", max_q4k_cache_layers);
+    if opts.max_q4k_cache_layers > 0 {
+        index.set_q4k_ffn_cache_max_layers(opts.max_q4k_cache_layers);
+        info!(
+            "  Q4K FFN cache: LRU, max {} layers",
+            opts.max_q4k_cache_layers
+        );
     }
-    if let Some(ef) = hnsw {
+    if let Some(ef) = opts.hnsw {
         index.enable_hnsw(ef);
         info!("  HNSW gate KNN: enabled (ef_search={ef})");
-        if warmup_hnsw {
+        if opts.warmup_hnsw {
             let t0 = std::time::Instant::now();
             index.warmup_hnsw_all_layers();
             // `warmup_hnsw_all_layers` walks 0..num_layers but the
@@ -272,11 +288,15 @@ fn load_single_vindex(
             // server (`--layers START-END`) only the owned range
             // actually builds. Report the owned count so the log
             // reflects reality.
-            let owned = match layer_range {
+            let owned = match opts.layer_range {
                 Some((s, e)) => e - s,
                 None => config.num_layers,
             };
-            info!("  HNSW warmup: built {} owned layer(s) in {:.2?}", owned, t0.elapsed());
+            info!(
+                "  HNSW warmup: built {} owned layer(s) in {:.2?}",
+                owned,
+                t0.elapsed()
+            );
         }
     }
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
@@ -285,7 +305,7 @@ fn load_single_vindex(
         || config.extract_level == larql_vindex::ExtractLevel::Inference
         || config.extract_level == larql_vindex::ExtractLevel::All;
 
-    if let Some((start, end)) = layer_range {
+    if let Some((start, end)) = opts.layer_range {
         info!("  Layers: {start}–{} (of {})", end - 1, config.num_layers);
     }
     info!(
@@ -295,26 +315,34 @@ fn load_single_vindex(
 
     // Load mmap'd feature-major vectors for walk FFN optimization.
     // Skip for embed_only — we never touch FFN paths.
-    if !embed_only {
+    if !opts.embed_only {
         match index.load_down_features(&path) {
             Ok(()) => info!("  Down features: loaded (mmap walk enabled)"),
             Err(_) => info!("  Down features: not available"),
         }
-        if let Ok(()) = index.load_up_features(&path) { info!("  Up features: loaded (full mmap FFN)") }
+        if let Ok(()) = index.load_up_features(&path) {
+            info!("  Up features: loaded (full mmap FFN)")
+        }
         // W2: feature-major Q4_K down. Loaded silently inside
         // `load_vindex_with_range` when present; surface it explicitly
         // so operators can confirm the per-feature cache-bypass path is
         // active vs. the vindex falling back to the legacy cache.
         if index.has_down_features_q4k() {
-            info!("  Down features Q4K: loaded (W2 — per-feature decode skips q4k_ffn_layer cache)");
+            info!(
+                "  Down features Q4K: loaded (W2 — per-feature decode skips q4k_ffn_layer cache)"
+            );
         }
     }
 
     // Warmup eagerly dequantises f16 gate vectors to f32 (~2x blowup). On a
     // 31B vindex that's ~13 GB f16 → ~26 GB f32 resident before the first
     // request. Skip it under `--ffn-only` / `--embed-only`.
-    if ffn_only || embed_only {
-        let reason = if embed_only { "--embed-only" } else { "--ffn-only" };
+    if opts.ffn_only || opts.embed_only {
+        let reason = if opts.embed_only {
+            "--embed-only"
+        } else {
+            "--ffn-only"
+        };
         info!("  Warmup: skipped ({reason})");
     } else {
         index.warmup();
@@ -322,11 +350,15 @@ fn load_single_vindex(
     }
 
     let (embeddings, embed_scale) = load_vindex_embeddings(&path)?;
-    info!("  Embeddings: {}x{}", embeddings.shape()[0], embeddings.shape()[1]);
+    info!(
+        "  Embeddings: {}x{}",
+        embeddings.shape()[0],
+        embeddings.shape()[1]
+    );
 
     // In --embed-only mode, attempt an f16-at-rest store to halve RSS.
     // Falls back silently if embeddings.bin is f32 (older vindexes).
-    let embed_store = if embed_only {
+    let embed_store = if opts.embed_only {
         match larql_server::embed_store::EmbedStoreF16::open(
             &path,
             embed_scale,
@@ -360,14 +392,14 @@ fn load_single_vindex(
     }
 
     // --ffn-only and --embed-only both disable /v1/infer.
-    let infer_disabled = no_infer || ffn_only || embed_only;
-    if embed_only {
+    let infer_disabled = opts.no_infer || opts.ffn_only || opts.embed_only;
+    if opts.embed_only {
         info!("  Mode: embed-service (--embed-only)");
         info!("  Infer: disabled (embed-service mode)");
-    } else if ffn_only {
+    } else if opts.ffn_only {
         info!("  Mode: ffn-service (--ffn-only)");
         info!("  Infer: disabled (FFN-service mode)");
-    } else if no_infer {
+    } else if opts.no_infer {
         info!("  Infer: disabled (--no-infer)");
     } else if has_weights {
         info!("  Infer: available (weights detected, will lazy-load on first request)");
@@ -375,11 +407,11 @@ fn load_single_vindex(
         info!("  Infer: not available (no model weights in vindex)");
     }
 
-    if release_mmap_after_request {
+    if opts.release_mmap_after_request {
         info!("  Mmap release: enabled (MADV_DONTNEED after each walk-ffn request)");
     }
 
-    if let Some((start, end)) = expert_filter {
+    if let Some((start, end)) = opts.expert_filter {
         info!("  Experts: {start}–{end} (shard filter)");
     }
 
@@ -393,14 +425,14 @@ fn load_single_vindex(
         embed_scale,
         tokenizer,
         infer_disabled,
-        ffn_only,
-        embed_only,
+        ffn_only: opts.ffn_only,
+        embed_only: opts.embed_only,
         embed_store,
-        release_mmap_after_request,
+        release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
         probe_labels,
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(num_layers),
-        expert_filter,
+        expert_filter: opts.expert_filter,
     })
 }
 
@@ -423,7 +455,9 @@ async fn main() -> Result<(), BoxError> {
     // Accept both `larql-server <path>` and `larql-server serve <path>`.
     let args: Vec<String> = std::env::args().collect();
     let filtered: Vec<String> = if args.len() > 1 && args[1] == "serve" {
-        std::iter::once(args[0].clone()).chain(args[2..].iter().cloned()).collect()
+        std::iter::once(args[0].clone())
+            .chain(args[2..].iter().cloned())
+            .collect()
     } else {
         args
     };
@@ -442,6 +476,22 @@ async fn main() -> Result<(), BoxError> {
 
     let layer_range = cli.layers.as_deref().map(parse_layer_range).transpose()?;
     let expert_filter = cli.experts.as_deref().map(parse_layer_range).transpose()?;
+    let load_opts = LoadVindexOptions {
+        no_infer: cli.no_infer,
+        ffn_only: cli.ffn_only,
+        embed_only: cli.embed_only,
+        layer_range,
+        max_gate_cache_layers: cli.max_gate_cache_layers,
+        max_q4k_cache_layers: cli.max_q4k_cache_layers,
+        hnsw: if cli.hnsw {
+            Some(cli.hnsw_ef_search)
+        } else {
+            None
+        },
+        warmup_hnsw: cli.warmup_hnsw,
+        release_mmap_after_request: cli.release_mmap_after_request,
+        expert_filter,
+    };
 
     if let Some(ref dir) = cli.dir {
         let paths = discover_vindexes(dir);
@@ -450,15 +500,13 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            let hnsw = if cli.hnsw { Some(cli.hnsw_ef_search) } else { None };
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.warmup_hnsw, cli.release_mmap_after_request, expert_filter) {
+            match load_single_vindex(&p.to_string_lossy(), load_opts) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
-        let hnsw = if cli.hnsw { Some(cli.hnsw_ef_search) } else { None };
-        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, hnsw, cli.warmup_hnsw, cli.release_mmap_after_request, expert_filter)?;
+        let m = load_single_vindex(vindex_path, load_opts)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());
@@ -469,18 +517,22 @@ async fn main() -> Result<(), BoxError> {
     }
 
     // Parse rate limiter if specified.
-    let rate_limiter = cli.rate_limit.as_ref().and_then(|spec| {
-        match ratelimit::RateLimiter::parse(spec) {
-            Some(rl) => {
-                info!("Rate limit: {}", spec);
-                Some(Arc::new(rl))
-            }
-            None => {
-                warn!("Invalid rate limit format: {} (expected e.g. '100/min')", spec);
-                None
-            }
-        }
-    });
+    let rate_limiter =
+        cli.rate_limit
+            .as_ref()
+            .and_then(|spec| match ratelimit::RateLimiter::parse(spec) {
+                Some(rl) => {
+                    info!("Rate limit: {}", spec);
+                    Some(Arc::new(rl))
+                }
+                None => {
+                    warn!(
+                        "Invalid rate limit format: {} (expected e.g. '100/min')",
+                        spec
+                    );
+                    None
+                }
+            });
 
     let state = Arc::new(AppState {
         models: models.clone(),
@@ -528,18 +580,29 @@ async fn main() -> Result<(), BoxError> {
             let r = routes::warmup::warmup_model_async(Arc::clone(m), req).await;
             info!(
                 "  Warmup walk-ffn[{}]: weights={} ({}ms), prefetched {} layers ({}ms), total {}ms",
-                r.model, r.weights_loaded, r.weights_load_ms,
-                r.layers_prefetched, r.prefetch_ms, r.total_ms,
+                r.model,
+                r.weights_loaded,
+                r.weights_load_ms,
+                r.layers_prefetched,
+                r.prefetch_ms,
+                r.total_ms,
             );
         }
     }
 
     // Rate limiting middleware.
     if let Some(ref rl) = rate_limiter {
+        let rate_state = Arc::new(ratelimit::RateLimitState {
+            limiter: Arc::clone(rl),
+            trust_forwarded_for: cli.trust_forwarded_for,
+        });
         app = app.layer(middleware::from_fn_with_state(
-            Arc::clone(rl),
+            rate_state,
             ratelimit::rate_limit_middleware,
         ));
+        if cli.trust_forwarded_for {
+            info!("Rate limit: trusting X-Forwarded-For");
+        }
     }
 
     // Auth middleware (if --api-key set).
@@ -587,7 +650,11 @@ async fn main() -> Result<(), BoxError> {
     // Grid announce (if --join provided).
     if let Some(join_spec) = cli.join.clone() {
         let listen_url = cli.public_url.clone().unwrap_or_else(|| {
-            let host = if cli.host == "0.0.0.0" { "127.0.0.1" } else { &cli.host };
+            let host = if cli.host == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                &cli.host
+            };
             format!("http://{}:{}", host, cli.port)
         });
         let join_urls: Vec<String> = join_spec
@@ -621,13 +688,15 @@ async fn main() -> Result<(), BoxError> {
 
     // TLS or plain HTTP.
     if let (Some(cert_path), Some(key_path)) = (&cli.tls_cert, &cli.tls_key) {
-        info!("TLS: enabled ({}, {})", cert_path.display(), key_path.display());
+        info!(
+            "TLS: enabled ({}, {})",
+            cert_path.display(),
+            key_path.display()
+        );
         info!("Listening: https://{}", addr);
 
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            cert_path, key_path,
-        )
-        .await?;
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
 
         axum_server::bind_rustls(addr.parse()?, tls_config)
             .serve(app.into_make_service())

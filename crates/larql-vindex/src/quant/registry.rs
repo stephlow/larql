@@ -70,15 +70,15 @@ impl QuantFormatInfo {
     /// if the row isn't a whole number of blocks.
     #[inline]
     pub fn bytes_per_row(&self, n_cols: usize) -> Option<usize> {
-        if !n_cols.is_multiple_of(self.block_elements) { return None; }
+        if !n_cols.is_multiple_of(self.block_elements) {
+            return None;
+        }
         Some((n_cols / self.block_elements) * self.bytes_per_block)
     }
 
     /// Convenience: dequantise one block and return the f32 vector.
     /// Routes to the registered `dequantize` fn pointer.
-    pub fn dequantize_block(&self, bytes: &[u8])
-        -> Result<Vec<f32>, larql_models::ModelError>
-    {
+    pub fn dequantize_block(&self, bytes: &[u8]) -> Result<Vec<f32>, larql_models::ModelError> {
         (self.dequantize)(bytes, self.block_elements)
     }
 }
@@ -121,10 +121,12 @@ mod tests {
 
     #[test]
     fn registry_tags_unique() {
-        let tags: std::collections::HashSet<_> =
-            QUANT_FORMATS.iter().map(|f| f.tag).collect();
-        assert_eq!(tags.len(), QUANT_FORMATS.len(),
-            "duplicate format tag in QUANT_FORMATS");
+        let tags: std::collections::HashSet<_> = QUANT_FORMATS.iter().map(|f| f.tag).collect();
+        assert_eq!(
+            tags.len(),
+            QUANT_FORMATS.len(),
+            "duplicate format tag in QUANT_FORMATS"
+        );
     }
 
     #[test]

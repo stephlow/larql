@@ -33,15 +33,18 @@ use std::time::Instant;
 
 use larql_models::quant::fp4_block::BLOCK_ELEMENTS;
 use larql_vindex::{
-    ComplianceGate, Fp4Config, Precision, ProjectionFormat, Projections,
-    VindexConfig,
+    ComplianceGate, Fp4Config, Precision, ProjectionFormat, Projections, VindexConfig,
 };
 use serde_json::{json, Value};
 
 // ── Args ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
-enum Policy { A, B, C }
+enum Policy {
+    A,
+    B,
+    C,
+}
 
 impl Policy {
     fn parse(s: &str) -> Result<Self, String> {
@@ -96,12 +99,29 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--in"  => { i += 1; in_path = Some(PathBuf::from(&args[i])); }
-            "--out" => { i += 1; out_path = Some(PathBuf::from(&args[i])); }
-            "--policy" => { i += 1; policy = Policy::parse(&args[i]).expect("policy"); }
-            "--compliance-floor" => { i += 1; compliance_floor = args[i].parse().expect("float"); }
-            "--threshold" => { i += 1; threshold = args[i].parse().expect("float"); }
-            "--force" => { force = true; }
+            "--in" => {
+                i += 1;
+                in_path = Some(PathBuf::from(&args[i]));
+            }
+            "--out" => {
+                i += 1;
+                out_path = Some(PathBuf::from(&args[i]));
+            }
+            "--policy" => {
+                i += 1;
+                policy = Policy::parse(&args[i]).expect("policy");
+            }
+            "--compliance-floor" => {
+                i += 1;
+                compliance_floor = args[i].parse().expect("float");
+            }
+            "--threshold" => {
+                i += 1;
+                threshold = args[i].parse().expect("float");
+            }
+            "--force" => {
+                force = true;
+            }
             _ => eprintln!("unknown arg: {}", args[i]),
         }
         i += 1;
@@ -114,13 +134,24 @@ fn parse_args() -> Args {
         eprintln!("usage: fp4_convert --in SRC --out DST [--policy option-b] [--force]");
         std::process::exit(1);
     });
-    Args { in_path, out_path, policy, compliance_floor, threshold, force }
+    Args {
+        in_path,
+        out_path,
+        policy,
+        compliance_floor,
+        threshold,
+        force,
+    }
 }
 
 // ── Source reader (f32 or f16) ────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum SrcDtype { F32, F16, Bf16 }
+enum SrcDtype {
+    F32,
+    F16,
+    Bf16,
+}
 
 impl SrcDtype {
     fn from_str(s: &str) -> Result<Self, String> {
@@ -131,7 +162,12 @@ impl SrcDtype {
             _ => Err(format!("unsupported source dtype: {s}")),
         }
     }
-    fn bytes_per_float(self) -> usize { match self { Self::F32 => 4, _ => 2 } }
+    fn bytes_per_float(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            _ => 2,
+        }
+    }
 }
 
 /// Read a whole projection file (layer-concatenated, feature-major) and
@@ -146,9 +182,12 @@ fn read_source_projection(
     let bpf = dtype.bytes_per_float();
     let expected: usize = per_layer_features.iter().sum::<usize>() * hidden * bpf;
     assert_eq!(
-        bytes.len(), expected,
+        bytes.len(),
+        expected,
         "{}: size {} != expected {}",
-        path.display(), bytes.len(), expected
+        path.display(),
+        bytes.len(),
+        expected
     );
     let mut out = Vec::with_capacity(per_layer_features.len());
     let mut cursor = 0usize;
@@ -159,9 +198,8 @@ fn read_source_projection(
             SrcDtype::F32 => {
                 // SAFETY: in-memory Vec, u8→f32 reinterpret is safe because
                 // f32 has no alignment requirement above u8 for read.
-                let view: &[f32] = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const f32, n * hidden)
-                };
+                let view: &[f32] =
+                    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const f32, n * hidden) };
                 view.to_vec()
             }
             SrcDtype::F16 => larql_models::quant::half::decode_f16(slice),
@@ -196,8 +234,12 @@ fn compliance_fraction(layers: &[Vec<f32>], hidden: usize, threshold: f32) -> f6
                 let s = sb.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
                 if s > 0.0 {
                     any_nonzero = true;
-                    if s > mx { mx = s; }
-                    if s < mn { mn = s; }
+                    if s > mx {
+                        mx = s;
+                    }
+                    if s < mn {
+                        mn = s;
+                    }
                 }
             }
             total += 1;
@@ -208,13 +250,19 @@ fn compliance_fraction(layers: &[Vec<f32>], hidden: usize, threshold: f32) -> f6
             }
         }
     }
-    if total == 0 { 0.0 } else { compliant as f64 / total as f64 }
+    if total == 0 {
+        0.0
+    } else {
+        compliant as f64 / total as f64
+    }
 }
 
 // ── File copy/link ────────────────────────────────────────────────────────────
 
 fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if dst.exists() { std::fs::remove_file(dst)?; }
+    if dst.exists() {
+        std::fs::remove_file(dst)?;
+    }
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -234,19 +282,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!(
                 "output dir {} exists (use --force to overwrite)",
                 args.out_path.display()
-            ).into());
+            )
+            .into());
         }
         std::fs::remove_dir_all(&args.out_path)?;
     }
     std::fs::create_dir_all(&args.out_path)?;
 
     // ── Read source index.json ───────────────────────────────────────────────
-    let src_index: Value = serde_json::from_str(
-        &std::fs::read_to_string(args.in_path.join("index.json"))?,
-    )?;
-    let mut src_config: VindexConfig = serde_json::from_str(
-        &std::fs::read_to_string(args.in_path.join("index.json"))?,
-    )?;
+    let src_index: Value =
+        serde_json::from_str(&std::fs::read_to_string(args.in_path.join("index.json"))?)?;
+    let mut src_config: VindexConfig =
+        serde_json::from_str(&std::fs::read_to_string(args.in_path.join("index.json"))?)?;
 
     let num_layers = src_config.num_layers;
     let hidden = src_config.hidden_size;
@@ -260,7 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let gate_src = args.in_path.join("gate_vectors.bin");
-    let up_src   = args.in_path.join("up_features.bin");
+    let up_src = args.in_path.join("up_features.bin");
     let down_src = args.in_path.join("down_features.bin");
     for (name, p) in [("gate", &gate_src), ("up", &up_src), ("down", &down_src)] {
         if !p.exists() {
@@ -276,7 +323,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  dst   : {}", args.out_path.display());
     println!("  model : {}", src_config.model);
     println!("  layers: {num_layers}  hidden: {hidden}  dtype: {src_dtype:?}");
-    println!("  policy: {:?}  floor: {}  threshold: {}", args.policy, args.compliance_floor, args.threshold);
+    println!(
+        "  policy: {:?}  floor: {}  threshold: {}",
+        args.policy, args.compliance_floor, args.threshold
+    );
     println!();
 
     // ── Read + quantise each projection ──────────────────────────────────────
@@ -291,7 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let projections = [
         ("gate", "gate_vectors.bin", policy_g),
-        ("up",   "up_features.bin",  policy_u),
+        ("up", "up_features.bin", policy_u),
         ("down", "down_features.bin", policy_d),
     ];
 
@@ -306,16 +356,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let t_scan = Instant::now();
         let compliance = compliance_fraction(&layers, hidden, args.threshold) as f32;
-        println!("  compliance @ R<{}: {:.4}% (scan {:.1}s)",
-                 args.threshold, compliance * 100.0, t_scan.elapsed().as_secs_f64());
+        println!(
+            "  compliance @ R<{}: {:.4}% (scan {:.1}s)",
+            args.threshold,
+            compliance * 100.0,
+            t_scan.elapsed().as_secs_f64()
+        );
 
         // Decide final precision for this projection.
         let (chosen_prec, action) = match policy_prec {
             Precision::Fp4 => {
                 if compliance < args.compliance_floor {
                     // Downgrade per self-policing gate.
-                    println!("  compliance {} < floor {} → downgrading to FP8",
-                             compliance, args.compliance_floor);
+                    println!(
+                        "  compliance {} < floor {} → downgrading to FP8",
+                        compliance, args.compliance_floor
+                    );
                     (Precision::Fp8, "downgraded_fp4_to_fp8")
                 } else {
                     (Precision::Fp4, "wrote_fp4")
@@ -339,12 +395,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match chosen_prec {
             Precision::Fp4 => {
                 larql_vindex::format::fp4_storage::write_fp4_projection(
-                    &out_path, hidden, &layer_refs,
+                    &out_path,
+                    hidden,
+                    &layer_refs,
                 )?;
             }
             Precision::Fp8 => {
                 larql_vindex::format::fp4_storage::write_fp8_projection(
-                    &out_path, hidden, &layer_refs,
+                    &out_path,
+                    hidden,
+                    &layer_refs,
                 )?;
             }
             Precision::F16 | Precision::F32 => {
@@ -380,7 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Build new VindexConfig with fp4 manifest ─────────────────────────────
     let projections_cfg = Projections {
         gate: final_projections[0].take().unwrap(),
-        up:   final_projections[1].take().unwrap(),
+        up: final_projections[1].take().unwrap(),
         down: final_projections[2].take().unwrap(),
     };
     let fp4_cfg = Fp4Config {
@@ -391,9 +451,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fallback_precision: Precision::Fp8,
         },
         ..Fp4Config::v1_defaults(Projections {
-            gate: ProjectionFormat { precision: Precision::Fp4, file: String::new() },
-            up:   ProjectionFormat { precision: Precision::Fp4, file: String::new() },
-            down: ProjectionFormat { precision: Precision::Fp4, file: String::new() },
+            gate: ProjectionFormat {
+                precision: Precision::Fp4,
+                file: String::new(),
+            },
+            up: ProjectionFormat {
+                precision: Precision::Fp4,
+                file: String::new(),
+            },
+            down: ProjectionFormat {
+                precision: Precision::Fp4,
+                file: String::new(),
+            },
         })
     };
     src_config.fp4 = Some(fp4_cfg);
@@ -424,7 +493,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "up_features.bin",
         "down_features.bin",
         "fp4_compliance.json",
-    ].iter().copied().collect();
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     let mut linked = 0;
     let mut linked_bytes: u64 = 0;
@@ -432,9 +504,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let entry = entry?;
         let fname = entry.file_name();
         let fname_str = fname.to_string_lossy();
-        if handled.contains(fname_str.as_ref()) { continue; }
+        if handled.contains(fname_str.as_ref()) {
+            continue;
+        }
         let meta = entry.metadata()?;
-        if !meta.is_file() { continue; }
+        if !meta.is_file() {
+            continue;
+        }
         let dst = args.out_path.join(&fname);
         link_or_copy(&entry.path(), &dst)?;
         linked += 1;
@@ -452,13 +528,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("== summary ==");
     let src_ffn_bytes = src_config.layers.iter().map(|l| l.length * 3).sum::<u64>();
     let out_ffn_bytes: u64 = [
-        src_config.fp4.as_ref().unwrap().projections.gate.file.clone(),
+        src_config
+            .fp4
+            .as_ref()
+            .unwrap()
+            .projections
+            .gate
+            .file
+            .clone(),
         src_config.fp4.as_ref().unwrap().projections.up.file.clone(),
-        src_config.fp4.as_ref().unwrap().projections.down.file.clone(),
-    ].iter().map(|f| std::fs::metadata(args.out_path.join(f)).map(|m| m.len()).unwrap_or(0)).sum();
+        src_config
+            .fp4
+            .as_ref()
+            .unwrap()
+            .projections
+            .down
+            .file
+            .clone(),
+    ]
+    .iter()
+    .map(|f| {
+        std::fs::metadata(args.out_path.join(f))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    })
+    .sum();
     let ratio = src_ffn_bytes as f64 / out_ffn_bytes.max(1) as f64;
-    println!("  FFN storage src : {:.2} GB", src_ffn_bytes as f64 / 1_073_741_824.0);
-    println!("  FFN storage dst : {:.2} GB", out_ffn_bytes as f64 / 1_073_741_824.0);
+    println!(
+        "  FFN storage src : {:.2} GB",
+        src_ffn_bytes as f64 / 1_073_741_824.0
+    );
+    println!(
+        "  FFN storage dst : {:.2} GB",
+        out_ffn_bytes as f64 / 1_073_741_824.0
+    );
     println!("  compression    : {ratio:.2}×");
 
     Ok(())
@@ -467,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn fs_prefix(proj_name: &str) -> &'static str {
     match proj_name {
         "gate" => "gate_vectors",
-        "up"   => "up_features",
+        "up" => "up_features",
         "down" => "down_features",
         _ => panic!("unknown projection {proj_name}"),
     }
@@ -477,6 +580,9 @@ fn fs_prefix(proj_name: &str) -> &'static str {
 /// epoch + a crude breakdown; good enough for log lines.
 fn chrono_now_fallback() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     format!("@epoch+{secs}s")
 }

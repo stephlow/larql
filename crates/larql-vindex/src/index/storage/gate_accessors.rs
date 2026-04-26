@@ -21,7 +21,9 @@ impl VectorIndex {
     /// Checks heap first (mutation overrides), then mmap (production read path).
     pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
         // Heap path first — catches mutation overrides (INSERT/UPDATE)
-        if let Some(meta) = self.metadata.down_meta
+        if let Some(meta) = self
+            .metadata
+            .down_meta
             .get(layer)
             .and_then(|v| v.as_ref())
             .and_then(|metas| metas.get(feature))
@@ -89,18 +91,26 @@ impl VectorIndex {
     /// weights path, silently bypassing the vindex entirely.
     pub fn num_features(&self, layer: usize) -> usize {
         if self.gate.gate_mmap_bytes.is_some() {
-            let n = self.gate.gate_mmap_slices
+            let n = self
+                .gate
+                .gate_mmap_slices
                 .get(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0);
-            if n > 0 { return n; }
+            if n > 0 {
+                return n;
+            }
         }
-        if let Some(n) = self.gate.gate_vectors
+        if let Some(n) = self
+            .gate
+            .gate_vectors
             .get(layer)
             .and_then(|v| v.as_ref())
             .map(|m| m.shape()[0])
         {
-            if n > 0 { return n; }
+            if n > 0 {
+                return n;
+            }
         }
         // FP4 storage fallback — layer_features is populated from
         // `index.json.layers[]` at load time.
@@ -115,9 +125,15 @@ impl VectorIndex {
     /// Total gate vectors loaded across all layers.
     pub fn total_gate_vectors(&self) -> usize {
         if self.gate.gate_mmap_bytes.is_some() {
-            return self.gate.gate_mmap_slices.iter().map(|s| s.num_features).sum();
+            return self
+                .gate
+                .gate_mmap_slices
+                .iter()
+                .map(|s| s.num_features)
+                .sum();
         }
-        self.gate.gate_vectors
+        self.gate
+            .gate_vectors
             .iter()
             .filter_map(|v| v.as_ref())
             .map(|m| m.shape()[0])
@@ -129,7 +145,8 @@ impl VectorIndex {
         if let Some(ref dm) = self.metadata.down_meta_mmap {
             return dm.total_features();
         }
-        self.metadata.down_meta
+        self.metadata
+            .down_meta
             .iter()
             .filter_map(|v| v.as_ref())
             .map(|metas| metas.iter().filter(|m| m.is_some()).count())
@@ -139,14 +156,17 @@ impl VectorIndex {
     /// Layers that have gate vectors loaded.
     pub fn loaded_layers(&self) -> Vec<usize> {
         if self.gate.gate_mmap_bytes.is_some() {
-            return self.gate.gate_mmap_slices
+            return self
+                .gate
+                .gate_mmap_slices
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.num_features > 0)
                 .map(|(i, _)| i)
                 .collect();
         }
-        self.gate.gate_vectors
+        self.gate
+            .gate_vectors
             .iter()
             .enumerate()
             .filter_map(|(i, v)| v.as_ref().map(|_| i))
@@ -155,7 +175,8 @@ impl VectorIndex {
 
     /// Access down metadata for a specific layer.
     pub fn down_meta_at(&self, layer: usize) -> Option<&[Option<FeatureMeta>]> {
-        self.metadata.down_meta
+        self.metadata
+            .down_meta
             .get(layer)
             .and_then(|v| v.as_ref())
             .map(|v| v.as_slice())
@@ -190,7 +211,10 @@ impl VectorIndex {
                     return None;
                 }
                 let raw = &mmap[byte_offset..byte_offset + byte_count];
-                return Some(crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype));
+                return Some(crate::config::dtype::decode_floats(
+                    raw,
+                    self.gate.gate_mmap_dtype,
+                ));
             }
         }
         None
@@ -236,7 +260,8 @@ impl VectorIndex {
     /// Number of features at a layer (works in both heap and mmap mode).
     pub fn num_features_at(&self, layer: usize) -> usize {
         if self.gate.gate_mmap_bytes.is_some() {
-            self.gate.gate_mmap_slices
+            self.gate
+                .gate_mmap_slices
                 .get(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0)
@@ -273,19 +298,45 @@ impl VectorIndex {
         let advise = |m: &memmap2::Mmap| unsafe {
             let _ = m.unchecked_advise(UncheckedAdvice::DontNeed);
         };
-        if let Some(ref m) = self.gate.gate_mmap_bytes { advise(m); }
-        if let Some(ref m) = self.ffn.down_features_mmap { advise(m); }
-        if let Some(ref m) = self.ffn.up_features_mmap { advise(m); }
-        if let Some(ref m) = self.projections.lm_head_mmap { advise(m); }
-        if let Some(ref m) = self.projections.lm_head_f16_mmap { advise(m); }
-        if let Some(ref m) = self.ffn.interleaved_mmap { advise(m); }
-        if let Some(ref m) = self.ffn.interleaved_q4_mmap { advise(m); }
-        if let Some(ref m) = self.ffn.interleaved_q4k_mmap { advise(m); }
-        if let Some(ref m) = self.gate.gate_q4_mmap { advise(m); }
-        if let Some(ref m) = self.projections.lm_head_q4_mmap { advise(m); }
-        if let Some(ref m) = self.projections.attn_q4k_mmap { advise(m); }
-        if let Some(ref m) = self.projections.attn_q4_mmap { advise(m); }
-        if let Some(ref m) = self.projections.attn_q8_mmap { advise(m); }
+        if let Some(ref m) = self.gate.gate_mmap_bytes {
+            advise(m);
+        }
+        if let Some(ref m) = self.ffn.down_features_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.ffn.up_features_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.projections.lm_head_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.projections.lm_head_f16_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.ffn.interleaved_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.ffn.interleaved_q4_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.ffn.interleaved_q4k_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.gate.gate_q4_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.projections.lm_head_q4_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.projections.attn_q4k_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.projections.attn_q4_mmap {
+            advise(m);
+        }
+        if let Some(ref m) = self.projections.attn_q8_mmap {
+            advise(m);
+        }
     }
 
     /// Pre-decode f16 gate vectors to f32 for lock-free access.
@@ -335,9 +386,9 @@ impl VectorIndex {
 
 #[cfg(test)]
 mod release_mmap_pages_tests {
+    use crate::config::dtype::StorageDtype;
     use crate::index::core::VectorIndex;
     use crate::index::types::GateLayerSlice;
-    use crate::config::dtype::StorageDtype;
     use ndarray::{Array1, Array2};
 
     #[test]
@@ -364,7 +415,10 @@ mod release_mmap_pages_tests {
         let encoded = larql_models::quant::half::encode_f16(&data);
         anon[..bytes].copy_from_slice(&encoded);
         let mmap = anon.make_read_only().unwrap();
-        let slices = vec![GateLayerSlice { float_offset: 0, num_features }];
+        let slices = vec![GateLayerSlice {
+            float_offset: 0,
+            num_features,
+        }];
         let idx = VectorIndex::new_mmap(mmap, slices, StorageDtype::F16, None, 1, hidden);
         assert!(idx.is_mmap(), "mmap-backed index sanity check");
 
@@ -378,6 +432,9 @@ mod release_mmap_pages_tests {
         // And the index must stay usable afterwards — `gate_knn` will
         // re-fault whatever pages the kernel actually evicted.
         let hits = idx.gate_knn(0, &q, 1);
-        assert!(!hits.is_empty(), "gate_knn must still work after page release");
+        assert!(
+            !hits.is_empty(),
+            "gate_knn must still work after page release"
+        );
     }
 }

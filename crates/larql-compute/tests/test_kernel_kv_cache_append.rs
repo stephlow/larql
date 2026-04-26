@@ -43,9 +43,7 @@ extern crate blas_src;
 mod common;
 use common::{cos_sim, get_metal, max_diff};
 
-use larql_compute::metal::ops::kv_cache::{
-    encode_kv_append, encode_kv_attend, LayerKVCache,
-};
+use larql_compute::metal::ops::kv_cache::{encode_kv_append, encode_kv_attend, LayerKVCache};
 
 // ── CPU reference ───────────────────────────────────────────────────────────
 
@@ -80,7 +78,9 @@ fn cpu_kv_attention(
         let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
-        for e in exps.iter_mut() { *e /= sum_exp; }
+        for e in exps.iter_mut() {
+            *e /= sum_exp;
+        }
         for d in 0..head_dim {
             let mut acc = 0.0f64;
             for (ki, &exp) in exps.iter().enumerate() {
@@ -130,7 +130,13 @@ fn append_one(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    encode_kv_append(enc, cache, &metal.kv_append_pipeline, &new_k_buf, &new_v_buf);
+    encode_kv_append(
+        enc,
+        cache,
+        &metal.kv_append_pipeline,
+        &new_k_buf,
+        &new_v_buf,
+    );
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
@@ -152,8 +158,14 @@ fn attend(
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     encode_kv_attend(
-        enc, cache, &metal.kv_attend_pipeline,
-        &q_buf, &out_buf, num_q, scale, window,
+        enc,
+        cache,
+        &metal.kv_attend_pipeline,
+        &q_buf,
+        &out_buf,
+        num_q,
+        scale,
+        window,
     );
     enc.end_encoding();
     cmd.commit();
@@ -228,18 +240,24 @@ fn assert_append_writes_exact_bytes(
          (k_diff={k_diff:.3e} v_diff={v_diff:.3e})",
     );
     for p in 0..max_seq {
-        if p == target_pos { continue; }
+        if p == target_pos {
+            continue;
+        }
         let off = p * kv_total;
         for d in 0..kv_total {
             assert_eq!(
-                k_full[off + d], 0.0,
+                k_full[off + d],
+                0.0,
                 "kv_cache_append {label}: K cache pos {p} d {d} = {} (should be 0 — \
                  indicates the writer scattered into the wrong slot or the kernel \
                  striped output across multiple positions)",
                 k_full[off + d],
             );
-            assert_eq!(v_full[off + d], 0.0,
-                "kv_cache_append {label}: V cache pos {p} d {d} != 0 (writer scatter bug)");
+            assert_eq!(
+                v_full[off + d],
+                0.0,
+                "kv_cache_append {label}: V cache pos {p} d {d} != 0 (writer scatter bug)"
+            );
         }
     }
 }
@@ -285,7 +303,7 @@ fn append_at_pos_zero_clears_otherwise_only_writes_one() {
 #[allow(clippy::too_many_arguments)]
 fn assert_append_roundtrip(
     label: &str,
-    seq: usize,           // tokens to append
+    seq: usize, // tokens to append
     num_q: usize,
     num_kv: usize,
     head_dim: usize,

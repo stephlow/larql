@@ -18,10 +18,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::VindexError;
-use crate::format::filenames::*;
-use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::config::{VindexConfig, VindexModelConfig};
+use crate::error::VindexError;
+use crate::extract::callbacks::IndexBuildCallbacks;
+use crate::format::filenames::*;
 use crate::format::load::load_vindex_config;
 
 use larql_models::ModelWeights;
@@ -120,11 +120,11 @@ impl<'a> StreamingWeights<'a> {
         let shape = view.shape().to_vec();
 
         let data = match view.dtype() {
-            safetensors::Dtype::F32 => {
-                view.data().chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect()
-            }
+            safetensors::Dtype::F32 => view
+                .data()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
             safetensors::Dtype::F16 => crate::format::quant::half::decode_f16(view.data()),
             safetensors::Dtype::BF16 => crate::format::quant::half::decode_bf16(view.data()),
             _ => return None,
@@ -136,13 +136,17 @@ impl<'a> StreamingWeights<'a> {
 impl<'a> WeightSource for StreamingWeights<'a> {
     fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)> {
         let (data, shape) = self.read_tensor_raw(key)?;
-        if shape.len() != 2 { return None; }
+        if shape.len() != 2 {
+            return None;
+        }
         Some((data, shape[0], shape[1]))
     }
 
     fn get_vector(&self, key: &str) -> Option<Vec<f32>> {
         let (data, shape) = self.read_tensor_raw(key)?;
-        if shape.len() != 1 { return None; }
+        if shape.len() != 1 {
+            return None;
+        }
         Some(data)
     }
 
@@ -180,7 +184,9 @@ impl<'a> WeightSource for StreamingWeights<'a> {
         let (shard_idx, tensor_name) = self.tensor_index.get(key)?;
         let st = safetensors::SafeTensors::deserialize(self.shard_mmaps[*shard_idx]).ok()?;
         let view = st.tensor(tensor_name).ok()?;
-        if view.dtype() != safetensors::Dtype::BF16 { return None; }
+        if view.dtype() != safetensors::Dtype::BF16 {
+            return None;
+        }
         Some(view.data().to_vec())
     }
 }
@@ -265,48 +271,55 @@ pub fn write_model_weights_with_opts(
     let write_lm_head = opts.level.writes_lm_head();
 
     if write_attn {
-    let attn_path = dir.join(ATTN_WEIGHTS_BIN);
-    let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
-    let mut attn_offset: u64 = 0;
+        let attn_path = dir.join(ATTN_WEIGHTS_BIN);
+        let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
+        let mut attn_offset: u64 = 0;
 
-    for layer in 0..num_layers {
-        callbacks.on_layer_start(COMP_ATTN_WEIGHTS, layer, num_layers);
-        for key in &[
-            arch.attn_q_key(layer),
-            arch.attn_k_key(layer),
-            arch.attn_v_key(layer),
-            arch.attn_o_key(layer),
-        ] {
-            if let Some((data, rows, cols)) = source.get_tensor(key) {
-                let len = write_floats(&mut attn_file, &data, dtype)?;
-                entries.push(WeightEntry {
-                    key: key.clone(), kind: "tensor".into(),
-                    shape: vec![rows, cols],
-                    offset: attn_offset, length: len,
-                    file: ATTN_WEIGHTS_BIN.into(),
-                });
-                attn_offset += len;
+        for layer in 0..num_layers {
+            callbacks.on_layer_start(COMP_ATTN_WEIGHTS, layer, num_layers);
+            for key in &[
+                arch.attn_q_key(layer),
+                arch.attn_k_key(layer),
+                arch.attn_v_key(layer),
+                arch.attn_o_key(layer),
+            ] {
+                if let Some((data, rows, cols)) = source.get_tensor(key) {
+                    let len = write_floats(&mut attn_file, &data, dtype)?;
+                    entries.push(WeightEntry {
+                        key: key.clone(),
+                        kind: "tensor".into(),
+                        shape: vec![rows, cols],
+                        offset: attn_offset,
+                        length: len,
+                        file: ATTN_WEIGHTS_BIN.into(),
+                    });
+                    attn_offset += len;
+                }
             }
-        }
 
-        // QK norms (1D vectors, stored alongside attention)
-        for key in [arch.attn_q_norm_key(layer), arch.attn_k_norm_key(layer)].iter().flatten() {
-            if let Some(data) = source.get_vector(key) {
-                let bytes = crate::config::dtype::encode_floats(&data, dtype);
-                attn_file.write_all(&bytes)?;
-                entries.push(WeightEntry {
-                    key: key.clone(), kind: "vector".into(),
-                    shape: vec![data.len()],
-                    offset: attn_offset, length: bytes.len() as u64,
-                    file: ATTN_WEIGHTS_BIN.into(),
-                });
-                attn_offset += bytes.len() as u64;
+            // QK norms (1D vectors, stored alongside attention)
+            for key in [arch.attn_q_norm_key(layer), arch.attn_k_norm_key(layer)]
+                .iter()
+                .flatten()
+            {
+                if let Some(data) = source.get_vector(key) {
+                    let bytes = crate::config::dtype::encode_floats(&data, dtype);
+                    attn_file.write_all(&bytes)?;
+                    entries.push(WeightEntry {
+                        key: key.clone(),
+                        kind: "vector".into(),
+                        shape: vec![data.len()],
+                        offset: attn_offset,
+                        length: bytes.len() as u64,
+                        file: ATTN_WEIGHTS_BIN.into(),
+                    });
+                    attn_offset += bytes.len() as u64;
+                }
             }
-        }
 
-        callbacks.on_layer_done(COMP_ATTN_WEIGHTS, layer, 0.0);
-    }
-    attn_file.flush()?;
+            callbacks.on_layer_done(COMP_ATTN_WEIGHTS, layer, 0.0);
+        }
+        attn_file.flush()?;
     } // end if write_attn
 
     // ── FFN up + down weights (gate is in gate_vectors.bin) ──
@@ -322,91 +335,102 @@ pub fn write_model_weights_with_opts(
     if opts.ffn_compact && arch.is_moe() && opts.level.writes_ffn() {
         return Err(VindexError::Parse(
             "ffn_compact not yet supported for MoE architectures — \
-             per-expert feature-major files don't exist yet".into(),
+             per-expert feature-major files don't exist yet"
+                .into(),
         ));
     }
 
     if write_ffn {
-    let up_path = dir.join("up_weights.bin");
-    let mut up_file = BufWriter::new(std::fs::File::create(&up_path)?);
-    let mut up_offset: u64 = 0;
+        let up_path = dir.join("up_weights.bin");
+        let mut up_file = BufWriter::new(std::fs::File::create(&up_path)?);
+        let mut up_offset: u64 = 0;
 
-    let down_path = dir.join("down_weights.bin");
-    let mut down_file = BufWriter::new(std::fs::File::create(&down_path)?);
-    let mut down_offset: u64 = 0;
+        let down_path = dir.join("down_weights.bin");
+        let mut down_file = BufWriter::new(std::fs::File::create(&down_path)?);
+        let mut down_offset: u64 = 0;
 
-    for layer in 0..num_layers {
-        callbacks.on_layer_start(COMP_UP_DOWN_WEIGHTS, layer, num_layers);
+        for layer in 0..num_layers {
+            callbacks.on_layer_start(COMP_UP_DOWN_WEIGHTS, layer, num_layers);
 
-        if arch.is_moe() {
-            for expert in 0..arch.num_experts() {
-                if let Some(key) = arch.expert_ffn_up_key(layer, expert) {
+            if arch.is_moe() {
+                for expert in 0..arch.num_experts() {
+                    if let Some(key) = arch.expert_ffn_up_key(layer, expert) {
+                        if let Some((data, rows, cols)) = source.get_tensor(&key) {
+                            let len = write_floats(&mut up_file, &data, dtype)?;
+                            entries.push(WeightEntry {
+                                key,
+                                kind: "tensor".into(),
+                                shape: vec![rows, cols],
+                                offset: up_offset,
+                                length: len,
+                                file: "up_weights.bin".into(),
+                            });
+                            up_offset += len;
+                        }
+                    }
+                    if let Some(key) = arch.expert_ffn_down_key(layer, expert) {
+                        if let Some((data, rows, cols)) = source.get_tensor(&key) {
+                            let len = write_floats(&mut down_file, &data, dtype)?;
+                            entries.push(WeightEntry {
+                                key,
+                                kind: "tensor".into(),
+                                shape: vec![rows, cols],
+                                offset: down_offset,
+                                length: len,
+                                file: "down_weights.bin".into(),
+                            });
+                            down_offset += len;
+                        }
+                    }
+                }
+                if let Some(key) = arch.moe_router_key(layer) {
                     if let Some((data, rows, cols)) = source.get_tensor(&key) {
                         let len = write_floats(&mut up_file, &data, dtype)?;
                         entries.push(WeightEntry {
-                            key, kind: "tensor".into(),
+                            key,
+                            kind: "tensor".into(),
                             shape: vec![rows, cols],
-                            offset: up_offset, length: len,
+                            offset: up_offset,
+                            length: len,
                             file: "up_weights.bin".into(),
                         });
                         up_offset += len;
                     }
                 }
-                if let Some(key) = arch.expert_ffn_down_key(layer, expert) {
-                    if let Some((data, rows, cols)) = source.get_tensor(&key) {
-                        let len = write_floats(&mut down_file, &data, dtype)?;
-                        entries.push(WeightEntry {
-                            key, kind: "tensor".into(),
-                            shape: vec![rows, cols],
-                            offset: down_offset, length: len,
-                            file: "down_weights.bin".into(),
-                        });
-                        down_offset += len;
-                    }
-                }
-            }
-            if let Some(key) = arch.moe_router_key(layer) {
-                if let Some((data, rows, cols)) = source.get_tensor(&key) {
+            } else {
+                let up_key = arch.ffn_up_key(layer);
+                if let Some((data, rows, cols)) = source.get_tensor(&up_key) {
                     let len = write_floats(&mut up_file, &data, dtype)?;
                     entries.push(WeightEntry {
-                        key, kind: "tensor".into(),
+                        key: up_key,
+                        kind: "tensor".into(),
                         shape: vec![rows, cols],
-                        offset: up_offset, length: len,
+                        offset: up_offset,
+                        length: len,
                         file: "up_weights.bin".into(),
                     });
                     up_offset += len;
                 }
-            }
-        } else {
-            let up_key = arch.ffn_up_key(layer);
-            if let Some((data, rows, cols)) = source.get_tensor(&up_key) {
-                let len = write_floats(&mut up_file, &data, dtype)?;
-                entries.push(WeightEntry {
-                    key: up_key, kind: "tensor".into(),
-                    shape: vec![rows, cols],
-                    offset: up_offset, length: len,
-                    file: "up_weights.bin".into(),
-                });
-                up_offset += len;
+
+                let down_key = arch.ffn_down_key(layer);
+                if let Some((data, rows, cols)) = source.get_tensor(&down_key) {
+                    let len = write_floats(&mut down_file, &data, dtype)?;
+                    entries.push(WeightEntry {
+                        key: down_key,
+                        kind: "tensor".into(),
+                        shape: vec![rows, cols],
+                        offset: down_offset,
+                        length: len,
+                        file: "down_weights.bin".into(),
+                    });
+                    down_offset += len;
+                }
             }
 
-            let down_key = arch.ffn_down_key(layer);
-            if let Some((data, rows, cols)) = source.get_tensor(&down_key) {
-                let len = write_floats(&mut down_file, &data, dtype)?;
-                entries.push(WeightEntry {
-                    key: down_key, kind: "tensor".into(),
-                    shape: vec![rows, cols],
-                    offset: down_offset, length: len,
-                    file: "down_weights.bin".into(),
-                });
-                down_offset += len;
-            }
+            callbacks.on_layer_done(COMP_UP_DOWN_WEIGHTS, layer, 0.0);
         }
-
-        callbacks.on_layer_done(COMP_UP_DOWN_WEIGHTS, layer, 0.0);
-    }
-    up_file.flush()?;
-    down_file.flush()?;
+        up_file.flush()?;
+        down_file.flush()?;
     } // end if write_ffn
 
     // ── Norms ── (paired with attention; skipped when level < Attention)
@@ -422,7 +446,10 @@ pub fn write_model_weights_with_opts(
                 Some(arch.post_attention_layernorm_key(layer)),
                 arch.pre_feedforward_layernorm_key(layer),
                 arch.post_feedforward_layernorm_key(layer),
-            ].into_iter().flatten().collect();
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
 
             // Hybrid MoE additions: the pre_2/post_1/post_2 weights plus
             // the outer post_feedforward_layernorm that wraps (h1+h2).
@@ -432,7 +459,10 @@ pub fn write_model_weights_with_opts(
                     arch.moe_post_ffn1_norm_key(layer),
                     arch.moe_post_experts_norm_key(layer),
                     arch.moe_post_outer_norm_key(layer),
-                ].into_iter().flatten() {
+                ]
+                .into_iter()
+                .flatten()
+                {
                     if !norm_keys.contains(&k) {
                         norm_keys.push(k);
                     }
@@ -444,9 +474,11 @@ pub fn write_model_weights_with_opts(
                     let bytes = crate::config::dtype::encode_floats(&data, dtype);
                     norms_file.write_all(&bytes)?;
                     entries.push(WeightEntry {
-                        key, kind: "vector".into(),
+                        key,
+                        kind: "vector".into(),
                         shape: vec![data.len()],
-                        offset: norms_offset, length: bytes.len() as u64,
+                        offset: norms_offset,
+                        length: bytes.len() as u64,
                         file: NORMS_BIN.into(),
                     });
                     norms_offset += bytes.len() as u64;
@@ -459,9 +491,11 @@ pub fn write_model_weights_with_opts(
             let bytes = crate::config::dtype::encode_floats(&data, dtype);
             norms_file.write_all(&bytes)?;
             entries.push(WeightEntry {
-                key: "norm.weight".into(), kind: "vector".into(),
+                key: "norm.weight".into(),
+                kind: "vector".into(),
                 shape: vec![data.len()],
-                offset: norms_offset, length: bytes.len() as u64,
+                offset: norms_offset,
+                length: bytes.len() as u64,
                 file: NORMS_BIN.into(),
             });
         }
@@ -474,24 +508,26 @@ pub fn write_model_weights_with_opts(
             let lm_bytes = crate::config::dtype::encode_floats(&data, dtype);
             std::fs::write(dir.join(LM_HEAD_BIN), &lm_bytes)?;
             entries.push(WeightEntry {
-                key: "lm_head.weight".into(), kind: "tensor".into(),
+                key: "lm_head.weight".into(),
+                kind: "tensor".into(),
                 shape: vec![rows, cols],
-                offset: 0, length: lm_bytes.len() as u64,
+                offset: 0,
+                length: lm_bytes.len() as u64,
                 file: LM_HEAD_BIN.into(),
             });
         }
     }
 
     // ── Manifest ──
-    let manifest_json = serde_json::to_string_pretty(&entries)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let manifest_json =
+        serde_json::to_string_pretty(&entries).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
 
     // ── Update index.json ──
     let config_path = dir.join(INDEX_JSON);
     let config_text = std::fs::read_to_string(&config_path)?;
-    let mut config: VindexConfig = serde_json::from_str(&config_text)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let mut config: VindexConfig =
+        serde_json::from_str(&config_text).map_err(|e| VindexError::Parse(e.to_string()))?;
 
     config.has_model_weights = true;
 
@@ -533,8 +569,8 @@ pub fn write_model_weights_with_opts(
         final_logit_softcapping: cfg.final_logit_softcapping,
     });
 
-    let config_json = serde_json::to_string_pretty(&config)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let config_json =
+        serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(&config_path, config_json)?;
 
     callbacks.on_stage_done(STAGE_MODEL_WEIGHTS, start.elapsed().as_secs_f64() * 1000.0);
@@ -542,4 +578,3 @@ pub fn write_model_weights_with_opts(
 }
 
 use crate::config::dtype::write_floats;
-

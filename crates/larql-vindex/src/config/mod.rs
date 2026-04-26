@@ -28,13 +28,10 @@ pub mod quantization;
 pub use compliance::{ComplianceGate, LayerBands};
 pub use dtype::StorageDtype;
 pub use index::{
-    DownMetaRecord, DownMetaTopK, ExtractLevel, VindexConfig,
-    VindexLayerInfo, VindexSource,
+    DownMetaRecord, DownMetaTopK, ExtractLevel, VindexConfig, VindexLayerInfo, VindexSource,
 };
 pub use model::{MoeConfig, VindexModelConfig};
-pub use quantization::{
-    Fp4Config, Precision, ProjectionFormat, Projections, QuantFormat,
-};
+pub use quantization::{Fp4Config, Precision, ProjectionFormat, Projections, QuantFormat};
 
 /// Back-compat alias — pre-split callers reach types via
 /// `config::types::FooBar`. Drop this once external callers migrate.

@@ -47,7 +47,10 @@ mod tests {
     }
 
     fn max_diff(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     /// `None` backend → ndarray fallback. Pin the pure-CPU `a @ b^T`.

@@ -223,11 +223,15 @@ From 2026-04-26 coverage review (50.45% line coverage).
 **`ffn/graph_backend.rs` — zero tests** ✅ Done 2026-04-26  
 Construction (layer count, empty layers), lookup_from_tokens (top-K limit, unknown layer, empty scores, out-of-range tokens), precompute_entity, save/load roundtrip.
 
-**`layer_graph/` — 7 of 17 files untested** (3 done, 4 open)  
-`dense.rs` ✅ Done 2026-04-26 — DenseLayerGraph shape/finiteness/capture, PerLayerGraph bounds.  
-`walk.rs` ✅ Done 2026-04-26 — WalkLayerGraph all-layers, PipelinedLayerGraph in/out-of-range.  
-`mod.rs` ✅ Done 2026-04-26 — trait dispatch, name distinctness.  
-`prefill.rs`, `template.rs`, `grid.rs`, `pipeline_layer.rs` — need real vindex + Metal backend, defer.
+**`layer_graph/` — 7 of 17 files untested** ✅ All 7 done 2026-04-26  
+`dense.rs` — DenseLayerGraph shape/finiteness/capture, PerLayerGraph bounds.  
+`walk.rs` — WalkLayerGraph all-layers, PipelinedLayerGraph in/out-of-range.  
+`mod.rs` — trait dispatch, name distinctness.  
+`prefill.rs` — CPU path: shape, finiteness, partial range, empty range, logit correctness.  
+`template.rs` — detect_template (7 pure tests), TemplateUniverse build/get/total, GuidedWalkLayerGraph shape/finiteness.  
+`pipeline_layer.rs` — build_arch_params param extraction, resolve_attn_weights None path, resolve_ffn_weights legacy stride slicing.  
+`grid.rs` — error path: no Q4K mmap → `Err(BadResponse)`.  
+Integration tests: `tests/test_layer_graph_integration.rs` — real vindex tests for prefill_with_kv, build_pipeline_layers, TemplateUniverse, GuidedWalkLayerGraph (all `#[ignore]`, run with `--ignored`).
 
 ### High priority
 
@@ -324,3 +328,10 @@ Full RS Graph Walk requires cracked attention (static head caching).
 | Tests: GQA reps>1 | 2026-04-26 | 3 tests; shape, finiteness, KV-head sharing |
 | Tests: RoPE property tests | 2026-04-26 | 4 tests; base sensitivity, offset=position, fractions |
 | 499 unit tests total | 2026-04-26 | +42 tests; all passing |
+| Tests: `layer_graph/prefill.rs` | 2026-04-26 | 6 tests; CPU path shape/finiteness/logits |
+| Tests: `layer_graph/template.rs` | 2026-04-26 | 12 tests; detect_template + TemplateUniverse + GuidedWalk |
+| Tests: `layer_graph/pipeline_layer.rs` | 2026-04-26 | 6 tests; arch params, attn weights, FFN stride |
+| Tests: `layer_graph/grid.rs` | 2026-04-26 | 1 test; error path for missing Q4K mmap |
+| Integration tests: `test_layer_graph_integration.rs` | 2026-04-26 | 7 ignored tests; real vindex prefill/pipeline/template |
+| Fix: `residual_diff/capture.rs` missing PathBuf import | 2026-04-26 | Pre-existing bug; broke lib test compilation |
+| 525 unit tests total | 2026-04-26 | All passing |

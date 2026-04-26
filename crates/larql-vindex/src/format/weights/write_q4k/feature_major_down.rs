@@ -29,14 +29,14 @@ use super::{pad_rows_to_256, QuantBlockFormat};
 /// while the FFN write loop is running; collapsed into the manifest
 /// JSON at end-of-loop. Each field has a name at the call sites
 /// (replaces what used to be an anonymous 3-tuple inside the writer).
-pub(crate)struct FeatureMajorDownState {
+pub(crate) struct FeatureMajorDownState {
     file: BufWriter<std::fs::File>,
     next_offset: u64,
     manifest: Vec<Q4kManifestEntry>,
 }
 
 impl FeatureMajorDownState {
-    pub(crate)fn new(path: &Path, capacity_layers: usize) -> Result<Self, VindexError> {
+    pub(crate) fn new(path: &Path, capacity_layers: usize) -> Result<Self, VindexError> {
         Ok(Self {
             file: BufWriter::new(std::fs::File::create(path)?),
             next_offset: 0,
@@ -49,7 +49,7 @@ impl FeatureMajorDownState {
     /// re-pad rows to 256, and quantise at `format`. Mirrors the
     /// orientation used by `q4k_ffn_layer`'s in-memory transpose so
     /// the runtime decode path reads the same byte layout.
-    pub(crate)fn append_layer(
+    pub(crate) fn append_layer(
         &mut self,
         key: String,
         padded_down: &[f32],
@@ -61,7 +61,8 @@ impl FeatureMajorDownState {
         debug_assert_eq!(padded_down.len(), n);
         let mut transposed = vec![0.0f32; n];
         for h in 0..rows_hidden {
-            let src = &padded_down[h * cols_padded_intermediate..(h + 1) * cols_padded_intermediate];
+            let src =
+                &padded_down[h * cols_padded_intermediate..(h + 1) * cols_padded_intermediate];
             for (feat, &v) in src.iter().enumerate() {
                 transposed[feat * rows_hidden + h] = v;
             }
@@ -86,7 +87,7 @@ impl FeatureMajorDownState {
     }
 
     /// Flush the bytes and write the manifest JSON sidecar.
-    pub(crate)fn finalize(mut self, manifest_path: &Path) -> Result<(), VindexError> {
+    pub(crate) fn finalize(mut self, manifest_path: &Path) -> Result<(), VindexError> {
         self.file.flush()?;
         drop(self.file);
         let json = serde_json::to_string_pretty(&self.manifest)

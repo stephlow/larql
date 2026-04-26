@@ -27,8 +27,14 @@ fn parse_args() -> (PathBuf, PathBuf) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--src" => { i += 1; src = Some(PathBuf::from(&args[i])); }
-            "--fp4" => { i += 1; fp4 = Some(PathBuf::from(&args[i])); }
+            "--src" => {
+                i += 1;
+                src = Some(PathBuf::from(&args[i]));
+            }
+            "--fp4" => {
+                i += 1;
+                fp4 = Some(PathBuf::from(&args[i]));
+            }
             _ => eprintln!("unknown arg: {}", args[i]),
         }
         i += 1;
@@ -55,9 +61,8 @@ fn load_source_feature(
                 [feat_offset..feat_offset + feat_bytes];
             return match dtype {
                 "f32" => {
-                    let v: &[f32] = unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr() as *const f32, hidden)
-                    };
+                    let v: &[f32] =
+                        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, hidden) };
                     v.to_vec()
                 }
                 "f16" => larql_models::quant::half::decode_f16(bytes),
@@ -110,7 +115,9 @@ fn feature_errors(src: &[f32], decoded: &[f32]) -> (f32, f32, f32) {
     let mut sum_sq = 0.0f32;
     for (&a, &b) in src.iter().zip(decoded.iter()) {
         let e = (a - b).abs();
-        if e > max { max = e; }
+        if e > max {
+            max = e;
+        }
         sum += e;
         sum_sq += e * e;
     }
@@ -122,18 +129,23 @@ fn main() {
     let (src_dir, fp4_dir) = parse_args();
 
     let src_config: VindexConfig =
-        serde_json::from_str(&std::fs::read_to_string(src_dir.join("index.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(src_dir.join("index.json")).unwrap())
+            .unwrap();
     let fp4_config: VindexConfig =
-        serde_json::from_str(&std::fs::read_to_string(fp4_dir.join("index.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(fp4_dir.join("index.json")).unwrap())
+            .unwrap();
     let fp4_cfg = fp4_config.fp4.expect("no fp4 manifest in target");
 
     let hidden = src_config.hidden_size;
     let num_layers = src_config.num_layers;
-    let per_layer_features: Vec<usize> =
-        src_config.layers.iter().map(|l| l.num_features).collect();
+    let per_layer_features: Vec<usize> = src_config.layers.iter().map(|l| l.num_features).collect();
     let src_dtype_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(src_dir.join("index.json")).unwrap()).unwrap();
-    let src_dtype = src_dtype_json["dtype"].as_str().unwrap_or("f32").to_string();
+        serde_json::from_str(&std::fs::read_to_string(src_dir.join("index.json")).unwrap())
+            .unwrap();
+    let src_dtype = src_dtype_json["dtype"]
+        .as_str()
+        .unwrap_or("f32")
+        .to_string();
 
     println!("== fp4_verify ==");
     println!("  src    : {} ({src_dtype})", src_dir.display());
@@ -143,17 +155,25 @@ fn main() {
 
     let projections = [
         ("gate", "gate_vectors.bin", &fp4_cfg.projections.gate),
-        ("up",   "up_features.bin",  &fp4_cfg.projections.up),
+        ("up", "up_features.bin", &fp4_cfg.projections.up),
         ("down", "down_features.bin", &fp4_cfg.projections.down),
     ];
 
     // Sample a few (layer, feat) pairs across layers.
-    let sample_layers = [0usize, num_layers / 4, num_layers / 2, 3 * num_layers / 4, num_layers - 1];
+    let sample_layers = [
+        0usize,
+        num_layers / 4,
+        num_layers / 2,
+        3 * num_layers / 4,
+        num_layers - 1,
+    ];
     let sample_feats = [0usize, 1000, 5000, 9000];
 
     for (proj_name, src_file, proj) in projections.iter() {
-        println!("→ {proj_name} (source {src_file}, decoded {} ({:?}))",
-                 proj.file, proj.precision);
+        println!(
+            "→ {proj_name} (source {src_file}, decoded {} ({:?}))",
+            proj.file, proj.precision
+        );
 
         let mut max_over_samples = 0.0f32;
         let mut sum_rms = 0.0f32;
@@ -161,16 +181,32 @@ fn main() {
 
         for &layer in &sample_layers {
             for &feat in &sample_feats {
-                if feat >= per_layer_features[layer] { continue; }
+                if feat >= per_layer_features[layer] {
+                    continue;
+                }
                 let src = load_source_feature(
-                    &src_dir, src_file, &src_dtype, layer, feat, hidden, &per_layer_features,
+                    &src_dir,
+                    src_file,
+                    &src_dtype,
+                    layer,
+                    feat,
+                    hidden,
+                    &per_layer_features,
                 );
                 let dec = load_fp4_feature(
-                    &fp4_dir, &proj.file, proj.precision, layer, feat, hidden, &per_layer_features,
+                    &fp4_dir,
+                    &proj.file,
+                    proj.precision,
+                    layer,
+                    feat,
+                    hidden,
+                    &per_layer_features,
                 );
                 let (max, mean, rms) = feature_errors(&src, &dec);
                 let block_max = src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                if max > max_over_samples { max_over_samples = max; }
+                if max > max_over_samples {
+                    max_over_samples = max;
+                }
                 sum_rms += rms;
                 count += 1;
                 println!(
@@ -181,7 +217,8 @@ fn main() {
         }
         println!(
             "  summary: max {:.4e}  mean rms {:.4e}  n={count}",
-            max_over_samples, sum_rms / count as f32
+            max_over_samples,
+            sum_rms / count as f32
         );
         println!();
     }

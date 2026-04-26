@@ -2,8 +2,8 @@
 //!
 //! See the `super` module doc for the full binary frame layout.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub(super) const BINARY_CT: &str = "application/x-larql-ffn";
 pub(super) const BATCH_MARKER: u32 = 0xFFFF_FFFF;
@@ -116,7 +116,10 @@ pub(crate) fn decode_binary_single(body: &[u8]) -> Result<(usize, Vec<f32>), Str
 /// Returns a map from layer → output floats.
 pub(crate) fn decode_binary_batch(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, String> {
     if body.len() < 12 {
-        return Err(format!("binary batch response too short: {} bytes", body.len()));
+        return Err(format!(
+            "binary batch response too short: {} bytes",
+            body.len()
+        ));
     }
     let marker = u32::from_le_bytes(body[0..4].try_into().unwrap());
 
@@ -167,7 +170,11 @@ pub(super) fn extract_response_latency_ms(body: &[u8]) -> f64 {
     }
     // Both single-layer and batch responses have latency_ms at offset 8.
     let v = f32::from_le_bytes(body[8..12].try_into().unwrap());
-    if v.is_finite() { v as f64 } else { 0.0 }
+    if v.is_finite() {
+        v as f64
+    } else {
+        0.0
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -327,10 +334,7 @@ mod tests {
 
     #[test]
     fn decode_batch_response_correct() {
-        let body = make_batch_response(
-            15.0,
-            &[(5, &[1.0, 2.0]), (20, &[3.0, 4.0])],
-        );
+        let body = make_batch_response(15.0, &[(5, &[1.0, 2.0]), (20, &[3.0, 4.0])]);
         let map = decode_binary_batch(&body).unwrap();
         assert_eq!(map.len(), 2);
         let v5 = map.get(&5).unwrap();

@@ -7,7 +7,10 @@ use std::io::{Seek, Write};
 use std::path::Path;
 use tempfile::TempDir;
 
-use larql_models::{load_model_dir, load_model_dir_filtered, load_model_dir_walk_only, ModelError};
+use larql_models::{
+    load_model_dir, load_model_dir_filtered, load_model_dir_validated, load_model_dir_walk_only,
+    load_model_dir_walk_only_validated, validation::FIELD_HEAD_DIM, ModelError,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Safetensors binary builder
@@ -302,6 +305,61 @@ fn load_f32_tensors_correct_values() {
     assert!((weights.embed[[0, 0]] - known[0]).abs() < 1e-6);
     // Last element: known[39] = 3.9
     assert!((weights.embed[[9, 3]] - known[39]).abs() < 1e-5);
+}
+
+#[test]
+fn load_model_dir_validated_rejects_invalid_config() {
+    let dir = TempDir::new().unwrap();
+    write_model_dir_with_config(
+        dir.path(),
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 5,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
+            "vocab_size": 10,
+        }),
+        &minimal_tensors(),
+    );
+
+    let permissive = load_model_dir(dir.path()).unwrap();
+    assert_eq!(permissive.hidden_size, 5);
+
+    match load_model_dir_validated(dir.path()) {
+        Err(ModelError::ConfigValidation(errors)) => {
+            assert!(errors.iter().any(|error| error.field == FIELD_HEAD_DIM));
+        }
+        _ => panic!("expected config validation error"),
+    }
+}
+
+#[test]
+fn load_model_dir_walk_only_validated_rejects_invalid_config() {
+    let dir = TempDir::new().unwrap();
+    write_model_dir_with_config(
+        dir.path(),
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 5,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
+            "vocab_size": 10,
+        }),
+        &minimal_tensors(),
+    );
+
+    match load_model_dir_walk_only_validated(dir.path()) {
+        Err(ModelError::ConfigValidation(errors)) => {
+            assert!(errors.iter().any(|error| error.field == FIELD_HEAD_DIM));
+        }
+        _ => panic!("expected config validation error"),
+    }
 }
 
 #[test]

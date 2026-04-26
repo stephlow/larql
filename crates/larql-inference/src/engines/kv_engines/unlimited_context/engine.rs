@@ -14,18 +14,20 @@
 //!   Token archive = 4 bytes/token
 //!   Total ≈ 30 MB  vs  25.8 GB for Standard KV  (≈2,000×)
 
+use larql_compute::{cpu_backend, ComputeBackend};
+use larql_vindex::VectorIndex;
 use ndarray::Array2;
 use serde::Serialize;
-use larql_compute::{ComputeBackend, cpu_backend};
-use larql_vindex::VectorIndex;
 
-use crate::attention::SharedKV;
-use crate::model::ModelWeights;
 use super::checkpoint_store::CheckpointStore;
-use super::extend::{empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_q4k};
+use super::extend::{
+    empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_q4k,
+};
 use super::token_archive::TokenArchive;
+use crate::attention::SharedKV;
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::engines::{EngineInfo, KvEngine};
+use crate::model::ModelWeights;
 
 // ─── EngineStats ─────────────────────────────────────────────────────────────
 
@@ -125,7 +127,13 @@ impl UnlimitedContextEngine {
             empty_prior(weights)
         };
 
-        let out = rs_extend_from_checkpoint_backend(weights, tokens, &prior, abs_offset, self.backend.as_ref())?;
+        let out = rs_extend_from_checkpoint_backend(
+            weights,
+            tokens,
+            &prior,
+            abs_offset,
+            self.backend.as_ref(),
+        )?;
         let abs_end = abs_offset + tokens.len() - 1;
         Some((out.kv_cache, abs_end))
     }
@@ -195,19 +203,21 @@ impl UnlimitedContextEngine {
         chunk: &[u32],
         backend: &dyn ComputeBackend,
     ) -> Option<()> {
-        if chunk.is_empty() { return Some(()); }
+        if chunk.is_empty() {
+            return Some(());
+        }
 
         let prior = if self.current_window_tokens.is_empty() {
-            if self.current_window_id > 0
-                && self.checkpoints.contains(self.current_window_id - 1)
-            {
+            if self.current_window_id > 0 && self.checkpoints.contains(self.current_window_id - 1) {
                 let (ckpt, _) = self.checkpoints.load(self.current_window_id - 1)?;
                 ckpt
             } else {
                 empty_prior(weights)
             }
         } else {
-            self.current_window_kv.take().unwrap_or_else(|| empty_prior(weights))
+            self.current_window_kv
+                .take()
+                .unwrap_or_else(|| empty_prior(weights))
         };
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
@@ -226,12 +236,12 @@ impl UnlimitedContextEngine {
     }
 
     fn extend_current(&mut self, weights: &ModelWeights, chunk: &[u32]) -> Option<()> {
-        if chunk.is_empty() { return Some(()); }
+        if chunk.is_empty() {
+            return Some(());
+        }
 
         let prior = if self.current_window_tokens.is_empty() {
-            if self.current_window_id > 0
-                && self.checkpoints.contains(self.current_window_id - 1)
-            {
+            if self.current_window_id > 0 && self.checkpoints.contains(self.current_window_id - 1) {
                 let (ckpt, _) = self.checkpoints.load(self.current_window_id - 1)?;
                 ckpt
             } else {
@@ -244,7 +254,13 @@ impl UnlimitedContextEngine {
         };
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
-        let out = rs_extend_from_checkpoint_backend(weights, chunk, &prior, abs_start, self.backend.as_ref())?;
+        let out = rs_extend_from_checkpoint_backend(
+            weights,
+            chunk,
+            &prior,
+            abs_start,
+            self.backend.as_ref(),
+        )?;
 
         self.last_hidden = Some(out.last_hidden);
         self.current_window_kv = Some(out.kv_cache);
@@ -271,7 +287,8 @@ impl UnlimitedContextEngine {
         let window_len = self.current_window_tokens.len();
         let abs_end = self.abs_offset + window_len - 1;
 
-        self.checkpoints.save(self.current_window_id, last_kv, abs_end);
+        self.checkpoints
+            .save(self.current_window_id, last_kv, abs_end);
         self.archive.archive(
             self.current_window_id,
             std::mem::take(&mut self.current_window_tokens),
@@ -283,12 +300,13 @@ impl UnlimitedContextEngine {
 }
 
 impl KvEngine for UnlimitedContextEngine {
-    fn name(&self) -> &str { "unlimited-context" }
+    fn name(&self) -> &str {
+        "unlimited-context"
+    }
 
     fn info(&self) -> EngineInfo {
-        let mem = self.checkpoints.total_bytes()
-            + self.archive.total_bytes()
-            + self.current_kv_bytes();
+        let mem =
+            self.checkpoints.total_bytes() + self.archive.total_bytes() + self.current_kv_bytes();
         EngineInfo {
             name: "unlimited-context".into(),
             description: format!(
@@ -314,12 +332,12 @@ impl KvEngine for UnlimitedContextEngine {
     }
 
     fn memory_bytes(&self) -> usize {
-        self.checkpoints.total_bytes()
-            + self.archive.total_bytes()
-            + self.current_kv_bytes()
+        self.checkpoints.total_bytes() + self.archive.total_bytes() + self.current_kv_bytes()
     }
 
-    fn window_tokens(&self) -> usize { self.current_window_tokens.len() }
+    fn window_tokens(&self) -> usize {
+        self.current_window_tokens.len()
+    }
 
     fn cold_bytes(&self) -> usize {
         self.checkpoints.total_bytes() + self.archive.total_bytes()
@@ -383,7 +401,9 @@ pub(crate) fn q4k_prefill_metal(
     use crate::layer_graph::pipeline_layer::build_pipeline_layers;
     use larql_vindex::GateIndex;
 
-    if !backend.has_q4() { return None; }
+    if !backend.has_q4() {
+        return None;
+    }
 
     let gate_index: &dyn GateIndex = index;
     let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
@@ -399,7 +419,9 @@ pub(crate) fn q4k_prefill_metal(
     let hidden = weights.hidden_size;
     let num_layers = weights.num_layers;
     let intermediate = gate_index.num_features(0);
-    if intermediate == 0 { return None; }
+    if intermediate == 0 {
+        return None;
+    }
 
     let q4_ffn_per_matrix = if ffn_is_q4k {
         (intermediate * hidden).div_ceil(256) * 144
@@ -413,15 +435,20 @@ pub(crate) fn q4k_prefill_metal(
     };
 
     let layers = build_pipeline_layers(
-        weights, index, 0..num_layers, q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+        weights,
+        index,
+        0..num_layers,
+        q4_ffn_mmap,
+        q4_ffn_per_matrix,
+        ffn_format,
     );
 
     let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
 
-    let q_dim  = weights.num_q_heads * weights.head_dim;
+    let q_dim = weights.num_q_heads * weights.head_dim;
     let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope   = arch.rope_base_for_layer(0) as f32;
+    let rope = arch.rope_base_for_layer(0) as f32;
     let seq_len = token_ids.len();
     let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm = arch.attn_q_norm_key(0).is_some();
@@ -435,9 +462,19 @@ pub(crate) fn q4k_prefill_metal(
     }
 
     let h_vec = backend.prefill_q4(
-        &layers, &x, hidden, intermediate, q_dim, kv_dim,
-        seq_len, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
-        rope, qk_norm, softcap,
+        &layers,
+        &x,
+        hidden,
+        intermediate,
+        q_dim,
+        kv_dim,
+        seq_len,
+        weights.num_q_heads,
+        weights.num_kv_heads,
+        weights.head_dim,
+        rope,
+        qk_norm,
+        softcap,
     )?;
 
     // Return pre-final_norm hidden state — the caller (hidden_to_raw_logits) applies it.
@@ -465,7 +502,7 @@ pub(crate) fn q4k_decode_token(
         return None;
     };
 
-    let arch   = &*weights.arch;
+    let arch = &*weights.arch;
     let hidden = weights.hidden_size;
     let num_layers = weights.num_layers;
     let intermediate = gate_index.num_features(0);
@@ -482,19 +519,32 @@ pub(crate) fn q4k_decode_token(
     };
 
     let layers = build_pipeline_layers(
-        weights, index, 0..num_layers, q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+        weights,
+        index,
+        0..num_layers,
+        q4_ffn_mmap,
+        q4_ffn_per_matrix,
+        ffn_format,
     );
 
     let h_tok = crate::forward::embed_tokens_pub(weights, &[token_id]);
     let x_dec: Vec<f32> = h_tok.row(0).to_vec();
 
-    let q_dim  = weights.num_q_heads * weights.head_dim;
+    let q_dim = weights.num_q_heads * weights.head_dim;
     let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope   = arch.rope_base_for_layer(0) as f32;
+    let rope = arch.rope_base_for_layer(0) as f32;
 
     let h_vec = backend.decode_token(
-        &layers, &x_dec, hidden, intermediate, q_dim, kv_dim,
-        weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+        &layers,
+        &x_dec,
+        hidden,
+        intermediate,
+        q_dim,
+        kv_dim,
+        weights.num_q_heads,
+        weights.num_kv_heads,
+        weights.head_dim,
+        rope,
     )?;
 
     // Return pre-final_norm hidden state — the caller (hidden_to_raw_logits) applies it.
@@ -522,7 +572,11 @@ mod tests {
         let eng = UnlimitedContextEngine::new(256);
         let info = eng.info();
         assert_eq!(info.name, "unlimited-context");
-        assert!(info.backend.starts_with("cpu"), "expected cpu backend, got {:?}", info.backend);
+        assert!(
+            info.backend.starts_with("cpu"),
+            "expected cpu backend, got {:?}",
+            info.backend
+        );
         assert_eq!(info.config, "window=256");
         assert!(info.summary().contains("unlimited-context"));
         assert!(info.summary().contains("cpu"));
@@ -548,9 +602,14 @@ mod tests {
         use crate::engines::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(512);
-        let h = engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill failed");
+        let h = engine
+            .prefill(&weights, &[0u32, 1, 2])
+            .expect("prefill failed");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
-        assert!(h.iter().all(|v| v.is_finite()), "hidden state should be finite");
+        assert!(
+            h.iter().all(|v| v.is_finite()),
+            "hidden state should be finite"
+        );
     }
 
     #[test]
@@ -576,8 +635,16 @@ mod tests {
             engine.process(&weights, &[tok]).expect("process failed");
         }
         assert_eq!(engine.archive.len(), 1, "one window should be archived");
-        assert_eq!(engine.current_window_tokens.len(), 0, "current window should be empty");
-        assert_eq!(engine.checkpoints.len(), 1, "one checkpoint should be saved");
+        assert_eq!(
+            engine.current_window_tokens.len(),
+            0,
+            "current window should be empty"
+        );
+        assert_eq!(
+            engine.checkpoints.len(),
+            1,
+            "one checkpoint should be saved"
+        );
     }
 
     #[test]
@@ -624,7 +691,10 @@ mod tests {
         let mut engine = UnlimitedContextEngine::new(2);
         assert_eq!(engine.cold_bytes(), 0);
         engine.process(&weights, &[0u32, 1]).expect("process"); // closes window
-        assert!(engine.cold_bytes() > 0, "cold tier should grow after window close");
+        assert!(
+            engine.cold_bytes() > 0,
+            "cold tier should grow after window close"
+        );
     }
 
     #[test]
@@ -645,6 +715,9 @@ mod tests {
         let mut engine = UnlimitedContextEngine::new(512);
         let h = engine.prefill(&weights, &[0u32, 1]).expect("prefill");
         let logits = hidden_to_raw_logits(&weights, &h);
-        assert!(logits.iter().all(|v| v.is_finite()), "logits should be finite");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "logits should be finite"
+        );
     }
 }

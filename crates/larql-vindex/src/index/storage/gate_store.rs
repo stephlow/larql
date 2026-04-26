@@ -18,8 +18,8 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use ndarray::{Array1, Array2, ArrayView2};
 use larql_compute::{ComputeBackend, MatMul};
+use ndarray::{Array1, Array2, ArrayView2};
 
 use crate::index::core::VectorIndex;
 use crate::index::types::{GateLayerSlice, GateQ4Slice};
@@ -188,7 +188,8 @@ impl VectorIndex {
     /// gates at ~1.7 GB (at the cost of repeated decode on evicted
     /// layers).
     pub fn set_gate_cache_max_layers(&self, max_layers: usize) {
-        self.gate.gate_cache_max_layers
+        self.gate
+            .gate_cache_max_layers
             .store(max_layers, std::sync::atomic::Ordering::Relaxed);
         // Shrink eagerly if the new cap is below the current cache size.
         if max_layers > 0 {
@@ -214,7 +215,9 @@ impl VectorIndex {
         just_inserted: bool,
         cache: &mut [Option<Vec<f32>>],
     ) {
-        let max = self.gate.gate_cache_max_layers
+        let max = self
+            .gate
+            .gate_cache_max_layers
             .load(std::sync::atomic::Ordering::Relaxed);
         if max == 0 {
             return;
@@ -246,7 +249,9 @@ impl VectorIndex {
         {
             let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
-                let nf = self.gate.gate_mmap_slices
+                let nf = self
+                    .gate
+                    .gate_mmap_slices
                     .get(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
@@ -325,16 +330,15 @@ impl VectorIndex {
         {
             let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
-                let nf = self.gate.gate_mmap_slices
+                let nf = self
+                    .gate
+                    .gate_mmap_slices
                     .get(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
                 if nf > 0 {
-                    let view = ArrayView2::from_shape(
-                        (nf, self.hidden_size),
-                        data.as_slice(),
-                    )
-                    .unwrap();
+                    let view =
+                        ArrayView2::from_shape((nf, self.hidden_size), data.as_slice()).unwrap();
                     return Some(gemv(&view, residual));
                 }
             }
@@ -349,23 +353,16 @@ impl VectorIndex {
                     }
                     let bpf = 4;
                     let byte_offset = slice.float_offset * bpf;
-                    let byte_end =
-                        byte_offset + slice.num_features * self.hidden_size * bpf;
+                    let byte_end = byte_offset + slice.num_features * self.hidden_size * bpf;
                     if byte_end > mmap.len() {
                         return None;
                     }
                     let data = unsafe {
                         let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
-                        std::slice::from_raw_parts(
-                            ptr,
-                            slice.num_features * self.hidden_size,
-                        )
+                        std::slice::from_raw_parts(ptr, slice.num_features * self.hidden_size)
                     };
-                    let view = ArrayView2::from_shape(
-                        (slice.num_features, self.hidden_size),
-                        data,
-                    )
-                    .unwrap();
+                    let view = ArrayView2::from_shape((slice.num_features, self.hidden_size), data)
+                        .unwrap();
                     return Some(gemv(&view, residual));
                 }
             }
@@ -432,7 +429,8 @@ mod gate_cache_lru_tests {
     }
 
     fn resident_layers(idx: &VectorIndex) -> usize {
-        idx.gate.f16_decode_cache
+        idx.gate
+            .f16_decode_cache
             .lock()
             .unwrap()
             .iter()
@@ -441,7 +439,8 @@ mod gate_cache_lru_tests {
     }
 
     fn lru_snapshot(idx: &VectorIndex) -> Vec<usize> {
-        idx.gate.gate_cache_lru
+        idx.gate
+            .gate_cache_lru
             .lock()
             .unwrap()
             .iter()

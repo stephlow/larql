@@ -19,16 +19,16 @@
 //! unknown family) returns the raw prompt unchanged with an explanatory
 //! `note` on [`ChatWrap`]. A broken template must never brick generation.
 
-pub(crate) mod source;
-pub(crate) mod render;
 pub(crate) mod fallback;
+pub(crate) mod render;
+pub(crate) mod source;
 
 use std::path::Path;
 
 use serde_json::Value;
 
-use source::try_hf_template;
 use fallback::fallback_template_for;
+use source::try_hf_template;
 
 /// Outcome of applying (or not applying) a chat template to the user's
 /// prompt. Returned wholesale so callers can both use the rendered string
@@ -112,7 +112,11 @@ fn try_fallback(model_hint: Option<&str>, user_prompt: &str) -> Option<ChatWrap>
 /// callers that already have the template text in memory (remote API, test
 /// fixture, in-memory generation) can reuse the render machinery without
 /// touching the filesystem.
-pub fn wrap_prompt_raw(template_str: &str, cfg: &Value, user_prompt: &str) -> Result<String, String> {
+pub fn wrap_prompt_raw(
+    template_str: &str,
+    cfg: &Value,
+    user_prompt: &str,
+) -> Result<String, String> {
     render::render_chat_template(template_str, cfg, user_prompt).map_err(|e| e.to_string())
 }
 
@@ -136,11 +140,7 @@ mod integration_tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = r#"{"chat_template":"HF:{{ messages[0].content }}"}"#;
         std::fs::write(tmp.path().join("tokenizer_config.json"), cfg).unwrap();
-        let w = wrap_chat_prompt(
-            tmp.path(),
-            Some("meta-llama/Llama-2-7b-chat-hf"),
-            "hi",
-        );
+        let w = wrap_chat_prompt(tmp.path(), Some("meta-llama/Llama-2-7b-chat-hf"), "hi");
         assert!(w.applied);
         // Primary path wins — we get the HF template, not `[INST]`.
         assert_eq!(w.prompt, "HF:hi");
@@ -164,11 +164,13 @@ mod integration_tests {
         std::fs::write(
             tmp.path().join("chat_template.jinja"),
             "JINJA:{{ messages[0].content }}",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             tmp.path().join("tokenizer_config.json"),
             r#"{"chat_template":"TC:{{ messages[0].content }}"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let w = wrap_with_vindex_template(tmp.path(), "hi");
         assert!(w.applied);
         assert_eq!(w.prompt, "JINJA:hi");

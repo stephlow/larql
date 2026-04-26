@@ -23,7 +23,11 @@ impl StageAccumulator {
     }
 
     pub fn avg_us(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.total_us / self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total_us / self.count as f64
+        }
     }
 }
 
@@ -52,18 +56,49 @@ impl DecodeStageSummary {
         let total = self.avg_total_decode_us;
         let pct = |v: f64| if total > 0.0 { v / total * 100.0 } else { 0.0 };
 
-        println!("\nStage breakdown  ({}, {}, {} decode steps avg):", self.engine, self.backend, self.steps);
+        println!(
+            "\nStage breakdown  ({}, {}, {} decode steps avg):",
+            self.engine, self.backend, self.steps
+        );
         println!("  {:<25} {:>8}  {:>6}", "Stage", "avg_us", "%");
         println!("  {}", "-".repeat(45));
-        println!("  {:<25} {:>8.1}  {:>5.1}%", "embed",          self.avg_embed_us,                pct(self.avg_embed_us));
+        println!(
+            "  {:<25} {:>8.1}  {:>5.1}%",
+            "embed",
+            self.avg_embed_us,
+            pct(self.avg_embed_us)
+        );
         if self.avg_recompute_total_us() > 0.0 {
-            println!("  {:<25} {:>8.1}  {:>5.1}%", "recompute_kv (cold)", self.avg_recompute_cold_us, pct(self.avg_recompute_cold_us));
-            println!("  {:<25} {:>8.1}  {:>5.1}%", "recompute_kv (hot)",  self.avg_recompute_hot_us,  pct(self.avg_recompute_hot_us));
+            println!(
+                "  {:<25} {:>8.1}  {:>5.1}%",
+                "recompute_kv (cold)",
+                self.avg_recompute_cold_us,
+                pct(self.avg_recompute_cold_us)
+            );
+            println!(
+                "  {:<25} {:>8.1}  {:>5.1}%",
+                "recompute_kv (hot)",
+                self.avg_recompute_hot_us,
+                pct(self.avg_recompute_hot_us)
+            );
         }
-        println!("  {:<25} {:>8.1}  {:>5.1}%", "attention",      self.avg_attention_us,            pct(self.avg_attention_us));
-        println!("  {:<25} {:>8.1}  {:>5.1}%", "ffn",            self.avg_ffn_us,                  pct(self.avg_ffn_us));
+        println!(
+            "  {:<25} {:>8.1}  {:>5.1}%",
+            "attention",
+            self.avg_attention_us,
+            pct(self.avg_attention_us)
+        );
+        println!(
+            "  {:<25} {:>8.1}  {:>5.1}%",
+            "ffn",
+            self.avg_ffn_us,
+            pct(self.avg_ffn_us)
+        );
         println!("  {}", "-".repeat(45));
-        println!("  {:<25} {:>8.1}  {:>5.1}%", "total (measured)", total, 100.0);
+        println!(
+            "  {:<25} {:>8.1}  {:>5.1}%",
+            "total (measured)", total, 100.0
+        );
         println!();
     }
 }
@@ -86,12 +121,12 @@ impl EngineProfiler {
             engine: engine.to_string(),
             backend: backend.to_string(),
             steps: self.decode_total.count,
-            avg_embed_us:          self.embed.avg_us(),
+            avg_embed_us: self.embed.avg_us(),
             avg_recompute_cold_us: self.recompute_cold.avg_us(),
-            avg_recompute_hot_us:  self.recompute_hot.avg_us(),
-            avg_attention_us:      self.attention.avg_us(),
-            avg_ffn_us:            self.ffn.avg_us(),
-            avg_total_decode_us:   self.decode_total.avg_us(),
+            avg_recompute_hot_us: self.recompute_hot.avg_us(),
+            avg_attention_us: self.attention.avg_us(),
+            avg_ffn_us: self.ffn.avg_us(),
+            avg_total_decode_us: self.decode_total.avg_us(),
         }
     }
 }

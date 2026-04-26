@@ -118,19 +118,35 @@ mod tests {
     #[test]
     fn all_filenames_unique() {
         let names = [
-            INDEX_JSON, TOKENIZER_JSON, TOKENIZER_CONFIG_JSON,
-            WEIGHT_MANIFEST_JSON, EMBEDDINGS_BIN, NORMS_BIN,
-            GATE_VECTORS_BIN, GATE_VECTORS_Q4_BIN, GATE_VECTORS_FP4_BIN,
-            DOWN_META_BIN, DOWN_FEATURES_BIN, DOWN_FEATURES_FP8_BIN,
-            DOWN_FEATURES_Q4K_BIN, DOWN_FEATURES_Q4K_MANIFEST_JSON,
-            UP_FEATURES_BIN, UP_FEATURES_FP4_BIN,
-            INTERLEAVED_BIN, INTERLEAVED_Q4_BIN, INTERLEAVED_Q4K_BIN,
+            INDEX_JSON,
+            TOKENIZER_JSON,
+            TOKENIZER_CONFIG_JSON,
+            WEIGHT_MANIFEST_JSON,
+            EMBEDDINGS_BIN,
+            NORMS_BIN,
+            GATE_VECTORS_BIN,
+            GATE_VECTORS_Q4_BIN,
+            GATE_VECTORS_FP4_BIN,
+            DOWN_META_BIN,
+            DOWN_FEATURES_BIN,
+            DOWN_FEATURES_FP8_BIN,
+            DOWN_FEATURES_Q4K_BIN,
+            DOWN_FEATURES_Q4K_MANIFEST_JSON,
+            UP_FEATURES_BIN,
+            UP_FEATURES_FP4_BIN,
+            INTERLEAVED_BIN,
+            INTERLEAVED_Q4_BIN,
+            INTERLEAVED_Q4K_BIN,
             INTERLEAVED_Q4K_MANIFEST_JSON,
             ATTN_WEIGHTS_BIN,
-            ATTN_WEIGHTS_Q4_BIN, ATTN_WEIGHTS_Q4_MANIFEST_JSON,
-            ATTN_WEIGHTS_Q4K_BIN, ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
-            ATTN_WEIGHTS_Q8_BIN, ATTN_WEIGHTS_Q8_MANIFEST_JSON,
-            LM_HEAD_BIN, LM_HEAD_Q4_BIN,
+            ATTN_WEIGHTS_Q4_BIN,
+            ATTN_WEIGHTS_Q4_MANIFEST_JSON,
+            ATTN_WEIGHTS_Q4K_BIN,
+            ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+            ATTN_WEIGHTS_Q8_BIN,
+            ATTN_WEIGHTS_Q8_MANIFEST_JSON,
+            LM_HEAD_BIN,
+            LM_HEAD_Q4_BIN,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "duplicate filename constant");
@@ -141,8 +157,10 @@ mod tests {
         // HF_UPLOAD_FILES must reference real constants. If a constant
         // is removed, this test catches the dangling reference.
         for name in HF_UPLOAD_FILES {
-            assert!(name.ends_with(".bin") || name.ends_with(".json"),
-                "HF_UPLOAD_FILES has odd entry: {name}");
+            assert!(
+                name.ends_with(".bin") || name.ends_with(".json"),
+                "HF_UPLOAD_FILES has odd entry: {name}"
+            );
         }
     }
 }

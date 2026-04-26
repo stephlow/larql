@@ -9,7 +9,6 @@
 
 use ndarray::Array2;
 
-
 use super::WalkFfn;
 
 impl<'a> WalkFfn<'a> {
@@ -41,7 +40,8 @@ impl<'a> WalkFfn<'a> {
 
         let mut out = larql_compute::matmul_gpu(&activation, &down_view, self.backend);
 
-        if let Some(bias) = arch.ffn_down_bias_key(layer)
+        if let Some(bias) = arch
+            .ffn_down_bias_key(layer)
             .and_then(|k| self.weights.vectors.get(&k))
         {
             crate::forward::add_bias(&mut out, bias);

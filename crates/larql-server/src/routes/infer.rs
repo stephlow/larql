@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
+use axum::Json;
 use serde::Deserialize;
 
 use crate::band_utils::{INFER_MODE_COMPARE, INFER_MODE_DENSE, INFER_MODE_WALK};
 use crate::error::ServerError;
 use crate::session::extract_session_id;
-use crate::state::{AppState, LoadedModel, elapsed_ms};
+use crate::state::{elapsed_ms, AppState, LoadedModel};
 
 #[derive(Deserialize)]
 pub struct InferRequest {
@@ -21,8 +21,12 @@ pub struct InferRequest {
     pub mode: String,
 }
 
-fn default_top() -> usize { 5 }
-fn default_mode() -> String { INFER_MODE_WALK.into() }
+fn default_top() -> usize {
+    5
+}
+fn default_mode() -> String {
+    INFER_MODE_WALK.into()
+}
 
 fn run_infer(
     state: &AppState,
@@ -112,7 +116,10 @@ fn run_infer(
 
         if is_compare {
             result.insert(INFER_MODE_WALK.into(), serde_json::json!(predictions));
-            result.insert("walk_ms".into(), serde_json::json!((walk_ms * 10.0).round() / 10.0));
+            result.insert(
+                "walk_ms".into(),
+                serde_json::json!((walk_ms * 10.0).round() / 10.0),
+            );
         } else {
             result.insert("predictions".into(), serde_json::json!(predictions));
             result.insert("mode".into(), serde_json::json!(INFER_MODE_WALK));
@@ -121,12 +128,7 @@ fn run_infer(
 
     if use_dense {
         let dense_start = std::time::Instant::now();
-        let pred = larql_inference::predict(
-            weights,
-            &model.tokenizer,
-            &token_ids,
-            req.top,
-        );
+        let pred = larql_inference::predict(weights, &model.tokenizer, &token_ids, req.top);
         let dense_ms = dense_start.elapsed().as_secs_f64() * 1000.0;
 
         let predictions: Vec<serde_json::Value> = pred
@@ -142,7 +144,10 @@ fn run_infer(
 
         if is_compare {
             result.insert(INFER_MODE_DENSE.into(), serde_json::json!(predictions));
-            result.insert("dense_ms".into(), serde_json::json!((dense_ms * 10.0).round() / 10.0));
+            result.insert(
+                "dense_ms".into(),
+                serde_json::json!((dense_ms * 10.0).round() / 10.0),
+            );
         } else {
             result.insert("predictions".into(), serde_json::json!(predictions));
             result.insert("mode".into(), serde_json::json!(INFER_MODE_DENSE));
@@ -163,9 +168,10 @@ pub async fn handle_infer(
     let model = state.model_or_err(None)?.clone();
     let sid = extract_session_id(&headers);
     let state2 = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || run_infer(&state2, &model, &req, sid.as_deref()))
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))??;
+    let result =
+        tokio::task::spawn_blocking(move || run_infer(&state2, &model, &req, sid.as_deref()))
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))??;
     Ok(Json(result))
 }
 
@@ -179,8 +185,9 @@ pub async fn handle_infer_multi(
     let model = state.model_or_err(Some(&model_id))?.clone();
     let sid = extract_session_id(&headers);
     let state2 = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || run_infer(&state2, &model, &req, sid.as_deref()))
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))??;
+    let result =
+        tokio::task::spawn_blocking(move || run_infer(&state2, &model, &req, sid.as_deref()))
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))??;
     Ok(Json(result))
 }

@@ -54,10 +54,22 @@ struct ConsistencyCase {
 }
 
 const CASES: &[ConsistencyCase] = &[
-    ConsistencyCase { name: "gemma3-4b-it",         vindex_name: "gemma3-4b-q4k-v2" },
-    ConsistencyCase { name: "gemma4-31b-it (dense)", vindex_name: "gemma4-31b-q4k" },
-    ConsistencyCase { name: "llama2-7b-hf (base)",  vindex_name: "llama2-7b-q4k" },
-    ConsistencyCase { name: "mistral-7b-v0.1 (base)", vindex_name: "mistral-7b-v0.1-q4k" },
+    ConsistencyCase {
+        name: "gemma3-4b-it",
+        vindex_name: "gemma3-4b-q4k-v2",
+    },
+    ConsistencyCase {
+        name: "gemma4-31b-it (dense)",
+        vindex_name: "gemma4-31b-q4k",
+    },
+    ConsistencyCase {
+        name: "llama2-7b-hf (base)",
+        vindex_name: "llama2-7b-q4k",
+    },
+    ConsistencyCase {
+        name: "mistral-7b-v0.1 (base)",
+        vindex_name: "mistral-7b-v0.1-q4k",
+    },
 ];
 
 fn find_vindex(name: &str) -> Option<PathBuf> {
@@ -67,15 +79,23 @@ fn find_vindex(name: &str) -> Option<PathBuf> {
         name.to_uppercase().replace('-', "_")
     )) {
         let p = PathBuf::from(env_path);
-        if p.is_dir() { return Some(p); }
+        if p.is_dir() {
+            return Some(p);
+        }
     }
     let chris_models = PathBuf::from("/Users/christopherhay/chris-models").join(&filename);
-    if chris_models.is_dir() { return Some(chris_models); }
+    if chris_models.is_dir() {
+        return Some(chris_models);
+    }
     let home = std::env::var("HOME").ok()?;
     [
-        PathBuf::from(&home).join(".cache/larql/local").join(&filename),
+        PathBuf::from(&home)
+            .join(".cache/larql/local")
+            .join(&filename),
         PathBuf::from("output").join(&filename),
-    ].into_iter().find(|p| p.is_dir())
+    ]
+    .into_iter()
+    .find(|p| p.is_dir())
 }
 
 fn strict_mode() -> bool {
@@ -97,22 +117,28 @@ fn check_one_step(case: &ConsistencyCase) -> Result<(), String> {
                 case.name, case.vindex_name
             ));
         }
-        eprintln!("[{}] skip: vindex `{}` not found", case.name, case.vindex_name);
+        eprintln!(
+            "[{}] skip: vindex `{}` not found",
+            case.name, case.vindex_name
+        );
         return Ok(());
     };
 
     let mut cb = SilentLoadCallbacks;
-    let cfg = load_vindex_config(&vindex_path)
-        .map_err(|e| format!("load_vindex_config: {e}"))?;
+    let cfg = load_vindex_config(&vindex_path).map_err(|e| format!("load_vindex_config: {e}"))?;
     if cfg.quant != QuantFormat::Q4K {
         return Err(format!("expected Q4K vindex, got {:?}", cfg.quant));
     }
-    let tokenizer = load_vindex_tokenizer(&vindex_path)
-        .map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
-    let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb)
-        .map_err(|e| format!("load vindex: {e}"))?;
-    q4_index.load_attn_q4k(&vindex_path).map_err(|e| format!("load_attn_q4k: {e}"))?;
-    q4_index.load_interleaved_q4k(&vindex_path).map_err(|e| format!("load_interleaved_q4k: {e}"))?;
+    let tokenizer =
+        load_vindex_tokenizer(&vindex_path).map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
+    let mut q4_index =
+        VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
+    q4_index
+        .load_attn_q4k(&vindex_path)
+        .map_err(|e| format!("load_attn_q4k: {e}"))?;
+    q4_index
+        .load_interleaved_q4k(&vindex_path)
+        .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
     let _ = q4_index.load_lm_head_q4(&vindex_path);
 
     let mut w_metal = load_model_weights_q4k(&vindex_path, &mut cb)
@@ -125,8 +151,8 @@ fn check_one_step(case: &ConsistencyCase) -> Result<(), String> {
     let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrap.prompt)
         .map_err(|e| format!("encode_prompt: {e}"))?;
 
-    let metal_backend = larql_compute::metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable")?;
+    let metal_backend =
+        larql_compute::metal::MetalBackend::new().ok_or("Metal backend unavailable")?;
 
     // Step 0: drive Metal through `generate(max_tokens=1)` to pick a
     // realistic next token. Using a deterministic argmax (which is
@@ -135,10 +161,20 @@ fn check_one_step(case: &ConsistencyCase) -> Result<(), String> {
     let cached = larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
     let metal_num_layers = w_metal.num_layers;
     let r0 = larql_inference::layer_graph::generate(
-        &mut w_metal, &tokenizer, &prompt_ids, 1,
-        &q4_index, &metal_backend, &cached, 0..metal_num_layers,
+        &mut w_metal,
+        &tokenizer,
+        &prompt_ids,
+        1,
+        &q4_index,
+        &metal_backend,
+        &cached,
+        0..metal_num_layers,
     );
-    let token_0_text = r0.tokens.first().map(|(t, _)| t.clone()).unwrap_or_default();
+    let token_0_text = r0
+        .tokens
+        .first()
+        .map(|(t, _)| t.clone())
+        .unwrap_or_default();
     if token_0_text.is_empty() {
         return Err(format!("[{}] generate produced no first token", case.name));
     }
@@ -159,17 +195,20 @@ fn check_one_step(case: &ConsistencyCase) -> Result<(), String> {
 
     // Capture both paths.
     let metal_decode = ResidualCapture::metal_decode(
-        &mut w_metal, &prompt_ids, token_0_id, &q4_index, &metal_backend,
+        &mut w_metal,
+        &prompt_ids,
+        token_0_id,
+        &q4_index,
+        &metal_backend,
     )?;
-    let cpu_ref_full = ResidualCapture::cpu_prefill(
-        &mut w_cpu, &appended_ids, &q4_index,
-    )?;
+    let cpu_ref_full = ResidualCapture::cpu_prefill(&mut w_cpu, &appended_ids, &q4_index)?;
     // CPU is `[seq=N+1, hidden]` per layer; decode is `[1, hidden]`.
     // Slice CPU's last-position row to align shapes.
     let cpu_ref = cpu_ref_full.project_to_last_position();
 
     let report = compare_captures(&cpu_ref, &metal_decode, ParityThreshold::tight());
-    report.assert_clean()
+    report
+        .assert_clean()
         .map_err(|e| format!("[{}] one-step decode: {e}", case.name))?;
     eprintln!(
         "[{}] decode-consistency OK across {} layers (1 step)",

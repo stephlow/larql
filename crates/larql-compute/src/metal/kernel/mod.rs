@@ -32,4 +32,4 @@ pub mod handle;
 pub mod traits;
 
 pub use handle::KernelHandle;
-pub use traits::{TiledKernel, ShaderKernel, get_shader_pipeline};
+pub use traits::{get_shader_pipeline, ShaderKernel, TiledKernel};

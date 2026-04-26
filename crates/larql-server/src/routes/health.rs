@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::State;
+use axum::Json;
 
+use crate::band_utils::HEALTH_STATUS_OK;
 use crate::state::AppState;
 
-pub async fn handle_health(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     state.bump_requests();
     let uptime = state.started_at.elapsed().as_secs();
     let served = state
@@ -17,7 +16,7 @@ pub async fn handle_health(
         .load(std::sync::atomic::Ordering::Relaxed);
 
     Json(serde_json::json!({
-        "status": "ok",
+        "status": HEALTH_STATUS_OK,
         "uptime_seconds": uptime,
         "requests_served": served,
     }))

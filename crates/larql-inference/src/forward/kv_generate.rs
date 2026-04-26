@@ -27,8 +27,8 @@ use crate::attention::{
     run_attention_block_decode_step_backend, run_attention_with_kv_backend, KvCache,
 };
 use crate::ffn::FfnBackend;
-use crate::forward::{embed_tokens_pub, logits_to_predictions_pub, run_ffn};
 use crate::forward::predict::hidden_to_raw_logits;
+use crate::forward::{embed_tokens_pub, logits_to_predictions_pub, run_ffn};
 use crate::model::ModelWeights;
 
 /// Stream autoregressive generation with a KV cache.
@@ -51,7 +51,14 @@ where
     F: FnMut(u32, &str),
 {
     generate_cached_bounded(
-        weights, tokenizer, ffn, prompt_ids, max_new_tokens, None, None, &mut on_token,
+        weights,
+        tokenizer,
+        ffn,
+        prompt_ids,
+        max_new_tokens,
+        None,
+        None,
+        &mut on_token,
     )
 }
 
@@ -72,7 +79,14 @@ where
     F: FnMut(u32, &str),
 {
     generate_cached_bounded(
-        weights, tokenizer, ffn, prompt_ids, max_new_tokens, window, backend, &mut on_token,
+        weights,
+        tokenizer,
+        ffn,
+        prompt_ids,
+        max_new_tokens,
+        window,
+        backend,
+        &mut on_token,
     )
 }
 
@@ -95,7 +109,14 @@ where
     F: FnMut(u32, &str),
 {
     generate_cached_bounded(
-        weights, tokenizer, ffn, prompt_ids, max_new_tokens, window, None, &mut on_token,
+        weights,
+        tokenizer,
+        ffn,
+        prompt_ids,
+        max_new_tokens,
+        window,
+        None,
+        &mut on_token,
     )
 }
 
@@ -169,7 +190,12 @@ fn generate_cached_bounded(
         for layer in 0..num_layers {
             let kv_entry = cache.layers[layer].as_ref();
             let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
-                weights, &h_step, layer, kv_entry, abs_position, backend,
+                weights,
+                &h_step,
+                layer,
+                kv_entry,
+                abs_position,
+                backend,
             ) {
                 Some(t) => t,
                 None => return generated,
@@ -265,11 +291,11 @@ where
     // ── Prefill ──
     let mut h = embed_tokens_pub(weights, prompt_ids);
     for layer in 0..num_layers {
-        let (h_post_attn, k_rope, v) =
-            match run_attention_with_kv_backend(weights, &h, layer, None) {
-                Some(t) => t,
-                None => return Vec::new(),
-            };
+        let (h_post_attn, k_rope, v) = match run_attention_with_kv_backend(weights, &h, layer, None)
+        {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
         cache.layers[layer] = Some((k_rope, v));
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
         h = h_out;
@@ -300,7 +326,12 @@ where
         for layer in 0..num_layers {
             let kv_entry = cache.layers[layer].as_ref();
             let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
-                weights, &h_step, layer, kv_entry, abs_position, None,
+                weights,
+                &h_step,
+                layer,
+                kv_entry,
+                abs_position,
+                None,
             ) {
                 Some(t) => t,
                 None => return generated,
@@ -343,7 +374,7 @@ fn masked_argmax(logits: &[f32], tokenizer: &tokenizers::Tokenizer) -> Option<(u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{make_test_weights, make_test_tokenizer};
+    use crate::engines::test_utils::{make_test_tokenizer, make_test_weights};
     use crate::ffn::WeightFfn;
 
     #[test]
@@ -352,13 +383,15 @@ mod tests {
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
         let mut decoded_tokens: Vec<String> = Vec::new();
-        let ids = generate_cached(
-            &weights, &tokenizer, &ffn,
-            &[0u32, 1], 3,
-            |_id, text| decoded_tokens.push(text.to_string()),
-        );
+        let ids = generate_cached(&weights, &tokenizer, &ffn, &[0u32, 1], 3, |_id, text| {
+            decoded_tokens.push(text.to_string())
+        });
         assert!(ids.len() <= 3, "should generate at most 3 tokens");
-        assert_eq!(ids.len(), decoded_tokens.len(), "callback called once per token");
+        assert_eq!(
+            ids.len(),
+            decoded_tokens.len(),
+            "callback called once per token"
+        );
     }
 
     #[test]
@@ -367,8 +400,11 @@ mod tests {
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
         let ids = generate_cached_with_window(
-            &weights, &tokenizer, &ffn,
-            &[0u32], 4,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &[0u32],
+            4,
             Some(2), // sliding window of 2
             |_, _| {},
         );
@@ -381,9 +417,13 @@ mod tests {
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
         let ids = generate_cached_backend(
-            &weights, &tokenizer, &ffn,
-            &[2u32, 3], 2,
-            None, None, // no backend override, no window
+            &weights,
+            &tokenizer,
+            &ffn,
+            &[2u32, 3],
+            2,
+            None,
+            None, // no backend override, no window
             |_, _| {},
         );
         assert!(ids.len() <= 2);
@@ -397,8 +437,11 @@ mod tests {
         // Allow only tokens 0..8 by masking the rest to NEG_INFINITY
         let allowed: std::collections::HashSet<u32> = (0u32..8).collect();
         let ids = generate_cached_constrained(
-            &weights, &tokenizer, &ffn,
-            &[0u32], 3,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &[0u32],
+            3,
             |_generated, logits| {
                 for (id, logit) in logits.iter_mut().enumerate() {
                     if !allowed.contains(&(id as u32)) {
@@ -410,8 +453,10 @@ mod tests {
         );
         // All generated tokens should be in the allowed set (or empty if all masked)
         for &id in &ids {
-            assert!(allowed.contains(&id),
-                "generated token {id} outside allowed set");
+            assert!(
+                allowed.contains(&id),
+                "generated token {id} outside allowed set"
+            );
         }
     }
 

@@ -74,6 +74,7 @@ larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --
 | `--cors` | Enable CORS headers | false |
 | `--api-key <KEY>` | Require Bearer token auth (health exempt) | — |
 | `--rate-limit <SPEC>` | Per-IP rate limit (e.g., "100/min", "10/sec") | — |
+| `--trust-forwarded-for` | Use the first `X-Forwarded-For` IP for rate limiting. Enable only behind a trusted reverse proxy. | false |
 | `--max-concurrent <N>` | Max concurrent requests | 100 |
 | `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results (0 = disabled) | 0 |
 | `--grpc-port <PORT>` | Enable gRPC server on this port (separate from the router-announce gRPC) | — |
@@ -533,7 +534,10 @@ Per-IP token bucket rate limiting. Supports `N/sec`, `N/min`, `N/hour` formats. 
 larql serve output/gemma3-4b.vindex --rate-limit "100/min"
 ```
 
-Excess requests receive `429 Too Many Requests`. The limiter also respects `X-Forwarded-For` headers for clients behind proxies.
+Excess requests receive `429 Too Many Requests`. By default the limiter uses
+the socket peer address and ignores client-supplied `X-Forwarded-For`. Behind a
+trusted reverse proxy, add `--trust-forwarded-for` so the first forwarded IP is
+used as the bucket key; the proxy must strip untrusted forwarding headers.
 
 ## DESCRIBE Cache
 
@@ -576,7 +580,8 @@ Sessions expire after 1 hour of inactivity. Without an `X-Session-Id` header, pa
 | 503 | Inference unavailable (`--no-infer` or no model weights) |
 | 500 | Internal server error |
 
-All errors return `{"error": "message"}`.
+All HTTP errors return `{"error": "message"}`, including embed-service
+endpoints and binary-protocol parse errors.
 
 ## Layer Bands
 

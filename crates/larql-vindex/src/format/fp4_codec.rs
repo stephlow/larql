@@ -34,10 +34,7 @@ pub struct Fp4LayerLayout {
 
 /// Compute per-layer byte offsets for an FP4 file given the per-layer
 /// feature counts and the projection's hidden dim.
-pub fn fp4_layer_layouts(
-    per_layer_features: &[usize],
-    hidden: usize,
-) -> Vec<Fp4LayerLayout> {
+pub fn fp4_layer_layouts(per_layer_features: &[usize], hidden: usize) -> Vec<Fp4LayerLayout> {
     let per_feat = fp4_feature_bytes(hidden);
     let mut cursor = 0usize;
     per_layer_features
@@ -56,10 +53,7 @@ pub fn fp4_layer_layouts(
 }
 
 /// FP8 counterpart of `fp4_layer_layouts`.
-pub fn fp8_layer_layouts(
-    per_layer_features: &[usize],
-    hidden: usize,
-) -> Vec<Fp4LayerLayout> {
+pub fn fp8_layer_layouts(per_layer_features: &[usize], hidden: usize) -> Vec<Fp4LayerLayout> {
     let per_feat = fp8_feature_bytes(hidden);
     let mut cursor = 0usize;
     per_layer_features
@@ -224,9 +218,7 @@ pub fn read_fp8_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::filenames::{
-        DOWN_FEATURES_FP8_BIN, GATE_VECTORS_FP4_BIN,
-    };
+    use crate::format::filenames::{DOWN_FEATURES_FP8_BIN, GATE_VECTORS_FP4_BIN};
     use std::io::Write as IoWrite;
 
     /// A tempdir helper that cleans up at drop, using std::fs only.
@@ -245,7 +237,9 @@ mod tests {
         }
     }
     impl Drop for TempDir {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn synthetic_layer(num_features: usize, hidden: usize, seed: f32) -> Vec<f32> {
@@ -321,7 +315,8 @@ mod tests {
                     let block_max = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                     for i in 0..BLOCK_ELEMENTS {
                         let err = (layer_values[layer_idx][block_start + i]
-                            - layer_dec[block_start + i]).abs();
+                            - layer_dec[block_start + i])
+                            .abs();
                         assert!(
                             err <= block_max * 0.15,
                             "layer {layer_idx} feat {f} blk {b} elem {i}: err {err} > {}",
@@ -379,7 +374,11 @@ mod tests {
         let path = tmp.0.join("x.bin");
         write_fp4_projection(&path, hidden, &slices).unwrap();
         let size = std::fs::metadata(&path).unwrap().len() as usize;
-        assert_eq!(size, num_features * 137, "expected 137 B/feature at hidden=256");
+        assert_eq!(
+            size,
+            num_features * 137,
+            "expected 137 B/feature at hidden=256"
+        );
     }
 
     #[test]
@@ -392,7 +391,11 @@ mod tests {
         let path = tmp.0.join("x.bin");
         write_fp8_projection(&path, hidden, &slices).unwrap();
         let size = std::fs::metadata(&path).unwrap().len() as usize;
-        assert_eq!(size, num_features * 257, "expected 257 B/feature at hidden=256");
+        assert_eq!(
+            size,
+            num_features * 257,
+            "expected 257 B/feature at hidden=256"
+        );
     }
 
     #[test]
@@ -403,6 +406,9 @@ mod tests {
         f.write_all(&[0u8; 100]).unwrap();
         let err = read_fp4_projection(&path, 256, &[10]).unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("size"), "error should mention size mismatch: {msg}");
+        assert!(
+            msg.contains("size"),
+            "error should mention size mismatch: {msg}"
+        );
     }
 }

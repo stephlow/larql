@@ -40,9 +40,12 @@ const DRIFT_THRESHOLD: f32 = 0.9999;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
-        args.next().ok_or("usage: residual_diff <vindex-dir> [prompt]")?,
+        args.next()
+            .ok_or("usage: residual_diff <vindex-dir> [prompt]")?,
     );
-    let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
+    let prompt = args
+        .next()
+        .unwrap_or_else(|| "The capital of France is".to_string());
 
     if !vindex_path.is_dir() {
         return Err(format!("not a vindex dir: {}", vindex_path.display()).into());
@@ -54,10 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // set by the caller (for interactive inspection of intermediate
     // files), we use those paths directly and skip the TempDir guard so
     // the files survive the run.
-    let external_cpu = std::env::var_os("LARQL_CPU_DUMP_LAYERS")
-        .map(std::path::PathBuf::from);
-    let external_metal = std::env::var_os("LARQL_METAL_DUMP_LAYERS")
-        .map(std::path::PathBuf::from);
+    let external_cpu = std::env::var_os("LARQL_CPU_DUMP_LAYERS").map(std::path::PathBuf::from);
+    let external_metal = std::env::var_os("LARQL_METAL_DUMP_LAYERS").map(std::path::PathBuf::from);
     let _cpu_guard: Option<tempfile::TempDir>;
     let _metal_guard: Option<tempfile::TempDir>;
     let cpu_path: std::path::PathBuf = if let Some(p) = external_cpu {
@@ -90,7 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Which layer's per-stage snapshots to compare. Override with the env
     // var if you want to bisect somewhere other than L0.
     let stage_layer: usize = std::env::var("LARQL_STAGE_DUMP_LAYER")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     // ── Load vindex ────────────────────────────────────────────────────
     let mut cb = larql_vindex::SilentLoadCallbacks;
@@ -115,27 +118,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  model:        {}", cfg.model);
     println!("  family:       {}", cfg.family);
     println!("  prompt:       {prompt:?}");
-    println!("  seq_len:      {seq_len}  ({} tokens post-template)", token_ids.len());
+    println!(
+        "  seq_len:      {seq_len}  ({} tokens post-template)",
+        token_ids.len()
+    );
     println!("  num_layers:   {num_layers}");
     println!("  hidden:       {hidden}");
     println!();
 
     // ── Drive both backends (max_tokens=1 → just prefill once each) ─────
-    let metal_backend = larql_compute::metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable")?;
+    let metal_backend =
+        larql_compute::metal::MetalBackend::new().ok_or("Metal backend unavailable")?;
     let metal_cached = CachedLayerGraph::from_residuals(Vec::new());
-    println!("Running Metal prefill (dumps → {})", metal_path.as_path().display());
+    println!(
+        "Running Metal prefill (dumps → {})",
+        metal_path.as_path().display()
+    );
     let _ = generate(
-        &mut w_metal, &tokenizer, &token_ids, 1,
-        &q4_index, &metal_backend, &metal_cached, 0..num_layers,
+        &mut w_metal,
+        &tokenizer,
+        &token_ids,
+        1,
+        &q4_index,
+        &metal_backend,
+        &metal_cached,
+        0..num_layers,
     );
 
     let cpu_backend = larql_compute::CpuBackend;
     let cpu_cached = CachedLayerGraph::from_residuals(Vec::new());
-    println!("Running CPU prefill (dumps → {})", cpu_path.as_path().display());
+    println!(
+        "Running CPU prefill (dumps → {})",
+        cpu_path.as_path().display()
+    );
     let _ = generate(
-        &mut w_cpu, &tokenizer, &token_ids, 1,
-        &q4_index, &cpu_backend, &cpu_cached, 0..num_layers,
+        &mut w_cpu,
+        &tokenizer,
+        &token_ids,
+        1,
+        &q4_index,
+        &cpu_backend,
+        &cpu_cached,
+        0..num_layers,
     );
 
     println!();
@@ -148,7 +172,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let load = |cpu_name: &str, metal_name: &str| -> Option<(Vec<f32>, Vec<f32>)> {
             let c = read_f32(&cpu_path.as_path().join(cpu_name))?;
             let m = read_f32(&metal_path.as_path().join(metal_name))?;
-            if c.len() != m.len() { return None; }
+            if c.len() != m.len() {
+                return None;
+            }
             Some((c, m))
         };
 
@@ -171,7 +197,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if stat_out.cos < DRIFT_THRESHOLD && first_bad.is_none() {
             first_bad = Some(l);
         }
-        let flag = if stat_out.cos < DRIFT_THRESHOLD { " ←" } else { "" };
+        let flag = if stat_out.cos < DRIFT_THRESHOLD {
+            " ←"
+        } else {
+            ""
+        };
 
         // Diagnostic: which piece (attention vs FFN) introduces the drift.
         // If h_post_attn already differs, attention is the culprit;
@@ -190,31 +220,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!(
             "  L{l:02}  {}  {:>8.6} / {:>8.2e}  {:>9}{flag}",
-            hpa_cell,
-            stat_out.cos, stat_out.max_abs_diff,
-            diagnosis,
+            hpa_cell, stat_out.cos, stat_out.max_abs_diff, diagnosis,
         );
     }
 
     println!();
     match first_bad {
         Some(l) => {
-            println!("━━━ First layer with cos_sim < {} ─────────────────────────", DRIFT_THRESHOLD);
+            println!(
+                "━━━ First layer with cos_sim < {} ─────────────────────────",
+                DRIFT_THRESHOLD
+            );
             println!("  L{l} is where CPU and Metal first diverge meaningfully.");
             if l == 0 {
                 println!("  Layer 0 drift → culprit is in the embedding or layer-0 pre-norm / attention / FFN.");
             } else {
-                println!("  Earlier layers match; focus on L{l} attention, FFN, or per-layer scalar.");
+                println!(
+                    "  Earlier layers match; focus on L{l} attention, FFN, or per-layer scalar."
+                );
             }
             // Also point at stages (dumped for L0 only by the Metal
             // prefill hook) so the user can cross-reference.
             let stage_dumps = [
-                "norm_out", "q_out", "k_out", "v_out", "attn_out",
-                "o_out", "h_post_attn",
+                "norm_out",
+                "q_out",
+                "k_out",
+                "v_out",
+                "attn_out",
+                "o_out",
+                "h_post_attn",
             ];
             if l == 0 {
                 println!();
-                println!("  L0 stage files available in {}:", metal_path.as_path().display());
+                println!(
+                    "  L0 stage files available in {}:",
+                    metal_path.as_path().display()
+                );
                 for s in &stage_dumps {
                     let p = metal_path.as_path().join(format!("metal_layer_00_{s}.f32"));
                     if p.is_file() {
@@ -238,23 +279,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // We match both sides' layout below for a unified comparison table.
     println!();
     println!("━━━ Stage-by-stage comparison @ L{stage_layer} ──────────────────────────");
-    println!("  {:<28} {:>10}  {:>12}  {:>10}  {:>10}",
-        "stage", "cos_sim", "max_abs_Δ", "||cpu||", "||mtl||");
+    println!(
+        "  {:<28} {:>10}  {:>12}  {:>10}  {:>10}",
+        "stage", "cos_sim", "max_abs_Δ", "||cpu||", "||mtl||"
+    );
     let ll = format!("{stage_layer:02}");
     // Pairs of (pretty name, cpu file suffix, metal file suffix). CPU's
     // stage dump is always L0-prefixed by current block.rs convention, so
     // we read from that name — any layer picked up by the dump infra
     // still writes under `cpu_L0_*` for historical reasons.
     let pairs: &[(&str, String, String)] = &[
-        ("norm_out (pre-Q/K/V)",  format!("cpu_L0_norm_out.f32"),           format!("metal_layer_{ll}_norm_out.f32")),
-        ("q_out (raw, pre QK-norm)", format!("cpu_L0_q_out_raw.f32"),       format!("metal_layer_{ll}_q_out.f32")),
-        ("q_out_after_qk_norm",   format!("cpu_L0_q_out_after_qk_norm.f32"), format!("metal_L0_q_out_after_qk_norm.f32")),
-        ("q_out_after_rope",      format!("cpu_L0_q_out_after_rope.f32"),   String::new()),
-        ("attn_out (softmax·V)",  format!("cpu_L0_attn_out.f32"),           format!("metal_layer_{ll}_attn_out.f32")),
-        ("o_out (post Wo-proj)",  format!("cpu_L0_o_out.f32"),              format!("metal_layer_{ll}_o_out.f32")),
+        (
+            "norm_out (pre-Q/K/V)",
+            format!("cpu_L0_norm_out.f32"),
+            format!("metal_layer_{ll}_norm_out.f32"),
+        ),
+        (
+            "q_out (raw, pre QK-norm)",
+            format!("cpu_L0_q_out_raw.f32"),
+            format!("metal_layer_{ll}_q_out.f32"),
+        ),
+        (
+            "q_out_after_qk_norm",
+            format!("cpu_L0_q_out_after_qk_norm.f32"),
+            format!("metal_L0_q_out_after_qk_norm.f32"),
+        ),
+        (
+            "q_out_after_rope",
+            format!("cpu_L0_q_out_after_rope.f32"),
+            String::new(),
+        ),
+        (
+            "attn_out (softmax·V)",
+            format!("cpu_L0_attn_out.f32"),
+            format!("metal_layer_{ll}_attn_out.f32"),
+        ),
+        (
+            "o_out (post Wo-proj)",
+            format!("cpu_L0_o_out.f32"),
+            format!("metal_layer_{ll}_o_out.f32"),
+        ),
     ];
     for (name, cpu_name, metal_name) in pairs {
-        if metal_name.is_empty() { continue; }
+        if metal_name.is_empty() {
+            continue;
+        }
         let cpu_path = cpu_path.as_path().join(cpu_name);
         let metal_path = metal_path.as_path().join(metal_name);
         let cpu = read_f32(&cpu_path);
@@ -263,11 +332,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Some(c), Some(m)) if c.len() == m.len() => {
                 let s = layer_stats(&c, &m);
                 let flag = if s.cos < DRIFT_THRESHOLD { " ←" } else { "" };
-                println!("  {:<28} {:>10.6}  {:>12.3e}  {:>10.3}  {:>10.3}{flag}",
-                    name, s.cos, s.max_abs_diff, s.cpu_norm, s.metal_norm);
+                println!(
+                    "  {:<28} {:>10.6}  {:>12.3e}  {:>10.3}  {:>10.3}{flag}",
+                    name, s.cos, s.max_abs_diff, s.cpu_norm, s.metal_norm
+                );
             }
             (Some(c), Some(m)) => {
-                println!("  {:<28} <len mismatch: cpu={} mtl={}>", name, c.len(), m.len());
+                println!(
+                    "  {:<28} <len mismatch: cpu={} mtl={}>",
+                    name,
+                    c.len(),
+                    m.len()
+                );
             }
             (None, _) => println!("  {:<28} <cpu missing: {}>", name, cpu_path.display()),
             (_, None) => println!("  {:<28} <mtl missing: {}>", name, metal_path.display()),
@@ -300,7 +376,9 @@ fn layer_stats(cpu: &[f32], metal: &[f32]) -> LayerStat {
         cn += a * a;
         mn += b * b;
         let d = (cpu[i] - metal[i]).abs();
-        if d > max_abs { max_abs = d; }
+        if d > max_abs {
+            max_abs = d;
+        }
     }
     let cos = if cn > 0.0 && mn > 0.0 {
         (dot / (cn.sqrt() * mn.sqrt())) as f32
@@ -319,9 +397,13 @@ fn layer_stats(cpu: &[f32], metal: &[f32]) -> LayerStat {
 /// error or non-multiple-of-4 file size.
 fn read_f32(path: &Path) -> Option<Vec<f32>> {
     let bytes = std::fs::read(path).ok()?;
-    if !bytes.len().is_multiple_of(4) { return None; }
-    Some(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
 }

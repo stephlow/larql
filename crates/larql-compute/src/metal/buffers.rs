@@ -42,27 +42,37 @@ impl BufferCache {
             // allocated once and reused.
             let stub_key: CacheKey = (0, 0);
             let mut cache = self.cache.lock().unwrap();
-            if let Some(buf) = cache.get(&stub_key) { return buf.clone(); }
-            let buf = self.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+            if let Some(buf) = cache.get(&stub_key) {
+                return buf.clone();
+            }
+            let buf = self
+                .device
+                .new_buffer(4, MTLResourceOptions::StorageModeShared);
             cache.insert(stub_key, buf.clone());
             return buf;
         }
 
         let key: CacheKey = (data.as_ptr() as usize, data.len());
         let mut cache = self.cache.lock().unwrap();
-        if let Some(buf) = cache.get(&key) { return buf.clone(); }
+        if let Some(buf) = cache.get(&key) {
+            return buf.clone();
+        }
 
         let bytes = data.len() * 4;
         let ptr = data.as_ptr() as *const c_void;
 
         let buf = if Self::is_page_aligned(ptr, bytes) {
             self.device.new_buffer_with_bytes_no_copy(
-                ptr as *mut c_void, bytes as u64,
-                MTLResourceOptions::StorageModeShared, None,
+                ptr as *mut c_void,
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
             )
         } else {
             self.device.new_buffer_with_data(
-                ptr, bytes as u64, MTLResourceOptions::StorageModeShared,
+                ptr,
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
             )
         };
 
@@ -77,27 +87,37 @@ impl BufferCache {
         if data.is_empty() {
             let stub_key: CacheKey = (1, 0);
             let mut cache = self.cache.lock().unwrap();
-            if let Some(buf) = cache.get(&stub_key) { return buf.clone(); }
-            let buf = self.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+            if let Some(buf) = cache.get(&stub_key) {
+                return buf.clone();
+            }
+            let buf = self
+                .device
+                .new_buffer(4, MTLResourceOptions::StorageModeShared);
             cache.insert(stub_key, buf.clone());
             return buf;
         }
 
         let key: CacheKey = (data.as_ptr() as usize, data.len());
         let mut cache = self.cache.lock().unwrap();
-        if let Some(buf) = cache.get(&key) { return buf.clone(); }
+        if let Some(buf) = cache.get(&key) {
+            return buf.clone();
+        }
 
         let ptr = data.as_ptr() as *const c_void;
         let bytes = data.len();
 
         let buf = if Self::is_page_aligned(ptr, bytes) {
             self.device.new_buffer_with_bytes_no_copy(
-                ptr as *mut c_void, bytes as u64,
-                MTLResourceOptions::StorageModeShared, None,
+                ptr as *mut c_void,
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
             )
         } else {
             self.device.new_buffer_with_data(
-                ptr, bytes as u64, MTLResourceOptions::StorageModeShared,
+                ptr,
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
             )
         };
 
@@ -128,7 +148,9 @@ impl BufferCache {
     /// Q4K expert weight slices before a GPU matvec dispatch.
     pub fn transient_from_bytes(&self, data: &[u8]) -> Buffer {
         if data.is_empty() {
-            return self.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+            return self
+                .device
+                .new_buffer(4, MTLResourceOptions::StorageModeShared);
         }
         self.device.new_buffer_with_data(
             data.as_ptr() as *const c_void,
@@ -137,10 +159,10 @@ impl BufferCache {
         )
     }
 
-
     /// Create an empty output buffer of given byte size.
     pub fn output(&self, bytes: u64) -> Buffer {
-        self.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        self.device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
     }
 
     /// Number of cached buffers (for diagnostics).
@@ -187,13 +209,17 @@ pub fn read_buffer_f32(buf: &metal::Buffer, len: usize) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    fn dev() -> Option<Device> { Device::system_default() }
+    fn dev() -> Option<Device> {
+        Device::system_default()
+    }
 
     /// `get_f32` caches by (pointer, len). The same slice handed in
     /// twice must return the same Buffer (one allocation, two clones).
     #[test]
     fn get_f32_caches_by_slice_identity() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         assert_eq!(cache.len(), 0);
@@ -208,7 +234,9 @@ mod tests {
     /// happen to be byte-identical (cache key is pointer+len, not value).
     #[test]
     fn get_f32_distinct_slices_get_distinct_buffers() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let a = vec![1.0f32; 16];
         let b = vec![1.0f32; 16];
@@ -221,7 +249,9 @@ mod tests {
     /// allocations, so the cache returns a single shared stub buffer.
     #[test]
     fn get_f32_empty_slice_returns_shared_stub() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let empty: Vec<f32> = vec![];
         let b1 = cache.get_f32(&empty);
@@ -235,17 +265,25 @@ mod tests {
     /// stub (cache keys are different — `(0,0)` vs `(1,0)`).
     #[test]
     fn empty_f32_and_empty_bytes_have_separate_stubs() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let _ = cache.get_f32(&[][..]);
         let _ = cache.get_bytes(&[][..]);
-        assert_eq!(cache.len(), 2, "f32 and bytes empty stubs are independent cache entries");
+        assert_eq!(
+            cache.len(),
+            2,
+            "f32 and bytes empty stubs are independent cache entries"
+        );
     }
 
     /// `transient_from_*` does NOT cache. Ten calls = ten allocations.
     #[test]
     fn transient_buffers_are_not_cached() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let data = vec![0.0f32; 64];
         let _b1 = cache.transient_from_f32(&data);
@@ -257,7 +295,9 @@ mod tests {
     /// size (Metal may round up but never under).
     #[test]
     fn output_buffer_is_at_least_requested_size() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let buf = cache.output(1024);
         assert!(buf.length() >= 1024);
@@ -272,7 +312,9 @@ mod tests {
     /// "buffer-finished → CPU read" contract.
     #[test]
     fn read_buffer_f32_round_trip() {
-        let Some(d) = dev() else { return; };
+        let Some(d) = dev() else {
+            return;
+        };
         let cache = BufferCache::new(&d);
         let src: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
         let buf = cache.transient_from_f32(&src);

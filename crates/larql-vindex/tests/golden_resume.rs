@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use larql_vindex::{
-    build_vindex_streaming, ExtractLevel, QuantFormat, Q4kWriteOptions,
-    SilentBuildCallbacks, StorageDtype, WriteWeightsOptions,
+    build_vindex_streaming, ExtractLevel, Q4kWriteOptions, QuantFormat, SilentBuildCallbacks,
+    StorageDtype, WriteWeightsOptions,
 };
 
 /// Atomic counter for unique tmp dirs in parallel test runs.
@@ -106,25 +106,21 @@ fn write_synth_model(model_dir: &Path) {
         .map(|(name, bytes, shape)| {
             (
                 name.clone(),
-                safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
-                    shape.clone(),
-                    bytes,
-                )
-                .unwrap(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
             )
         })
         .collect();
     let serialized = safetensors::tensor::serialize(views, &None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
 }
 
 fn run_extract(model_dir: &Path, output_dir: &Path) {
-    let tok_bytes =
-        std::fs::read(model_dir.join("tokenizer.json")).unwrap();
+    let tok_bytes = std::fs::read(model_dir.join("tokenizer.json")).unwrap();
     let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(&tok_bytes).unwrap();
     let mut cb = SilentBuildCallbacks;
     build_vindex_streaming(
@@ -158,7 +154,11 @@ fn snapshot_dir(dir: &Path) -> HashMap<String, String> {
         if !entry.is_file() {
             continue;
         }
-        let rel = entry.strip_prefix(dir).unwrap().to_string_lossy().to_string();
+        let rel = entry
+            .strip_prefix(dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         out.insert(rel, sha_file(&entry));
     }
     out
@@ -209,10 +209,8 @@ fn resume_after_gate_complete_matches_full_run() {
     // Reconstruct the gate_layer_infos the prior run would have saved.
     // We read them from the reference index.json — same values, same
     // shape. (Simpler than re-running the gate phase on a sink.)
-    let ref_idx: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(ref_dir.0.join("index.json")).unwrap(),
-    )
-    .unwrap();
+    let ref_idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ref_dir.0.join("index.json")).unwrap()).unwrap();
     let layers = ref_idx["layers"].clone();
 
     let checkpoint = serde_json::json!({

@@ -31,21 +31,26 @@ fn residual_norm_store_matches_residual_norm_and_raw_sum() {
 
     let a: Vec<f32> = (0..len).map(|i| ((i as f32 * 0.007).sin()) * 0.4).collect();
     let b: Vec<f32> = (0..len).map(|i| ((i as f32 * 0.011).cos()) * 0.3).collect();
-    let weight: Vec<f32> = (0..len).map(|i| 0.9 + (i as f32 * 0.001).sin() * 0.1).collect();
+    let weight: Vec<f32> = (0..len)
+        .map(|i| 0.9 + (i as f32 * 0.001).sin() * 0.1)
+        .collect();
 
     // CPU reference
     let sum: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
     let sum_sq: f32 = sum.iter().map(|v| v * v).sum();
     let rms = 1.0 / (sum_sq / len as f32 + eps).sqrt();
-    let cpu_norm: Vec<f32> = sum.iter().zip(weight.iter())
-        .map(|(s, w)| s * (w + offset) * rms).collect();
+    let cpu_norm: Vec<f32> = sum
+        .iter()
+        .zip(weight.iter())
+        .map(|(s, w)| s * (w + offset) * rms)
+        .collect();
 
     // Metal: residual_norm_store
     let buf_a = metal.bufs().transient_from_f32(&a);
     let buf_b = metal.bufs().transient_from_f32(&b);
     let buf_w = metal.bufs().get_f32(&weight);
     let buf_norm = metal.bufs().output((len * 4) as u64);
-    let buf_sum  = metal.bufs().output((len * 4) as u64);
+    let buf_sum = metal.bufs().output((len * 4) as u64);
     let len_val = len as u32;
 
     let cmd = metal.queue().new_command_buffer();
@@ -68,15 +73,19 @@ fn residual_norm_store_matches_residual_norm_and_raw_sum() {
     cmd.wait_until_completed();
 
     let got_norm = larql_compute::metal::buffers::read_buffer_f32(&buf_norm, len);
-    let got_sum  = larql_compute::metal::buffers::read_buffer_f32(&buf_sum, len);
+    let got_sum = larql_compute::metal::buffers::read_buffer_f32(&buf_sum, len);
 
     let d_norm = max_diff(&cpu_norm, &got_norm);
-    assert!(d_norm < 1e-4,
-        "residual_norm_store norm_out: max_diff {d_norm:.3e} vs residual_norm reference");
+    assert!(
+        d_norm < 1e-4,
+        "residual_norm_store norm_out: max_diff {d_norm:.3e} vs residual_norm reference"
+    );
 
     let d_sum = max_diff(&sum, &got_sum);
-    assert!(d_sum < 1e-6,
-        "residual_norm_store sum_out: max_diff {d_sum:.3e} vs raw a+b");
+    assert!(
+        d_sum < 1e-6,
+        "residual_norm_store sum_out: max_diff {d_sum:.3e} vs raw a+b"
+    );
 }
 
 // ── q4k_q6k_qkv_proj_normed ──
@@ -91,20 +100,25 @@ fn q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj() {
     use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
     use larql_compute::metal::shaders::q4k_q6k_qkv_proj as sh;
 
-    let q_rows = 512usize;  // scaled-down Gemma 3 4B (8192→512 to keep test fast)
+    let q_rows = 512usize; // scaled-down Gemma 3 4B (8192→512 to keep test fast)
     let kv_rows = 256usize;
-    let hidden = 512usize;  // must be multiple of 256
+    let hidden = 512usize; // must be multiple of 256
 
     let wq_f32: Vec<f32> = (0..q_rows * hidden)
-        .map(|i| ((i as f32 * 0.001).cos()) * 0.5).collect();
+        .map(|i| ((i as f32 * 0.001).cos()) * 0.5)
+        .collect();
     let wk_f32: Vec<f32> = (0..kv_rows * hidden)
-        .map(|i| ((i as f32 * 0.002).sin()) * 0.5).collect();
+        .map(|i| ((i as f32 * 0.002).sin()) * 0.5)
+        .collect();
     let wv_f32: Vec<f32> = (0..kv_rows * hidden)
-        .map(|i| ((i as f32 * 0.003).cos()) * 0.4).collect();
+        .map(|i| ((i as f32 * 0.003).cos()) * 0.4)
+        .collect();
     let h_raw: Vec<f32> = (0..hidden)
-        .map(|i| ((i as f32 * 0.013).sin() + 0.2) * 0.4).collect();
+        .map(|i| ((i as f32 * 0.013).sin() + 0.2) * 0.4)
+        .collect();
     let norm_w: Vec<f32> = (0..hidden)
-        .map(|i| 0.9 + (i as f32 * 0.001).sin() * 0.1).collect();
+        .map(|i| 0.9 + (i as f32 * 0.001).sin() * 0.1)
+        .collect();
 
     let wq_q4k = quantize_q4_k(&wq_f32);
     let wk_q4k = quantize_q4_k(&wk_f32);
@@ -116,29 +130,38 @@ fn q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj() {
     // Reference: CPU rms_norm then fused QKV via existing tested kernel
     let sum_sq: f32 = h_raw.iter().map(|v| v * v).sum();
     let rms = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
-    let h_normed: Vec<f32> = h_raw.iter().zip(norm_w.iter())
-        .map(|(h, w)| h * rms * (offset + w)).collect();
+    let h_normed: Vec<f32> = h_raw
+        .iter()
+        .zip(norm_w.iter())
+        .map(|(h, w)| h * rms * (offset + w))
+        .collect();
 
     // Run existing qkv_proj (non-normed) against pre-normed h
-    let ref_q = metal.q4k_matvec(&wq_q4k, &h_normed, q_rows, hidden).unwrap();
-    let ref_k = metal.q4k_matvec(&wk_q4k, &h_normed, kv_rows, hidden).unwrap();
-    let ref_v = metal.q6k_matvec(&wv_q6k, &h_normed, kv_rows, hidden).unwrap();
+    let ref_q = metal
+        .q4k_matvec(&wq_q4k, &h_normed, q_rows, hidden)
+        .unwrap();
+    let ref_k = metal
+        .q4k_matvec(&wk_q4k, &h_normed, kv_rows, hidden)
+        .unwrap();
+    let ref_v = metal
+        .q6k_matvec(&wv_q6k, &h_normed, kv_rows, hidden)
+        .unwrap();
 
     // Fused normed kernel
     let wq_buf = metal.bufs().get_bytes(&wq_q4k);
     let wk_buf = metal.bufs().get_bytes(&wk_q4k);
     let wv_buf = metal.bufs().get_bytes(&wv_q6k);
-    let h_buf  = metal.bufs().transient_from_f32(&h_raw);
+    let h_buf = metal.bufs().transient_from_f32(&h_raw);
     let nw_buf = metal.bufs().get_f32(&norm_w);
-    let q_out  = metal.bufs().output((q_rows * 4) as u64);
-    let k_out  = metal.bufs().output((kv_rows * 4) as u64);
-    let v_out  = metal.bufs().output((kv_rows * 4) as u64);
+    let q_out = metal.bufs().output((q_rows * 4) as u64);
+    let k_out = metal.bufs().output((kv_rows * 4) as u64);
+    let v_out = metal.bufs().output((kv_rows * 4) as u64);
 
     let total_rows = (q_rows + kv_rows + kv_rows) as u64;
     let num_tgs = total_rows.div_ceil(sh::ROWS_PER_TG);
-    let q_u  = q_rows as u32;
+    let q_u = q_rows as u32;
     let kv_u = kv_rows as u32;
-    let h_u  = hidden as u32;
+    let h_u = hidden as u32;
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
@@ -151,11 +174,11 @@ fn q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj() {
     enc.set_buffer(5, Some(&q_out), 0);
     enc.set_buffer(6, Some(&k_out), 0);
     enc.set_buffer(7, Some(&v_out), 0);
-    enc.set_bytes(8,  4, &q_u  as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(9,  4, &kv_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &q_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(9, 4, &kv_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(10, 4, &kv_u as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(11, 4, &h_u  as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(12, 4, &eps    as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(11, 4, &h_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(12, 4, &eps as *const f32 as *const std::ffi::c_void);
     enc.set_bytes(13, 4, &offset as *const f32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         metal::MTLSize::new(num_tgs, 1, 1),
@@ -170,16 +193,37 @@ fn q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj() {
     let got_v = larql_compute::metal::buffers::read_buffer_f32(&v_out, kv_rows);
 
     let threshold = 0.001; // 0.1% relative
-    let max_abs_q = ref_q.iter().map(|v: &f32| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let max_abs_q = ref_q
+        .iter()
+        .map(|v: &f32| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let dq = max_diff(&ref_q, &got_q);
-    assert!(dq < max_abs_q * threshold,
-        "q4k_q6k_qkv_proj_normed Q: max_diff {dq:.3e} exceeds {:.3e}", max_abs_q * threshold);
-    let max_abs_k = ref_k.iter().map(|v: &f32| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    assert!(
+        dq < max_abs_q * threshold,
+        "q4k_q6k_qkv_proj_normed Q: max_diff {dq:.3e} exceeds {:.3e}",
+        max_abs_q * threshold
+    );
+    let max_abs_k = ref_k
+        .iter()
+        .map(|v: &f32| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let dk = max_diff(&ref_k, &got_k);
-    assert!(dk < max_abs_k * threshold,
-        "q4k_q6k_qkv_proj_normed K: max_diff {dk:.3e} exceeds {:.3e}", max_abs_k * threshold);
-    let max_abs_v = ref_v.iter().map(|v: &f32| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    assert!(
+        dk < max_abs_k * threshold,
+        "q4k_q6k_qkv_proj_normed K: max_diff {dk:.3e} exceeds {:.3e}",
+        max_abs_k * threshold
+    );
+    let max_abs_v = ref_v
+        .iter()
+        .map(|v: &f32| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let dv = max_diff(&ref_v, &got_v);
-    assert!(dv < max_abs_v * threshold,
-        "q4k_q6k_qkv_proj_normed V: max_diff {dv:.3e} exceeds {:.3e}", max_abs_v * threshold);
+    assert!(
+        dv < max_abs_v * threshold,
+        "q4k_q6k_qkv_proj_normed V: max_diff {dv:.3e} exceeds {:.3e}",
+        max_abs_v * threshold
+    );
 }

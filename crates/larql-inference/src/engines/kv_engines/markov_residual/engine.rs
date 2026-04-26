@@ -1,15 +1,15 @@
 //! MarkovResidualEngine — KvEngine implementation.
 
-use larql_compute::{ComputeBackend, cpu_backend};
+use larql_compute::{cpu_backend, ComputeBackend};
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
 
-use crate::model::ModelWeights;
-use crate::engines::{EngineInfo, KvEngine};
-use crate::engines::profiler::{DecodeStageSummary, EngineProfiler};
+use super::compute::{rs_decode_step, rs_decode_step_profiled, rs_prefill};
+use super::q4k::{ensure_attn_tensors_dequantised, rs_decode_step_walk, rs_prefill_walk};
 use super::store::RsStore;
-use super::compute::{rs_prefill, rs_decode_step, rs_decode_step_profiled};
-use super::q4k::{ensure_attn_tensors_dequantised, rs_prefill_walk, rs_decode_step_walk};
+use crate::engines::profiler::{DecodeStageSummary, EngineProfiler};
+use crate::engines::{EngineInfo, KvEngine};
+use crate::model::ModelWeights;
 
 pub struct MarkovResidualEngine {
     window_size: Option<usize>,
@@ -26,8 +26,14 @@ impl MarkovResidualEngine {
     }
 
     pub fn with_backend(window_size: Option<usize>, backend: Box<dyn ComputeBackend>) -> Self {
-        Self { window_size, store: None, backend, profiling: false,
-               profile: EngineProfiler::default(), metal_prefill_done: false }
+        Self {
+            window_size,
+            store: None,
+            backend,
+            profiling: false,
+            profile: EngineProfiler::default(),
+            metal_prefill_done: false,
+        }
     }
 
     pub fn with_profiling(mut self, enabled: bool) -> Self {
@@ -41,7 +47,9 @@ impl MarkovResidualEngine {
 }
 
 impl KvEngine for MarkovResidualEngine {
-    fn name(&self) -> &str { "markov-rs" }
+    fn name(&self) -> &str {
+        "markov-rs"
+    }
 
     fn info(&self) -> EngineInfo {
         let config = match self.window_size {
@@ -70,7 +78,13 @@ impl KvEngine for MarkovResidualEngine {
     fn decode_step(&mut self, weights: &ModelWeights, token_id: u32) -> Option<Array2<f32>> {
         let rs = self.store.take()?;
         let (hidden, new_rs) = if self.profiling {
-            rs_decode_step_profiled(weights, token_id, rs, self.backend.as_ref(), &mut self.profile)?
+            rs_decode_step_profiled(
+                weights,
+                token_id,
+                rs,
+                self.backend.as_ref(),
+                &mut self.profile,
+            )?
         } else {
             rs_decode_step(weights, token_id, rs, self.backend.as_ref())?
         };
@@ -78,7 +92,9 @@ impl KvEngine for MarkovResidualEngine {
         Some(hidden)
     }
 
-    fn memory_bytes(&self) -> usize { self.total_memory_bytes() }
+    fn memory_bytes(&self) -> usize {
+        self.total_memory_bytes()
+    }
 
     fn window_tokens(&self) -> usize {
         self.store.as_ref().map_or(0, |s| s.window_tokens())
@@ -89,7 +105,9 @@ impl KvEngine for MarkovResidualEngine {
     }
 
     fn stage_summary(&self) -> Option<DecodeStageSummary> {
-        if !self.profiling || self.profile.decode_total.count == 0 { return None; }
+        if !self.profiling || self.profile.decode_total.count == 0 {
+            return None;
+        }
         Some(self.profile.summary("markov-rs", self.backend.name()))
     }
 
@@ -161,14 +179,22 @@ mod tests {
     fn engine_info_full_window() {
         let eng = MarkovResidualEngine::new(None);
         let info = eng.info();
-        assert!(info.config.contains("full"), "expected 'full' in config, got '{}'", info.config);
+        assert!(
+            info.config.contains("full"),
+            "expected 'full' in config, got '{}'",
+            info.config
+        );
     }
 
     #[test]
     fn engine_info_fixed_window() {
         let eng = MarkovResidualEngine::new(Some(16));
         let info = eng.info();
-        assert!(info.config.contains("16"), "expected window size in config, got '{}'", info.config);
+        assert!(
+            info.config.contains("16"),
+            "expected window size in config, got '{}'",
+            info.config
+        );
     }
 
     // ── Prefill → decode cycle ────────────────────────────────────────────────
@@ -179,7 +205,10 @@ mod tests {
         let mut engine = MarkovResidualEngine::new(None);
         let h = engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
-        assert!(engine.memory_bytes() > 0, "store should be non-empty after prefill");
+        assert!(
+            engine.memory_bytes() > 0,
+            "store should be non-empty after prefill"
+        );
     }
 
     #[test]
@@ -189,7 +218,9 @@ mod tests {
         engine.prefill(&weights, &[0u32, 1]).expect("prefill");
         let h = engine.decode_step(&weights, 2).expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
-        assert!(hidden_to_raw_logits(&weights, &h).iter().all(|v| v.is_finite()));
+        assert!(hidden_to_raw_logits(&weights, &h)
+            .iter()
+            .all(|v| v.is_finite()));
     }
 
     #[test]
@@ -202,7 +233,10 @@ mod tests {
         let mem_after_1 = engine.memory_bytes();
         engine.decode_step(&weights, 2).expect("decode 2");
         let mem_after_2 = engine.memory_bytes();
-        assert!(mem_after_1 > mem_after_prefill, "memory should grow with decode steps");
+        assert!(
+            mem_after_1 > mem_after_prefill,
+            "memory should grow with decode steps"
+        );
         assert!(mem_after_2 > mem_after_1);
     }
 
@@ -210,12 +244,20 @@ mod tests {
     fn window_clipping_limits_hot_store() {
         let weights = make_test_weights();
         let mut engine = MarkovResidualEngine::new(Some(2)); // window=2 tokens
-        engine.prefill(&weights, &[0u32, 1, 2, 3, 4]).expect("prefill 5 tokens");
+        engine
+            .prefill(&weights, &[0u32, 1, 2, 3, 4])
+            .expect("prefill 5 tokens");
         // After clipping, hot store ≤ window
-        assert!(engine.window_tokens() <= 2,
-            "window_tokens={} should be ≤ 2", engine.window_tokens());
+        assert!(
+            engine.window_tokens() <= 2,
+            "window_tokens={} should be ≤ 2",
+            engine.window_tokens()
+        );
         // Cold bytes should now be non-zero (overflow clipped to cold)
-        assert!(engine.cold_bytes() > 0, "cold tier should have bytes after clipping");
+        assert!(
+            engine.cold_bytes() > 0,
+            "cold tier should have bytes after clipping"
+        );
     }
 
     #[test]

@@ -77,9 +77,11 @@ mod tests {
 
     fn make_qk(seq: usize, heads: usize, head_dim: usize) -> Array2<f32> {
         let n = seq * heads * head_dim;
-        Array2::from_shape_vec((seq, heads * head_dim),
-            (0..n).map(|i| (i as f32 + 1.0) * 0.01).collect()
-        ).unwrap()
+        Array2::from_shape_vec(
+            (seq, heads * head_dim),
+            (0..n).map(|i| (i as f32 + 1.0) * 0.01).collect(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -103,10 +105,24 @@ mod tests {
         let out = apply_rope(&x, 2, 8, 10000.0);
         for row in 0..3 {
             for h in 0..2 {
-                let orig: f32 = x.row(row).iter().skip(h * 8).take(8).map(|v| v * v).sum::<f32>();
-                let rotd: f32 = out.row(row).iter().skip(h * 8).take(8).map(|v| v * v).sum::<f32>();
-                assert!((orig.sqrt() - rotd.sqrt()).abs() < 1e-4,
-                    "RoPE changed L2 norm at row={row} head={h}: {orig} → {rotd}");
+                let orig: f32 = x
+                    .row(row)
+                    .iter()
+                    .skip(h * 8)
+                    .take(8)
+                    .map(|v| v * v)
+                    .sum::<f32>();
+                let rotd: f32 = out
+                    .row(row)
+                    .iter()
+                    .skip(h * 8)
+                    .take(8)
+                    .map(|v| v * v)
+                    .sum::<f32>();
+                assert!(
+                    (orig.sqrt() - rotd.sqrt()).abs() < 1e-4,
+                    "RoPE changed L2 norm at row={row} head={h}: {orig} → {rotd}"
+                );
             }
         }
     }
@@ -120,8 +136,14 @@ mod tests {
         let out = apply_rope(&x, 1, 8, 10000.0);
         let row0: Vec<f32> = out.row(0).to_vec();
         let row1: Vec<f32> = out.row(1).to_vec();
-        let differ = row0.iter().zip(row1.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
-        assert!(differ, "identical inputs at different positions should differ after RoPE");
+        let differ = row0
+            .iter()
+            .zip(row1.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            differ,
+            "identical inputs at different positions should differ after RoPE"
+        );
     }
 
     #[test]
@@ -157,8 +179,14 @@ mod tests {
         let x = make_qk(2, 2, 8);
         let out1 = apply_rope(&x, 2, 8, 10_000.0);
         let out2 = apply_rope(&x, 2, 8, 500_000.0);
-        let differs = out1.iter().zip(out2.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
-        assert!(differs, "different rope_base should produce different output");
+        let differs = out1
+            .iter()
+            .zip(out2.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(
+            differs,
+            "different rope_base should produce different output"
+        );
     }
 
     #[test]
@@ -188,8 +216,10 @@ mod tests {
         let row5: Vec<f32> = out_seq6.row(5).to_vec();
         let offset_row: Vec<f32> = out_offset5.row(0).to_vec();
         for (a, b) in row5.iter().zip(offset_row.iter()) {
-            assert!((a - b).abs() < 1e-5,
-                "offset=5 should match position 5 in sequential apply: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "offset=5 should match position 5 in sequential apply: {a} vs {b}"
+            );
         }
     }
 
@@ -200,7 +230,10 @@ mod tests {
         for &frac in &[0.25f64, 0.5, 0.75] {
             let out = apply_rope_partial(&x, 2, 16, 10000.0, frac);
             assert_eq!(out.shape(), x.shape());
-            assert!(out.iter().all(|v| v.is_finite()), "fraction={frac} produced non-finite");
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "fraction={frac} produced non-finite"
+            );
         }
     }
 }

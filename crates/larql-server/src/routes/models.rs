@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::State;
+use axum::Json;
 
+use crate::http::API_PREFIX;
 use crate::state::AppState;
 
-pub async fn handle_models(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn handle_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     state.bump_requests();
 
     let models: Vec<serde_json::Value> = state
@@ -20,9 +19,9 @@ pub async fn handle_models(
             serde_json::json!({
                 "id": m.id,
                 "path": if state.is_multi_model() {
-                    format!("/v1/{}", m.id)
+                    format!("{}/{}", API_PREFIX, m.id)
                 } else {
-                    "/v1".to_string()
+                    API_PREFIX.to_string()
                 },
                 "features": total_features,
                 "loaded": true,

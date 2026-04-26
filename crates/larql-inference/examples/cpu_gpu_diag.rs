@@ -32,9 +32,12 @@ use larql_inference::wrap_chat_prompt;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
-        args.next().ok_or("usage: cpu_gpu_diag <vindex-dir> [prompt] [tokens]")?,
+        args.next()
+            .ok_or("usage: cpu_gpu_diag <vindex-dir> [prompt] [tokens]")?,
     );
-    let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
+    let prompt = args
+        .next()
+        .unwrap_or_else(|| "The capital of France is".to_string());
     let tokens: usize = args.next().map(|s| s.parse().unwrap_or(8)).unwrap_or(8);
 
     if !vindex_path.is_dir() {
@@ -66,8 +69,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  family:   {}", cfg.family);
     println!("  prompt:   {prompt:?}");
     println!("  chat:     applied={} ({})", wrap.applied, wrap.note);
-    println!("  prompt_ids.len(): {}  (template prompt: {:?})", token_ids.len(),
-        &wrap.prompt[..wrap.prompt.len().min(100)]);
+    println!(
+        "  prompt_ids.len(): {}  (template prompt: {:?})",
+        token_ids.len(),
+        &wrap.prompt[..wrap.prompt.len().min(100)]
+    );
     println!("  tokens:   {tokens}");
     println!();
 
@@ -78,8 +84,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Running Metal…");
     let t0 = Instant::now();
     let r_metal = generate(
-        &mut weights_metal, &tokenizer, &token_ids,
-        tokens, &q4_index, &metal_backend, &metal_cached, 0..num_layers,
+        &mut weights_metal,
+        &tokenizer,
+        &token_ids,
+        tokens,
+        &q4_index,
+        &metal_backend,
+        &metal_cached,
+        0..num_layers,
     );
     let metal_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -89,32 +101,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Running CPU…");
     let t0 = Instant::now();
     let r_cpu = generate(
-        &mut weights_cpu, &tokenizer, &token_ids,
-        tokens, &q4_index, &cpu_backend, &cpu_cached, 0..num_layers,
+        &mut weights_cpu,
+        &tokenizer,
+        &token_ids,
+        tokens,
+        &q4_index,
+        &cpu_backend,
+        &cpu_cached,
+        0..num_layers,
     );
     let cpu_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // ── Timing table ──────────────────────────────────────────────────────
     println!();
     println!("━━━ Performance ────────────────────────────────────────────────────");
-    println!("  {:<10} {:>10}  {:>10}  {:>9}  {:>9}  {:>6}",
-        "Backend", "wall ms", "prefill ms", "ms/tok", "tok/s", "steps");
+    println!(
+        "  {:<10} {:>10}  {:>10}  {:>9}  {:>9}  {:>6}",
+        "Backend", "wall ms", "prefill ms", "ms/tok", "tok/s", "steps"
+    );
     for (name, r, wall) in [
         ("metal", &r_metal, metal_wall_ms),
-        ("cpu",   &r_cpu,   cpu_wall_ms),
+        ("cpu", &r_cpu, cpu_wall_ms),
     ] {
         let avg = r.avg_decode_ms();
         let tps = r.decode_tok_s();
         println!(
             "  {:<10} {:>10.1}  {:>10.1}  {:>9.2}  {:>9.2}  {:>6}",
-            name, wall, r.prefill_ms, avg, tps, r.decode_ms.len(),
+            name,
+            wall,
+            r.prefill_ms,
+            avg,
+            tps,
+            r.decode_ms.len(),
         );
     }
     let speedup = if r_cpu.avg_decode_ms() > 0.0 && r_metal.avg_decode_ms() > 0.0 {
         r_cpu.avg_decode_ms() / r_metal.avg_decode_ms()
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     if speedup > 0.0 {
-        println!("  → Metal is {:.1}× faster per decoded token than CPU", speedup);
+        println!(
+            "  → Metal is {:.1}× faster per decoded token than CPU",
+            speedup
+        );
     }
 
     // ── Accuracy: full generated text ──────────────────────────────────────
@@ -125,8 +155,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metal_text = r_metal.text();
     let cpu_text = r_cpu.text();
     let shared_prefix = shared_prefix_len(&metal_text, &cpu_text);
-    println!("  shared prefix (chars): {} / metal={} cpu={}",
-        shared_prefix, metal_text.chars().count(), cpu_text.chars().count());
+    println!(
+        "  shared prefix (chars): {} / metal={} cpu={}",
+        shared_prefix,
+        metal_text.chars().count(),
+        cpu_text.chars().count()
+    );
 
     // ── Token-by-token agreement ───────────────────────────────────────────
     println!();
@@ -137,21 +171,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..n {
         let m = &r_metal.tokens[i].0;
         let c = &r_cpu.tokens[i].0;
-        let match_mark = if m == c { agreed += 1; "✓" } else { "✗" };
-        println!("  {:<5} {:<28} {:<28}  {}",
+        let match_mark = if m == c {
+            agreed += 1;
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "  {:<5} {:<28} {:<28}  {}",
             i,
             format!("{m:?}"),
             format!("{c:?}"),
-            match_mark);
+            match_mark
+        );
     }
     if n > 0 {
-        println!("  token-level match: {agreed}/{n} ({:.1}%)",
-            100.0 * agreed as f64 / n as f64);
+        println!(
+            "  token-level match: {agreed}/{n} ({:.1}%)",
+            100.0 * agreed as f64 / n as f64
+        );
     }
     // If token counts differ, show which side ran over.
     if r_metal.tokens.len() != r_cpu.tokens.len() {
-        println!("  note: metal produced {} tokens, cpu produced {} tokens",
-            r_metal.tokens.len(), r_cpu.tokens.len());
+        println!(
+            "  note: metal produced {} tokens, cpu produced {} tokens",
+            r_metal.tokens.len(),
+            r_cpu.tokens.len()
+        );
     }
 
     Ok(())

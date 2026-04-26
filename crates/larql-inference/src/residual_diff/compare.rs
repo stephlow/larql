@@ -42,7 +42,11 @@ impl LayerStat {
     /// norms ~400, Gemma 4 31B has ~1500) where an absolute threshold
     /// would either be too loose for one or too tight for another.
     pub fn rel_max_abs(&self) -> f32 {
-        if self.a_norm > 0.0 { self.max_abs / self.a_norm } else { 0.0 }
+        if self.a_norm > 0.0 {
+            self.max_abs / self.a_norm
+        } else {
+            0.0
+        }
     }
 }
 
@@ -59,7 +63,10 @@ impl ParityThreshold {
     /// well below these on Gemma 3 / Gemma 4 / Llama 2 / Mistral —
     /// empirically all 158 layers in `test_cpu_metal_parity` fit.
     pub const fn tight() -> Self {
-        Self { cos: 0.99995, rel_max_abs: 0.01 }
+        Self {
+            cos: 0.99995,
+            rel_max_abs: 0.01,
+        }
     }
 
     /// For paths that go through different kernel families (e.g.
@@ -67,7 +74,10 @@ impl ParityThreshold {
     /// drift accumulates but cos stays high. Used by the looser
     /// regression guards.
     pub const fn loose() -> Self {
-        Self { cos: 0.999, rel_max_abs: 0.05 }
+        Self {
+            cos: 0.999,
+            rel_max_abs: 0.05,
+        }
     }
 }
 
@@ -96,9 +106,12 @@ impl ParityReport {
                 Err(format!(
                     "parity broken at L{l}: cos={:.6} max_abs={:.3e} \
                      ({:.3}% of ref ||{:.2}||); thresholds: cos≥{}, rel≤{}",
-                    s.cos, s.max_abs, 100.0 * s.rel_max_abs(),
+                    s.cos,
+                    s.max_abs,
+                    100.0 * s.rel_max_abs(),
                     s.a_norm,
-                    self.threshold.cos, self.threshold.rel_max_abs,
+                    self.threshold.cos,
+                    self.threshold.rel_max_abs,
                 ))
             }
         }
@@ -129,16 +142,24 @@ pub fn compare_captures(
                 a_norm: 0.0,
                 b_norm: 0.0,
             });
-            if first_bad.is_none() { first_bad = Some(l); }
+            if first_bad.is_none() {
+                first_bad = Some(l);
+            }
             continue;
         }
         let s = layer_stat(l, av, bv);
         if s.cos < thr.cos || s.rel_max_abs() > thr.rel_max_abs {
-            if first_bad.is_none() { first_bad = Some(l); }
+            if first_bad.is_none() {
+                first_bad = Some(l);
+            }
         }
         stats.push(s);
     }
-    ParityReport { layers: stats, first_bad, threshold: thr }
+    ParityReport {
+        layers: stats,
+        first_bad,
+        threshold: thr,
+    }
 }
 
 fn layer_stat(layer: usize, a: &[f32], b: &[f32]) -> LayerStat {
@@ -154,11 +175,15 @@ fn layer_stat(layer: usize, a: &[f32], b: &[f32]) -> LayerStat {
         a_sq += x * x;
         b_sq += y * y;
         let d = (a[i] - b[i]).abs();
-        if d > max_abs { max_abs = d; }
+        if d > max_abs {
+            max_abs = d;
+        }
     }
     let cos = if a_sq > 0.0 && b_sq > 0.0 {
         (dot / (a_sq.sqrt() * b_sq.sqrt())) as f32
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     LayerStat {
         layer,
         cos,
@@ -170,11 +195,15 @@ fn layer_stat(layer: usize, a: &[f32], b: &[f32]) -> LayerStat {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::capture::ResidualCapture;
+    use super::*;
 
     fn cap(layers: Vec<Vec<f32>>, hidden: usize, seq_len: usize) -> ResidualCapture {
-        ResidualCapture { layers, hidden_size: hidden, seq_len }
+        ResidualCapture {
+            layers,
+            hidden_size: hidden,
+            seq_len,
+        }
     }
 
     #[test]
@@ -224,9 +253,9 @@ mod tests {
         // 5% relative drift — passes loose (≤5%) but fails tight (≤1%).
         let mut b0 = vec![1.0; 100];
         b0[0] = 1.05; // delta 0.05; ||a|| = sqrt(100)=10; rel = 0.05/10 = 0.5% — actually small
-        // Need a bigger delta to land between loose and tight.
+                      // Need a bigger delta to land between loose and tight.
         b0[0] = 2.0; // delta 1.0; rel = 1/10 = 10%? still too big for loose.
-        // Just construct directly: rel = 0.03 (between 0.01 and 0.05).
+                     // Just construct directly: rel = 0.03 (between 0.01 and 0.05).
         let mut a0 = vec![0.0; 100];
         a0[0] = 10.0;
         let mut b0 = vec![0.0; 100];

@@ -21,7 +21,8 @@ use super::{VINDEX_CORE_FILES, VINDEX_WEIGHT_FILES};
 /// Files are cached in the HuggingFace cache directory (~/.cache/huggingface/).
 /// Only downloads files that don't already exist locally.
 pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
-    let path = hf_path.strip_prefix("hf://")
+    let path = hf_path
+        .strip_prefix("hf://")
         .ok_or_else(|| VindexError::Parse(format!("not an hf:// path: {hf_path}")))?;
 
     // Parse repo and optional revision
@@ -49,12 +50,15 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
     };
 
     // Download index.json first (small, tells us what we need)
-    let index_path = repo.get(INDEX_JSON)
-        .map_err(|e| VindexError::Parse(format!(
-            "failed to download index.json from hf://{}: {e}", repo_id
-        )))?;
+    let index_path = repo.get(INDEX_JSON).map_err(|e| {
+        VindexError::Parse(format!(
+            "failed to download index.json from hf://{}: {e}",
+            repo_id
+        ))
+    })?;
 
-    let vindex_dir = index_path.parent()
+    let vindex_dir = index_path
+        .parent()
         .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
         .to_path_buf();
 
@@ -72,7 +76,8 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
 /// Download additional weight files for inference/compile.
 /// Called lazily when INFER or COMPILE is first used.
 pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
-    let path = hf_path.strip_prefix("hf://")
+    let path = hf_path
+        .strip_prefix("hf://")
         .ok_or_else(|| VindexError::Parse(format!("not an hf:// path: {hf_path}")))?;
 
     let (repo_id, revision) = if let Some((repo, rev)) = path.split_once('@') {
@@ -188,9 +193,7 @@ fn head_etag_and_size(
     filename: &str,
 ) -> Option<(String, u64)> {
     let rev = revision.unwrap_or("main");
-    let url = format!(
-        "https://huggingface.co/datasets/{repo_id}/resolve/{rev}/{filename}"
-    );
+    let url = format!("https://huggingface.co/datasets/{repo_id}/resolve/{rev}/{filename}");
     let token = get_hf_token().ok();
 
     // **No redirects.** HF LFS files 302 → S3, and `X-Linked-Etag` +
@@ -253,7 +256,10 @@ fn hf_cache_repo_dir(repo_id: &str) -> Option<PathBuf> {
         PathBuf::from(hf_home).join("hub")
     } else {
         let home = std::env::var("HOME").ok()?;
-        PathBuf::from(home).join(".cache").join("huggingface").join("hub")
+        PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
     };
     let safe = repo_id.replace('/', "--");
     Some(hub_root.join(format!("datasets--{safe}")))
@@ -300,7 +306,10 @@ where
             rev.clone(),
         ))
     } else {
-        api.repo(hf_hub::Repo::new(repo_id.clone(), hf_hub::RepoType::Dataset))
+        api.repo(hf_hub::Repo::new(
+            repo_id.clone(),
+            hf_hub::RepoType::Dataset,
+        ))
     };
 
     // Helper: one file, with cache short-circuit. Returns the resolved
@@ -308,7 +317,9 @@ where
     // bar shows a filled-to-100% track tagged with the filename — users
     // see that the file was served from cache, not re-downloaded.
     let mut fetch = |filename: &str, label: &str| -> Option<PathBuf> {
-        if let Some((cached_path, size)) = cached_snapshot_file(&repo_id, revision.as_deref(), filename) {
+        if let Some((cached_path, size)) =
+            cached_snapshot_file(&repo_id, revision.as_deref(), filename)
+        {
             // Tag the progress message so the bar visibly distinguishes
             // "cached" from "just downloaded very fast". Callers rendering
             // the bar see the prefix at init time and can restyle.
@@ -325,9 +336,7 @@ where
     // index.json drives everything — we need its snapshot dir to know
     // where the rest of the files live. Cache-hit or download.
     let index_path = fetch(INDEX_JSON, INDEX_JSON).ok_or_else(|| {
-        VindexError::Parse(format!(
-            "failed to fetch index.json from hf://{repo_id}"
-        ))
+        VindexError::Parse(format!("failed to fetch index.json from hf://{repo_id}"))
     })?;
     let vindex_dir = index_path
         .parent()
@@ -343,4 +352,3 @@ where
     }
     Ok(vindex_dir)
 }
-

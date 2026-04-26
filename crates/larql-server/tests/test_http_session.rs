@@ -34,7 +34,11 @@ async fn session_manager_apply_patch_and_list() {
         description: Some("my-patch".into()),
         author: None,
         tags: vec![],
-        operations: vec![larql_vindex::PatchOp::Delete { layer: 0, feature: 0, reason: None }],
+        operations: vec![larql_vindex::PatchOp::Delete {
+            layer: 0,
+            feature: 0,
+            reason: None,
+        }],
     };
 
     let (op_count, active) = sm.apply_patch("sess-1", &m, patch).await;
@@ -60,7 +64,11 @@ async fn session_manager_remove_nonexistent_patch_returns_err() {
         description: Some("my-patch".into()),
         author: None,
         tags: vec![],
-        operations: vec![larql_vindex::PatchOp::Delete { layer: 0, feature: 0, reason: None }],
+        operations: vec![larql_vindex::PatchOp::Delete {
+            layer: 0,
+            feature: 0,
+            reason: None,
+        }],
     };
     sm.apply_patch("sess-1", &m, patch).await;
 
@@ -85,7 +93,11 @@ async fn session_manager_remove_patch_by_name() {
             description: Some((*name).into()),
             author: None,
             tags: vec![],
-            operations: vec![larql_vindex::PatchOp::Delete { layer: 0, feature: 1, reason: None }],
+            operations: vec![larql_vindex::PatchOp::Delete {
+                layer: 0,
+                feature: 1,
+                reason: None,
+            }],
         };
         sm.apply_patch("sess-2", &m, patch).await;
     }

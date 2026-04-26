@@ -47,14 +47,21 @@ impl ProfileTimings {
     pub fn format_summary(&self, num_layers: usize) -> String {
         let total = self.total_ms();
         let pct = |v: f64| if total > 0.0 { v / total * 100.0 } else { 0.0 };
-        let per_layer = if num_layers > 0 { total / num_layers as f64 } else { 0.0 };
+        let per_layer = if num_layers > 0 {
+            total / num_layers as f64
+        } else {
+            0.0
+        };
         format!(
             "[profile-split] {num_layers} layers — \
              attn={:.2}ms ({:.0}%)  gate+up={:.2}ms ({:.0}%)  \
              down={:.2}ms ({:.0}%)  total={:.2}ms ({per_layer:.3}ms/layer)",
-            self.attn_ms, pct(self.attn_ms),
-            self.gate_up_ms, pct(self.gate_up_ms),
-            self.down_ms, pct(self.down_ms),
+            self.attn_ms,
+            pct(self.attn_ms),
+            self.gate_up_ms,
+            pct(self.gate_up_ms),
+            self.down_ms,
+            pct(self.down_ms),
             total,
         )
     }
@@ -66,7 +73,11 @@ mod tests {
 
     #[test]
     fn total_ms_sums_buckets() {
-        let p = ProfileTimings { attn_ms: 1.5, gate_up_ms: 2.5, down_ms: 1.0 };
+        let p = ProfileTimings {
+            attn_ms: 1.5,
+            gate_up_ms: 2.5,
+            down_ms: 1.0,
+        };
         assert!((p.total_ms() - 5.0).abs() < 1e-9);
     }
 
@@ -81,7 +92,11 @@ mod tests {
 
     #[test]
     fn format_summary_includes_per_layer_average() {
-        let p = ProfileTimings { attn_ms: 6.0, gate_up_ms: 3.0, down_ms: 1.0 };
+        let p = ProfileTimings {
+            attn_ms: 6.0,
+            gate_up_ms: 3.0,
+            down_ms: 1.0,
+        };
         let s = p.format_summary(10);
         // total = 10.0, per-layer = 1.0
         assert!(s.contains("total=10.00ms"));

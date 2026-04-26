@@ -49,9 +49,7 @@ pub fn merge_for_save(
         vectors.insert(k.clone(), v.clone());
     }
 
-    if tensors.contains_key("model.embed_tokens.weight")
-        && tensors.contains_key("lm_head.weight")
-    {
+    if tensors.contains_key("model.embed_tokens.weight") && tensors.contains_key("lm_head.weight") {
         tensors.remove("lm_head.weight");
     }
 
@@ -125,7 +123,7 @@ pub fn copy_model_config(base: &Path, output: &Path) {
         TOKENIZER_CONFIG_JSON,
         "special_tokens_map.json",
         "generation_config.json",
-        "tokenizer.model",  // SentencePiece model — required by llama.cpp's GGUF converter
+        "tokenizer.model", // SentencePiece model — required by llama.cpp's GGUF converter
     ] {
         let src = base.join(name);
         if src.exists() {

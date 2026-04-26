@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ndarray::Array2;
 
-use crate::detect::ModelError;
+use crate::detect::{detect_architecture_validated, ModelError};
 use crate::weights::{ModelWeights, PACKED_EXPERTS_DOWN_PROJ, PACKED_EXPERTS_GATE_UP_PROJ};
 
 const SAFETENSORS_EXT: &str = "safetensors";
@@ -53,6 +53,13 @@ pub fn load_model_dir_walk_only(path: impl AsRef<Path>) -> Result<ModelWeights, 
     load_model_dir_filtered(path, is_ffn_tensor)
 }
 
+/// Validated variant of [`load_model_dir_walk_only`].
+pub fn load_model_dir_walk_only_validated(
+    path: impl AsRef<Path>,
+) -> Result<ModelWeights, ModelError> {
+    load_model_dir_filtered_with_validation(path, is_ffn_tensor, true)
+}
+
 /// Load model weights from a directory or file.
 ///
 /// Auto-detects the format:
@@ -65,6 +72,14 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError
     load_model_dir_filtered(path, |_| false)
 }
 
+/// Validated variant of [`load_model_dir`].
+///
+/// Architecture detection stays permissive in `load_model_dir`; use this when
+/// inference or extraction should fail fast on inconsistent config values.
+pub fn load_model_dir_validated(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError> {
+    load_model_dir_filtered_with_validation(path, |_| false, true)
+}
+
 /// Same as `load_model_dir` but `skip_key` returning true causes a tensor to
 /// be dropped before decode — its bytes are never read from the mmap and no
 /// f32 heap allocation occurs for it.
@@ -72,12 +87,32 @@ pub fn load_model_dir_filtered(
     path: impl AsRef<Path>,
     skip_key: impl Fn(&str) -> bool,
 ) -> Result<ModelWeights, ModelError> {
+    load_model_dir_filtered_with_validation(path, skip_key, false)
+}
+
+/// Validated variant of [`load_model_dir_filtered`].
+pub fn load_model_dir_filtered_validated(
+    path: impl AsRef<Path>,
+    skip_key: impl Fn(&str) -> bool,
+) -> Result<ModelWeights, ModelError> {
+    load_model_dir_filtered_with_validation(path, skip_key, true)
+}
+
+fn load_model_dir_filtered_with_validation(
+    path: impl AsRef<Path>,
+    skip_key: impl Fn(&str) -> bool,
+    validate_config: bool,
+) -> Result<ModelWeights, ModelError> {
     let path = path.as_ref();
 
     // Single GGUF file
     if path.is_file() {
         if path.extension().is_some_and(|ext| ext == GGUF_EXT) {
-            return super::gguf::load_gguf_filtered(path, &skip_key);
+            return super::gguf::load_gguf_filtered_with_validation(
+                path,
+                &skip_key,
+                validate_config,
+            );
         }
         return Err(ModelError::NotADirectory(path.to_path_buf()));
     }
@@ -99,11 +134,19 @@ pub fn load_model_dir_filtered(
             .into_iter()
             .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             .unwrap();
-        return super::gguf::load_gguf_filtered(&gguf_path, &skip_key);
+        return super::gguf::load_gguf_filtered_with_validation(
+            &gguf_path,
+            &skip_key,
+            validate_config,
+        );
     }
 
     // Safetensors loading (also handles MLX format — same files, sometimes in weights/ subdir)
-    let arch = crate::detect_architecture(path).map_err(|e| ModelError::Parse(e.to_string()))?;
+    let arch = if validate_config {
+        detect_architecture_validated(path)?
+    } else {
+        crate::detect_architecture(path)?
+    };
     let prefixes = arch.key_prefixes_to_strip();
 
     let mut st_files: Vec<PathBuf> = std::fs::read_dir(path)?

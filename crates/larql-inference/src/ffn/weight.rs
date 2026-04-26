@@ -1,12 +1,12 @@
 //! Dense FFN backend — full matrix multiply, architecture-correct.
 //! This is the ground truth: identical to model inference.
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
 use ndarray::Array2;
-use larql_compute::{ComputeBackend, dot_proj_gpu};
 
+use super::{gelu_tanh, gelu_tanh_gate_up, sigmoid, silu_gate_up, FfnBackend};
 use crate::forward::add_bias;
 use crate::model::ModelWeights;
-use super::{sigmoid, gelu_tanh, silu_gate_up, gelu_tanh_gate_up, FfnBackend};
 
 /// Dense FFN: follows the model architecture exactly (CPU BLAS).
 /// Gated: activation(x @ gate.T) * (x @ up.T) @ down.T + bias
@@ -24,7 +24,9 @@ impl<'a> FfnBackend for WeightFfn<'a> {
         dense_ffn_forward(self.weights, layer, x)
     }
 
-    fn name(&self) -> &str { "weights" }
+    fn name(&self) -> &str {
+        "weights"
+    }
 }
 
 /// Backend-dispatched dense FFN. Matmuls route through `ComputeBackend` when
@@ -44,7 +46,9 @@ impl<'a, 'b> FfnBackend for BackendFfn<'a, 'b> {
         dense_ffn_forward_backend(self.weights, layer, x, Some(self.backend))
     }
 
-    fn name(&self) -> &str { "weights+backend" }
+    fn name(&self) -> &str {
+        "weights+backend"
+    }
 }
 
 /// Architecture-correct dense FFN — CPU BLAS path.
@@ -85,27 +89,34 @@ pub fn dense_ffn_forward_backend(
             .get(&arch.ffn_gate_key(layer))
             .unwrap_or_else(|| panic!("{compact_hint} (key: {})", arch.ffn_gate_key(layer)));
         let gate = dot_proj_gpu(x, w_gate, backend);
-        let up   = dot_proj_gpu(x, w_up, backend);
+        let up = dot_proj_gpu(x, w_up, backend);
         match arch.activation() {
             larql_models::Activation::GeluTanh => gelu_tanh_gate_up(&gate, &up),
             _ => silu_gate_up(&gate, &up),
         }
     } else {
         let mut projected = dot_proj_gpu(x, w_up, backend);
-        if let Some(bias) = arch.ffn_up_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+        if let Some(bias) = arch
+            .ffn_up_bias_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+        {
             add_bias(&mut projected, bias);
         }
         match arch.activation() {
-            larql_models::Activation::GeluTanh | larql_models::Activation::Gelu => projected.mapv(gelu_tanh),
+            larql_models::Activation::GeluTanh | larql_models::Activation::Gelu => {
+                projected.mapv(gelu_tanh)
+            }
             _ => projected.mapv(|v| v * sigmoid(v)),
         }
     };
 
     let mut out = dot_proj_gpu(&activation, w_down, backend);
-    if let Some(bias) = arch.ffn_down_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    if let Some(bias) = arch
+        .ffn_down_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         add_bias(&mut out, bias);
     }
-
 
     (out, activation)
 }
@@ -113,13 +124,17 @@ pub fn dense_ffn_forward_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
     use crate::engines::test_utils::make_test_weights;
+    use ndarray::Array2;
 
     fn x(rows: usize, hidden: usize) -> Array2<f32> {
-        Array2::from_shape_vec((rows, hidden),
-            (0..rows * hidden).map(|i| (i as f32 + 1.0) * 0.05).collect()
-        ).unwrap()
+        Array2::from_shape_vec(
+            (rows, hidden),
+            (0..rows * hidden)
+                .map(|i| (i as f32 + 1.0) * 0.05)
+                .collect(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -136,8 +151,14 @@ mod tests {
         let weights = make_test_weights();
         let input = x(2, weights.hidden_size);
         let (out, act) = dense_ffn_forward(&weights, 0, &input);
-        assert!(out.iter().all(|v| v.is_finite()), "FFN output has non-finite values");
-        assert!(act.iter().all(|v| v.is_finite()), "FFN activation has non-finite values");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "FFN output has non-finite values"
+        );
+        assert!(
+            act.iter().all(|v| v.is_finite()),
+            "FFN activation has non-finite values"
+        );
     }
 
     #[test]
@@ -147,7 +168,10 @@ mod tests {
         let input = x(2, weights.hidden_size);
         let (out1, act1) = dense_ffn_forward(&weights, 0, &input);
         let (out2, act2) = dense_ffn_forward_backend(&weights, 0, &input, None);
-        assert_eq!(out1, out2, "output should match between dense_ffn_forward and backend(None)");
+        assert_eq!(
+            out1, out2,
+            "output should match between dense_ffn_forward and backend(None)"
+        );
         assert_eq!(act1, act2, "activation should match");
     }
 
@@ -157,9 +181,15 @@ mod tests {
         let input = x(1, weights.hidden_size);
         for layer in 0..weights.num_layers {
             let (out, _) = dense_ffn_forward(&weights, layer, &input);
-            assert_eq!(out.shape(), &[1, weights.hidden_size],
-                "layer {layer} wrong shape");
-            assert!(out.iter().all(|v| v.is_finite()), "layer {layer} non-finite");
+            assert_eq!(
+                out.shape(),
+                &[1, weights.hidden_size],
+                "layer {layer} wrong shape"
+            );
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "layer {layer} non-finite"
+            );
         }
     }
 
@@ -179,12 +209,18 @@ mod tests {
         use crate::ffn::FfnBackend;
         let weights = make_test_weights();
         let wffn = WeightFfn { weights: &weights };
-        let bffn = BackendFfn { weights: &weights, backend: &larql_compute::CpuBackend };
+        let bffn = BackendFfn {
+            weights: &weights,
+            backend: &larql_compute::CpuBackend,
+        };
         let input = x(2, weights.hidden_size);
         let out_w = wffn.forward(0, &input);
         let out_b = bffn.forward(0, &input);
         for (w, b) in out_w.iter().zip(out_b.iter()) {
-            assert!((w - b).abs() < 1e-4, "WeightFfn and BackendFfn differ: {w} vs {b}");
+            assert!(
+                (w - b).abs() < 1e-4,
+                "WeightFfn and BackendFfn differ: {w} vs {b}"
+            );
         }
     }
 }

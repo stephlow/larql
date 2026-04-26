@@ -4,10 +4,12 @@
 //! in-process to the full router with no network socket. Every test builds a
 //! synthetic in-memory VectorIndex (1 layer, 3 features, hidden=4).
 
+#![allow(dead_code, unused_imports)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -31,8 +33,16 @@ pub fn make_feature(token: &str, id: u32, score: f32) -> FeatureMeta {
         top_token_id: id,
         c_score: score,
         top_k: vec![
-            larql_models::TopKEntry { token: token.to_string(), token_id: id, logit: score },
-            larql_models::TopKEntry { token: "also".into(), token_id: id + 1, logit: score * 0.5 },
+            larql_models::TopKEntry {
+                token: token.to_string(),
+                token_id: id,
+                logit: score,
+            },
+            larql_models::TopKEntry {
+                token: "also".into(),
+                token_id: id + 1,
+                logit: score * 0.5,
+            },
         ],
     }
 }
@@ -45,7 +55,7 @@ pub fn test_index() -> VectorIndex {
     gate[[2, 2]] = 1.0; // Europe → dim 2
 
     let meta: Vec<Option<FeatureMeta>> = vec![
-        Some(make_feature("Paris",  100, 0.95)),
+        Some(make_feature("Paris", 100, 0.95)),
         Some(make_feature("French", 101, 0.88)),
         Some(make_feature("Europe", 102, 0.75)),
     ];
@@ -68,10 +78,18 @@ pub fn test_config() -> VindexConfig {
         extract_level: ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::default(),
         quant: QuantFormat::None,
-        layer_bands: Some(LayerBands { syntax: (0, 0), knowledge: (0, 0), output: (0, 0) }),
+        layer_bands: Some(LayerBands {
+            syntax: (0, 0),
+            knowledge: (0, 0),
+            output: (0, 0),
+        }),
         layers: vec![VindexLayerInfo {
-            layer: 0, num_features: 3, offset: 0, length: 48,
-            num_experts: None, num_features_per_expert: None,
+            layer: 0,
+            num_features: 3,
+            offset: 0,
+            length: 48,
+            num_experts: None,
+            num_features_per_expert: None,
         }],
         down_top_k: 5,
         has_model_weights: false,
@@ -82,7 +100,8 @@ pub fn test_config() -> VindexConfig {
 }
 
 pub fn empty_tokenizer() -> larql_vindex::tokenizers::Tokenizer {
-    let json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     larql_vindex::tokenizers::Tokenizer::from_bytes(json).unwrap()
 }
 
@@ -177,9 +196,18 @@ impl ModelBuilder {
             config: test_config(),
         }
     }
-    pub fn ffn_only(mut self) -> Self { self.ffn_only = true; self }
-    pub fn embed_only(mut self) -> Self { self.embed_only = true; self }
-    pub fn infer_disabled(mut self, v: bool) -> Self { self.infer_disabled = v; self }
+    pub fn ffn_only(mut self) -> Self {
+        self.ffn_only = true;
+        self
+    }
+    pub fn embed_only(mut self) -> Self {
+        self.embed_only = true;
+        self
+    }
+    pub fn infer_disabled(mut self, v: bool) -> Self {
+        self.infer_disabled = v;
+        self
+    }
     pub fn with_labels(mut self, labels: HashMap<(usize, usize), String>) -> Self {
         self.probe_labels = labels;
         self
@@ -213,7 +241,9 @@ impl ModelBuilder {
     }
 }
 
-pub fn model(id: &str) -> Arc<LoadedModel> { ModelBuilder::new(id).build() }
+pub fn model(id: &str) -> Arc<LoadedModel> {
+    ModelBuilder::new(id).build()
+}
 
 // ══════════════════════════════════════════════════════════════
 // State builders
@@ -262,41 +292,76 @@ pub async fn body_json(body: Body) -> serde_json::Value {
 }
 
 pub async fn get(app: axum::Router, path: &str) -> axum::http::Response<Body> {
-    app.oneshot(Request::builder().method("GET").uri(path).body(Body::empty()).unwrap())
-        .await.unwrap()
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 pub async fn get_h(app: axum::Router, path: &str, h: (&str, &str)) -> axum::http::Response<Body> {
     app.oneshot(
-        Request::builder().method("GET").uri(path).header(h.0, h.1).body(Body::empty()).unwrap()
-    ).await.unwrap()
-}
-
-pub async fn post_json(app: axum::Router, path: &str, body: serde_json::Value) -> axum::http::Response<Body> {
-    app.oneshot(
         Request::builder()
-            .method("POST").uri(path)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
-    ).await.unwrap()
+            .method("GET")
+            .uri(path)
+            .header(h.0, h.1)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
-pub async fn post_json_h(
-    app: axum::Router, path: &str,
-    body: serde_json::Value, h: (&str, &str),
+pub async fn post_json(
+    app: axum::Router,
+    path: &str,
+    body: serde_json::Value,
 ) -> axum::http::Response<Body> {
     app.oneshot(
         Request::builder()
-            .method("POST").uri(path)
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+pub async fn post_json_h(
+    app: axum::Router,
+    path: &str,
+    body: serde_json::Value,
+    h: (&str, &str),
+) -> axum::http::Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(path)
             .header("content-type", "application/json")
             .header(h.0, h.1)
-            .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
-    ).await.unwrap()
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 pub async fn delete(app: axum::Router, path: &str) -> axum::http::Response<Body> {
-    app.oneshot(Request::builder().method("DELETE").uri(path).body(Body::empty()).unwrap())
-        .await.unwrap()
+    app.oneshot(
+        Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 // ══════════════════════════════════════════════════════════════

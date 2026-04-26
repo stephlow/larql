@@ -2,7 +2,7 @@
 
 ## Overview
 
-`ModelArchitecture` is the core abstraction in `larql-models`. It has 82 methods that describe *what a model is* — tensor key patterns, norm behavior, activation functions, scaling — without any compute dependencies.
+`ModelArchitecture` is the core abstraction in `larql-models`. It has 83 methods that describe *what a model is* — tensor key patterns, norm behavior, activation functions, scaling, and config invariants — without any compute dependencies.
 
 Every model family (Gemma, Llama, DeepSeek, ...) implements this trait. The rest of LARQL (inference, compute, vindex) only interacts with models through this trait.
 
@@ -52,6 +52,10 @@ fn head_dim_for_layer(&self, layer: usize) -> usize {
 
 Tensor keys are returned as `String`, not an enum. This keeps the trait open to new tensor patterns without modifying central types. Component names (`ffn_down`, `attn_ov`, ...) are `&str` constants for the same reason.
 
+### 5. Permissive detection, explicit validation
+
+`detect_from_json` constructs an architecture even for incomplete or inconsistent configs so callers can inspect what was parsed. Use `detect_from_json_validated`, `detect_architecture_validated`, or validated loading entry points before inference or extraction to catch bad dimensions and cross-field mismatches early. Validation internals live in `src/validation.rs`, with field-name constants used for diagnostics and tests.
+
 ## Method Categories
 
 ### Tensor Keys (~20 methods)
@@ -78,6 +82,17 @@ Control how attention is computed at each layer:
 - `is_sliding_window_layer(layer)` — sliding vs full attention
 - `v_shares_k(layer)` — K=V sharing (Gemma 4)
 - `kv_shared_source_layer(layer)` — cross-layer KV reuse
+
+### Config Validation
+
+`validate()` returns `Result<(), Vec<ConfigValidationError>>` and checks invariants that otherwise fail later in inference or extraction:
+- Core dimensions are positive
+- `head_dim` divides `hidden_size`
+- KV heads do not exceed Q heads and Q heads divide evenly by KV heads
+- RoPE bases, scaling factors, partial rotary fractions, and softcapping/scaling values are finite and valid
+- Explicit `layer_types` length matches `num_layers`, and KV sharing leaves at least one source layer
+- MoE configs provide both expert count and experts-per-token, and top-k does not exceed total experts
+- Hybrid MoE configs include `moe_intermediate_size`
 
 ### Normalization (~8 methods)
 

@@ -12,19 +12,19 @@
 //! decompresses the full prior K/V for attention, appends the new token's
 //! K/V, then re-compresses and stores the updated cache.
 
-use ndarray::{s, Array2};
-use larql_compute::{ComputeBackend, cpu_backend};
+use larql_compute::{cpu_backend, ComputeBackend};
 use larql_vindex::VectorIndex;
+use ndarray::{s, Array2};
 
-use crate::model::ModelWeights;
-use crate::attention::{run_attention_with_kv_backend, run_attention_block_decode_step_backend};
-use crate::ffn::BackendFfn;
-use crate::vindex::{WalkFfn, WalkFfnConfig};
-use crate::forward::{embed_tokens_pub, run_ffn};
-use crate::attention::SharedKV;
-use crate::engines::{EngineInfo, KvEngine};
-use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use super::{codebooks, lloyd_max, packing, rotation};
+use crate::attention::SharedKV;
+use crate::attention::{run_attention_block_decode_step_backend, run_attention_with_kv_backend};
+use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
+use crate::engines::{EngineInfo, KvEngine};
+use crate::ffn::BackendFfn;
+use crate::forward::{embed_tokens_pub, run_ffn};
+use crate::model::ModelWeights;
+use crate::vindex::{WalkFfn, WalkFfnConfig};
 
 // ─── TurboQuant codec ────────────────────────────────────────────────────────
 
@@ -52,7 +52,8 @@ impl TurboQuant {
         };
         let y = rotation::wht(&x_hat);
         let codebook = codebooks::get_codebook(d, self.bits);
-        let indices: Vec<u8> = y.iter()
+        let indices: Vec<u8> = y
+            .iter()
             .map(|&val| lloyd_max::quantize_scalar(val, codebook))
             .collect();
         let mut buf = Vec::new();
@@ -66,7 +67,10 @@ impl TurboQuant {
         let norm = f32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         let indices = packing::unpack_indices(&encoded[4..], dim, self.bits);
         let codebook = codebooks::get_codebook(dim, self.bits);
-        let y: Vec<f32> = indices.iter().map(|&i| codebook.centroids[i as usize]).collect();
+        let y: Vec<f32> = indices
+            .iter()
+            .map(|&i| codebook.centroids[i as usize])
+            .collect();
         let x_hat = rotation::wht(&y);
         x_hat.iter().map(|&v| v * norm).collect()
     }
@@ -91,7 +95,7 @@ impl CompressedLayer {
     pub(super) fn compress(kv: &SharedKV, tq: &TurboQuant) -> Self {
         let (k, v) = kv;
         let num_vecs = k.shape()[0];
-        let kv_dim   = k.shape()[1];
+        let kv_dim = k.shape()[1];
         let head_dim = detect_head_dim(kv_dim);
         Self {
             compressed_k: compress_matrix(k, tq, head_dim),
@@ -103,8 +107,20 @@ impl CompressedLayer {
     }
 
     pub(super) fn decompress(&self, tq: &TurboQuant) -> SharedKV {
-        let k = decompress_matrix(&self.compressed_k, self.num_vecs, self.kv_dim, self.head_dim, tq);
-        let v = decompress_matrix(&self.compressed_v, self.num_vecs, self.kv_dim, self.head_dim, tq);
+        let k = decompress_matrix(
+            &self.compressed_k,
+            self.num_vecs,
+            self.kv_dim,
+            self.head_dim,
+            tq,
+        );
+        let v = decompress_matrix(
+            &self.compressed_v,
+            self.num_vecs,
+            self.kv_dim,
+            self.head_dim,
+            tq,
+        );
         (k, v)
     }
 
@@ -115,7 +131,9 @@ impl CompressedLayer {
 
 pub(super) fn detect_head_dim(kv_dim: usize) -> usize {
     for &hd in &[256usize, 128, 64, 32] {
-        if kv_dim.is_multiple_of(hd) { return hd; }
+        if kv_dim.is_multiple_of(hd) {
+            return hd;
+        }
     }
     kv_dim // fallback: treat whole row as one head
 }
@@ -171,12 +189,19 @@ impl TurboQuantEngine {
     }
 
     pub fn with_backend(bits: u8, backend: Box<dyn ComputeBackend>) -> Self {
-        Self { tq: TurboQuant::new(bits), backend, layers: Vec::new(), abs_position: 0 }
+        Self {
+            tq: TurboQuant::new(bits),
+            backend,
+            layers: Vec::new(),
+            abs_position: 0,
+        }
     }
 }
 
 impl KvEngine for TurboQuantEngine {
-    fn name(&self) -> &str { "turbo-quant" }
+    fn name(&self) -> &str {
+        "turbo-quant"
+    }
 
     fn info(&self) -> EngineInfo {
         let mem: usize = self.layers.iter().map(|l| l.memory_bytes()).sum();
@@ -199,11 +224,14 @@ impl KvEngine for TurboQuantEngine {
         self.layers.clear();
 
         for layer in 0..num_layers {
-            let (h_post_attn, k, v) =
-                run_attention_with_kv_backend(weights, &h, layer, be)?;
-            self.layers.push(CompressedLayer::compress(&(k, v), &self.tq));
+            let (h_post_attn, k, v) = run_attention_with_kv_backend(weights, &h, layer, be)?;
+            self.layers
+                .push(CompressedLayer::compress(&(k, v), &self.tq));
 
-            let bffn = BackendFfn { weights, backend: self.backend.as_ref() };
+            let bffn = BackendFfn {
+                weights,
+                backend: self.backend.as_ref(),
+            };
             let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
             h = h_out;
         }
@@ -223,7 +251,11 @@ impl KvEngine for TurboQuantEngine {
 
             // Decode step returns updated K/V (prior + new token).
             let (h_post_attn, updated_kv) = run_attention_block_decode_step_backend(
-                weights, &h, layer, Some(&prior_kv), abs_position,
+                weights,
+                &h,
+                layer,
+                Some(&prior_kv),
+                abs_position,
                 Some(self.backend.as_ref()),
             )?;
 
@@ -238,7 +270,10 @@ impl KvEngine for TurboQuantEngine {
                 head_dim: detect_head_dim(kv_dim),
             };
 
-            let bffn = BackendFfn { weights, backend: self.backend.as_ref() };
+            let bffn = BackendFfn {
+                weights,
+                backend: self.backend.as_ref(),
+            };
             let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
             h = h_out;
         }
@@ -288,7 +323,6 @@ impl KvEngine for TurboQuantEngine {
         // CPU Q4K fallback.
         self.decode_step_q4k_cpu(weights, index, token_id, backend)
     }
-
 }
 
 // ── CPU Q4K helper methods (not part of the KvEngine trait) ──────────────────
@@ -309,7 +343,8 @@ impl TurboQuantEngine {
 
         for layer in 0..num_layers {
             let (h_post_attn, k, v) = run_attention_with_kv_backend(weights, &h, layer, be)?;
-            self.layers.push(CompressedLayer::compress(&(k, v), &self.tq));
+            self.layers
+                .push(CompressedLayer::compress(&(k, v), &self.tq));
 
             let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
                 .with_backend(backend);
@@ -336,7 +371,12 @@ impl TurboQuantEngine {
         for layer in 0..num_layers {
             let prior_kv = self.layers[layer].decompress(&self.tq);
             let (h_post_attn, updated_kv) = run_attention_block_decode_step_backend(
-                weights, &h, layer, Some(&prior_kv), abs_position, Some(backend),
+                weights,
+                &h,
+                layer,
+                Some(&prior_kv),
+                abs_position,
+                Some(backend),
             )?;
             let arch = &*weights.arch;
             let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
@@ -372,20 +412,32 @@ mod tests {
     /// Uses lower 32 bits of the state for uniform [0, 1) values.
     fn unit_norm_vec(dim: usize, seed: u64) -> Vec<f32> {
         let mut state = seed;
-        let raw: Vec<f32> = (0..dim).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (state as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
-        }).collect();
+        let raw: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
+            })
+            .collect();
         let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm > 1e-12 { raw.iter().map(|v| v / norm).collect() } else { raw }
+        if norm > 1e-12 {
+            raw.iter().map(|v| v / norm).collect()
+        } else {
+            raw
+        }
     }
 
     fn random_vec(dim: usize, seed: u64) -> Vec<f32> {
         let mut state = seed;
-        (0..dim).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (state as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
-        }).collect()
+        (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
+            })
+            .collect()
     }
 
     // ── Codec roundtrip quality ───────────────────────────────────────────────
@@ -431,7 +483,10 @@ mod tests {
         let norm_dec: f32 = dec.iter().map(|v| v * v).sum::<f32>().sqrt();
         let ratio = norm_dec / norm_orig;
         // The codec stores the norm explicitly — after roundtrip it should be close.
-        assert!((ratio - 1.0).abs() < 0.20, "norm ratio {ratio:.4} not near 1.0");
+        assert!(
+            (ratio - 1.0).abs() < 0.20,
+            "norm ratio {ratio:.4} not near 1.0"
+        );
     }
 
     #[test]
@@ -442,7 +497,10 @@ mod tests {
         let dec = tq.decode_vector(&enc, 256);
         // Zero vector: all decoded values should be ~0 (codec stores norm=0).
         let max_abs = dec.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        assert!(max_abs < 1e-6, "zero vector decoded to non-zero: max_abs={max_abs}");
+        assert!(
+            max_abs < 1e-6,
+            "zero vector decoded to non-zero: max_abs={max_abs}"
+        );
     }
 
     #[test]
@@ -534,8 +592,10 @@ mod tests {
         let cl = CompressedLayer::compress(&(k, v), &tq);
         let fp32_bytes = 10 * 1024 * 4 * 2; // K+V, f32
         let compressed = cl.memory_bytes();
-        assert!(compressed < fp32_bytes,
-            "compressed {compressed}B should be < fp32 {fp32_bytes}B");
+        assert!(
+            compressed < fp32_bytes,
+            "compressed {compressed}B should be < fp32 {fp32_bytes}B"
+        );
         // Compression ratio should be ~4×
         let ratio = fp32_bytes as f64 / compressed as f64;
         assert!(ratio > 3.0, "ratio {ratio:.2} < 3.0");
@@ -546,20 +606,25 @@ mod tests {
         use ndarray::Array2;
         let tq = TurboQuant::new(4);
         // Use unit-norm rows matching TurboQuant's codebook distribution.
-        let k_data: Vec<f32> = (0..10).flat_map(|i| unit_norm_vec(256, i * 7 + 17)).collect();
-        let v_data: Vec<f32> = (0..10).flat_map(|i| unit_norm_vec(256, i * 7 + 31)).collect();
+        let k_data: Vec<f32> = (0..10)
+            .flat_map(|i| unit_norm_vec(256, i * 7 + 17))
+            .collect();
+        let v_data: Vec<f32> = (0..10)
+            .flat_map(|i| unit_norm_vec(256, i * 7 + 31))
+            .collect();
         let k = Array2::from_shape_vec((10, 256), k_data.clone()).unwrap();
         let v = Array2::from_shape_vec((10, 256), v_data.clone()).unwrap();
         let cl = CompressedLayer::compress(&(k, v), &tq);
         let (k_dec, v_dec) = cl.decompress(&tq);
         // Check last row cosine (most relevant for decode)
-        let k_orig_last: Vec<f32> = k_data[9*256..10*256].to_vec();
+        let k_orig_last: Vec<f32> = k_data[9 * 256..10 * 256].to_vec();
         let k_dec_last: Vec<f32> = k_dec.row(9).to_vec();
-        assert!(cosine_similarity(&k_orig_last, &k_dec_last) > 0.88,
-            "K roundtrip cosine too low");
+        assert!(
+            cosine_similarity(&k_orig_last, &k_dec_last) > 0.88,
+            "K roundtrip cosine too low"
+        );
     }
 }
-
 
 // ─── Integration tests with synthetic weights ─────────────────────────────────
 
@@ -574,9 +639,15 @@ mod integration_tests {
         let weights = make_test_weights();
         let mut engine = TurboQuantEngine::new(4);
         assert_eq!(engine.memory_bytes(), 0);
-        let h = engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill failed");
+        let h = engine
+            .prefill(&weights, &[0u32, 1, 2])
+            .expect("prefill failed");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
-        assert_eq!(engine.layers.len(), weights.num_layers, "one CompressedLayer per model layer");
+        assert_eq!(
+            engine.layers.len(),
+            weights.num_layers,
+            "one CompressedLayer per model layer"
+        );
         assert!(engine.memory_bytes() > 0);
     }
 
@@ -589,8 +660,10 @@ mod integration_tests {
 
         engine.decode_step(&weights, 1).expect("decode_step");
         // After decode: K/V cache has one more entry per layer → more compressed bytes
-        assert!(engine.memory_bytes() > mem_before,
-            "compressed cache should grow after each decode step");
+        assert!(
+            engine.memory_bytes() > mem_before,
+            "compressed cache should grow after each decode step"
+        );
     }
 
     #[test]
@@ -598,9 +671,13 @@ mod integration_tests {
         let weights = make_test_weights();
         let mut engine = TurboQuantEngine::new(4);
         let h_pre = engine.prefill(&weights, &[0u32, 1]).expect("prefill");
-        assert!(hidden_to_raw_logits(&weights, &h_pre).iter().all(|v| v.is_finite()));
+        assert!(hidden_to_raw_logits(&weights, &h_pre)
+            .iter()
+            .all(|v| v.is_finite()));
         let h_dec = engine.decode_step(&weights, 2).expect("decode");
-        assert!(hidden_to_raw_logits(&weights, &h_dec).iter().all(|v| v.is_finite()));
+        assert!(hidden_to_raw_logits(&weights, &h_dec)
+            .iter()
+            .all(|v| v.is_finite()));
     }
 
     #[test]
@@ -613,6 +690,9 @@ mod integration_tests {
         let mem3 = engine.memory_bytes();
         let mut engine4 = TurboQuantEngine::new(4);
         engine4.prefill(&weights, &[0u32]).expect("4-bit prefill");
-        assert!(mem3 < engine4.memory_bytes(), "3-bit should use less memory than 4-bit");
+        assert!(
+            mem3 < engine4.memory_bytes(),
+            "3-bit should use less memory than 4-bit"
+        );
     }
 }

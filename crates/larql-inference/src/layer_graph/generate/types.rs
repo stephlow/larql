@@ -25,7 +25,9 @@ impl StageTimings {
     /// Per-token average across `n` decode steps. Returns all-zero if
     /// `n == 0` (short-circuit no-decode paths safely).
     pub fn avg_per_step(&self, n: usize) -> StageTimings {
-        if n == 0 { return Self::default(); }
+        if n == 0 {
+            return Self::default();
+        }
         let nf = n as f64;
         StageTimings {
             embed_ms_total: self.embed_ms_total / nf,
@@ -39,16 +41,27 @@ impl StageTimings {
 
 impl GenerateResult {
     pub fn avg_decode_ms(&self) -> f64 {
-        if self.decode_ms.is_empty() { 0.0 }
-        else { self.decode_ms.iter().sum::<f64>() / self.decode_ms.len() as f64 }
+        if self.decode_ms.is_empty() {
+            0.0
+        } else {
+            self.decode_ms.iter().sum::<f64>() / self.decode_ms.len() as f64
+        }
     }
 
     pub fn decode_tok_s(&self) -> f64 {
         let avg = self.avg_decode_ms();
-        if avg > 0.0 { 1000.0 / avg } else { 0.0 }
+        if avg > 0.0 {
+            1000.0 / avg
+        } else {
+            0.0
+        }
     }
 
     pub fn text(&self) -> String {
-        self.tokens.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("")
+        self.tokens
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("")
     }
 }

@@ -1,9 +1,9 @@
 //! Small math utilities shared by `forward/` and `attention/`.
 
-use ndarray::Array2;
 use crate::model::ModelWeights;
-use larql_models::NormType;
 use crate::residual::rms_norm;
+use larql_models::NormType;
+use ndarray::Array2;
 
 /// Apply the appropriate norm (RMSNorm or LayerNorm) based on architecture.
 pub fn apply_norm(
@@ -35,7 +35,9 @@ pub fn dot_proj(
 
 /// Numerically-stable softmax. Returns an empty vec for empty input.
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
-    if logits.is_empty() { return vec![]; }
+    if logits.is_empty() {
+        return vec![];
+    }
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
@@ -56,8 +58,8 @@ pub fn add_bias(x: &mut Array2<f32>, bias: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
     use crate::engines::test_utils::make_test_weights;
+    use ndarray::Array2;
 
     // ── dot_proj ──────────────────────────────────────────────────────────────
 
@@ -101,7 +103,10 @@ mod tests {
         add_bias(&mut x, &bias);
         for row in x.rows() {
             for (j, v) in row.iter().enumerate() {
-                assert!((v - (1.0 + bias[j])).abs() < 1e-6, "row val wrong at col {j}");
+                assert!(
+                    (v - (1.0 + bias[j])).abs() < 1e-6,
+                    "row val wrong at col {j}"
+                );
             }
         }
     }
@@ -144,7 +149,10 @@ mod tests {
         let x = Array2::from_elem((1, weights.hidden_size), 1.0f32);
         let norm_key = weights.arch.input_layernorm_key(0);
         let out = apply_norm(&weights, &x, &norm_key, 0.0);
-        assert!(out.iter().all(|v| v.is_finite()), "apply_norm produced non-finite values");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "apply_norm produced non-finite values"
+        );
     }
 
     #[test]
@@ -155,6 +163,9 @@ mod tests {
         let out0 = apply_norm(&weights, &x, &norm_key, 0.0);
         let out1 = apply_norm(&weights, &x, &norm_key, 1.0);
         // offset=1.0 means weight = 1 + learned; result should differ
-        assert_ne!(out0, out1, "different offsets should produce different norms");
+        assert_ne!(
+            out0, out1,
+            "different offsets should produce different norms"
+        );
     }
 }

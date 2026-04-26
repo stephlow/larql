@@ -4,6 +4,8 @@
 //! describes *what the model is* — tensor key patterns, norm behavior,
 //! activation functions, scaling — without any compute dependencies.
 
+use crate::validation::ConfigValidationResult;
+
 /// Normalization type used by the model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NormType {
@@ -131,6 +133,16 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// Parsed model configuration.
     fn config(&self) -> &ModelConfig;
+
+    /// Validate parsed architecture dimensions and cross-field invariants.
+    ///
+    /// Detection is intentionally permissive so callers can inspect partially
+    /// specified configs. Call this before inference or extraction to fail
+    /// early on inconsistent head geometry, RoPE settings, per-layer metadata,
+    /// MoE routing, or other values that would otherwise surface later.
+    fn validate(&self) -> ConfigValidationResult {
+        crate::validation::validate_architecture(self)
+    }
 
     // ── Tensor key patterns ──
 

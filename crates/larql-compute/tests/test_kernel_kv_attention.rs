@@ -66,7 +66,9 @@ fn cpu_kv_attention(
         let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
-        for e in exps.iter_mut() { *e /= sum_exp; }
+        for e in exps.iter_mut() {
+            *e /= sum_exp;
+        }
         // V-weighted sum.
         for d in 0..head_dim {
             let mut acc = 0.0f64;
@@ -137,7 +139,7 @@ fn assert_kv_attention_matches_cpu(
 ) {
     let metal = get_metal();
     let scale = 1.0f32; // Gemma 4 uses QK-norm so default scale is 1.0
-    let window = 0u32;  // 0 = no sliding window
+    let window = 0u32; // 0 = no sliding window
 
     let q_total = num_q * head_dim;
     let kv_total_per_pos = num_kv * head_dim;
@@ -157,7 +159,9 @@ fn assert_kv_attention_matches_cpu(
         .collect();
 
     let cpu_out = cpu_kv_attention(&q, &k, &v, t, num_q, num_kv, head_dim, scale);
-    let metal_out = run_kv_attention(&metal, &q, &k, &v, t, num_q, num_kv, head_dim, scale, window);
+    let metal_out = run_kv_attention(
+        &metal, &q, &k, &v, t, num_q, num_kv, head_dim, scale, window,
+    );
 
     let diff = max_diff(&cpu_out, &metal_out);
     let cos = cos_sim(&cpu_out, &metal_out);

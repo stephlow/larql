@@ -4,9 +4,9 @@
 //! Two streams are combined: a model-level projection of the main embeddings,
 //! and a per-layer token embedding lookup, scaled and gated.
 
-use ndarray::Array2;
+use super::{apply_norm, dot_proj};
 use crate::model::ModelWeights;
-use super::{dot_proj, apply_norm};
+use ndarray::Array2;
 
 /// Precompute per-layer input signals from token embeddings.
 ///
@@ -164,8 +164,8 @@ pub(crate) fn apply_per_layer_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
     use crate::engines::test_utils::make_test_weights;
+    use ndarray::Array2;
 
     fn input(seq: usize, hidden: usize) -> Array2<f32> {
         let data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect();
@@ -181,8 +181,11 @@ mod tests {
         let embeds = input(3, weights.hidden_size);
         let token_ids = &[0u32, 1, 2];
         let result = precompute_per_layer_inputs(&weights, &embeds, token_ids);
-        assert!(result.is_empty(),
-            "non-PLE arch should return empty vec, got {} layers", result.len());
+        assert!(
+            result.is_empty(),
+            "non-PLE arch should return empty vec, got {} layers",
+            result.len()
+        );
     }
 
     #[test]
@@ -232,15 +235,22 @@ mod tests {
         let logits = vec![1.0f32, 2.0, 3.0, 0.5];
         let probs = crate::forward::softmax(&logits);
         let sum: f32 = probs.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6, "softmax should sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "softmax should sum to 1, got {sum}"
+        );
     }
 
     #[test]
     fn softmax_preserves_argmax() {
         let logits = vec![0.1f32, 5.0, 0.2];
         let probs = crate::forward::softmax(&logits);
-        let argmax = probs.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        let argmax = probs
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
         assert_eq!(argmax, 1, "argmax should be preserved by softmax");
     }
 

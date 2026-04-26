@@ -67,7 +67,13 @@ mod tests {
         fs::write(src.join("generation_config.json"), r#"{"t":1.0}"#).unwrap();
 
         let copied = snapshot_hf_metadata(&src, &dst).unwrap();
-        assert_eq!(copied, vec![TOKENIZER_CONFIG_JSON.to_string(), "generation_config.json".to_string()]);
+        assert_eq!(
+            copied,
+            vec![
+                TOKENIZER_CONFIG_JSON.to_string(),
+                "generation_config.json".to_string()
+            ]
+        );
         assert!(dst.join(TOKENIZER_CONFIG_JSON).exists());
         assert!(!dst.join("special_tokens_map.json").exists());
         assert!(dst.join("generation_config.json").exists());

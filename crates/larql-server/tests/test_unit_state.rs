@@ -2,28 +2,32 @@
 //! auth, rate limit, cache, ETag, session, announce hash, warmup_model,
 //! probe labels, content token, server error mapping, infer disabled logic.
 
-use larql_vindex::ndarray::Array2;
-use larql_vindex::{
-    PatchedVindex, VectorIndex, VindexConfig, VindexLayerInfo,
-    ExtractLevel, QuantFormat, FeatureMeta,
-};
+use axum::response::IntoResponse;
 use larql_server::cache::DescribeCache;
 use larql_server::error::ServerError;
 use larql_server::ffn_l2_cache::FfnL2Cache;
 use larql_server::session::SessionManager;
-use larql_server::state::{AppState, LoadedModel, load_probe_labels, model_id_from_name};
-use axum::response::IntoResponse;
+use larql_server::state::{load_probe_labels, model_id_from_name, AppState, LoadedModel};
+use larql_vindex::ndarray::Array2;
+use larql_vindex::{
+    ExtractLevel, FeatureMeta, PatchedVindex, QuantFormat, VectorIndex, VindexConfig,
+    VindexLayerInfo,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 // ══════════════════════════════════════════════════════════════
 // Tiny fixture helpers (local copies — ~50 LOC)
 // ══════════════════════════════════════════════════════════════
 
 fn make_top_k(token: &str, id: u32, logit: f32) -> larql_models::TopKEntry {
-    larql_models::TopKEntry { token: token.to_string(), token_id: id, logit }
+    larql_models::TopKEntry {
+        token: token.to_string(),
+        token_id: id,
+        logit,
+    }
 }
 
 fn make_meta(token: &str, id: u32, score: f32) -> FeatureMeta {
@@ -31,7 +35,10 @@ fn make_meta(token: &str, id: u32, score: f32) -> FeatureMeta {
         top_token: token.to_string(),
         top_token_id: id,
         c_score: score,
-        top_k: vec![make_top_k(token, id, score), make_top_k("also", id + 1, score * 0.5)],
+        top_k: vec![
+            make_top_k(token, id, score),
+            make_top_k("also", id + 1, score * 0.5),
+        ],
     }
 }
 
@@ -40,7 +47,8 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
     let gate = Array2::<f32>::zeros((2, hidden));
     let index = VectorIndex::new(vec![Some(gate)], vec![None], 1, hidden);
     let patched = PatchedVindex::new(index);
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json).unwrap();
     Arc::new(LoadedModel {
         id: id.to_string(),
@@ -61,8 +69,12 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
             quant: QuantFormat::None,
             layer_bands: None,
             layers: vec![VindexLayerInfo {
-                layer: 0, num_features: 2, offset: 0, length: 32,
-                num_experts: None, num_features_per_expert: None,
+                layer: 0,
+                num_features: 2,
+                offset: 0,
+                length: 32,
+                num_experts: None,
+                num_features_per_expert: None,
             }],
             down_top_k: 2,
             has_model_weights: false,
@@ -117,9 +129,19 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         extract_level: ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::default(),
         quant: QuantFormat::None,
-        layer_bands: Some(larql_vindex::LayerBands { syntax: (0, 0), knowledge: (0, 0), output: (0, 0) }),
-        layers: vec![VindexLayerInfo { layer: 0, num_features: 3, offset: 0, length: 48,
-                                      num_experts: None, num_features_per_expert: None }],
+        layer_bands: Some(larql_vindex::LayerBands {
+            syntax: (0, 0),
+            knowledge: (0, 0),
+            output: (0, 0),
+        }),
+        layers: vec![VindexLayerInfo {
+            layer: 0,
+            num_features: 3,
+            offset: 0,
+            length: 48,
+            num_experts: None,
+            num_features_per_expert: None,
+        }],
         down_top_k: 5,
         has_model_weights: false,
         model_config: None,
@@ -127,7 +149,8 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         ffn_layout: None,
     };
 
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json).unwrap();
 
     Arc::new(LoadedModel {
@@ -197,12 +220,27 @@ fn test_app_state_is_multi_model_multi() {
 #[test]
 fn test_app_state_bump_requests_increments() {
     let state = make_tiny_state(vec![make_tiny_model("a")]);
-    assert_eq!(state.requests_served.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        state
+            .requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     state.bump_requests();
-    assert_eq!(state.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        state
+            .requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
     state.bump_requests();
     state.bump_requests();
-    assert_eq!(state.requests_served.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert_eq!(
+        state
+            .requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -260,7 +298,11 @@ fn test_multi_model_lookup_by_id() {
 fn test_single_model_returns_first() {
     let models = ["only-model"];
     // Single model mode: None → returns first
-    let result = if models.len() == 1 { models.first() } else { None };
+    let result = if models.len() == 1 {
+        models.first()
+    } else {
+        None
+    };
     assert_eq!(result, Some(&"only-model"));
 }
 
@@ -268,7 +310,11 @@ fn test_single_model_returns_first() {
 fn test_multi_model_none_returns_none() {
     let models = ["a", "b"];
     // Multi-model mode: None → returns None (must specify ID)
-    let result: Option<&&str> = if models.len() == 1 { models.first() } else { None };
+    let result: Option<&&str> = if models.len() == 1 {
+        models.first()
+    } else {
+        None
+    };
     assert_eq!(result, None);
 }
 
@@ -401,7 +447,9 @@ fn test_rate_limit_parse() {
 
 fn rate_limit_parse(spec: &str) -> Option<(f64, f64)> {
     let parts: Vec<&str> = spec.split('/').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     let count: f64 = parts[0].trim().parse().ok()?;
     let per_sec = match parts[1].trim() {
         "sec" | "s" | "second" => count,
@@ -419,8 +467,10 @@ fn test_rate_limit_token_bucket() {
     let max_tokens: f64 = 2.0;
 
     // First two requests succeed
-    assert!(tokens >= 1.0); tokens -= 1.0;
-    assert!(tokens >= 1.0); tokens -= 1.0;
+    assert!(tokens >= 1.0);
+    tokens -= 1.0;
+    assert!(tokens >= 1.0);
+    tokens -= 1.0;
 
     // Third fails
     assert!(tokens < 1.0);
@@ -449,7 +499,9 @@ fn test_rate_limiter_per_minute_long_form() {
     // "60/minute" is valid; verify it allows 60 consecutive requests.
     let rl = RateLimiter::parse("60/minute").unwrap();
     let ip: std::net::IpAddr = "10.0.0.60".parse().unwrap();
-    for _ in 0..60 { assert!(rl.check(ip)); }
+    for _ in 0..60 {
+        assert!(rl.check(ip));
+    }
     assert!(!rl.check(ip)); // 61st request blocked
 }
 
@@ -458,7 +510,9 @@ fn test_rate_limiter_per_second_long_form() {
     // "10/second" is valid; verify it allows 10 consecutive requests.
     let rl = RateLimiter::parse("10/second").unwrap();
     let ip: std::net::IpAddr = "10.0.0.10".parse().unwrap();
-    for _ in 0..10 { assert!(rl.check(ip)); }
+    for _ in 0..10 {
+        assert!(rl.check(ip));
+    }
     assert!(!rl.check(ip)); // 11th request blocked
 }
 
@@ -701,9 +755,13 @@ fn vindex_identity_hash_is_hex_string() {
 
 #[test]
 fn warmup_model_skip_weights_sets_loaded_false() {
-    use larql_server::routes::warmup::{WarmupRequest, warmup_model};
+    use larql_server::routes::warmup::{warmup_model, WarmupRequest};
     let model = make_loaded_model_for_warmup();
-    let req = WarmupRequest { layers: None, skip_weights: true, warmup_hnsw: false };
+    let req = WarmupRequest {
+        layers: None,
+        skip_weights: true,
+        warmup_hnsw: false,
+    };
     let resp = warmup_model(&model, &req);
     assert!(!resp.weights_loaded);
     assert_eq!(resp.weights_load_ms, 0);
@@ -711,45 +769,65 @@ fn warmup_model_skip_weights_sets_loaded_false() {
 
 #[test]
 fn warmup_model_with_explicit_layers_prefetches_matching() {
-    use larql_server::routes::warmup::{WarmupRequest, warmup_model};
+    use larql_server::routes::warmup::{warmup_model, WarmupRequest};
     let model = make_loaded_model_for_warmup();
-    let req = WarmupRequest { layers: Some(vec![0]), skip_weights: true, warmup_hnsw: false };
+    let req = WarmupRequest {
+        layers: Some(vec![0]),
+        skip_weights: true,
+        warmup_hnsw: false,
+    };
     let resp = warmup_model(&model, &req);
     assert_eq!(resp.layers_prefetched, 1);
 }
 
 #[test]
 fn warmup_model_out_of_range_layer_is_skipped() {
-    use larql_server::routes::warmup::{WarmupRequest, warmup_model};
+    use larql_server::routes::warmup::{warmup_model, WarmupRequest};
     let model = make_loaded_model_for_warmup();
-    let req = WarmupRequest { layers: Some(vec![999]), skip_weights: true, warmup_hnsw: false };
+    let req = WarmupRequest {
+        layers: Some(vec![999]),
+        skip_weights: true,
+        warmup_hnsw: false,
+    };
     let resp = warmup_model(&model, &req);
     assert_eq!(resp.layers_prefetched, 0);
 }
 
 #[test]
 fn warmup_model_empty_layers_list_prefetches_zero() {
-    use larql_server::routes::warmup::{WarmupRequest, warmup_model};
+    use larql_server::routes::warmup::{warmup_model, WarmupRequest};
     let model = make_loaded_model_for_warmup();
-    let req = WarmupRequest { layers: Some(vec![]), skip_weights: true, warmup_hnsw: false };
+    let req = WarmupRequest {
+        layers: Some(vec![]),
+        skip_weights: true,
+        warmup_hnsw: false,
+    };
     let resp = warmup_model(&model, &req);
     assert_eq!(resp.layers_prefetched, 0);
 }
 
 #[test]
 fn warmup_model_reports_correct_model_name() {
-    use larql_server::routes::warmup::{WarmupRequest, warmup_model};
+    use larql_server::routes::warmup::{warmup_model, WarmupRequest};
     let model = make_loaded_model_for_warmup();
-    let req = WarmupRequest { layers: Some(vec![]), skip_weights: true, warmup_hnsw: false };
+    let req = WarmupRequest {
+        layers: Some(vec![]),
+        skip_weights: true,
+        warmup_hnsw: false,
+    };
     let resp = warmup_model(&model, &req);
     assert_eq!(resp.model, "test/warmup-model");
 }
 
 #[test]
 fn warmup_model_weight_load_fails_gracefully() {
-    use larql_server::routes::warmup::{WarmupRequest, warmup_model};
+    use larql_server::routes::warmup::{warmup_model, WarmupRequest};
     let model = make_loaded_model_for_warmup();
-    let req = WarmupRequest { layers: Some(vec![]), skip_weights: false, warmup_hnsw: false };
+    let req = WarmupRequest {
+        layers: Some(vec![]),
+        skip_weights: false,
+        warmup_hnsw: false,
+    };
     // Path is /nonexistent so get_or_load_weights fails — should warn but not panic.
     let resp = warmup_model(&model, &req);
     assert!(!resp.weights_loaded);
@@ -798,7 +876,11 @@ fn test_load_probe_labels_malformed_json_returns_empty() {
 fn test_load_probe_labels_non_object_json_returns_empty() {
     let dir = std::env::temp_dir().join("larql_test_labels_03");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("feature_labels.json"), b"[\"not\",\"an\",\"object\"]").unwrap();
+    std::fs::write(
+        dir.join("feature_labels.json"),
+        b"[\"not\",\"an\",\"object\"]",
+    )
+    .unwrap();
 
     let labels = load_probe_labels(&dir);
     assert!(labels.is_empty());
@@ -829,35 +911,125 @@ fn test_load_probe_labels_skips_malformed_keys() {
 
 fn is_content_token_test(tok: &str) -> bool {
     let tok = tok.trim();
-    if tok.is_empty() || tok.len() > 30 { return false; }
-    let readable = tok.chars().filter(|c| {
-        c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '\'' || *c == '.' || *c == ','
-    }).count();
-    let total = tok.chars().count();
-    if readable * 2 < total || total == 0 { return false; }
-    let chars: Vec<char> = tok.chars().collect();
-    if chars.len() < 3 || chars.len() > 25 { return false; }
-    let alpha = chars.iter().filter(|c| c.is_ascii_alphabetic()).count();
-    if alpha < chars.len() * 2 / 3 { return false; }
-    for w in chars.windows(2) {
-        if w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase() { return false; }
+    if tok.is_empty() || tok.len() > 30 {
+        return false;
     }
-    if !chars.iter().any(|c| c.is_ascii_alphabetic()) { return false; }
+    let readable = tok
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == ' '
+                || *c == '-'
+                || *c == '\''
+                || *c == '.'
+                || *c == ','
+        })
+        .count();
+    let total = tok.chars().count();
+    if readable * 2 < total || total == 0 {
+        return false;
+    }
+    let chars: Vec<char> = tok.chars().collect();
+    if chars.len() < 3 || chars.len() > 25 {
+        return false;
+    }
+    let alpha = chars.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    if alpha < chars.len() * 2 / 3 {
+        return false;
+    }
+    for w in chars.windows(2) {
+        if w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase() {
+            return false;
+        }
+    }
+    if !chars.iter().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
     let lower = tok.to_lowercase();
     !matches!(
         lower.as_str(),
-        "the" | "and" | "for" | "but" | "not" | "you" | "all" | "can"
-        | "her" | "was" | "one" | "our" | "out" | "are" | "has" | "his"
-        | "how" | "its" | "may" | "new" | "now" | "old" | "see" | "way"
-        | "who" | "did" | "get" | "let" | "say" | "she" | "too" | "use"
-        | "from" | "have" | "been" | "will" | "with" | "this" | "that"
-        | "they" | "were" | "some" | "them" | "than" | "when"
-        | "what" | "your" | "each" | "make" | "like" | "just" | "over"
-        | "such" | "take" | "also" | "into" | "only" | "very" | "more"
-        | "does" | "most" | "about" | "which" | "their" | "would" | "there"
-        | "could" | "other" | "after" | "being" | "where" | "these" | "those"
-        | "first" | "should" | "because" | "through" | "before"
-        | "par" | "aux" | "che" | "del"
+        "the"
+            | "and"
+            | "for"
+            | "but"
+            | "not"
+            | "you"
+            | "all"
+            | "can"
+            | "her"
+            | "was"
+            | "one"
+            | "our"
+            | "out"
+            | "are"
+            | "has"
+            | "his"
+            | "how"
+            | "its"
+            | "may"
+            | "new"
+            | "now"
+            | "old"
+            | "see"
+            | "way"
+            | "who"
+            | "did"
+            | "get"
+            | "let"
+            | "say"
+            | "she"
+            | "too"
+            | "use"
+            | "from"
+            | "have"
+            | "been"
+            | "will"
+            | "with"
+            | "this"
+            | "that"
+            | "they"
+            | "were"
+            | "some"
+            | "them"
+            | "than"
+            | "when"
+            | "what"
+            | "your"
+            | "each"
+            | "make"
+            | "like"
+            | "just"
+            | "over"
+            | "such"
+            | "take"
+            | "also"
+            | "into"
+            | "only"
+            | "very"
+            | "more"
+            | "does"
+            | "most"
+            | "about"
+            | "which"
+            | "their"
+            | "would"
+            | "there"
+            | "could"
+            | "other"
+            | "after"
+            | "being"
+            | "where"
+            | "these"
+            | "those"
+            | "first"
+            | "should"
+            | "because"
+            | "through"
+            | "before"
+            | "par"
+            | "aux"
+            | "che"
+            | "del"
     )
 }
 
@@ -882,7 +1054,7 @@ fn test_content_token_stopwords_rejected() {
 
 #[test]
 fn test_content_token_too_short_rejected() {
-    assert!(!is_content_token_test("ab"));  // < 3 chars
+    assert!(!is_content_token_test("ab")); // < 3 chars
     assert!(!is_content_token_test("a"));
     assert!(!is_content_token_test(""));
 }
@@ -1017,9 +1189,13 @@ fn test_embed_only_implies_infer_disabled() {
 #[test]
 fn test_embed_only_mode_string() {
     fn mode(embed_only: bool, ffn_only: bool) -> &'static str {
-        if embed_only { "embed-service" }
-        else if ffn_only { "ffn-service" }
-        else { "full" }
+        if embed_only {
+            "embed-service"
+        } else if ffn_only {
+            "ffn-service"
+        } else {
+            "full"
+        }
     }
     assert_eq!(mode(false, false), "full");
     assert_eq!(mode(false, true), "ffn-service");
@@ -1129,43 +1305,71 @@ fn test_error_nonexistent_model_in_multi() {
 // RATELIMIT MIDDLEWARE
 // ══════════════════════════════════════════════════════════════
 
-use larql_server::ratelimit::rate_limit_middleware;
-use axum::{Router, routing::get, middleware};
-use tower::ServiceExt as TowerServiceExt;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
+use axum::{middleware, routing::get, Router};
+use larql_server::ratelimit::{rate_limit_middleware, RateLimitState};
+use std::net::SocketAddr;
+use tower::ServiceExt as TowerServiceExt;
 
-async fn ok_handler() -> &'static str { "ok" }
+async fn ok_handler() -> &'static str {
+    "ok"
+}
 
 fn router_with_limiter(rl: Arc<RateLimiter>) -> Router {
+    router_with_limiter_trust_forwarded_for(rl, false)
+}
+
+fn router_with_limiter_trust_forwarded_for(
+    rl: Arc<RateLimiter>,
+    trust_forwarded_for: bool,
+) -> Router {
+    let state = Arc::new(RateLimitState {
+        limiter: rl,
+        trust_forwarded_for,
+    });
     Router::new()
         .route("/v1/stats", get(ok_handler))
         .route("/v1/health", get(ok_handler))
-        .layer(middleware::from_fn_with_state(rl, rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(state, rate_limit_middleware))
 }
 
 #[tokio::test]
 async fn rate_limit_blocks_when_exhausted() {
-    // 1/sec → first request with X-Forwarded-For passes, second is rejected.
-    // The middleware uses the X-Forwarded-For IP for per-IP rate limiting.
+    // 1/sec → first request with trusted X-Forwarded-For passes, second is rejected.
     let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
-    let app1 = router_with_limiter(Arc::clone(&rl));
-    let resp1 = app1.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "1.2.3.4")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let app1 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp1 = app1
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "1.2.3.4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp1.status(), StatusCode::OK, "first request should pass");
 
-    let app2 = router_with_limiter(Arc::clone(&rl));
-    let resp2 = app2.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "1.2.3.4")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS, "second request should be rate-limited");
+    let app2 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "1.2.3.4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "second request should be rate-limited"
+    );
 }
 
 #[tokio::test]
@@ -1174,69 +1378,132 @@ async fn rate_limit_health_exempt() {
     let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
 
     // Exhaust the limiter for 127.0.0.1 via X-Forwarded-For.
-    let app1 = router_with_limiter(Arc::clone(&rl));
-    let resp1 = app1.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "127.0.0.1")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let app1 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp1 = app1
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
 
     // Verify exhausted on /v1/stats.
-    let app2 = router_with_limiter(Arc::clone(&rl));
-    let resp2 = app2.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "127.0.0.1")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let app2 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // Health check is exempt — should still pass.
-    let app3 = router_with_limiter(Arc::clone(&rl));
-    let resp3 = app3.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/health")
-            .header("x-forwarded-for", "127.0.0.1")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
-    assert_eq!(resp3.status(), StatusCode::OK, "/v1/health should be exempt from rate limiting");
+    let app3 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp3 = app3
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/health")
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp3.status(),
+        StatusCode::OK,
+        "/v1/health should be exempt from rate limiting"
+    );
 }
 
 #[tokio::test]
-async fn rate_limit_forwarded_for_header_used_as_ip() {
+async fn rate_limit_forwarded_for_header_used_as_ip_when_trusted() {
     // X-Forwarded-For: 10.0.0.1 → uses that IP, different from 10.0.0.2.
     let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
+    let proxy_addr: SocketAddr = "192.0.2.10:443".parse().unwrap();
 
     // Exhaust 10.0.0.1 bucket.
-    let app1 = router_with_limiter(Arc::clone(&rl));
-    let _ = app1.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "10.0.0.1")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let app1 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let _ = app1
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "10.0.0.1")
+                .extension(ConnectInfo(proxy_addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     // 10.0.0.1 is now blocked.
-    let app2 = router_with_limiter(Arc::clone(&rl));
-    let resp_blocked = app2.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "10.0.0.1")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let app2 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp_blocked = app2
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "10.0.0.1")
+                .extension(ConnectInfo(proxy_addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // 10.0.0.2 has its own bucket — should pass.
-    let app3 = router_with_limiter(Arc::clone(&rl));
-    let resp_other = app3.oneshot(
-        Request::builder()
-            .method("GET").uri("/v1/stats")
-            .header("x-forwarded-for", "10.0.0.2")
-            .body(Body::empty()).unwrap()
-    ).await.unwrap();
-    assert_eq!(resp_other.status(), StatusCode::OK, "different IP should have its own bucket");
+    let app3 = router_with_limiter_trust_forwarded_for(Arc::clone(&rl), true);
+    let resp_other = app3
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stats")
+                .header("x-forwarded-for", "10.0.0.2")
+                .extension(ConnectInfo(proxy_addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_other.status(),
+        StatusCode::OK,
+        "different IP should have its own bucket"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_forwarded_for_header_ignored_by_default() {
+    let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
+
+    for ip in ["10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+        let app = router_with_limiter(Arc::clone(&rl));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/stats")
+                    .header("x-forwarded-for", ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
 
 #[tokio::test]
@@ -1247,12 +1514,21 @@ async fn rate_limit_no_ip_passes_through() {
     // Make multiple requests with no IP info — all should pass (no IP → no rate limit applied).
     for _ in 0..3 {
         let app = router_with_limiter(Arc::clone(&rl));
-        let resp = app.oneshot(
-            Request::builder()
-                .method("GET").uri("/v1/stats")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         // Without an IP, rate_limit_middleware skips the check and passes through.
-        assert_eq!(resp.status(), StatusCode::OK, "no IP → should pass through even beyond limit");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "no IP → should pass through even beyond limit"
+        );
     }
 }

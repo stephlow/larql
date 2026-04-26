@@ -226,7 +226,10 @@ mod fp4_schema_tests {
         assert_eq!(cfg.projections.down.file, DOWN_FEATURES_FP8_BIN);
         assert_eq!(cfg.compliance_gate.threshold_ratio, 16.0);
         assert_eq!(cfg.compliance_gate.min_compliant_fraction, 0.99);
-        assert!(matches!(cfg.compliance_gate.fallback_precision, Precision::Fp8));
+        assert!(matches!(
+            cfg.compliance_gate.fallback_precision,
+            Precision::Fp8
+        ));
         assert_eq!(cfg.compliance_report, "fp4_compliance.json");
     }
 
@@ -277,7 +280,10 @@ mod fp4_schema_tests {
             ffn_layout: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(!json.contains("\"fp4\""), "legacy config leaked fp4 field: {json}");
+        assert!(
+            !json.contains("\"fp4\""),
+            "legacy config leaked fp4 field: {json}"
+        );
 
         // And still deserialises when the key is absent (default).
         let parsed: VindexConfig = serde_json::from_str(&json).unwrap();

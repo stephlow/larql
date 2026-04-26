@@ -62,7 +62,11 @@ impl MetalBackend {
         dims: FfnDims,
         ffn_uses_q4k: bool,
     ) {
-        let FfnDims { hidden, inter, inter_padded } = dims;
+        let FfnDims {
+            hidden,
+            inter,
+            inter_padded,
+        } = dims;
         let inter_val = inter as u32;
         let inter_padded_val = inter_padded as u32;
         let hidden_val = hidden as u32;
@@ -72,8 +76,17 @@ impl MetalBackend {
         if ffn_is_q4kf {
             self.encode_q4kf_ffn(enc, layer, &bufs, hidden, inter, hidden_val, inter_val);
         } else if ffn_uses_q4k {
-            self.encode_q4k_ffn(enc, layer, &bufs, hidden, inter, inter_padded,
-                hidden_val, inter_val, inter_padded_val);
+            self.encode_q4k_ffn(
+                enc,
+                layer,
+                &bufs,
+                hidden,
+                inter,
+                inter_padded,
+                hidden_val,
+                inter_val,
+                inter_padded_val,
+            );
         } else {
             self.encode_q4_0_ffn(enc, layer, &bufs, hidden, inter, hidden_val, inter_val);
         }
@@ -92,8 +105,8 @@ impl MetalBackend {
         hidden_val: u32,
         inter_val: u32,
     ) {
-        use crate::metal::shaders::q4kf_qkv_proj as q4kf;
         use crate::metal::shaders::q4kf_ffn_gate_up as q4kf_gu;
+        use crate::metal::shaders::q4kf_qkv_proj as q4kf;
         let n_tgs_down = (hidden as u64).div_ceil(q4kf::ROWS_PER_TG);
 
         if layer.is_gated() {
@@ -127,9 +140,19 @@ impl MetalBackend {
             enc.set_buffer(2, Some(bufs.up_out), 0);
             enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(n_tgs_up, 1, 1), MTLSize::new(q4kf::THREADS_PER_TG, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs_up, 1, 1),
+                MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
+            );
 
-            self.encode_activation(enc, layer, bufs.up_out, bufs.act_buf, inter_val, inter as u64);
+            self.encode_activation(
+                enc,
+                layer,
+                bufs.up_out,
+                bufs.act_buf,
+                inter_val,
+                inter as u64,
+            );
 
             enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline.state);
             enc.set_buffer(0, Some(bufs.down_w), 0);
@@ -137,7 +160,10 @@ impl MetalBackend {
             enc.set_buffer(2, Some(bufs.down_out), 0);
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(q4kf::THREADS_PER_TG, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs_down, 1, 1),
+                MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
+            );
         }
     }
 
@@ -156,8 +182,8 @@ impl MetalBackend {
         inter_val: u32,
         inter_padded_val: u32,
     ) {
-        use crate::metal::shaders::q4k_matvec as q4k;
         use crate::metal::shaders::q4k_ffn_gate_up as q4k_gu;
+        use crate::metal::shaders::q4k_matvec as q4k;
         let n_tgs_down = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
 
         if layer.is_gated() {
@@ -197,7 +223,13 @@ impl MetalBackend {
             // GEGLU then format-aware down dispatch.
             if layer.down.format == crate::QuantFormat::Q4_K {
                 self.encode_q4k_fused_geglu_down(
-                    enc, layer, bufs, hidden, inter_padded, hidden_val, inter_padded_val,
+                    enc,
+                    layer,
+                    bufs,
+                    hidden,
+                    inter_padded,
+                    hidden_val,
+                    inter_padded_val,
                 );
             } else {
                 self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
@@ -209,12 +241,20 @@ impl MetalBackend {
                     q4_matvec: &self.q4.matvec,
                 };
                 qmv::encode(
-                    enc, layer.down.format, bufs.down_w,
-                    bufs.act_buf, 0,
-                    bufs.act_buf, 0, bufs.act_buf, 0, // Q8 unused for f32 input
-                    bufs.down_out, 0,
+                    enc,
+                    layer.down.format,
+                    bufs.down_w,
+                    bufs.act_buf,
+                    0,
+                    bufs.act_buf,
+                    0,
+                    bufs.act_buf,
+                    0, // Q8 unused for f32 input
+                    bufs.down_out,
+                    0,
                     &pipes,
-                    hidden, inter_padded,
+                    hidden,
+                    inter_padded,
                 );
             }
             let _ = n_tgs_down;
@@ -226,17 +266,34 @@ impl MetalBackend {
             enc.set_buffer(2, Some(bufs.up_out), 0);
             enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(n_tgs_up, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs_up, 1, 1),
+                MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+            );
 
-            self.encode_activation(enc, layer, bufs.up_out, bufs.act_buf, inter_val, inter as u64);
+            self.encode_activation(
+                enc,
+                layer,
+                bufs.up_out,
+                bufs.act_buf,
+                inter_val,
+                inter as u64,
+            );
 
             enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(bufs.down_w), 0);
             enc.set_buffer(1, Some(bufs.act_buf), 0);
             enc.set_buffer(2, Some(bufs.down_out), 0);
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(4, 4, &inter_padded_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+            enc.set_bytes(
+                4,
+                4,
+                &inter_padded_val as *const u32 as *const std::ffi::c_void,
+            );
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs_down, 1, 1),
+                MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+            );
         }
     }
 
@@ -285,7 +342,14 @@ impl MetalBackend {
             enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(MTLSize::new(n_tgs_ffn, 1, 1), tg_size);
 
-            self.encode_activation(enc, layer, bufs.up_out, bufs.act_buf, inter_val, inter as u64);
+            self.encode_activation(
+                enc,
+                layer,
+                bufs.up_out,
+                bufs.act_buf,
+                inter_val,
+                inter as u64,
+            );
         }
 
         // Down via Q4_0 f32-input matvec (fixed pipeline, no
@@ -343,9 +407,7 @@ impl MetalBackend {
             crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
             _ => &self.q4k_geglu_silu_down_pipeline,
         };
-        Self::dispatch_fused_geglu_down(
-            enc, kernel, bufs, hidden, hidden_val, inter_padded_val,
-        );
+        Self::dispatch_fused_geglu_down(enc, kernel, bufs, hidden, hidden_val, inter_padded_val);
     }
 
     /// Twin of `encode_q4k_fused_geglu_down` for Q6_K down weights.
@@ -366,9 +428,7 @@ impl MetalBackend {
             crate::Activation::GeluTanh => &self.q6k_geglu_gelu_tanh_down_pipeline,
             _ => &self.q6k_geglu_silu_down_pipeline,
         };
-        Self::dispatch_fused_geglu_down(
-            enc, kernel, bufs, hidden, hidden_val, inter_padded_val,
-        );
+        Self::dispatch_fused_geglu_down(enc, kernel, bufs, hidden, hidden_val, inter_padded_val);
     }
 
     /// Shared dispatch body for the Q4_K / Q6_K fused activation+down
@@ -392,7 +452,11 @@ impl MetalBackend {
         enc.set_buffer(2, Some(bufs.up_out), 0);
         enc.set_buffer(3, Some(bufs.down_out), 0);
         enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(5, 4, &inter_padded_val as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(
+            5,
+            4,
+            &inter_padded_val as *const u32 as *const std::ffi::c_void,
+        );
         enc.dispatch_thread_groups(
             MTLSize::new(n_tgs_down, 1, 1),
             MTLSize::new(kernel.threads_per_tg, 1, 1),
@@ -435,12 +499,20 @@ impl MetalBackend {
             q4_matvec: &self.q4.matvec,
         };
         qmv::encode(
-            enc, layer.down.format, bufs.down_w,
-            bufs.act_buf, 0,
-            bufs.act_buf, 0, bufs.act_buf, 0,
-            bufs.down_out, 0,
+            enc,
+            layer.down.format,
+            bufs.down_w,
+            bufs.act_buf,
+            0,
+            bufs.act_buf,
+            0,
+            bufs.act_buf,
+            0,
+            bufs.down_out,
+            0,
             &pipes,
-            hidden, inter,
+            hidden,
+            inter,
         );
     }
 }

@@ -22,12 +22,20 @@ pub trait DecodeBackend {
         &self,
         _layers: &[crate::FullPipelineLayer<'_>],
         _x: &[f32],
-        _hidden: usize, _inter: usize,
-        _q_dim: usize, _kv_dim: usize,
+        _hidden: usize,
+        _inter: usize,
+        _q_dim: usize,
+        _kv_dim: usize,
         _seq_len: usize,
-        _num_q_heads: usize, _num_kv_heads: usize, _head_dim: usize,
-        _rope_base: f32, _use_qk_norm: bool, _softcap: f32,
-    ) -> Option<Vec<f32>> { None }
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        _use_qk_norm: bool,
+        _softcap: f32,
+    ) -> Option<Vec<f32>> {
+        None
+    }
 
     /// Multi-layer Q4 FFN in one submission: gate → up → GEGLU → down.
     fn multi_layer_q4_ffn(
@@ -36,26 +44,33 @@ pub trait DecodeBackend {
         _x: &[f32],
         _inter: usize,
         _hidden: usize,
-    ) -> Option<Vec<f32>> { None }
+    ) -> Option<Vec<f32>> {
+        None
+    }
 
     /// Whether this backend supports KV-cache decode operations.
-    fn has_kv_cache(&self) -> bool { false }
+    fn has_kv_cache(&self) -> bool {
+        false
+    }
 
     /// Populate KV cache with prefill K/V data for one layer.
     fn populate_kv_layer(
-        &self, _layer: usize,
-        _k_data: &[f32], _v_data: &[f32],
-        _seq_len: usize, _num_kv_heads: usize, _head_dim: usize,
-    ) {}
+        &self,
+        _layer: usize,
+        _k_data: &[f32],
+        _v_data: &[f32],
+        _seq_len: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) {
+    }
 
     /// Reset KV cache (for new prompt).
     fn reset_kv_cache(&self) {}
 
     /// Pre-allocate the KV cache with per-layer shapes. Required for
     /// asymmetric attention geometry (Gemma 4 alternates sliding/global).
-    fn preallocate_kv_cache_per_layer(
-        &self, _shapes: &[(usize, usize)], _max_seq: usize,
-    ) {}
+    fn preallocate_kv_cache_per_layer(&self, _shapes: &[(usize, usize)], _max_seq: usize) {}
 
     /// Decode one token through all layers with KV cache.
     #[allow(clippy::too_many_arguments)]
@@ -63,11 +78,17 @@ pub trait DecodeBackend {
         &self,
         _layers: &[crate::FullPipelineLayer<'_>],
         _x: &[f32],
-        _hidden: usize, _inter: usize,
-        _q_dim: usize, _kv_dim: usize,
-        _num_q_heads: usize, _num_kv_heads: usize, _head_dim: usize,
+        _hidden: usize,
+        _inter: usize,
+        _q_dim: usize,
+        _kv_dim: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
         _rope_base: f32,
-    ) -> Option<Vec<f32>> { None }
+    ) -> Option<Vec<f32>> {
+        None
+    }
 
     /// Like `decode_token` but calls `moe_fn(layer, h_post_attn)` for
     /// MoE layers (enables remote expert dispatch). Default delegates
@@ -77,14 +98,28 @@ pub trait DecodeBackend {
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
         rope_base: f32,
         _moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
-        self.decode_token(layers, x, hidden, inter, q_dim, kv_dim,
-                          num_q_heads, num_kv_heads, head_dim, rope_base)
+        self.decode_token(
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+        )
     }
 
     /// Like `decode_token` but splits each layer into attn / gate+up /
@@ -96,15 +131,31 @@ pub trait DecodeBackend {
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
         rope_base: f32,
     ) -> (Option<Vec<f32>>, f64, f64, f64) {
         (
-            self.decode_token(layers, x, hidden, inter, q_dim, kv_dim,
-                              num_q_heads, num_kv_heads, head_dim, rope_base),
-            0.0, 0.0, 0.0,
+            self.decode_token(
+                layers,
+                x,
+                hidden,
+                inter,
+                q_dim,
+                kv_dim,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                rope_base,
+            ),
+            0.0,
+            0.0,
+            0.0,
         )
     }
 
@@ -116,10 +167,18 @@ pub trait DecodeBackend {
         &self,
         _layers: &[crate::FullPipelineLayer<'_>],
         _x: &[f32],
-        _hidden: usize, _inter: usize,
-        _q_dim: usize, _kv_dim: usize,
+        _hidden: usize,
+        _inter: usize,
+        _q_dim: usize,
+        _kv_dim: usize,
         _seq_len: usize,
-        _num_q_heads: usize, _num_kv_heads: usize, _head_dim: usize,
-        _rope_base: f32, _use_qk_norm: bool, _softcap: f32,
-    ) -> Option<Vec<f32>> { None }
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        _use_qk_norm: bool,
+        _softcap: f32,
+    ) -> Option<Vec<f32>> {
+        None
+    }
 }

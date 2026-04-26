@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use ndarray::Array2;
 use larql_models::TopKEntry;
+use ndarray::Array2;
 
 use crate::error::VindexError;
 
@@ -229,5 +229,4 @@ impl VectorIndex {
 
         Ok(count)
     }
-
 }

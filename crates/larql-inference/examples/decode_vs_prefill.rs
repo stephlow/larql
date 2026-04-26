@@ -37,9 +37,12 @@ use larql_inference::wrap_chat_prompt;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
-        args.next().ok_or("usage: decode_vs_prefill <vindex-dir> [prompt]")?,
+        args.next()
+            .ok_or("usage: decode_vs_prefill <vindex-dir> [prompt]")?,
     );
-    let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
+    let prompt = args
+        .next()
+        .unwrap_or_else(|| "The capital of France is".to_string());
 
     if !vindex_path.is_dir() {
         return Err(format!("not a vindex dir: {}", vindex_path.display()).into());
@@ -76,21 +79,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Step 0: drive Metal through generate() to populate KV cache
     // and obtain the first-token argmax. We then append that token to
     // the prompt and have two ways to compute the next hidden state. ──
-    let metal_backend = larql_compute::metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable")?;
+    let metal_backend =
+        larql_compute::metal::MetalBackend::new().ok_or("Metal backend unavailable")?;
     let cached = CachedLayerGraph::from_residuals(Vec::new());
 
     // Warm-up then measured: first generate() call allocates KV buffers;
     // we want the measurement to reflect the fast path.
     let _ = generate(
-        &mut w_metal, &tokenizer, &prompt_ids, 1,
-        &q4_index, &metal_backend, &cached, 0..num_layers,
+        &mut w_metal,
+        &tokenizer,
+        &prompt_ids,
+        1,
+        &q4_index,
+        &metal_backend,
+        &cached,
+        0..num_layers,
     );
     // Re-run in a way that leaves the KV cache populated for the
     // prefill-only scope (max_tokens=1 → prefill runs, no decode loop).
     let r0 = generate(
-        &mut w_metal, &tokenizer, &prompt_ids, 1,
-        &q4_index, &metal_backend, &cached, 0..num_layers,
+        &mut w_metal,
+        &tokenizer,
+        &prompt_ids,
+        1,
+        &q4_index,
+        &metal_backend,
+        &cached,
+        0..num_layers,
     );
     let token_0_text = r0
         .tokens
@@ -103,7 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Using the rendered chat prompt + the decoded first token ensures
     // the id we re-feed is whatever Metal selected.
     let appended_prompt = format!("{}{}", wrap.prompt, token_0_text);
-    let appended_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &appended_prompt)?;
+    let appended_ids =
+        larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &appended_prompt)?;
     let appended_len = appended_ids.len();
     if appended_len <= prompt_ids.len() {
         return Err("failed to append step-0 token to prompt (tokeniser re-merged)".into());
@@ -118,15 +134,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reference without the tooling overhead of running Metal prefill
     // twice.
     let t0 = Instant::now();
-    let cpu_hidden_full = larql_inference::vindex::predict_q4k_hidden(
-        &mut w_cpu, &appended_ids, &q4_index,
-    );
+    let cpu_hidden_full =
+        larql_inference::vindex::predict_q4k_hidden(&mut w_cpu, &appended_ids, &q4_index);
     let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let cpu_last = cpu_hidden_full
         .row(cpu_hidden_full.nrows().saturating_sub(1))
         .to_owned();
-    println!("  A) CPU full prefill({} tok) took {:>7.1} ms",
-        appended_ids.len(), cpu_ms);
+    println!(
+        "  A) CPU full prefill({} tok) took {:>7.1} ms",
+        appended_ids.len(),
+        cpu_ms
+    );
 
     // ── B. Metal prefill(prompt) + single decode_token(token_0). ──
     // `generate()` leaves the backend's KV cache in a usable state for
@@ -155,11 +173,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let intermediate = q4_index.num_features(0);
 
     let t1 = Instant::now();
-    let prefill_result = metal_backend.prefill_q4(
-        &layers, &prefill_x, hidden, intermediate, q_dim, kv_dim,
-        prompt_ids.len(), w_metal.num_q_heads, w_metal.num_kv_heads, w_metal.head_dim,
-        rope, qk_norm_val, softcap,
-    ).ok_or("Metal prefill_q4 returned None")?;
+    let prefill_result = metal_backend
+        .prefill_q4(
+            &layers,
+            &prefill_x,
+            hidden,
+            intermediate,
+            q_dim,
+            kv_dim,
+            prompt_ids.len(),
+            w_metal.num_q_heads,
+            w_metal.num_kv_heads,
+            w_metal.head_dim,
+            rope,
+            qk_norm_val,
+            softcap,
+        )
+        .ok_or("Metal prefill_q4 returned None")?;
     let metal_prefill_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     // Decode one token. Returns the [hidden] output of the final
@@ -182,25 +212,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `layer_graph::generate` drives and the one we want to verify.
     let backend_dyn: &dyn ComputeBackend = &metal_backend;
     let t2 = Instant::now();
-    let metal_decode = backend_dyn.decode_token(
-        &layers, &dec_x, hidden, intermediate, q_dim, kv_dim,
-        w_metal.num_q_heads, w_metal.num_kv_heads, w_metal.head_dim, rope,
-    ).ok_or("Metal decode_token returned None")?;
+    let metal_decode = backend_dyn
+        .decode_token(
+            &layers,
+            &dec_x,
+            hidden,
+            intermediate,
+            q_dim,
+            kv_dim,
+            w_metal.num_q_heads,
+            w_metal.num_kv_heads,
+            w_metal.head_dim,
+            rope,
+        )
+        .ok_or("Metal decode_token returned None")?;
     let metal_decode_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
     // Re-run CPU full-prefill with the layer-dump env var set so we can
     // walk the two paths side by side. Cheap relative to the Metal
     // prefill we already paid for.
     let mut w_cpu2 = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
-    let _ = larql_inference::vindex::predict_q4k_hidden(
-        &mut w_cpu2, &appended_ids, &q4_index,
-    );
+    let _ = larql_inference::vindex::predict_q4k_hidden(&mut w_cpu2, &appended_ids, &q4_index);
 
     println!(
         "  B) Metal prefill({} tok) + decode(1 tok) took {:>5.1} + {:>5.1} ms",
-        prompt_ids.len(), metal_prefill_ms, metal_decode_ms,
+        prompt_ids.len(),
+        metal_prefill_ms,
+        metal_decode_ms,
     );
-    let _ = prefill_result;  // last hidden not needed for the comparison
+    let _ = prefill_result; // last hidden not needed for the comparison
 
     // ── Compare A vs B ────────────────────────────────────────────────────
     if cpu_last.len() != metal_decode.len() {
@@ -208,16 +248,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "shape mismatch: cpu={} metal_decode={}",
             cpu_last.len(),
             metal_decode.len()
-        ).into());
+        )
+        .into());
     }
     let cpu_slice = cpu_last.as_slice().unwrap();
     let (cos, max_abs, cpu_norm, mtl_norm) = compare(cpu_slice, &metal_decode);
-    let rel = if mtl_norm > 0.0 { max_abs / mtl_norm } else { 0.0 };
+    let rel = if mtl_norm > 0.0 {
+        max_abs / mtl_norm
+    } else {
+        0.0
+    };
 
     println!();
     println!("━━━ Hidden state at new position ────────────────────────────────────");
     println!("  cos_sim       {cos:.6}");
-    println!("  max|Δ|        {max_abs:.3e}  ({:.3}% of ||mtl||)", 100.0 * rel);
+    println!(
+        "  max|Δ|        {max_abs:.3e}  ({:.3}% of ||mtl||)",
+        100.0 * rel
+    );
     println!("  ||cpu||       {cpu_norm:.3}");
     println!("  ||mtl_decode|| {mtl_norm:.3}");
 
@@ -237,29 +285,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // comparison. ──
     println!();
     println!("━━━ Per-layer compare: CPU last-row vs decode_token output ─────────");
-    println!("  {:>3}  {:>10}  {:>12}  {:>10}  {:>10}", "L", "cos_sim", "max_abs_Δ", "||cpu||", "||dec||");
+    println!(
+        "  {:>3}  {:>10}  {:>12}  {:>10}  {:>10}",
+        "L", "cos_sim", "max_abs_Δ", "||cpu||", "||dec||"
+    );
     for l in 0..num_layers {
         let dec_path = decode_dump.path().join(format!("decode_layer_{l:02}.f32"));
         let cpu_path = cpu_dump.path().join(format!("cpu_layer_{l:02}.f32"));
         let dec_v = match std::fs::read(&dec_path) {
-            Ok(b) => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>(),
-            Err(_) => { println!("  L{l:02}  <decode dump missing>"); continue; }
+            Ok(b) => b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>(),
+            Err(_) => {
+                println!("  L{l:02}  <decode dump missing>");
+                continue;
+            }
         };
         let cpu_all = match std::fs::read(&cpu_path) {
-            Ok(b) => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>(),
-            Err(_) => { println!("  L{l:02}  <cpu dump missing>"); continue; }
+            Ok(b) => b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>(),
+            Err(_) => {
+                println!("  L{l:02}  <cpu dump missing>");
+                continue;
+            }
         };
         // CPU dump is [seq_len, hidden] flat; take the last position.
         let sl = cpu_all.len() / hidden;
         let cpu_last_row = &cpu_all[(sl - 1) * hidden..sl * hidden];
         if cpu_last_row.len() != dec_v.len() {
-            println!("  L{l:02}  <len mismatch: cpu_row={} dec={}>", cpu_last_row.len(), dec_v.len());
+            println!(
+                "  L{l:02}  <len mismatch: cpu_row={} dec={}>",
+                cpu_last_row.len(),
+                dec_v.len()
+            );
             continue;
         }
         let (c, m, cn, mn) = compare(cpu_last_row, &dec_v);
         let rel = if mn > 0.0 { m / mn } else { 0.0 };
         let flag = if c < 0.9999 { " ←" } else { "" };
-        println!("  L{l:02}  {c:>10.6}  {m:>12.3e}  {cn:>10.3}  {mn:>10.3}  ({:.1}%){flag}", 100.0 * rel);
+        println!(
+            "  L{l:02}  {c:>10.6}  {m:>12.3e}  {cn:>10.3}  {mn:>10.3}  ({:.1}%){flag}",
+            100.0 * rel
+        );
     }
 
     Ok(())
@@ -286,11 +356,21 @@ fn build_layers<'a>(
     } else {
         intermediate * hidden / 32 * 18
     };
-    let ffn_format = if ffn_is_q4k { larql_compute::QuantFormat::Q4_K } else { larql_compute::QuantFormat::Q4_0 };
-    Ok(larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
-        weights, index, 0..num_layers,
-        q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
-    ))
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    Ok(
+        larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
+            weights,
+            index,
+            0..num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
+        ),
+    )
 }
 
 fn compare(a: &[f32], b: &[f32]) -> (f32, f32, f32, f32) {
@@ -305,10 +385,14 @@ fn compare(a: &[f32], b: &[f32]) -> (f32, f32, f32, f32) {
         an += x * x;
         bn += y * y;
         let d = (a[i] - b[i]).abs();
-        if d > max_abs { max_abs = d; }
+        if d > max_abs {
+            max_abs = d;
+        }
     }
     let cos = if an > 0.0 && bn > 0.0 {
         (dot / (an.sqrt() * bn.sqrt())) as f32
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     (cos, max_abs, an.sqrt() as f32, bn.sqrt() as f32)
 }

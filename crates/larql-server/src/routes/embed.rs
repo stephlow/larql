@@ -9,17 +9,18 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use larql_inference::forward::predict::logits_to_predictions_pub;
 use larql_vindex::ndarray::Array2;
 
 use crate::error::ServerError;
+use crate::http::BINARY_FFN_CONTENT_TYPE;
 use crate::state::{AppState, LoadedModel};
 
 // ── Request / response types ──────────────────────────────────────────────────
@@ -48,8 +49,16 @@ pub struct LogitsRequest {
     pub temperature: f32,
 }
 
-fn default_top_k() -> usize { 5 }
-fn default_temperature() -> f32 { 1.0 }
+fn default_top_k() -> usize {
+    5
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+
+fn error_response(error: ServerError) -> Response {
+    error.into_response()
+}
 
 #[derive(Serialize)]
 pub struct TokenProb {
@@ -153,7 +162,7 @@ async fn handle_embed_inner(
     let model = match state.model(model_id) {
         Some(m) => m,
         None => {
-            return (StatusCode::NOT_FOUND, "model not found").into_response();
+            return error_response(ServerError::NotFound("model not found".into()));
         }
     };
 
@@ -165,19 +174,23 @@ async fn handle_embed_inner(
     let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response();
+            return error_response(ServerError::BadRequest(format!("read body: {e}")));
         }
     };
 
     let start = std::time::Instant::now();
 
-    let token_ids: Vec<u32> = if content_type.contains("application/x-larql-ffn") {
+    let token_ids: Vec<u32> = if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
         if bytes.len() < 4 {
-            return (StatusCode::BAD_REQUEST, "binary embed: need ≥4 bytes").into_response();
+            return error_response(ServerError::BadRequest(
+                "binary embed: need ≥4 bytes".into(),
+            ));
         }
         let num_tokens = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         if bytes.len() < 4 + num_tokens * 4 {
-            return (StatusCode::BAD_REQUEST, "binary embed: truncated token_ids").into_response();
+            return error_response(ServerError::BadRequest(
+                "binary embed: truncated token_ids".into(),
+            ));
         }
         (0..num_tokens)
             .map(|i| u32::from_le_bytes(bytes[4 + i * 4..4 + i * 4 + 4].try_into().unwrap()))
@@ -186,15 +199,18 @@ async fn handle_embed_inner(
         let req: EmbedRequest = match serde_json::from_slice(&bytes) {
             Ok(r) => r,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("parse embed request: {e}"))
-                    .into_response();
+                return error_response(ServerError::BadRequest(format!(
+                    "parse embed request: {e}"
+                )));
             }
         };
         req.token_ids
     };
 
     if token_ids.is_empty() {
-        return (StatusCode::BAD_REQUEST, "token_ids must be non-empty").into_response();
+        return error_response(ServerError::BadRequest(
+            "token_ids must be non-empty".into(),
+        ));
     }
 
     let h = match embed_tokens(model, &token_ids) {
@@ -207,25 +223,17 @@ async fn handle_embed_inner(
     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
 
     // Return binary if the client asked for it.
-    if content_type.contains("application/x-larql-ffn") {
+    if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
         let mut out = Vec::with_capacity(8 + seq_len * hidden * 4);
         out.extend_from_slice(&(seq_len as u32).to_le_bytes());
         out.extend_from_slice(&(hidden as u32).to_le_bytes());
         for val in h.iter() {
             out.extend_from_slice(&val.to_le_bytes());
         }
-        return (
-            [(header::CONTENT_TYPE, "application/x-larql-ffn")],
-            out,
-        )
-            .into_response();
+        return ([(header::CONTENT_TYPE, BINARY_FFN_CONTENT_TYPE)], out).into_response();
     }
 
-    let residual: Vec<Vec<f32>> = h
-        .rows()
-        .into_iter()
-        .map(|row| row.to_vec())
-        .collect();
+    let residual: Vec<Vec<f32>> = h.rows().into_iter().map(|row| row.to_vec()).collect();
 
     Json(EmbedResponse {
         residual,
@@ -269,7 +277,7 @@ async fn handle_logits_inner(
     state.bump_requests();
     let model = match state.model(model_id) {
         Some(m) => m,
-        None => return (StatusCode::NOT_FOUND, "model not found").into_response(),
+        None => return error_response(ServerError::NotFound("model not found".into())),
     };
 
     let content_type = headers
@@ -279,14 +287,15 @@ async fn handle_logits_inner(
 
     let bytes = match axum::body::to_bytes(body, 256 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response(),
+        Err(e) => return error_response(ServerError::BadRequest(format!("read body: {e}"))),
     };
 
     let (residual_flat, top_k, temperature): (Vec<f32>, usize, f32) =
-        if content_type.contains("application/x-larql-ffn") {
+        if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
             if bytes.len() % 4 != 0 {
-                return (StatusCode::BAD_REQUEST, "binary logits: byte length not multiple of 4")
-                    .into_response();
+                return error_response(ServerError::BadRequest(
+                    "binary logits: byte length not multiple of 4".into(),
+                ));
             }
             let floats: Vec<f32> = bytes
                 .chunks_exact(4)
@@ -297,8 +306,9 @@ async fn handle_logits_inner(
             let req: LogitsRequest = match serde_json::from_slice(&bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    return (StatusCode::BAD_REQUEST, format!("parse logits request: {e}"))
-                        .into_response();
+                    return error_response(ServerError::BadRequest(format!(
+                        "parse logits request: {e}"
+                    )));
                 }
             };
             (req.residual, req.top_k, req.temperature)
@@ -306,22 +316,17 @@ async fn handle_logits_inner(
 
     let hidden = model.config.hidden_size;
     if residual_flat.len() != hidden {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "residual length {} != hidden_size {}",
-                residual_flat.len(),
-                hidden
-            ),
-        )
-            .into_response();
+        return error_response(ServerError::BadRequest(format!(
+            "residual length {} != hidden_size {}",
+            residual_flat.len(),
+            hidden
+        )));
     }
 
     let weights = match model.get_or_load_weights() {
         Ok(w) => w,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("load weights: {e}"))
-                .into_response();
+            return error_response(ServerError::Internal(format!("load weights: {e}")));
         }
     };
 
@@ -481,26 +486,29 @@ fn handle_embed_single_inner(
     state.bump_requests();
     let model = match state.model(model_id) {
         Some(m) => m,
-        None => return (StatusCode::NOT_FOUND, "model not found").into_response(),
+        None => return error_response(ServerError::NotFound("model not found".into())),
     };
 
     let row: Vec<f32> = if let Some(ref store) = model.embed_store {
         match store.lookup(token_id) {
             Ok(r) => r,
-            Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+            Err(e) => return error_response(ServerError::BadRequest(e)),
         }
     } else {
         let vocab = model.embeddings.shape()[0];
         let scale = model.embed_scale;
         let tid = token_id as usize;
         if tid >= vocab {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("token_id {token_id} out of range (vocab={vocab})"),
-            )
-                .into_response();
+            return error_response(ServerError::BadRequest(format!(
+                "token_id {token_id} out of range (vocab={vocab})"
+            )));
         }
-        model.embeddings.row(tid).iter().map(|&v| v * scale).collect()
+        model
+            .embeddings
+            .row(tid)
+            .iter()
+            .map(|&v| v * scale)
+            .collect()
     };
 
     let cache_headers = [
@@ -530,7 +538,7 @@ fn handle_embed_single_inner(
     }
     (
         [
-            (header::CONTENT_TYPE, "application/x-larql-ffn"),
+            (header::CONTENT_TYPE, BINARY_FFN_CONTENT_TYPE),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             (header::VARY, "Accept"),
         ],
@@ -603,8 +611,14 @@ mod tests {
         for val in h.iter() {
             out.extend_from_slice(&val.to_le_bytes());
         }
-        assert_eq!(u32::from_le_bytes(out[..4].try_into().unwrap()) as usize, seq_len);
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()) as usize, hidden);
+        assert_eq!(
+            u32::from_le_bytes(out[..4].try_into().unwrap()) as usize,
+            seq_len
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[4..8].try_into().unwrap()) as usize,
+            hidden
+        );
         assert_eq!(out.len(), 8 + seq_len * hidden * 4);
     }
 
@@ -620,7 +634,11 @@ mod tests {
         let payload = &out[8..];
         for (i, chunk) in payload.chunks_exact(4).enumerate() {
             let got = f32::from_le_bytes(chunk.try_into().unwrap());
-            assert!((got - values[i]).abs() < 1e-6, "float[{i}]: {got} != {}", values[i]);
+            assert!(
+                (got - values[i]).abs() < 1e-6,
+                "float[{i}]: {got} != {}",
+                values[i]
+            );
         }
         let _ = (seq_len, hidden);
     }
@@ -715,7 +733,7 @@ mod tests {
         let embed = Array2::<f32>::zeros((8, 4));
         let vocab = embed.shape()[0];
         assert!((8usize >= vocab)); // token_id=8 is OOB for vocab=8
-        assert!(7usize < vocab);   // token_id=7 is in range
+        assert!(7usize < vocab); // token_id=7 is in range
     }
 
     #[test]

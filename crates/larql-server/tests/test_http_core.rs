@@ -12,8 +12,8 @@ use larql_server::cache::DescribeCache;
 use larql_server::error::ServerError;
 use larql_server::session::SessionManager;
 use larql_server::state::AppState;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 // ══════════════════════════════════════════════════════════════
 // GET /v1/health
@@ -41,7 +41,11 @@ async fn http_health_bumps_request_counter() {
     let st = state(vec![model("test")]);
     let app = single_model_router(st.clone());
     get(app, "/v1/health").await;
-    assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        st.requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -77,8 +81,7 @@ async fn http_models_multi_path_includes_model_id() {
     let models = body["models"].as_array().unwrap();
     assert_eq!(models.len(), 2);
     // Multi-model paths are /v1/{id}
-    let paths: Vec<&str> = models.iter()
-        .map(|m| m["path"].as_str().unwrap()).collect();
+    let paths: Vec<&str> = models.iter().map(|m| m["path"].as_str().unwrap()).collect();
     assert!(paths.contains(&"/v1/a"));
     assert!(paths.contains(&"/v1/b"));
 }
@@ -193,8 +196,8 @@ async fn http_auth_no_api_key_configured_allows_all() {
 #[tokio::test]
 async fn http_auth_correct_bearer_returns_200() {
     let st = state_with_key(vec![model("test")], "secret123");
-    let app = single_model_router(st.clone())
-        .layer(middleware::from_fn_with_state(st, auth_middleware));
+    let app =
+        single_model_router(st.clone()).layer(middleware::from_fn_with_state(st, auth_middleware));
     let resp = get_h(app, "/v1/stats", ("authorization", "Bearer secret123")).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -202,8 +205,8 @@ async fn http_auth_correct_bearer_returns_200() {
 #[tokio::test]
 async fn http_auth_wrong_bearer_returns_401() {
     let st = state_with_key(vec![model("test")], "secret123");
-    let app = single_model_router(st.clone())
-        .layer(middleware::from_fn_with_state(st, auth_middleware));
+    let app =
+        single_model_router(st.clone()).layer(middleware::from_fn_with_state(st, auth_middleware));
     let resp = get_h(app, "/v1/stats", ("authorization", "Bearer wrongkey")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -211,8 +214,8 @@ async fn http_auth_wrong_bearer_returns_401() {
 #[tokio::test]
 async fn http_auth_missing_header_returns_401() {
     let st = state_with_key(vec![model("test")], "secret123");
-    let app = single_model_router(st.clone())
-        .layer(middleware::from_fn_with_state(st, auth_middleware));
+    let app =
+        single_model_router(st.clone()).layer(middleware::from_fn_with_state(st, auth_middleware));
     let resp = get(app, "/v1/stats").await; // no auth header
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -220,8 +223,8 @@ async fn http_auth_missing_header_returns_401() {
 #[tokio::test]
 async fn http_auth_health_exempt_without_key() {
     let st = state_with_key(vec![model("test")], "secret123");
-    let app = single_model_router(st.clone())
-        .layer(middleware::from_fn_with_state(st, auth_middleware));
+    let app =
+        single_model_router(st.clone()).layer(middleware::from_fn_with_state(st, auth_middleware));
     // /v1/health must be reachable even without auth.
     let resp = get(app, "/v1/health").await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -230,8 +233,8 @@ async fn http_auth_health_exempt_without_key() {
 #[tokio::test]
 async fn http_auth_non_bearer_format_rejected() {
     let st = state_with_key(vec![model("test")], "secret123");
-    let app = single_model_router(st.clone())
-        .layer(middleware::from_fn_with_state(st, auth_middleware));
+    let app =
+        single_model_router(st.clone()).layer(middleware::from_fn_with_state(st, auth_middleware));
     let resp = get_h(app, "/v1/stats", ("authorization", "Token secret123")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -273,7 +276,10 @@ async fn http_server_error_unavailable_body_has_error_key() {
     let status = resp.status();
     let body = body_json(resp.into_body()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(body["error"].as_str().unwrap().contains("no weights loaded"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("no weights loaded"));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -283,12 +289,16 @@ async fn http_server_error_unavailable_body_has_error_key() {
 #[tokio::test]
 async fn http_requests_served_increments_per_request() {
     let st = state(vec![model("test")]);
-    let before = st.requests_served.load(std::sync::atomic::Ordering::Relaxed);
+    let before = st
+        .requests_served
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let app = single_model_router(st.clone());
     get(app, "/v1/health").await;
 
-    let after = st.requests_served.load(std::sync::atomic::Ordering::Relaxed);
+    let after = st
+        .requests_served
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(after, before + 1);
 }
 
@@ -297,7 +307,11 @@ async fn http_select_increments_request_counter() {
     let st = state(vec![model("test")]);
     let app = single_model_router(st.clone());
     post_json(app, "/v1/select", serde_json::json!({})).await;
-    assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        st.requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -310,7 +324,9 @@ async fn http_load_probe_labels_roundtrip() {
     let dir = std::env::temp_dir().join("larql_http_labels_01");
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let json = r#"{"L0_F0":"capital","L1_F2":"language"}"#;
-    tokio::fs::write(dir.join("feature_labels.json"), json).await.unwrap();
+    tokio::fs::write(dir.join("feature_labels.json"), json)
+        .await
+        .unwrap();
 
     let labels = load_probe_labels(&dir);
     assert_eq!(labels.get(&(0, 0)), Some(&"capital".to_string()));

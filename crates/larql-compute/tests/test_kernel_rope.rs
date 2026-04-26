@@ -40,15 +40,13 @@ use common::{cos_sim, get_metal, max_diff};
 /// CPU reference: apply Llama-style split-half RoPE in place to a
 /// single head vector at absolute position `pos`. `rotary_dim` of 0
 /// means "rotate the entire head_dim".
-fn cpu_rope_at_pos(
-    head_dim: usize,
-    rotary_dim: usize,
-    base: f32,
-    pos: usize,
-    x: &mut [f32],
-) {
+fn cpu_rope_at_pos(head_dim: usize, rotary_dim: usize, base: f32, pos: usize, x: &mut [f32]) {
     debug_assert_eq!(x.len(), head_dim);
-    let rdim = if rotary_dim == 0 { head_dim } else { rotary_dim.min(head_dim) };
+    let rdim = if rotary_dim == 0 {
+        head_dim
+    } else {
+        rotary_dim.min(head_dim)
+    };
     let hdim = rdim / 2;
     for d in 0..hdim {
         let freq = 1.0 / base.powf(2.0 * d as f32 / rdim as f32);
@@ -108,7 +106,11 @@ fn run_rope_at_pos_batched(
     enc.set_bytes(5, 4, &nh_val as *const u32 as *const std::ffi::c_void);
 
     // Match the production decode dispatch (one thread per pair × per head).
-    let rdim_eff = if rotary_dim == 0 { head_dim } else { rotary_dim };
+    let rdim_eff = if rotary_dim == 0 {
+        head_dim
+    } else {
+        rotary_dim
+    };
     let pairs = (rdim_eff / 2) as u64;
     enc.dispatch_threads(
         metal::MTLSize::new(pairs, num_heads as u64, 1),
@@ -137,9 +139,7 @@ fn assert_rope_at_pos_batched_matches_cpu(
         .collect();
     let mut expected = x.clone();
     cpu_rope_at_pos_batched(&mut expected, num_heads, head_dim, rotary_dim, base, pos);
-    let result = run_rope_at_pos_batched(
-        &metal, &x, num_heads, head_dim, rotary_dim, base, pos,
-    );
+    let result = run_rope_at_pos_batched(&metal, &x, num_heads, head_dim, rotary_dim, base, pos);
     let diff = max_diff(&expected, &result);
     let cos = cos_sim(&expected, &result);
     assert!(
@@ -154,10 +154,7 @@ fn assert_rope_at_pos_batched_matches_cpu(
 fn rope_at_pos_batched_llama2_full() {
     // 32 heads × 128 dim, full rotation, standard rope_base.
     for &pos in &[0, 1, 5, 17] {
-        assert_rope_at_pos_batched_matches_cpu(
-            "llama2 full",
-            32, 128, 0, 10_000.0, pos,
-        );
+        assert_rope_at_pos_batched_matches_cpu("llama2 full", 32, 128, 0, 10_000.0, pos);
     }
 }
 
@@ -165,10 +162,7 @@ fn rope_at_pos_batched_llama2_full() {
 fn rope_at_pos_batched_gemma3_full_256() {
     // Gemma 3 4B: 8 KV heads × 256 dim, full rotation.
     for &pos in &[0, 7, 23] {
-        assert_rope_at_pos_batched_matches_cpu(
-            "gemma3 full 256",
-            8, 256, 0, 10_000.0, pos,
-        );
+        assert_rope_at_pos_batched_matches_cpu("gemma3 full 256", 8, 256, 0, 10_000.0, pos);
     }
 }
 
@@ -177,10 +171,7 @@ fn rope_at_pos_batched_gemma4_sliding() {
     // Gemma 4 31B sliding layer KV geometry: 16 heads × 256 dim,
     // full rotation, rope_base=10000.
     for &pos in &[0, 17, 100] {
-        assert_rope_at_pos_batched_matches_cpu(
-            "gemma4 sliding",
-            16, 256, 0, 10_000.0, pos,
-        );
+        assert_rope_at_pos_batched_matches_cpu("gemma4 sliding", 16, 256, 0, 10_000.0, pos);
     }
 }
 
@@ -194,7 +185,11 @@ fn rope_at_pos_batched_gemma4_global_partial() {
     for &pos in &[0, 17, 100] {
         assert_rope_at_pos_batched_matches_cpu(
             "gemma4 global partial",
-            4, 512, 128, 500_000.0, pos,
+            4,
+            512,
+            128,
+            500_000.0,
+            pos,
         );
     }
 }
@@ -207,7 +202,11 @@ fn rope_at_pos_batched_q_heads_global() {
     for &pos in &[0, 17] {
         assert_rope_at_pos_batched_matches_cpu(
             "gemma4 global Q heads",
-            32, 512, 128, 500_000.0, pos,
+            32,
+            512,
+            128,
+            500_000.0,
+            pos,
         );
     }
 }
@@ -247,12 +246,22 @@ fn assert_rope_batched_qk_matches_separate(
     let mut ref_q = q_in.clone();
     let mut ref_k = k_in.clone();
     for h in 0..num_q_heads {
-        cpu_rope_at_pos(head_dim, rotary_dim, rope_base, pos,
-                        &mut ref_q[h*head_dim..(h+1)*head_dim]);
+        cpu_rope_at_pos(
+            head_dim,
+            rotary_dim,
+            rope_base,
+            pos,
+            &mut ref_q[h * head_dim..(h + 1) * head_dim],
+        );
     }
     for h in 0..num_kv_heads {
-        cpu_rope_at_pos(head_dim, rotary_dim, rope_base, pos,
-                        &mut ref_k[h*head_dim..(h+1)*head_dim]);
+        cpu_rope_at_pos(
+            head_dim,
+            rotary_dim,
+            rope_base,
+            pos,
+            &mut ref_k[h * head_dim..(h + 1) * head_dim],
+        );
     }
 
     // Fused: rope_at_pos_batched_qk
@@ -263,7 +272,11 @@ fn assert_rope_batched_qk_matches_separate(
     let rdim = rotary_dim as u32;
     let pos_u = pos as u32;
     let nq = num_q_heads as u32;
-    let rope_pairs = (if rotary_dim == 0 { head_dim } else { rotary_dim }) / 2;
+    let rope_pairs = (if rotary_dim == 0 {
+        head_dim
+    } else {
+        rotary_dim
+    }) / 2;
     let total_heads = (num_q_heads + num_kv_heads) as u64;
 
     let cmd = metal.queue().new_command_buffer();

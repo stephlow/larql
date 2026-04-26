@@ -92,9 +92,8 @@ impl Checkpoint {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path)?;
-        let cp: Checkpoint = serde_json::from_str(&text).map_err(|e| {
-            VindexError::Parse(format!("checkpoint at {}: {e}", path.display()))
-        })?;
+        let cp: Checkpoint = serde_json::from_str(&text)
+            .map_err(|e| VindexError::Parse(format!("checkpoint at {}: {e}", path.display())))?;
         Ok(Some(cp))
     }
 
@@ -102,8 +101,8 @@ impl Checkpoint {
     pub fn save(&self, output_dir: &Path) -> Result<(), VindexError> {
         let path = checkpoint_path(output_dir);
         let tmp_path = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| VindexError::Parse(e.to_string()))?;
         let mut f = std::fs::File::create(&tmp_path)?;
         f.write_all(json.as_bytes())?;
         f.sync_all()?;

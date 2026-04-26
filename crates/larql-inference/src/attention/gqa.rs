@@ -3,8 +3,8 @@
 //! Memory-efficient: O(seq) per position, never materializes full [seq, seq] matrix.
 //! Uses BLAS gemv for both Q·K scores and softmax·V accumulation.
 
-use ndarray::Array2;
 use super::AttentionWeights;
+use ndarray::Array2;
 
 /// GQA with causal masking (no weight capture).
 /// q: (seq, num_q * head_dim), k: (seq, num_kv * head_dim), v: same as k
@@ -19,7 +19,8 @@ pub fn gqa_attention(
     scale: f64,
     seq_len: usize,
 ) -> Array2<f32> {
-    let (out, _) = gqa_attention_with_weights(q, k, v, num_q, head_dim, reps, scale, seq_len, false, None);
+    let (out, _) =
+        gqa_attention_with_weights(q, k, v, num_q, head_dim, reps, scale, seq_len, false, None);
     out
 }
 
@@ -101,7 +102,9 @@ pub fn gqa_attention_with_weights(
     }
 
     let weights = if capture {
-        Some(AttentionWeights { heads: captured_heads })
+        Some(AttentionWeights {
+            heads: captured_heads,
+        })
     } else {
         None
     };
@@ -114,8 +117,12 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
-    fn zeros(rows: usize, cols: usize) -> Array2<f32> { Array2::zeros((rows, cols)) }
-    fn ones(rows: usize, cols: usize) -> Array2<f32> { Array2::ones((rows, cols)) }
+    fn zeros(rows: usize, cols: usize) -> Array2<f32> {
+        Array2::zeros((rows, cols))
+    }
+    fn ones(rows: usize, cols: usize) -> Array2<f32> {
+        Array2::ones((rows, cols))
+    }
 
     fn small(rows: usize, cols: usize, scale: f32) -> Array2<f32> {
         let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32 + 1.0) * scale).collect();
@@ -142,7 +149,10 @@ mod tests {
     #[test]
     fn gqa_output_finite() {
         let out = run(4);
-        assert!(out.iter().all(|v| v.is_finite()), "gqa output has non-finite values");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "gqa output has non-finite values"
+        );
     }
 
     #[test]
@@ -164,14 +174,19 @@ mod tests {
         let v = small(seq, hd, 1.0); // distinct values
         let out = gqa_attention(&q, &k, &v, nq, hd, 1, 1.0 / (hd as f64).sqrt(), seq);
         // Last row should be a weighted average of V rows (all weights equal → mean)
-        let expected_last: Vec<f32> = v.rows().into_iter()
-            .fold(vec![0.0f32; hd], |mut acc, row| {
-                for (a, v) in acc.iter_mut().zip(row.iter()) { *a += v / seq as f32; }
+        let expected_last: Vec<f32> =
+            v.rows().into_iter().fold(vec![0.0f32; hd], |mut acc, row| {
+                for (a, v) in acc.iter_mut().zip(row.iter()) {
+                    *a += v / seq as f32;
+                }
                 acc
             });
         let got_last: Vec<f32> = out.row(seq - 1).to_vec();
         for (e, g) in expected_last.iter().zip(got_last.iter()) {
-            assert!((e - g).abs() < 0.01, "last token mean-attn mismatch: {e} vs {g}");
+            assert!(
+                (e - g).abs() < 0.01,
+                "last token mean-attn mismatch: {e} vs {g}"
+            );
         }
     }
 
@@ -182,13 +197,26 @@ mod tests {
         let q = small(seq, hd, 0.1);
         let k = small(seq, hd, 0.1);
         let v = small(seq, hd, 0.1);
-        let (out, weights) = gqa_attention_with_weights(&q, &k, &v, 1, hd, 1,
-            1.0 / (hd as f64).sqrt(), seq, true, None);
+        let (out, weights) = gqa_attention_with_weights(
+            &q,
+            &k,
+            &v,
+            1,
+            hd,
+            1,
+            1.0 / (hd as f64).sqrt(),
+            seq,
+            true,
+            None,
+        );
         assert!(out.iter().all(|v| v.is_finite()));
         let w = weights.expect("weights should be captured");
         // Attention weights for last position should sum to ~1
         let sum: f32 = w.heads[0].iter().sum();
-        assert!((sum - 1.0).abs() < 0.01, "attention weights should sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "attention weights should sum to 1, got {sum}"
+        );
     }
 
     // ── GQA reps > 1: multiple Q-heads per KV-head ───────────────────────────
@@ -205,8 +233,11 @@ mod tests {
         let k = small(seq, num_kv * hd, 0.01);
         let v = small(seq, num_kv * hd, 0.01);
         let out = gqa_attention(&q, &k, &v, num_q, hd, reps, 1.0 / (hd as f64).sqrt(), seq);
-        assert_eq!(out.shape(), &[seq, num_q * hd],
-            "output should be [seq, num_q * head_dim]");
+        assert_eq!(
+            out.shape(),
+            &[seq, num_q * hd],
+            "output should be [seq, num_q * head_dim]"
+        );
     }
 
     #[test]
@@ -218,10 +249,20 @@ mod tests {
         let q = small(seq, num_q * hd, 0.01);
         let k = small(seq, num_kv * hd, 0.01);
         let v = small(seq, num_kv * hd, 0.01);
-        let out = gqa_attention(&q, &k, &v, num_q, hd, num_q / num_kv,
-            1.0 / (hd as f64).sqrt(), seq);
-        assert!(out.iter().all(|v| v.is_finite()),
-            "reps=2 GQA output has non-finite values");
+        let out = gqa_attention(
+            &q,
+            &k,
+            &v,
+            num_q,
+            hd,
+            num_q / num_kv,
+            1.0 / (hd as f64).sqrt(),
+            seq,
+        );
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "reps=2 GQA output has non-finite values"
+        );
     }
 
     #[test]
@@ -237,10 +278,10 @@ mod tests {
         let mut q_data = vec![0.0f32; seq * num_q * hd];
         for s in 0..seq {
             for d in 0..hd {
-                q_data[s * num_q * hd + 0 * hd + d] = 0.1;  // head 0
-                q_data[s * num_q * hd + 1 * hd + d] = 0.1;  // head 1 (same as 0)
-                q_data[s * num_q * hd + 2 * hd + d] = 0.5;  // head 2
-                q_data[s * num_q * hd + 3 * hd + d] = 0.5;  // head 3 (same as 2)
+                q_data[s * num_q * hd + 0 * hd + d] = 0.1; // head 0
+                q_data[s * num_q * hd + 1 * hd + d] = 0.1; // head 1 (same as 0)
+                q_data[s * num_q * hd + 2 * hd + d] = 0.5; // head 2
+                q_data[s * num_q * hd + 3 * hd + d] = 0.5; // head 3 (same as 2)
             }
         }
         let q = Array2::from_shape_vec((seq, num_q * hd), q_data).unwrap();
@@ -251,7 +292,10 @@ mod tests {
         let h0: Vec<f32> = out.row(0).iter().skip(0 * hd).take(hd).copied().collect();
         let h1: Vec<f32> = out.row(0).iter().skip(1 * hd).take(hd).copied().collect();
         for (a, b) in h0.iter().zip(h1.iter()) {
-            assert!((a - b).abs() < 1e-5, "heads 0 and 1 should produce same output: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "heads 0 and 1 should produce same output: {a} vs {b}"
+            );
         }
     }
 }

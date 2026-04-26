@@ -32,4 +32,4 @@ mod stages;
 // Public re-exports — these names are part of the crate-level API
 // (`prefill.rs` uses the encode helpers, callers reach for
 // `dispatch_full_pipeline` directly).
-pub use dispatch::{LayerWeights, dispatch_full_pipeline, encode_rms_norm, encode_residual_add};
+pub use dispatch::{dispatch_full_pipeline, encode_residual_add, encode_rms_norm, LayerWeights};

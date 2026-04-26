@@ -22,7 +22,6 @@ pub struct VindexModelConfig {
 
     // ── Gemma 4 per-layer attention geometry ──
     // All optional for backward compatibility with existing vindexes.
-
     /// Head dimension for global (full) attention layers. If None, all layers use head_dim.
     /// Gemma 4: 512 for global layers, head_dim (256) for sliding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,8 +132,14 @@ mod tests {
     fn optional_fields_absent_in_json_when_none() {
         let cfg = minimal_model_config();
         let j = serde_json::to_string(&cfg).unwrap();
-        assert!(!j.contains("global_head_dim"), "None optional should be omitted");
-        assert!(!j.contains("sliding_window_pattern"), "None optional should be omitted");
+        assert!(
+            !j.contains("global_head_dim"),
+            "None optional should be omitted"
+        );
+        assert!(
+            !j.contains("sliding_window_pattern"),
+            "None optional should be omitted"
+        );
     }
 
     #[test]
@@ -180,4 +185,3 @@ mod tests {
         assert!(!moe.hybrid);
     }
 }
-

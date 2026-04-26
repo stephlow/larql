@@ -14,11 +14,11 @@ use larql_vindex::format::filenames::*;
 use std::path::Path;
 
 use larql_models::quant::fp4_block::BLOCK_ELEMENTS;
+use larql_vindex::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 use larql_vindex::{
     ExtractLevel, Fp4Config, GateIndex, SilentLoadCallbacks, StorageDtype, VectorIndex,
     VindexConfig, VindexLayerInfo,
 };
-use larql_vindex::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 
 /// Minimal tempdir that cleans up on drop.
 struct TempDir(std::path::PathBuf);
@@ -26,14 +26,18 @@ impl TempDir {
     fn new(label: &str) -> Self {
         let base = std::env::temp_dir();
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let p = base.join(format!("fp4_synth_{label}_{}_{}", std::process::id(), ts));
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
     }
 }
 impl Drop for TempDir {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Produce a flat `[num_features × hidden]` layer of synthetic f32 data.
@@ -123,15 +127,16 @@ fn build_minimal_vindex() -> (
     std::fs::write(dir.join("index.json"), config_json).unwrap();
 
     // Minimal tokenizer + down_meta stubs so the loader doesn't choke.
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
     // down_meta.bin header: magic "DMET" + version + num_layers + top_k, no feature records.
     let mut down_meta = Vec::<u8>::new();
     down_meta.extend_from_slice(b"DMET");
-    down_meta.extend_from_slice(&1u32.to_le_bytes());                        // version
+    down_meta.extend_from_slice(&1u32.to_le_bytes()); // version
     down_meta.extend_from_slice(&(per_layer_features.len() as u32).to_le_bytes());
-    down_meta.extend_from_slice(&1u32.to_le_bytes());                        // top_k
-    // Per-layer num_features counts.
+    down_meta.extend_from_slice(&1u32.to_le_bytes()); // top_k
+                                                      // Per-layer num_features counts.
     for &n in &per_layer_features {
         down_meta.extend_from_slice(&(n as u32).to_le_bytes());
     }
@@ -282,7 +287,7 @@ fn synthetic_ffn_row_into_decodes_correctly() {
 
     let src_row = &gate[layer][feat * hidden..(feat + 1) * hidden];
     let block_max = src_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let bound = block_max / 3.0;   // FP4 worst-case per-element
+    let bound = block_max / 3.0; // FP4 worst-case per-element
 
     for i in 0..hidden {
         let err = (src_row[i] - out[i]).abs();
@@ -299,7 +304,9 @@ fn synthetic_ffn_row_returns_none_on_oob() {
     // Layer out of range.
     assert!(index.ffn_row_dot(99, 0, 0, &x).is_none());
     // Feature out of range.
-    assert!(index.ffn_row_dot(0, 0, per_layer_features[0] + 100, &x).is_none());
+    assert!(index
+        .ffn_row_dot(0, 0, per_layer_features[0] + 100, &x)
+        .is_none());
     // Invalid component.
     assert!(index.ffn_row_dot(0, 9, 0, &x).is_none());
 }
@@ -346,8 +353,11 @@ fn synthetic_cloned_index_preserves_fp4_storage() {
     let src_dot = index.ffn_row_dot(0, 0, 0, &x).unwrap();
     let cln_dot = cloned.ffn_row_dot(0, 0, 0, &x).unwrap();
     // Same backend, same bytes → identical dot.
-    assert_eq!(src_dot.to_bits(), cln_dot.to_bits(),
-               "cloned dispatch diverges from source");
+    assert_eq!(
+        src_dot.to_bits(),
+        cln_dot.to_bits(),
+        "cloned dispatch diverges from source"
+    );
 
     // Sanity: both are within bound of the source.
     let src_row = &gate[0][0..hidden];

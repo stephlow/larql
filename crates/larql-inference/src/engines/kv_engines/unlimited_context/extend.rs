@@ -3,15 +3,15 @@
 //! Runs a CPU/GPU forward pass over new tokens, seeding each layer's attention
 //! with an optional prior K,V cache (the window boundary checkpoint).
 
-use ndarray::Array2;
 use larql_compute::ComputeBackend;
 use larql_vindex::VectorIndex;
+use ndarray::Array2;
 
 use crate::attention::{run_attention_block_decode_step_backend, SharedKV};
 use crate::ffn::BackendFfn;
-use crate::vindex::{WalkFfn, WalkFfnConfig};
 use crate::forward::{embed_tokens_pub, run_ffn};
 use crate::model::ModelWeights;
+use crate::vindex::{WalkFfn, WalkFfnConfig};
 
 pub struct ExtendOutput {
     /// Hidden state at the last processed token, shape (1, hidden).
@@ -33,7 +33,10 @@ pub fn rs_extend_from_checkpoint(
     abs_start: usize,
 ) -> Option<ExtendOutput> {
     rs_extend_from_checkpoint_backend(
-        weights, token_ids, prior_kv, abs_start,
+        weights,
+        token_ids,
+        prior_kv,
+        abs_start,
         &larql_compute::CpuBackend,
     )
 }
@@ -48,8 +51,12 @@ pub fn rs_extend_from_checkpoint_backend(
 ) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
 
-    if token_ids.is_empty() { return None; }
-    if prior_kv.len() != num_layers { return None; }
+    if token_ids.is_empty() {
+        return None;
+    }
+    if prior_kv.len() != num_layers {
+        return None;
+    }
 
     let mut kv_cache: Vec<SharedKV> = prior_kv.to_vec();
     let mut last_hidden: Option<Array2<f32>> = None;
@@ -66,7 +73,12 @@ pub fn rs_extend_from_checkpoint_backend(
             };
 
             let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-                weights, &h, layer, kv_entry, abs_position, Some(backend),
+                weights,
+                &h,
+                layer,
+                kv_entry,
+                abs_position,
+                Some(backend),
             )?;
 
             let bffn = BackendFfn { weights, backend };
@@ -111,8 +123,12 @@ pub fn rs_extend_from_checkpoint_q4k(
 ) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
 
-    if token_ids.is_empty() { return None; }
-    if prior_kv.len() != num_layers { return None; }
+    if token_ids.is_empty() {
+        return None;
+    }
+    if prior_kv.len() != num_layers {
+        return None;
+    }
 
     let mut kv_cache: Vec<SharedKV> = prior_kv.to_vec();
     let mut last_hidden: Option<Array2<f32>> = None;
@@ -122,10 +138,19 @@ pub fn rs_extend_from_checkpoint_q4k(
         let mut h = embed_tokens_pub(weights, &[token_id]);
 
         for (layer, kv_slot) in kv_cache.iter_mut().enumerate() {
-            let kv_entry: Option<&SharedKV> = if kv_slot.0.shape()[0] > 0 { Some(kv_slot) } else { None };
+            let kv_entry: Option<&SharedKV> = if kv_slot.0.shape()[0] > 0 {
+                Some(kv_slot)
+            } else {
+                None
+            };
 
             let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-                weights, &h, layer, kv_entry, abs_position, Some(backend),
+                weights,
+                &h,
+                layer,
+                kv_entry,
+                abs_position,
+                Some(backend),
             )?;
 
             let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
@@ -148,7 +173,11 @@ pub fn rs_extend_from_checkpoint_q4k(
         })
         .collect();
 
-    Some(ExtendOutput { last_hidden: last_hidden?, kv_cache, new_checkpoint })
+    Some(ExtendOutput {
+        last_hidden: last_hidden?,
+        kv_cache,
+        new_checkpoint,
+    })
 }
 
 /// Build an empty (zero-row) K,V seed for use when no prior checkpoint exists.
@@ -217,8 +246,8 @@ mod tests {
     fn extend_kv_cache_grows_with_each_token() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let output = rs_extend_from_checkpoint(&weights, &[0u32, 1, 2], &prior, 0)
-            .expect("3-token extend");
+        let output =
+            rs_extend_from_checkpoint(&weights, &[0u32, 1, 2], &prior, 0).expect("3-token extend");
         // After 3 tokens from empty prior, K has 3 rows per layer
         let kv_dim = weights.num_kv_heads * weights.head_dim;
         for (k, v) in &output.kv_cache {
@@ -231,18 +260,23 @@ mod tests {
     fn extend_checkpoint_is_last_row_of_kv_cache() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let output = rs_extend_from_checkpoint(&weights, &[0u32, 1], &prior, 0)
-            .expect("2-token extend");
+        let output =
+            rs_extend_from_checkpoint(&weights, &[0u32, 1], &prior, 0).expect("2-token extend");
         // new_checkpoint should be the last row of each K/V
-        for (layer, ((k_cache, v_cache), (k_ckpt, v_ckpt))) in
-            output.kv_cache.iter().zip(output.new_checkpoint.iter()).enumerate()
+        for (layer, ((k_cache, v_cache), (k_ckpt, v_ckpt))) in output
+            .kv_cache
+            .iter()
+            .zip(output.new_checkpoint.iter())
+            .enumerate()
         {
             let n = k_cache.shape()[0];
             let last_k = k_cache.row(n - 1).to_vec();
             let ckpt_k = k_ckpt.row(0).to_vec();
             for (a, b) in last_k.iter().zip(ckpt_k.iter()) {
-                assert!((a - b).abs() < 1e-6,
-                    "layer {layer}: checkpoint K doesn't match last K cache row");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "layer {layer}: checkpoint K doesn't match last K cache row"
+                );
             }
             let _ = (v_cache, v_ckpt); // symmetry — trust by shape
         }
@@ -258,7 +292,10 @@ mod tests {
         let k0 = &out0.kv_cache[0].0;
         let k5 = &out5.kv_cache[0].0;
         let diff: f32 = k0.iter().zip(k5.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 0.0, "different abs_start should produce different K (RoPE)");
+        assert!(
+            diff > 0.0,
+            "different abs_start should produce different K (RoPE)"
+        );
     }
 
     #[test]
@@ -277,9 +314,8 @@ mod tests {
         let prior = empty_prior(&weights);
         let first = rs_extend_from_checkpoint(&weights, &[0u32], &prior, 0).unwrap();
         // Use the checkpoint from the first extend as the prior for the second
-        let second = rs_extend_from_checkpoint(
-            &weights, &[1u32], &first.new_checkpoint, 1,
-        ).expect("extend from non-empty prior");
+        let second = rs_extend_from_checkpoint(&weights, &[1u32], &first.new_checkpoint, 1)
+            .expect("extend from non-empty prior");
         assert_eq!(second.last_hidden.shape(), &[1, weights.hidden_size]);
         assert!(second.last_hidden.iter().all(|v| v.is_finite()));
     }

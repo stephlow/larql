@@ -60,26 +60,30 @@ use larql_vindex::{
 /// CPU's `q_out_after_rope` ↔ Metal's `q_out`.
 const STAGE_PAIRS: &[(&str, &str)] = &[
     // Pre-attention
-    ("norm_out",          "norm_out"),
-    ("q_out_after_rope",  "q_out"),
-    ("k_out_after_rope",  "k_out"),
-    ("v_out",             "v_out"),
+    ("norm_out", "norm_out"),
+    ("q_out_after_rope", "q_out"),
+    ("k_out_after_rope", "k_out"),
+    ("v_out", "v_out"),
     // Attention block
-    ("attn_out",          "attn_out"),
-    ("o_out",             "o_out"),
-    ("h_post_attn",       "h_post_attn"),
+    ("attn_out", "attn_out"),
+    ("o_out", "o_out"),
+    ("h_post_attn", "h_post_attn"),
     // FFN block
-    ("ffn_norm_out",      "ffn_norm_out"),
-    ("ffn_out_raw",       "down_out"),
+    ("ffn_norm_out", "ffn_norm_out"),
+    ("ffn_out_raw", "down_out"),
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
-        args.next().ok_or("usage: stage_bisect <vindex-dir> [prompt] [layer]")?,
+        args.next()
+            .ok_or("usage: stage_bisect <vindex-dir> [prompt] [layer]")?,
     );
-    let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
-    let layer: usize = args.next()
+    let prompt = args
+        .next()
+        .unwrap_or_else(|| "The capital of France is".to_string());
+    let layer: usize = args
+        .next()
         .or_else(|| std::env::var("LARQL_STAGE_DUMP_LAYER").ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -106,15 +110,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wrap = wrap_chat_prompt(&vindex_path, Some(cfg.model.as_str()), &prompt);
     let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrap.prompt)?;
 
-    let metal_backend = larql_compute::metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable")?;
+    let metal_backend =
+        larql_compute::metal::MetalBackend::new().ok_or("Metal backend unavailable")?;
 
     println!("━━━ Per-stage decode-vs-prefill bisect ────────────────────────────");
     println!("  vindex: {}", vindex_path.display());
     println!("  model:  {}", cfg.model);
     println!("  prompt: {prompt:?}");
     println!("  layer:  L{layer}");
-    println!("  prompt_ids ({}): {:?}…", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(8)]);
+    println!(
+        "  prompt_ids ({}): {:?}…",
+        prompt_ids.len(),
+        &prompt_ids[..prompt_ids.len().min(8)]
+    );
     println!();
 
     // Step 0: deterministic next token via greedy Metal decode. Mirrors
@@ -123,17 +131,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cached = larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
     let metal_num_layers = w_metal.num_layers;
     let r0 = larql_inference::layer_graph::generate(
-        &mut w_metal, &tokenizer, &prompt_ids, 1,
-        &q4_index, &metal_backend, &cached, 0..metal_num_layers,
+        &mut w_metal,
+        &tokenizer,
+        &prompt_ids,
+        1,
+        &q4_index,
+        &metal_backend,
+        &cached,
+        0..metal_num_layers,
     );
-    let token_0_text = r0.tokens.first().map(|(t, _)| t.clone()).unwrap_or_default();
+    let token_0_text = r0
+        .tokens
+        .first()
+        .map(|(t, _)| t.clone())
+        .unwrap_or_default();
     if token_0_text.is_empty() {
         return Err("generate produced no first token".into());
     }
     println!("  step-0 token: {token_0_text:?}");
 
     let appended_prompt = format!("{}{}", wrap.prompt, token_0_text);
-    let appended_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &appended_prompt)?;
+    let appended_ids =
+        larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &appended_prompt)?;
     if appended_ids.len() != prompt_ids.len() + 1 {
         eprintln!(
             "note: tokeniser merged step-0 token at the prompt boundary; \
@@ -146,16 +165,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 1: capture stages from both backends.
     metal_backend.reset_kv_cache();
-    println!("Running Metal prefill({prefill_n}) + decode(1) with stage dump …",
-        prefill_n = prompt_ids.len());
+    println!(
+        "Running Metal prefill({prefill_n}) + decode(1) with stage dump …",
+        prefill_n = prompt_ids.len()
+    );
     let metal_stages = StageCapture::metal_decode(
-        &mut w_metal, &prompt_ids, token_0_id, &q4_index, &metal_backend, layer,
+        &mut w_metal,
+        &prompt_ids,
+        token_0_id,
+        &q4_index,
+        &metal_backend,
+        layer,
     )?;
 
-    println!("Running CPU prefill({}) with stage dump …", appended_ids.len());
-    let cpu_stages = StageCapture::cpu_prefill(
-        &mut w_cpu, &appended_ids, &q4_index, layer,
-    )?.project_to_last_position();
+    println!(
+        "Running CPU prefill({}) with stage dump …",
+        appended_ids.len()
+    );
+    let cpu_stages = StageCapture::cpu_prefill(&mut w_cpu, &appended_ids, &q4_index, layer)?
+        .project_to_last_position();
 
     if cpu_stages.is_empty() {
         return Err("CPU stage capture empty — env var or path bug".into());
@@ -169,22 +197,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // up as cos<<0.999 (kernel-noise drift sits in the 1e-4 .. 1e-6
     // range across architectures).
     let report = compare_stages(
-        &cpu_stages, &metal_stages, STAGE_PAIRS, ParityThreshold::loose(),
+        &cpu_stages,
+        &metal_stages,
+        STAGE_PAIRS,
+        ParityThreshold::loose(),
     );
     println!();
     print!("{}", report.summary());
     println!();
     if report.is_clean() {
-        println!("✓ no stage diverges past the loose threshold — decode and prefill agree at L{layer}.");
+        println!(
+            "✓ no stage diverges past the loose threshold — decode and prefill agree at L{layer}."
+        );
     } else {
         let i = report.first_bad.unwrap();
         let p = &report.pairs[i];
         if p.missing {
-            println!("✗ first divergence at stage `{}` (capture missing on one side)", p.name_a);
+            println!(
+                "✗ first divergence at stage `{}` (capture missing on one side)",
+                p.name_a
+            );
         } else {
             println!(
                 "✗ first divergence at stage `{}` (cos={:.6} rel={:.3}%)",
-                p.name_a, p.stat.cos, 100.0 * p.stat.rel_max_abs(),
+                p.name_a,
+                p.stat.cos,
+                100.0 * p.stat.rel_max_abs(),
             );
         }
         std::process::exit(1);

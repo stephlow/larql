@@ -3,6 +3,10 @@
 ## Current state (as of 2026-04-26)
 
 - Code quality pass complete: modularity refactor + magic string cleanup + test restructure (see Completed below).
+- Follow-up review fixes complete: rate limiting no longer trusts
+  `X-Forwarded-For` by default, route/path strings are centralized,
+  server loader options are grouped, embed errors use the standard JSON
+  error envelope, and server-local clippy allows were reduced.
 - Test coverage: **63.3% line / 73.2% function** (430 tests, 0 failures). gRPC handler tests unblocked grpc.rs (0%→65%). Magic strings eliminated across stream.rs, grpc.rs, describe.rs.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
   inclusive layer ranges 0-14 + 15-29).
@@ -81,6 +85,30 @@ per-expert error handling). This server owns the endpoint definitions and the
 ---
 
 ## P1: Active
+
+### T3. Review follow-up — server hygiene ✅ done 2026-04-26
+
+**Scope**: follow-up from review of `larql-server` focused on magic strings,
+modularity, cleanliness, tests, and clippy.
+
+Shipped:
+- `X-Forwarded-For` is ignored by default for rate limiting; new
+  `--trust-forwarded-for` opt-in is for deployments behind a trusted proxy.
+- HTTP protocol constants added for shared health path, API prefix,
+  bearer prefix, and binary FFN content type.
+- Route path literals in `routes/mod.rs` centralized as named constants so
+  single-model and multi-model routing drift is easier to spot.
+- `load_single_vindex` now takes a `LoadVindexOptions` struct instead of
+  an 11-argument call and repeated `too_many_arguments` clippy allows.
+- Embed endpoints now return the standard `{"error": ...}` JSON envelope
+  for errors instead of a mix of plain text and JSON.
+- Server-local clippy cleanup removed the repeated `too_many_arguments`
+  exemptions from the vindex loading path.
+
+Follow-up worth keeping open:
+- Move boot/loading/discovery from `main.rs` into a library module if CLI
+  startup needs deeper unit coverage.
+- Consider a route-registration macro/table if route count keeps growing.
 
 ### T1. Test coverage — functional tokenizer + uncovered routes ✅ done 2026-04-26
 

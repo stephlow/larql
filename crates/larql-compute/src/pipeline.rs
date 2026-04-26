@@ -10,21 +10,21 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(non_camel_case_types)]
 pub enum QuantFormat {
-    Q4_0,   // 18 bytes per 32 values (one f16 scale)
-    Q4_K,   // 144 bytes per 256 values (GGUF-canonical, Ollama-compatible)
-    Q4_KF,  // 160 bytes per 256 values (pre-baked half scales — fast decode)
-    Q6_K,   // 210 bytes per 256 values (6-bit with sub-block scales)
-    Q8_0,   // int8 values + separate f32 scales
-    BF16,   // raw bfloat16 (2 bytes per value, no quantization scales)
-    F16,    // raw float16  (2 bytes per value)
-    F32,    // raw float32  (4 bytes per value)
+    Q4_0,  // 18 bytes per 32 values (one f16 scale)
+    Q4_K,  // 144 bytes per 256 values (GGUF-canonical, Ollama-compatible)
+    Q4_KF, // 160 bytes per 256 values (pre-baked half scales — fast decode)
+    Q6_K,  // 210 bytes per 256 values (6-bit with sub-block scales)
+    Q8_0,  // int8 values + separate f32 scales
+    BF16,  // raw bfloat16 (2 bytes per value, no quantization scales)
+    F16,   // raw float16  (2 bytes per value)
+    F32,   // raw float32  (4 bytes per value)
 }
 
 /// A quantized weight matrix — raw bytes with format tag.
 #[derive(Clone, Copy)]
 pub struct QuantWeight<'a> {
     pub data: &'a [u8],
-    pub scales: Option<&'a [f32]>,  // only for Q8_0 (separate scale array)
+    pub scales: Option<&'a [f32]>, // only for Q8_0 (separate scale array)
     pub format: QuantFormat,
 }
 
@@ -214,7 +214,11 @@ impl<'a> FullPipelineLayer<'a> {
 impl From<bool> for Activation {
     /// `true` = GeluTanh (Gemma), `false` = Silu (Llama).
     fn from(use_gelu_tanh: bool) -> Self {
-        if use_gelu_tanh { Activation::GeluTanh } else { Activation::Silu }
+        if use_gelu_tanh {
+            Activation::GeluTanh
+        } else {
+            Activation::Silu
+        }
     }
 }
 
@@ -223,7 +227,11 @@ mod tests {
     use super::*;
 
     fn minimal_qw(data: &[u8]) -> QuantWeight<'_> {
-        QuantWeight { data, scales: None, format: QuantFormat::Q4_0 }
+        QuantWeight {
+            data,
+            scales: None,
+            format: QuantFormat::Q4_0,
+        }
     }
 
     fn minimal_layer<'a>(
@@ -234,20 +242,42 @@ mod tests {
     ) -> FullPipelineLayer<'a> {
         let qw = minimal_qw(data);
         FullPipelineLayer {
-            wq: qw, wk: qw, wv: qw, wo: qw,
-            gate: qw, up: qw, down: qw,
-            input_norm: norms, post_attn_norm: norms,
-            pre_ffn_norm: None, post_ffn_norm: None,
-            input_norm_bias: None, post_attn_norm_bias: None,
-            norm_offset: 0.0, qk_norm_offset: 0.0, eps: 1e-6,
-            has_post_norms: false, norm_type: NormType::RmsNorm,
-            ffn_type, activation: Activation::Silu,
-            attn_scale: 0.5, head_dim: 4, num_q_heads: 1, num_kv_heads: 1,
-            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
-            has_v_norm: false, layer_scalar: 0.0,
-            q_norm_weight: None, k_norm_weight: None,
-            ffn_up_bias: None, ffn_down_bias: None,
-            moe, moe_combined_output_norm: false, moe_outer_post_norm: None,
+            wq: qw,
+            wk: qw,
+            wv: qw,
+            wo: qw,
+            gate: qw,
+            up: qw,
+            down: qw,
+            input_norm: norms,
+            post_attn_norm: norms,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 0.0,
+            qk_norm_offset: 0.0,
+            eps: 1e-6,
+            has_post_norms: false,
+            norm_type: NormType::RmsNorm,
+            ffn_type,
+            activation: Activation::Silu,
+            attn_scale: 0.5,
+            head_dim: 4,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            rope_base: 10000.0,
+            rotary_dim: 0,
+            sliding_window: 0,
+            has_v_norm: false,
+            layer_scalar: 0.0,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            moe,
+            moe_combined_output_norm: false,
+            moe_outer_post_norm: None,
         }
     }
 
@@ -273,12 +303,20 @@ mod tests {
         assert!(!no_moe.is_hybrid_moe());
 
         let moe = MoeLayerWeights {
-            experts_gate_up: &[], experts_down: &[],
-            router_proj: &[], router_scale: &[], router_per_expert_scale: &[],
-            router_norm: &[], router_norm_parameter_free: false,
-            router_input_scalar: 1.0, pre_experts_norm: &[],
-            post_ffn1_norm: &[], post_experts_norm: &[],
-            num_experts: 2, top_k: 1, intermediate_size: 4,
+            experts_gate_up: &[],
+            experts_down: &[],
+            router_proj: &[],
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts: 2,
+            top_k: 1,
+            intermediate_size: 4,
             activation: Activation::Silu,
             expert_data_format: QuantFormat::BF16,
         };

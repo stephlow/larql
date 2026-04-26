@@ -18,10 +18,10 @@
 use std::path::{Path, PathBuf};
 
 use larql_models::ModelWeights;
-use larql_vindex::VectorIndex;
+use larql_vindex::{GateIndex, VectorIndex};
 
-use crate::layer_graph::CachedLayerGraph;
 use crate::layer_graph::generate::generate;
+use crate::layer_graph::CachedLayerGraph;
 
 /// Per-layer end-of-layer hidden state. `layers[l]` is the residual
 /// after layer l completes (post post_ffn norm + post-FFN residual +
@@ -93,9 +93,8 @@ impl ResidualCapture {
         let layers = (0..num_layers)
             .map(|l| {
                 let path = dir.path().join(format!("cpu_layer_{l:02}.f32"));
-                read_f32_vec(&path).ok_or_else(|| {
-                    format!("CPU dump missing for layer {l} at {}", path.display())
-                })
+                read_f32_vec(&path)
+                    .ok_or_else(|| format!("CPU dump missing for layer {l} at {}", path.display()))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -124,8 +123,6 @@ impl ResidualCapture {
         index: &VectorIndex,
         backend: &dyn larql_compute::ComputeBackend,
     ) -> Result<Self, String> {
-        use larql_vindex::GateIndex;
-
         let hidden = weights.hidden_size;
         let num_layers = weights.num_layers;
         let arch = &*weights.arch;
@@ -140,7 +137,7 @@ impl ResidualCapture {
         backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
 
         // Build pipeline layers — same wiring `layer_graph::generate` uses.
-        let gate_index: &dyn larql_vindex::GateIndex = index;
+        let gate_index: &dyn GateIndex = index;
         let (q4_ffn, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
             (Some(m), true)
         } else {
@@ -159,8 +156,12 @@ impl ResidualCapture {
             larql_compute::QuantFormat::Q4_0
         };
         let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
-            weights, index, 0..num_layers,
-            q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+            weights,
+            index,
+            0..num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
         );
 
         let q_dim = weights.num_q_heads * weights.head_dim;
@@ -173,20 +174,39 @@ impl ResidualCapture {
         // only the KV cache state for the subsequent decode step.
         let h_embed = crate::forward::embed_tokens_pub(weights, prefix_ids);
         let prefill_x: Vec<f32> = h_embed.as_slice().unwrap().to_vec();
-        backend.prefill_q4(
-            &layers, &prefill_x, hidden, intermediate, q_dim, kv_dim,
-            prefix_ids.len(),
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
-            rope, qk_norm_val, softcap,
-        ).ok_or("Metal prefill_q4 returned None")?;
+        backend
+            .prefill_q4(
+                &layers,
+                &prefill_x,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                prefix_ids.len(),
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
+                qk_norm_val,
+                softcap,
+            )
+            .ok_or("Metal prefill_q4 returned None")?;
 
         // Decode one token, with the per-layer dump hook active.
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[new_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
         let dir = run_with_dump_dir("LARQL_DECODE_DUMP_LAYERS", || {
             let _ = backend.decode_token(
-                &layers, &dec_x, hidden, intermediate, q_dim, kv_dim,
-                weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+                &layers,
+                &dec_x,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
             );
         })?;
 
@@ -233,7 +253,14 @@ impl ResidualCapture {
             // including the per-layer dump hook for Metal.
             let dummy_tok = build_dummy_tokenizer();
             let _ = generate(
-                weights, &dummy_tok, ids, 1, index, backend, &cached, 0..num_layers,
+                weights,
+                &dummy_tok,
+                ids,
+                1,
+                index,
+                backend,
+                &cached,
+                0..num_layers,
             );
         })?;
 
@@ -241,7 +268,10 @@ impl ResidualCapture {
             .map(|l| {
                 let path = dir.path().join(format!("metal_layer_{l:02}_h_out.f32"));
                 read_f32_vec(&path).ok_or_else(|| {
-                    format!("Metal prefill dump missing for layer {l} at {}", path.display())
+                    format!(
+                        "Metal prefill dump missing for layer {l} at {}",
+                        path.display()
+                    )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -261,10 +291,7 @@ impl ResidualCapture {
 /// the previous env var value on drop (best-effort — Rust env vars
 /// are process-global, so racing `cargo test --test-threads=N` would
 /// stomp; tests in this suite run with `--test-threads=1` upstream).
-fn run_with_dump_dir(
-    env_var: &str,
-    f: impl FnOnce(),
-) -> Result<tempfile::TempDir, String> {
+fn run_with_dump_dir(env_var: &str, f: impl FnOnce()) -> Result<tempfile::TempDir, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let prev = std::env::var(env_var).ok();
     std::env::set_var(env_var, dir.path());
@@ -316,6 +343,7 @@ fn build_dummy_tokenizer() -> tokenizers::Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn last_position_returns_correct_slice() {
@@ -333,10 +361,7 @@ mod tests {
     #[test]
     fn project_to_last_position_drops_other_rows() {
         let cap = ResidualCapture {
-            layers: vec![
-                vec![1.0, 1.0, 2.0, 2.0],
-                vec![10.0, 10.0, 20.0, 20.0],
-            ],
+            layers: vec![vec![1.0, 1.0, 2.0, 2.0], vec![10.0, 10.0, 20.0, 20.0]],
             hidden_size: 2,
             seq_len: 2,
         };

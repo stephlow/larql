@@ -29,11 +29,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::config::types::{
-    ComplianceGate, Fp4Config, Precision, ProjectionFormat, Projections,
-    VindexConfig,
+    ComplianceGate, Fp4Config, Precision, ProjectionFormat, Projections, VindexConfig,
 };
-use crate::format::filenames::*;
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::format::fp4_codec::{write_fp4_projection, write_fp8_projection};
 
 use super::scan::{scan_vindex, Dtype, ScanConfig, VindexComplianceReport};
@@ -42,7 +41,11 @@ use super::scan::{scan_vindex, Dtype, ScanConfig, VindexComplianceReport};
 /// source dtype in every policy (see FP4 gate caveat in §2 of that
 /// spec); only up + down vary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Policy { A, B, C }
+pub enum Policy {
+    A,
+    B,
+    C,
+}
 
 impl Policy {
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -110,12 +113,12 @@ pub enum ProjectionOutcome {
 impl ProjectionOutcome {
     pub fn action_str(self) -> &'static str {
         match self {
-            Self::WroteFp4               => "wrote_fp4",
-            Self::WroteFp8               => "wrote_fp8_per_policy_default",
-            Self::WroteF16               => "wrote_f16_per_policy_default",
-            Self::LinkedAsSource         => "linked_as_source_dtype",
-            Self::DowngradedFp4ToFp8     => "downgraded_fp4_to_fp8",
-            Self::DowngradedFp4ToF16     => "downgraded_fp4_to_f16",
+            Self::WroteFp4 => "wrote_fp4",
+            Self::WroteFp8 => "wrote_fp8_per_policy_default",
+            Self::WroteF16 => "wrote_f16_per_policy_default",
+            Self::LinkedAsSource => "linked_as_source_dtype",
+            Self::DowngradedFp4ToFp8 => "downgraded_fp4_to_fp8",
+            Self::DowngradedFp4ToF16 => "downgraded_fp4_to_f16",
         }
     }
 }
@@ -149,20 +152,23 @@ pub struct Fp4ConvertReport {
 }
 
 impl Fp4ConvertReport {
-    pub fn compliance_sidecar_json(
-        &self,
-        scan_report: &VindexComplianceReport,
-    ) -> Value {
-        let per_projection: Vec<Value> = self.per_projection.iter().map(|p| json!({
-            "projection": p.name,
-            "compliance_at_threshold": p.compliance_at_threshold,
-            "threshold": self.threshold,
-            "policy_precision": precision_str(p.policy_precision),
-            "chosen_precision": precision_str(p.chosen_precision),
-            "action": p.outcome.action_str(),
-            "output_file": p.output_file,
-            "output_size_bytes": p.output_size_bytes,
-        })).collect();
+    pub fn compliance_sidecar_json(&self, scan_report: &VindexComplianceReport) -> Value {
+        let per_projection: Vec<Value> = self
+            .per_projection
+            .iter()
+            .map(|p| {
+                json!({
+                    "projection": p.name,
+                    "compliance_at_threshold": p.compliance_at_threshold,
+                    "threshold": self.threshold,
+                    "policy_precision": precision_str(p.policy_precision),
+                    "chosen_precision": precision_str(p.chosen_precision),
+                    "action": p.outcome.action_str(),
+                    "output_file": p.output_file,
+                    "output_size_bytes": p.output_size_bytes,
+                })
+            })
+            .collect();
         json!({
             "extracted_at": now_iso_like(),
             "policy": self.policy.label(),
@@ -186,8 +192,10 @@ fn precision_str(p: Precision) -> String {
 
 fn now_iso_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     format!("@epoch+{secs}s")
 }
 
@@ -219,11 +227,10 @@ pub fn vindex_to_fp4(
     }
 
     // Atomic-rename staging: write into DST.tmp/, rename at the end.
-    let dst_tmp = dst.with_file_name(
-        format!("{}.tmp",
-            dst.file_name().and_then(|s| s.to_str()).unwrap_or("out")
-        )
-    );
+    let dst_tmp = dst.with_file_name(format!(
+        "{}.tmp",
+        dst.file_name().and_then(|s| s.to_str()).unwrap_or("out")
+    ));
     if dst_tmp.exists() {
         std::fs::remove_dir_all(&dst_tmp)
             .map_err(|e| VindexError::Parse(format!("clean staging dir: {e}")))?;
@@ -240,15 +247,14 @@ pub fn vindex_to_fp4(
     let src_index_raw: Value = serde_json::from_str(
         &std::fs::read_to_string(src.join(INDEX_JSON))
             .map_err(|e| VindexError::Parse(format!("re-read src index.json: {e}")))?,
-    ).map_err(|e| VindexError::Parse(format!("parse raw src index.json: {e}")))?;
+    )
+    .map_err(|e| VindexError::Parse(format!("parse raw src index.json: {e}")))?;
     let src_dtype_str = src_index_raw["dtype"].as_str().unwrap_or("f32");
-    let src_dtype = Dtype::from_index_json(src_dtype_str)
-        .map_err(VindexError::Parse)?;
+    let src_dtype = Dtype::from_index_json(src_dtype_str).map_err(VindexError::Parse)?;
 
     let hidden = src_config.hidden_size;
     let num_layers = src_config.num_layers;
-    let per_layer_features: Vec<usize> =
-        src_config.layers.iter().map(|l| l.num_features).collect();
+    let per_layer_features: Vec<usize> = src_config.layers.iter().map(|l| l.num_features).collect();
 
     if !hidden.is_multiple_of(larql_models::quant::fp4_block::BLOCK_ELEMENTS) {
         return Err(VindexError::Parse(format!(
@@ -296,8 +302,7 @@ pub fn vindex_to_fp4(
     for (idx, (name, src_file, policy_prec)) in projections.iter().enumerate() {
         let src_path = src.join(src_file);
         let scan_for_proj = scan_report.projection(name);
-        let compliance = scan_for_proj
-            .map(|p| p.compliance_at(config.threshold) as f32);
+        let compliance = scan_for_proj.map(|p| p.compliance_at(config.threshold) as f32);
 
         // Decide output precision. Compliance floor only gates FP4-
         // targeted projections.
@@ -333,25 +338,23 @@ pub fn vindex_to_fp4(
         let outcome_tag = match (*policy_prec, chosen) {
             (Precision::Fp4, Precision::Fp4) => outcome,
             (Precision::Fp4, Precision::Fp8) => ProjectionOutcome::DowngradedFp4ToFp8,
-            (_, Precision::Fp8)              => ProjectionOutcome::WroteFp8,
-            (_, Precision::F16)              => ProjectionOutcome::WroteF16,
-            (_, Precision::F32)              => ProjectionOutcome::LinkedAsSource,
-            _                                => outcome,
+            (_, Precision::Fp8) => ProjectionOutcome::WroteFp8,
+            (_, Precision::F16) => ProjectionOutcome::WroteF16,
+            (_, Precision::F32) => ProjectionOutcome::LinkedAsSource,
+            _ => outcome,
         };
 
         match chosen {
             Precision::Fp4 => {
                 // Decode source → float → encode FP4.
-                let layers = read_source_projection(
-                    &src_path, src_dtype, &per_layer_features, hidden,
-                )?;
+                let layers =
+                    read_source_projection(&src_path, src_dtype, &per_layer_features, hidden)?;
                 let refs: Vec<&[f32]> = layers.iter().map(|v| v.as_slice()).collect();
                 write_fp4_projection(&out_path, hidden, &refs)?;
             }
             Precision::Fp8 => {
-                let layers = read_source_projection(
-                    &src_path, src_dtype, &per_layer_features, hidden,
-                )?;
+                let layers =
+                    read_source_projection(&src_path, src_dtype, &per_layer_features, hidden)?;
                 let refs: Vec<&[f32]> = layers.iter().map(|v| v.as_slice()).collect();
                 write_fp8_projection(&out_path, hidden, &refs)?;
             }
@@ -392,9 +395,18 @@ pub fn vindex_to_fp4(
             fallback_precision: Precision::Fp8,
         },
         ..Fp4Config::v1_defaults(Projections {
-            gate: ProjectionFormat { precision: Precision::Fp4, file: String::new() },
-            up: ProjectionFormat { precision: Precision::Fp4, file: String::new() },
-            down: ProjectionFormat { precision: Precision::Fp4, file: String::new() },
+            gate: ProjectionFormat {
+                precision: Precision::Fp4,
+                file: String::new(),
+            },
+            up: ProjectionFormat {
+                precision: Precision::Fp4,
+                file: String::new(),
+            },
+            down: ProjectionFormat {
+                precision: Precision::Fp4,
+                file: String::new(),
+            },
         })
     };
     src_config.fp4 = Some(fp4_cfg);
@@ -413,16 +425,21 @@ pub fn vindex_to_fp4(
             threshold: config.threshold,
             compliance_floor: config.compliance_floor,
             per_projection: actions.clone(),
-            src_ffn_bytes: 0, dst_ffn_bytes: 0, compression: 0.0,
-            aux_linked_count: 0, aux_linked_bytes: 0,
-            wall_time: Duration::ZERO, walk_backend: String::new(),
+            src_ffn_bytes: 0,
+            dst_ffn_bytes: 0,
+            compression: 0.0,
+            aux_linked_count: 0,
+            aux_linked_bytes: 0,
+            wall_time: Duration::ZERO,
+            walk_backend: String::new(),
         };
         let sidecar = report_for_sidecar.compliance_sidecar_json(&scan_report);
         std::fs::write(
             dst_tmp.join("fp4_compliance.json"),
             serde_json::to_string_pretty(&sidecar)
                 .map_err(|e| VindexError::Parse(format!("serialise sidecar: {e}")))?,
-        ).map_err(|e| VindexError::Parse(format!("write sidecar: {e}")))?;
+        )
+        .map_err(|e| VindexError::Parse(format!("write sidecar: {e}")))?;
     }
 
     // Hard-link auxiliary files.
@@ -432,19 +449,28 @@ pub fn vindex_to_fp4(
         UP_FEATURES_BIN,
         DOWN_FEATURES_BIN,
         "fp4_compliance.json",
-    ].iter().copied().collect();
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     let mut aux_linked = 0usize;
     let mut aux_bytes = 0u64;
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| VindexError::Parse(format!("read src dir: {e}")))?
+    for entry in
+        std::fs::read_dir(src).map_err(|e| VindexError::Parse(format!("read src dir: {e}")))?
     {
         let entry = entry.map_err(|e| VindexError::Parse(format!("{e}")))?;
         let fname = entry.file_name();
         let fname_str = fname.to_string_lossy();
-        if handled.contains(fname_str.as_ref()) { continue; }
-        let meta = entry.metadata().map_err(|e| VindexError::Parse(format!("{e}")))?;
-        if !meta.is_file() { continue; }
+        if handled.contains(fname_str.as_ref()) {
+            continue;
+        }
+        let meta = entry
+            .metadata()
+            .map_err(|e| VindexError::Parse(format!("{e}")))?;
+        if !meta.is_file() {
+            continue;
+        }
         let dst_path = dst_tmp.join(&fname);
         link_or_copy(&entry.path(), &dst_path)?;
         aux_linked += 1;
@@ -452,12 +478,13 @@ pub fn vindex_to_fp4(
     }
 
     // Atomic promote: rename dst.tmp → dst.
-    std::fs::rename(&dst_tmp, dst)
-        .map_err(|e| VindexError::Parse(format!(
+    std::fs::rename(&dst_tmp, dst).map_err(|e| {
+        VindexError::Parse(format!(
             "atomic rename {} → {}: {e}",
             dst_tmp.display(),
             dst.display(),
-        )))?;
+        ))
+    })?;
 
     let src_ffn_bytes: u64 = src_config.layers.iter().map(|l| l.length * 3).sum();
     let dst_ffn_bytes: u64 = actions.iter().map(|a| a.output_size_bytes).sum();
@@ -465,10 +492,12 @@ pub fn vindex_to_fp4(
 
     // Load the new vindex to produce the backend-describe line for the
     // report. Cheap: just mmap metadata, no per-layer work.
-    let walk_backend = describe_out_backend(dst).unwrap_or_else(|e| format!("<describe failed: {e:?}>"));
+    let walk_backend =
+        describe_out_backend(dst).unwrap_or_else(|e| format!("<describe failed: {e:?}>"));
 
     // Patch up the actions' report now that we have the numbers.
-    let n = num_layers; let _ = n;  // silence if unused after downstream changes
+    let n = num_layers;
+    let _ = n; // silence if unused after downstream changes
     let report = Fp4ConvertReport {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
@@ -516,7 +545,9 @@ fn read_source_projection(
     if bytes.len() != expected {
         return Err(VindexError::Parse(format!(
             "{}: size {} != expected {}",
-            path.display(), bytes.len(), expected,
+            path.display(),
+            bytes.len(),
+            expected,
         )));
     }
     let mut out = Vec::with_capacity(layer_features.len());
@@ -526,9 +557,8 @@ fn read_source_projection(
         let slice = &bytes[cursor..cursor + layer_bytes];
         let floats: Vec<f32> = match dtype {
             Dtype::F32 => {
-                let view: &[f32] = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const f32, n * hidden)
-                };
+                let view: &[f32] =
+                    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const f32, n * hidden) };
                 view.to_vec()
             }
             Dtype::F16 => larql_models::quant::half::decode_f16(slice),
@@ -548,10 +578,13 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<(), VindexError> {
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
         Err(_) => {
-            std::fs::copy(src, dst)
-                .map_err(|e| VindexError::Parse(format!(
-                    "copy fallback {} → {}: {e}", src.display(), dst.display()
-                )))?;
+            std::fs::copy(src, dst).map_err(|e| {
+                VindexError::Parse(format!(
+                    "copy fallback {} → {}: {e}",
+                    src.display(),
+                    dst.display()
+                ))
+            })?;
             Ok(())
         }
     }

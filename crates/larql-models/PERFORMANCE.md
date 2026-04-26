@@ -2,6 +2,40 @@
 
 This crate is not compute-bound — it describes models and loads weights. Performance characteristics are about loading speed and memory.
 
+## Benchmark Suite
+
+Run the crate-local Criterion suite with:
+
+```bash
+cargo bench -p larql-models --bench models
+```
+
+The suite measures config detection and validation, architecture tensor-key
+generation, FFN tensor classification, synthetic safetensors loading, and GGML
+Q4_0/Q8_0/Q4_K/Q6_K dequantization. The synthetic loading case uses an
+in-benchmark safetensors model so CI and local runs do not need external model
+downloads.
+
+Current local baseline from 2026-04-26:
+
+| Benchmark | Median |
+|-----------|--------|
+| `config_detection/detect/llama` | ~590 ns |
+| `config_detection/detect_validated/llama` | ~605 ns |
+| `config_detection/detect/gemma4` | ~2.48 µs |
+| `config_detection/detect_validated/gemma4` | ~2.58 µs |
+| `config_detection/detect_validated/gpt_oss` | ~609 ns |
+| `tensor_keys/gemma4_all_layer_hot_keys` | ~24.3 µs |
+| `tensor_classification/is_ffn_tensor_key_set` | ~6.15 µs |
+| `weight_loading/load_synthetic_safetensors_validated` | ~156 µs |
+
+| Quant Decode | Median | Throughput |
+|--------------|--------|------------|
+| `quant_decode/q4_0` | ~4.43 µs | ~1.85 Gelem/s |
+| `quant_decode/q8_0` | ~3.76 µs | ~2.18 Gelem/s |
+| `quant_decode/q4_k` | ~2.40 µs | ~3.42 Gelem/s |
+| `quant_decode/q6_k` | ~6.51 µs | ~1.26 Gelem/s |
+
 ## Weight Loading (M3 Max, NVMe SSD)
 
 | Model | Format | Shards | Tensors | Load Time | Peak RAM | Notes |
@@ -20,11 +54,16 @@ This crate is not compute-bound — it describes models and loads weights. Perfo
 | dtype conversion (f16→f32) | 70% | Vectorized but still touches every byte |
 | Prefix stripping + key mapping | 1% | String operations on ~270 keys |
 | Architecture detection | <1% | JSON parse + match |
+| Config validation | <1% | O(num_layers) checks when callers opt in |
 | GGUF dequantization | 80% | Block-by-block decode (when using GGUF) |
 
-### Memory: drop_ffn_weights
+### Memory: Walk-only filtering and drop_ffn_weights
 
-Walk-only mode drops FFN tensors after loading:
+Walk-only mode skips FFN tensors during loading where possible. Safetensors keys
+are filtered before dtype conversion, GGUF keys are normalized and filtered
+before dequantization, and GPT-OSS packed MXFP4 experts are not expanded when
+their generated expert keys are filtered. `drop_ffn_weights()` remains available
+for already-loaded `ModelWeights`.
 
 | Model | Before | After | Freed | Savings |
 |-------|--------|-------|-------|---------|
@@ -44,7 +83,7 @@ detect_architecture: ~50μs (read config.json + parse + detect)
 
 ## Config Parsing
 
-`parse_model_config` handles ~30 fields from config.json. All fields use `.as_u64()` / `.as_f64()` with defaults — no validation overhead, no allocations beyond the final `ModelConfig` struct.
+`parse_model_config` handles ~30 fields from config.json. All fields use `.as_u64()` / `.as_f64()` with defaults and detection remains permissive. `ModelArchitecture::validate()` is an explicit O(num_layers) caller check, not part of detection by default.
 
 Gemma 4 adds precomputed vectors in `from_config`:
 - `global_layers: Vec<bool>` — O(num_layers) allocation, computed once

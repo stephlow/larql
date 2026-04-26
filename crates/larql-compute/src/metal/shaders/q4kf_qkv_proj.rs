@@ -226,8 +226,8 @@ kernel void q4kf_proj(
 }
 "#;
 
-pub const ROWS_PER_TG: u64 = 4;   // 2 SG × 2 rows/SG
-pub const THREADS_PER_TG: u64 = 64;  // 2 SG × 32 lanes
+pub const ROWS_PER_TG: u64 = 4; // 2 SG × 2 rows/SG
+pub const THREADS_PER_TG: u64 = 64; // 2 SG × 32 lanes
 
 /// Two kernels share this file's geometry — fused QKV projection
 /// (`q4kf_qkv_proj`) and the per-projection variant (`q4kf_proj`).

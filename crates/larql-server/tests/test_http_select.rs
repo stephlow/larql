@@ -52,7 +52,12 @@ async fn http_select_entity_filter() {
 async fn http_select_min_confidence_filter() {
     let app = single_model_router(state(vec![model("test")]));
     // Only Paris (0.95) and French (0.88) pass min_confidence=0.85.
-    let resp = post_json(app, "/v1/select", serde_json::json!({"min_confidence": 0.85})).await;
+    let resp = post_json(
+        app,
+        "/v1/select",
+        serde_json::json!({"min_confidence": 0.85}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
@@ -76,29 +81,51 @@ async fn http_select_limit_truncates_results() {
 #[tokio::test]
 async fn http_select_order_asc_returns_lowest_confidence_first() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/select",
-        serde_json::json!({"order_by": "confidence", "order": "asc"})).await;
+    let resp = post_json(
+        app,
+        "/v1/select",
+        serde_json::json!({"order_by": "confidence", "order": "asc"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
-    let scores: Vec<f64> = edges.iter().map(|e| e["c_score"].as_f64().unwrap()).collect();
+    let scores: Vec<f64> = edges
+        .iter()
+        .map(|e| e["c_score"].as_f64().unwrap())
+        .collect();
     // Should be ascending.
     for i in 1..scores.len() {
-        assert!(scores[i] >= scores[i - 1], "expected ascending: {:?}", scores);
+        assert!(
+            scores[i] >= scores[i - 1],
+            "expected ascending: {:?}",
+            scores
+        );
     }
 }
 
 #[tokio::test]
 async fn http_select_order_desc_returns_highest_confidence_first() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/select",
-        serde_json::json!({"order_by": "confidence", "order": "desc"})).await;
+    let resp = post_json(
+        app,
+        "/v1/select",
+        serde_json::json!({"order_by": "confidence", "order": "desc"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
-    let scores: Vec<f64> = edges.iter().map(|e| e["c_score"].as_f64().unwrap()).collect();
+    let scores: Vec<f64> = edges
+        .iter()
+        .map(|e| e["c_score"].as_f64().unwrap())
+        .collect();
     for i in 1..scores.len() {
-        assert!(scores[i] <= scores[i - 1], "expected descending: {:?}", scores);
+        assert!(
+            scores[i] <= scores[i - 1],
+            "expected descending: {:?}",
+            scores
+        );
     }
 }
 
@@ -109,7 +136,12 @@ async fn http_select_relation_filter_returns_labelled_features() {
     labels.insert((0usize, 1usize), "language".to_string());
     let m = ModelBuilder::new("test").with_labels(labels).build();
     let app = single_model_router(state(vec![m]));
-    let resp = post_json(app, "/v1/select", serde_json::json!({"relation": "capital"})).await;
+    let resp = post_json(
+        app,
+        "/v1/select",
+        serde_json::json!({"relation": "capital"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
@@ -121,8 +153,12 @@ async fn http_select_relation_filter_returns_labelled_features() {
 #[tokio::test]
 async fn http_select_order_by_layer_asc() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/select",
-        serde_json::json!({"order_by": "layer", "order": "asc"})).await;
+    let resp = post_json(
+        app,
+        "/v1/select",
+        serde_json::json!({"order_by": "layer", "order": "asc"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     // All features are at layer 0 in our 1-layer test index; ordering should succeed.
@@ -170,7 +206,10 @@ async fn http_relations_probe_count_reflects_labels() {
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["probe_count"], 2);
     let probe_rels = body["probe_relations"].as_array().unwrap();
-    let names: Vec<&str> = probe_rels.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = probe_rels
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"capital"));
     assert!(names.contains(&"language"));
 }

@@ -4,13 +4,8 @@
 //! re-export so existing benchmark code continues to compile unchanged.
 
 pub use larql_inference::engines::unlimited_context::{
-    CheckpointStore,
-    EngineStats,
-    ExtendOutput,
-    TokenArchive,
-    UnlimitedContextEngine,
-    empty_prior,
-    rs_extend_from_checkpoint,
+    empty_prior, rs_extend_from_checkpoint, CheckpointStore, EngineStats, ExtendOutput,
+    TokenArchive, UnlimitedContextEngine,
 };
 
 #[doc(hidden)]

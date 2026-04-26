@@ -1,14 +1,14 @@
 //! Dense (full-weight) forward passes and logit projection utilities.
 
-use ndarray::Array2;
+use super::super::embed::embed_tokens;
+use super::super::layer::run_layer_with_ffn;
+use super::super::ple::precompute_per_layer_inputs;
+use super::super::{apply_norm, dot_proj};
+use super::types::{PredictResult, PredictResultWithResiduals};
 use crate::attention::SharedKV;
 use crate::ffn::WeightFfn;
 use crate::model::ModelWeights;
-use super::super::{apply_norm, dot_proj};
-use super::super::embed::embed_tokens;
-use super::super::ple::precompute_per_layer_inputs;
-use super::super::layer::run_layer_with_ffn;
-use super::types::{PredictResult, PredictResultWithResiduals};
+use ndarray::Array2;
 
 /// Descending order on the probability field of `(index, prob)` pairs,
 /// with NaN probabilities treated as the smallest value so they never
@@ -68,10 +68,7 @@ pub(crate) fn logits_to_predictions(
         .collect();
 
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f64 = logits
-        .iter()
-        .map(|l| ((l - max_logit) as f64).exp())
-        .sum();
+    let exp_sum: f64 = logits.iter().map(|l| ((l - max_logit) as f64).exp()).sum();
     let probs: Vec<f32> = logits
         .iter()
         .map(|l| (((l - max_logit) as f64).exp() / exp_sum) as f32)
@@ -96,7 +93,10 @@ pub(crate) fn logits_to_predictions(
         }
     }
 
-    PredictResult { predictions, token_ids }
+    PredictResult {
+        predictions,
+        token_ids,
+    }
 }
 
 /// Run a full forward pass and return the top-k next token predictions.
@@ -120,15 +120,26 @@ pub fn predict_with_temperature(
     let num_layers = weights.num_layers;
     let mut h = embed_tokens(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
-    let mut kv_cache: std::collections::HashMap<usize, SharedKV> =
-        std::collections::HashMap::new();
+    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
     for layer in 0..num_layers {
-        let shared_kv = weights.arch.kv_shared_source_layer(layer)
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
-        match run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), shared_kv) {
+        match run_layer_with_ffn(
+            weights,
+            &h,
+            layer,
+            &ffn,
+            false,
+            ple_inputs.get(layer),
+            shared_kv,
+        ) {
             Some((h_new, _, kv_out)) => {
                 h = h_new;
-                if let Some(kv) = kv_out { kv_cache.insert(layer, kv); }
+                if let Some(kv) = kv_out {
+                    kv_cache.insert(layer, kv);
+                }
             }
             None => continue,
         }
@@ -143,7 +154,9 @@ pub fn logit_lens_top1(
     residual: &[f32],
 ) -> Option<(String, f64)> {
     let hidden = weights.hidden_size;
-    if residual.len() != hidden { return None; }
+    if residual.len() != hidden {
+        return None;
+    }
 
     let h = Array2::from_shape_vec((1, hidden), residual.to_vec()).ok()?;
     let result = logits_to_predictions(weights, &h, tokenizer, 1, 1.0);

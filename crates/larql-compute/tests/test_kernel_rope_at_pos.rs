@@ -47,15 +47,13 @@ mod common;
 use common::{cos_sim, get_metal, max_diff};
 
 /// CPU reference: split-half RoPE on a single head, in place.
-fn cpu_rope_at_pos(
-    head_dim: usize,
-    rotary_dim: usize,
-    base: f32,
-    pos: usize,
-    x: &mut [f32],
-) {
+fn cpu_rope_at_pos(head_dim: usize, rotary_dim: usize, base: f32, pos: usize, x: &mut [f32]) {
     debug_assert_eq!(x.len(), head_dim);
-    let rdim = if rotary_dim == 0 { head_dim } else { rotary_dim.min(head_dim) };
+    let rdim = if rotary_dim == 0 {
+        head_dim
+    } else {
+        rotary_dim.min(head_dim)
+    };
     let hdim = rdim / 2;
     for d in 0..hdim {
         let freq = 1.0 / base.powf(2.0 * d as f32 / rdim as f32);
@@ -86,7 +84,11 @@ fn run_rope_at_pos(
     let hd = head_dim as u32;
     let rd_val = rotary_dim as u32;
     let pos_val = pos as u32;
-    let rdim_eff = if rotary_dim == 0 { head_dim } else { rotary_dim };
+    let rdim_eff = if rotary_dim == 0 {
+        head_dim
+    } else {
+        rotary_dim
+    };
     let pairs = (rdim_eff / 2) as u64;
 
     let cmd = metal.queue().new_command_buffer();
@@ -137,7 +139,11 @@ fn assert_rope_at_pos_matches_cpu(
     // Also assert pass-through dims (those past rotary_dim) are
     // untouched. A bug that loops past `rdim` would manifest end-to-end
     // as silent drift on partial-rotary geometries (Gemma 4 global).
-    let rdim_eff = if rotary_dim == 0 { head_dim } else { rotary_dim.min(head_dim) };
+    let rdim_eff = if rotary_dim == 0 {
+        head_dim
+    } else {
+        rotary_dim.min(head_dim)
+    };
     if rdim_eff < head_dim {
         for d in rdim_eff..head_dim {
             let delta = (result[d] - x[d]).abs();
@@ -160,10 +166,7 @@ fn rope_at_pos_llama2_full() {
     // lockstep — high-pos divergence is `Metal::pow` vs Rust `powf`
     // float precision noise, not a kernel bug.
     for &pos in &[0usize, 1, 5, 17] {
-        assert_rope_at_pos_matches_cpu(
-            "llama2 full",
-            128, 0, 10_000.0, pos,
-        );
+        assert_rope_at_pos_matches_cpu("llama2 full", 128, 0, 10_000.0, pos);
     }
 }
 
@@ -171,10 +174,7 @@ fn rope_at_pos_llama2_full() {
 fn rope_at_pos_gemma3_full_256() {
     // Gemma 3 4B: 256-dim head, full rotation.
     for &pos in &[0usize, 7, 23] {
-        assert_rope_at_pos_matches_cpu(
-            "gemma3 full 256",
-            256, 0, 10_000.0, pos,
-        );
+        assert_rope_at_pos_matches_cpu("gemma3 full 256", 256, 0, 10_000.0, pos);
     }
 }
 
@@ -182,10 +182,7 @@ fn rope_at_pos_gemma3_full_256() {
 fn rope_at_pos_gemma4_sliding() {
     // Gemma 4 31B sliding layer: 256-dim head, full rotation, base=10000.
     for &pos in &[0usize, 17, 100] {
-        assert_rope_at_pos_matches_cpu(
-            "gemma4 sliding",
-            256, 0, 10_000.0, pos,
-        );
+        assert_rope_at_pos_matches_cpu("gemma4 sliding", 256, 0, 10_000.0, pos);
     }
 }
 
@@ -201,10 +198,7 @@ fn rope_at_pos_gemma4_global_partial() {
     // disagree here, every cached K from prefill is subtly off versus
     // what decode would have written, and the parity test fails.
     for &pos in &[0usize, 17, 100] {
-        assert_rope_at_pos_matches_cpu(
-            "gemma4 global partial",
-            512, 128, 500_000.0, pos,
-        );
+        assert_rope_at_pos_matches_cpu("gemma4 global partial", 512, 128, 500_000.0, pos);
     }
 }
 
@@ -216,10 +210,7 @@ fn rope_at_pos_partial_pass_through_preserved() {
     // `rotary_dim=0` was passed via a typo-path; an analogous bug here
     // would silently fail end-to-end without this check.
     for &pos in &[0usize, 5, 23] {
-        assert_rope_at_pos_matches_cpu(
-            "half-rotation pass-through",
-            128, 64, 10_000.0, pos,
-        );
+        assert_rope_at_pos_matches_cpu("half-rotation pass-through", 128, 64, 10_000.0, pos);
     }
 }
 

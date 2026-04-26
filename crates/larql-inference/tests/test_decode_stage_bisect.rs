@@ -47,10 +47,22 @@ struct StageCase {
 }
 
 const CASES: &[StageCase] = &[
-    StageCase { name: "gemma3-4b-it",         vindex_name: "gemma3-4b-q4k-v2" },
-    StageCase { name: "gemma4-31b-it (dense)", vindex_name: "gemma4-31b-q4k" },
-    StageCase { name: "llama2-7b-hf (base)",  vindex_name: "llama2-7b-q4k" },
-    StageCase { name: "mistral-7b-v0.1 (base)", vindex_name: "mistral-7b-v0.1-q4k" },
+    StageCase {
+        name: "gemma3-4b-it",
+        vindex_name: "gemma3-4b-q4k-v2",
+    },
+    StageCase {
+        name: "gemma4-31b-it (dense)",
+        vindex_name: "gemma4-31b-q4k",
+    },
+    StageCase {
+        name: "llama2-7b-hf (base)",
+        vindex_name: "llama2-7b-q4k",
+    },
+    StageCase {
+        name: "mistral-7b-v0.1 (base)",
+        vindex_name: "mistral-7b-v0.1-q4k",
+    },
 ];
 
 fn find_vindex(name: &str) -> Option<PathBuf> {
@@ -60,15 +72,23 @@ fn find_vindex(name: &str) -> Option<PathBuf> {
         name.to_uppercase().replace('-', "_")
     )) {
         let p = PathBuf::from(env_path);
-        if p.is_dir() { return Some(p); }
+        if p.is_dir() {
+            return Some(p);
+        }
     }
     let chris_models = PathBuf::from("/Users/christopherhay/chris-models").join(&filename);
-    if chris_models.is_dir() { return Some(chris_models); }
+    if chris_models.is_dir() {
+        return Some(chris_models);
+    }
     let home = std::env::var("HOME").ok()?;
     [
-        PathBuf::from(&home).join(".cache/larql/local").join(&filename),
+        PathBuf::from(&home)
+            .join(".cache/larql/local")
+            .join(&filename),
         PathBuf::from("output").join(&filename),
-    ].into_iter().find(|p| p.is_dir())
+    ]
+    .into_iter()
+    .find(|p| p.is_dir())
 }
 
 fn strict_mode() -> bool {
@@ -95,17 +115,17 @@ fn strict_mode() -> bool {
 /// shadowed by downstream amplification.
 const STAGE_PAIRS: &[(&str, &str)] = &[
     // Pre-attention
-    ("norm_out",          "norm_out"),
-    ("q_out_after_rope",  "q_out"),
-    ("k_out_after_rope",  "k_out"),
-    ("v_out",             "v_out"),
+    ("norm_out", "norm_out"),
+    ("q_out_after_rope", "q_out"),
+    ("k_out_after_rope", "k_out"),
+    ("v_out", "v_out"),
     // Attention block
-    ("attn_out",          "attn_out"),
-    ("o_out",             "o_out"),
-    ("h_post_attn",       "h_post_attn"),
+    ("attn_out", "attn_out"),
+    ("o_out", "o_out"),
+    ("h_post_attn", "h_post_attn"),
     // FFN block
-    ("ffn_norm_out",      "ffn_norm_out"),
-    ("ffn_out_raw",       "down_out"),
+    ("ffn_norm_out", "ffn_norm_out"),
+    ("ffn_out_raw", "down_out"),
 ];
 
 fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
@@ -116,22 +136,28 @@ fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
                 case.name, case.vindex_name
             ));
         }
-        eprintln!("[{}] skip: vindex `{}` not found", case.name, case.vindex_name);
+        eprintln!(
+            "[{}] skip: vindex `{}` not found",
+            case.name, case.vindex_name
+        );
         return Ok(());
     };
 
     let mut cb = SilentLoadCallbacks;
-    let cfg = load_vindex_config(&vindex_path)
-        .map_err(|e| format!("load_vindex_config: {e}"))?;
+    let cfg = load_vindex_config(&vindex_path).map_err(|e| format!("load_vindex_config: {e}"))?;
     if cfg.quant != QuantFormat::Q4K {
         return Err(format!("expected Q4K vindex, got {:?}", cfg.quant));
     }
-    let tokenizer = load_vindex_tokenizer(&vindex_path)
-        .map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
-    let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb)
-        .map_err(|e| format!("load vindex: {e}"))?;
-    q4_index.load_attn_q4k(&vindex_path).map_err(|e| format!("load_attn_q4k: {e}"))?;
-    q4_index.load_interleaved_q4k(&vindex_path).map_err(|e| format!("load_interleaved_q4k: {e}"))?;
+    let tokenizer =
+        load_vindex_tokenizer(&vindex_path).map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
+    let mut q4_index =
+        VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
+    q4_index
+        .load_attn_q4k(&vindex_path)
+        .map_err(|e| format!("load_attn_q4k: {e}"))?;
+    q4_index
+        .load_interleaved_q4k(&vindex_path)
+        .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
     let _ = q4_index.load_lm_head_q4(&vindex_path);
 
     let mut w_metal = load_model_weights_q4k(&vindex_path, &mut cb)
@@ -144,8 +170,8 @@ fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
     let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrap.prompt)
         .map_err(|e| format!("encode_prompt: {e}"))?;
 
-    let metal_backend = larql_compute::metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable")?;
+    let metal_backend =
+        larql_compute::metal::MetalBackend::new().ok_or("Metal backend unavailable")?;
 
     // Pick a deterministic next token by running one greedy step
     // through Metal, exactly as `test_decode_consistency` does. Keeps
@@ -153,10 +179,20 @@ fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
     let cached = larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
     let metal_num_layers = w_metal.num_layers;
     let r0 = larql_inference::layer_graph::generate(
-        &mut w_metal, &tokenizer, &prompt_ids, 1,
-        &q4_index, &metal_backend, &cached, 0..metal_num_layers,
+        &mut w_metal,
+        &tokenizer,
+        &prompt_ids,
+        1,
+        &q4_index,
+        &metal_backend,
+        &cached,
+        0..metal_num_layers,
     );
-    let token_0_text = r0.tokens.first().map(|(t, _)| t.clone()).unwrap_or_default();
+    let token_0_text = r0
+        .tokens
+        .first()
+        .map(|(t, _)| t.clone())
+        .unwrap_or_default();
     if token_0_text.is_empty() {
         return Err(format!("[{}] generate produced no first token", case.name));
     }
@@ -178,21 +214,31 @@ fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
     // `prompt_ids` cleanly.
     metal_backend.reset_kv_cache();
     let metal_stages = StageCapture::metal_decode(
-        &mut w_metal, &prompt_ids, token_0_id, &q4_index, &metal_backend,
+        &mut w_metal,
+        &prompt_ids,
+        token_0_id,
+        &q4_index,
+        &metal_backend,
         /*layer*/ 0,
     )?;
     // CPU prefill captures every stage as `[seq_len, stride]`. The
     // Metal-decode capture is single-position. Slice CPU's last
     // position out of every stage so 1:1 comparison works.
-    let cpu_stages = StageCapture::cpu_prefill(
-        &mut w_cpu, &appended_ids, &q4_index, /*layer*/ 0,
-    )?.project_to_last_position();
+    let cpu_stages =
+        StageCapture::cpu_prefill(&mut w_cpu, &appended_ids, &q4_index, /*layer*/ 0)?
+            .project_to_last_position();
 
     if cpu_stages.is_empty() {
-        return Err(format!("[{}] CPU stage capture empty — env var or path bug", case.name));
+        return Err(format!(
+            "[{}] CPU stage capture empty — env var or path bug",
+            case.name
+        ));
     }
     if metal_stages.is_empty() {
-        return Err(format!("[{}] Metal stage capture empty — env var or path bug", case.name));
+        return Err(format!(
+            "[{}] Metal stage capture empty — env var or path bug",
+            case.name
+        ));
     }
 
     // Loose threshold here, not tight. Metal decode and CPU prefill go
@@ -202,10 +248,14 @@ fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
     // stage *jumps* (cos drops well below kernel-noise) when something
     // structural diverges.
     let report = compare_stages(
-        &cpu_stages, &metal_stages, STAGE_PAIRS, ParityThreshold::loose(),
+        &cpu_stages,
+        &metal_stages,
+        STAGE_PAIRS,
+        ParityThreshold::loose(),
     );
     eprintln!("[{}] {}", case.name, report.summary());
-    report.assert_clean()
+    report
+        .assert_clean()
         .map_err(|e| format!("[{}] L0 stage divergence:\n{e}", case.name))?;
     Ok(())
 }

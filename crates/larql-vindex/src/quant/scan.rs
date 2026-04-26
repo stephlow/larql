@@ -41,8 +41,7 @@ pub const DEFAULT_TILE_SUB_BLOCKS: usize = 16;
 
 /// Canonical compliance thresholds Q1 reports always include.
 /// Consumers can add custom thresholds; these are always measured.
-pub const DEFAULT_COMPLIANCE_THRESHOLDS: &[f32] =
-    &[2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+pub const DEFAULT_COMPLIANCE_THRESHOLDS: &[f32] = &[2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
 
 /// Default top-K offenders recorded per projection per granularity.
 pub const DEFAULT_TOP_K_OFFENDERS: usize = 32;
@@ -57,7 +56,11 @@ pub const PROJECTIONS: &[(&str, &str)] = &[
 /// Source dtype on disk. Q1 is always run on raw-float inputs; FP4
 /// vindexes don't need a scan — they're the output of one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype { F32, F16, Bf16 }
+pub enum Dtype {
+    F32,
+    F16,
+    Bf16,
+}
 
 impl Dtype {
     pub fn from_index_json(s: &str) -> Result<Self, String> {
@@ -69,10 +72,17 @@ impl Dtype {
         }
     }
     pub fn bytes_per_float(self) -> usize {
-        match self { Dtype::F32 => 4, _ => 2 }
+        match self {
+            Dtype::F32 => 4,
+            _ => 2,
+        }
     }
     pub fn as_str(self) -> &'static str {
-        match self { Dtype::F32 => "f32", Dtype::F16 => "f16", Dtype::Bf16 => "bf16" }
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+            Dtype::Bf16 => "bf16",
+        }
     }
 }
 
@@ -101,17 +111,23 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    pub fn count(&self) -> u64 { self.ratios.len() as u64 + self.all_zero_blocks }
+    pub fn count(&self) -> u64 {
+        self.ratios.len() as u64 + self.all_zero_blocks
+    }
 
     pub fn compliance_at(&self, threshold: f32) -> f64 {
         let total = self.count() as f64;
-        if total == 0.0 { return 0.0; }
+        if total == 0.0 {
+            return 0.0;
+        }
         let under = self.ratios.iter().filter(|&&r| r < threshold).count() as f64;
         (under + self.all_zero_blocks as f64) / total
     }
 
     fn percentile(sorted: &[f32], p: f64) -> f32 {
-        if sorted.is_empty() { return f32::NAN; }
+        if sorted.is_empty() {
+            return f32::NAN;
+        }
         let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
         sorted[idx.min(sorted.len() - 1)]
     }
@@ -124,7 +140,9 @@ impl Bucket {
             nonzero_ratio_blocks: sorted.len() as u64,
             all_zero_blocks: self.all_zero_blocks,
             has_some_zero_blocks: self.has_zero_blocks,
-            mean: if sorted.is_empty() { f32::NAN } else {
+            mean: if sorted.is_empty() {
+                f32::NAN
+            } else {
                 sorted.iter().map(|&x| x as f64).sum::<f64>() as f32 / sorted.len() as f32
             },
             p50: Self::percentile(&sorted, 0.50),
@@ -214,7 +232,10 @@ impl VindexComplianceReport {
 
     /// Per-projection compliance at the given ratio threshold.
     pub fn per_projection_compliance(&self, threshold: f32) -> Vec<(String, f64)> {
-        self.projections.iter().map(|p| (p.name.clone(), p.compliance_at(threshold))).collect()
+        self.projections
+            .iter()
+            .map(|p| (p.name.clone(), p.compliance_at(threshold)))
+            .collect()
     }
 
     /// Canonical JSON dump — matches the shape the `fp4_q1_scan`
@@ -226,10 +247,15 @@ impl VindexComplianceReport {
 
         fn bucket_json(b: &Bucket, thresholds: &[f32]) -> Value {
             let q = b.quantiles();
-            let compliance: Vec<Value> = thresholds.iter().map(|&t| json!({
-                "threshold": t,
-                "compliant_fraction": b.compliance_at(t),
-            })).collect();
+            let compliance: Vec<Value> = thresholds
+                .iter()
+                .map(|&t| {
+                    json!({
+                        "threshold": t,
+                        "compliant_fraction": b.compliance_at(t),
+                    })
+                })
+                .collect();
             json!({
                 "total_blocks": q.total_blocks as f64,
                 "nonzero_ratio_blocks": q.nonzero_ratio_blocks as f64,
@@ -242,11 +268,17 @@ impl VindexComplianceReport {
             })
         }
 
-        let per_projection: Vec<Value> = self.projections.iter().map(|p| json!({
-            "projection": p.name,
-            "per_feature": bucket_json(&p.aggregate.per_feature, thresholds),
-            "sub_feature_tile": bucket_json(&p.aggregate.sub_feature_tile, thresholds),
-        })).collect();
+        let per_projection: Vec<Value> = self
+            .projections
+            .iter()
+            .map(|p| {
+                json!({
+                    "projection": p.name,
+                    "per_feature": bucket_json(&p.aggregate.per_feature, thresholds),
+                    "sub_feature_tile": bucket_json(&p.aggregate.sub_feature_tile, thresholds),
+                })
+            })
+            .collect();
 
         let mut per_layer_json: Vec<Value> = Vec::new();
         for p in &self.projections {
@@ -313,16 +345,24 @@ fn record_block(scales: &[f32], bucket: &mut Bucket, mut on_ratio: impl FnMut(Op
     let mut mn = f32::INFINITY;
     let mut any_zero = false;
     for &s in scales {
-        if s > mx { mx = s; }
-        if s > 0.0 && s < mn { mn = s; }
-        if s == 0.0 { any_zero = true; }
+        if s > mx {
+            mx = s;
+        }
+        if s > 0.0 && s < mn {
+            mn = s;
+        }
+        if s == 0.0 {
+            any_zero = true;
+        }
     }
     if mx == 0.0 {
         bucket.all_zero_blocks += 1;
         on_ratio(None);
         return;
     }
-    if any_zero { bucket.has_zero_blocks += 1; }
+    if any_zero {
+        bucket.has_zero_blocks += 1;
+    }
     let ratio = mx / mn;
     bucket.ratios.push(ratio);
     on_ratio(Some(ratio));
@@ -338,24 +378,34 @@ fn scan_feature_vector(
 ) {
     let hidden = vec.len();
     let sub_blocks = hidden / SUB_BLOCK_SIZE;
-    if sub_blocks == 0 { return; }
+    if sub_blocks == 0 {
+        return;
+    }
     let mut scales = Vec::with_capacity(sub_blocks);
     for chunk in vec.chunks_exact(SUB_BLOCK_SIZE) {
         let s = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         scales.push(s);
     }
     record_block(&scales, &mut gran.per_feature, |r| {
-        if let Some(r) = r { top_pf.push((feat_idx, r)); }
+        if let Some(r) = r {
+            top_pf.push((feat_idx, r));
+        }
     });
     for (tile_idx, tile_scales) in scales.chunks_exact(tile_sub_blocks).enumerate() {
         record_block(tile_scales, &mut gran.sub_feature_tile, |r| {
-            if let Some(r) = r { top_sf.push((feat_idx, tile_idx, r)); }
+            if let Some(r) = r {
+                top_sf.push((feat_idx, tile_idx, r));
+            }
         });
     }
 }
 
 fn truncate_top<T: Clone>(v: &mut Vec<T>, k: usize, key: impl Fn(&T) -> f32) {
-    v.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| {
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     v.truncate(k);
 }
 
@@ -379,9 +429,7 @@ pub fn scan_projection(
 
     let file = std::fs::File::open(path)
         .map_err(|e| VindexError::Parse(format!("open {}: {e}", path.display())))?;
-    let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| VindexError::Parse(format!("mmap: {e}")))?
-    };
+    let mmap = unsafe { Mmap::map(&file).map_err(|e| VindexError::Parse(format!("mmap: {e}")))? };
     if mmap.len() != expected_bytes {
         return Err(VindexError::Parse(format!(
             "{}: size {} != expected {}",
@@ -413,10 +461,7 @@ pub fn scan_projection(
                 Dtype::F32 => {
                     // SAFETY: mmap'd region, f32 alignment matches u8.
                     let view: &[f32] = unsafe {
-                        std::slice::from_raw_parts(
-                            layer_bytes.as_ptr() as *const f32,
-                            nf * hidden,
-                        )
+                        std::slice::from_raw_parts(layer_bytes.as_ptr() as *const f32, nf * hidden)
                     };
                     view.to_vec()
                 }
@@ -427,7 +472,9 @@ pub fn scan_projection(
             for feat in 0..nf {
                 let v = &floats[feat * hidden..(feat + 1) * hidden];
                 scan_feature_vector(
-                    v, feat, tile_sub_blocks,
+                    v,
+                    feat,
+                    tile_sub_blocks,
                     &mut stats.granularity,
                     &mut stats.top_per_feature,
                     &mut stats.top_sub_feature,
@@ -442,10 +489,16 @@ pub fn scan_projection(
     let mut aggregate = GranularityStats::default();
     for l in &layer_stats {
         aggregate.per_feature.merge_from(&l.granularity.per_feature);
-        aggregate.sub_feature_tile.merge_from(&l.granularity.sub_feature_tile);
+        aggregate
+            .sub_feature_tile
+            .merge_from(&l.granularity.sub_feature_tile);
     }
 
-    Ok(ProjectionReport { name: name.to_string(), layers: layer_stats, aggregate })
+    Ok(ProjectionReport {
+        name: name.to_string(),
+        layers: layer_stats,
+        aggregate,
+    })
 }
 
 pub fn scan_vindex(
@@ -458,36 +511,57 @@ pub fn scan_vindex(
     )
     .map_err(|e| VindexError::Parse(format!("parse index.json: {e}")))?;
 
-    let num_layers = index_json["num_layers"].as_u64()
-        .ok_or_else(|| VindexError::Parse("index.json: missing num_layers".into()))? as usize;
-    let hidden = index_json["hidden_size"].as_u64()
-        .ok_or_else(|| VindexError::Parse("index.json: missing hidden_size".into()))? as usize;
+    let num_layers = index_json["num_layers"]
+        .as_u64()
+        .ok_or_else(|| VindexError::Parse("index.json: missing num_layers".into()))?
+        as usize;
+    let hidden = index_json["hidden_size"]
+        .as_u64()
+        .ok_or_else(|| VindexError::Parse("index.json: missing hidden_size".into()))?
+        as usize;
     let dtype_str = index_json["dtype"].as_str().unwrap_or("f32");
     let dtype = Dtype::from_index_json(dtype_str).map_err(VindexError::Parse)?;
 
-    let layers_array = index_json["layers"].as_array()
+    let layers_array = index_json["layers"]
+        .as_array()
         .ok_or_else(|| VindexError::Parse("index.json: missing layers[]".into()))?;
-    let layer_features: Vec<usize> = layers_array.iter()
+    let layer_features: Vec<usize> = layers_array
+        .iter()
         .map(|v| v["num_features"].as_u64().unwrap_or(0) as usize)
         .collect();
 
     let mut projections = Vec::new();
     for (name, filename) in PROJECTIONS {
         let path = vindex_dir.join(filename);
-        if !path.exists() { continue; }
-        projections.push(scan_projection(&path, name, dtype, &layer_features, hidden, config)?);
+        if !path.exists() {
+            continue;
+        }
+        projections.push(scan_projection(
+            &path,
+            name,
+            dtype,
+            &layer_features,
+            hidden,
+            config,
+        )?);
     }
 
     let mut aggregate = GranularityStats::default();
     for p in &projections {
         aggregate.per_feature.merge_from(&p.aggregate.per_feature);
-        aggregate.sub_feature_tile.merge_from(&p.aggregate.sub_feature_tile);
+        aggregate
+            .sub_feature_tile
+            .merge_from(&p.aggregate.sub_feature_tile);
     }
 
     Ok(VindexComplianceReport {
         config: config.clone(),
-        num_layers, hidden, layer_features, dtype,
-        projections, aggregate,
+        num_layers,
+        hidden,
+        layer_features,
+        dtype,
+        projections,
+        aggregate,
     })
 }
 

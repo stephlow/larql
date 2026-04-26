@@ -39,7 +39,13 @@ impl KernelHandle {
     /// )?,
     /// ```
     pub fn from_kernel<K: TiledKernel>(device: &Device, library: &Library) -> Option<Self> {
-        Self::compile(device, library, K::KERNEL_NAME, K::ROWS_PER_TG, K::THREADS_PER_TG)
+        Self::compile(
+            device,
+            library,
+            K::KERNEL_NAME,
+            K::ROWS_PER_TG,
+            K::THREADS_PER_TG,
+        )
     }
 
     /// Lower-level constructor used by [`from_kernel`](Self::from_kernel).
@@ -65,6 +71,11 @@ impl KernelHandle {
             );
             return None;
         }
-        Some(Self { state, rows_per_tg, threads_per_tg, kernel_name })
+        Some(Self {
+            state,
+            rows_per_tg,
+            threads_per_tg,
+            kernel_name,
+        })
     }
 }

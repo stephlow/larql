@@ -7,10 +7,10 @@
 //!
 //! Zero forward passes. Pure matrix multiplication.
 
-use larql_vindex::format::filenames::*;
 use larql_core::core::edge::Edge;
 use larql_core::core::enums::SourceType;
 use larql_core::core::graph::Graph;
+use larql_vindex::format::filenames::*;
 
 use super::utils::{count_threshold, decode_token, partial_top_k_column, top_entities};
 use crate::error::InferenceError;

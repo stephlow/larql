@@ -64,11 +64,14 @@ pub(super) fn encode_input_norm_and_qkv(
     let q8_off = |p: usize| (p * ctx.q8_row_max) as u64;
     let q8s_off = |p: usize| (p * ctx.q8s_row_bytes) as u64;
 
-    let all_same_format = layer.wq.format == layer.wk.format
-        && layer.wk.format == layer.wv.format;
-    let fused_qkv_pipe = pipes.q4kf_qkv_proj.or(pipes.q4k_qkv_proj)
-        .filter(|_| all_same_format
-            && matches!(layer.wq.format, crate::QuantFormat::Q4_K | crate::QuantFormat::Q4_KF));
+    let all_same_format = layer.wq.format == layer.wk.format && layer.wk.format == layer.wv.format;
+    let fused_qkv_pipe = pipes.q4kf_qkv_proj.or(pipes.q4k_qkv_proj).filter(|_| {
+        all_same_format
+            && matches!(
+                layer.wq.format,
+                crate::QuantFormat::Q4_K | crate::QuantFormat::Q4_KF
+            )
+    });
 
     if uses_f32_input {
         // Q4_K / Q6_K / Q4_KF: f32 norm output, then either fused or
@@ -76,34 +79,71 @@ pub(super) fn encode_input_norm_and_qkv(
         for pos in 0..seq_len {
             let enc = cmd.new_compute_command_encoder();
             input_norm::encode_f32(
-                enc, pipes.rms_norm,
-                &lb.h[l], h_off(pos),
+                enc,
+                pipes.rms_norm,
+                &lb.h[l],
+                h_off(pos),
                 &lb.input_norm[l],
-                &lb.norm_out[l], h_off(pos),
-                hidden, ctx.eps, ctx.norm_offset,
+                &lb.norm_out[l],
+                h_off(pos),
+                hidden,
+                ctx.eps,
+                ctx.norm_offset,
             );
             if let Some(fused_pipeline) = fused_qkv_pipe {
                 qkv_proj::encode_fused_f32(
-                    enc, fused_pipeline,
-                    &lb.wq[l], &lb.wk[l], &lb.wv[l],
-                    &lb.norm_out[l], h_off(pos),
-                    &lb.q_out[l], q_off(pos),
-                    &lb.k_out[l], kv_off(pos),
-                    &lb.v_out[l], kv_off(pos),
-                    ctx.layer_q_dim, ctx.layer_kv_dim, hidden,
+                    enc,
+                    fused_pipeline,
+                    &lb.wq[l],
+                    &lb.wk[l],
+                    &lb.wv[l],
+                    &lb.norm_out[l],
+                    h_off(pos),
+                    &lb.q_out[l],
+                    q_off(pos),
+                    &lb.k_out[l],
+                    kv_off(pos),
+                    &lb.v_out[l],
+                    kv_off(pos),
+                    ctx.layer_q_dim,
+                    ctx.layer_kv_dim,
+                    hidden,
                 );
             } else {
                 let pos_qoff = q_off(pos);
                 let pos_kvoff = kv_off(pos);
                 qkv_proj::encode_per_proj(
-                    enc, &pipes.qm_pipes,
-                    &lb.norm_out[l], h_off(pos),
+                    enc,
+                    &pipes.qm_pipes,
+                    &lb.norm_out[l],
+                    h_off(pos),
                     // Q8 input unused for f32-input formats — placeholder.
-                    &lb.norm_out[l], 0, &lb.norm_out[l], 0,
+                    &lb.norm_out[l],
+                    0,
+                    &lb.norm_out[l],
+                    0,
                     [
-                        qkv_proj::Proj { format: layer.wq.format, w_buf: &lb.wq[l], out_buf: &lb.q_out[l], out_off: pos_qoff,  rows: ctx.layer_q_dim },
-                        qkv_proj::Proj { format: layer.wk.format, w_buf: &lb.wk[l], out_buf: &lb.k_out[l], out_off: pos_kvoff, rows: ctx.layer_kv_dim },
-                        qkv_proj::Proj { format: layer.wv.format, w_buf: &lb.wv[l], out_buf: &lb.v_out[l], out_off: pos_kvoff, rows: ctx.layer_kv_dim },
+                        qkv_proj::Proj {
+                            format: layer.wq.format,
+                            w_buf: &lb.wq[l],
+                            out_buf: &lb.q_out[l],
+                            out_off: pos_qoff,
+                            rows: ctx.layer_q_dim,
+                        },
+                        qkv_proj::Proj {
+                            format: layer.wk.format,
+                            w_buf: &lb.wk[l],
+                            out_buf: &lb.k_out[l],
+                            out_off: pos_kvoff,
+                            rows: ctx.layer_kv_dim,
+                        },
+                        qkv_proj::Proj {
+                            format: layer.wv.format,
+                            w_buf: &lb.wv[l],
+                            out_buf: &lb.v_out[l],
+                            out_off: pos_kvoff,
+                            rows: ctx.layer_kv_dim,
+                        },
                     ],
                     hidden,
                 );
@@ -115,24 +155,41 @@ pub(super) fn encode_input_norm_and_qkv(
         for pos in 0..seq_len {
             let enc = cmd.new_compute_command_encoder();
             input_norm::encode_q8(
-                enc, pipes.rms_norm_q8,
-                &lb.h[l], h_off(pos),
+                enc,
+                pipes.rms_norm_q8,
+                &lb.h[l],
+                h_off(pos),
                 &lb.input_norm[l],
-                &lb.q8[l], q8_off(pos),
-                &lb.q8s[l], q8s_off(pos),
-                hidden, ctx.eps, ctx.norm_offset,
+                &lb.q8[l],
+                q8_off(pos),
+                &lb.q8s[l],
+                q8s_off(pos),
+                hidden,
+                ctx.eps,
+                ctx.norm_offset,
             );
             qkv_proj::encode_fused_q8(
-                enc, pipes.q8_qkv_proj,
-                &lb.wq[l], &lb.wq_scale[l],
-                &lb.wk[l], &lb.wk_scale[l],
-                &lb.wv[l], &lb.wv_scale[l],
-                &lb.q8[l], q8_off(pos),
-                &lb.q8s[l], q8s_off(pos),
-                &lb.q_out[l], q_off(pos),
-                &lb.k_out[l], kv_off(pos),
-                &lb.v_out[l], kv_off(pos),
-                ctx.layer_q_dim, ctx.layer_kv_dim, hidden,
+                enc,
+                pipes.q8_qkv_proj,
+                &lb.wq[l],
+                &lb.wq_scale[l],
+                &lb.wk[l],
+                &lb.wk_scale[l],
+                &lb.wv[l],
+                &lb.wv_scale[l],
+                &lb.q8[l],
+                q8_off(pos),
+                &lb.q8s[l],
+                q8s_off(pos),
+                &lb.q_out[l],
+                q_off(pos),
+                &lb.k_out[l],
+                kv_off(pos),
+                &lb.v_out[l],
+                kv_off(pos),
+                ctx.layer_q_dim,
+                ctx.layer_kv_dim,
+                hidden,
             );
             enc.end_encoding();
         }

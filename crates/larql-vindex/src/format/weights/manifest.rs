@@ -87,14 +87,18 @@ mod tests {
     #[test]
     fn format_tag_matches_on_disk_strings() {
         let q4 = Q4kManifestEntry {
-            key: "x".into(), shape: vec![1, 256],
+            key: "x".into(),
+            shape: vec![1, 256],
             format: QuantBlockFormat::Q4K,
-            offset: 0, length: 0,
+            offset: 0,
+            length: 0,
         };
         let q6 = Q4kManifestEntry {
-            key: "x".into(), shape: vec![1, 256],
+            key: "x".into(),
+            shape: vec![1, 256],
             format: QuantBlockFormat::Q6K,
-            offset: 0, length: 0,
+            offset: 0,
+            length: 0,
         };
         assert_eq!(q4.format_tag(), "Q4_K");
         assert_eq!(q6.format_tag(), "Q6_K");
@@ -107,23 +111,29 @@ mod tests {
     #[test]
     fn padded_width_extracts_second_dim() {
         let two_d = Q4kManifestEntry {
-            key: "x".into(), shape: vec![10240, 2560],
+            key: "x".into(),
+            shape: vec![10240, 2560],
             format: QuantBlockFormat::Q4K,
-            offset: 0, length: 0,
+            offset: 0,
+            length: 0,
         };
         assert_eq!(two_d.padded_width(), Some(2560));
 
         let one_d = Q4kManifestEntry {
-            key: "x".into(), shape: vec![2560],
+            key: "x".into(),
+            shape: vec![2560],
             format: QuantBlockFormat::Q4K,
-            offset: 0, length: 0,
+            offset: 0,
+            length: 0,
         };
         assert_eq!(one_d.padded_width(), None);
 
         let empty = Q4kManifestEntry {
-            key: "x".into(), shape: vec![],
+            key: "x".into(),
+            shape: vec![],
             format: QuantBlockFormat::Q4K,
-            offset: 0, length: 0,
+            offset: 0,
+            length: 0,
         };
         assert_eq!(empty.padded_width(), None);
     }
@@ -135,6 +145,9 @@ mod tests {
     fn missing_format_field_fails_parse() {
         let json = r#"[{"key":"x","shape":[10240,2560],"offset":0,"length":1}]"#;
         let parsed: Result<Vec<Q4kManifestEntry>, _> = serde_json::from_str(json);
-        assert!(parsed.is_err(), "missing `format` must error, not silently default");
+        assert!(
+            parsed.is_err(),
+            "missing `format` must error, not silently default"
+        );
     }
 }

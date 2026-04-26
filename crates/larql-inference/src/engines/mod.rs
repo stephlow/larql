@@ -20,9 +20,9 @@ pub use kv_engines::markov_residual;
 pub use kv_engines::turbo_quant;
 pub use kv_engines::unlimited_context;
 
-use ndarray::Array2;
-use larql_compute::ComputeBackend;
 use crate::model::ModelWeights;
+use larql_compute::ComputeBackend;
+use ndarray::Array2;
 
 // ─── EngineInfo ───────────────────────────────────────────────────────────────
 
@@ -44,7 +44,10 @@ impl EngineInfo {
         if self.config.is_empty() {
             format!("{} [{}]  {}", self.name, self.backend, self.description)
         } else {
-            format!("{} [{}] ({})  {}", self.name, self.backend, self.config, self.description)
+            format!(
+                "{} [{}] ({})  {}",
+                self.name, self.backend, self.config, self.description
+            )
         }
     }
 }
@@ -70,13 +73,19 @@ pub trait KvEngine: Send {
     fn memory_bytes(&self) -> usize;
 
     /// Token count in the active hot window (varies by engine type).
-    fn window_tokens(&self) -> usize { 0 }
+    fn window_tokens(&self) -> usize {
+        0
+    }
 
     /// Cold-tier bytes (residuals or token IDs past the hot window).
-    fn cold_bytes(&self) -> usize { 0 }
+    fn cold_bytes(&self) -> usize {
+        0
+    }
 
     /// Per-stage timing summary. Returns `None` if profiling was not enabled.
-    fn stage_summary(&self) -> Option<profiler::DecodeStageSummary> { None }
+    fn stage_summary(&self) -> Option<profiler::DecodeStageSummary> {
+        None
+    }
 
     /// Prefill using Q4K quantised weights from `index` and `backend`.
     ///
@@ -119,10 +128,20 @@ pub trait KvEngine: Send {
 /// Engine selector. Parse with [`EngineKind::from_name`]; build with [`EngineKind::build`].
 #[derive(Debug, Clone)]
 pub enum EngineKind {
-    MarkovResidual { window_size: Option<usize> },
-    UnlimitedContext { window_size: usize },
-    TurboQuant { bits: u8 },
-    Apollo { injection_layer: usize, inject_coefficient: f32, top_k: usize },
+    MarkovResidual {
+        window_size: Option<usize>,
+    },
+    UnlimitedContext {
+        window_size: usize,
+    },
+    TurboQuant {
+        bits: u8,
+    },
+    Apollo {
+        injection_layer: usize,
+        inject_coefficient: f32,
+        top_k: usize,
+    },
 }
 
 impl EngineKind {
@@ -147,10 +166,16 @@ impl EngineKind {
             .collect();
 
         let get_usize = |key: &str, default: usize| -> usize {
-            params.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+            params
+                .get(key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
         };
         let get_f32 = |key: &str, default: f32| -> f32 {
-            params.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+            params
+                .get(key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
         };
 
         match name.trim() {
@@ -159,18 +184,20 @@ impl EngineKind {
                 Some(EngineKind::MarkovResidual { window_size })
             }
             "unlimited" | "unlimited-context" | "unlimited_context" => {
-                Some(EngineKind::UnlimitedContext { window_size: get_usize("window", 512) })
+                Some(EngineKind::UnlimitedContext {
+                    window_size: get_usize("window", 512),
+                })
             }
-            "turbo-quant" | "turbo_quant" | "turboquant" | "tq4" => {
-                Some(EngineKind::TurboQuant { bits: get_usize("bits", 4) as u8 })
-            }
+            "turbo-quant" | "turbo_quant" | "turboquant" | "tq4" => Some(EngineKind::TurboQuant {
+                bits: get_usize("bits", 4) as u8,
+            }),
             "tq3" => Some(EngineKind::TurboQuant { bits: 3 }),
             "apollo" => {
                 let cfg = apollo::entry::InjectionConfig::default();
                 Some(EngineKind::Apollo {
-                    injection_layer:    get_usize("layer", cfg.injection_layer),
+                    injection_layer: get_usize("layer", cfg.injection_layer),
                     inject_coefficient: get_f32("coef", cfg.inject_coefficient),
-                    top_k:              get_usize("top_k", cfg.top_k),
+                    top_k: get_usize("top_k", cfg.top_k),
                 })
             }
             _ => None,
@@ -179,10 +206,10 @@ impl EngineKind {
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            EngineKind::MarkovResidual { .. }  => "markov-rs",
+            EngineKind::MarkovResidual { .. } => "markov-rs",
             EngineKind::UnlimitedContext { .. } => "unlimited-context",
-            EngineKind::TurboQuant { .. }       => "turbo-quant",
-            EngineKind::Apollo { .. }           => "apollo",
+            EngineKind::TurboQuant { .. } => "turbo-quant",
+            EngineKind::Apollo { .. } => "apollo",
         }
     }
 
@@ -192,23 +219,31 @@ impl EngineKind {
     }
 
     /// Build a boxed engine with optional per-stage decode profiling.
-    pub fn build_with_profiling(self, backend: Box<dyn ComputeBackend>, profiling: bool) -> Box<dyn KvEngine> {
+    pub fn build_with_profiling(
+        self,
+        backend: Box<dyn ComputeBackend>,
+        profiling: bool,
+    ) -> Box<dyn KvEngine> {
         match self {
-            EngineKind::MarkovResidual { window_size } => {
-                Box::new(markov_residual::MarkovResidualEngine::with_backend(window_size, backend)
-                    .with_profiling(profiling))
-            }
-            EngineKind::UnlimitedContext { window_size } => {
-                Box::new(unlimited_context::UnlimitedContextEngine::with_backend(window_size, backend))
-            }
+            EngineKind::MarkovResidual { window_size } => Box::new(
+                markov_residual::MarkovResidualEngine::with_backend(window_size, backend)
+                    .with_profiling(profiling),
+            ),
+            EngineKind::UnlimitedContext { window_size } => Box::new(
+                unlimited_context::UnlimitedContextEngine::with_backend(window_size, backend),
+            ),
             EngineKind::TurboQuant { bits } => {
                 Box::new(turbo_quant::TurboQuantEngine::with_backend(bits, backend))
             }
-            EngineKind::Apollo { injection_layer, inject_coefficient, top_k } => {
-                Box::new(apollo::ApolloEngine::new(
-                    apollo::InjectionConfig { injection_layer, inject_coefficient, top_k }
-                ))
-            }
+            EngineKind::Apollo {
+                injection_layer,
+                inject_coefficient,
+                top_k,
+            } => Box::new(apollo::ApolloEngine::new(apollo::InjectionConfig {
+                injection_layer,
+                inject_coefficient,
+                top_k,
+            })),
         }
     }
 }
@@ -219,15 +254,26 @@ mod tests {
 
     #[test]
     fn engine_kind_from_name_roundtrip() {
-        for name in &["markov-rs", "markov_rs", "markov-residual", "markov_residual"] {
+        for name in &[
+            "markov-rs",
+            "markov_rs",
+            "markov-residual",
+            "markov_residual",
+        ] {
             assert!(
-                matches!(EngineKind::from_name(name), Some(EngineKind::MarkovResidual { .. })),
+                matches!(
+                    EngineKind::from_name(name),
+                    Some(EngineKind::MarkovResidual { .. })
+                ),
                 "failed to parse {name:?}"
             );
         }
         for name in &["unlimited", "unlimited-context", "unlimited_context"] {
             assert!(
-                matches!(EngineKind::from_name(name), Some(EngineKind::UnlimitedContext { .. })),
+                matches!(
+                    EngineKind::from_name(name),
+                    Some(EngineKind::UnlimitedContext { .. })
+                ),
                 "failed to parse {name:?}"
             );
         }
@@ -239,7 +285,9 @@ mod tests {
     fn engine_kind_from_name_with_params() {
         // window param
         match EngineKind::from_name("markov-rs:window=1024") {
-            Some(EngineKind::MarkovResidual { window_size: Some(1024) }) => {}
+            Some(EngineKind::MarkovResidual {
+                window_size: Some(1024),
+            }) => {}
             other => panic!("expected MarkovResidual{{window=1024}}, got {other:?}"),
         }
         // unlimited window
@@ -254,7 +302,11 @@ mod tests {
         }
         // apollo params
         match EngineKind::from_name("apollo:layer=25,coef=8.0,top_k=12") {
-            Some(EngineKind::Apollo { injection_layer: 25, top_k: 12, .. }) => {}
+            Some(EngineKind::Apollo {
+                injection_layer: 25,
+                top_k: 12,
+                ..
+            }) => {}
             other => panic!("expected Apollo{{layer=25,top_k=12}}, got {other:?}"),
         }
         // unknown param is silently ignored, defaults apply
@@ -301,11 +353,17 @@ mod compliance_tests {
     fn all_kinds() -> Vec<EngineKind> {
         vec![
             EngineKind::MarkovResidual { window_size: None },
-            EngineKind::MarkovResidual { window_size: Some(32) },
+            EngineKind::MarkovResidual {
+                window_size: Some(32),
+            },
             EngineKind::UnlimitedContext { window_size: 64 },
             EngineKind::TurboQuant { bits: 4 },
             EngineKind::TurboQuant { bits: 3 },
-            EngineKind::Apollo { injection_layer: 30, inject_coefficient: 10.0, top_k: 8 },
+            EngineKind::Apollo {
+                injection_layer: 30,
+                inject_coefficient: 10.0,
+                top_k: 8,
+            },
         ]
     }
 
@@ -313,14 +371,25 @@ mod compliance_tests {
     fn all_engines_memory_zero_before_prefill() {
         for kind in all_kinds() {
             let engine = kind.clone().build(cpu_backend());
-            assert_eq!(engine.memory_bytes(), 0,
-                "{} should have 0 memory before prefill", kind.display_name());
+            assert_eq!(
+                engine.memory_bytes(),
+                0,
+                "{} should have 0 memory before prefill",
+                kind.display_name()
+            );
         }
     }
 
     #[test]
     fn all_engines_have_valid_name() {
-        let expected = ["markov-rs", "markov-rs", "unlimited-context", "turbo-quant", "turbo-quant", "apollo"];
+        let expected = [
+            "markov-rs",
+            "markov-rs",
+            "unlimited-context",
+            "turbo-quant",
+            "turbo-quant",
+            "apollo",
+        ];
         for (kind, expected_name) in all_kinds().into_iter().zip(expected.iter()) {
             let engine = kind.build(cpu_backend());
             assert_eq!(engine.name(), *expected_name);
@@ -333,7 +402,7 @@ mod compliance_tests {
             let name = kind.display_name();
             let engine = kind.build(cpu_backend());
             let info = engine.info();
-            assert!(!info.name.is_empty(),    "{name}: empty name");
+            assert!(!info.name.is_empty(), "{name}: empty name");
             assert!(!info.backend.is_empty(), "{name}: empty backend");
         }
     }
@@ -342,8 +411,12 @@ mod compliance_tests {
     fn all_engines_window_tokens_zero_before_prefill() {
         for kind in all_kinds() {
             let engine = kind.clone().build(cpu_backend());
-            assert_eq!(engine.window_tokens(), 0,
-                "{} window_tokens should be 0 before prefill", kind.display_name());
+            assert_eq!(
+                engine.window_tokens(),
+                0,
+                "{} window_tokens should be 0 before prefill",
+                kind.display_name()
+            );
         }
     }
 
@@ -351,8 +424,12 @@ mod compliance_tests {
     fn all_engines_cold_bytes_zero_before_prefill() {
         for kind in all_kinds() {
             let engine = kind.clone().build(cpu_backend());
-            assert_eq!(engine.cold_bytes(), 0,
-                "{} cold_bytes should be 0 before prefill", kind.display_name());
+            assert_eq!(
+                engine.cold_bytes(),
+                0,
+                "{} cold_bytes should be 0 before prefill",
+                kind.display_name()
+            );
         }
     }
 
@@ -360,8 +437,11 @@ mod compliance_tests {
     fn all_engines_stage_summary_none_before_decode() {
         for kind in all_kinds() {
             let engine = kind.clone().build_with_profiling(cpu_backend(), true);
-            assert!(engine.stage_summary().is_none(),
-                "{} stage_summary should be None before decode", kind.display_name());
+            assert!(
+                engine.stage_summary().is_none(),
+                "{} stage_summary should be None before decode",
+                kind.display_name()
+            );
         }
     }
 
@@ -383,10 +463,13 @@ mod compliance_tests {
             ("apollo", "apollo"),
         ];
         for (spec, expected_display) in specs {
-            let kind = EngineKind::from_name(spec)
-                .unwrap_or_else(|| panic!("{spec:?} failed to parse"));
-            assert_eq!(kind.display_name(), expected_display,
-                "{spec} parsed to wrong display_name");
+            let kind =
+                EngineKind::from_name(spec).unwrap_or_else(|| panic!("{spec:?} failed to parse"));
+            assert_eq!(
+                kind.display_name(),
+                expected_display,
+                "{spec} parsed to wrong display_name"
+            );
         }
     }
 }

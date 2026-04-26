@@ -14,23 +14,21 @@
 //! loaded `VectorIndex`) live elsewhere — see
 //! `crate::index::fp4_storage` and `crate::format::fp4_storage`.
 
-pub mod registry;
-pub mod scan;
 pub mod convert;
 pub mod convert_q4k;
+pub mod registry;
+pub mod scan;
 
 pub use registry::{lookup, QuantFormatInfo, QUANT_FORMATS};
 
-pub use scan::{
-    scan_projection, scan_vindex, BucketQuantiles, ComplianceThreshold,
-    Dtype, GranularityStats, LayerStats, ProjectionReport, ScanConfig,
-    VindexComplianceReport, PROJECTIONS,
-};
 pub use convert::{
-    vindex_to_fp4, Fp4ConvertConfig, Fp4ConvertReport, Policy,
-    ProjectionAction, ProjectionOutcome,
+    vindex_to_fp4, Fp4ConvertConfig, Fp4ConvertReport, Policy, ProjectionAction, ProjectionOutcome,
 };
 pub use convert_q4k::{
-    add_feature_major_down, vindex_to_q4k, AddFeatureMajorDownReport,
-    Q4kConvertConfig, Q4kConvertReport,
+    add_feature_major_down, vindex_to_q4k, AddFeatureMajorDownReport, Q4kConvertConfig,
+    Q4kConvertReport,
+};
+pub use scan::{
+    scan_projection, scan_vindex, BucketQuantiles, ComplianceThreshold, Dtype, GranularityStats,
+    LayerStats, ProjectionReport, ScanConfig, VindexComplianceReport, PROJECTIONS,
 };

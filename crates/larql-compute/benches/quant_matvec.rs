@@ -24,10 +24,10 @@
 
 extern crate blas_src;
 
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use larql_compute::cpu::ops::q4_common::{
+    quantize_q4_0, quantize_q4_k, quantize_q4_kf, quantize_q6_k,
 };
-use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k, quantize_q4_kf, quantize_q6_k};
 use larql_compute::{ComputeBackend, CpuBackend, QuantFormat};
 
 /// Three reference shapes — see module docs for their roles.
@@ -38,9 +38,21 @@ struct Shape {
 }
 
 const SHAPES: &[Shape] = &[
-    Shape { name: "decode_2560",     n: 2_560,    k: 2_560 },
-    Shape { name: "prefill_10240",   n: 10_240,   k: 2_560 },
-    Shape { name: "lm_head_262144",  n: 262_144,  k: 2_560 },
+    Shape {
+        name: "decode_2560",
+        n: 2_560,
+        k: 2_560,
+    },
+    Shape {
+        name: "prefill_10240",
+        n: 10_240,
+        k: 2_560,
+    },
+    Shape {
+        name: "lm_head_262144",
+        n: 262_144,
+        k: 2_560,
+    },
 ];
 
 /// Q4_K / Q6_K / Q4_KF require both N×K to be a multiple of the

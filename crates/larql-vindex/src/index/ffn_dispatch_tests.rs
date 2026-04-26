@@ -55,22 +55,41 @@ impl GateIndex for Mock {
     fn feature_meta(&self, _layer: usize, _feature: usize) -> Option<FeatureMeta> {
         None
     }
-    fn num_features(&self, _layer: usize) -> usize { 8 }
+    fn num_features(&self, _layer: usize) -> usize {
+        8
+    }
 
-    fn has_fp4_storage(&self) -> bool { self.fp4_on }
+    fn has_fp4_storage(&self) -> bool {
+        self.fp4_on
+    }
     fn fp4_ffn_row_dot(&self, _layer: usize, _c: usize, _f: usize, _x: &[f32]) -> Option<f32> {
-        if !self.fp4_on { return None; }
+        if !self.fp4_on {
+            return None;
+        }
         self.mark("fp4");
         self.fp4_dot_return
     }
-    fn fp4_ffn_row_scaled_add(&self, _layer: usize, _c: usize, _f: usize, alpha: f32, out: &mut [f32]) -> bool {
-        if !self.fp4_on { return false; }
+    fn fp4_ffn_row_scaled_add(
+        &self,
+        _layer: usize,
+        _c: usize,
+        _f: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
+        if !self.fp4_on {
+            return false;
+        }
         self.mark("fp4");
-        for v in out.iter_mut() { *v += alpha * 1.0; }
+        for v in out.iter_mut() {
+            *v += alpha * 1.0;
+        }
         true
     }
     fn fp4_ffn_row_into(&self, _layer: usize, _c: usize, _f: usize, out: &mut [f32]) -> bool {
-        if !self.fp4_on { return false; }
+        if !self.fp4_on {
+            return false;
+        }
         self.mark("fp4");
         out.fill(42.0);
         true
@@ -83,31 +102,60 @@ impl GateIndex for Mock {
         self.native_down.as_ref().map(|m| m.view())
     }
     fn down_feature_vector(&self, _layer: usize, feat: usize) -> Option<&[f32]> {
-        self.native_down.as_ref()
+        self.native_down
+            .as_ref()
             .filter(|m| feat < m.nrows())
             .and_then(|m| m.row(feat).to_slice())
     }
 
-    fn has_interleaved_q4k(&self) -> bool { self.q4k_on }
+    fn has_interleaved_q4k(&self) -> bool {
+        self.q4k_on
+    }
     fn q4k_ffn_row_dot(&self, _layer: usize, _c: usize, _f: usize, _x: &[f32]) -> Option<f32> {
-        if !self.q4k_on { return None; }
+        if !self.q4k_on {
+            return None;
+        }
         self.mark("q4k");
         self.q4k_dot_return
     }
-    fn q4k_ffn_row_scaled_add_via_cache(&self, _layer: usize, _c: usize, _f: usize, alpha: f32, out: &mut [f32]) -> bool {
-        if !self.q4k_on { return false; }
+    fn q4k_ffn_row_scaled_add_via_cache(
+        &self,
+        _layer: usize,
+        _c: usize,
+        _f: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
+        if !self.q4k_on {
+            return false;
+        }
         self.mark("q4k_via_cache");
-        for v in out.iter_mut() { *v += alpha * 2.0; }
+        for v in out.iter_mut() {
+            *v += alpha * 2.0;
+        }
         true
     }
-    fn q4k_ffn_row_scaled_add(&self, _layer: usize, _c: usize, _f: usize, alpha: f32, out: &mut [f32]) -> bool {
-        if !self.q4k_on { return false; }
+    fn q4k_ffn_row_scaled_add(
+        &self,
+        _layer: usize,
+        _c: usize,
+        _f: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
+        if !self.q4k_on {
+            return false;
+        }
         self.mark("q4k_direct");
-        for v in out.iter_mut() { *v += alpha * 3.0; }
+        for v in out.iter_mut() {
+            *v += alpha * 3.0;
+        }
         true
     }
     fn q4k_ffn_row_into(&self, _layer: usize, _c: usize, _f: usize, out: &mut [f32]) -> bool {
-        if !self.q4k_on { return false; }
+        if !self.q4k_on {
+            return false;
+        }
         self.mark("q4k");
         out.fill(99.0);
         true
@@ -142,7 +190,7 @@ mod tests {
     fn ffn_row_dot_falls_through_fp4_none_to_native() {
         let m = Mock {
             fp4_on: true,
-            fp4_dot_return: None,      // FP4 loaded but projection precision is f16/f32
+            fp4_dot_return: None, // FP4 loaded but projection precision is f16/f32
             native_up: Some(make_native_row(8, 4, 2.0)),
             ..Default::default()
         };
@@ -178,8 +226,10 @@ mod tests {
         };
         let x = vec![1.0; 4];
         assert_eq!(m.ffn_row_dot(0, 1, 0, &x), Some(4.0));
-        assert!(m.ffn_row_dot(0, 2, 0, &x).is_none(),
-                "down projection unset — no backend covers it");
+        assert!(
+            m.ffn_row_dot(0, 2, 0, &x).is_none(),
+            "down projection unset — no backend covers it"
+        );
     }
 
     #[test]
@@ -241,7 +291,10 @@ mod tests {
         // No FP4, no native. For component 2 (down), the unified method
         // must route Q4K to the via-cache variant (which handles
         // transposed-down storage efficiently).
-        let m = Mock { q4k_on: true, ..Default::default() };
+        let m = Mock {
+            q4k_on: true,
+            ..Default::default()
+        };
         let mut out = vec![0.0f32; 4];
         assert!(m.ffn_row_scaled_add(0, 2, 0, 1.0, &mut out));
         assert!(out.iter().all(|&v| (v - 2.0).abs() < 1e-6));
@@ -251,7 +304,10 @@ mod tests {
     #[test]
     fn ffn_row_scaled_add_gate_up_uses_direct_q4k() {
         // Components 0 / 1 use the non-via-cache Q4K variant.
-        let m = Mock { q4k_on: true, ..Default::default() };
+        let m = Mock {
+            q4k_on: true,
+            ..Default::default()
+        };
         let mut out = vec![0.0f32; 4];
         assert!(m.ffn_row_scaled_add(0, 1, 0, 1.0, &mut out));
         assert!(out.iter().all(|&v| (v - 3.0).abs() < 1e-6));
@@ -294,7 +350,10 @@ mod tests {
 
     #[test]
     fn ffn_row_into_falls_through_to_q4k() {
-        let m = Mock { q4k_on: true, ..Default::default() };
+        let m = Mock {
+            q4k_on: true,
+            ..Default::default()
+        };
         let mut out = vec![0.0f32; 4];
         assert!(m.ffn_row_into(0, 1, 0, &mut out));
         assert!(out.iter().all(|&v| v == 99.0));

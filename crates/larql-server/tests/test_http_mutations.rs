@@ -33,8 +33,12 @@ async fn http_warmup_empty_body_returns_200() {
 #[tokio::test]
 async fn http_warmup_with_layer_list_returns_prefetch_count() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/warmup",
-        serde_json::json!({"skip_weights": true, "layers": [0]})).await;
+    let resp = post_json(
+        app,
+        "/v1/warmup",
+        serde_json::json!({"skip_weights": true, "layers": [0]}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["layers_prefetched"], 1);
@@ -43,8 +47,12 @@ async fn http_warmup_with_layer_list_returns_prefetch_count() {
 #[tokio::test]
 async fn http_warmup_with_out_of_range_layers_returns_zero_prefetch() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/warmup",
-        serde_json::json!({"skip_weights": true, "layers": [999]})).await;
+    let resp = post_json(
+        app,
+        "/v1/warmup",
+        serde_json::json!({"skip_weights": true, "layers": [999]}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["layers_prefetched"], 0);
@@ -69,7 +77,11 @@ async fn http_walk_bumps_request_counter() {
     let st = state(vec![model("test")]);
     let app = single_model_router(st.clone());
     get(app, "/v1/walk?prompt=test").await;
-    assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        st.requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 #[tokio::test]
@@ -104,8 +116,12 @@ async fn http_infer_missing_prompt_returns_422() {
 #[tokio::test]
 async fn http_infer_multi_model_not_found_returns_404() {
     let app = multi_model_router(state(vec![model("a")]));
-    let resp = post_json(app, "/v1/nosuchmodel/infer",
-        serde_json::json!({"prompt": "hello"})).await;
+    let resp = post_json(
+        app,
+        "/v1/nosuchmodel/infer",
+        serde_json::json!({"prompt": "hello"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -114,7 +130,11 @@ async fn http_infer_bumps_request_counter() {
     let st = state(vec![model("test")]);
     let app = single_model_router(st.clone());
     post_json(app, "/v1/infer", serde_json::json!({"prompt": "hello"})).await;
-    assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        st.requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -125,16 +145,24 @@ async fn http_infer_bumps_request_counter() {
 async fn http_explain_no_weights_returns_503() {
     // explain-infer calls get_or_load_weights(); path=/nonexistent → fails → 503.
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/explain-infer",
-        serde_json::json!({"prompt": "hello"})).await;
+    let resp = post_json(
+        app,
+        "/v1/explain-infer",
+        serde_json::json!({"prompt": "hello"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
 async fn http_explain_multi_model_not_found_returns_404() {
     let app = multi_model_router(state(vec![model("a")]));
-    let resp = post_json(app, "/v1/nosuchmodel/explain-infer",
-        serde_json::json!({"prompt": "hello"})).await;
+    let resp = post_json(
+        app,
+        "/v1/nosuchmodel/explain-infer",
+        serde_json::json!({"prompt": "hello"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -143,7 +171,11 @@ async fn http_explain_bumps_request_counter() {
     let st = state(vec![model("test")]);
     let app = single_model_router(st.clone());
     post_json(app, "/v1/explain-infer", serde_json::json!({"prompt": "x"})).await;
-    assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        st.requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -154,11 +186,16 @@ async fn http_explain_bumps_request_counter() {
 async fn http_insert_returns_200_with_embedding_mode() {
     // has_model_weights=false → compute_residuals returns empty → embedding fallback.
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/insert", serde_json::json!({
-        "entity": "France",
-        "relation": "capital",
-        "target": "Paris"
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/insert",
+        serde_json::json!({
+            "entity": "France",
+            "relation": "capital",
+            "target": "Paris"
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["entity"], "France");
@@ -172,11 +209,17 @@ async fn http_insert_returns_200_with_embedding_mode() {
 #[tokio::test]
 async fn http_insert_with_session_header_returns_session_field() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json_h(app, "/v1/insert", serde_json::json!({
-        "entity": "Germany",
-        "relation": "capital",
-        "target": "Berlin"
-    }), ("x-session-id", "test-session")).await;
+    let resp = post_json_h(
+        app,
+        "/v1/insert",
+        serde_json::json!({
+            "entity": "Germany",
+            "relation": "capital",
+            "target": "Berlin"
+        }),
+        ("x-session-id", "test-session"),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["session"], "test-session");
@@ -185,23 +228,33 @@ async fn http_insert_with_session_header_returns_session_field() {
 #[tokio::test]
 async fn http_insert_multi_model_not_found_returns_404() {
     let app = multi_model_router(state(vec![model("a")]));
-    let resp = post_json(app, "/v1/nosuchmodel/insert", serde_json::json!({
-        "entity": "X",
-        "relation": "y",
-        "target": "Z"
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/nosuchmodel/insert",
+        serde_json::json!({
+            "entity": "X",
+            "relation": "y",
+            "target": "Z"
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn http_insert_with_explicit_layer_returns_200() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/insert", serde_json::json!({
-        "entity": "Japan",
-        "relation": "capital",
-        "target": "Tokyo",
-        "layer": 0
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/insert",
+        serde_json::json!({
+            "entity": "Japan",
+            "relation": "capital",
+            "target": "Tokyo",
+            "layer": 0
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["entity"], "Japan");
@@ -211,10 +264,19 @@ async fn http_insert_with_explicit_layer_returns_200() {
 async fn http_insert_bumps_request_counter() {
     let st = state(vec![model("test")]);
     let app = single_model_router(st.clone());
-    post_json(app, "/v1/insert", serde_json::json!({
-        "entity": "X", "relation": "y", "target": "Z"
-    })).await;
-    assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    post_json(
+        app,
+        "/v1/insert",
+        serde_json::json!({
+            "entity": "X", "relation": "y", "target": "Z"
+        }),
+    )
+    .await;
+    assert_eq!(
+        st.requests_served
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -233,7 +295,11 @@ async fn http_infer_no_weights_check_returns_503() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_json(resp.into_body()).await;
     assert!(
-        body["error"].as_str().unwrap_or("").contains("model weights"),
-        "expected 'model weights' in error, got: {:?}", body["error"]
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("model weights"),
+        "expected 'model weights' in error, got: {:?}",
+        body["error"]
     );
 }

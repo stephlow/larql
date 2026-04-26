@@ -47,11 +47,7 @@ pub fn get_layer_bands(model: &LoadedModel) -> LayerBands {
 
 /// Filter a layer list to only those that fall within the named band.
 /// `BAND_ALL` (or any unrecognised string) returns all layers unchanged.
-pub fn filter_layers_by_band(
-    all_layers: Vec<usize>,
-    band: &str,
-    bands: &LayerBands,
-) -> Vec<usize> {
+pub fn filter_layers_by_band(all_layers: Vec<usize>, band: &str, bands: &LayerBands) -> Vec<usize> {
     match band {
         BAND_SYNTAX => all_layers
             .into_iter()

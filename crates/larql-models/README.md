@@ -26,23 +26,26 @@ Describes *what a model is* without performing any computation. Every model arch
 ## Architecture Detection
 
 ```rust
-use larql_models::{detect_architecture, detect_from_json, ModelArchitecture};
+use larql_models::{
+    detect_architecture, detect_architecture_validated, detect_from_json,
+    detect_from_json_validated, ModelArchitecture,
+};
 
 // From a model directory (reads config.json)
-let arch = detect_architecture(Path::new("/path/to/model"))?;
+let arch = detect_architecture_validated(Path::new("/path/to/model"))?;
 
 // From parsed JSON (multimodal text_config handled automatically)
-let arch = detect_from_json(&config_json);
+let arch = detect_from_json_validated(&config_json)?;
 
 println!("{} — {} layers, head_dim={}", 
     arch.family(), arch.config().num_layers, arch.config().head_dim);
 ```
 
-Detection handles both top-level and nested `text_config` (multimodal models like Gemma 3/4).
+Detection handles both top-level and nested `text_config` (multimodal models like Gemma 3/4). The base `detect_*` functions remain permissive for inspection tools; use the `_validated` variants before inference or extraction to catch inconsistent dimensions, RoPE settings, per-layer metadata, and MoE routing.
 
 ## ModelArchitecture Trait
 
-The trait has 82 methods organized into categories:
+The trait has 83 methods organized into categories:
 
 | Category | Methods | Purpose |
 |----------|---------|---------|
@@ -57,16 +60,17 @@ The trait has 82 methods organized into categories:
 | **Softcapping** | `attn_logit_softcapping`, `final_logit_softcapping` | Gemma 2 score clamping |
 | **PLE** | `has_per_layer_embeddings`, `per_layer_embed_key` | Gemma 4 per-layer embeddings |
 | **KV sharing** | `kv_shared_source_layer`, `v_shares_k` | Cross-layer KV reuse, K=V |
+| **Validation** | `validate` | Cross-field config invariants before inference/extraction |
 
 Every method has a sensible default. New architectures only override what differs.
 
 ## Weight Loading
 
 ```rust
-use larql_models::load_model_dir;
+use larql_models::load_model_dir_validated;
 
 // Auto-detects format: safetensors or GGUF
-let weights = load_model_dir("/path/to/model")?;
+let weights = load_model_dir_validated("/path/to/model")?;
 
 // Access tensors
 let q_proj = &weights.tensors["layers.0.self_attn.q_proj.weight"];
@@ -95,7 +99,7 @@ weights.drop_embed();
 | Format | Source | Handling |
 |--------|--------|----------|
 | **Safetensors** | HuggingFace | mmap + dtype conversion (f16/bf16 → f32), prefix stripping |
-| **GGUF** | llama.cpp | Parse + dequantize (Q4_0, Q4_1, Q8_0, F16, BF16 → f32) |
+| **GGUF** | llama.cpp | Parse + dequantize (F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q6_K → f32) |
 
 ### HuggingFace Cache Resolution
 
@@ -172,27 +176,41 @@ src/
     fp8.rs            FP8 (e4m3)
     mxfp4.rs          MXFP4 + e8m0 + split_gate_up_experts (GPT-OSS)
 
+  validation.rs       ModelArchitecture::validate implementation + diagnostic field constants
+
 tests/
-  test_architectures.rs  Integration tests (66): all 12 architectures, MoE, MLA, bias, scaling, quant, ModelWeights drop methods
-  test_loading.rs        Loading tests (19): synthetic safetensors + GGUF, dtype conversion, walk-only filtering, error paths
+  test_architectures.rs  Integration tests (75): all 12 architectures, MoE, MLA, bias, scaling, quant, config validation, ModelWeights drop methods
+  test_loading.rs        Loading tests (21): synthetic safetensors + GGUF, dtype conversion, walk-only filtering, validated loading, error paths
 
 examples/
   architecture_demo.rs   Guided tour: detection, keys, sliding window, MoE, quant formats
   demo_loading.rs        Load model from disk, inspect tensors and architecture
   demo_tensor_keys.rs    Compare tensor key patterns across all 12 architectures
+
+benches/
+  models.rs              Criterion benchmarks for detection, validation, key mapping,
+                         FFN classification, synthetic loading, and GGML dequantization
 ```
 
 ## Tests
 
 ```bash
-cargo test -p larql-models           # 263 tests
-cargo llvm-cov --package larql-models --summary-only  # 87.87% line coverage
+cargo test -p larql-models           # 274 tests
+cargo llvm-cov --package larql-models --summary-only  # 88.02% line coverage
+cargo bench -p larql-models --bench models            # Criterion benchmark suite
 ```
 
-263 tests (178 unit + 66 architecture integration + 19 loading integration) covering:
-- All 12 architectures: detection, tensor key patterns, MoE expert formats (PerExpert / PackedMxfp4 / PackedBF16), MLA compression keys, Gemma 2 softcapping + QK norm offsets, Gemma 3 sliding window + dual RoPE, Gemma 4 per-layer geometry (head_dim, KV heads, partial RoPE, KV sharing, PLE, V-norm, K=V), Qwen attention bias, StarCoder2 bias + LayerNorm + non-gated FFN, DeepSeek shared experts + MLA, Granite scaling multipliers, generic fallback
+274 tests (178 unit + 75 architecture integration + 21 loading integration) covering:
+- All 12 architectures: detection, tensor key patterns, config validation, MoE expert formats (PerExpert / PackedMxfp4 / PackedBF16), MLA compression keys, Gemma 2 softcapping + QK norm offsets, Gemma 3 sliding window + dual RoPE, Gemma 4 per-layer geometry (head_dim, KV heads, partial RoPE, KV sharing, PLE, V-norm, K=V), Qwen attention bias, StarCoder2 bias + LayerNorm + non-gated FFN, DeepSeek shared experts + MLA, Granite scaling multipliers, generic fallback
 - Quantization: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q6_K round-trips, NEON vs scalar parity, fused row-dot vs manual dot, scaled-add correctness, MXFP4 dequant + `split_gate_up_experts`, malformed-input rejection across all dequantizers
 - Loading: synthetic safetensors (F32/F16/BF16 dtype conversion, 1D vectors, walk-only, custom filter, unsupported dtype → `skipped_tensors`, missing embed error, MLX weights/ subdir), synthetic GGUF (metadata parsing, tensor loading, walk-only FFN filtering, key normalisation, truncated-data rejection), GPT-OSS packed MXFP4 walk-only filtering, StarCoder2 FFN filtering, `drop_attn_weights` / `drop_lm_head` / `drop_embed`, `get_packed_bytes`
+
+The benchmark suite covers the same non-compute hot paths: config detection and
+validation, architecture tensor-key generation, FFN tensor classification,
+synthetic safetensors loading, and GGML Q4_0/Q8_0/Q4_K/Q6_K dequantization.
+Current baseline: validated detection is sub-microsecond for Llama/GPT-OSS,
+~2.6 µs for Gemma 4, synthetic validated safetensors loading is ~156 µs, and
+line coverage is 88.02%.
 
 ## Examples
 
@@ -214,7 +232,7 @@ cargo run -p larql-models --example demo_tensor_keys
 | Doc | Content |
 |-----|---------|
 | [ROADMAP.md](ROADMAP.md) | Planned architectures, trait extensions, loading improvements |
-| [docs/adr/](docs/adr/) | 6 architectural decision records (trait design, component names, config parsing, prefix stripping, Gemma 4 layers, norm offsets) |
+| [docs/adr/](docs/adr/) | 8 architectural decision records (trait design, component names, config parsing, prefix stripping, Gemma 4 layers, norm offsets, config validation, future weight storage APIs) |
 | [docs/architecture-trait.md](docs/architecture-trait.md) | ModelArchitecture trait design and extension guide |
 | [docs/weight-loading.md](docs/weight-loading.md) | Loading pipeline: formats, dtype conversion, prefix stripping |
 | [docs/quantization-formats.md](docs/quantization-formats.md) | GGML, MXFP4, f16 format specifications |

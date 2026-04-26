@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use ndarray::Array2;
 
-use crate::ffn::FfnBackend;
 use super::codec::{
-    BINARY_CT, encode_binary_request, decode_binary_single, decode_binary_batch,
-    extract_response_latency_ms, RemoteLatencyStats, WalkFfnSingleResponse,
+    decode_binary_batch, decode_binary_single, encode_binary_request, extract_response_latency_ms,
+    RemoteLatencyStats, WalkFfnSingleResponse, BINARY_CT,
 };
+use crate::ffn::FfnBackend;
 
 const STATS_PATH: &str = "/v1/stats";
 const WALK_FFN_PATH: &str = "/v1/walk-ffn";
@@ -68,12 +68,13 @@ impl RemoteWalkBackend {
             .map_err(|e| RemoteFfnError::Client(e.to_string()))?;
 
         let stats_url = format!("{}{STATS_PATH}", config.base_url);
-        let resp = client.get(&stats_url).send().map_err(|e| {
-            RemoteFfnError::Unreachable {
+        let resp = client
+            .get(&stats_url)
+            .send()
+            .map_err(|e| RemoteFfnError::Unreachable {
                 url: stats_url.clone(),
                 cause: e.to_string(),
-            }
-        })?;
+            })?;
         if !resp.status().is_success() {
             return Err(RemoteFfnError::ServerError {
                 status: resp.status().as_u16(),
@@ -87,7 +88,11 @@ impl RemoteWalkBackend {
             RemoteFfnError::BadResponse(format!("stats missing {HIDDEN_SIZE_KEY}"))
         })? as usize;
 
-        Ok(Self { config, client, hidden_size })
+        Ok(Self {
+            config,
+            client,
+            hidden_size,
+        })
     }
 
     /// Hidden size advertised by the remote server.
@@ -139,8 +144,8 @@ impl RemoteWalkBackend {
             .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
 
         let output = if ct.starts_with(BINARY_CT) {
-            let (_, floats) = decode_binary_single(&resp_bytes)
-                .map_err(RemoteFfnError::BadResponse)?;
+            let (_, floats) =
+                decode_binary_single(&resp_bytes).map_err(RemoteFfnError::BadResponse)?;
             floats
         } else {
             // Fallback: server returned JSON.
@@ -172,8 +177,7 @@ impl RemoteWalkBackend {
         seq_len: usize,
     ) -> Result<HashMap<usize, Vec<f32>>, RemoteFfnError> {
         let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
-        let body =
-            encode_binary_request(None, Some(layers), residual_flat, seq_len, true, 8092);
+        let body = encode_binary_request(None, Some(layers), residual_flat, seq_len, true, 8092);
 
         let resp = self
             .client
@@ -247,7 +251,10 @@ impl RemoteWalkBackend {
         layers: &[usize],
         n: usize,
     ) -> Result<RemoteLatencyStats, RemoteFfnError> {
-        assert!(n >= 2, "probe_latency: need at least 2 calls (1 warmup + 1 measured)");
+        assert!(
+            n >= 2,
+            "probe_latency: need at least 2 calls (1 warmup + 1 measured)"
+        );
         let residual = vec![0.0f32; self.hidden_size];
         let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
         let body = encode_binary_request(None, Some(layers), &residual, 1, true, 8092);
@@ -263,15 +270,19 @@ impl RemoteWalkBackend {
                 .header(reqwest::header::CONTENT_TYPE, BINARY_CT)
                 .body(body.clone())
                 .send()
-                .map_err(|e| RemoteFfnError::Http { layer: layers[0], cause: e.to_string() })?;
+                .map_err(|e| RemoteFfnError::Http {
+                    layer: layers[0],
+                    cause: e.to_string(),
+                })?;
             if !resp.status().is_success() {
                 return Err(RemoteFfnError::ServerError {
                     status: resp.status().as_u16(),
                     body: resp.text().unwrap_or_default(),
                 });
             }
-            let resp_bytes =
-                resp.bytes().map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
+            let resp_bytes = resp
+                .bytes()
+                .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
             let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             // Extract server-reported latency from bytes 8-11 of response.
@@ -324,8 +335,8 @@ impl RemoteWalkBackend {
                     floats.len()
                 )));
             }
-            let arr = Array2::from_shape_vec((seq_len, hidden), floats)
-                .expect("shape validated above");
+            let arr =
+                Array2::from_shape_vec((seq_len, hidden), floats).expect("shape validated above");
             result.insert(layer, arr);
         }
         Ok(result)
@@ -345,19 +356,13 @@ impl FfnBackend for RemoteWalkBackend {
         let residual_flat: Vec<f32> = x.iter().copied().collect();
         let output = self
             .call_single(layer, &residual_flat, seq_len)
-            .unwrap_or_else(|e| {
-                panic!("RemoteWalkBackend layer {layer}: {e}")
-            });
+            .unwrap_or_else(|e| panic!("RemoteWalkBackend layer {layer}: {e}"));
 
         Array2::from_shape_vec((seq_len, hidden), output)
             .expect("RemoteWalkBackend: server output shape mismatch (validated above)")
     }
 
-    fn forward_with_activation(
-        &self,
-        layer: usize,
-        x: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>) {
+    fn forward_with_activation(&self, layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         let out = self.forward(layer, x);
         let seq_len = x.shape()[0];
         let zeros = Array2::<f32>::zeros((seq_len, 1));

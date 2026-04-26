@@ -21,16 +21,15 @@ pub mod write_f32;
 pub mod write_layers;
 pub mod write_q4k;
 
-pub use write_f32::{
-    write_model_weights, write_model_weights_with_opts,
-    StreamingWeights, WeightSource, WriteWeightsOptions,
-};
-pub use write_q4k::{
-    write_model_weights_q4k, write_model_weights_q4k_with_opts,
-    Q4kWriteOptions, QuantBlockFormat,
+pub use load::{
+    find_tokenizer_path, load_model_weights, load_model_weights_q4k, load_model_weights_with_opts,
+    LoadWeightsOptions,
 };
 pub use manifest::Q4kManifestEntry;
-pub use load::{
-    load_model_weights, load_model_weights_with_opts, load_model_weights_q4k,
-    find_tokenizer_path, LoadWeightsOptions,
+pub use write_f32::{
+    write_model_weights, write_model_weights_with_opts, StreamingWeights, WeightSource,
+    WriteWeightsOptions,
+};
+pub use write_q4k::{
+    write_model_weights_q4k, write_model_weights_q4k_with_opts, Q4kWriteOptions, QuantBlockFormat,
 };

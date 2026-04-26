@@ -20,7 +20,9 @@ impl VectorIndex {
         dir: &std::path::Path,
         config: &crate::config::types::VindexConfig,
     ) -> Result<(), VindexError> {
-        let Some(ref manifest) = config.fp4 else { return Ok(()); };
+        let Some(ref manifest) = config.fp4 else {
+            return Ok(());
+        };
         let layer_features: Vec<usize> = config.layers.iter().map(|l| l.num_features).collect();
         let storage = super::super::fp4_store::Fp4Storage::load(
             dir,
@@ -64,7 +66,9 @@ impl VectorIndex {
         alpha: f32,
         out: &mut [f32],
     ) -> bool {
-        let Some(fp4) = self.ffn.fp4_storage.as_ref() else { return false; };
+        let Some(fp4) = self.ffn.fp4_storage.as_ref() else {
+            return false;
+        };
         fp4.row_scaled_add(layer, component, feat, alpha, out)
     }
 
@@ -78,7 +82,9 @@ impl VectorIndex {
         feat: usize,
         out: &mut [f32],
     ) -> bool {
-        let Some(fp4) = self.ffn.fp4_storage.as_ref() else { return false; };
+        let Some(fp4) = self.ffn.fp4_storage.as_ref() else {
+            return false;
+        };
         fp4.dequant_row_into(layer, component, feat, out)
     }
 }

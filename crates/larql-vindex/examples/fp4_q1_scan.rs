@@ -41,19 +41,33 @@ const COMPLIANCE_THRESHOLDS: &[f32] = &[2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 
 const TOP_K_OFFENDERS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Dtype { F32, F16, Bf16 }
+enum Dtype {
+    F32,
+    F16,
+    Bf16,
+}
 
 impl Dtype {
     fn from_str(s: &str) -> Option<Self> {
-        match s { "f32" => Some(Dtype::F32), "f16" => Some(Dtype::F16), "bf16" => Some(Dtype::Bf16), _ => None }
+        match s {
+            "f32" => Some(Dtype::F32),
+            "f16" => Some(Dtype::F16),
+            "bf16" => Some(Dtype::Bf16),
+            _ => None,
+        }
     }
-    fn bytes_per_float(self) -> usize { match self { Dtype::F32 => 4, _ => 2 } }
+    fn bytes_per_float(self) -> usize {
+        match self {
+            Dtype::F32 => 4,
+            _ => 2,
+        }
+    }
 }
 
 /// `(projection_name, filename)` — scanner opportunistically skips missing files.
 const PROJECTIONS: &[(&str, &str)] = &[
     ("gate", "gate_vectors.bin"),
-    ("up",   "up_features.bin"),
+    ("up", "up_features.bin"),
     ("down", "down_features.bin"),
 ];
 
@@ -71,29 +85,42 @@ impl Bucket {
         self.has_zero_blocks += other.has_zero_blocks;
     }
 
-    fn count(&self) -> usize { self.ratios.len() + self.all_zero_blocks as usize }
+    fn count(&self) -> usize {
+        self.ratios.len() + self.all_zero_blocks as usize
+    }
 
     fn summary(&self) -> Value {
         let mut sorted = self.ratios.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let percentile = |p: f64| -> f32 {
-            if sorted.is_empty() { return f32::NAN; }
+            if sorted.is_empty() {
+                return f32::NAN;
+            }
             let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
             sorted[idx.min(sorted.len() - 1)]
         };
-        let mean = if sorted.is_empty() { f32::NAN } else {
+        let mean = if sorted.is_empty() {
+            f32::NAN
+        } else {
             sorted.iter().map(|&x| x as f64).sum::<f64>() as f32 / sorted.len() as f32
         };
         let total = self.count() as f64;
         let nonzero = sorted.len() as f64;
-        let compliance: Value = COMPLIANCE_THRESHOLDS.iter()
+        let compliance: Value = COMPLIANCE_THRESHOLDS
+            .iter()
             .map(|&t| {
                 let under = sorted.iter().filter(|&&r| r < t).count() as f64;
                 // Blocks with any all-zero: trivially lossless — count as compliant.
                 let compliant_total = under + self.all_zero_blocks as f64;
-                let frac = if total > 0.0 { compliant_total / total } else { 0.0 };
+                let frac = if total > 0.0 {
+                    compliant_total / total
+                } else {
+                    0.0
+                };
                 json!({ "threshold": t, "compliant_fraction": frac })
-            }).collect::<Vec<_>>().into();
+            })
+            .collect::<Vec<_>>()
+            .into();
         json!({
             "total_blocks": total,
             "nonzero_ratio_blocks": nonzero,
@@ -128,13 +155,19 @@ struct LayerStats {
 }
 
 /// Scan one feature vector (`hidden` f32s), record stats.
-fn scan_feature_vector(vec: &[f32], feat_idx: usize, tile_sub_blocks: usize,
-                       gran: &mut Granularity,
-                       top_pf: &mut Vec<(usize, f32)>,
-                       top_sf: &mut Vec<(usize, usize, f32)>) {
+fn scan_feature_vector(
+    vec: &[f32],
+    feat_idx: usize,
+    tile_sub_blocks: usize,
+    gran: &mut Granularity,
+    top_pf: &mut Vec<(usize, f32)>,
+    top_sf: &mut Vec<(usize, usize, f32)>,
+) {
     let hidden = vec.len();
     let sub_blocks = hidden / SUB_BLOCK_SIZE;
-    if sub_blocks == 0 { return; }
+    if sub_blocks == 0 {
+        return;
+    }
 
     let mut scales = Vec::with_capacity(sub_blocks);
     for chunk in vec.chunks_exact(SUB_BLOCK_SIZE) {
@@ -144,13 +177,17 @@ fn scan_feature_vector(vec: &[f32], feat_idx: usize, tile_sub_blocks: usize,
 
     // Per-feature block: one block covering all sub_blocks of this feature.
     record_block(&scales, &mut gran.per_feature, |r| {
-        if let Some(r) = r { top_pf.push((feat_idx, r)); }
+        if let Some(r) = r {
+            top_pf.push((feat_idx, r));
+        }
     });
 
     // Sub-feature tiles: `tile_sub_blocks` contiguous sub-blocks each.
     for (tile_idx, tile_scales) in scales.chunks_exact(tile_sub_blocks).enumerate() {
         record_block(tile_scales, &mut gran.sub_feature_tile, |r| {
-            if let Some(r) = r { top_sf.push((feat_idx, tile_idx, r)); }
+            if let Some(r) = r {
+                top_sf.push((feat_idx, tile_idx, r));
+            }
         });
     }
 }
@@ -163,16 +200,24 @@ fn record_block(scales: &[f32], bucket: &mut Bucket, mut on_ratio: impl FnMut(Op
     let mut mn = f32::INFINITY;
     let mut any_zero = false;
     for &s in scales {
-        if s > mx { mx = s; }
-        if s > 0.0 && s < mn { mn = s; }
-        if s == 0.0 { any_zero = true; }
+        if s > mx {
+            mx = s;
+        }
+        if s > 0.0 && s < mn {
+            mn = s;
+        }
+        if s == 0.0 {
+            any_zero = true;
+        }
     }
     if mx == 0.0 {
         bucket.all_zero_blocks += 1;
         on_ratio(None);
         return;
     }
-    if any_zero { bucket.has_zero_blocks += 1; }
+    if any_zero {
+        bucket.has_zero_blocks += 1;
+    }
     let ratio = mx / mn;
     bucket.ratios.push(ratio);
     on_ratio(Some(ratio));
@@ -180,14 +225,20 @@ fn record_block(scales: &[f32], bucket: &mut Bucket, mut on_ratio: impl FnMut(Op
 
 /// Keep only the top `k` largest values in a Vec, in descending order.
 fn truncate_top<T: Clone>(v: &mut Vec<T>, k: usize, key: impl Fn(&T) -> f32) {
-    v.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| {
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     v.truncate(k);
 }
 
 fn log2_histogram(ratios: &[f32], max_bucket: usize) -> Vec<u64> {
     let mut buckets = vec![0u64; max_bucket + 1];
     for &r in ratios {
-        if r <= 0.0 || !r.is_finite() { continue; }
+        if r <= 0.0 || !r.is_finite() {
+            continue;
+        }
         let b = r.log2().max(0.0) as usize;
         let idx = b.min(max_bucket);
         buckets[idx] += 1;
@@ -203,9 +254,18 @@ fn parse_args() -> (PathBuf, PathBuf, usize) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--vindex" => { i += 1; vindex = Some(PathBuf::from(&args[i])); }
-            "--out"    => { i += 1; out    = Some(PathBuf::from(&args[i])); }
-            "--tile-sub-blocks" => { i += 1; tile_sub_blocks = args[i].parse().expect("integer"); }
+            "--vindex" => {
+                i += 1;
+                vindex = Some(PathBuf::from(&args[i]));
+            }
+            "--out" => {
+                i += 1;
+                out = Some(PathBuf::from(&args[i]));
+            }
+            "--tile-sub-blocks" => {
+                i += 1;
+                tile_sub_blocks = args[i].parse().expect("integer");
+            }
             _ => eprintln!("unknown arg: {}", args[i]),
         }
         i += 1;
@@ -224,20 +284,21 @@ fn parse_args() -> (PathBuf, PathBuf, usize) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (vindex_path, out_path, tile_sub_blocks) = parse_args();
 
-    let index_json: Value = serde_json::from_str(
-        &std::fs::read_to_string(vindex_path.join("index.json"))?,
-    )?;
-    let num_layers  = index_json["num_layers"].as_u64().ok_or("num_layers")? as usize;
-    let hidden      = index_json["hidden_size"].as_u64().ok_or("hidden_size")? as usize;
-    let dtype_str    = index_json["dtype"].as_str().unwrap_or("f32");
-    let dtype = Dtype::from_str(dtype_str)
-        .ok_or_else(|| format!("unsupported dtype: {dtype_str}"))?;
+    let index_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(vindex_path.join("index.json"))?)?;
+    let num_layers = index_json["num_layers"].as_u64().ok_or("num_layers")? as usize;
+    let hidden = index_json["hidden_size"].as_u64().ok_or("hidden_size")? as usize;
+    let dtype_str = index_json["dtype"].as_str().unwrap_or("f32");
+    let dtype =
+        Dtype::from_str(dtype_str).ok_or_else(|| format!("unsupported dtype: {dtype_str}"))?;
     // Per-layer num_features (may vary — MoE / E2B-style layouts) and byte offsets.
     // The `layers` array in index.json is authoritative for gate_vectors.bin;
     // up_features.bin / down_features.bin use the same per-layer feature count.
-    let layers_array = index_json["layers"].as_array()
+    let layers_array = index_json["layers"]
+        .as_array()
         .ok_or("index.json missing `layers` array")?;
-    let layer_features: Vec<usize> = layers_array.iter()
+    let layer_features: Vec<usize> = layers_array
+        .iter()
         .map(|v| v["num_features"].as_u64().unwrap_or(0) as usize)
         .collect();
     let intermediate_max = layer_features.iter().copied().max().unwrap_or(0);
@@ -256,11 +317,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("  dtype        : {dtype_str}");
     println!("  sub_block    : {SUB_BLOCK_SIZE}");
-    println!("  tile (sub)   : {tile_sub_blocks} sub-blocks = {} elements", tile_sub_blocks * SUB_BLOCK_SIZE);
+    println!(
+        "  tile (sub)   : {tile_sub_blocks} sub-blocks = {} elements",
+        tile_sub_blocks * SUB_BLOCK_SIZE
+    );
     println!();
 
     if !hidden.is_multiple_of(SUB_BLOCK_SIZE) {
-        return Err(format!("hidden={hidden} is not divisible by sub-block {SUB_BLOCK_SIZE}").into());
+        return Err(
+            format!("hidden={hidden} is not divisible by sub-block {SUB_BLOCK_SIZE}").into(),
+        );
     }
 
     // Results keyed: results[proj_idx][layer] = LayerStats. None if file missing.
@@ -291,72 +357,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if mmap.len() != expected_total_bytes {
             return Err(format!(
                 "{}: size {} != expected {}",
-                filename, mmap.len(), expected_total_bytes
-            ).into());
+                filename,
+                mmap.len(),
+                expected_total_bytes
+            )
+            .into());
         }
         let bytes = &mmap[..];
 
         let t_proj = Instant::now();
-        let layer_stats: Vec<LayerStats> = (0..num_layers).into_par_iter().map(|layer| {
-            let nf = layer_features[layer];
-            let layer_bytes_start = layer_byte_offsets[layer];
-            let layer_bytes_len   = nf * hidden * bpf;
-            let layer_bytes = &bytes[layer_bytes_start..layer_bytes_start + layer_bytes_len];
-            let floats: Vec<f32> = match dtype {
-                Dtype::F32 => {
-                    // SAFETY: mmap'd region, f32 alignment matches u8 at read; no writes.
-                    let view: &[f32] = unsafe {
-                        std::slice::from_raw_parts(
-                            layer_bytes.as_ptr() as *const f32,
-                            nf * hidden,
-                        )
-                    };
-                    view.to_vec()
+        let layer_stats: Vec<LayerStats> = (0..num_layers)
+            .into_par_iter()
+            .map(|layer| {
+                let nf = layer_features[layer];
+                let layer_bytes_start = layer_byte_offsets[layer];
+                let layer_bytes_len = nf * hidden * bpf;
+                let layer_bytes = &bytes[layer_bytes_start..layer_bytes_start + layer_bytes_len];
+                let floats: Vec<f32> = match dtype {
+                    Dtype::F32 => {
+                        // SAFETY: mmap'd region, f32 alignment matches u8 at read; no writes.
+                        let view: &[f32] = unsafe {
+                            std::slice::from_raw_parts(
+                                layer_bytes.as_ptr() as *const f32,
+                                nf * hidden,
+                            )
+                        };
+                        view.to_vec()
+                    }
+                    Dtype::F16 => larql_models::quant::half::decode_f16(layer_bytes),
+                    Dtype::Bf16 => larql_models::quant::half::decode_bf16(layer_bytes),
+                };
+                let mut stats = LayerStats::default();
+                for feat in 0..nf {
+                    let v = &floats[feat * hidden..(feat + 1) * hidden];
+                    scan_feature_vector(
+                        v,
+                        feat,
+                        tile_sub_blocks,
+                        &mut stats.granularity,
+                        &mut stats.top_per_feature,
+                        &mut stats.top_sub_feature,
+                    );
+                    truncate_top(&mut stats.top_per_feature, TOP_K_OFFENDERS, |(_, r)| *r);
+                    truncate_top(&mut stats.top_sub_feature, TOP_K_OFFENDERS, |(_, _, r)| *r);
                 }
-                Dtype::F16 => larql_models::quant::half::decode_f16(layer_bytes),
-                Dtype::Bf16 => larql_models::quant::half::decode_bf16(layer_bytes),
-            };
-            let mut stats = LayerStats::default();
-            for feat in 0..nf {
-                let v = &floats[feat * hidden..(feat + 1) * hidden];
-                scan_feature_vector(
-                    v,
-                    feat,
-                    tile_sub_blocks,
-                    &mut stats.granularity,
-                    &mut stats.top_per_feature,
-                    &mut stats.top_sub_feature,
-                );
-                truncate_top(&mut stats.top_per_feature, TOP_K_OFFENDERS, |(_, r)| *r);
-                truncate_top(&mut stats.top_sub_feature, TOP_K_OFFENDERS, |(_, _, r)| *r);
-            }
-            stats
-        }).collect();
+                stats
+            })
+            .collect();
         let elapsed = t_proj.elapsed();
         println!("  {proj_name} done in {:.1}s", elapsed.as_secs_f64());
         proj_results.push(Some(layer_stats));
         scanned_projections.push(proj_name);
     }
-    println!("all projections scanned in {:.1}s", t_total.elapsed().as_secs_f64());
+    println!(
+        "all projections scanned in {:.1}s",
+        t_total.elapsed().as_secs_f64()
+    );
 
     // ── Aggregate ──────────────────────────────────────────────────────────
-    let mut per_projection_agg: Vec<Granularity> = (0..PROJECTIONS.len()).map(|_| Granularity::default()).collect();
+    let mut per_projection_agg: Vec<Granularity> = (0..PROJECTIONS.len())
+        .map(|_| Granularity::default())
+        .collect();
     let mut all_agg = Granularity::default();
 
     for (p, proj_layers) in proj_results.iter().enumerate() {
-        let Some(proj_layers) = proj_layers else { continue; };
+        let Some(proj_layers) = proj_layers else {
+            continue;
+        };
         for lstats in proj_layers {
             let mut copy = lstats.granularity.clone();
-            per_projection_agg[p].per_feature.merge(std::mem::take(&mut copy.per_feature));
-            per_projection_agg[p].sub_feature_tile.merge(std::mem::take(&mut copy.sub_feature_tile));
+            per_projection_agg[p]
+                .per_feature
+                .merge(std::mem::take(&mut copy.per_feature));
+            per_projection_agg[p]
+                .sub_feature_tile
+                .merge(std::mem::take(&mut copy.sub_feature_tile));
         }
     }
 
     for proj_gran in &per_projection_agg {
-        all_agg.per_feature.ratios.extend(&proj_gran.per_feature.ratios);
+        all_agg
+            .per_feature
+            .ratios
+            .extend(&proj_gran.per_feature.ratios);
         all_agg.per_feature.all_zero_blocks += proj_gran.per_feature.all_zero_blocks;
         all_agg.per_feature.has_zero_blocks += proj_gran.per_feature.has_zero_blocks;
-        all_agg.sub_feature_tile.ratios.extend(&proj_gran.sub_feature_tile.ratios);
+        all_agg
+            .sub_feature_tile
+            .ratios
+            .extend(&proj_gran.sub_feature_tile.ratios);
         all_agg.sub_feature_tile.all_zero_blocks += proj_gran.sub_feature_tile.all_zero_blocks;
         all_agg.sub_feature_tile.has_zero_blocks += proj_gran.sub_feature_tile.has_zero_blocks;
     }
@@ -364,7 +453,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-layer summary per projection.
     let mut per_layer_json: Vec<Value> = Vec::new();
     for (p, proj_layers) in proj_results.iter().enumerate() {
-        let Some(proj_layers) = proj_layers else { continue; };
+        let Some(proj_layers) = proj_layers else {
+            continue;
+        };
         let (proj_name, _) = PROJECTIONS[p];
         for (layer, lstats) in proj_layers.iter().enumerate() {
             per_layer_json.push(json!({
@@ -380,7 +471,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut global_pf: Vec<(String, usize, usize, f32)> = Vec::new();
     let mut global_sf: Vec<(String, usize, usize, usize, f32)> = Vec::new();
     for (p, proj_layers) in proj_results.iter().enumerate() {
-        let Some(proj_layers) = proj_layers else { continue; };
+        let Some(proj_layers) = proj_layers else {
+            continue;
+        };
         let (proj_name, _) = PROJECTIONS[p];
         for (layer, lstats) in proj_layers.iter().enumerate() {
             for &(feat, r) in &lstats.top_per_feature {
@@ -398,7 +491,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let histogram_pf = log2_histogram(&all_agg.per_feature.ratios, 24);
     let histogram_sf = log2_histogram(&all_agg.sub_feature_tile.ratios, 24);
 
-    let projection_summary: Vec<Value> = per_projection_agg.iter().enumerate()
+    let projection_summary: Vec<Value> = per_projection_agg
+        .iter()
+        .enumerate()
         .filter(|(p, _)| proj_results[*p].is_some())
         .map(|(p, g)| {
             json!({
@@ -406,7 +501,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "per_feature": g.per_feature.summary(),
                 "sub_feature_tile": g.sub_feature_tile.summary(),
             })
-        }).collect();
+        })
+        .collect();
 
     let report = json!({
         "experiment": "26_fp4_quantisation",
@@ -455,10 +551,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sf = &all_agg.sub_feature_tile;
     let pf_sum = pf.summary();
     let sf_sum = sf.summary();
-    println!("per_feature      : total={:>10} p50={:.3} p95={:.3} p99={:.3} p99.9={:.3} max={:.3}",
-             pf_sum["total_blocks"], pf_sum["p50"], pf_sum["p95"], pf_sum["p99"], pf_sum["p999"], pf_sum["max"]);
-    println!("sub_feature_tile : total={:>10} p50={:.3} p95={:.3} p99={:.3} p99.9={:.3} max={:.3}",
-             sf_sum["total_blocks"], sf_sum["p50"], sf_sum["p95"], sf_sum["p99"], sf_sum["p999"], sf_sum["max"]);
+    println!(
+        "per_feature      : total={:>10} p50={:.3} p95={:.3} p99={:.3} p99.9={:.3} max={:.3}",
+        pf_sum["total_blocks"],
+        pf_sum["p50"],
+        pf_sum["p95"],
+        pf_sum["p99"],
+        pf_sum["p999"],
+        pf_sum["max"]
+    );
+    println!(
+        "sub_feature_tile : total={:>10} p50={:.3} p95={:.3} p99={:.3} p99.9={:.3} max={:.3}",
+        sf_sum["total_blocks"],
+        sf_sum["p50"],
+        sf_sum["p95"],
+        sf_sum["p99"],
+        sf_sum["p999"],
+        sf_sum["max"]
+    );
     println!();
     println!("== compliance fraction at threshold ==");
     println!("threshold   per_feature   sub_feature_tile");
@@ -474,4 +584,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn _assert_send_sync() where LayerStats: Send + Sync {}
+fn _assert_send_sync()
+where
+    LayerStats: Send + Sync,
+{
+}

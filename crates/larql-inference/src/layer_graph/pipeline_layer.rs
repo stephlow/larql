@@ -4,8 +4,8 @@
 //! from larql-models and wiring them into larql-compute's FullPipelineLayer.
 //! Both GPU and CPU paths use this — no duplicated param extraction.
 
-use larql_compute::{QuantWeight, QuantFormat, FullPipelineLayer, MoeLayerWeights};
 use crate::model::ModelWeights;
+use larql_compute::{FullPipelineLayer, MoeLayerWeights, QuantFormat, QuantWeight};
 
 /// Extract per-layer architecture parameters into a FullPipelineLayer.
 ///
@@ -33,28 +33,48 @@ pub fn build_arch_params<'a>(
     let layer_nq = arch.num_q_heads_for_layer(layer);
     let layer_nkv = arch.num_kv_heads_for_layer(layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
-    let rotary_dim = if rotary_frac >= 1.0 { 0 } else { (layer_hd as f64 * rotary_frac) as usize };
+    let rotary_dim = if rotary_frac >= 1.0 {
+        0
+    } else {
+        (layer_hd as f64 * rotary_frac) as usize
+    };
     let sw = if arch.is_sliding_window_layer(layer) {
         arch.sliding_window_size().unwrap_or(0)
     } else {
         0
     };
-    let layer_scalar = arch.layer_scalar_key(layer)
+    let layer_scalar = arch
+        .layer_scalar_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .and_then(|v| v.first().copied())
         .unwrap_or(0.0);
 
     FullPipelineLayer {
-        wq, wk, wv, wo,
-        gate, up, down,
-        input_norm: weights.vectors.get(&arch.input_layernorm_key(layer))
-            .map(|v| v.as_slice()).unwrap_or(&[]),
-        post_attn_norm: weights.vectors.get(&arch.post_attention_layernorm_key(layer))
-            .map(|v| v.as_slice()).unwrap_or(&[]),
-        pre_ffn_norm: arch.pre_feedforward_layernorm_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
-        post_ffn_norm: arch.post_feedforward_layernorm_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
+        wq,
+        wk,
+        wv,
+        wo,
+        gate,
+        up,
+        down,
+        input_norm: weights
+            .vectors
+            .get(&arch.input_layernorm_key(layer))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
+        post_attn_norm: weights
+            .vectors
+            .get(&arch.post_attention_layernorm_key(layer))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
+        pre_ffn_norm: arch
+            .pre_feedforward_layernorm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
+        post_ffn_norm: arch
+            .post_feedforward_layernorm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
         norm_offset: arch.norm_weight_offset(),
         has_post_norms: arch.has_post_norms(),
         activation: match arch.activation() {
@@ -82,19 +102,29 @@ pub fn build_arch_params<'a>(
         layer_scalar,
         input_norm_bias: None,
         post_attn_norm_bias: None,
-        q_norm_weight: arch.attn_q_norm_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
-        k_norm_weight: arch.attn_k_norm_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
-        ffn_up_bias: arch.ffn_up_bias_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
-        ffn_down_bias: arch.ffn_down_bias_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
+        q_norm_weight: arch
+            .attn_q_norm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
+        k_norm_weight: arch
+            .attn_k_norm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
+        ffn_up_bias: arch
+            .ffn_up_bias_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
+        ffn_down_bias: arch
+            .ffn_down_bias_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
 
         moe: build_moe_weights(weights, arch, layer),
         moe_combined_output_norm: arch.moe_has_combined_output_norm(),
-        moe_outer_post_norm: arch.moe_post_outer_norm_key(layer)
-            .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
+        moe_outer_post_norm: arch
+            .moe_post_outer_norm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
     }
 }
 
@@ -103,7 +133,9 @@ pub(crate) fn build_moe_weights<'a>(
     arch: &dyn larql_models::ModelArchitecture,
     layer: usize,
 ) -> Option<MoeLayerWeights<'a>> {
-    if !arch.is_hybrid_moe() { return None; }
+    if !arch.is_hybrid_moe() {
+        return None;
+    }
     let router_key = arch.moe_router_key(layer)?;
     let router_proj = weights.vectors.get(&router_key)?.as_slice();
 
@@ -111,42 +143,47 @@ pub(crate) fn build_moe_weights<'a>(
     // `layers/{layer}/0/gate_up` and `layers/{layer}/0/down`.
     // In this path `experts_gate_up`/`experts_down` hold only expert 0's bytes;
     // the GPU dispatch path reads per-expert slices via `get_layer_entry_bytes`.
-    let (experts_gate_up, experts_down, expert_data_format) =
-        if weights.has_per_layer_ffn() {
-            // Per-layer Q4_K: expose expert 0 as a sentinel; real dispatch
-            // uses get_layer_entry_bytes per selected expert.
-            let (gu, dn) = weights.get_layer_entry_bytes(layer, 0)?;
-            (gu, dn, larql_compute::QuantFormat::Q4_K)
-        } else {
-            // Legacy BF16 monolithic blob path.
-            let gate_up_key = arch.packed_experts_gate_up_key(layer)?;
-            let down_key    = arch.packed_experts_down_key(layer)?;
-            let gu = weights.get_packed_bytes(&gate_up_key)?;
-            let dn = weights.get_packed_bytes(&down_key)?;
-            (gu, dn, larql_compute::QuantFormat::BF16)
-        };
+    let (experts_gate_up, experts_down, expert_data_format) = if weights.has_per_layer_ffn() {
+        // Per-layer Q4_K: expose expert 0 as a sentinel; real dispatch
+        // uses get_layer_entry_bytes per selected expert.
+        let (gu, dn) = weights.get_layer_entry_bytes(layer, 0)?;
+        (gu, dn, larql_compute::QuantFormat::Q4_K)
+    } else {
+        // Legacy BF16 monolithic blob path.
+        let gate_up_key = arch.packed_experts_gate_up_key(layer)?;
+        let down_key = arch.packed_experts_down_key(layer)?;
+        let gu = weights.get_packed_bytes(&gate_up_key)?;
+        let dn = weights.get_packed_bytes(&down_key)?;
+        (gu, dn, larql_compute::QuantFormat::BF16)
+    };
 
-    let router_scale = arch.moe_router_scale_key(layer)
+    let router_scale = arch
+        .moe_router_scale_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let router_per_expert_scale = arch.moe_router_per_expert_scale_key(layer)
+    let router_per_expert_scale = arch
+        .moe_router_per_expert_scale_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let pre_experts_norm = arch.moe_pre_experts_norm_key(layer)
+    let pre_experts_norm = arch
+        .moe_pre_experts_norm_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let post_ffn1_norm = arch.moe_post_ffn1_norm_key(layer)
+    let post_ffn1_norm = arch
+        .moe_post_ffn1_norm_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let post_experts_norm = arch.moe_post_experts_norm_key(layer)
+    let post_experts_norm = arch
+        .moe_post_experts_norm_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let router_norm = arch.moe_router_norm_key(layer)
+    let router_norm = arch
+        .moe_router_norm_key(layer)
         .and_then(|k| weights.vectors.get(&k))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
@@ -182,7 +219,12 @@ pub(crate) fn build_moe_weights<'a>(
 pub fn resolve_attn_weights<'a>(
     index: &'a larql_vindex::VectorIndex,
     layer: usize,
-) -> Option<(QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>)> {
+) -> Option<(
+    QuantWeight<'a>,
+    QuantWeight<'a>,
+    QuantWeight<'a>,
+    QuantWeight<'a>,
+)> {
     // Registry tag → compute::QuantFormat. Explicit so a typo or new
     // tag fails loudly rather than silently aliasing to Q4_K.
     fn to_format(s: &str) -> QuantFormat {
@@ -197,17 +239,49 @@ pub fn resolve_attn_weights<'a>(
 
     if let Some([q, k, v, o]) = index.attn_q4k_layer_data(layer) {
         Some((
-            QuantWeight { data: q.0, scales: None, format: to_format(q.1) },
-            QuantWeight { data: k.0, scales: None, format: to_format(k.1) },
-            QuantWeight { data: v.0, scales: None, format: to_format(v.1) },
-            QuantWeight { data: o.0, scales: None, format: to_format(o.1) },
+            QuantWeight {
+                data: q.0,
+                scales: None,
+                format: to_format(q.1),
+            },
+            QuantWeight {
+                data: k.0,
+                scales: None,
+                format: to_format(k.1),
+            },
+            QuantWeight {
+                data: v.0,
+                scales: None,
+                format: to_format(v.1),
+            },
+            QuantWeight {
+                data: o.0,
+                scales: None,
+                format: to_format(o.1),
+            },
         ))
     } else if let Some([q, k, v, o]) = index.attn_q8_layer_data(layer) {
         Some((
-            QuantWeight { data: q.0, scales: Some(q.1), format: QuantFormat::Q8_0 },
-            QuantWeight { data: k.0, scales: Some(k.1), format: QuantFormat::Q8_0 },
-            QuantWeight { data: v.0, scales: Some(v.1), format: QuantFormat::Q8_0 },
-            QuantWeight { data: o.0, scales: Some(o.1), format: QuantFormat::Q8_0 },
+            QuantWeight {
+                data: q.0,
+                scales: Some(q.1),
+                format: QuantFormat::Q8_0,
+            },
+            QuantWeight {
+                data: k.0,
+                scales: Some(k.1),
+                format: QuantFormat::Q8_0,
+            },
+            QuantWeight {
+                data: v.0,
+                scales: Some(v.1),
+                format: QuantFormat::Q8_0,
+            },
+            QuantWeight {
+                data: o.0,
+                scales: Some(o.1),
+                format: QuantFormat::Q8_0,
+            },
         ))
     } else {
         None
@@ -245,18 +319,42 @@ pub fn resolve_ffn_weights<'a>(
 
     if let Some([gate, up, down]) = index.interleaved_q4k_layer_data(layer) {
         return (
-            QuantWeight { data: gate.0, scales: None, format: str_to_format(gate.1, ffn_format) },
-            QuantWeight { data: up.0,   scales: None, format: str_to_format(up.1,   ffn_format) },
-            QuantWeight { data: down.0, scales: None, format: str_to_format(down.1, ffn_format) },
+            QuantWeight {
+                data: gate.0,
+                scales: None,
+                format: str_to_format(gate.1, ffn_format),
+            },
+            QuantWeight {
+                data: up.0,
+                scales: None,
+                format: str_to_format(up.1, ffn_format),
+            },
+            QuantWeight {
+                data: down.0,
+                scales: None,
+                format: str_to_format(down.1, ffn_format),
+            },
         );
     }
 
     let q4_ffn_per_layer = q4_ffn_per_matrix * 3;
     let fs = layer * q4_ffn_per_layer;
     (
-        QuantWeight { data: &q4_ffn_mmap[fs..fs + q4_ffn_per_matrix], scales: None, format: ffn_format },
-        QuantWeight { data: &q4_ffn_mmap[fs + q4_ffn_per_matrix..fs + 2 * q4_ffn_per_matrix], scales: None, format: ffn_format },
-        QuantWeight { data: &q4_ffn_mmap[fs + 2 * q4_ffn_per_matrix..fs + 3 * q4_ffn_per_matrix], scales: None, format: ffn_format },
+        QuantWeight {
+            data: &q4_ffn_mmap[fs..fs + q4_ffn_per_matrix],
+            scales: None,
+            format: ffn_format,
+        },
+        QuantWeight {
+            data: &q4_ffn_mmap[fs + q4_ffn_per_matrix..fs + 2 * q4_ffn_per_matrix],
+            scales: None,
+            format: ffn_format,
+        },
+        QuantWeight {
+            data: &q4_ffn_mmap[fs + 2 * q4_ffn_per_matrix..fs + 3 * q4_ffn_per_matrix],
+            scales: None,
+            format: ffn_format,
+        },
     )
 }
 
@@ -271,10 +369,138 @@ pub fn build_pipeline_layers<'a>(
     q4_ffn_per_matrix: usize,
     ffn_format: QuantFormat,
 ) -> Vec<FullPipelineLayer<'a>> {
-    layer_range.map(|layer| {
-        let (wq, wk, wv, wo) = resolve_attn_weights(index, layer)
-            .expect("No attention weights available for layer");
-        let (gate, up, down) = resolve_ffn_weights(index, layer, q4_ffn_mmap, q4_ffn_per_matrix, ffn_format);
-        build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
-    }).collect()
+    layer_range
+        .map(|layer| {
+            let (wq, wk, wv, wo) = resolve_attn_weights(index, layer)
+                .expect("No attention weights available for layer");
+            let (gate, up, down) =
+                resolve_ffn_weights(index, layer, q4_ffn_mmap, q4_ffn_per_matrix, ffn_format);
+            build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::{make_test_vindex, make_test_weights};
+    use larql_models::ModelWeights;
+    use std::sync::OnceLock;
+
+    fn weights() -> &'static ModelWeights {
+        static W: OnceLock<ModelWeights> = OnceLock::new();
+        W.get_or_init(make_test_weights)
+    }
+
+    fn empty_qw() -> QuantWeight<'static> {
+        QuantWeight {
+            data: &[],
+            scales: None,
+            format: QuantFormat::Q4_K,
+        }
+    }
+
+    // ── build_arch_params ─────────────────────────────────────────────────────
+
+    #[test]
+    fn build_arch_params_extracts_norm_weights() {
+        let w = weights();
+        let params = build_arch_params(
+            w,
+            0,
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+        );
+        // input_norm comes from arch.input_layernorm_key(0) which is in test weights
+        assert!(
+            !params.input_norm.is_empty(),
+            "input_norm should be populated"
+        );
+        assert!(
+            !params.post_attn_norm.is_empty(),
+            "post_attn_norm should be populated"
+        );
+    }
+
+    #[test]
+    fn build_arch_params_head_dims_correct() {
+        let w = weights();
+        let params = build_arch_params(
+            w,
+            0,
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+        );
+        assert_eq!(params.head_dim, w.head_dim);
+        assert_eq!(params.num_q_heads, w.num_q_heads);
+        assert_eq!(params.num_kv_heads, w.num_kv_heads);
+    }
+
+    #[test]
+    fn build_arch_params_all_layers_no_panic() {
+        let w = weights();
+        for layer in 0..w.num_layers {
+            let _ = build_arch_params(
+                w,
+                layer,
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+            );
+        }
+    }
+
+    // ── resolve_attn_weights ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_attn_weights_returns_none_without_q4k() {
+        // make_test_vindex has no Q4K attn data → should return None
+        let w = weights();
+        let idx = make_test_vindex(w);
+        let result = resolve_attn_weights(&idx, 0);
+        assert!(
+            result.is_none(),
+            "test vindex has no Q4K attn data, expected None"
+        );
+    }
+
+    // ── resolve_ffn_weights ───────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_ffn_weights_legacy_stride_slices_correctly() {
+        // 4 bytes per matrix, layer 0: fs=0, gate=[0..4], up=[4..8], down=[8..12]
+        let mmap: Vec<u8> = (0u8..12).collect();
+        let idx = make_test_vindex(weights());
+        let (gate, up, down) = resolve_ffn_weights(&idx, 0, &mmap, 4, QuantFormat::Q4_K);
+        // No manifest, falls back to legacy stride
+        assert_eq!(gate.data, &[0, 1, 2, 3]);
+        assert_eq!(up.data, &[4, 5, 6, 7]);
+        assert_eq!(down.data, &[8, 9, 10, 11]);
+        assert_eq!(gate.format, QuantFormat::Q4_K);
+    }
+
+    #[test]
+    fn resolve_ffn_weights_layer1_correct_offset() {
+        // layer=1, per_matrix=4: fs = 1*12 = 12
+        let mmap: Vec<u8> = (0u8..24).collect();
+        let idx = make_test_vindex(weights());
+        let (gate, up, down) = resolve_ffn_weights(&idx, 1, &mmap, 4, QuantFormat::Q4_0);
+        assert_eq!(gate.data, &[12, 13, 14, 15]);
+        assert_eq!(up.data, &[16, 17, 18, 19]);
+        assert_eq!(down.data, &[20, 21, 22, 23]);
+    }
 }

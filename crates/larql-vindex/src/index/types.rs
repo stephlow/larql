@@ -1,7 +1,7 @@
 //! Shared types and traits for the vindex index.
 
-use ndarray::{Array1, Array2};
 use larql_models::TopKEntry;
+use ndarray::{Array1, Array2};
 
 /// Metadata for a single FFN feature (from extraction).
 #[derive(Clone)]
@@ -34,24 +34,40 @@ pub trait GateIndex: Send + Sync {
     fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)>;
     fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta>;
     fn num_features(&self, layer: usize) -> usize;
-    fn down_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
+    fn down_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> {
+        None
+    }
     /// Up vector override at (layer, feature). Used by INSERT to write
     /// the slot's up component when installing a constellation fact.
     /// `walk_ffn_sparse` checks this before reading from `up_layer_matrix`,
     /// matching the parallel pattern for `down_override`.
-    fn up_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
+    fn up_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> {
+        None
+    }
     /// Gate vector override at (layer, feature). Lives in the patch
     /// overlay (`PatchedVindex.overrides_gate`). Used by the sparse
     /// inference fallback to recompute `silu(gate_override · x)` so
     /// the strong installed gate actually drives the activation —
     /// without this, gather-from-dense reads the original weak slot.
-    fn gate_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
+    fn gate_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> {
+        None
+    }
     /// Check if any down vector overrides or gate overrides exist at this layer.
-    fn has_overrides_at(&self, _layer: usize) -> bool { false }
-    fn down_feature_vector(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
-    fn has_down_features(&self) -> bool { false }
-    fn down_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn gate_scores_batch(&self, _layer: usize, _x: &Array2<f32>) -> Option<Array2<f32>> { None }
+    fn has_overrides_at(&self, _layer: usize) -> bool {
+        false
+    }
+    fn down_feature_vector(&self, _layer: usize, _feature: usize) -> Option<&[f32]> {
+        None
+    }
+    fn has_down_features(&self) -> bool {
+        false
+    }
+    fn down_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        None
+    }
+    fn gate_scores_batch(&self, _layer: usize, _x: &Array2<f32>) -> Option<Array2<f32>> {
+        None
+    }
     /// Backend-aware variant of `gate_scores_batch`. When `backend` is a
     /// Metal `ComputeBackend` and `x` is a single row, implementations
     /// can dispatch `f32_gemv` instead of CPU BLAS — the gate matmul is
@@ -66,40 +82,74 @@ pub trait GateIndex: Send + Sync {
     ) -> Option<Array2<f32>> {
         self.gate_scores_batch(layer, x)
     }
-    fn up_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn has_full_mmap_ffn(&self) -> bool { false }
-    fn has_interleaved(&self) -> bool { false }
-    fn interleaved_gate(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn interleaved_up(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn interleaved_down(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
+    fn up_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        None
+    }
+    fn has_full_mmap_ffn(&self) -> bool {
+        false
+    }
+    fn has_interleaved(&self) -> bool {
+        false
+    }
+    fn interleaved_gate(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        None
+    }
+    fn interleaved_up(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        None
+    }
+    fn interleaved_down(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        None
+    }
     fn prefetch_interleaved_layer(&self, _layer: usize) {}
-    fn has_interleaved_q4(&self) -> bool { false }
-    fn interleaved_q4_gate(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
-    fn interleaved_q4_up(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
-    fn interleaved_q4_down(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
+    fn has_interleaved_q4(&self) -> bool {
+        false
+    }
+    fn interleaved_q4_gate(&self, _layer: usize) -> Option<ndarray::Array2<f32>> {
+        None
+    }
+    fn interleaved_q4_up(&self, _layer: usize) -> Option<ndarray::Array2<f32>> {
+        None
+    }
+    fn interleaved_q4_down(&self, _layer: usize) -> Option<ndarray::Array2<f32>> {
+        None
+    }
     fn prefetch_interleaved_q4_layer(&self, _layer: usize) {}
-    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> { None }
-    fn has_interleaved_q4k(&self) -> bool { false }
-    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> { None }
+    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
+        None
+    }
+    fn has_interleaved_q4k(&self) -> bool {
+        false
+    }
+    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
+        None
+    }
     /// Issue MADV_WILLNEED for the next layer's Q4_K/Q6_K FFN data so
     /// pages are streamed in while the current layer computes. No-op
     /// default for non-mmap implementations.
     fn prefetch_interleaved_q4k_layer(&self, _layer: usize) {}
     /// Per-layer FFN Q4_K/Q6_K slices — [gate, up, down] with format tags.
     /// `None` when the FFN manifest wasn't emitted (older vindexes).
-    fn interleaved_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 3]> { None }
+    fn interleaved_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 3]> {
+        None
+    }
 
     /// Whether feature-major Q4_K-encoded down vectors
     /// (`down_features_q4k.bin`) are loaded. When true,
     /// `q4k_down_feature_scaled_add` can serve component=2 row decode
     /// without going through the `q4k_ffn_layer` cache.
-    fn has_down_features_q4k(&self) -> bool { false }
+    fn has_down_features_q4k(&self) -> bool {
+        false
+    }
 
     /// W2: feature-major down decode. Returns `true` on success and
     /// writes `out += alpha * down[layer][feat]`. Returns `false` when
     /// the file isn't loaded; caller falls back to the cache path.
     fn q4k_down_feature_scaled_add(
-        &self, _layer: usize, _feat: usize, _alpha: f32, _out: &mut [f32],
+        &self,
+        _layer: usize,
+        _feat: usize,
+        _alpha: f32,
+        _out: &mut [f32],
     ) -> bool {
         false
     }
@@ -107,18 +157,31 @@ pub trait GateIndex: Send + Sync {
     /// Dequantised Q4K/Q6K FFN matrix for `(layer, component)` where
     /// `component` is 0=gate, 1=up, 2=down. Lazily decoded and cached.
     /// Returns `None` when the vindex has no Q4K interleaved data.
-    fn q4k_ffn_layer(&self, _layer: usize, _component: usize)
-        -> Option<std::sync::Arc<Vec<f32>>> { None }
+    fn q4k_ffn_layer(&self, _layer: usize, _component: usize) -> Option<std::sync::Arc<Vec<f32>>> {
+        None
+    }
 
     /// Decode one row of a Q4K FFN matrix without caching. Small-memory
     /// alternative to `q4k_ffn_layer`. See `VectorIndex::q4k_ffn_row_into`.
-    fn q4k_ffn_row_into(&self, _layer: usize, _component: usize, _feat: usize, _out: &mut [f32]) -> bool {
+    fn q4k_ffn_row_into(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _out: &mut [f32],
+    ) -> bool {
         false
     }
 
     /// Fused Q4K/Q6K decode + dot — returns `dot(dequant(row), x)` without
     /// materialising the decoded row. See `VectorIndex::q4k_ffn_row_dot`.
-    fn q4k_ffn_row_dot(&self, _layer: usize, _component: usize, _feat: usize, _x: &[f32]) -> Option<f32> {
+    fn q4k_ffn_row_dot(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _x: &[f32],
+    ) -> Option<f32> {
         None
     }
 
@@ -127,13 +190,27 @@ pub trait GateIndex: Send + Sync {
     /// per-row decode that gives a single feature's down vector
     /// without first transposing the layer (which is what
     /// `q4k_ffn_layer` does and caches). See ROADMAP W2.
-    fn q4k_ffn_row_scaled_add_via_cache(&self, _layer: usize, _component: usize, _feat: usize, _alpha: f32, _out: &mut [f32]) -> bool {
+    fn q4k_ffn_row_scaled_add_via_cache(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _alpha: f32,
+        _out: &mut [f32],
+    ) -> bool {
         false
     }
 
     /// Fused Q4K/Q6K decode + scaled-add — `out += alpha * dequant(row)`
     /// without materialising the decoded row.
-    fn q4k_ffn_row_scaled_add(&self, _layer: usize, _component: usize, _feat: usize, _alpha: f32, _out: &mut [f32]) -> bool {
+    fn q4k_ffn_row_scaled_add(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _alpha: f32,
+        _out: &mut [f32],
+    ) -> bool {
         false
     }
 
@@ -144,20 +221,41 @@ pub trait GateIndex: Send + Sync {
     // FP4 storage work unchanged.
 
     /// Whether this index has FP4/FP8 FFN storage attached.
-    fn has_fp4_storage(&self) -> bool { false }
+    fn has_fp4_storage(&self) -> bool {
+        false
+    }
 
     /// FP4/FP8 fused dequant + dot. `component`: 0=gate, 1=up, 2=down.
-    fn fp4_ffn_row_dot(&self, _layer: usize, _component: usize, _feat: usize, _x: &[f32]) -> Option<f32> {
+    fn fp4_ffn_row_dot(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _x: &[f32],
+    ) -> Option<f32> {
         None
     }
 
     /// FP4/FP8 fused dequant + scaled-add: `out += alpha * dequant(row)`.
-    fn fp4_ffn_row_scaled_add(&self, _layer: usize, _component: usize, _feat: usize, _alpha: f32, _out: &mut [f32]) -> bool {
+    fn fp4_ffn_row_scaled_add(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _alpha: f32,
+        _out: &mut [f32],
+    ) -> bool {
         false
     }
 
     /// FP4/FP8 dequantise one row into `out`.
-    fn fp4_ffn_row_into(&self, _layer: usize, _component: usize, _feat: usize, _out: &mut [f32]) -> bool {
+    fn fp4_ffn_row_into(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _feat: usize,
+        _out: &mut [f32],
+    ) -> bool {
         false
     }
 
@@ -241,9 +339,16 @@ pub trait GateIndex: Send + Sync {
     /// Unified fused dequant + scaled-add: `out[i] += alpha * row[i]`.
     /// Returns `true` on success, `false` if no backend covers the
     /// coordinate (or shapes don't match).
-    fn ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
-        if self.has_fp4_storage()
-            && self.fp4_ffn_row_scaled_add(layer, component, feat, alpha, out) {
+    fn ffn_row_scaled_add(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
+        if self.has_fp4_storage() && self.fp4_ffn_row_scaled_add(layer, component, feat, alpha, out)
+        {
             return true;
         }
         let mut out_view = ndarray::ArrayViewMut1::from(&mut out[..]);
@@ -310,27 +415,36 @@ pub trait GateIndex: Send + Sync {
 
     /// Unified decode-into-buffer. `out.len()` must equal the row width.
     fn ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
-        if self.has_fp4_storage()
-            && self.fp4_ffn_row_into(layer, component, feat, out) {
+        if self.has_fp4_storage() && self.fp4_ffn_row_into(layer, component, feat, out) {
             return true;
         }
         let copy_row = |row: ndarray::ArrayView1<'_, f32>, out: &mut [f32]| -> bool {
-            if row.len() != out.len() { return false; }
-            for (i, &v) in row.iter().enumerate() { out[i] = v; }
+            if row.len() != out.len() {
+                return false;
+            }
+            for (i, &v) in row.iter().enumerate() {
+                out[i] = v;
+            }
             true
         };
         match component {
             0 => {
                 if let Some(m) = self.interleaved_gate(layer) {
-                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                    if feat < m.nrows() {
+                        return copy_row(m.row(feat), out);
+                    }
                 }
             }
             1 => {
                 if let Some(m) = self.interleaved_up(layer) {
-                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                    if feat < m.nrows() {
+                        return copy_row(m.row(feat), out);
+                    }
                 }
                 if let Some(m) = self.up_layer_matrix(layer) {
-                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                    if feat < m.nrows() {
+                        return copy_row(m.row(feat), out);
+                    }
                 }
             }
             2 => {
@@ -338,10 +452,14 @@ pub trait GateIndex: Send + Sync {
                     return copy_row(ndarray::ArrayView1::from(row), out);
                 }
                 if let Some(m) = self.interleaved_down(layer) {
-                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                    if feat < m.nrows() {
+                        return copy_row(m.row(feat), out);
+                    }
                 }
                 if let Some(m) = self.down_layer_matrix(layer) {
-                    if feat < m.nrows() { return copy_row(m.row(feat), out); }
+                    if feat < m.nrows() {
+                        return copy_row(m.row(feat), out);
+                    }
                 }
             }
             _ => return false,
@@ -374,12 +492,19 @@ pub trait GateIndex: Send + Sync {
         _residual: &Array1<f32>,
         _top_k: usize,
         _backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> { None }
+    ) -> Option<Vec<(usize, f32)>> {
+        None
+    }
 
     /// Per-feature gate scoring: iterate all features, dot product each one.
     /// No matrix multiplication — each feature scored individually.
     /// Returns (feature_index, score) sorted by absolute score descending.
-    fn gate_walk(&self, _layer: usize, _residual: &Array1<f32>, _top_k: usize) -> Option<Vec<(usize, f32)>> {
+    fn gate_walk(
+        &self,
+        _layer: usize,
+        _residual: &Array1<f32>,
+        _top_k: usize,
+    ) -> Option<Vec<(usize, f32)>> {
         None // Override in VectorIndex to use mmap
     }
 
@@ -437,36 +562,61 @@ impl DownMetaMmap {
     }
 
     pub fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
-        if layer >= self.layer_offsets.len() { return None; }
+        if layer >= self.layer_offsets.len() {
+            return None;
+        }
         let num_features = self.layer_num_features[layer];
-        if num_features == 0 || feature >= num_features { return None; }
+        if num_features == 0 || feature >= num_features {
+            return None;
+        }
 
         let offset = self.layer_offsets[layer] + feature * self.record_size();
         let rec_size = self.record_size();
-        if offset + rec_size > self.mmap.len() { return None; }
+        if offset + rec_size > self.mmap.len() {
+            return None;
+        }
 
         let b = &self.mmap[offset..offset + rec_size];
         let top_token_id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         let c_score = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
 
-        if top_token_id == 0 && c_score == 0.0 { return None; }
+        if top_token_id == 0 && c_score == 0.0 {
+            return None;
+        }
 
         let mut top_k = Vec::new();
         for i in 0..self.top_k_count {
             let o = 8 + i * 8;
-            let tid = u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
-            let logit = f32::from_le_bytes([b[o+4], b[o+5], b[o+6], b[o+7]]);
+            let tid = u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let logit = f32::from_le_bytes([b[o + 4], b[o + 5], b[o + 6], b[o + 7]]);
             if tid > 0 || logit != 0.0 {
-                let token = self.tokenizer.decode(&[tid], true)
-                    .unwrap_or_else(|_| format!("T{tid}")).trim().to_string();
-                top_k.push(TopKEntry { token, token_id: tid, logit });
+                let token = self
+                    .tokenizer
+                    .decode(&[tid], true)
+                    .unwrap_or_else(|_| format!("T{tid}"))
+                    .trim()
+                    .to_string();
+                top_k.push(TopKEntry {
+                    token,
+                    token_id: tid,
+                    logit,
+                });
             }
         }
 
-        let top_token = self.tokenizer.decode(&[top_token_id], true)
-            .unwrap_or_else(|_| format!("T{top_token_id}")).trim().to_string();
+        let top_token = self
+            .tokenizer
+            .decode(&[top_token_id], true)
+            .unwrap_or_else(|_| format!("T{top_token_id}"))
+            .trim()
+            .to_string();
 
-        Some(FeatureMeta { top_token, top_token_id, c_score, top_k })
+        Some(FeatureMeta {
+            top_token,
+            top_token_id,
+            c_score,
+            top_k,
+        })
     }
 
     pub fn num_features(&self, layer: usize) -> usize {

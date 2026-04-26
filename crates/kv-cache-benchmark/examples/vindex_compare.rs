@@ -53,23 +53,52 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--reference" => { i += 1; a.reference = PathBuf::from(&argv[i]); }
-            "--candidate" => { i += 1; a.candidate = PathBuf::from(&argv[i]); }
-            "--prompts"   => { i += 1; a.prompts_path = Some(PathBuf::from(&argv[i])); }
-            "--model"     => { i += 1; a.model = argv[i].clone(); }
-            "--out"       => { i += 1; a.out = Some(PathBuf::from(&argv[i])); }
-            "--top-k"     => { i += 1; a.top_k = argv[i].parse().expect("int"); }
-            "--max-seq"   => { i += 1; a.max_seq_len = Some(argv[i].parse().expect("int")); }
-            "--max-layers"=> { i += 1; a.max_layers = Some(argv[i].parse().expect("int")); }
-            "--prompt"    => { i += 1; a.inline_prompts.push(argv[i].clone()); }
-            "--trace"     => { a.trace = true; }
+            "--reference" => {
+                i += 1;
+                a.reference = PathBuf::from(&argv[i]);
+            }
+            "--candidate" => {
+                i += 1;
+                a.candidate = PathBuf::from(&argv[i]);
+            }
+            "--prompts" => {
+                i += 1;
+                a.prompts_path = Some(PathBuf::from(&argv[i]));
+            }
+            "--model" => {
+                i += 1;
+                a.model = argv[i].clone();
+            }
+            "--out" => {
+                i += 1;
+                a.out = Some(PathBuf::from(&argv[i]));
+            }
+            "--top-k" => {
+                i += 1;
+                a.top_k = argv[i].parse().expect("int");
+            }
+            "--max-seq" => {
+                i += 1;
+                a.max_seq_len = Some(argv[i].parse().expect("int"));
+            }
+            "--max-layers" => {
+                i += 1;
+                a.max_layers = Some(argv[i].parse().expect("int"));
+            }
+            "--prompt" => {
+                i += 1;
+                a.inline_prompts.push(argv[i].clone());
+            }
+            "--trace" => {
+                a.trace = true;
+            }
             other => eprintln!("warn: ignored arg {other}"),
         }
         i += 1;
     }
     if a.reference.as_os_str().is_empty() || a.candidate.as_os_str().is_empty() {
         eprintln!(
-"usage: vindex_compare --reference PATH --candidate PATH \\
+            "usage: vindex_compare --reference PATH --candidate PATH \\
     [--prompts FILE] [--prompt 'inline text' ...] \\
     [--model NAME] [--out PATH] [--top-k K] [--max-seq N] [--max-layers L]
 
@@ -87,7 +116,9 @@ fn load_prompts(args: &Args) -> Vec<String> {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
             prompts.push(trimmed.to_string());
         }
     }
@@ -120,14 +151,17 @@ fn main() {
     println!("  candidate: {}", args.candidate.display());
     println!("  model    : {}", args.model);
     println!("  top-k    : {}", args.top_k);
-    if let Some(cap) = args.max_seq_len { println!("  max_seq  : {cap}"); }
-    if let Some(l)   = args.max_layers  { println!("  max_layers: {l}"); }
+    if let Some(cap) = args.max_seq_len {
+        println!("  max_seq  : {cap}");
+    }
+    if let Some(l) = args.max_layers {
+        println!("  max_layers: {l}");
+    }
     println!();
 
     let t_load = std::time::Instant::now();
     eprintln!("Loading model weights ({})...", args.model);
-    let model = InferenceModel::load(&args.model)
-        .unwrap_or_else(|e| panic!("load model: {e}"));
+    let model = InferenceModel::load(&args.model).unwrap_or_else(|e| panic!("load model: {e}"));
     let tokenizer = model.tokenizer().clone();
 
     eprintln!("Loading reference vindex...");
@@ -138,18 +172,28 @@ fn main() {
     let candidate = VectorIndex::load_vindex(&args.candidate, &mut cb)
         .unwrap_or_else(|e| panic!("load candidate: {e:?}"));
     eprintln!("  loaded in {:.1}s", t_load.elapsed().as_secs_f64());
-    eprintln!("  reference has_fp4_storage={}", reference.has_fp4_storage());
-    eprintln!("  candidate has_fp4_storage={}", candidate.has_fp4_storage());
+    eprintln!(
+        "  reference has_fp4_storage={}",
+        reference.has_fp4_storage()
+    );
+    eprintln!(
+        "  candidate has_fp4_storage={}",
+        candidate.has_fp4_storage()
+    );
     eprintln!();
 
     // Tokenise the prompt set.
     let prompts = load_prompts(&args);
     eprintln!("Prompt set: {} prompts", prompts.len());
-    let prompts_and_tokens: Vec<(&str, Vec<u32>)> = prompts.iter().map(|p| {
-        let enc = tokenizer.encode(p.as_str(), true)
-            .unwrap_or_else(|e| panic!("tokenize: {e}"));
-        (p.as_str(), enc.get_ids().to_vec())
-    }).collect();
+    let prompts_and_tokens: Vec<(&str, Vec<u32>)> = prompts
+        .iter()
+        .map(|p| {
+            let enc = tokenizer
+                .encode(p.as_str(), true)
+                .unwrap_or_else(|e| panic!("tokenize: {e}"));
+            (p.as_str(), enc.get_ids().to_vec())
+        })
+        .collect();
 
     let config = ComparisonConfig {
         top_k: args.top_k,
@@ -207,8 +251,8 @@ fn main() {
         if let Some(parent) = out_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let json = serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|e| panic!("serialise: {e}"));
+        let json =
+            serde_json::to_string_pretty(&report).unwrap_or_else(|e| panic!("serialise: {e}"));
         std::fs::write(out_path, json)
             .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
         println!();
@@ -237,11 +281,16 @@ fn print_human_report(report: &kv_cache_benchmark::vindex_compare::AggregateRepo
     println!();
     println!("── aggregate ──");
     println!("  n prompts             : {}", report.n_prompts);
-    println!("  argmax agreement      : {:.4}  ({}/{})",
-             report.argmax_agreement,
-             (report.argmax_agreement * report.n_prompts as f64).round() as usize,
-             report.n_prompts);
-    println!("  top-{} Jaccard mean    : {:.4}", report.config.top_k, report.top_k_agreement_mean);
+    println!(
+        "  argmax agreement      : {:.4}  ({}/{})",
+        report.argmax_agreement,
+        (report.argmax_agreement * report.n_prompts as f64).round() as usize,
+        report.n_prompts
+    );
+    println!(
+        "  top-{} Jaccard mean    : {:.4}",
+        report.config.top_k, report.top_k_agreement_mean
+    );
     println!("  logit cosine mean     : {:.4}", report.logit_cos_mean);
     println!("  symmetric KL mean     : {:.5}", report.kl_mean);
     println!("  symmetric KL p95      : {:.5}", report.kl_p95);

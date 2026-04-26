@@ -359,12 +359,9 @@ impl GateIndex {
     /// Precompute entity feature lists for all layers at once.
     /// Returns a vec indexed by layer number (sparse — unlisted layers are empty).
     /// Zero allocation at query time — just index into the vec.
-    pub fn precompute_entity(
-        &self,
-        token_ids: &[u32],
-        top_k: usize,
-    ) -> Vec<Vec<usize>> {
-        let token_scores: Vec<(usize, f32)> = token_ids.iter().map(|&t| (t as usize, 1.0)).collect();
+    pub fn precompute_entity(&self, token_ids: &[u32], top_k: usize) -> Vec<Vec<usize>> {
+        let token_scores: Vec<(usize, f32)> =
+            token_ids.iter().map(|&t| (t as usize, 1.0)).collect();
         let max_layer = self.index.keys().copied().max().unwrap_or(0);
         let mut result = vec![Vec::new(); max_layer + 1];
         for &layer in self.index.keys() {
@@ -441,7 +438,13 @@ mod tests {
     const FEATURES_PER_TOK: usize = 4;
 
     fn build_small_index(weights: &ModelWeights) -> GateIndex {
-        GateIndex::build(weights, &[0, 1], FEATURES_PER_TOK, TOP_TOKENS, &mut SilentIndexCallbacks)
+        GateIndex::build(
+            weights,
+            &[0, 1],
+            FEATURES_PER_TOK,
+            TOP_TOKENS,
+            &mut SilentIndexCallbacks,
+        )
     }
 
     // ── Construction ──────────────────────────────────────────────────────────
@@ -466,7 +469,11 @@ mod tests {
     fn build_empty_layers_is_empty() {
         let weights = make_test_weights();
         let idx = GateIndex::build(
-            &weights, &[], FEATURES_PER_TOK, TOP_TOKENS, &mut SilentIndexCallbacks,
+            &weights,
+            &[],
+            FEATURES_PER_TOK,
+            TOP_TOKENS,
+            &mut SilentIndexCallbacks,
         );
         assert_eq!(idx.num_layers(), 0);
         assert_eq!(idx.total_entries(), 0);
@@ -480,7 +487,11 @@ mod tests {
         let idx = build_small_index(&weights);
         let tok_scores = vec![(0usize, 1.0f32), (1, 0.9)];
         let features = idx.lookup_from_tokens(&tok_scores, 0, 3);
-        assert!(features.len() <= 3, "got {} features, expected ≤ 3", features.len());
+        assert!(
+            features.len() <= 3,
+            "got {} features, expected ≤ 3",
+            features.len()
+        );
     }
 
     #[test]
@@ -504,7 +515,10 @@ mod tests {
         let idx = build_small_index(&weights);
         let big_tok = weights.vocab_size + 999;
         let features = idx.lookup_from_tokens(&[(big_tok, 1.0)], 0, 10);
-        assert!(features.is_empty(), "out-of-range token should produce no features");
+        assert!(
+            features.is_empty(),
+            "out-of-range token should produce no features"
+        );
     }
 
     // ── precompute_entity ─────────────────────────────────────────────────────
@@ -516,7 +530,10 @@ mod tests {
         let entity = idx.precompute_entity(&[0u32], 4);
         assert!(!entity.is_empty());
         let has_features = entity.iter().any(|f| !f.is_empty());
-        assert!(has_features, "precompute_entity should find features for token 0");
+        assert!(
+            has_features,
+            "precompute_entity should find features for token 0"
+        );
     }
 
     // ── save / load roundtrip ─────────────────────────────────────────────────

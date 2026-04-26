@@ -8,14 +8,21 @@
 
 ```
 load_model_dir(path)                   → auto-detect format, load all tensors
+load_model_dir_validated(path)         → validate architecture before loading tensors
 load_model_dir_walk_only(path)         → skip FFN tensors at parse/dequant time (no heap spike)
+load_model_dir_walk_only_validated(path)
 load_model_dir_filtered(path, skip_fn) → skip any tensors matching predicate
+load_model_dir_filtered_validated(path, skip_fn)
   ├── *.safetensors/     → loading::safetensors
   ├── *.gguf             → loading::gguf::load_gguf_filtered
   └── error              → ModelError::{NotADirectory, NoSafetensors}
 
 resolve_model_path(name) → resolve HF cache path to model directory
 ```
+
+Use validated entry points for inference, extraction, and long-running servers.
+Use permissive entry points for inspection/conversion tools that need to report
+or repair incomplete configs.
 
 ## Safetensors Pipeline
 
@@ -39,12 +46,19 @@ Read config.json → serde_json::Value
 parse_model_config() → ModelConfig
   ↓
 Match model_type → Box<dyn ModelArchitecture>
+  ↓
+Validated entry points call arch.validate()
 ```
 
 Config parsing handles:
 - Top-level config (Llama, Qwen, etc.)
 - Nested `text_config` (multimodal Gemma 3/4)
 - Fallback defaults per model family
+
+Detection is intentionally permissive so tooling can inspect partial configs.
+Validated entry points call `arch.validate()` to fail fast on invalid dimensions,
+head geometry, RoPE values, per-layer metadata, KV sharing, or MoE routing. The
+validation implementation and diagnostic field constants live in `validation.rs`.
 
 ### 3. Load Tensors
 
@@ -131,6 +145,8 @@ GGUF metadata keys map to config.json fields:
 ```
 For each tensor descriptor:
   Read name, shape, dtype, offset
+  Normalize key ("blk.N." → "layers.N.", etc.)
+  Apply optional skip predicate before reading/dequantizing data
   Seek to data offset
   ↓
   Match dtype:
@@ -139,12 +155,19 @@ For each tensor descriptor:
     BF16 → quant::half::decode_bf16
     Q4_0 → quant::ggml::dequantize (block decode)
     Q4_1 → quant::ggml::dequantize
+    Q5_0 → quant::ggml::dequantize
+    Q5_1 → quant::ggml::dequantize
     Q8_0 → quant::ggml::dequantize
+    Q4_K → quant::ggml::dequantize
+    Q6_K → quant::ggml::dequantize
     other → ModelError::UnsupportedDtype
   ↓
-  Strip GGUF key prefix ("blk.N." → "layers.N.")
   Reshape + insert into tensors
 ```
+
+`load_gguf_filtered` applies the predicate after key normalization and before
+data-size calculation and dequantization. This is what keeps walk-only GGUF
+loads from expanding FFN tensors into f32.
 
 ### 4. Key Translation
 
@@ -156,6 +179,9 @@ GGUF uses different key patterns than safetensors:
 | `blk.0.ffn_gate.weight` | `layers.0.mlp.gate_proj.weight` |
 | `token_embd.weight` | `embed_tokens.weight` |
 | `output_norm.weight` | `norm.weight` |
+
+The replacement table is centralized in `loading/gguf.rs`; add new GGUF key
+forms there rather than scattering ad-hoc rewrites through loading code.
 
 ## ModelWeights Struct
 
@@ -213,7 +239,7 @@ Loader string constants are centralized in code:
 Tensors with unsupported dtypes (I64 attention masks, U8 token type IDs, etc.) are collected here rather than causing a load failure. Each entry is `(tensor_key, dtype_string)`. Check after loading to detect unexpected format gaps:
 
 ```rust
-let weights = load_model_dir(path)?;
+let weights = load_model_dir_validated(path)?;
 for (key, dtype) in &weights.skipped_tensors {
     if !["I64", "I32", "U8"].iter().any(|&d| dtype.contains(d)) {
         eprintln!("unexpected skipped tensor: {key} ({dtype})");

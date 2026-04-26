@@ -50,12 +50,11 @@ pub mod publish;
 // Re-export the previous flat-module surface so callers don't have to
 // pick a submodule.
 pub use discovery::{
-    add_collection_item, dataset_repo_exists, ensure_collection,
-    fetch_collection_items, repo_exists, CollectionItem,
+    add_collection_item, dataset_repo_exists, ensure_collection, fetch_collection_items,
+    repo_exists, CollectionItem,
 };
 pub use download::{
-    download_hf_weights, resolve_hf_vindex, resolve_hf_vindex_with_progress,
-    DownloadProgress,
+    download_hf_weights, resolve_hf_vindex, resolve_hf_vindex_with_progress, DownloadProgress,
 };
 pub use publish::{
     publish_vindex, publish_vindex_with_opts, PublishCallbacks, PublishOptions,

@@ -40,19 +40,25 @@ use larql_compute::metal::shaders;
 /// time constants.
 fn assert_handle_matches_marker<K: TiledKernel>(handle: &KernelHandle, label: &str) {
     assert_eq!(
-        handle.kernel_name, K::KERNEL_NAME,
+        handle.kernel_name,
+        K::KERNEL_NAME,
         "{label}: handle.kernel_name='{}' but marker expects '{}'",
-        handle.kernel_name, K::KERNEL_NAME,
+        handle.kernel_name,
+        K::KERNEL_NAME,
     );
     assert_eq!(
-        handle.rows_per_tg, K::ROWS_PER_TG,
+        handle.rows_per_tg,
+        K::ROWS_PER_TG,
         "{label}: handle.rows_per_tg={} but marker expects {}",
-        handle.rows_per_tg, K::ROWS_PER_TG,
+        handle.rows_per_tg,
+        K::ROWS_PER_TG,
     );
     assert_eq!(
-        handle.threads_per_tg, K::THREADS_PER_TG,
+        handle.threads_per_tg,
+        K::THREADS_PER_TG,
         "{label}: handle.threads_per_tg={} but marker expects {}",
-        handle.threads_per_tg, K::THREADS_PER_TG,
+        handle.threads_per_tg,
+        K::THREADS_PER_TG,
     );
 
     // Pipeline cap >= requested threads_per_tg. `KernelHandle::from_kernel`
@@ -74,9 +80,7 @@ fn assert_handle_matches_marker<K: TiledKernel>(handle: &KernelHandle, label: &s
 #[test]
 fn q4_pipelines_handle_contract() {
     let metal = get_metal();
-    assert_handle_matches_marker::<shaders::q4_matvec_v4::Kernel>(
-        &metal.q4.matvec, "q4.matvec",
-    );
+    assert_handle_matches_marker::<shaders::q4_matvec_v4::Kernel>(&metal.q4.matvec, "q4.matvec");
 }
 
 /// The K-format matvec family — Q4_K, Q6_K, Q8.
@@ -84,13 +88,16 @@ fn q4_pipelines_handle_contract() {
 fn k_matvec_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_matvec::Kernel>(
-        &metal.q4k_matvec_pipeline, "q4k_matvec_pipeline",
+        &metal.q4k_matvec_pipeline,
+        "q4k_matvec_pipeline",
     );
     assert_handle_matches_marker::<shaders::q6k_matvec::Kernel>(
-        &metal.q6k_matvec_pipeline, "q6k_matvec_pipeline",
+        &metal.q6k_matvec_pipeline,
+        "q6k_matvec_pipeline",
     );
     assert_handle_matches_marker::<shaders::q8_matvec::Kernel>(
-        &metal.q8_matvec_pipeline, "q8_matvec_pipeline",
+        &metal.q8_matvec_pipeline,
+        "q8_matvec_pipeline",
     );
 }
 
@@ -99,10 +106,12 @@ fn k_matvec_handle_contract() {
 fn ffn_gate_up_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_ffn_gate_up::Kernel>(
-        &metal.q4k_ffn_gate_up_pipeline, "q4k_ffn_gate_up_pipeline",
+        &metal.q4k_ffn_gate_up_pipeline,
+        "q4k_ffn_gate_up_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_ffn_gate_up::Kernel>(
-        &metal.q4kf_ffn_gate_up_pipeline, "q4kf_ffn_gate_up_pipeline",
+        &metal.q4kf_ffn_gate_up_pipeline,
+        "q4kf_ffn_gate_up_pipeline",
     );
 }
 
@@ -112,19 +121,24 @@ fn ffn_gate_up_handle_contract() {
 fn qkv_proj_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_qkv_proj::QkvKernel>(
-        &metal.q4k_qkv_proj_pipeline, "q4k_qkv_proj_pipeline",
+        &metal.q4k_qkv_proj_pipeline,
+        "q4k_qkv_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_qkv_proj::ProjKernel>(
-        &metal.q4k_proj_pipeline, "q4k_proj_pipeline",
+        &metal.q4k_proj_pipeline,
+        "q4k_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_qkv_proj::QkvKernel>(
-        &metal.q4kf_qkv_proj_pipeline, "q4kf_qkv_proj_pipeline",
+        &metal.q4kf_qkv_proj_pipeline,
+        "q4kf_qkv_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_qkv_proj::ProjKernel>(
-        &metal.q4kf_proj_pipeline, "q4kf_proj_pipeline",
+        &metal.q4kf_proj_pipeline,
+        "q4kf_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_q6k_qkv_proj::Kernel>(
-        &metal.q4k_q6k_qkv_proj_pipeline, "q4k_q6k_qkv_proj_pipeline",
+        &metal.q4k_q6k_qkv_proj_pipeline,
+        "q4k_q6k_qkv_proj_pipeline",
     );
 }
 
@@ -136,7 +150,8 @@ fn qkv_proj_handle_contract() {
 fn q8_qkv_proj_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q8_attn_proj::QkvKernel>(
-        &metal.q8_qkv_proj_pipeline, "q8_qkv_proj_pipeline",
+        &metal.q8_qkv_proj_pipeline,
+        "q8_qkv_proj_pipeline",
     );
 }
 
@@ -145,10 +160,12 @@ fn q8_qkv_proj_handle_contract() {
 fn geglu_down_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_geglu_down::SiluKernel>(
-        &metal.q4k_geglu_silu_down_pipeline, "q4k_geglu_silu_down_pipeline",
+        &metal.q4k_geglu_silu_down_pipeline,
+        "q4k_geglu_silu_down_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_geglu_down::GeluTanhKernel>(
-        &metal.q4k_geglu_gelu_tanh_down_pipeline, "q4k_geglu_gelu_tanh_down_pipeline",
+        &metal.q4k_geglu_gelu_tanh_down_pipeline,
+        "q4k_geglu_gelu_tanh_down_pipeline",
     );
 }
 
@@ -157,10 +174,12 @@ fn geglu_down_handle_contract() {
 fn gemv_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::f32_gemv::Kernel>(
-        &metal.f32_gemv_pipeline, "f32_gemv_pipeline",
+        &metal.f32_gemv_pipeline,
+        "f32_gemv_pipeline",
     );
     assert_handle_matches_marker::<shaders::f16_gemv::Kernel>(
-        &metal.f16_gemv_pipeline, "f16_gemv_pipeline",
+        &metal.f16_gemv_pipeline,
+        "f16_gemv_pipeline",
     );
 }
 
@@ -168,8 +187,8 @@ fn gemv_handle_contract() {
 /// equivalent in `test_correctness.rs::cpu_backend_capability_truth_table`.
 #[test]
 fn metal_backend_capability_truth_table() {
-    use larql_compute::Capability;
     use larql_compute::prelude::*;
+    use larql_compute::Capability;
 
     let metal = get_metal();
     // Metal accelerates everything in the menu — see
@@ -188,6 +207,9 @@ fn metal_backend_capability_truth_table() {
         Capability::PrefillQ4,
     ];
     for cap in all {
-        assert!(metal.supports(cap), "expected MetalBackend to support {cap:?}");
+        assert!(
+            metal.supports(cap),
+            "expected MetalBackend to support {cap:?}"
+        );
     }
 }

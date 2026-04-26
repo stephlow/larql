@@ -17,8 +17,8 @@ extern crate blas_src;
 
 fn main() {
     let _results = larql_compute::metal::diag::kernel_profile::profile_all(
-        34,  // n_layers
-        5,   // warmup iterations
-        50,  // measurement iterations
+        34, // n_layers
+        5,  // warmup iterations
+        50, // measurement iterations
     );
 }

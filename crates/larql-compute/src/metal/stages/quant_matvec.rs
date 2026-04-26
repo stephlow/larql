@@ -23,8 +23,8 @@
 //! multi-position prefill the caller loops over positions, passing
 //! `f32_in_off` / `out_off` in bytes.
 
-use std::ffi::c_void;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
+use std::ffi::c_void;
 
 use crate::metal::kernel::KernelHandle;
 

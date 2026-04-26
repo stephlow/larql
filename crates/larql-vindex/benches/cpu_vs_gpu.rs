@@ -69,10 +69,7 @@ fn bench_f32_gemv(c: &mut Criterion) {
         let q_slice = query.as_slice().unwrap();
 
         // CPU: matmul_transb against [1, hidden] × [features, hidden]^T.
-        let q_2d = query
-            .view()
-            .into_shape_with_order((1, hidden))
-            .unwrap();
+        let q_2d = query.view().into_shape_with_order((1, hidden)).unwrap();
         group.bench_with_input(
             BenchmarkId::new("cpu", name),
             &(gate.view(), q_2d),

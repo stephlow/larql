@@ -1,9 +1,9 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use kv_cache_benchmark::*;
+use kv_cache_benchmark::markov_residual::MarkovResidual;
 use kv_cache_benchmark::model_config::ModelConfig;
 use kv_cache_benchmark::standard_kv::StandardKv;
 use kv_cache_benchmark::turboquant::TurboQuant;
-use kv_cache_benchmark::markov_residual::MarkovResidual;
+use kv_cache_benchmark::*;
 use rand::prelude::*;
 
 fn bench_encode(c: &mut Criterion) {
@@ -43,7 +43,9 @@ fn bench_encode(c: &mut Criterion) {
 fn bench_wht(c: &mut Criterion) {
     let mut group = c.benchmark_group("wht");
     for dim in [128, 256] {
-        let x: Vec<f32> = (0..dim).map(|i| (i as f32 - dim as f32 / 2.0) / 100.0).collect();
+        let x: Vec<f32> = (0..dim)
+            .map(|i| (i as f32 - dim as f32 / 2.0) / 100.0)
+            .collect();
         group.bench_with_input(BenchmarkId::new("wht", dim), &x, |b, x| {
             b.iter(|| kv_cache_benchmark::turboquant::rotation::wht(x))
         });
@@ -70,13 +72,17 @@ fn bench_memory_sweep(c: &mut Criterion) {
 /// how much the correctness checks add to a real-model test run.
 fn bench_accuracy_metrics(c: &mut Criterion) {
     use larql_inference::engines::accuracy::{
-        cosine_similarity, mse, softmax, kl_divergence, js_divergence,
+        cosine_similarity, js_divergence, kl_divergence, mse, softmax,
     };
 
     let hidden = 2560usize; // Gemma 3 4B hidden_dim
     let mut rng = StdRng::seed_from_u64(99);
-    let a: Vec<f32> = (0..hidden).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
-    let b: Vec<f32> = (0..hidden).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
+    let a: Vec<f32> = (0..hidden)
+        .map(|_| rng.gen_range(-1.0f32..1.0f32))
+        .collect();
+    let b: Vec<f32> = (0..hidden)
+        .map(|_| rng.gen_range(-1.0f32..1.0f32))
+        .collect();
 
     let mut group = c.benchmark_group("accuracy");
     group.throughput(Throughput::Elements(hidden as u64));
@@ -84,9 +90,7 @@ fn bench_accuracy_metrics(c: &mut Criterion) {
     group.bench_function("cosine_similarity/2560", |bench| {
         bench.iter(|| cosine_similarity(&a, &b))
     });
-    group.bench_function("mse/2560", |bench| {
-        bench.iter(|| mse(&a, &b))
-    });
+    group.bench_function("mse/2560", |bench| bench.iter(|| mse(&a, &b)));
 
     // Softmax + KL on a 1K-token subset (fast enough for CI)
     let vocab = 1000usize;
@@ -96,9 +100,7 @@ fn bench_accuracy_metrics(c: &mut Criterion) {
     let q_sum: f32 = raw_q.iter().sum();
     let q: Vec<f32> = raw_q.iter().map(|x| x / q_sum).collect();
 
-    group.bench_function("softmax/1k_vocab", |bench| {
-        bench.iter(|| softmax(&logits))
-    });
+    group.bench_function("softmax/1k_vocab", |bench| bench.iter(|| softmax(&logits)));
     group.bench_function("kl_divergence/1k_vocab", |bench| {
         bench.iter(|| kl_divergence(&p, &q))
     });
@@ -124,14 +126,15 @@ fn bench_engine_kind(c: &mut Criterion) {
     });
     group.bench_function("build/markov_rs_W512", |b| {
         b.iter(|| {
-            EngineKind::MarkovResidual { window_size: Some(512) }
-                .build(larql_compute::cpu_backend())
+            EngineKind::MarkovResidual {
+                window_size: Some(512),
+            }
+            .build(larql_compute::cpu_backend())
         })
     });
     group.bench_function("build/unlimited_context_W512", |b| {
         b.iter(|| {
-            EngineKind::UnlimitedContext { window_size: 512 }
-                .build(larql_compute::cpu_backend())
+            EngineKind::UnlimitedContext { window_size: 512 }.build(larql_compute::cpu_backend())
         })
     });
 
@@ -185,7 +188,11 @@ fn bench_engine_memory_accounting(c: &mut Criterion) {
                     let markov_hot = window * layers * hidden * 4;
                     let markov_cold = seq_len.saturating_sub(window) * 4; // 4B/token cold
                     let markov_total = markov_hot + markov_cold;
-                    if markov_total > 0 { std_kv as f64 / markov_total as f64 } else { 0.0 }
+                    if markov_total > 0 {
+                        std_kv as f64 / markov_total as f64
+                    } else {
+                        0.0
+                    }
                 })
             },
         );

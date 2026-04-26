@@ -72,21 +72,17 @@ fn bench_gate_knn(c: &mut Criterion) {
 
         // Brute baseline (HNSW disabled — registry-routed brute path).
         index.disable_hnsw();
-        group.bench_with_input(
-            BenchmarkId::new("brute", label),
-            &index,
-            |b, idx| b.iter(|| idx.gate_knn(0, &query, 10)),
-        );
+        group.bench_with_input(BenchmarkId::new("brute", label), &index, |b, idx| {
+            b.iter(|| idx.gate_knn(0, &query, 10))
+        });
 
         // HNSW enabled. Build cost is one-shot — first query pays it.
         // Pre-warm so the bench measures steady-state search.
         index.enable_hnsw(200);
         let _warm = index.gate_knn(0, &query, 10);
-        group.bench_with_input(
-            BenchmarkId::new("hnsw", label),
-            &index,
-            |b, idx| b.iter(|| idx.gate_knn(0, &query, 10)),
-        );
+        group.bench_with_input(BenchmarkId::new("hnsw", label), &index, |b, idx| {
+            b.iter(|| idx.gate_knn(0, &query, 10))
+        });
 
         // Reset for the next config.
         index.disable_hnsw();
@@ -107,15 +103,19 @@ fn bench_hnsw_build(c: &mut Criterion) {
     ];
 
     for &(label, features, hidden) in configs {
-        group.bench_with_input(BenchmarkId::from_parameter(label), &(features, hidden), |b, &(f, h)| {
-            b.iter(|| {
-                let idx = build_index(f, h);
-                idx.enable_hnsw(200);
-                // Trigger lazy build.
-                let q = random_query(h);
-                let _ = idx.gate_knn(0, &q, 10);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(features, hidden),
+            |b, &(f, h)| {
+                b.iter(|| {
+                    let idx = build_index(f, h);
+                    idx.enable_hnsw(200);
+                    // Trigger lazy build.
+                    let q = random_query(h);
+                    let _ = idx.gate_knn(0, &q, 10);
+                });
+            },
+        );
     }
     group.finish();
 }

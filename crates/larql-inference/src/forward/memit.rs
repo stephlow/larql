@@ -21,9 +21,9 @@
 //! distribution across L8-L12 on v11 TinyStories 115M. See
 //! `experiments/15_v11_model/RESULTS.md §20`.
 
-use ndarray::{Array1, Array2};
-use crate::model::ModelWeights;
 use super::trace::{capture_ffn_activation_matrix, estimate_ffn_covariance};
+use crate::model::ModelWeights;
+use ndarray::{Array1, Array2};
 
 /// A single fact to be compiled via MEMIT.
 #[derive(Debug, Clone)]
@@ -284,14 +284,7 @@ fn run_memit_inner(
             }
         };
 
-        let result = memit_solve_layer(
-            weights,
-            layer_facts,
-            *layer,
-            &cov_tokens,
-            ridge,
-            layer_r,
-        )?;
+        let result = memit_solve_layer(weights, layer_facts, *layer, &cov_tokens, ridge, layer_r)?;
         results.push(result);
     }
 
@@ -365,7 +358,9 @@ fn memit_solve_layer(
     // Verify W_down exists at this layer (the delta will be added to it).
     let w_down_key = weights.arch.ffn_down_key(layer);
     if !weights.tensors.contains_key(&w_down_key) {
-        return Err(format!("MEMIT: W_down not found at layer {layer} (key: {w_down_key})"));
+        return Err(format!(
+            "MEMIT: W_down not found at layer {layer} (key: {w_down_key})"
+        ));
     }
 
     // ── Step 3+4: Compute R (deltas) and K matrices ──
@@ -496,9 +491,7 @@ mod tests {
         // by_layer is empty → run_memit_inner returns before touching the tokenizer.
         // Pass a real tokenizer so the test doesn't rely on pointer provenance.
         let tokenizer = make_test_tokenizer(weights.vocab_size);
-        let result = run_memit_inner(
-            &weights, &[], 1.0, RSource::EmbedShortcut(1.0), &tokenizer,
-        );
+        let result = run_memit_inner(&weights, &[], 1.0, RSource::EmbedShortcut(1.0), &tokenizer);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -515,7 +508,10 @@ mod tests {
             delta_w: delta.clone(),
             fact_results: vec![],
         };
-        assert_eq!(result.delta_w.shape(), &[weights.hidden_size, weights.intermediate_size]);
+        assert_eq!(
+            result.delta_w.shape(),
+            &[weights.hidden_size, weights.intermediate_size]
+        );
     }
 
     // ── Real-model MEMIT (requires LARQL_VINDEX_PATH + LARQL_TOKENIZER_PATH) ──
@@ -545,7 +541,13 @@ mod tests {
         let results = result.expect("MEMIT should succeed");
         assert!(!results.is_empty(), "should get at least one result");
         let r = &results[0];
-        assert_eq!(r.delta_w.shape(), &[weights.hidden_size, weights.intermediate_size]);
-        eprintln!("delta_w norm: {:.4}", r.delta_w.iter().map(|v| v * v).sum::<f32>().sqrt());
+        assert_eq!(
+            r.delta_w.shape(),
+            &[weights.hidden_size, weights.intermediate_size]
+        );
+        eprintln!(
+            "delta_w norm: {:.4}",
+            r.delta_w.iter().map(|v| v * v).sum::<f32>().sqrt()
+        );
     }
 }

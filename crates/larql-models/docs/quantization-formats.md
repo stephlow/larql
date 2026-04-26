@@ -34,9 +34,12 @@ let f32_vals = half::decode_f16(&f16_bytes);             // Vec<f32>
 let f32_vals = half::decode_bf16(&bf16_bytes);           // Vec<f32>
 ```
 
-## GGML Block Quantization (ggml.rs)
+## GGML Block Quantization (`quant/ggml/`)
 
-GGML uses block quantization: groups of 32 elements share a scale factor, reducing storage while preserving relative magnitudes within each block.
+GGML uses block quantization: groups of 32 or 256 elements share scale metadata,
+reducing storage while preserving relative magnitudes within each block. The
+loader currently dequantizes supported GGUF tensor types to f32 `ModelWeights`;
+the fused row operations documented here are available for compute-side use.
 
 ### Q4_0
 
@@ -130,7 +133,9 @@ let vals = q4_k::dequantize_q4_k(&bytes, num_elements)?;
 let vals = q6_k::dequantize_q6_k(&bytes, num_elements)?;
 ```
 
-On aarch64, `q4k_row_dot` and `q6k_row_dot` use NEON SIMD; other targets fall back to scalar.
+On aarch64, `q4k_row_dot` and `q6k_row_dot` use NEON SIMD; other targets fall
+back to scalar. Tests assert NEON and scalar parity, plus fused row-dot and
+scaled-add agreement with full dequantization.
 
 ### API
 
@@ -166,6 +171,10 @@ let name = ggml::type_name(ggml::TYPE_Q6_K);                // "Q6_K"
 | `TYPE_Q4_K` | 12 | Q4_K |
 | `TYPE_Q6_K` | 14 | Q6_K |
 | `TYPE_BF16` | 30 | BF16 |
+
+`TYPE_Q2_K`, `TYPE_Q3_K`, and `TYPE_Q5_K` names are recognized for diagnostics
+and sizing compatibility, but they are not dequantized yet; dispatch returns
+`ModelError::UnsupportedDtype` for unsupported GGML types.
 
 ## MXFP4 (mxfp4.rs)
 

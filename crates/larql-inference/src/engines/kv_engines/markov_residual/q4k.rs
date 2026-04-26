@@ -1,16 +1,16 @@
 //! Q4K helpers — attention dequantisation and WalkFfn-backed forward paths.
 
-use ndarray::Array2;
 use larql_compute::ComputeBackend;
 use larql_vindex::VectorIndex;
+use ndarray::Array2;
 
-use crate::model::ModelWeights;
-use crate::forward::{embed_tokens_pub, run_ffn};
-use crate::attention::run_attention_with_kv_backend;
-use crate::vindex::{WalkFfn, WalkFfnConfig};
-use crate::attention::SharedKV;
+use super::compute::{last_row, recompute_kv, RsPrefillResult};
 use super::store::RsStore;
-use super::compute::{recompute_kv, last_row, RsPrefillResult};
+use crate::attention::run_attention_with_kv_backend;
+use crate::attention::SharedKV;
+use crate::forward::{embed_tokens_pub, run_ffn};
+use crate::model::ModelWeights;
+use crate::vindex::{WalkFfn, WalkFfnConfig};
 
 /// Dequantise attention Q4K weights (Q, K, V, O) for all layers into
 /// `weights.tensors`. Idempotent — skips layers already present.
@@ -19,18 +19,22 @@ pub fn ensure_attn_tensors_dequantised(weights: &mut ModelWeights, index: &Vecto
     for layer in 0..num_layers {
         let arch = &*weights.arch;
         let q_key = arch.attn_q_key(layer);
-        if weights.tensors.contains_key(&q_key) { continue; }
-        let Some(attn) = index.attn_q4k_layer_data(layer) else { continue };
-        let num_q  = arch.num_q_heads_for_layer(layer);
+        if weights.tensors.contains_key(&q_key) {
+            continue;
+        }
+        let Some(attn) = index.attn_q4k_layer_data(layer) else {
+            continue;
+        };
+        let num_q = arch.num_q_heads_for_layer(layer);
         let num_kv = arch.num_kv_heads_for_layer(layer);
-        let hd     = arch.head_dim_for_layer(layer);
+        let hd = arch.head_dim_for_layer(layer);
         let hidden = weights.hidden_size;
-        let q_dim  = num_q * hd;
+        let q_dim = num_q * hd;
         let kv_dim = num_kv * hd;
         let k_key = arch.attn_k_key(layer);
         let v_key = arch.attn_v_key(layer);
         let o_key = arch.attn_o_key(layer);
-        let w_q = dequantize_matrix(attn[0].0, attn[0].1, q_dim,  hidden);
+        let w_q = dequantize_matrix(attn[0].0, attn[0].1, q_dim, hidden);
         let w_k = dequantize_matrix(attn[1].0, attn[1].1, kv_dim, hidden);
         let w_v = dequantize_matrix(attn[2].0, attn[2].1, kv_dim, hidden);
         let w_o = dequantize_matrix(attn[3].0, attn[3].1, hidden, q_dim);
@@ -46,9 +50,13 @@ fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Ar
     let padded = n.div_ceil(256) * 256;
     let info = larql_vindex::quant::registry::lookup(format)
         .unwrap_or_else(|| panic!("unsupported quant format: {format}"));
-    let floats = (info.dequantize)(bytes, padded)
-        .unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
-    let truncated = if floats.len() > n { floats[..n].to_vec() } else { floats };
+    let floats =
+        (info.dequantize)(bytes, padded).unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
+    let truncated = if floats.len() > n {
+        floats[..n].to_vec()
+    } else {
+        floats
+    };
     Array2::from_shape_vec((rows, cols), truncated).expect("shape mismatch")
 }
 
@@ -77,23 +85,36 @@ pub(super) fn rs_prefill_walk(
     }
 
     let mut rs = RsStore {
-        stored, cold_residuals: None, cold_kv: None,
-        cold_abs_start: 0, next_position: seq_len, max_window,
+        stored,
+        cold_residuals: None,
+        cold_kv: None,
+        cold_abs_start: 0,
+        next_position: seq_len,
+        max_window,
     };
     let mut cold: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-    for layer in 0..num_layers { rs.clip_layer(layer, &mut cold); }
+    for layer in 0..num_layers {
+        rs.clip_layer(layer, &mut cold);
+    }
     if cold.first().map_or(0, |c| c.shape()[0]) > 0 {
         let cold_kv: Vec<SharedKV> = (0..num_layers)
-            .map(|layer| recompute_kv(weights, &cold[layer], layer, 0, backend)
-                .expect("cold K/V pre-computation failed"))
+            .map(|layer| {
+                recompute_kv(weights, &cold[layer], layer, 0, backend)
+                    .expect("cold K/V pre-computation failed")
+            })
             .collect();
         rs.cold_residuals = Some(cold);
         rs.cold_kv = Some(cold_kv);
         rs.cold_abs_start = 0;
     }
     let window_tokens = rs.window_tokens();
-    let memory_bytes  = rs.memory_bytes();
-    RsPrefillResult { hidden: last_row(&h), store: rs, memory_bytes, window_tokens }
+    let memory_bytes = rs.memory_bytes();
+    RsPrefillResult {
+        hidden: last_row(&h),
+        store: rs,
+        memory_bytes,
+        window_tokens,
+    }
 }
 
 /// Decode step using `WalkFfn` (Q4K FFN).
@@ -106,7 +127,7 @@ pub(super) fn rs_decode_step_walk(
 ) -> Option<(Array2<f32>, RsStore)> {
     use ndarray::s;
 
-    let num_layers   = weights.num_layers;
+    let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
     let mut h_new = embed_tokens_pub(weights, &[new_token_id]);
     let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
@@ -147,7 +168,12 @@ pub(super) fn rs_decode_step_walk(
         new_stored.push(h_new.clone());
 
         let (h_post_attn, _new_kv) = crate::attention::run_attention_block_decode_step_backend(
-            weights, &h_new, layer, Some(&(k_full, v_full)), abs_position, Some(backend),
+            weights,
+            &h_new,
+            layer,
+            Some(&(k_full, v_full)),
+            abs_position,
+            Some(backend),
         )?;
         let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
             .with_backend(backend);
@@ -175,7 +201,9 @@ pub(super) fn rs_decode_step_walk(
     };
 
     let mut overflow: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-    for layer in 0..num_layers { updated_rs.clip_layer(layer, &mut overflow); }
+    for layer in 0..num_layers {
+        updated_rs.clip_layer(layer, &mut overflow);
+    }
     if overflow.first().map_or(0, |c| c.shape()[0]) > 0 {
         match updated_rs.cold_residuals.as_mut() {
             Some(cold) => {
@@ -189,7 +217,9 @@ pub(super) fn rs_decode_step_walk(
                     cold[layer] = merged;
                 }
             }
-            None => { updated_rs.cold_residuals = Some(overflow); }
+            None => {
+                updated_rs.cold_residuals = Some(overflow);
+            }
         }
         updated_rs.cold_kv = None;
     }

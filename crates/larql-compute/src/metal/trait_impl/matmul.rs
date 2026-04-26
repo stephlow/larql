@@ -1,24 +1,38 @@
 //! `MatMul` impl + private encoder helpers shared by `f32_gemv` and
 //! `f16_gemv` (threshold-gated and force variants).
 
-use std::sync::atomic::Ordering;
 use ndarray::{Array2, ArrayView2};
+use std::sync::atomic::Ordering;
 
 use crate::backend::{MatMul, MatMulOp};
 use crate::metal::MetalBackend;
 
 impl MatMul for MetalBackend {
     fn matmul(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
-        self.f32_ops.matmul(&self.queue, &self.bufs, a, b, self.flop_threshold.load(Ordering::Relaxed))
+        self.f32_ops.matmul(
+            &self.queue,
+            &self.bufs,
+            a,
+            b,
+            self.flop_threshold.load(Ordering::Relaxed),
+        )
     }
 
     fn matmul_transb(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
-        self.f32_ops.matmul_transb(&self.queue, &self.bufs, a, b, self.flop_threshold.load(Ordering::Relaxed))
+        self.f32_ops.matmul_transb(
+            &self.queue,
+            &self.bufs,
+            a,
+            b,
+            self.flop_threshold.load(Ordering::Relaxed),
+        )
     }
 
     fn f32_gemv(&self, w: ArrayView2<f32>, x: &[f32]) -> Option<Vec<f32>> {
         let (n, k) = (w.shape()[0], w.shape()[1]);
-        if x.len() != k { return None; }
+        if x.len() != k {
+            return None;
+        }
         // Fall back below the GPU threshold — small gemvs are dominated by
         // dispatch overhead.
         if 2 * n * k < self.flop_threshold.load(Ordering::Relaxed) {
@@ -29,18 +43,26 @@ impl MatMul for MetalBackend {
 
     fn f32_gemv_force(&self, w: ArrayView2<f32>, x: &[f32]) -> Option<Vec<f32>> {
         let (_n, k) = (w.shape()[0], w.shape()[1]);
-        if x.len() != k { return None; }
+        if x.len() != k {
+            return None;
+        }
         self.encode_f32_gemv(w, x)
     }
 
     fn f16_gemv(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
-        if w_f16.len() < n * k * 2 || x.len() != k { return None; }
-        if 2 * n * k < self.flop_threshold.load(Ordering::Relaxed) { return None; }
+        if w_f16.len() < n * k * 2 || x.len() != k {
+            return None;
+        }
+        if 2 * n * k < self.flop_threshold.load(Ordering::Relaxed) {
+            return None;
+        }
         self.encode_f16_gemv(w_f16, x, n, k)
     }
 
     fn f16_gemv_force(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
-        if w_f16.len() < n * k * 2 || x.len() != k { return None; }
+        if w_f16.len() < n * k * 2 || x.len() != k {
+            return None;
+        }
         self.encode_f16_gemv(w_f16, x, n, k)
     }
 
@@ -49,10 +71,15 @@ impl MatMul for MetalBackend {
     }
 
     fn matmul_batch(&self, ops: &[MatMulOp]) -> Vec<Array2<f32>> {
-        ops.iter().map(|op| {
-            if op.transpose_b { self.matmul_transb(op.a.view(), op.b.view()) }
-            else { self.matmul(op.a.view(), op.b.view()) }
-        }).collect()
+        ops.iter()
+            .map(|op| {
+                if op.transpose_b {
+                    self.matmul_transb(op.a.view(), op.b.view())
+                } else {
+                    self.matmul(op.a.view(), op.b.view())
+                }
+            })
+            .collect()
     }
 }
 
@@ -62,7 +89,9 @@ impl MetalBackend {
     /// Metal plumbing aren't duplicated.
     fn encode_f32_gemv(&self, w: ArrayView2<f32>, x: &[f32]) -> Option<Vec<f32>> {
         let (n, k) = (w.shape()[0], w.shape()[1]);
-        if x.len() != k { return None; }
+        if x.len() != k {
+            return None;
+        }
         let w_buf = match w.as_slice() {
             Some(s) => self.bufs.get_f32(s),
             None => {
@@ -108,7 +137,9 @@ impl MetalBackend {
     /// Saves ~0.33ms (1MB readback eliminated). Used by lm_head top-1 path.
     pub fn f32_gemv_topk1(&self, w: ArrayView2<f32>, x: &[f32]) -> Option<(u32, f32)> {
         let (n, k) = (w.shape()[0], w.shape()[1]);
-        if x.len() != k || n == 0 { return None; }
+        if x.len() != k || n == 0 {
+            return None;
+        }
 
         let w_buf = match w.as_slice() {
             Some(s) => self.bufs.get_f32(s),
@@ -117,7 +148,7 @@ impl MetalBackend {
                 self.bufs.transient_from_f32(owned.as_slice().unwrap())
             }
         };
-        let x_buf  = self.bufs.transient_from_f32(x);
+        let x_buf = self.bufs.transient_from_f32(x);
         let scores = self.bufs.output((n * 4) as u64);
 
         // Phase 1: f32_gemv
@@ -129,8 +160,8 @@ impl MetalBackend {
         // Phase 2: f32_argmax_partial — TG size = 256, one TG per 256 scores.
         const ARGMAX_TG_SZ: u64 = 256;
         let argmax_tgs = (n as u64).div_ceil(ARGMAX_TG_SZ);
-        let partial_vals = self.bufs.output(argmax_tgs * 4);  // f32 per TG
-        let partial_idxs = self.bufs.output(argmax_tgs * 4);  // u32 per TG
+        let partial_vals = self.bufs.output(argmax_tgs * 4); // f32 per TG
+        let partial_idxs = self.bufs.output(argmax_tgs * 4); // u32 per TG
         let argmax_tg_sz_u32 = ARGMAX_TG_SZ as u32;
 
         let cmd = self.queue.new_command_buffer();
@@ -171,13 +202,22 @@ impl MetalBackend {
             unsafe { std::slice::from_raw_parts(ptr, n_partials) }.to_vec()
         };
 
-        let (best_idx, best_val) = vals.iter().copied().enumerate()
+        let (best_idx, best_val) = vals
+            .iter()
+            .copied()
+            .enumerate()
             .filter(|(_, v)| v.is_finite())
             .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, v)| {
-                if v > bv { (i, v) } else { (bi, bv) }
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
             });
 
-        if best_val == f32::NEG_INFINITY { return None; }
+        if best_val == f32::NEG_INFINITY {
+            return None;
+        }
         Some((idxs_raw[best_idx], best_val))
     }
 

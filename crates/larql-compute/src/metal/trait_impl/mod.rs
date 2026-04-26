@@ -12,13 +12,17 @@ use super::*;
 use crate::backend::{Capability, ComputeBackend};
 
 impl ComputeBackend for MetalBackend {
-    fn name(&self) -> &str { "metal (GPU)" }
+    fn name(&self) -> &str {
+        "metal (GPU)"
+    }
 
     fn device_info(&self) -> String {
         format!("Metal GPU, FLOP threshold: {}", self.flop_threshold())
     }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn supports(&self, cap: Capability) -> bool {
         // Metal accelerates everything in the menu.

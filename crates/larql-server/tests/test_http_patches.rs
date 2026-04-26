@@ -64,7 +64,12 @@ async fn http_patches_list_after_apply_shows_patch() {
     let st = state(vec![model("test")]);
     // Apply the patch.
     let app1 = single_model_router(st.clone());
-    post_json(app1, "/v1/patches/apply", inline_delete_patch("visible-patch")).await;
+    post_json(
+        app1,
+        "/v1/patches/apply",
+        inline_delete_patch("visible-patch"),
+    )
+    .await;
     // List patches.
     let app2 = single_model_router(st.clone());
     let resp = get(app2, "/v1/patches").await;
@@ -99,8 +104,13 @@ async fn http_patches_session_apply_returns_session_field() {
     st.sessions.get_or_create("sid-abc", &m).await;
 
     let app = single_model_router(st);
-    let resp = post_json_h(app, "/v1/patches/apply",
-        inline_delete_patch("sess-patch"), ("x-session-id", "sid-abc")).await;
+    let resp = post_json_h(
+        app,
+        "/v1/patches/apply",
+        inline_delete_patch("sess-patch"),
+        ("x-session-id", "sid-abc"),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["session"], "sid-abc");
@@ -114,8 +124,13 @@ async fn http_patches_session_list_after_session_apply() {
     st.sessions.get_or_create("sid-list", &m).await;
 
     let app1 = single_model_router(st.clone());
-    post_json_h(app1, "/v1/patches/apply",
-        inline_delete_patch("session-visible"), ("x-session-id", "sid-list")).await;
+    post_json_h(
+        app1,
+        "/v1/patches/apply",
+        inline_delete_patch("session-visible"),
+        ("x-session-id", "sid-list"),
+    )
+    .await;
     let app2 = single_model_router(st.clone());
     let resp = get_h(app2, "/v1/patches", ("x-session-id", "sid-list")).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -128,7 +143,11 @@ async fn http_patches_session_list_after_session_apply() {
 #[tokio::test]
 async fn http_patches_multi_model_apply_not_found_returns_404() {
     let app = multi_model_router(state(vec![model("a")]));
-    let resp = post_json(app, "/v1/nosuchmodel/patches/apply",
-        inline_delete_patch("p")).await;
+    let resp = post_json(
+        app,
+        "/v1/nosuchmodel/patches/apply",
+        inline_delete_patch("p"),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

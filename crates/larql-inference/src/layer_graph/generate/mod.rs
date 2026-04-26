@@ -1,13 +1,13 @@
 //! Token generation — GPU and CPU paths.
 
-mod types;
-mod lm_head;
 mod cpu;
 mod gpu;
+mod lm_head;
+mod types;
 
-pub use types::{StageTimings, GenerateResult};
-pub use lm_head::lm_head_topk;
 pub use gpu::{generate, generate_constrained};
+pub use lm_head::lm_head_topk;
+pub use types::{GenerateResult, StageTimings};
 
 #[cfg(test)]
 mod tests {
@@ -22,8 +22,15 @@ mod tests {
         let weights = make_test_weights();
         let q = ndarray::Array1::from_elem(weights.hidden_size, 0.1f32);
         let scores = lm_head::backend_lm_head_scores(&weights, &q, &larql_compute::CpuBackend);
-        assert_eq!(scores.len(), weights.vocab_size, "scores length should be vocab_size");
-        assert!(scores.iter().all(|v| v.is_finite()), "scores should be finite");
+        assert_eq!(
+            scores.len(),
+            weights.vocab_size,
+            "scores length should be vocab_size"
+        );
+        assert!(
+            scores.iter().all(|v| v.is_finite()),
+            "scores should be finite"
+        );
     }
 
     #[test]
@@ -40,12 +47,18 @@ mod tests {
         let weights = make_test_weights();
         let q = ndarray::Array1::from_shape_vec(
             weights.hidden_size,
-            (0..weights.hidden_size).map(|i| i as f32 * 0.01).collect()
-        ).unwrap();
+            (0..weights.hidden_size).map(|i| i as f32 * 0.01).collect(),
+        )
+        .unwrap();
         let hits = lm_head::cpu_lm_head_topk(&weights, &q, 4);
         let scores: Vec<f32> = hits.iter().map(|(_, s)| *s).collect();
         for w in scores.windows(2) {
-            assert!(w[0] >= w[1], "top-k should be sorted descending: {} >= {}", w[0], w[1]);
+            assert!(
+                w[0] >= w[1],
+                "top-k should be sorted descending: {} >= {}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -55,8 +68,11 @@ mod tests {
         let q = ndarray::Array1::zeros(weights.hidden_size);
         let hits = lm_head::cpu_lm_head_topk(&weights, &q, 3);
         for (id, _) in &hits {
-            assert!(*id < weights.vocab_size as u32,
-                "token id {id} should be < vocab_size {}", weights.vocab_size);
+            assert!(
+                *id < weights.vocab_size as u32,
+                "token id {id} should be < vocab_size {}",
+                weights.vocab_size
+            );
         }
     }
 
@@ -80,42 +96,71 @@ mod tests {
     #[test]
     #[ignore = "requires LARQL_VINDEX_PATH pointing to a Q4K vindex"]
     fn generate_returns_tokens() {
-        let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
-        let tokenizer = larql_vindex::load_vindex_tokenizer(
-            std::path::Path::new(&std::env::var("LARQL_VINDEX_PATH").unwrap())
-        ).expect("tokenizer load failed");
+        let (index, mut weights) =
+            load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
+        let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
+            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+        ))
+        .expect("tokenizer load failed");
 
         let prompt = "The capital of France is";
-        let token_ids = crate::encode_prompt(&tokenizer, &*weights.arch, prompt)
-            .expect("tokenize failed");
+        let token_ids =
+            crate::encode_prompt(&tokenizer, &*weights.arch, prompt).expect("tokenize failed");
 
         let backend = larql_compute::default_backend();
         let cached = CachedLayerGraph::from_residuals(vec![]);
         let num_layers = weights.num_layers;
         let result = generate(
-            &mut weights, &tokenizer, &token_ids, 5,
-            &index, backend.as_ref(), &cached, 0..num_layers,
+            &mut weights,
+            &tokenizer,
+            &token_ids,
+            5,
+            &index,
+            backend.as_ref(),
+            &cached,
+            0..num_layers,
         );
 
-        assert!(!result.tokens.is_empty(), "should generate at least one token");
-        eprintln!("Generated: {:?}", result.tokens.iter().map(|(t, _)| t).collect::<Vec<_>>());
+        assert!(
+            !result.tokens.is_empty(),
+            "should generate at least one token"
+        );
+        eprintln!(
+            "Generated: {:?}",
+            result.tokens.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     #[ignore = "requires LARQL_VINDEX_PATH"]
     fn generate_prefill_ms_positive() {
         let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set");
-        let tokenizer = larql_vindex::load_vindex_tokenizer(
-            std::path::Path::new(&std::env::var("LARQL_VINDEX_PATH").unwrap())
-        ).unwrap();
+        let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
+            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+        ))
+        .unwrap();
         let prompt = "Hello";
         let token_ids = crate::encode_prompt(&tokenizer, &*weights.arch, prompt).unwrap();
         let backend = larql_compute::default_backend();
         let cached = CachedLayerGraph::from_residuals(vec![]);
         let num_layers = weights.num_layers;
-        let result = generate(&mut weights, &tokenizer, &token_ids, 1,
-            &index, backend.as_ref(), &cached, 0..num_layers);
-        assert!(result.prefill_ms > 0.0, "prefill_ms should be positive (timing was recorded)");
-        assert_eq!(result.decode_ms.len(), result.tokens.len().saturating_sub(1));
+        let result = generate(
+            &mut weights,
+            &tokenizer,
+            &token_ids,
+            1,
+            &index,
+            backend.as_ref(),
+            &cached,
+            0..num_layers,
+        );
+        assert!(
+            result.prefill_ms > 0.0,
+            "prefill_ms should be positive (timing was recorded)"
+        );
+        assert_eq!(
+            result.decode_ms.len(),
+            result.tokens.len().saturating_sub(1)
+        );
     }
 }

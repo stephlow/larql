@@ -36,10 +36,13 @@ impl Gemma4Arch {
 
         // Determine global layers from explicit layer_types or pattern
         let global_layers: Vec<bool> = if let Some(ref types) = config.layer_types {
-            types.iter().map(|t| t == LAYER_TYPE_FULL).collect()
+            (0..num_layers)
+                .map(|layer| types.get(layer).is_some_and(|t| t == LAYER_TYPE_FULL))
+                .collect()
         } else {
             let pattern = config
                 .sliding_window_pattern
+                .filter(|&pattern| pattern > 0)
                 .unwrap_or(DEFAULT_SLIDING_WINDOW_PATTERN);
             (0..num_layers)
                 .map(|layer| (layer + 1) % pattern == 0)

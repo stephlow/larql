@@ -38,27 +38,27 @@
 
 use ndarray::Array2;
 
-use larql_compute::prelude::*;
-use crate::ffn::FfnBackend;
 use crate::ffn::sparse_compute::sparse_ffn_forward;
+use crate::ffn::FfnBackend;
 use crate::model::ModelWeights;
 use crate::vindex::l1_cache::FfnL1Cache;
 use crate::vindex::walk_config::WalkFfnConfig;
+use larql_compute::prelude::*;
 
 use larql_vindex::{GateIndex, WalkHit, WalkTrace};
 
-mod helpers;
-mod sparse;
-mod interleaved_q4;
-mod interleaved;
-mod full_mmap;
-mod interleaved_q4k;
 mod exact;
+mod full_mmap;
+mod helpers;
+mod interleaved;
+mod interleaved_q4;
+mod interleaved_q4k;
+mod sparse;
 
 #[cfg(test)]
 mod routing_tests;
 
-pub use helpers::{DispatchEntry, TRACE_NAMES};
+pub use helpers::DispatchEntry;
 
 pub struct WalkFfn<'a> {
     pub weights: &'a ModelWeights,
@@ -81,7 +81,10 @@ impl<'a> WalkFfn<'a> {
         config: WalkFfnConfig,
     ) -> Self {
         Self {
-            weights, index, config, backend: None,
+            weights,
+            index,
+            config,
+            backend: None,
             trace_residuals: std::cell::RefCell::new(Vec::new()),
             record_trace: false,
             l1_cache: None,
@@ -151,7 +154,9 @@ thread_local! {
 
 fn walk_trace_env_enabled() -> bool {
     WALK_TRACE_ENABLED.with(|c| {
-        if let Some(v) = c.get() { return v; }
+        if let Some(v) = c.get() {
+            return v;
+        }
         let enabled = std::env::var("LARQL_WALK_TRACE").ok().as_deref() == Some("1");
         c.set(Some(enabled));
         enabled
@@ -159,7 +164,6 @@ fn walk_trace_env_enabled() -> bool {
 }
 
 impl<'a> WalkFfn<'a> {
-
     fn top_k_for(&self, layer: usize) -> usize {
         self.config.k_for(layer).unwrap_or(usize::MAX)
     }
@@ -196,14 +200,15 @@ impl<'a> WalkFfn<'a> {
         Self::new_unlimited(weights, index).with_backend(backend)
     }
 
-    pub fn new_with_trace(weights: &'a ModelWeights, index: &'a dyn GateIndex, top_k: usize) -> Self {
+    pub fn new_with_trace(
+        weights: &'a ModelWeights,
+        index: &'a dyn GateIndex,
+        top_k: usize,
+    ) -> Self {
         Self::new(weights, index, top_k).with_trace()
     }
 
-    pub fn new_unlimited_with_trace(
-        weights: &'a ModelWeights,
-        index: &'a dyn GateIndex,
-    ) -> Self {
+    pub fn new_unlimited_with_trace(weights: &'a ModelWeights, index: &'a dyn GateIndex) -> Self {
         Self::new_unlimited(weights, index).with_trace()
     }
 
@@ -212,7 +217,11 @@ impl<'a> WalkFfn<'a> {
     }
 
     pub fn take_trace(&self) -> WalkTrace {
-        let residuals = self.trace_residuals.borrow_mut().drain(..).collect::<Vec<_>>();
+        let residuals = self
+            .trace_residuals
+            .borrow_mut()
+            .drain(..)
+            .collect::<Vec<_>>();
         let mut layers = Vec::with_capacity(residuals.len());
         for (layer, residual) in residuals {
             let r = ndarray::Array1::from_vec(residual);
@@ -221,7 +230,12 @@ impl<'a> WalkFfn<'a> {
                 .into_iter()
                 .filter_map(|(feature, gate_score)| {
                     let meta = self.index.feature_meta(layer, feature)?.clone();
-                    Some(WalkHit { layer, feature, gate_score, meta })
+                    Some(WalkHit {
+                        layer,
+                        feature,
+                        gate_score,
+                        meta,
+                    })
                 })
                 .collect();
             layers.push((layer, walk_hits));
@@ -235,15 +249,13 @@ impl<'a> FfnBackend for WalkFfn<'a> {
         self.forward_with_activation(layer, x).0
     }
 
-    fn forward_with_activation(
-        &self,
-        layer: usize,
-        x: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>) {
+    fn forward_with_activation(&self, layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         let num_features = self.index.num_features(layer);
         if num_features == 0 {
             self.trace_path(layer, "zero_features_dense");
-            let dense_ffn = crate::ffn::WeightFfn { weights: self.weights };
+            let dense_ffn = crate::ffn::WeightFfn {
+                weights: self.weights,
+            };
             return dense_ffn.forward_with_activation(layer, x);
         }
 
@@ -287,7 +299,8 @@ impl<'a> FfnBackend for WalkFfn<'a> {
                 if let Some(cached) = cache.get(layer, key) {
                     let hidden = x.shape()[1];
                     let mut out = Array2::<f32>::zeros((1, hidden));
-                    out.row_mut(0).assign(&ndarray::ArrayView1::from(cached.as_slice()));
+                    out.row_mut(0)
+                        .assign(&ndarray::ArrayView1::from(cached.as_slice()));
                     self.trace_path(layer, "l1_cache_hit");
                     return (out, Array2::zeros((1, num_features)));
                 }
@@ -373,7 +386,11 @@ impl<'a> FfnBackend for WalkFfn<'a> {
                     .collect();
                 self.trace_path(layer, "weights_fallback:override");
                 break 'routing crate::ffn::sparse_ffn_forward_with_full_overrides(
-                    self.weights, layer, x, &features, &slot_overrides,
+                    self.weights,
+                    layer,
+                    x,
+                    &features,
+                    &slot_overrides,
                 );
             }
             self.trace_path(layer, "weights_fallback:sparse");
@@ -397,11 +414,11 @@ impl<'a> FfnBackend for WalkFfn<'a> {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use ndarray::{Array1, Array2};
-    use larql_vindex::{GateIndex, FeatureMeta, WalkHit, WalkTrace};
-    use std::sync::OnceLock;
     use crate::engines::test_utils::make_test_weights;
     use crate::model::ModelWeights;
+    use larql_vindex::{FeatureMeta, GateIndex, WalkHit, WalkTrace};
+    use ndarray::{Array1, Array2};
+    use std::sync::OnceLock;
 
     fn shared_weights() -> &'static ModelWeights {
         static W: OnceLock<ModelWeights> = OnceLock::new();
@@ -418,23 +435,37 @@ mod dispatch_tests {
     }
 
     impl GateIndex for MockGateIndex {
-        fn gate_knn(&self, _layer: usize, _residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
+        fn gate_knn(
+            &self,
+            _layer: usize,
+            _residual: &Array1<f32>,
+            top_k: usize,
+        ) -> Vec<(usize, f32)> {
             (0..top_k.min(self.n_features))
                 .map(|i| (i, 1.0 / (i as f32 + 1.0)))
                 .collect()
         }
-        fn feature_meta(&self, _layer: usize, _feature: usize) -> Option<FeatureMeta> { None }
-        fn num_features(&self, _layer: usize) -> usize { self.n_features }
+        fn feature_meta(&self, _layer: usize, _feature: usize) -> Option<FeatureMeta> {
+            None
+        }
+        fn num_features(&self, _layer: usize) -> usize {
+            self.n_features
+        }
     }
 
     fn mock_index(weights: &ModelWeights) -> MockGateIndex {
-        MockGateIndex { n_features: weights.intermediate_size, hidden: weights.hidden_size }
+        MockGateIndex {
+            n_features: weights.intermediate_size,
+            hidden: weights.hidden_size,
+        }
     }
 
     fn input(seq: usize, hidden: usize) -> Array2<f32> {
-        Array2::from_shape_vec((seq, hidden),
-            (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect()
-        ).unwrap()
+        Array2::from_shape_vec(
+            (seq, hidden),
+            (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect(),
+        )
+        .unwrap()
     }
 
     // ── WalkFfn construction ──────────────────────────────────────────────────
@@ -486,8 +517,15 @@ mod dispatch_tests {
         let x = input(1, weights.hidden_size);
         for layer in 0..weights.num_layers {
             let out = ffn.forward(layer, &x);
-            assert_eq!(out.shape(), &[1, weights.hidden_size], "layer {layer} wrong shape");
-            assert!(out.iter().all(|v| v.is_finite()), "layer {layer} non-finite");
+            assert_eq!(
+                out.shape(),
+                &[1, weights.hidden_size],
+                "layer {layer} wrong shape"
+            );
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "layer {layer} non-finite"
+            );
         }
     }
 
@@ -496,7 +534,7 @@ mod dispatch_tests {
         let weights = shared_weights();
         let idx = mock_index(&weights);
         let ffn_sparse = WalkFfn::new(&weights, &idx, 4);
-        let ffn_dense  = WalkFfn::new_unlimited(&weights, &idx);
+        let ffn_dense = WalkFfn::new_unlimited(&weights, &idx);
         let x = input(1, weights.hidden_size);
         let out_s = ffn_sparse.forward(0, &x);
         let out_d = ffn_dense.forward(0, &x);
@@ -518,7 +556,10 @@ mod dispatch_tests {
     fn walk_ffn_zero_features_falls_back_to_weight_ffn() {
         // When MockGateIndex returns 0 features, WalkFfn should fall back to WeightFfn.
         let weights = shared_weights();
-        let zero_idx = MockGateIndex { n_features: 0, hidden: weights.hidden_size };
+        let zero_idx = MockGateIndex {
+            n_features: 0,
+            hidden: weights.hidden_size,
+        };
         let ffn = WalkFfn::new_unlimited(&weights, &zero_idx);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);

@@ -12,8 +12,8 @@
 //!     8. Post-FFN norm (if post_norms) + residual_add(h, ffn_out) → h
 //!     9. Q8 quantize h → next layer
 
-use std::ffi::c_void;
 use metal::*;
+use std::ffi::c_void;
 
 use crate::metal::buffers::BufferCache;
 use crate::metal::ops::q4_common::Q4Pipelines;
@@ -50,7 +50,10 @@ pub fn encode_rms_norm(
     enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
     enc.set_bytes(5, 4, &offset as *const f32 as *const c_void);
     // Single threadgroup — cooperative SIMD reduction requires all threads in one TG.
-    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(len as u64), 1, 1));
+    enc.dispatch_thread_groups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(256.min(len as u64), 1, 1),
+    );
 }
 
 pub fn encode_residual_add(
@@ -67,7 +70,10 @@ pub fn encode_residual_add(
     enc.set_buffer(1, Some(buf_b), 0);
     enc.set_buffer(2, Some(buf_out), 0);
     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
-    enc.dispatch_threads(MTLSize::new(len as u64, 1, 1), MTLSize::new(256.min(len as u64), 1, 1));
+    enc.dispatch_threads(
+        MTLSize::new(len as u64, 1, 1),
+        MTLSize::new(256.min(len as u64), 1, 1),
+    );
 }
 
 /// Q4_0 matvec with explicit input/output offsets (bytes).
@@ -155,9 +161,7 @@ pub fn dispatch_full_pipeline(
     // See `LayerBuffers::allocate` for the sizing rationale (Gemma 4
     // mixed sliding/global geometry, Q8 staging shared between the
     // attention-input and O-projection paths, etc.).
-    let lb = super::buffers::LayerBuffers::allocate(
-        bufs, layers, x, hidden, inter, seq_len, q_dim,
-    );
+    let lb = super::buffers::LayerBuffers::allocate(bufs, layers, x, hidden, inter, seq_len, q_dim);
     // Local aliases to keep the orchestration body readable. Using
     // shared references means the body's existing `wq_bufs[l]` etc.
     // resolve through `Vec<Buffer>` indexing unchanged.
@@ -165,31 +169,31 @@ pub fn dispatch_full_pipeline(
     // input-norm + QKV stage helper (`stages::encode_input_norm_and_qkv`)
     // — the helper reads them off `lb` directly. The rest of the body
     // only needs `wo` (for o_proj).
-    let wo_bufs        = &lb.wo;
-    let gate_bufs      = &lb.gate;
-    let up_bufs        = &lb.up;
-    let down_bufs      = &lb.down;
+    let wo_bufs = &lb.wo;
+    let gate_bufs = &lb.gate;
+    let up_bufs = &lb.up;
+    let down_bufs = &lb.down;
     let post_attn_norm_bufs = &lb.post_attn_norm;
-    let pre_ffn_norm_bufs  = &lb.pre_ffn_norm;
+    let pre_ffn_norm_bufs = &lb.pre_ffn_norm;
     let post_ffn_norm_bufs = &lb.post_ffn_norm;
-    let h_bufs         = &lb.h;
-    let q_outs         = &lb.q_out;
-    let k_outs         = &lb.k_out;
-    let v_outs         = &lb.v_out;
-    let attn_outs      = &lb.attn_out;
-    let o_outs         = &lb.o_out;
-    let h_post_attns   = &lb.h_post_attn;
-    let ffn_norm_outs  = &lb.ffn_norm_out;
-    let gate_outs      = &lb.gate_out;
-    let up_outs        = &lb.up_out;
-    let act_bufs_vec   = &lb.act_buf;
-    let down_outs      = &lb.down_out;
-    let q8_bufs        = &lb.q8;
-    let q8s_bufs       = &lb.q8s;
-    let ffn_q8_bufs    = &lb.ffn_q8;
-    let ffn_q8s_bufs   = &lb.ffn_q8s;
-    let q8_row_max     = lb.q8_row_max;
-    let q8s_row_bytes  = lb.q8s_row_bytes;
+    let h_bufs = &lb.h;
+    let q_outs = &lb.q_out;
+    let k_outs = &lb.k_out;
+    let v_outs = &lb.v_out;
+    let attn_outs = &lb.attn_out;
+    let o_outs = &lb.o_out;
+    let h_post_attns = &lb.h_post_attn;
+    let ffn_norm_outs = &lb.ffn_norm_out;
+    let gate_outs = &lb.gate_out;
+    let up_outs = &lb.up_out;
+    let act_bufs_vec = &lb.act_buf;
+    let down_outs = &lb.down_out;
+    let q8_bufs = &lb.q8;
+    let q8s_bufs = &lb.q8s;
+    let ffn_q8_bufs = &lb.ffn_q8;
+    let ffn_q8s_bufs = &lb.ffn_q8s;
+    let q8_row_max = lb.q8_row_max;
+    let q8s_row_bytes = lb.q8s_row_bytes;
 
     // Per-layer GPU commit mode: used for hybrid MoE models where the CPU
     // expert block runs after each layer's dense FFN. When active, we commit
@@ -233,11 +237,17 @@ pub fn dispatch_full_pipeline(
         };
         super::stages::encode_input_norm_and_qkv(
             cmd.as_ref(),
-            &layers[l], l, seq_len, hidden,
+            &layers[l],
+            l,
+            seq_len,
+            hidden,
             &super::stages::LayerCtx {
-                eps, norm_offset,
-                layer_q_dim, layer_kv_dim,
-                q8_row_max, q8s_row_bytes,
+                eps,
+                norm_offset,
+                layer_q_dim,
+                layer_kv_dim,
+                q8_row_max,
+                q8s_row_bytes,
             },
             &super::stages::InputNormQkvPipes {
                 rms_norm: rms_norm_pipeline,
@@ -266,9 +276,14 @@ pub fn dispatch_full_pipeline(
                 let ones_buf = bufs.transient_from_f32(&ones);
                 let enc = cmd.new_compute_command_encoder();
                 crate::metal::stages::qk_norm::encode_v_norm(
-                    enc, qk_norm_pipe,
-                    &v_outs[l], &ones_buf,
-                    seq_len, layer_num_kv_heads, layer_head_dim, eps,
+                    enc,
+                    qk_norm_pipe,
+                    &v_outs[l],
+                    &ones_buf,
+                    seq_len,
+                    layer_num_kv_heads,
+                    layer_head_dim,
+                    eps,
                 );
                 enc.end_encoding();
             }
@@ -276,24 +291,39 @@ pub fn dispatch_full_pipeline(
 
         // Stage dump: Q just after QKV projection, before QK-norm.
         cmd = super::dump::dump_layer0_q_after_stage(
-            dump_path.as_deref(), queue, cmd, &lb, "raw",
-            seq_len, layer_q_dim, l,
+            dump_path.as_deref(),
+            queue,
+            cmd,
+            &lb,
+            "raw",
+            seq_len,
+            layer_q_dim,
+            l,
         );
 
         // ── 3a. QK-norm on Q and K (pre-RoPE). Gemma 3 / Gemma 4. ──
         let applied_prerope_qk_norm = if use_qk_norm {
-            if let (Some(qk_norm_pipe), Some(q_w_slice), Some(k_w_slice)) =
-                (qk_norm_pipeline, layers[l].q_norm_weight, layers[l].k_norm_weight)
-            {
+            if let (Some(qk_norm_pipe), Some(q_w_slice), Some(k_w_slice)) = (
+                qk_norm_pipeline,
+                layers[l].q_norm_weight,
+                layers[l].k_norm_weight,
+            ) {
                 let q_w_buf = bufs.get_f32(q_w_slice);
                 let k_w_buf = bufs.get_f32(k_w_slice);
                 let enc = cmd.new_compute_command_encoder();
                 crate::metal::stages::qk_norm::encode_qk_norm(
-                    enc, qk_norm_pipe,
-                    &q_outs[l], &q_w_buf,
-                    &k_outs[l], &k_w_buf,
-                    seq_len, layer_num_q_heads, layer_num_kv_heads, layer_head_dim,
-                    eps, layers[l].qk_norm_offset,
+                    enc,
+                    qk_norm_pipe,
+                    &q_outs[l],
+                    &q_w_buf,
+                    &k_outs[l],
+                    &k_w_buf,
+                    seq_len,
+                    layer_num_q_heads,
+                    layer_num_kv_heads,
+                    layer_head_dim,
+                    eps,
+                    layers[l].qk_norm_offset,
                 );
                 enc.end_encoding();
                 true
@@ -308,8 +338,14 @@ pub fn dispatch_full_pipeline(
 
         // Stage dump: Q after QK-norm, before RoPE.
         cmd = super::dump::dump_layer0_q_after_stage(
-            dump_path.as_deref(), queue, cmd, &lb, "after_qk_norm",
-            seq_len, layer_q_dim, l,
+            dump_path.as_deref(),
+            queue,
+            cmd,
+            &lb,
+            "after_qk_norm",
+            seq_len,
+            layer_q_dim,
+            l,
         );
 
         // ── 3b. Apply RoPE separately when populating KV cache ──
@@ -317,10 +353,16 @@ pub fn dispatch_full_pipeline(
         if use_separate_rope {
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::rope::encode(
-                enc, rope_at_pos_pipeline.unwrap(),
-                &q_outs[l], &k_outs[l],
-                seq_len, layer_num_q_heads, layer_num_kv_heads, layer_head_dim,
-                layers[l].rotary_dim, layer_rope_base,
+                enc,
+                rope_at_pos_pipeline.unwrap(),
+                &q_outs[l],
+                &k_outs[l],
+                seq_len,
+                layer_num_q_heads,
+                layer_num_kv_heads,
+                layer_head_dim,
+                layers[l].rotary_dim,
+                layer_rope_base,
             );
             enc.end_encoding();
         }
@@ -329,10 +371,18 @@ pub fn dispatch_full_pipeline(
         if let Some(fused_pipeline) = fused_attn_pipeline {
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::attention::encode(
-                enc, fused_pipeline,
-                &q_outs[l], &k_outs[l], &v_outs[l], &attn_outs[l],
-                seq_len, layer_num_q_heads, layer_num_kv_heads, layer_head_dim,
-                layer_attn_scale, layer_rope_base,
+                enc,
+                fused_pipeline,
+                &q_outs[l],
+                &k_outs[l],
+                &v_outs[l],
+                &attn_outs[l],
+                seq_len,
+                layer_num_q_heads,
+                layer_num_kv_heads,
+                layer_head_dim,
+                layer_attn_scale,
+                layer_rope_base,
                 crate::metal::stages::attention::Flags {
                     // Caller pre-applied QK-norm: tell shader to skip its internal
                     // normalisation so we don't double-normalise.
@@ -349,14 +399,21 @@ pub fn dispatch_full_pipeline(
         for pos in 0..seq_len {
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::o_proj::encode(
-                enc, &qm_pipes, q8_quant_pipeline,
+                enc,
+                &qm_pipes,
+                q8_quant_pipeline,
                 layers[l].wo.format,
                 &wo_bufs[l],
-                &attn_outs[l], q_off(pos),
-                &q8_bufs[l], q8_off(pos),
-                &q8s_bufs[l], q8s_off(pos),
-                &o_outs[l], h_off(pos),
-                layer_q_dim, hidden,
+                &attn_outs[l],
+                q_off(pos),
+                &q8_bufs[l],
+                q8_off(pos),
+                &q8s_bufs[l],
+                q8s_off(pos),
+                &o_outs[l],
+                h_off(pos),
+                layer_q_dim,
+                hidden,
             );
             enc.end_encoding();
         }
@@ -371,10 +428,14 @@ pub fn dispatch_full_pipeline(
         // `h_post_attns[l]` holds the post-residual f32 hidden state for the
         // final residual add at the end of this layer (step 10).
         let ffn_format = layers[l].gate.format;
-        let ffn_needs_q8 = matches!(ffn_format,
-            crate::QuantFormat::Q4_0 | crate::QuantFormat::Q8_0);
+        let ffn_needs_q8 = matches!(
+            ffn_format,
+            crate::QuantFormat::Q4_0 | crate::QuantFormat::Q8_0
+        );
         let pre_ffn_weight_buf: &metal::Buffer = if has_post_norms {
-            pre_ffn_norm_bufs[l].as_ref().unwrap_or(&post_attn_norm_bufs[l])
+            pre_ffn_norm_bufs[l]
+                .as_ref()
+                .unwrap_or(&post_attn_norm_bufs[l])
         } else {
             &post_attn_norm_bufs[l]
         };
@@ -382,13 +443,25 @@ pub fn dispatch_full_pipeline(
             let mut scratch = |bytes: u64| bufs.output(bytes);
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::residual::encode_post_attn(
-                enc, rms_norm_pipeline, residual_add_pipeline, q8_quant_pipeline,
+                enc,
+                rms_norm_pipeline,
+                residual_add_pipeline,
+                q8_quant_pipeline,
                 &mut scratch,
-                &h_bufs[l], &o_outs[l], &h_post_attns[l], &ffn_norm_outs[l],
-                &post_attn_norm_bufs[l], pre_ffn_weight_buf,
-                &ffn_q8_bufs[l], &ffn_q8s_bufs[l],
-                seq_len, hidden, eps, norm_offset,
-                has_post_norms, ffn_needs_q8,
+                &h_bufs[l],
+                &o_outs[l],
+                &h_post_attns[l],
+                &ffn_norm_outs[l],
+                &post_attn_norm_bufs[l],
+                pre_ffn_weight_buf,
+                &ffn_q8_bufs[l],
+                &ffn_q8s_bufs[l],
+                seq_len,
+                hidden,
+                eps,
+                norm_offset,
+                has_post_norms,
+                ffn_needs_q8,
                 (hidden * 4) as u64,
                 hidden as u64,
                 (hidden.div_ceil(32) * 4) as u64,
@@ -411,29 +484,62 @@ pub fn dispatch_full_pipeline(
             let enc = cmd.new_compute_command_encoder();
             if layers[l].ffn_type == crate::FfnType::Standard {
                 ffn::encode_standard(
-                    enc, &qm_pipes, silu_pipeline, gelu_tanh_pipeline,
-                    layers[l].up.format, layers[l].down.format, act,
-                    &up_bufs[l], &down_bufs[l],
-                    &ffn_norm_outs[l], &ffn_q8_bufs[l], &ffn_q8s_bufs[l],
-                    &up_outs[l], &act_bufs_vec[l], &down_outs[l],
-                    seq_len, inter, hidden,
-                    h_stride, inter_stride, q8_stride, q8s_stride,
+                    enc,
+                    &qm_pipes,
+                    silu_pipeline,
+                    gelu_tanh_pipeline,
+                    layers[l].up.format,
+                    layers[l].down.format,
+                    act,
+                    &up_bufs[l],
+                    &down_bufs[l],
+                    &ffn_norm_outs[l],
+                    &ffn_q8_bufs[l],
+                    &ffn_q8s_bufs[l],
+                    &up_outs[l],
+                    &act_bufs_vec[l],
+                    &down_outs[l],
+                    seq_len,
+                    inter,
+                    hidden,
+                    h_stride,
+                    inter_stride,
+                    q8_stride,
+                    q8s_stride,
                 );
             } else {
                 ffn::encode_gated(
-                    enc, &qm_pipes, geglu_pipeline, geglu_gelu_tanh_pipeline,
+                    enc,
+                    &qm_pipes,
+                    geglu_pipeline,
+                    geglu_gelu_tanh_pipeline,
                     ffn::FusedGegluDown {
                         q4k_silu: fused_q4k_geglu_silu_down,
                         q4k_gelu_tanh: fused_q4k_geglu_gelu_tanh_down,
                         q6k_silu: fused_q6k_geglu_silu_down,
                         q6k_gelu_tanh: fused_q6k_geglu_gelu_tanh_down,
                     },
-                    layers[l].gate.format, layers[l].up.format, layers[l].down.format, act,
-                    &gate_bufs[l], &up_bufs[l], &down_bufs[l],
-                    &ffn_norm_outs[l], &ffn_q8_bufs[l], &ffn_q8s_bufs[l],
-                    &gate_outs[l], &up_outs[l], &act_bufs_vec[l], &down_outs[l],
-                    seq_len, inter, hidden,
-                    h_stride, inter_stride, q8_stride, q8s_stride,
+                    layers[l].gate.format,
+                    layers[l].up.format,
+                    layers[l].down.format,
+                    act,
+                    &gate_bufs[l],
+                    &up_bufs[l],
+                    &down_bufs[l],
+                    &ffn_norm_outs[l],
+                    &ffn_q8_bufs[l],
+                    &ffn_q8s_bufs[l],
+                    &gate_outs[l],
+                    &up_outs[l],
+                    &act_bufs_vec[l],
+                    &down_outs[l],
+                    seq_len,
+                    inter,
+                    hidden,
+                    h_stride,
+                    inter_stride,
+                    q8_stride,
+                    q8s_stride,
                 );
             }
             enc.end_encoding();
@@ -444,11 +550,18 @@ pub fn dispatch_full_pipeline(
             let mut scratch = |bytes: u64| bufs.output(bytes);
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::residual::encode_post_ffn(
-                enc, rms_norm_pipeline, residual_add_pipeline,
+                enc,
+                rms_norm_pipeline,
+                residual_add_pipeline,
                 &mut scratch,
-                &down_outs[l], &h_post_attns[l], &h_bufs[l + 1],
+                &down_outs[l],
+                &h_post_attns[l],
+                &h_bufs[l + 1],
                 post_ffn_norm_bufs[l].as_ref(),
-                seq_len, hidden, eps, norm_offset,
+                seq_len,
+                hidden,
+                eps,
+                norm_offset,
                 has_post_norms,
                 (hidden * 4) as u64,
             );
@@ -465,7 +578,12 @@ pub fn dispatch_full_pipeline(
             if let Some(scale_pipe) = scale_vector_pipeline {
                 let enc = cmd.new_compute_command_encoder();
                 crate::metal::stages::layer_scalar::encode(
-                    enc, scale_pipe, &h_bufs[l + 1], seq_len, hidden, layers[l].layer_scalar,
+                    enc,
+                    scale_pipe,
+                    &h_bufs[l + 1],
+                    seq_len,
+                    hidden,
+                    layers[l].layer_scalar,
                 );
                 enc.end_encoding();
             }
@@ -474,8 +592,15 @@ pub fn dispatch_full_pipeline(
         // End-of-layer dump (LARQL_METAL_DUMP_LAYERS=<dir>) — bisects
         // CPU/Metal drift layer-by-layer.
         cmd = super::dump::dump_layer_snapshots(
-            dump_path.as_deref(), queue, cmd, &lb,
-            layers, l, seq_len, hidden, inter,
+            dump_path.as_deref(),
+            queue,
+            cmd,
+            &lb,
+            layers,
+            l,
+            seq_len,
+            hidden,
+            inter,
         );
 
         // ── Per-layer MoE interleave. ──
@@ -489,9 +614,7 @@ pub fn dispatch_full_pipeline(
             // KV cache: copy this layer's K/V before the caller reads
             // `h_post_attn` or touches `new_h`.
             if let Some(kv) = kv_cache.as_mut() {
-                super::kv_copy::populate_kv_one_layer(
-                    kv, bufs, &lb, &layers[l], l, seq_len,
-                );
+                super::kv_copy::populate_kv_one_layer(kv, bufs, &lb, &layers[l], l, seq_len);
             }
 
             if is_moe_layer {
@@ -519,9 +642,7 @@ pub fn dispatch_full_pipeline(
         // Post-commit: populate persistent KV cache from GPU-computed
         // RoPE'd K/V (buffers are readable now that the command buffer is
         // finished).
-        super::kv_copy::populate_kv_after_commit(
-            kv_cache, bufs, &lb, layers, seq_len,
-        );
+        super::kv_copy::populate_kv_after_commit(kv_cache, bufs, &lb, layers, seq_len);
     }
 
     // Read final hidden state — `seq_len * hidden` floats, caller reshapes

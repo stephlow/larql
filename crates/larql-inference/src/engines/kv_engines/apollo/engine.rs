@@ -24,9 +24,9 @@ use thiserror::Error;
 use super::entry::{InjectionConfig, VecInjectEntry};
 use super::routing::{RoutingIndex, RoutingQuery};
 use super::store::ApolloStore;
-use crate::model::ModelWeights;
-use crate::forward::{embed_tokens_pub, forward_raw_logits, forward_from_layer};
 use crate::engines::{EngineInfo, KvEngine};
+use crate::forward::{embed_tokens_pub, forward_from_layer, forward_raw_logits};
+use crate::model::ModelWeights;
 
 /// (context_tokens, injection_delta, boundary_residual, crystal_layer)
 type InjectionPrep = (Vec<u32>, ndarray::Array1<f32>, Option<Vec<f32>>, usize);
@@ -99,10 +99,18 @@ impl ApolloEngine {
         Ok(())
     }
 
-    pub fn config(&self) -> &InjectionConfig { &self.config }
-    pub fn has_store(&self) -> bool { self.store.is_some() }
-    pub fn store(&self) -> Option<&ApolloStore> { self.store.as_ref() }
-    pub fn routing(&self) -> &RoutingIndex { &self.routing }
+    pub fn config(&self) -> &InjectionConfig {
+        &self.config
+    }
+    pub fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+    pub fn store(&self) -> Option<&ApolloStore> {
+        self.store.as_ref()
+    }
+    pub fn routing(&self) -> &RoutingIndex {
+        &self.routing
+    }
 
     /// Return the top-k entries most relevant to `query_token_ids`,
     /// scoped to `candidate_windows`. Uses seed + proximity + fact-group +
@@ -114,18 +122,25 @@ impl ApolloEngine {
     ) -> Result<Vec<VecInjectEntry>, ApolloError> {
         const PROXIMITY_RADIUS: u16 = 10;
         let store = self.store.as_ref().ok_or(ApolloError::StoreNotLoaded)?;
-        if query_token_ids.is_empty() { return Ok(vec![]); }
+        if query_token_ids.is_empty() {
+            return Ok(vec![]);
+        }
         let qset: std::collections::HashSet<u32> = query_token_ids.iter().copied().collect();
         let wset: std::collections::HashSet<u16> = candidate_windows.iter().copied().collect();
         let in_candidate = |e: &VecInjectEntry| wset.is_empty() || wset.contains(&e.window_id);
-        let entry_key = |e: &VecInjectEntry| (e.window_id, e.position_in_window, e.token_id, e.fact_id);
+        let entry_key =
+            |e: &VecInjectEntry| (e.window_id, e.position_in_window, e.token_id, e.fact_id);
 
-        let seeds: Vec<&VecInjectEntry> = store.entries.iter()
+        let seeds: Vec<&VecInjectEntry> = store
+            .entries
+            .iter()
             .filter(|e| in_candidate(e) && qset.contains(&e.token_id))
             .collect();
 
         if seeds.is_empty() {
-            let mut scored: Vec<(VecInjectEntry, f32)> = store.entries.iter()
+            let mut scored: Vec<(VecInjectEntry, f32)> = store
+                .entries
+                .iter()
                 .filter(|e| in_candidate(e))
                 .map(|e| (*e, e.coefficient))
                 .collect();
@@ -135,12 +150,14 @@ impl ApolloEngine {
         }
 
         let seed_facts: std::collections::HashSet<u16> = seeds.iter().map(|e| e.fact_id).collect();
-        let seed_positions: std::collections::HashSet<(u16, u16)> = seeds.iter()
+        let seed_positions: std::collections::HashSet<(u16, u16)> = seeds
+            .iter()
             .map(|e| (e.window_id, e.position_in_window))
             .collect();
 
         let mut scored: Vec<(VecInjectEntry, f32)> = Vec::new();
-        let mut seen: std::collections::HashSet<(u16, u16, u32, u16)> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(u16, u16, u32, u16)> =
+            std::collections::HashSet::new();
 
         for e in &seeds {
             scored.push((**e, e.coefficient));
@@ -148,21 +165,40 @@ impl ApolloEngine {
         }
         for e in store.entries.iter().filter(|e| in_candidate(e)) {
             let k = entry_key(e);
-            if seen.contains(&k) { continue; }
+            if seen.contains(&k) {
+                continue;
+            }
             let near = seed_positions.iter().any(|(w, p)| {
-                *w == e.window_id && (e.position_in_window as i32 - *p as i32).abs() <= PROXIMITY_RADIUS as i32
+                *w == e.window_id
+                    && (e.position_in_window as i32 - *p as i32).abs() <= PROXIMITY_RADIUS as i32
             });
-            if near { scored.push((*e, e.coefficient * 1.3)); seen.insert(k); }
+            if near {
+                scored.push((*e, e.coefficient * 1.3));
+                seen.insert(k);
+            }
         }
-        for e in store.entries.iter().filter(|e| in_candidate(e) && seed_facts.contains(&e.fact_id)) {
+        for e in store
+            .entries
+            .iter()
+            .filter(|e| in_candidate(e) && seed_facts.contains(&e.fact_id))
+        {
             let k = entry_key(e);
-            if !seen.contains(&k) { scored.push((*e, e.coefficient * 1.3)); seen.insert(k); }
+            if !seen.contains(&k) {
+                scored.push((*e, e.coefficient * 1.3));
+                seen.insert(k);
+            }
         }
         if scored.len() < self.config.top_k {
-            let mut pool: Vec<&VecInjectEntry> = store.entries.iter()
+            let mut pool: Vec<&VecInjectEntry> = store
+                .entries
+                .iter()
                 .filter(|e| in_candidate(e) && !seen.contains(&entry_key(e)))
                 .collect();
-            pool.sort_by(|a, b| b.coefficient.partial_cmp(&a.coefficient).unwrap_or(std::cmp::Ordering::Equal));
+            pool.sort_by(|a, b| {
+                b.coefficient
+                    .partial_cmp(&a.coefficient)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for e in pool.into_iter().take(self.config.top_k - scored.len()) {
                 scored.push((*e, e.coefficient * 0.8));
             }
@@ -182,7 +218,9 @@ impl ApolloEngine {
         query_ids: &[u32],
     ) -> Option<InjectionPrep> {
         let store = self.store.as_ref()?;
-        let q = RoutingQuery { token_ids: query_ids.to_vec() };
+        let q = RoutingQuery {
+            token_ids: query_ids.to_vec(),
+        };
         let routed = self.routing.resolve(&q, 3);
         let top_window = *routed.first()?;
 
@@ -191,7 +229,11 @@ impl ApolloEngine {
 
         // Context = window_tokens ++ query_tokens (drop leading BOS if present).
         let mut context: Vec<u32> = window_tokens.clone();
-        let skip = if !query_ids.is_empty() && query_ids[0] == 2 { 1 } else { 0 };
+        let skip = if !query_ids.is_empty() && query_ids[0] == 2 {
+            1
+        } else {
+            0
+        };
         context.extend_from_slice(&query_ids[skip..]);
 
         // Injection delta: sum of answer-side entry embeddings.
@@ -199,10 +241,14 @@ impl ApolloEngine {
         let mut delta = vec![0.0f32; hidden];
         let qset: std::collections::HashSet<u32> = query_ids.iter().copied().collect();
         for e in &entries {
-            if qset.contains(&e.token_id) { continue; }
+            if qset.contains(&e.token_id) {
+                continue;
+            }
             let emb = embed_tokens_pub(weights, &[e.token_id]);
             let scale = e.coefficient * self.config.inject_coefficient;
-            for (i, v) in emb.row(0).iter().enumerate() { delta[i] += v * scale; }
+            for (i, v) in emb.row(0).iter().enumerate() {
+                delta[i] += v * scale;
+            }
         }
 
         // Boundary residual: if the store has one for this window, the compressed
@@ -215,11 +261,7 @@ impl ApolloEngine {
 
     /// One-shot query: route → retrieve → inject → forward. Uses the compressed
     /// path (boundary + 4 layers) when the store has boundary residuals.
-    pub fn query_greedy(
-        &self,
-        weights: &ModelWeights,
-        query_ids: &[u32],
-    ) -> Option<QueryTrace> {
+    pub fn query_greedy(&self, weights: &ModelWeights, query_ids: &[u32]) -> Option<QueryTrace> {
         let (context, delta, boundary, crystal) = self.prepare_injection(weights, query_ids)?;
         let perturb = Some((self.config.injection_layer, delta.view()));
         let raw = if let Some(ref bnd) = boundary {
@@ -228,12 +270,19 @@ impl ApolloEngine {
         } else {
             forward_raw_logits(weights, &context, perturb)
         };
-        let (top1_id, top1_logit) = raw.logits.iter().enumerate()
+        let (top1_id, top1_logit) = raw
+            .logits
+            .iter()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, &v)| (i as u32, v))?;
-        let q = RoutingQuery { token_ids: query_ids.to_vec() };
+        let q = RoutingQuery {
+            token_ids: query_ids.to_vec(),
+        };
         let routed = self.routing.resolve(&q, 3);
-        let entries = self.retrieve_entries(query_ids, routed.get(..1).unwrap_or(&[])).unwrap_or_default();
+        let entries = self
+            .retrieve_entries(query_ids, routed.get(..1).unwrap_or(&[]))
+            .unwrap_or_default();
         Some(QueryTrace {
             routed_windows: routed,
             injected_entries: entries,
@@ -254,15 +303,36 @@ mod tests {
     /// Build a minimal in-memory ApolloStore with synthetic data.
     fn mk_store(windows: usize, window_size: usize, hidden: usize) -> ApolloStore {
         let window_tokens: Vec<Vec<u32>> = (0..windows)
-            .map(|w| (0..window_size).map(|i| (w * window_size + i) as u32).collect())
+            .map(|w| {
+                (0..window_size)
+                    .map(|i| (w * window_size + i) as u32)
+                    .collect()
+            })
             .collect();
-        let boundaries: Vec<Vec<f32>> = (0..windows)
-            .map(|w| vec![w as f32 * 0.1; hidden])
-            .collect();
+        let boundaries: Vec<Vec<f32>> =
+            (0..windows).map(|w| vec![w as f32 * 0.1; hidden]).collect();
         let entries = vec![
-            VecInjectEntry { token_id: 42, coefficient: 5.0, window_id: 0, position_in_window: 10, fact_id: 1 },
-            VecInjectEntry { token_id: 43, coefficient: 3.0, window_id: 0, position_in_window: 11, fact_id: 1 },
-            VecInjectEntry { token_id: 99, coefficient: 4.0, window_id: 1, position_in_window: 5,  fact_id: 2 },
+            VecInjectEntry {
+                token_id: 42,
+                coefficient: 5.0,
+                window_id: 0,
+                position_in_window: 10,
+                fact_id: 1,
+            },
+            VecInjectEntry {
+                token_id: 43,
+                coefficient: 3.0,
+                window_id: 0,
+                position_in_window: 11,
+                fact_id: 1,
+            },
+            VecInjectEntry {
+                token_id: 99,
+                coefficient: 4.0,
+                window_id: 1,
+                position_in_window: 5,
+                fact_id: 2,
+            },
         ];
         ApolloStore {
             manifest: StoreManifest {
@@ -329,15 +399,27 @@ mod tests {
     fn info_with_store_shows_window_count() {
         let engine = mk_engine_with_store(3);
         let info = engine.info();
-        assert!(info.description.contains("3 windows"), "got: {}", info.description);
-        assert!(info.description.contains("3 entries"), "got: {}", info.description);
+        assert!(
+            info.description.contains("3 windows"),
+            "got: {}",
+            info.description
+        );
+        assert!(
+            info.description.contains("3 entries"),
+            "got: {}",
+            info.description
+        );
     }
 
     #[test]
     fn info_shows_compressed_path_when_boundaries_present() {
         let engine = mk_engine_with_store(2);
         let info = engine.info();
-        assert!(info.description.contains("compressed(layer=30)"), "got: {}", info.description);
+        assert!(
+            info.description.contains("compressed(layer=30)"),
+            "got: {}",
+            info.description
+        );
     }
 
     #[test]
@@ -372,7 +454,10 @@ mod tests {
         // token_id=42 is in window 0 with coefficient 5.0
         let entries = engine.retrieve_entries(&[42], &[0]).unwrap();
         assert!(!entries.is_empty(), "expected at least one entry");
-        assert!(entries.iter().any(|e| e.token_id == 42), "seed token not in results");
+        assert!(
+            entries.iter().any(|e| e.token_id == 42),
+            "seed token not in results"
+        );
     }
 
     #[test]
@@ -381,8 +466,10 @@ mod tests {
         // Querying [42] should include 43 via proximity (radius=10).
         let engine = mk_engine_with_store(2);
         let entries = engine.retrieve_entries(&[42], &[0]).unwrap();
-        assert!(entries.iter().any(|e| e.token_id == 43),
-            "adjacent entry (pos=11) not promoted via proximity");
+        assert!(
+            entries.iter().any(|e| e.token_id == 43),
+            "adjacent entry (pos=11) not promoted via proximity"
+        );
     }
 
     #[test]
@@ -390,8 +477,10 @@ mod tests {
         // token 99 is only in window 1; asking for window 0 should not return it.
         let engine = mk_engine_with_store(2);
         let entries = engine.retrieve_entries(&[1], &[0]).unwrap();
-        assert!(!entries.iter().any(|e| e.token_id == 99),
-            "entry from window 1 leaked into window 0 result");
+        assert!(
+            !entries.iter().any(|e| e.token_id == 99),
+            "entry from window 1 leaked into window 0 result"
+        );
     }
 
     #[test]
@@ -422,14 +511,19 @@ mod tests {
 // ─── KvEngine impl ────────────────────────────────────────────────────────────
 
 impl KvEngine for ApolloEngine {
-    fn name(&self) -> &str { "apollo" }
+    fn name(&self) -> &str {
+        "apollo"
+    }
 
     fn info(&self) -> EngineInfo {
         let windows = self.store.as_ref().map_or(0, |s| s.window_tokens.len());
         let entries = self.store.as_ref().map_or(0, |s| s.entries.len());
         let store_kb = self.store.as_ref().map_or(0, |s| s.total_bytes()) / 1024;
         let crystal = self.store.as_ref().map_or(0, |s| s.manifest.crystal_layer);
-        let has_boundaries = self.store.as_ref().is_some_and(|s| !s.boundaries.is_empty());
+        let has_boundaries = self
+            .store
+            .as_ref()
+            .is_some_and(|s| !s.boundaries.is_empty());
         let path = if has_boundaries {
             format!("compressed(layer={crystal})")
         } else {
@@ -441,10 +535,9 @@ impl KvEngine for ApolloEngine {
                 "retrieval+injection [{path}]: {windows} windows, {entries} entries, {store_kb}KB",
             ),
             backend: "cpu".into(),
-            config: format!("inject_layer={}, coef={}, top_k={}",
-                self.config.injection_layer,
-                self.config.inject_coefficient,
-                self.config.top_k,
+            config: format!(
+                "inject_layer={}, coef={}, top_k={}",
+                self.config.injection_layer, self.config.inject_coefficient, self.config.top_k,
             ),
         }
     }
@@ -495,7 +588,13 @@ impl KvEngine for ApolloEngine {
 
         let raw = if let Some(ref bnd) = self.boundary_residual {
             // Compressed: re-run only crystal_layer..num_layers over growing query.
-            forward_from_layer(weights, &self.context_tokens, bnd, self.crystal_layer, perturb)
+            forward_from_layer(
+                weights,
+                &self.context_tokens,
+                bnd,
+                self.crystal_layer,
+                perturb,
+            )
         } else {
             forward_raw_logits(weights, &self.context_tokens, perturb)
         };

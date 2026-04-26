@@ -46,10 +46,22 @@ struct ParityCase {
 /// (`metal/trait_impl.rs:215-229`), bypassing the per-layer dump that
 /// `prefill_q4` populates. Re-add when MoE prefill batches.
 const CASES: &[ParityCase] = &[
-    ParityCase { name: "gemma3-4b-it",           vindex_name: "gemma3-4b-q4k-v2" },
-    ParityCase { name: "gemma4-31b-it (dense)",  vindex_name: "gemma4-31b-q4k" },
-    ParityCase { name: "llama2-7b-hf (base)",    vindex_name: "llama2-7b-q4k" },
-    ParityCase { name: "mistral-7b-v0.1 (base)", vindex_name: "mistral-7b-v0.1-q4k" },
+    ParityCase {
+        name: "gemma3-4b-it",
+        vindex_name: "gemma3-4b-q4k-v2",
+    },
+    ParityCase {
+        name: "gemma4-31b-it (dense)",
+        vindex_name: "gemma4-31b-q4k",
+    },
+    ParityCase {
+        name: "llama2-7b-hf (base)",
+        vindex_name: "llama2-7b-q4k",
+    },
+    ParityCase {
+        name: "mistral-7b-v0.1 (base)",
+        vindex_name: "mistral-7b-v0.1-q4k",
+    },
 ];
 
 fn find_vindex(name: &str) -> Option<PathBuf> {
@@ -69,7 +81,9 @@ fn find_vindex(name: &str) -> Option<PathBuf> {
     }
     let home = std::env::var("HOME").ok()?;
     [
-        PathBuf::from(&home).join(".cache/larql/local").join(&filename),
+        PathBuf::from(&home)
+            .join(".cache/larql/local")
+            .join(&filename),
         PathBuf::from("output").join(&filename),
     ]
     .into_iter()
@@ -99,15 +113,14 @@ fn run_case(case: &ParityCase) -> Result<(), String> {
     };
 
     let mut cb = SilentLoadCallbacks;
-    let cfg = load_vindex_config(&vindex_path)
-        .map_err(|e| format!("load_vindex_config: {e}"))?;
+    let cfg = load_vindex_config(&vindex_path).map_err(|e| format!("load_vindex_config: {e}"))?;
     if cfg.quant != QuantFormat::Q4K {
         return Err(format!("expected Q4K vindex (got {:?})", cfg.quant));
     }
-    let tokenizer = load_vindex_tokenizer(&vindex_path)
-        .map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
-    let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb)
-        .map_err(|e| format!("load vindex: {e}"))?;
+    let tokenizer =
+        load_vindex_tokenizer(&vindex_path).map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
+    let mut q4_index =
+        VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
     q4_index
         .load_attn_q4k(&vindex_path)
         .map_err(|e| format!("load_attn_q4k: {e}"))?;
@@ -132,7 +145,8 @@ fn run_case(case: &ParityCase) -> Result<(), String> {
     let metal_backend = larql_compute::metal::MetalBackend::new()
         .ok_or("Metal backend unavailable — rebuild with --features metal")?;
 
-    let metal = ResidualCapture::metal_prefill(&mut w_metal, &token_ids, &q4_index, &metal_backend)?;
+    let metal =
+        ResidualCapture::metal_prefill(&mut w_metal, &token_ids, &q4_index, &metal_backend)?;
     let cpu = ResidualCapture::cpu_prefill(&mut w_cpu, &token_ids, &q4_index)?;
 
     if cpu.num_layers() != metal.num_layers() {
@@ -145,7 +159,8 @@ fn run_case(case: &ParityCase) -> Result<(), String> {
     }
 
     let report = compare_captures(&cpu, &metal, ParityThreshold::tight());
-    report.assert_clean()
+    report
+        .assert_clean()
         .map_err(|e| format!("[{}] {e}", case.name))?;
     eprintln!(
         "[{}] parity OK across {} layers (rel max_abs ≤ {:.1}%)",

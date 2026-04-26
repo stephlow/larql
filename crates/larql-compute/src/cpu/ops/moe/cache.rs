@@ -56,7 +56,9 @@ impl Inner {
     }
 
     fn insert(&mut self, key: Key, val: ExpertF32) {
-        if self.cap == 0 { return; }
+        if self.cap == 0 {
+            return;
+        }
         if self.map.contains_key(&key) {
             // Already present (a concurrent inserter raced us); don't duplicate.
             return;

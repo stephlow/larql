@@ -85,10 +85,12 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!(
             "resolved model path is not a directory: {}",
             vindex_path.display(),
-        ).into());
+        )
+        .into());
     }
 
-    let requested_backends: Vec<&str> = args.backends
+    let requested_backends: Vec<&str> = args
+        .backends
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -97,7 +99,9 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let want_cpu = requested_backends.contains(&"cpu");
     let want_engine = args.engine.is_some();
     if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine {
-        return Err("no backends selected: pass --backends metal,cpu, --ollama, or --engine".into());
+        return Err(
+            "no backends selected: pass --backends metal,cpu, --ollama, or --engine".into(),
+        );
     }
 
     println!("larql bench: {}", vindex_path.display());
@@ -107,7 +111,10 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.tokens,
         args.warmup,
         args.backends,
-        args.ollama.as_deref().map(|m| format!(", ollama={m}")).unwrap_or_default(),
+        args.ollama
+            .as_deref()
+            .map(|m| format!(", ollama={m}"))
+            .unwrap_or_default(),
     );
     println!();
 
@@ -126,7 +133,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 "GPU bench requires a Q4K vindex (got quant={:?}). \
                  Use a q4k vindex for GPU bench, or omit --backends and use --engine only.",
                 cfg.quant,
-            ).into());
+            )
+            .into());
         }
     }
     if want_cpu {
@@ -136,7 +144,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!(
                 "CPU bench requires a Q4K vindex (got quant={:?}).",
                 cfg.quant,
-            ).into());
+            )
+            .into());
         }
     }
     if let Some(ref ollama_model) = args.ollama {
@@ -153,17 +162,23 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         if is_q4k {
             // Fast path: load Q4K weights + Q4K VectorIndex (for attention bytes + WalkFfn FFN).
             let mut weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
-            let tokenizer  = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
-            let mut index  = larql_vindex::VectorIndex::load_vindex(&vindex_path, &mut cb)?;
+            let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
+            let mut index = larql_vindex::VectorIndex::load_vindex(&vindex_path, &mut cb)?;
             index.load_attn_q4k(&vindex_path)?;
             index.load_interleaved_q4k(&vindex_path)?;
-            let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
-                .map_err(|e| format!("tokenize: {e}"))?;
+            let token_ids =
+                larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+                    .map_err(|e| format!("tokenize: {e}"))?;
             let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
-                &weights, token_ids.len(),
+                &weights,
+                token_ids.len(),
             );
 
-            for engine_name in engine_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for engine_name in engine_list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 match EngineKind::from_name(engine_name) {
                     Some(kind) => {
                         let backend = if want_metal {
@@ -172,23 +187,38 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                             larql_inference::cpu_backend()
                         };
                         rows.push(run_engine_q4k(
-                            &mut weights, &index, &token_ids, kv_ref_bytes, kind, backend, &args,
+                            &mut weights,
+                            &index,
+                            &token_ids,
+                            kv_ref_bytes,
+                            kind,
+                            backend,
+                            &args,
                         )?);
                     }
-                    None => eprintln!("unknown engine {:?} — supported: markov-rs, unlimited-context", engine_name),
+                    None => eprintln!(
+                        "unknown engine {:?} — supported: markov-rs, unlimited-context",
+                        engine_name
+                    ),
                 }
             }
         } else {
             // Slow path: f32 weights (f16 vindex or similar).
-            let weights  = larql_vindex::load_model_weights(&vindex_path, &mut cb)?;
+            let weights = larql_vindex::load_model_weights(&vindex_path, &mut cb)?;
             let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
-            let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
-                .map_err(|e| format!("tokenize: {e}"))?;
+            let token_ids =
+                larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+                    .map_err(|e| format!("tokenize: {e}"))?;
             let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
-                &weights, token_ids.len(),
+                &weights,
+                token_ids.len(),
             );
 
-            for engine_name in engine_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for engine_name in engine_list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 match EngineKind::from_name(engine_name) {
                     Some(kind) => {
                         let backend = if want_metal {
@@ -196,9 +226,19 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             larql_inference::cpu_backend()
                         };
-                        rows.push(run_engine(&weights, &token_ids, kv_ref_bytes, kind, backend, &args)?);
+                        rows.push(run_engine(
+                            &weights,
+                            &token_ids,
+                            kv_ref_bytes,
+                            kind,
+                            backend,
+                            &args,
+                        )?);
                     }
-                    None => eprintln!("unknown engine {:?} — supported: markov-rs, unlimited-context", engine_name),
+                    None => eprintln!(
+                        "unknown engine {:?} — supported: markov-rs, unlimited-context",
+                        engine_name
+                    ),
                 }
             }
         }
@@ -225,7 +265,10 @@ fn run_larql(
     use larql_inference::layer_graph::CachedLayerGraph;
 
     if args.verbose {
-        eprintln!("[bench] loading vindex for {}…", if metal { "metal" } else { "cpu" });
+        eprintln!(
+            "[bench] loading vindex for {}…",
+            if metal { "metal" } else { "cpu" }
+        );
     }
 
     // Load the vindex once per backend. This mirrors `walk_cmd`'s Q4K
@@ -240,18 +283,21 @@ fn run_larql(
     let cfg = larql_vindex::load_vindex_config(vindex_path)?;
     if cfg.quant != larql_vindex::QuantFormat::Q4K {
         return Err(format!(
-            "larql bench currently requires a Q4K vindex (got {:?})", cfg.quant,
-        ).into());
+            "larql bench currently requires a Q4K vindex (got {:?})",
+            cfg.quant,
+        )
+        .into());
     }
     let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)?;
-    let token_ids: Vec<u32> = larql_inference::encode_prompt(
-        &tokenizer, &*weights.arch, args.prompt.as_str(),
-    ).map_err(|e| format!("tokenize: {e}"))?;
+    let token_ids: Vec<u32> =
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+            .map_err(|e| format!("tokenize: {e}"))?;
 
     let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        let b = larql_compute::metal::MetalBackend::new()
-            .ok_or("Metal backend unavailable — rebuild with `--features metal` on an M-series Mac")?;
+        let b = larql_compute::metal::MetalBackend::new().ok_or(
+            "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
+        )?;
         Box::new(b)
     } else {
         Box::new(larql_compute::CpuBackend)
@@ -266,9 +312,14 @@ fn run_larql(
     if metal {
         let num_layers = weights.num_layers;
         let _ = generate(
-            &mut weights, &tokenizer, &token_ids,
-            1, &q4_index, &*backend,
-            &cached_layers, 0..num_layers,
+            &mut weights,
+            &tokenizer,
+            &token_ids,
+            1,
+            &q4_index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
         );
     }
 
@@ -276,9 +327,14 @@ fn run_larql(
     let num_layers = weights.num_layers;
     let t0 = Instant::now();
     let result = generate(
-        &mut weights, &tokenizer, &token_ids,
-        max_tokens, &q4_index, &*backend,
-        &cached_layers, 0..num_layers,
+        &mut weights,
+        &tokenizer,
+        &token_ids,
+        max_tokens,
+        &q4_index,
+        &*backend,
+        &cached_layers,
+        0..num_layers,
     );
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -309,7 +365,10 @@ fn run_larql(
 
     let backend_name = backend_name_for(metal);
     let note = if measured_n < args.tokens {
-        format!("early stop @{}/{} (EOS or GPU fallback)", measured_n, args.tokens)
+        format!(
+            "early stop @{}/{} (EOS or GPU fallback)",
+            measured_n, args.tokens
+        )
     } else if measured_n == 0 {
         format!("no decode steps completed (wall {:.0}ms)", wall_ms)
     } else {
@@ -334,7 +393,11 @@ fn run_larql(
 }
 
 fn backend_name_for(metal: bool) -> &'static str {
-    if metal { "larql-metal" } else { "larql-cpu" }
+    if metal {
+        "larql-metal"
+    } else {
+        "larql-cpu"
+    }
 }
 
 /// Run the CPU KV-engine bench path for a single engine kind.
@@ -353,7 +416,11 @@ fn run_engine(
 
     let mut engine = kind.build_with_profiling(backend, args.profile);
     let info = engine.info();
-    let label = if info.config.is_empty() { format!("{} [{}]", info.name, info.backend) } else { format!("{} [{}] ({})", info.name, info.backend, info.config) };
+    let label = if info.config.is_empty() {
+        format!("{} [{}]", info.name, info.backend)
+    } else {
+        format!("{} [{}] ({})", info.name, info.backend, info.config)
+    };
 
     if args.verbose {
         eprintln!("[bench] {}", info.summary());
@@ -361,7 +428,8 @@ fn run_engine(
 
     // Prefill.
     let t_pre = Instant::now();
-    let mut hidden = engine.prefill(weights, token_ids)
+    let mut hidden = engine
+        .prefill(weights, token_ids)
         .ok_or("engine prefill failed")?;
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
 
@@ -375,7 +443,8 @@ fn run_engine(
 
     for _ in 0..max_steps {
         let t = Instant::now();
-        hidden = engine.decode_step(weights, last_token)
+        hidden = engine
+            .decode_step(weights, last_token)
             .ok_or("engine decode_step failed")?;
         decode_ms_all.push(t.elapsed().as_secs_f64() * 1000.0);
         last_token = argmax_token(&hidden_to_raw_logits(weights, &hidden));
@@ -393,8 +462,8 @@ fn run_engine(
 
     // Memory breakdown and compression ratio vs Standard KV (FP16).
     let total_mem = engine.memory_bytes();
-    let cold_mem  = engine.cold_bytes();
-    let hot_mem   = total_mem.saturating_sub(cold_mem);
+    let cold_mem = engine.cold_bytes();
+    let hot_mem = total_mem.saturating_sub(cold_mem);
     let ratio = if total_mem > 0 {
         kv_ref_bytes as f64 / total_mem as f64
     } else {
@@ -408,7 +477,11 @@ fn run_engine(
     );
 
     if args.verbose {
-        eprintln!("[bench] {} post-decode: {}", info.name, engine.info().description);
+        eprintln!(
+            "[bench] {} post-decode: {}",
+            info.name,
+            engine.info().description
+        );
     }
     if args.profile {
         if let Some(summary) = engine.stage_summary() {
@@ -459,7 +532,11 @@ fn run_engine_q4k(
     };
     let mut engine = kind.build_with_profiling(backend, args.profile);
     let info = engine.info();
-    let label = if info.config.is_empty() { format!("{} [{}] Q4K", info.name, info.backend) } else { format!("{} [{}] ({}) Q4K", info.name, info.backend, info.config) };
+    let label = if info.config.is_empty() {
+        format!("{} [{}] Q4K", info.name, info.backend)
+    } else {
+        format!("{} [{}] ({}) Q4K", info.name, info.backend, info.config)
+    };
 
     if args.verbose {
         eprintln!("[bench] Q4K engine: {}", info.summary());
@@ -474,14 +551,18 @@ fn run_engine_q4k(
         ($h:expr) => {{
             let h_1d = ndarray::Array1::from_iter($h.iter().copied());
             lm_head_topk(index, weights, &h_1d, 1, be)
-                .first().map(|(t, _)| *t)
-                .unwrap_or_else(|| argmax_token(&larql_inference::forward::hidden_to_raw_logits(weights, $h)))
+                .first()
+                .map(|(t, _)| *t)
+                .unwrap_or_else(|| {
+                    argmax_token(&larql_inference::forward::hidden_to_raw_logits(weights, $h))
+                })
         }};
     }
 
     // Prefill via Q4K path.
     let t_pre = Instant::now();
-    let mut hidden = engine.prefill_q4k(weights, index, token_ids, be)
+    let mut hidden = engine
+        .prefill_q4k(weights, index, token_ids, be)
         .ok_or("Q4K engine prefill failed")?;
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
 
@@ -492,7 +573,8 @@ fn run_engine_q4k(
 
     for _ in 0..max_steps {
         let t = Instant::now();
-        hidden = engine.decode_step_q4k(weights, index, last_token, be)
+        hidden = engine
+            .decode_step_q4k(weights, index, last_token, be)
             .ok_or("Q4K engine decode_step failed")?;
         decode_ms_all.push(t.elapsed().as_secs_f64() * 1000.0);
         last_token = pick_next!(&hidden);
@@ -509,9 +591,13 @@ fn run_engine_q4k(
     };
 
     let total_mem = engine.memory_bytes();
-    let cold_mem  = engine.cold_bytes();
-    let hot_mem   = total_mem.saturating_sub(cold_mem);
-    let ratio = if total_mem > 0 { kv_ref_bytes as f64 / total_mem as f64 } else { 0.0 };
+    let cold_mem = engine.cold_bytes();
+    let hot_mem = total_mem.saturating_sub(cold_mem);
+    let ratio = if total_mem > 0 {
+        kv_ref_bytes as f64 / total_mem as f64
+    } else {
+        0.0
+    };
     let note = format!(
         "hot={:.1}MB cold={:.1}MB  {:.0}× vs std-kv",
         hot_mem as f64 / 1_048_576.0,
@@ -520,7 +606,9 @@ fn run_engine_q4k(
     );
 
     if args.profile {
-        if let Some(summary) = engine.stage_summary() { summary.print(); }
+        if let Some(summary) = engine.stage_summary() {
+            summary.print();
+        }
     }
 
     Ok(BenchRow {
@@ -563,7 +651,10 @@ fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
         note: "not reachable (ollama serve on :11434?)".into(),
     };
 
-    let o = match out { Some(o) => o, None => return row };
+    let o = match out {
+        Some(o) => o,
+        None => return row,
+    };
     let text = String::from_utf8_lossy(&o.stdout);
     let val: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
@@ -602,31 +693,66 @@ fn print_table(rows: &[BenchRow]) {
     let stage_row = rows.iter().find(|r| r.stages.is_some());
     if let Some(r) = stage_row {
         let s = r.stages.unwrap();
-        let total = s.embed_ms_total + s.gpu_ms_total + s.norm_ms_total
-                  + s.lm_head_ms_total + s.detok_ms_total;
+        let total = s.embed_ms_total
+            + s.gpu_ms_total
+            + s.norm_ms_total
+            + s.lm_head_ms_total
+            + s.detok_ms_total;
         if total > 0.0 {
             let pct = |v: f64| (v / total) * 100.0;
             println!();
             println!("  Per-stage average ({}):", r.backend);
-            println!("    embed     {:>6.3}ms  ({:>4.1}%)", s.embed_ms_total, pct(s.embed_ms_total));
-            println!("    GPU fwd   {:>6.3}ms  ({:>4.1}%)", s.gpu_ms_total, pct(s.gpu_ms_total));
-            println!("    final_norm{:>6.3}ms  ({:>4.1}%)", s.norm_ms_total, pct(s.norm_ms_total));
-            println!("    lm_head   {:>6.3}ms  ({:>4.1}%)", s.lm_head_ms_total, pct(s.lm_head_ms_total));
-            println!("    detok     {:>6.3}ms  ({:>4.1}%)", s.detok_ms_total, pct(s.detok_ms_total));
+            println!(
+                "    embed     {:>6.3}ms  ({:>4.1}%)",
+                s.embed_ms_total,
+                pct(s.embed_ms_total)
+            );
+            println!(
+                "    GPU fwd   {:>6.3}ms  ({:>4.1}%)",
+                s.gpu_ms_total,
+                pct(s.gpu_ms_total)
+            );
+            println!(
+                "    final_norm{:>6.3}ms  ({:>4.1}%)",
+                s.norm_ms_total,
+                pct(s.norm_ms_total)
+            );
+            println!(
+                "    lm_head   {:>6.3}ms  ({:>4.1}%)",
+                s.lm_head_ms_total,
+                pct(s.lm_head_ms_total)
+            );
+            println!(
+                "    detok     {:>6.3}ms  ({:>4.1}%)",
+                s.detok_ms_total,
+                pct(s.detok_ms_total)
+            );
         }
     }
 
     // Top-line comparison: larql vs ollama, if both present.
-    let metal = rows.iter().find(|r| r.backend == "larql-metal" && r.tok_per_s > 0.0);
-    let ollama = rows.iter().find(|r| r.backend.starts_with("ollama") && r.tok_per_s > 0.0);
+    let metal = rows
+        .iter()
+        .find(|r| r.backend == "larql-metal" && r.tok_per_s > 0.0);
+    let ollama = rows
+        .iter()
+        .find(|r| r.backend.starts_with("ollama") && r.tok_per_s > 0.0);
     if let (Some(m), Some(o)) = (metal, ollama) {
         println!();
         let ratio = m.tok_per_s / o.tok_per_s;
-        let (verb, sign) = if ratio >= 1.0 { ("faster", '>') } else { ("slower", '<') };
+        let (verb, sign) = if ratio >= 1.0 {
+            ("faster", '>')
+        } else {
+            ("slower", '<')
+        };
         println!(
             "  → larql-metal is {:.2}× {} {} ollama ({:.1} {} {:.1} tok/s)",
             if ratio >= 1.0 { ratio } else { 1.0 / ratio },
-            verb, sign, m.tok_per_s, sign, o.tok_per_s,
+            verb,
+            sign,
+            m.tok_per_s,
+            sign,
+            o.tok_per_s,
         );
     }
 }

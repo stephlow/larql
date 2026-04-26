@@ -23,8 +23,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::ChatWrap;
 use super::render::render_chat_template;
+use super::ChatWrap;
 
 /// Resolve and render the HF-published template from the vindex.
 ///
@@ -42,7 +42,9 @@ pub(super) fn try_hf_template(vindex_dir: &Path, user_prompt: &str) -> Result<Ch
     let jinja_path = vindex_dir.join("chat_template.jinja");
     if jinja_path.is_file() {
         return match std::fs::read_to_string(&jinja_path) {
-            Ok(template_str) => finish_render(&template_str, &cfg, user_prompt, "chat_template.jinja"),
+            Ok(template_str) => {
+                finish_render(&template_str, &cfg, user_prompt, "chat_template.jinja")
+            }
             Err(e) => Err(ChatWrap {
                 prompt: user_prompt.to_string(),
                 applied: false,
@@ -143,15 +145,19 @@ mod tests {
                 {"name": "tool_use", "template": "TOOL"},
                 {"name": "default", "template": "DEFAULT"}
             ]}"#,
-        ).unwrap();
-        assert_eq!(extract_chat_template_field(&cfg).as_deref(), Some("DEFAULT"));
+        )
+        .unwrap();
+        assert_eq!(
+            extract_chat_template_field(&cfg).as_deref(),
+            Some("DEFAULT")
+        );
     }
 
     #[test]
     fn extract_falls_back_to_first_entry_when_no_default() {
-        let cfg: Value = serde_json::from_str(
-            r#"{"chat_template": [{"name": "rag", "template": "FIRST"}]}"#,
-        ).unwrap();
+        let cfg: Value =
+            serde_json::from_str(r#"{"chat_template": [{"name": "rag", "template": "FIRST"}]}"#)
+                .unwrap();
         assert_eq!(extract_chat_template_field(&cfg).as_deref(), Some("FIRST"));
     }
 
@@ -181,7 +187,8 @@ mod tests {
         std::fs::write(
             tmp.path().join("chat_template.jinja"),
             "{{ messages[0].content }}!",
-        ).unwrap();
+        )
+        .unwrap();
         let w = try_hf_template(tmp.path(), "hi").unwrap();
         assert!(w.applied);
         assert_eq!(w.prompt, "hi!");
@@ -195,7 +202,8 @@ mod tests {
         std::fs::write(
             tmp.path().join("tokenizer_config.json"),
             r#"{"chat_template": "tc:{{ messages[0].content }}"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let w = try_hf_template(tmp.path(), "hi").unwrap();
         assert!(w.applied);
         assert_eq!(w.prompt, "tc:hi");
@@ -206,12 +214,13 @@ mod tests {
     fn render_error_produces_err_wrap() {
         let tmp = tempfile::tempdir().unwrap();
         // Intentionally invalid Jinja — bare `{%` with no closing tag.
-        std::fs::write(
-            tmp.path().join("chat_template.jinja"),
-            "{% bogus",
-        ).unwrap();
+        std::fs::write(tmp.path().join("chat_template.jinja"), "{% bogus").unwrap();
         let w = try_hf_template(tmp.path(), "hi").unwrap_err();
         assert!(!w.applied);
-        assert!(w.note.contains("chat_template.jinja render failed"), "note={}", w.note);
+        assert!(
+            w.note.contains("chat_template.jinja render failed"),
+            "note={}",
+            w.note
+        );
     }
 }

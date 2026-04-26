@@ -1,9 +1,9 @@
 //! CPU Q4K generate path — used when the active backend does not support the
 //! fused Q4 prefill + KV-cached decode pipeline (today: CpuBackend).
 
-use larql_compute::prelude::*;
-use crate::model::ModelWeights;
 use super::types::{GenerateResult, StageTimings};
+use crate::model::ModelWeights;
+use larql_compute::prelude::*;
 
 // ── Backend capability probe + CPU Q4K delegation ────────────────────────────
 //
@@ -38,9 +38,7 @@ pub(super) fn generate_via_cpu_q4k(
 ) -> GenerateResult {
     let prefill_start = std::time::Instant::now();
     // First-token pass covers the prompt — that's our "prefill" here.
-    let first = crate::vindex::predict_q4k(
-        weights, tokenizer, token_ids, 5, index,
-    );
+    let first = crate::vindex::predict_q4k(weights, tokenizer, token_ids, 5, index);
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
@@ -54,28 +52,42 @@ pub(super) fn generate_via_cpu_q4k(
         let stop = crate::vindex::is_end_of_turn(first_pred.0.trim());
         ids.push(id);
         if stop {
-            return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() };
+            return GenerateResult {
+                tokens,
+                prefill_ms,
+                decode_ms,
+                stage_timings: StageTimings::default(),
+            };
         }
     } else {
-        return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() };
+        return GenerateResult {
+            tokens,
+            prefill_ms,
+            decode_ms,
+            stage_timings: StageTimings::default(),
+        };
     }
 
     for _step in 1..max_tokens {
         let t0 = std::time::Instant::now();
-        let result = crate::vindex::predict_q4k(
-            weights, tokenizer, &ids, 5, index,
-        );
+        let result = crate::vindex::predict_q4k(weights, tokenizer, &ids, 5, index);
         let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
         decode_ms.push(step_ms);
         t_gpu += step_ms;
 
         match result.token_ids.first() {
             Some(&id) => {
-                let tok = result.predictions.first().map(|p| p.0.clone()).unwrap_or_default();
+                let tok = result
+                    .predictions
+                    .first()
+                    .map(|p| p.0.clone())
+                    .unwrap_or_default();
                 let stop = crate::vindex::is_end_of_turn(tok.trim());
                 tokens.push((tok, 1.0));
                 ids.push(id);
-                if stop { break; }
+                if stop {
+                    break;
+                }
             }
             None => break,
         }
@@ -125,8 +137,7 @@ where
         let avg = total_ms / n as f64;
         (avg, avg)
     };
-    let tokens: Vec<(String, f64)> =
-        out.into_iter().map(|(t, _)| (t, 1.0)).collect();
+    let tokens: Vec<(String, f64)> = out.into_iter().map(|(t, _)| (t, 1.0)).collect();
     let decode_ms = (1..tokens.len()).map(|_| decode_ms_each).collect();
     GenerateResult {
         tokens,

@@ -53,43 +53,44 @@ impl KernelResult {
     }
 }
 
-fn mean(v: &[f64]) -> f64 { v.iter().sum::<f64>() / v.len() as f64 }
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len() as f64
+}
 fn stddev(v: &[f64]) -> f64 {
     let m = mean(v);
     (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
 }
 
 fn synth_f32(n: usize, seed: f32) -> Vec<f32> {
-    (0..n).map(|i| (seed + i as f32 * 0.007).sin() * 0.4).collect()
+    (0..n)
+        .map(|i| (seed + i as f32 * 0.007).sin() * 0.4)
+        .collect()
 }
 
-fn measure_isolated(
-    warmup: usize,
-    iters: usize,
-    f: &mut impl FnMut(),
-) -> (f64, f64) {
+fn measure_isolated(warmup: usize, iters: usize, f: &mut impl FnMut()) -> (f64, f64) {
     let mut times = Vec::with_capacity(iters);
     for i in 0..warmup + iters {
         let t = Instant::now();
         f();
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        if i >= warmup { times.push(ms); }
+        if i >= warmup {
+            times.push(ms);
+        }
     }
     (mean(&times), stddev(&times))
 }
 
-fn measure_batched(
-    warmup: usize,
-    iters: usize,
-    n_layers: usize,
-    f: &mut impl FnMut(),
-) -> f64 {
+fn measure_batched(warmup: usize, iters: usize, n_layers: usize, f: &mut impl FnMut()) -> f64 {
     let mut times = Vec::with_capacity(iters);
     for i in 0..warmup + iters {
         let t = Instant::now();
-        for _ in 0..n_layers { f(); }
+        for _ in 0..n_layers {
+            f();
+        }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        if i >= warmup { times.push(ms / n_layers as f64); }
+        if i >= warmup {
+            times.push(ms / n_layers as f64);
+        }
     }
     mean(&times)
 }
@@ -110,13 +111,13 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
     let metal = MetalBackend::new().expect("Metal backend required for profiling");
 
     // Gemma 3 4B production shapes
-    let hidden  = 2560usize;
-    let inter   = 10240usize;
-    let q_dim   = 8192usize;
-    let _kv_dim  = 4096usize;
-    let sb      = 256usize;
-    let q4k_sb  = 144usize;
-    let q6k_sb  = 210usize;
+    let hidden = 2560usize;
+    let inter = 10240usize;
+    let q_dim = 8192usize;
+    let _kv_dim = 4096usize;
+    let sb = 256usize;
+    let q4k_sb = 144usize;
+    let q6k_sb = 210usize;
 
     let mut results = Vec::new();
 
@@ -127,23 +128,30 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
             let t = Instant::now();
             let cmd = metal.queue().new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.end_encoding(); cmd.commit(); cmd.wait_until_completed();
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            if i >= warmup { times.push(ms); }
+            if i >= warmup {
+                times.push(ms);
+            }
         }
         mean(&times)
     };
 
     println!("Commit+wait overhead: {commit_overhead_ms:.3}ms");
     println!();
-    println!("{:<44} {:>8} {:>8} {:>8} {:>8} {:>8}",
-             "Kernel", "iso_ms", "iso_gbs", "bat_ms", "bat_gbs", "ms/tok");
+    println!(
+        "{:<44} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Kernel", "iso_ms", "iso_gbs", "bat_ms", "bat_gbs", "ms/tok"
+    );
     println!("{}", "-".repeat(88));
 
     // ── q6k_matvec: FFN down (N=hidden, K=inter) ─────────────────────────
     {
-        let n = hidden; let k = inter;
-        let mb = (n * (k/sb * q6k_sb)) as f64 / 1e6;
+        let n = hidden;
+        let k = inter;
+        let mb = (n * (k / sb * q6k_sb)) as f64 / 1e6;
         let w = quantize_q6_k(&synth_f32(n * k, 0.1));
         let x = synth_f32(k, 0.5);
 
@@ -156,90 +164,129 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let ob = metal.bufs().output((n * 4) as u64);
         let kh = &metal.q6k_matvec_pipeline;
         let n_tgs = (n as u64).div_ceil(kh.rows_per_tg);
-        let n_val = n as u32; let k_val = k as u32;
+        let n_val = n as u32;
+        let k_val = k as u32;
 
         let bat_ms = measure_batched(warmup, iters, n_layers, &mut || {
             let cmd = metal.queue().new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&kh.state);
-            enc.set_buffer(0, Some(&wb), 0); enc.set_buffer(1, Some(&xb), 0);
+            enc.set_buffer(0, Some(&wb), 0);
+            enc.set_buffer(1, Some(&xb), 0);
             enc.set_buffer(2, Some(&ob), 0);
             enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(kh.threads_per_tg, 1, 1));
-            enc.end_encoding(); cmd.commit(); cmd.wait_until_completed();
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs, 1, 1),
+                MTLSize::new(kh.threads_per_tg, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
         });
 
         let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
         let r = KernelResult {
-            name: "q6k_matvec (down, 2560×10240)".into(), mb_per_call: mb,
-            isolated_ms: iso_ms, isolated_sd_ms: iso_sd,
+            name: "q6k_matvec (down, 2560×10240)".into(),
+            mb_per_call: mb,
+            isolated_ms: iso_ms,
+            isolated_sd_ms: iso_sd,
             isolated_gbs: mb / iso_kernel,
             batched_ms_per_layer: bat_ms,
             batched_gbs: mb / bat_ms,
         };
-        println!("{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
-                 r.name, r.isolated_ms, r.isolated_gbs,
-                 r.batched_ms_per_layer, r.batched_gbs, r.ms_per_token(n_layers));
+        println!(
+            "{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
+            r.name,
+            r.isolated_ms,
+            r.isolated_gbs,
+            r.batched_ms_per_layer,
+            r.batched_gbs,
+            r.ms_per_token(n_layers)
+        );
         results.push(r);
     }
 
     // ── q4k_ffn_gate_up: fused gate+up (N=inter, K=hidden) ───────────────
     {
-        let n = inter; let k = hidden;
-        let mb = 2.0 * (n * (k/sb * q4k_sb)) as f64 / 1e6;
+        let n = inter;
+        let k = hidden;
+        let mb = 2.0 * (n * (k / sb * q4k_sb)) as f64 / 1e6;
         let gate_q4k = quantize_q4_k(&synth_f32(n * k, 0.2));
-        let up_q4k   = quantize_q4_k(&synth_f32(n * k, 0.3));
+        let up_q4k = quantize_q4_k(&synth_f32(n * k, 0.3));
         let x = synth_f32(k, 0.5);
 
         // Isolated: use the trait method which handles dispatch internally.
         // We can't use trait method for gate+up (it's internal), so dispatch directly.
-        let wg = metal.bufs().get_bytes(&gate_q4k); let wu = metal.bufs().get_bytes(&up_q4k);
+        let wg = metal.bufs().get_bytes(&gate_q4k);
+        let wu = metal.bufs().get_bytes(&up_q4k);
         let xb = metal.bufs().transient_from_f32(&x);
-        let go = metal.bufs().output((n * 4) as u64); let uo = metal.bufs().output((n * 4) as u64);
+        let go = metal.bufs().output((n * 4) as u64);
+        let uo = metal.bufs().output((n * 4) as u64);
         let kh = &metal.q4k_ffn_gate_up_pipeline;
         let tgs = (n as u64).div_ceil(kh.rows_per_tg);
-        let n_val = n as u32; let k_val = k as u32;
+        let n_val = n as u32;
+        let k_val = k as u32;
 
         let dispatch = |enc: &metal::ComputeCommandEncoderRef| {
             enc.set_compute_pipeline_state(&kh.state);
-            enc.set_buffer(0, Some(&wg), 0); enc.set_buffer(1, Some(&wu), 0);
-            enc.set_buffer(2, Some(&xb), 0); enc.set_buffer(3, Some(&go), 0);
+            enc.set_buffer(0, Some(&wg), 0);
+            enc.set_buffer(1, Some(&wu), 0);
+            enc.set_buffer(2, Some(&xb), 0);
+            enc.set_buffer(3, Some(&go), 0);
             enc.set_buffer(4, Some(&uo), 0);
             enc.set_bytes(5, 4, &n_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(6, 4, &k_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(tgs * 2, 1, 1), MTLSize::new(kh.threads_per_tg, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(tgs * 2, 1, 1),
+                MTLSize::new(kh.threads_per_tg, 1, 1),
+            );
         };
 
         let (iso_ms, iso_sd) = measure_isolated(warmup, iters, &mut || {
             let cmd = metal.queue().new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            dispatch(enc); enc.end_encoding(); cmd.commit(); cmd.wait_until_completed();
+            dispatch(enc);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
         });
         let bat_ms = measure_batched(warmup, iters, n_layers, &mut || {
             let cmd = metal.queue().new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            dispatch(enc); enc.end_encoding(); cmd.commit(); cmd.wait_until_completed();
+            dispatch(enc);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
         });
 
         let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
         let r = KernelResult {
-            name: "q4k_ffn_gate_up (gate+up, 10240×2560)".into(), mb_per_call: mb,
-            isolated_ms: iso_ms, isolated_sd_ms: iso_sd,
+            name: "q4k_ffn_gate_up (gate+up, 10240×2560)".into(),
+            mb_per_call: mb,
+            isolated_ms: iso_ms,
+            isolated_sd_ms: iso_sd,
             isolated_gbs: mb / iso_kernel,
             batched_ms_per_layer: bat_ms,
             batched_gbs: mb / bat_ms,
         };
-        println!("{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
-                 r.name, r.isolated_ms, r.isolated_gbs,
-                 r.batched_ms_per_layer, r.batched_gbs, r.ms_per_token(n_layers));
+        println!(
+            "{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
+            r.name,
+            r.isolated_ms,
+            r.isolated_gbs,
+            r.batched_ms_per_layer,
+            r.batched_gbs,
+            r.ms_per_token(n_layers)
+        );
         results.push(r);
     }
 
     // ── q4k_matvec: Wo O-projection (N=hidden, K=q_dim) ──────────────────
     {
-        let n = hidden; let k = q_dim;
-        let mb = (n * (k/sb * q4k_sb)) as f64 / 1e6;
+        let n = hidden;
+        let k = q_dim;
+        let mb = (n * (k / sb * q4k_sb)) as f64 / 1e6;
         let w = quantize_q4_k(&synth_f32(n * k, 0.4));
         let x = synth_f32(k, 0.6);
         let (iso_ms, iso_sd) = measure_isolated(warmup, iters, &mut || {
@@ -248,21 +295,30 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
         // Batched Wo: approximate — use isolated kernel time as lower bound.
         let r = KernelResult {
-            name: "q4k_matvec (Wo, 2560×8192)".into(), mb_per_call: mb,
-            isolated_ms: iso_ms, isolated_sd_ms: iso_sd,
+            name: "q4k_matvec (Wo, 2560×8192)".into(),
+            mb_per_call: mb,
+            isolated_ms: iso_ms,
+            isolated_sd_ms: iso_sd,
             isolated_gbs: mb / iso_kernel,
             batched_ms_per_layer: iso_kernel, // approximate
             batched_gbs: mb / iso_kernel,
         };
-        println!("{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms  (iso only)",
-                 r.name, r.isolated_ms, r.isolated_gbs,
-                 r.batched_ms_per_layer, r.batched_gbs, r.ms_per_token(n_layers));
+        println!(
+            "{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms  (iso only)",
+            r.name,
+            r.isolated_ms,
+            r.isolated_gbs,
+            r.batched_ms_per_layer,
+            r.batched_gbs,
+            r.ms_per_token(n_layers)
+        );
         results.push(r);
     }
 
     // ── f32_gemv: lm_head (N=vocab, K=hidden) ────────────────────────────
     {
-        let n = 262_144usize; let k = hidden;
+        let n = 262_144usize;
+        let k = hidden;
         let mb = (n * k * 4) as f64 / 1e6;
         let w = ndarray::Array2::from_shape_vec((n, k), synth_f32(n * k, 0.7)).unwrap();
         let x = synth_f32(k, 0.5);
@@ -271,14 +327,18 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         });
         let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
         let r = KernelResult {
-            name: "f32_gemv (lm_head, 262K×2560)".into(), mb_per_call: mb,
-            isolated_ms: iso_ms, isolated_sd_ms: iso_sd,
+            name: "f32_gemv (lm_head, 262K×2560)".into(),
+            mb_per_call: mb,
+            isolated_ms: iso_ms,
+            isolated_sd_ms: iso_sd,
             isolated_gbs: mb / iso_kernel,
             batched_ms_per_layer: iso_ms, // lm_head is one-per-token, not per-layer
             batched_gbs: mb / iso_kernel,
         };
-        println!("{:<44} {:>7.3}ms {:>7.1} {:>7}     {:>7}   (per token, not per layer)",
-                 r.name, r.isolated_ms, r.isolated_gbs, "—", "—");
+        println!(
+            "{:<44} {:>7.3}ms {:>7.1} {:>7}     {:>7}   (per token, not per layer)",
+            r.name, r.isolated_ms, r.isolated_gbs, "—", "—"
+        );
         results.push(r);
     }
 
@@ -289,14 +349,36 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
 
     println!();
     println!("=== Bottleneck analysis ===");
-    println!("q6k_matvec (down)   {:.1} GB/s — {}",
-             down.batched_gbs, if down.is_compute_bound() { "COMPUTE-BOUND" } else { "bandwidth-bound" });
-    println!("q4k_ffn_gate_up     {:.1} GB/s — {}",
-             gate.batched_gbs, if gate.is_compute_bound() { "COMPUTE-BOUND (K=2560 dequant dominates)" } else { "bandwidth-bound" });
-    println!("These two: {total_ms:.2}ms/tok ({:.0}% of ~11.7ms GPU fwd)",
-             total_ms / 11.7 * 100.0);
-    println!("At 350 GB/s: would take {:.1}ms/tok → need {:.0}% more throughput",
-             3029.0 / 350.0, (3029.0 / 350.0 / (down.batched_ms_per_layer + gate.batched_ms_per_layer + 0.001) - 1.0).abs() * 0.0 + (350.0 / ((down.batched_gbs + gate.batched_gbs) / 2.0) - 1.0) * 100.0);
+    println!(
+        "q6k_matvec (down)   {:.1} GB/s — {}",
+        down.batched_gbs,
+        if down.is_compute_bound() {
+            "COMPUTE-BOUND"
+        } else {
+            "bandwidth-bound"
+        }
+    );
+    println!(
+        "q4k_ffn_gate_up     {:.1} GB/s — {}",
+        gate.batched_gbs,
+        if gate.is_compute_bound() {
+            "COMPUTE-BOUND (K=2560 dequant dominates)"
+        } else {
+            "bandwidth-bound"
+        }
+    );
+    println!(
+        "These two: {total_ms:.2}ms/tok ({:.0}% of ~11.7ms GPU fwd)",
+        total_ms / 11.7 * 100.0
+    );
+    println!(
+        "At 350 GB/s: would take {:.1}ms/tok → need {:.0}% more throughput",
+        3029.0 / 350.0,
+        (3029.0 / 350.0 / (down.batched_ms_per_layer + gate.batched_ms_per_layer + 0.001) - 1.0)
+            .abs()
+            * 0.0
+            + (350.0 / ((down.batched_gbs + gate.batched_gbs) / 2.0) - 1.0) * 100.0
+    );
 
     results
 }

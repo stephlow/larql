@@ -60,32 +60,63 @@ impl GateIndex for MockIndex {
     fn gate_knn(&self, _layer: usize, _residual: &Array1<f32>, _top_k: usize) -> Vec<(usize, f32)> {
         vec![]
     }
-    fn feature_meta(&self, _layer: usize, _feature: usize) -> Option<FeatureMeta> { None }
-    fn num_features(&self, _layer: usize) -> usize { self.num_features }
-
-    fn has_overrides_at(&self, _layer: usize) -> bool { self.has_overrides }
-
-    fn has_fp4_storage(&self) -> bool { self.has_fp4 }
-    fn fp4_ffn_row_dot(&self, _l: usize, _c: usize, _f: usize, _x: &[f32]) -> Option<f32> {
-        if self.has_fp4 { Some(0.0) } else { None }
+    fn feature_meta(&self, _layer: usize, _feature: usize) -> Option<FeatureMeta> {
+        None
     }
-    fn fp4_ffn_row_scaled_add(&self, _l: usize, _c: usize, _f: usize, _a: f32, _out: &mut [f32]) -> bool {
+    fn num_features(&self, _layer: usize) -> usize {
+        self.num_features
+    }
+
+    fn has_overrides_at(&self, _layer: usize) -> bool {
+        self.has_overrides
+    }
+
+    fn has_fp4_storage(&self) -> bool {
+        self.has_fp4
+    }
+    fn fp4_ffn_row_dot(&self, _l: usize, _c: usize, _f: usize, _x: &[f32]) -> Option<f32> {
+        if self.has_fp4 {
+            Some(0.0)
+        } else {
+            None
+        }
+    }
+    fn fp4_ffn_row_scaled_add(
+        &self,
+        _l: usize,
+        _c: usize,
+        _f: usize,
+        _a: f32,
+        _out: &mut [f32],
+    ) -> bool {
         self.has_fp4
     }
 
-    fn has_interleaved_q4(&self) -> bool { self.has_q4_interleaved }
+    fn has_interleaved_q4(&self) -> bool {
+        self.has_q4_interleaved
+    }
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
         // Not used by the routing test — Q4 path requires real bytes.
         // For routing coverage we only need the flag.
         None
     }
 
-    fn has_interleaved(&self) -> bool { self.has_interleaved }
-    fn interleaved_gate(&self, _l: usize) -> Option<ArrayView2<'_, f32>> { None }
-    fn interleaved_up(&self, _l: usize) -> Option<ArrayView2<'_, f32>> { None }
-    fn interleaved_down(&self, _l: usize) -> Option<ArrayView2<'_, f32>> { None }
+    fn has_interleaved(&self) -> bool {
+        self.has_interleaved
+    }
+    fn interleaved_gate(&self, _l: usize) -> Option<ArrayView2<'_, f32>> {
+        None
+    }
+    fn interleaved_up(&self, _l: usize) -> Option<ArrayView2<'_, f32>> {
+        None
+    }
+    fn interleaved_down(&self, _l: usize) -> Option<ArrayView2<'_, f32>> {
+        None
+    }
 
-    fn has_full_mmap_ffn(&self) -> bool { self.has_full_mmap }
+    fn has_full_mmap_ffn(&self) -> bool {
+        self.has_full_mmap
+    }
     fn up_layer_matrix(&self, _l: usize) -> Option<ArrayView2<'_, f32>> {
         self.native_up.as_ref().map(|m| m.view())
     }
@@ -93,12 +124,20 @@ impl GateIndex for MockIndex {
         self.native_down.as_ref().map(|m| m.view())
     }
 
-    fn has_interleaved_q4k(&self) -> bool { self.has_q4k }
+    fn has_interleaved_q4k(&self) -> bool {
+        self.has_q4k
+    }
 
-    fn has_down_features(&self) -> bool { self.has_down_features }
-    fn down_feature_vector(&self, _l: usize, _f: usize) -> Option<&[f32]> { None }
+    fn has_down_features(&self) -> bool {
+        self.has_down_features
+    }
+    fn down_feature_vector(&self, _l: usize, _f: usize) -> Option<&[f32]> {
+        None
+    }
 
-    fn gate_knn_batch(&self, _l: usize, _x: &Array2<f32>, _k: usize) -> Vec<usize> { vec![] }
+    fn gate_knn_batch(&self, _l: usize, _x: &Array2<f32>, _k: usize) -> Vec<usize> {
+        vec![]
+    }
 }
 
 /// Minimal ModelWeights stand-in. Most tests don't reach into it
@@ -135,14 +174,30 @@ fn predicate_priority_ordering() {
     // assert it picks the expected path. Mirrors mod.rs `forward_with_activation`
     // but without the actual walk_ffn_* calls.
     fn pick_path(m: &MockIndex, config_is_sparse: bool, backend_has_q4: bool) -> &'static str {
-        if m.has_overrides { return "override:sparse"; }
-        if config_is_sparse { return "sparse:*"; }
-        if m.has_fp4 { return "fp4_storage:sparse"; }
-        if m.has_q4_interleaved && backend_has_q4 { return "interleaved_q4:*"; }
-        if m.has_interleaved { return "interleaved"; }
-        if m.has_full_mmap { return "full_mmap"; }
-        if m.has_q4k { return "interleaved_q4k:dequant"; }
-        if m.has_down_features { return "exact"; }
+        if m.has_overrides {
+            return "override:sparse";
+        }
+        if config_is_sparse {
+            return "sparse:*";
+        }
+        if m.has_fp4 {
+            return "fp4_storage:sparse";
+        }
+        if m.has_q4_interleaved && backend_has_q4 {
+            return "interleaved_q4:*";
+        }
+        if m.has_interleaved {
+            return "interleaved";
+        }
+        if m.has_full_mmap {
+            return "full_mmap";
+        }
+        if m.has_q4k {
+            return "interleaved_q4k:dequant";
+        }
+        if m.has_down_features {
+            return "exact";
+        }
         "weights_fallback:sparse"
     }
 
@@ -174,8 +229,16 @@ fn predicate_priority_ordering() {
     let mut m = MockIndex::new(hidden, intermediate);
     m.has_q4_interleaved = true;
     m.has_interleaved = true;
-    assert_eq!(pick_path(&m, false, false), "interleaved", "no GPU Q4 → skip Q4");
-    assert_eq!(pick_path(&m, false, true), "interleaved_q4:*", "GPU Q4 wins");
+    assert_eq!(
+        pick_path(&m, false, false),
+        "interleaved",
+        "no GPU Q4 → skip Q4"
+    );
+    assert_eq!(
+        pick_path(&m, false, true),
+        "interleaved_q4:*",
+        "GPU Q4 wins"
+    );
 
     // 5. interleaved wins over full_mmap / Q4K.
     let mut m = MockIndex::new(hidden, intermediate);
@@ -216,13 +279,27 @@ fn predicate_priority_ordering() {
 #[test]
 fn fp4_vindex_with_no_other_backends_picks_fp4_path() {
     fn pick_path(m: &MockIndex) -> &'static str {
-        if m.has_overrides { return "override:sparse"; }
-        if m.has_fp4 { return "fp4_storage:sparse"; }
-        if m.has_q4_interleaved { return "interleaved_q4:*"; }
-        if m.has_interleaved { return "interleaved"; }
-        if m.has_full_mmap { return "full_mmap"; }
-        if m.has_q4k { return "interleaved_q4k:dequant"; }
-        if m.has_down_features { return "exact"; }
+        if m.has_overrides {
+            return "override:sparse";
+        }
+        if m.has_fp4 {
+            return "fp4_storage:sparse";
+        }
+        if m.has_q4_interleaved {
+            return "interleaved_q4:*";
+        }
+        if m.has_interleaved {
+            return "interleaved";
+        }
+        if m.has_full_mmap {
+            return "full_mmap";
+        }
+        if m.has_q4k {
+            return "interleaved_q4k:dequant";
+        }
+        if m.has_down_features {
+            return "exact";
+        }
         "weights_fallback:sparse"
     }
     let mut m = MockIndex::new(256, 10);
@@ -246,5 +323,8 @@ fn dispatch_trace_is_opt_in() {
     // Smoke-test the field surface; skip trace invocation (requires
     // real ModelWeights).
     let _ = Mutex::new(0u8); // keep imports used
-    let _ = DispatchEntry { layer: 0, path: "x" };
+    let _ = DispatchEntry {
+        layer: 0,
+        path: "x",
+    };
 }

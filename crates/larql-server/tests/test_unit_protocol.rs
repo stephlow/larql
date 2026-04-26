@@ -109,7 +109,9 @@ fn test_walk_ffn_seq_len_default_is_one_for_features_only_mode() {
     let hidden = 4;
     let seq_len_default = 1;
     let residual = vec![0.1f32; hidden];
-    let expected = if false /* full_output */ {
+    let expected = if false
+    /* full_output */
+    {
         seq_len_default * hidden
     } else {
         hidden
@@ -396,10 +398,10 @@ fn test_binary_single_request_structure() {
     // Verify all fixed header fields at expected offsets.
     let residual = vec![0.5f32, -0.5];
     let body = bin_make_single_request(7, 2, true, 512, &residual);
-    let layer    = u32::from_le_bytes(body[0..4].try_into().unwrap());
-    let seq_len  = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    let flags    = u32::from_le_bytes(body[8..12].try_into().unwrap());
-    let top_k    = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let layer = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let seq_len = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    let flags = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let top_k = u32::from_le_bytes(body[12..16].try_into().unwrap());
     assert_eq!(layer, 7);
     assert_eq!(seq_len, 2);
     assert_eq!(flags & 1, 1); // full_output bit
@@ -419,8 +421,8 @@ fn test_binary_batch_request_structure() {
     assert_eq!((l0, l1, l2), (5, 20, 30));
     // After 3 layer u32s: seq_len, flags, top_k
     let seq_len = u32::from_le_bytes(body[20..24].try_into().unwrap());
-    let flags   = u32::from_le_bytes(body[24..28].try_into().unwrap());
-    let top_k   = u32::from_le_bytes(body[28..32].try_into().unwrap());
+    let flags = u32::from_le_bytes(body[24..28].try_into().unwrap());
+    let top_k = u32::from_le_bytes(body[28..32].try_into().unwrap());
     assert_eq!(seq_len, 1);
     assert_eq!(flags & 1, 1);
     assert_eq!(top_k, 128);
@@ -432,9 +434,9 @@ fn test_binary_single_response_structure() {
     let body = bin_make_single_response(26, 1, 9.5, &output);
     // [layer u32][seq_len u32][latency f32][output f32*]
     assert_eq!(body.len(), 12 + 3 * 4);
-    let layer    = u32::from_le_bytes(body[0..4].try_into().unwrap());
-    let seq_len  = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    let latency  = f32::from_le_bytes(body[8..12].try_into().unwrap());
+    let layer = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let seq_len = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    let latency = f32::from_le_bytes(body[8..12].try_into().unwrap());
     assert_eq!(layer, 26);
     assert_eq!(seq_len, 1);
     assert!((latency - 9.5).abs() < 0.01);
@@ -444,18 +446,15 @@ fn test_binary_single_response_structure() {
 
 #[test]
 fn test_binary_batch_response_structure() {
-    let body = bin_make_batch_response(
-        12.3,
-        &[(5, &[1.0, 2.0]), (20, &[3.0, 4.0])],
-    );
-    let marker      = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let body = bin_make_batch_response(12.3, &[(5, &[1.0, 2.0]), (20, &[3.0, 4.0])]);
+    let marker = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let num_results = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    let latency     = f32::from_le_bytes(body[8..12].try_into().unwrap());
+    let latency = f32::from_le_bytes(body[8..12].try_into().unwrap());
     assert_eq!(marker, BATCH_MARKER_U32);
     assert_eq!(num_results, 2);
     assert!((latency - 12.3).abs() < 0.01);
     // First result entry at offset 12
-    let layer0     = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let layer0 = u32::from_le_bytes(body[12..16].try_into().unwrap());
     let num_floats0 = u32::from_le_bytes(body[20..24].try_into().unwrap());
     assert_eq!(layer0, 5);
     assert_eq!(num_floats0, 2);
@@ -473,7 +472,9 @@ fn test_binary_float_roundtrip_exact() {
         assert_eq!(
             a.to_bits(),
             b.to_bits(),
-            "float bits differ: {:#010x} vs {:#010x}", a.to_bits(), b.to_bits()
+            "float bits differ: {:#010x} vs {:#010x}",
+            a.to_bits(),
+            b.to_bits()
         );
     }
 }
@@ -483,7 +484,11 @@ fn test_binary_features_only_flag_zero() {
     // Binary with full_output=false should have flags bit0 = 0.
     let body = bin_make_single_request(5, 1, false, 8092, &[1.0, 0.0, 0.0, 0.0]);
     let flags = u32::from_le_bytes(body[8..12].try_into().unwrap());
-    assert_eq!(flags & 1, 0, "full_output bit should be 0 for features-only");
+    assert_eq!(
+        flags & 1,
+        0,
+        "full_output bit should be 0 for features-only"
+    );
 }
 
 #[test]
@@ -530,7 +535,11 @@ fn test_embed_lookup_with_scale() {
     embed[[0, 0]] = 1.0;
     let scale = 3.0f32;
     let row: Vec<f32> = embed.row(0).iter().map(|&v| v * scale).collect();
-    assert!((row[0] - 3.0).abs() < 1e-6, "scale must be applied: got {}", row[0]);
+    assert!(
+        (row[0] - 3.0).abs() < 1e-6,
+        "scale must be applied: got {}",
+        row[0]
+    );
 }
 
 #[test]
@@ -643,7 +652,11 @@ fn test_logits_hidden_size_mismatch_detectable() {
     // Simulate the hidden size guard: residual.len() != hidden rejects request.
     let hidden_size = 4usize;
     let bad_residual = [0.0f32; 3]; // wrong length
-    assert_ne!(bad_residual.len(), hidden_size, "length 3 != hidden_size 4 → bad request");
+    assert_ne!(
+        bad_residual.len(),
+        hidden_size,
+        "length 3 != hidden_size 4 → bad request"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -664,10 +677,7 @@ fn test_token_decode_csv_parsing() {
 #[test]
 fn test_token_decode_invalid_id_detectable() {
     let q = "9515,notanumber,1234";
-    let ids: Vec<Result<u32, _>> = q
-        .split(',')
-        .map(|s| s.trim().parse::<u32>())
-        .collect();
+    let ids: Vec<Result<u32, _>> = q.split(',').map(|s| s.trim().parse::<u32>()).collect();
     assert!(ids[0].is_ok());
     assert!(ids[1].is_err(), "non-numeric token ID must fail to parse");
     assert!(ids[2].is_ok());

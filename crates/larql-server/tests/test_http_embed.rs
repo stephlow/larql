@@ -12,7 +12,12 @@ use axum::http::StatusCode;
 #[tokio::test]
 async fn http_embed_valid_token_ids_returns_200() {
     let app = single_model_router(state(vec![model("test")]));
-    let resp = post_json(app, "/v1/embed", serde_json::json!({"token_ids": [0, 1, 2]})).await;
+    let resp = post_json(
+        app,
+        "/v1/embed",
+        serde_json::json!({"token_ids": [0, 1, 2]}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["seq_len"], 3);

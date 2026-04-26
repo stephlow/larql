@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
+use larql_inference::InferenceModel;
 use larql_vindex::IndexBuildCallbacks;
-use larql_inference::{ InferenceModel};
 
 #[derive(Args)]
 pub struct ExtractIndexArgs {
@@ -158,13 +158,7 @@ impl IndexBuildCallbacks for CliBuildCallbacks {
             .set_message(format!("{component} L{layer} ({}/{})", layer + 1, total));
     }
 
-    fn on_feature_progress(
-        &mut self,
-        component: &str,
-        _layer: usize,
-        done: usize,
-        total: usize,
-    ) {
+    fn on_feature_progress(&mut self, component: &str, _layer: usize, done: usize, total: usize) {
         if total > 0 {
             self.feature_bar.set_length(total as u64);
         }
@@ -222,7 +216,10 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         larql_vindex::build_vindex_from_vectors(vectors_dir, &args.output, &mut callbacks)?;
 
-        if matches!(level, larql_vindex::ExtractLevel::Inference | larql_vindex::ExtractLevel::All) {
+        if matches!(
+            level,
+            larql_vindex::ExtractLevel::Inference | larql_vindex::ExtractLevel::All
+        ) {
             let model_name = args.model.as_deref().ok_or(
                 "--model required with --level inference/all (need model to extract weights)",
             )?;
@@ -233,7 +230,10 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 ffn_compact: args.compact,
             };
             larql_vindex::write_model_weights_with_opts(
-                model.weights(), &args.output, &mut callbacks, weight_opts,
+                model.weights(),
+                &args.output,
+                &mut callbacks,
+                weight_opts,
             )?;
         }
     } else {
@@ -255,8 +255,14 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             larql_vindex::StorageDtype::F32 => "f32",
             larql_vindex::StorageDtype::F16 => "f16",
         };
-        eprintln!("Extracting: {} → {} (level={}, dtype={}, quant={})",
-            model_path.display(), args.output.display(), level_str, dtype_str, args.quant);
+        eprintln!(
+            "Extracting: {} → {} (level={}, dtype={}, quant={})",
+            model_path.display(),
+            args.output.display(),
+            level_str,
+            dtype_str,
+            args.quant
+        );
 
         let output = &args.output;
 
@@ -327,10 +333,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  Output: {}", args.output.display());
 
     if build_elapsed.as_secs() >= 60 {
-        eprintln!(
-            "  Build time: {:.1}min",
-            build_elapsed.as_secs_f64() / 60.0
-        );
+        eprintln!("  Build time: {:.1}min", build_elapsed.as_secs_f64() / 60.0);
     } else {
         eprintln!("  Build time: {:.1}s", build_elapsed.as_secs_f64());
     }
@@ -369,7 +372,8 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     let total_size: u64 = std::fs::read_dir(&args.output)
         .ok()
         .map(|entries| {
-            entries.filter_map(|e| e.ok())
+            entries
+                .filter_map(|e| e.ok())
                 .filter_map(|e| e.metadata().ok())
                 .map(|m| m.len())
                 .sum()

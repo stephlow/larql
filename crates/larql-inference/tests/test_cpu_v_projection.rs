@@ -165,8 +165,11 @@ fn cpu_q4k_load_produces_distinct_w_k_and_w_v_for_gemma4_global() {
     let num_q = arch.num_q_heads_for_layer(layer);
     let num_kv = arch.num_kv_heads_for_layer(layer);
     let head_dim = arch.head_dim_for_layer(layer);
-    assert_eq!((num_q, num_kv, head_dim), (32, 4, 512),
-        "Gemma 4 31B L5 global geometry drifted — update test constants");
+    assert_eq!(
+        (num_q, num_kv, head_dim),
+        (32, 4, 512),
+        "Gemma 4 31B L5 global geometry drifted — update test constants"
+    );
 
     let kv_dim = num_kv * head_dim;
     let hidden = weights.hidden_size;
@@ -184,13 +187,20 @@ fn cpu_q4k_load_produces_distinct_w_k_and_w_v_for_gemma4_global() {
                 .expect("Q6_K dequant failed"),
             other => panic!("unsupported quant format in vindex: {other}"),
         };
-        if floats.len() > n { floats[..n].to_vec() } else { floats }
+        if floats.len() > n {
+            floats[..n].to_vec()
+        } else {
+            floats
+        }
     };
     let kf = dequant(attn[1].0, attn[1].1);
     let vf = dequant(attn[2].0, attn[2].1);
 
-    assert_eq!(kf.len(), vf.len(),
-        "K and V should have identical element counts at v_shares_k layers");
+    assert_eq!(
+        kf.len(),
+        vf.len(),
+        "K and V should have identical element counts at v_shares_k layers"
+    );
 
     // Element-wise distinctness: at least 10% of elements must differ
     // by > 1e-4 for the two quantisation round-trips to be genuinely
@@ -219,8 +229,16 @@ fn cpu_q4k_load_produces_distinct_w_k_and_w_v_for_gemma4_global() {
     // Global magnitude should be close (same source tensor, just
     // different quantisation noise) — a huge ratio would suggest K and
     // V aren't actually derived from the same underlying weight.
-    let k_norm: f64 = kf.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
-    let v_norm: f64 = vf.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+    let k_norm: f64 = kf
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt();
+    let v_norm: f64 = vf
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt();
     let ratio = v_norm / k_norm;
     assert!(
         (0.99..1.01).contains(&ratio),

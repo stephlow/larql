@@ -6,8 +6,15 @@
 /// Dequantize a BF16 byte slice to f32.
 #[inline]
 pub(super) fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2)
-        .map(|b| f32::from_bits((u32::from(u8::from_le_bytes([b[0]])) | (u32::from(u8::from_le_bytes([b[1]])) << 8)) << 16))
+    bytes
+        .chunks_exact(2)
+        .map(|b| {
+            f32::from_bits(
+                (u32::from(u8::from_le_bytes([b[0]]))
+                    | (u32::from(u8::from_le_bytes([b[1]])) << 8))
+                    << 16,
+            )
+        })
         .collect()
 }
 
@@ -18,16 +25,23 @@ pub(super) fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 /// RMSNorm: out[i] = x[i] / rms(x) * (w[i] + offset)
 pub(super) fn rms_norm(x: &[f32], w: &[f32], eps: f32, offset: f32) -> Vec<f32> {
-    if w.is_empty() || x.is_empty() { return x.to_vec(); }
+    if w.is_empty() || x.is_empty() {
+        return x.to_vec();
+    }
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt();
-    x.iter().zip(w.iter()).map(|(&xi, &wi)| xi / rms * (wi + offset)).collect()
+    x.iter()
+        .zip(w.iter())
+        .map(|(&xi, &wi)| xi / rms * (wi + offset))
+        .collect()
 }
 
 /// Parameter-free RMSNorm (HF `Gemma4RMSNorm(with_scale=False)`): scales
 /// `x` by `1/sqrt(mean(x²) + eps)` with no learned weight. Used by the
 /// Gemma 4 router, whose norm has no `.weight` tensor on disk.
 pub(super) fn rms_norm_no_weight(x: &[f32], eps: f32) -> Vec<f32> {
-    if x.is_empty() { return Vec::new(); }
+    if x.is_empty() {
+        return Vec::new();
+    }
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt();
     x.iter().map(|v| v / rms).collect()
 }
@@ -56,7 +70,9 @@ pub(super) fn gelu_tanh(x: f32) -> f32 {
 pub(super) fn matmul_vec(x: &[f32], w: &[f32], out_rows: usize, in_cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_rows * in_cols);
     debug_assert_eq!(x.len(), in_cols);
-    if out_rows == 0 || in_cols == 0 { return vec![0.0f32; out_rows]; }
+    if out_rows == 0 || in_cols == 0 {
+        return vec![0.0f32; out_rows];
+    }
     let w_view = ndarray::ArrayView2::from_shape((out_rows, in_cols), w)
         .expect("matmul_vec: weight shape mismatch");
     let x_view = ndarray::ArrayView1::from(x);
@@ -69,8 +85,15 @@ pub(super) fn matmul_vec(x: &[f32], w: &[f32], out_rows: usize, in_cols: usize) 
 pub(super) fn softmax(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
-    for x in v.iter_mut() { *x = (*x - max).exp(); sum += *x; }
-    if sum > 0.0 { for x in v.iter_mut() { *x /= sum; } }
+    for x in v.iter_mut() {
+        *x = (*x - max).exp();
+        sum += *x;
+    }
+    if sum > 0.0 {
+        for x in v.iter_mut() {
+            *x /= sum;
+        }
+    }
 }
 
 /// Top-k indices by value (descending). Returns (indices, values).
@@ -113,7 +136,9 @@ mod tests {
         let x = vec![2.0; 8];
         let w = vec![1.0; 8];
         let out = rms_norm(&x, &w, 0.0, 0.0);
-        for &v in &out { assert!((v - 1.0).abs() < 1e-5, "expected 1.0, got {v}"); }
+        for &v in &out {
+            assert!((v - 1.0).abs() < 1e-5, "expected 1.0, got {v}");
+        }
     }
 
     /// `rms_norm` with empty weight slice returns the input unchanged
@@ -131,7 +156,10 @@ mod tests {
         let x = vec![2.0, 4.0, 6.0, 8.0];
         let out = rms_norm_no_weight(&x, 1e-6);
         let mean_sq: f32 = out.iter().map(|v| v * v).sum::<f32>() / out.len() as f32;
-        assert!((mean_sq - 1.0).abs() < 1e-4, "mean(out²)={mean_sq:.5} ≠ 1.0");
+        assert!(
+            (mean_sq - 1.0).abs() < 1e-4,
+            "mean(out²)={mean_sq:.5} ≠ 1.0"
+        );
     }
 
     /// SiLU(0) = 0, SiLU(x) → x as x → ∞, SiLU(x) → 0 as x → -∞.
@@ -146,7 +174,7 @@ mod tests {
     #[test]
     fn top_k_descending_with_k_capped_at_len() {
         let (idx, val) = top_k(&[0.1, 0.5, 0.3, 0.9, 0.2], 3);
-        assert_eq!(idx, vec![3, 1, 2]);  // values 0.9, 0.5, 0.3
+        assert_eq!(idx, vec![3, 1, 2]); // values 0.9, 0.5, 0.3
         assert_eq!(val, vec![0.9, 0.5, 0.3]);
 
         // k > len — get all in descending order.
@@ -162,16 +190,22 @@ mod tests {
         let sum: f32 = v.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "softmax sum={sum} ≠ 1");
         // Largest input → largest output.
-        let max_idx = v.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        let max_idx = v
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
         assert_eq!(max_idx, 3, "max input index should be max output index");
     }
 
     /// `matmul_vec` agrees with a hand-rolled scalar reference.
     #[test]
     fn matmul_vec_matches_scalar_reference() {
-        let w = vec![1.0, 2.0, 3.0,    // row 0
-                     4.0, 5.0, 6.0];   // row 1
+        let w = vec![
+            1.0, 2.0, 3.0, // row 0
+            4.0, 5.0, 6.0,
+        ]; // row 1
         let x = vec![1.0, 1.0, 1.0];
         let out = matmul_vec(&x, &w, 2, 3);
         // Hand-computed: row0 = 1+2+3 = 6; row1 = 4+5+6 = 15.

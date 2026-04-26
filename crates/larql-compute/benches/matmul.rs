@@ -22,9 +22,9 @@
 extern crate blas_src;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use ndarray::Array2;
 use larql_compute::prelude::*;
 use larql_compute::CpuBackend;
+use ndarray::Array2;
 
 fn synth_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
     let mut state = seed;
@@ -47,9 +47,15 @@ fn bench_matmul_transb(c: &mut Criterion) {
     #[cfg(feature = "metal")]
     let metal = larql_compute::metal::MetalBackend::new();
     #[cfg(feature = "metal")]
-    if let Some(ref m) = metal { m.set_flop_threshold(1); }
+    if let Some(ref m) = metal {
+        m.set_flop_threshold(1);
+    }
 
-    for &(m, n, k) in &[(6usize, 2_560usize, 2_560usize), (6, 10_240, 2_560), (1, 262_144, 2_560)] {
+    for &(m, n, k) in &[
+        (6usize, 2_560usize, 2_560usize),
+        (6, 10_240, 2_560),
+        (1, 262_144, 2_560),
+    ] {
         let a = synth_matrix(m, k, 42);
         let b = synth_matrix(n, k, 43);
         let label = format!("M{m}_N{n}_K{k}");
@@ -84,7 +90,9 @@ fn bench_matmul_transb(c: &mut Criterion) {
 /// row-per-simdgroup `f32_gemv` shader's the specialised replacement.
 #[cfg(feature = "metal")]
 fn bench_f32_gemv_lmhead(c: &mut Criterion) {
-    let Some(metal) = larql_compute::metal::MetalBackend::new() else { return; };
+    let Some(metal) = larql_compute::metal::MetalBackend::new() else {
+        return;
+    };
     metal.set_flop_threshold(1);
 
     let n = 262_144usize;
@@ -95,14 +103,18 @@ fn bench_f32_gemv_lmhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("f32_gemv_lmhead");
     group.sample_size(20);
     group.throughput(Throughput::Elements((n * k) as u64));
-    group.bench_function(BenchmarkId::from_parameter("metal/N262144_K2560"), |bench| {
-        bench.iter(|| metal.f32_gemv_force(w.view(), &x));
-    });
+    group.bench_function(
+        BenchmarkId::from_parameter("metal/N262144_K2560"),
+        |bench| {
+            bench.iter(|| metal.f32_gemv_force(w.view(), &x));
+        },
+    );
     group.finish();
 }
 
 #[cfg(not(feature = "metal"))]
-fn bench_f32_gemv_lmhead(_c: &mut Criterion) { /* metal-only */ }
+fn bench_f32_gemv_lmhead(_c: &mut Criterion) { /* metal-only */
+}
 
 criterion_group!(benches, bench_matmul_transb, bench_f32_gemv_lmhead);
 criterion_main!(benches);

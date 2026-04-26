@@ -54,7 +54,9 @@ pub(super) fn populate_kv_after_commit(
     layers: &[FullPipelineLayer<'_>],
     seq_len: usize,
 ) {
-    let Some(kv) = kv_cache else { return; };
+    let Some(kv) = kv_cache else {
+        return;
+    };
     for (l, layer) in layers.iter().enumerate() {
         let lhd = layer.head_dim;
         let lnkv = layer.num_kv_heads;
@@ -87,27 +89,55 @@ mod tests {
     /// Construct a minimal `FullPipelineLayer` with the per-layer
     /// dims this test cares about. All other fields hold the smallest
     /// valid value.
-    fn synth_layer(num_q_heads: usize, num_kv_heads: usize, head_dim: usize) -> FullPipelineLayer<'static> {
+    fn synth_layer(
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> FullPipelineLayer<'static> {
         let q4 = Box::leak(vec![0u8; 32 * 18].into_boxed_slice());
         let norm = Box::leak(vec![1.0f32; 32].into_boxed_slice());
-        let q4w = || QuantWeight { data: q4, scales: None, format: QuantFormat::Q4_K };
+        let q4w = || QuantWeight {
+            data: q4,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
         FullPipelineLayer {
-            wq: q4w(), wk: q4w(), wv: q4w(), wo: q4w(),
-            gate: q4w(), up: q4w(), down: q4w(),
-            input_norm: norm, post_attn_norm: norm,
-            pre_ffn_norm: None, post_ffn_norm: None,
-            input_norm_bias: None, post_attn_norm_bias: None,
-            norm_offset: 1.0, qk_norm_offset: 1.0, eps: 1e-6,
+            wq: q4w(),
+            wk: q4w(),
+            wv: q4w(),
+            wo: q4w(),
+            gate: q4w(),
+            up: q4w(),
+            down: q4w(),
+            input_norm: norm,
+            post_attn_norm: norm,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 1.0,
+            qk_norm_offset: 1.0,
+            eps: 1e-6,
             has_post_norms: false,
-            norm_type: NormType::RmsNorm, ffn_type: FfnType::Gated,
+            norm_type: NormType::RmsNorm,
+            ffn_type: FfnType::Gated,
             activation: Activation::Silu,
             attn_scale: 0.125,
-            head_dim, num_q_heads, num_kv_heads,
-            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
-            has_v_norm: false, layer_scalar: 0.0,
-            q_norm_weight: None, k_norm_weight: None,
-            ffn_up_bias: None, ffn_down_bias: None,
-            moe: None, moe_combined_output_norm: false, moe_outer_post_norm: None,
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
+            rope_base: 10000.0,
+            rotary_dim: 0,
+            sliding_window: 0,
+            has_v_norm: false,
+            layer_scalar: 0.0,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            moe: None,
+            moe_combined_output_norm: false,
+            moe_outer_post_norm: None,
         }
     }
 
@@ -120,13 +150,17 @@ mod tests {
     /// Write a known f32 pattern into a Metal Buffer's contents.
     fn write_metal_f32(buf: &metal::Buffer, src: &[f32]) {
         let ptr = buf.contents() as *mut f32;
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len()); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
+        }
     }
 
     /// `None` cache → no-op. Function returns silently without panicking.
     #[test]
     fn populate_kv_after_commit_with_none_cache_is_a_noop() {
-        let Some(metal) = MetalBackend::new() else { return; };
+        let Some(metal) = MetalBackend::new() else {
+            return;
+        };
         let layers = vec![synth_layer(8, 4, 64)];
         let lb = LayerBuffers::allocate(metal.bufs(), &layers, &[0.0; 64], 64, 256, 1, 8 * 64);
         // Pre-condition: function returns without touching anything.
@@ -137,14 +171,16 @@ mod tests {
     /// destination layer with the right byte count and `current_len`.
     #[test]
     fn populate_kv_after_commit_copies_into_correct_layer() {
-        let Some(metal) = MetalBackend::new() else { return; };
+        let Some(metal) = MetalBackend::new() else {
+            return;
+        };
         let bufs = metal.bufs();
 
         let head_dim = 64;
         let num_kv_heads = 4;
-        let lkv = num_kv_heads * head_dim;   // 256
+        let lkv = num_kv_heads * head_dim; // 256
         let seq_len = 3;
-        let total = seq_len * lkv;            // 768 floats per layer
+        let total = seq_len * lkv; // 768 floats per layer
         let layers = vec![
             synth_layer(8, num_kv_heads, head_dim),
             synth_layer(8, num_kv_heads, head_dim),
@@ -153,9 +189,8 @@ mod tests {
 
         // Stamp distinguishable patterns into each layer's k_out / v_out.
         // L0 K = [100.0, 100.1, 100.2, …]; L0 V = [200.0, …]; L1 K = [300.0, …]; L1 V = [400.0, …].
-        let mk_pattern = |base: f32, n: usize| -> Vec<f32> {
-            (0..n).map(|i| base + i as f32 * 0.1).collect()
-        };
+        let mk_pattern =
+            |base: f32, n: usize| -> Vec<f32> { (0..n).map(|i| base + i as f32 * 0.1).collect() };
         let l0_k = mk_pattern(100.0, total);
         let l0_v = mk_pattern(200.0, total);
         let l1_k = mk_pattern(300.0, total);
@@ -194,7 +229,9 @@ mod tests {
     /// model decoded first and a larger one hits the same backend.
     #[test]
     fn populate_kv_after_commit_grows_undersized_cache() {
-        let Some(metal) = MetalBackend::new() else { return; };
+        let Some(metal) = MetalBackend::new() else {
+            return;
+        };
         let bufs = metal.bufs();
 
         let layers = vec![
@@ -222,13 +259,15 @@ mod tests {
     /// batched MoE prefill commit loop.
     #[test]
     fn populate_kv_one_layer_updates_only_target_layer() {
-        let Some(metal) = MetalBackend::new() else { return; };
+        let Some(metal) = MetalBackend::new() else {
+            return;
+        };
         let bufs = metal.bufs();
 
-        let head_dim    = 64usize;
+        let head_dim = 64usize;
         let num_kv_heads = 4usize;
-        let seq_len     = 3usize;
-        let total_kv    = seq_len * num_kv_heads * head_dim;
+        let seq_len = 3usize;
+        let total_kv = seq_len * num_kv_heads * head_dim;
 
         let layers = vec![
             synth_layer(8, num_kv_heads, head_dim),
@@ -252,7 +291,10 @@ mod tests {
         assert_eq!(kv.layers[0].current_len, 0, "layer 0 must not be updated");
 
         // Layer 1 must reflect the stamped K/V.
-        assert_eq!(kv.layers[1].current_len, seq_len, "layer 1 current_len updated");
+        assert_eq!(
+            kv.layers[1].current_len, seq_len,
+            "layer 1 current_len updated"
+        );
         let k_got = read_metal_f32(&kv.layers[1].k_cache, total_kv);
         let v_got = read_metal_f32(&kv.layers[1].v_cache, total_kv);
         assert_eq!(k_got, k_pat, "K cache mismatch");
@@ -263,7 +305,9 @@ mod tests {
     /// `populate_kv_after_commit` grow path, but per layer).
     #[test]
     fn populate_kv_one_layer_grows_empty_cache() {
-        let Some(metal) = MetalBackend::new() else { return; };
+        let Some(metal) = MetalBackend::new() else {
+            return;
+        };
         let bufs = metal.bufs();
 
         let layers = vec![synth_layer(8, 4, 64), synth_layer(8, 4, 64)];
@@ -272,7 +316,10 @@ mod tests {
         let mut kv = KVCache { layers: vec![] };
         // Populate layer 1 into an empty cache — must grow to at least 2 layers.
         populate_kv_one_layer(&mut kv, bufs, &lb, &layers[1], 1, 1);
-        assert!(kv.layers.len() >= 2, "cache must grow to hold the target layer");
+        assert!(
+            kv.layers.len() >= 2,
+            "cache must grow to hold the target layer"
+        );
         assert_eq!(kv.layers[1].current_len, 1);
     }
 }

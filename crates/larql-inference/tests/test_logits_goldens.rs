@@ -50,8 +50,8 @@ use larql_compute::{ComputeBackend, CpuBackend};
 use larql_inference::layer_graph::{generate, lm_head_topk, CachedLayerGraph};
 use larql_inference::wrap_chat_prompt;
 use larql_vindex::{
-    load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer,
-    SilentLoadCallbacks, VectorIndex,
+    load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer, SilentLoadCallbacks,
+    VectorIndex,
 };
 
 /// Tolerance for the top-1 logit value. f32 noise across CPU vs Metal
@@ -93,49 +93,67 @@ const GOLDENS: &[Golden] = &[
     // backends agree to within Q4 round-trip noise and the goldens
     // collapse to one set per arch.
     Golden {
-        arch_name: "gemma3-4b-it", vindex_name: "gemma3-4b-q4k-v2", backend: "metal",
+        arch_name: "gemma3-4b-it",
+        vindex_name: "gemma3-4b-q4k-v2",
+        backend: "metal",
         top5_token_ids: [256240, 256331, 250251, 249309, 212287],
         top1_logit: 3632.169922,
     },
     Golden {
-        arch_name: "gemma3-4b-it", vindex_name: "gemma3-4b-q4k-v2", backend: "cpu",
+        arch_name: "gemma3-4b-it",
+        vindex_name: "gemma3-4b-q4k-v2",
+        backend: "cpu",
         top5_token_ids: [256240, 256331, 250251, 249309, 212287],
         top1_logit: 3632.169922,
     },
     Golden {
-        arch_name: "gemma4-31b-it (dense)", vindex_name: "gemma4-31b-q4k", backend: "metal",
+        arch_name: "gemma4-31b-it (dense)",
+        vindex_name: "gemma4-31b-q4k",
+        backend: "metal",
         top5_token_ids: [236780, 236772, 236798, 236799, 236814],
         top1_logit: 2.261745,
     },
     Golden {
-        arch_name: "gemma4-31b-it (dense)", vindex_name: "gemma4-31b-q4k", backend: "cpu",
+        arch_name: "gemma4-31b-it (dense)",
+        vindex_name: "gemma4-31b-q4k",
+        backend: "cpu",
         top5_token_ids: [236780, 236772, 236798, 236799, 236814],
         top1_logit: 2.261745,
     },
     Golden {
-        arch_name: "llama2-7b-hf (base)", vindex_name: "llama2-7b-q4k", backend: "metal",
+        arch_name: "llama2-7b-hf (base)",
+        vindex_name: "llama2-7b-q4k",
+        backend: "metal",
         top5_token_ids: [263, 278, 697, 3681, 884],
         top1_logit: 29.988144,
     },
     Golden {
-        arch_name: "llama2-7b-hf (base)", vindex_name: "llama2-7b-q4k", backend: "cpu",
+        arch_name: "llama2-7b-hf (base)",
+        vindex_name: "llama2-7b-q4k",
+        backend: "cpu",
         top5_token_ids: [263, 278, 697, 3681, 884],
         top1_logit: 29.988144,
     },
     Golden {
-        arch_name: "mistral-7b-v0.1 (base)", vindex_name: "mistral-7b-v0.1-q4k", backend: "metal",
+        arch_name: "mistral-7b-v0.1 (base)",
+        vindex_name: "mistral-7b-v0.1-q4k",
+        backend: "metal",
         top5_token_ids: [5465, 264, 272, 5651, 624],
         top1_logit: 1.452387,
     },
     Golden {
-        arch_name: "mistral-7b-v0.1 (base)", vindex_name: "mistral-7b-v0.1-q4k", backend: "cpu",
+        arch_name: "mistral-7b-v0.1 (base)",
+        vindex_name: "mistral-7b-v0.1-q4k",
+        backend: "cpu",
         top5_token_ids: [5465, 264, 272, 5651, 624],
         top1_logit: 1.452387,
     },
 ];
 
 fn lookup_golden(vindex: &str, backend: &str) -> Option<&'static Golden> {
-    GOLDENS.iter().find(|g| g.vindex_name == vindex && g.backend == backend)
+    GOLDENS
+        .iter()
+        .find(|g| g.vindex_name == vindex && g.backend == backend)
 }
 
 fn find_vindex(name: &str) -> Option<PathBuf> {
@@ -145,15 +163,23 @@ fn find_vindex(name: &str) -> Option<PathBuf> {
         name.to_uppercase().replace('-', "_")
     )) {
         let p = PathBuf::from(env_path);
-        if p.is_dir() { return Some(p); }
+        if p.is_dir() {
+            return Some(p);
+        }
     }
     let chris_models = PathBuf::from("/Users/christopherhay/chris-models").join(&filename);
-    if chris_models.is_dir() { return Some(chris_models); }
+    if chris_models.is_dir() {
+        return Some(chris_models);
+    }
     let home = std::env::var("HOME").ok()?;
     [
-        PathBuf::from(&home).join(".cache/larql/local").join(&filename),
+        PathBuf::from(&home)
+            .join(".cache/larql/local")
+            .join(&filename),
         PathBuf::from("output").join(&filename),
-    ].into_iter().find(|p| p.is_dir())
+    ]
+    .into_iter()
+    .find(|p| p.is_dir())
 }
 
 fn strict_mode() -> bool {
@@ -191,7 +217,16 @@ fn capture_top5(
     // is what we'll scoreboard against the LM head.
     let cached = CachedLayerGraph::from_residuals(Vec::new());
     let n = weights.num_layers;
-    let _ = generate(weights, tokenizer, prompt_ids, 1, index, backend, &cached, 0..n);
+    let _ = generate(
+        weights,
+        tokenizer,
+        prompt_ids,
+        1,
+        index,
+        backend,
+        &cached,
+        0..n,
+    );
 
     // The per-token decode in `generate` runs the LM head internally.
     // To get the logits at the prompt's last position (not at the
@@ -219,7 +254,11 @@ fn capture_top5(
 /// Body shared by every (arch × backend) test. Loads the vindex,
 /// runs prefill, captures top-5, asserts against the pinned golden
 /// (or prints in `LARQL_LOGITS_GOLDENS_PRINT=1` mode).
-fn check_golden(g: &Golden, backend_name: &str, backend: &dyn ComputeBackend) -> Result<(), String> {
+fn check_golden(
+    g: &Golden,
+    backend_name: &str,
+    backend: &dyn ComputeBackend,
+) -> Result<(), String> {
     let Some(vindex_path) = find_vindex(g.vindex_name) else {
         if strict_mode() {
             return Err(format!(
@@ -235,25 +274,29 @@ fn check_golden(g: &Golden, backend_name: &str, backend: &dyn ComputeBackend) ->
     };
 
     let mut cb = SilentLoadCallbacks;
-    let cfg = load_vindex_config(&vindex_path)
-        .map_err(|e| format!("load_vindex_config: {e}"))?;
-    let tokenizer = load_vindex_tokenizer(&vindex_path)
-        .map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
-    let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb)
-        .map_err(|e| format!("load vindex: {e}"))?;
-    q4_index.load_attn_q4k(&vindex_path).map_err(|e| format!("load_attn_q4k: {e}"))?;
-    q4_index.load_interleaved_q4k(&vindex_path).map_err(|e| format!("load_interleaved_q4k: {e}"))?;
+    let cfg = load_vindex_config(&vindex_path).map_err(|e| format!("load_vindex_config: {e}"))?;
+    let tokenizer =
+        load_vindex_tokenizer(&vindex_path).map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
+    let mut q4_index =
+        VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
+    q4_index
+        .load_attn_q4k(&vindex_path)
+        .map_err(|e| format!("load_attn_q4k: {e}"))?;
+    q4_index
+        .load_interleaved_q4k(&vindex_path)
+        .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
     let _ = q4_index.load_lm_head_q4(&vindex_path);
 
-    let mut weights = load_model_weights_q4k(&vindex_path, &mut cb)
-        .map_err(|e| format!("load weights: {e}"))?;
+    let mut weights =
+        load_model_weights_q4k(&vindex_path, &mut cb).map_err(|e| format!("load weights: {e}"))?;
 
     let wrap = wrap_chat_prompt(&vindex_path, Some(cfg.model.as_str()), PROMPT);
     let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrap.prompt)
         .map_err(|e| format!("encode_prompt: {e}"))?;
 
     let top5 = capture_top5(&mut weights, &tokenizer, &q4_index, backend, &prompt_ids)?;
-    let actual_ids: [u32; 5] = std::array::from_fn(|i| top5.get(i).map(|t| t.0).unwrap_or(u32::MAX));
+    let actual_ids: [u32; 5] =
+        std::array::from_fn(|i| top5.get(i).map(|t| t.0).unwrap_or(u32::MAX));
     let actual_top1_logit = top5[0].1;
 
     if print_mode() {
@@ -269,8 +312,10 @@ fn check_golden(g: &Golden, backend_name: &str, backend: &dyn ComputeBackend) ->
     // noise can swap rank within the top-5 across backends (CPU BLAS
     // vs Metal f32_gemv accumulate in different order), so requiring
     // strict order would flag noise as a regression.
-    let mut want: Vec<u32> = g.top5_token_ids.to_vec(); want.sort_unstable();
-    let mut got: Vec<u32> = actual_ids.to_vec(); got.sort_unstable();
+    let mut want: Vec<u32> = g.top5_token_ids.to_vec();
+    want.sort_unstable();
+    let mut got: Vec<u32> = actual_ids.to_vec();
+    got.sort_unstable();
     if want != got {
         return Err(format!(
             "[{}/{backend_name}] top-5 set mismatch:\n  expected (sorted): {:?}\n  got      (sorted): {:?}\n  raw expected: {:?}\n  raw got:      {:?}",
@@ -301,24 +346,48 @@ fn metal_backend() -> Option<larql_compute::metal::MetalBackend> {
 
 fn run_metal(vindex: &str) {
     let Some(metal) = metal_backend() else {
-        eprintln!("skip: Metal backend unavailable"); return;
+        eprintln!("skip: Metal backend unavailable");
+        return;
     };
-    let g = lookup_golden(vindex, "metal")
-        .unwrap_or_else(|| panic!("no metal golden for {vindex}"));
+    let g =
+        lookup_golden(vindex, "metal").unwrap_or_else(|| panic!("no metal golden for {vindex}"));
     check_golden(g, "metal", &metal).unwrap_or_else(|e| panic!("{e}"));
 }
 
 fn run_cpu(vindex: &str) {
-    let g = lookup_golden(vindex, "cpu")
-        .unwrap_or_else(|| panic!("no cpu golden for {vindex}"));
+    let g = lookup_golden(vindex, "cpu").unwrap_or_else(|| panic!("no cpu golden for {vindex}"));
     check_golden(g, "cpu", &CpuBackend).unwrap_or_else(|e| panic!("{e}"));
 }
 
-#[test] fn logits_golden_gemma3_4b_metal()      { run_metal("gemma3-4b-q4k-v2"); }
-#[test] fn logits_golden_gemma3_4b_cpu()        { run_cpu("gemma3-4b-q4k-v2"); }
-#[test] fn logits_golden_gemma4_31b_dense_metal() { run_metal("gemma4-31b-q4k"); }
-#[test] fn logits_golden_gemma4_31b_dense_cpu()   { run_cpu("gemma4-31b-q4k"); }
-#[test] fn logits_golden_llama2_7b_metal()      { run_metal("llama2-7b-q4k"); }
-#[test] fn logits_golden_llama2_7b_cpu()        { run_cpu("llama2-7b-q4k"); }
-#[test] fn logits_golden_mistral_7b_metal()     { run_metal("mistral-7b-v0.1-q4k"); }
-#[test] fn logits_golden_mistral_7b_cpu()       { run_cpu("mistral-7b-v0.1-q4k"); }
+#[test]
+fn logits_golden_gemma3_4b_metal() {
+    run_metal("gemma3-4b-q4k-v2");
+}
+#[test]
+fn logits_golden_gemma3_4b_cpu() {
+    run_cpu("gemma3-4b-q4k-v2");
+}
+#[test]
+fn logits_golden_gemma4_31b_dense_metal() {
+    run_metal("gemma4-31b-q4k");
+}
+#[test]
+fn logits_golden_gemma4_31b_dense_cpu() {
+    run_cpu("gemma4-31b-q4k");
+}
+#[test]
+fn logits_golden_llama2_7b_metal() {
+    run_metal("llama2-7b-q4k");
+}
+#[test]
+fn logits_golden_llama2_7b_cpu() {
+    run_cpu("llama2-7b-q4k");
+}
+#[test]
+fn logits_golden_mistral_7b_metal() {
+    run_metal("mistral-7b-v0.1-q4k");
+}
+#[test]
+fn logits_golden_mistral_7b_cpu() {
+    run_cpu("mistral-7b-v0.1-q4k");
+}

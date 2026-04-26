@@ -8,8 +8,8 @@
 //! desync the dispatcher. (See `metal::kernel` and the q4_matvec_v4
 //! 75 %-row-drop ship-log entry.)
 
-use std::ffi::c_void;
 use metal::*;
+use std::ffi::c_void;
 
 use crate::metal::buffers::BufferCache;
 use crate::metal::kernel::KernelHandle;
@@ -43,7 +43,17 @@ pub fn dispatch(
 
     let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    encode(enc, kernel, &buf_q4, &buf_q8, &buf_scales, &buf_out, n_val, k_val, num_rows);
+    encode(
+        enc,
+        kernel,
+        &buf_q4,
+        &buf_q8,
+        &buf_scales,
+        &buf_out,
+        n_val,
+        k_val,
+        num_rows,
+    );
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();

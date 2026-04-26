@@ -11,12 +11,12 @@
 mod common;
 use common::*;
 
+use axum::http::StatusCode;
+use larql_server::state::LoadedModel;
+use larql_vindex::{ndarray::Array2, PatchedVindex};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use axum::http::StatusCode;
-use larql_vindex::{ndarray::Array2, PatchedVindex};
-use larql_server::state::LoadedModel;
 
 /// Build a model_functional variant with probe labels on (layer=0, feature=0) → "capital".
 /// This allows walk and describe to cover the probe label branch.
@@ -72,12 +72,11 @@ async fn http_walk_functional_hits_contain_paris() {
     let hits = body["hits"].as_array().unwrap();
     assert!(!hits.is_empty(), "expected at least one hit for 'France'");
     // The top hit should be "Paris" (feature 0, gate [1,0,0,0] matches embed row 0)
-    let targets: Vec<&str> = hits.iter()
-        .filter_map(|h| h["target"].as_str())
-        .collect();
+    let targets: Vec<&str> = hits.iter().filter_map(|h| h["target"].as_str()).collect();
     assert!(
         targets.contains(&"Paris"),
-        "expected 'Paris' in walk hits, got: {:?}", targets
+        "expected 'Paris' in walk hits, got: {:?}",
+        targets
     );
 }
 
@@ -107,7 +106,10 @@ async fn http_walk_functional_with_oob_layer() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let hits = body["hits"].as_array().unwrap();
-    assert!(hits.is_empty(), "out-of-range layer should return empty hits");
+    assert!(
+        hits.is_empty(),
+        "out-of-range layer should return empty hits"
+    );
 }
 
 #[tokio::test]
@@ -137,7 +139,10 @@ async fn http_describe_functional_returns_edges() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
-    assert!(!edges.is_empty(), "expected non-empty edges for 'France' with min_score=0");
+    assert!(
+        !edges.is_empty(),
+        "expected non-empty edges for 'France' with min_score=0"
+    );
 }
 
 #[tokio::test]
@@ -147,12 +152,11 @@ async fn http_describe_functional_paris_edge() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
-    let targets: Vec<&str> = edges.iter()
-        .filter_map(|e| e["target"].as_str())
-        .collect();
+    let targets: Vec<&str> = edges.iter().filter_map(|e| e["target"].as_str()).collect();
     assert!(
         targets.contains(&"Paris"),
-        "expected 'Paris' in describe edges, got: {:?}", targets
+        "expected 'Paris' in describe edges, got: {:?}",
+        targets
     );
 }
 
@@ -207,7 +211,10 @@ async fn http_describe_functional_min_score_filter() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
-    assert!(edges.is_empty(), "min_score=100 should filter all edges (max score is 0.95)");
+    assert!(
+        edges.is_empty(),
+        "min_score=100 should filter all edges (max score is 0.95)"
+    );
 }
 
 #[tokio::test]
@@ -219,9 +226,7 @@ async fn http_describe_functional_self_ref_filtered() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let edges = body["edges"].as_array().unwrap();
-    let targets: Vec<&str> = edges.iter()
-        .filter_map(|e| e["target"].as_str())
-        .collect();
+    let targets: Vec<&str> = edges.iter().filter_map(|e| e["target"].as_str()).collect();
     assert!(
         !targets.iter().any(|t| t.to_lowercase() == "paris"),
         "self-reference 'Paris' should be filtered from describe results"
@@ -246,11 +251,16 @@ async fn http_describe_functional_multi_model() {
 async fn http_insert_functional_with_tokenizer() {
     // Insert still works (embedding fallback) with the functional tokenizer
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/insert", serde_json::json!({
-        "entity": "France",
-        "relation": "capital",
-        "target": "Paris"
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/insert",
+        serde_json::json!({
+            "entity": "France",
+            "relation": "capital",
+            "target": "Paris"
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["entity"], "France");
@@ -288,12 +298,11 @@ async fn http_walk_with_probe_label_includes_relation_field() {
     let hits = body["hits"].as_array().unwrap();
     assert!(!hits.is_empty(), "expected at least one hit");
     // The top hit should have relation = "capital" from probe labels.
-    let relations: Vec<Option<&str>> = hits.iter()
-        .map(|h| h["relation"].as_str())
-        .collect();
+    let relations: Vec<Option<&str>> = hits.iter().map(|h| h["relation"].as_str()).collect();
     assert!(
-        relations.iter().any(|r| *r == Some("capital")),
-        "expected 'relation' = 'capital' in a walk hit (probe label branch), got hits: {:?}", hits
+        relations.contains(&Some("capital")),
+        "expected 'relation' = 'capital' in a walk hit (probe label branch), got hits: {:?}",
+        hits
     );
 }
 
@@ -332,7 +341,11 @@ async fn http_describe_multi_token_entity_averages_embeddings() {
     // This exercises the multi-token averaging branch in describe_entity.
     let app = single_model_router(state(vec![model_functional("test")]));
     // URL-encode "France capital" as "France%20capital" to send as entity param.
-    let resp = get(app, "/v1/describe?entity=France%20capital&min_score=0&band=all").await;
+    let resp = get(
+        app,
+        "/v1/describe?entity=France%20capital&min_score=0&band=all",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["entity"], "France capital");
@@ -348,10 +361,15 @@ async fn http_describe_multi_token_entity_averages_embeddings() {
 async fn http_walk_ffn_features_single_layer_returns_200() {
     // features-only mode (full_output=false, default) — no model weights needed.
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/walk-ffn", serde_json::json!({
-        "layer": 0,
-        "residual": [1.0, 0.0, 0.0, 0.0]
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/walk-ffn",
+        serde_json::json!({
+            "layer": 0,
+            "residual": [1.0, 0.0, 0.0, 0.0]
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     // features-only single layer: response has "layer", "features", "scores"
@@ -364,11 +382,16 @@ async fn http_walk_ffn_features_single_layer_returns_200() {
 async fn http_walk_ffn_features_single_layer_top_hit_is_feature_0() {
     // "France" embedding [1,0,0,0] should score highest against gate feature 0 ("Paris")
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/walk-ffn", serde_json::json!({
-        "layer": 0,
-        "residual": [1.0, 0.0, 0.0, 0.0],
-        "top_k": 3
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/walk-ffn",
+        serde_json::json!({
+            "layer": 0,
+            "residual": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 3
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     let features = body["features"].as_array().unwrap();
@@ -381,10 +404,15 @@ async fn http_walk_ffn_features_layers_array_single_returns_layer_format() {
     // When layers=[0] (exactly one), the handler returns single-layer format
     // (top-level "features"/"scores" keys, no "results" wrapper).
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/walk-ffn", serde_json::json!({
-        "layers": [0],
-        "residual": [1.0, 0.0, 0.0, 0.0]
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/walk-ffn",
+        serde_json::json!({
+            "layers": [0],
+            "residual": [1.0, 0.0, 0.0, 0.0]
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["layer"], 0);
@@ -396,9 +424,14 @@ async fn http_walk_ffn_features_layers_array_single_returns_layer_format() {
 async fn http_walk_ffn_missing_layer_returns_400() {
     // Neither layer nor layers → bad request
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/walk-ffn", serde_json::json!({
-        "residual": [1.0, 0.0, 0.0, 0.0]
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/walk-ffn",
+        serde_json::json!({
+            "residual": [1.0, 0.0, 0.0, 0.0]
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -406,20 +439,30 @@ async fn http_walk_ffn_missing_layer_returns_400() {
 async fn http_walk_ffn_wrong_residual_size_returns_400() {
     // hidden=4 but residual has 3 elements → bad request
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/walk-ffn", serde_json::json!({
-        "layer": 0,
-        "residual": [1.0, 0.0, 0.0]  // 3 elements, hidden=4
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/walk-ffn",
+        serde_json::json!({
+            "layer": 0,
+            "residual": [1.0, 0.0, 0.0]  // 3 elements, hidden=4
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn http_walk_ffn_multi_model_not_found() {
     let app = multi_model_router(state(vec![model_functional("a")]));
-    let resp = post_json(app, "/v1/nosuchmodel/walk-ffn", serde_json::json!({
-        "layer": 0,
-        "residual": [1.0, 0.0, 0.0, 0.0]
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/nosuchmodel/walk-ffn",
+        serde_json::json!({
+            "layer": 0,
+            "residual": [1.0, 0.0, 0.0, 0.0]
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -449,7 +492,7 @@ async fn http_walk_ffn_binary_without_full_output_returns_400() {
                 .uri("/v1/walk-ffn")
                 .header("content-type", binary_ct)
                 .body(Body::from(body))
-                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -459,10 +502,15 @@ async fn http_walk_ffn_binary_without_full_output_returns_400() {
 #[tokio::test]
 async fn http_walk_ffn_latency_ms_in_response() {
     let app = single_model_router(state(vec![model_functional("test")]));
-    let resp = post_json(app, "/v1/walk-ffn", serde_json::json!({
-        "layer": 0,
-        "residual": [1.0, 0.0, 0.0, 0.0]
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/walk-ffn",
+        serde_json::json!({
+            "layer": 0,
+            "residual": [1.0, 0.0, 0.0, 0.0]
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert!(body["latency_ms"].as_f64().is_some());
@@ -517,11 +565,16 @@ async fn http_describe_functional_cache_hit_same_etag() {
 #[tokio::test]
 async fn http_insert_multi_model_returns_200() {
     let app = multi_model_router(state(vec![model_functional("a"), model_functional("b")]));
-    let resp = post_json(app, "/v1/a/insert", serde_json::json!({
-        "entity": "France",
-        "relation": "capital",
-        "target": "Paris"
-    })).await;
+    let resp = post_json(
+        app,
+        "/v1/a/insert",
+        serde_json::json!({
+            "entity": "France",
+            "relation": "capital",
+            "target": "Paris"
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["entity"], "France");
@@ -630,8 +683,13 @@ async fn http_patches_session_remove_returns_session_field() {
 
     // Apply a session-scoped patch.
     let app1 = single_model_router(st.clone());
-    post_json_h(app1, "/v1/patches/apply",
-        inline_delete_patch("rm-patch"), ("x-session-id", "rm-session")).await;
+    post_json_h(
+        app1,
+        "/v1/patches/apply",
+        inline_delete_patch("rm-patch"),
+        ("x-session-id", "rm-session"),
+    )
+    .await;
 
     // Remove it via session using get_h helper which sets a header.
     // But delete_h doesn't exist, so build request manually.
@@ -645,7 +703,7 @@ async fn http_patches_session_remove_returns_session_field() {
                 .uri("/v1/patches/rm-patch")
                 .header("x-session-id", "rm-session")
                 .body(Body::empty())
-                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();

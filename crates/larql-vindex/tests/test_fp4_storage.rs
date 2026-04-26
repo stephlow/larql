@@ -28,7 +28,11 @@ fn fixture_paths() -> Option<(PathBuf, PathBuf)> {
         .to_path_buf();
     let src = repo_root.join(SOURCE);
     let tgt = repo_root.join(TARGET);
-    if src.is_dir() && tgt.is_dir() { Some((src, tgt)) } else { None }
+    if src.is_dir() && tgt.is_dir() {
+        Some((src, tgt))
+    } else {
+        None
+    }
 }
 
 /// Read one feature vector from a source vindex (f32 on disk) by direct
@@ -50,9 +54,8 @@ fn read_source_feature(
     let slice = &bytes[offset..offset + hidden * bpf];
     match dtype {
         "f32" => {
-            let v: &[f32] = unsafe {
-                std::slice::from_raw_parts(slice.as_ptr() as *const f32, hidden)
-            };
+            let v: &[f32] =
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const f32, hidden) };
             v.to_vec()
         }
         "f16" => larql_models::quant::half::decode_f16(slice),
@@ -86,19 +89,23 @@ fn fp4_row_dot_matches_source_f32_baseline() {
     };
 
     // Load target's config to get hidden, per-layer counts, precision tags.
-    let tgt_config_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tgt_dir.join("index.json")).unwrap(),
-    ).unwrap();
-    let src_config_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(src_dir.join("index.json")).unwrap(),
-    ).unwrap();
+    let tgt_config_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tgt_dir.join("index.json")).unwrap())
+            .unwrap();
+    let src_config_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(src_dir.join("index.json")).unwrap())
+            .unwrap();
     let hidden = tgt_config_json["hidden_size"].as_u64().unwrap() as usize;
     let per_layer_features: Vec<usize> = tgt_config_json["layers"]
-        .as_array().unwrap()
+        .as_array()
+        .unwrap()
         .iter()
         .map(|l| l["num_features"].as_u64().unwrap() as usize)
         .collect();
-    let src_dtype = src_config_json["dtype"].as_str().unwrap_or("f32").to_string();
+    let src_dtype = src_config_json["dtype"]
+        .as_str()
+        .unwrap_or("f32")
+        .to_string();
 
     let mut cb = SilentLoadCallbacks;
     let index = VectorIndex::load_vindex(&tgt_dir, &mut cb).expect("load");
@@ -116,8 +123,8 @@ fn fp4_row_dot_matches_source_f32_baseline() {
     // policies — gate KNN still wants the dense f32 matrix) are skipped:
     // `fp4_ffn_row_dot` returns None for non-FP4/FP8 components.
     let projections: [(usize, &str, f64, f64); 3] = [
-        (0, "gate_vectors.bin",  0.04, 0.0001), // fp4 tol vs f32 tol (perfect when source-dtype)
-        (1, "up_features.bin",   0.04, 0.0001),
+        (0, "gate_vectors.bin", 0.04, 0.0001), // fp4 tol vs f32 tol (perfect when source-dtype)
+        (1, "up_features.bin", 0.04, 0.0001),
         (2, "down_features.bin", 0.01, 0.0001), // FP8 ~10× tighter
     ];
 
@@ -130,12 +137,18 @@ fn fp4_row_dot_matches_source_f32_baseline() {
         // means the converter linked the source dtype through (gate today)
         // and `fp4_ffn_row_dot` will return None — skip and let the legacy
         // KNN path own that case.
-        let prec = tgt_config_json["fp4"]["projections"]
-            [match *comp { 0 => "gate", 1 => "up", _ => "down" }]
-            ["precision"].as_str().unwrap_or("");
+        let prec = tgt_config_json["fp4"]["projections"][match *comp {
+            0 => "gate",
+            1 => "up",
+            _ => "down",
+        }]["precision"]
+            .as_str()
+            .unwrap_or("");
         if prec != "fp4" && prec != "fp8" {
             assert!(
-                index.fp4_ffn_row_dot(*sample_layers.first().unwrap(), *comp, 0, &x).is_none(),
+                index
+                    .fp4_ffn_row_dot(*sample_layers.first().unwrap(), *comp, 0, &x)
+                    .is_none(),
                 "component {comp} stored as {prec} should return None from fp4_ffn_row_dot"
             );
             continue;
@@ -143,9 +156,17 @@ fn fp4_row_dot_matches_source_f32_baseline() {
         let tol_frac = *fp4_tol;
         for &layer in &sample_layers {
             for &feat in &sample_feats {
-                if feat >= per_layer_features[layer] { continue; }
+                if feat >= per_layer_features[layer] {
+                    continue;
+                }
                 let src_row = read_source_feature(
-                    &src_dir, src_file, layer, feat, hidden, &per_layer_features, &src_dtype,
+                    &src_dir,
+                    src_file,
+                    layer,
+                    feat,
+                    hidden,
+                    &per_layer_features,
+                    &src_dtype,
                 );
                 let src_dot: f32 = src_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
 
@@ -168,7 +189,10 @@ fn fp4_row_dot_matches_source_f32_baseline() {
             }
         }
     }
-    assert!(all_ok, "FP4 row_dot diverged beyond tolerance; see eprintln output");
+    assert!(
+        all_ok,
+        "FP4 row_dot diverged beyond tolerance; see eprintln output"
+    );
 }
 
 #[test]
@@ -177,19 +201,23 @@ fn fp4_row_scaled_add_matches_source_baseline() {
         eprintln!("skipping — fixtures not present");
         return;
     };
-    let tgt_config_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tgt_dir.join("index.json")).unwrap(),
-    ).unwrap();
-    let src_config_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(src_dir.join("index.json")).unwrap(),
-    ).unwrap();
+    let tgt_config_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tgt_dir.join("index.json")).unwrap())
+            .unwrap();
+    let src_config_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(src_dir.join("index.json")).unwrap())
+            .unwrap();
     let hidden = tgt_config_json["hidden_size"].as_u64().unwrap() as usize;
     let per_layer_features: Vec<usize> = tgt_config_json["layers"]
-        .as_array().unwrap()
+        .as_array()
+        .unwrap()
         .iter()
         .map(|l| l["num_features"].as_u64().unwrap() as usize)
         .collect();
-    let src_dtype = src_config_json["dtype"].as_str().unwrap_or("f32").to_string();
+    let src_dtype = src_config_json["dtype"]
+        .as_str()
+        .unwrap_or("f32")
+        .to_string();
 
     let mut cb = SilentLoadCallbacks;
     let index = VectorIndex::load_vindex(&tgt_dir, &mut cb).expect("load");
@@ -201,7 +229,13 @@ fn fp4_row_scaled_add_matches_source_baseline() {
     let alpha = 0.375f32;
 
     let src_row = read_source_feature(
-        &src_dir, "down_features.bin", layer, feat, hidden, &per_layer_features, &src_dtype,
+        &src_dir,
+        "down_features.bin",
+        layer,
+        feat,
+        hidden,
+        &per_layer_features,
+        &src_dtype,
     );
 
     let mut tgt_out = vec![0.0f32; hidden];
@@ -216,7 +250,8 @@ fn fp4_row_scaled_add_matches_source_baseline() {
         assert!(
             err <= bound,
             "elem {i}: err {err} > bound {bound} (exp {} got {})",
-            expected[i], tgt_out[i]
+            expected[i],
+            tgt_out[i]
         );
     }
 }

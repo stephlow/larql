@@ -23,13 +23,13 @@ use std::path::Path;
 use larql_models::{ModelWeights, TopKEntry, WeightArray};
 
 use crate::config::dtype::{write_floats, StorageDtype};
-use crate::format::filenames::*;
 use crate::config::{VindexConfig, VindexLayerInfo, VindexModelConfig};
 use crate::error::VindexError;
+use crate::format::filenames::*;
 
 use super::build_helpers::{
-    build_whole_word_vocab, chrono_now, compute_gate_top_tokens,
-    compute_offset_direction, run_clustering_pipeline, ClusterData,
+    build_whole_word_vocab, chrono_now, compute_gate_top_tokens, compute_offset_direction,
+    run_clustering_pipeline, ClusterData,
 };
 
 pub use crate::extract::callbacks::IndexBuildCallbacks;
@@ -111,7 +111,8 @@ impl<'a> BuildContext<'a> {
         let mut offset: u64 = 0;
 
         for layer in 0..self.num_layers {
-            self.callbacks.on_layer_start(COMP_GATE, layer, self.num_layers);
+            self.callbacks
+                .on_layer_start(COMP_GATE, layer, self.num_layers);
             let start = std::time::Instant::now();
 
             if self.is_moe && self.n_experts > 0 {
@@ -219,7 +220,8 @@ impl<'a> BuildContext<'a> {
         );
 
         for (layer, layer_down_meta) in all_down_meta.iter_mut().enumerate().take(self.num_layers) {
-            self.callbacks.on_layer_start(COMP_DOWN, layer, self.num_layers);
+            self.callbacks
+                .on_layer_start(COMP_DOWN, layer, self.num_layers);
             let start = std::time::Instant::now();
 
             // Collect all down matrices for this layer (dense: 1, MoE: num_experts)
@@ -263,8 +265,12 @@ impl<'a> BuildContext<'a> {
             let gate_top_tokens: Vec<String> = if is_knowledge_layer && !self.is_moe {
                 let num_features = down_matrices[0].0.shape()[1];
                 compute_gate_top_tokens(
-                    self.weights, self.tokenizer, layer, num_features,
-                    &ww_ids_shared, &ww_embed_shared,
+                    self.weights,
+                    self.tokenizer,
+                    layer,
+                    num_features,
+                    &ww_ids_shared,
+                    &ww_embed_shared,
                 )
             } else {
                 vec![]
@@ -278,10 +284,15 @@ impl<'a> BuildContext<'a> {
                 for batch_start in (0..num_features).step_by(batch_size) {
                     let batch_end = (batch_start + batch_size).min(num_features);
                     self.callbacks.on_feature_progress(
-                        "down", layer, feature_offset + batch_start, total_features_this_layer,
+                        "down",
+                        layer,
+                        feature_offset + batch_start,
+                        total_features_this_layer,
                     );
 
-                    let w_chunk = w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
+                    let w_chunk = w_down
+                        .slice(ndarray::s![.., batch_start..batch_end])
+                        .to_owned();
                     let cpu = larql_compute::CpuBackend;
                     use larql_compute::MatMul;
                     let chunk_logits = cpu.matmul(self.weights.embed.view(), w_chunk.view());
@@ -333,9 +344,12 @@ impl<'a> BuildContext<'a> {
                         if is_knowledge_layer && top_token_id > 0 && !gate_top_tokens.is_empty() {
                             let gate_tok = &gate_top_tokens[feat];
                             if let Some(offset) = compute_offset_direction(
-                                gate_tok, top_token_id as usize,
-                                self.weights, self.tokenizer,
-                                self.hidden_size, self.vocab_size,
+                                gate_tok,
+                                top_token_id as usize,
+                                self.weights,
+                                self.tokenizer,
+                                self.hidden_size,
+                                self.vocab_size,
                             ) {
                                 self.cluster_directions.extend_from_slice(&offset);
                                 self.cluster_features.push((layer, feat));
@@ -480,12 +494,16 @@ impl<'a> BuildContext<'a> {
         };
 
         // Preliminary write — `write_model_weights` reads the index.
-        let config_json = serde_json::to_string_pretty(&config)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let config_json =
+            serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
         std::fs::write(self.output_dir.join(INDEX_JSON), config_json)?;
 
         if extract_level != crate::ExtractLevel::Browse {
-            crate::format::weights::write_model_weights(self.weights, self.output_dir, self.callbacks)?;
+            crate::format::weights::write_model_weights(
+                self.weights,
+                self.output_dir,
+                self.callbacks,
+            )?;
             config.has_model_weights = true;
         }
 
@@ -499,8 +517,8 @@ impl<'a> BuildContext<'a> {
         });
         config.checksums = crate::format::checksums::compute_checksums(self.output_dir).ok();
 
-        let config_json = serde_json::to_string_pretty(&config)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let config_json =
+            serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
         std::fs::write(self.output_dir.join(INDEX_JSON), config_json)?;
         Ok(())
     }
@@ -527,9 +545,7 @@ pub fn build_vindex(
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
     std::fs::create_dir_all(output_dir)?;
-    let mut ctx = BuildContext::new(
-        weights, tokenizer, output_dir, callbacks, dtype, down_top_k,
-    );
+    let mut ctx = BuildContext::new(weights, tokenizer, output_dir, callbacks, dtype, down_top_k);
     ctx.write_gate_vectors()?;
     ctx.write_embeddings()?;
     ctx.write_down_meta_and_clusters()?;
@@ -570,8 +586,11 @@ pub fn build_vindex_resume(
             num_features_per_expert: None,
         });
     }
-    eprintln!("  Reconstructed {} layer infos from gate_vectors.bin ({:.1} GB)",
-        layer_infos.len(), gate_size as f64 / 1e9);
+    eprintln!(
+        "  Reconstructed {} layer infos from gate_vectors.bin ({:.1} GB)",
+        layer_infos.len(),
+        gate_size as f64 / 1e9
+    );
 
     // Read down_meta.jsonl to collect cluster directions (L14-28)
     let cluster_layer_min = 14.min(num_layers);
@@ -586,19 +605,34 @@ pub fn build_vindex_resume(
     let (ww_ids, ww_embed) =
         build_whole_word_vocab(tokenizer, &weights.embed, vocab_size, hidden_size);
 
-    eprintln!("  Computing gate input tokens for L{}-{}...", cluster_layer_min, cluster_layer_max - 1);
+    eprintln!(
+        "  Computing gate input tokens for L{}-{}...",
+        cluster_layer_min,
+        cluster_layer_max - 1
+    );
     let mut gate_top_tokens_per_layer: std::collections::HashMap<usize, Vec<String>> =
         std::collections::HashMap::new();
     for layer in cluster_layer_min..cluster_layer_max {
         let layer_start = std::time::Instant::now();
         let tokens = compute_gate_top_tokens(
-            weights, tokenizer, layer, intermediate_size,
-            &ww_ids, &ww_embed,
+            weights,
+            tokenizer,
+            layer,
+            intermediate_size,
+            &ww_ids,
+            &ww_embed,
         );
         gate_top_tokens_per_layer.insert(layer, tokens);
-        eprintln!("    gate L{:2}: {:.1}s", layer, layer_start.elapsed().as_secs_f64());
+        eprintln!(
+            "    gate L{:2}: {:.1}s",
+            layer,
+            layer_start.elapsed().as_secs_f64()
+        );
     }
-    eprintln!("  Gate input tokens computed for {} layers", gate_top_tokens_per_layer.len());
+    eprintln!(
+        "  Gate input tokens computed for {} layers",
+        gate_top_tokens_per_layer.len()
+    );
 
     eprintln!("  Reading down_meta.jsonl for offset directions...");
     let down_path = output_dir.join("down_meta.jsonl");
@@ -608,35 +642,51 @@ pub fn build_vindex_resume(
     for line in std::io::BufRead::lines(reader) {
         let line = line?;
         let line = line.trim();
-        if line.is_empty() { continue; }
-        let obj: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
-        if obj.get("_header").is_some() { continue; }
+        if line.is_empty() {
+            continue;
+        }
+        let obj: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| VindexError::Parse(e.to_string()))?;
+        if obj.get("_header").is_some() {
+            continue;
+        }
 
         let layer = obj.get("l").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let feat = obj.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let top_token_id = obj.get("i").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-        if layer >= cluster_layer_min && layer < cluster_layer_max
-            && top_token_id > 2 && top_token_id < vocab_size
+        if layer >= cluster_layer_min
+            && layer < cluster_layer_max
+            && top_token_id > 2
+            && top_token_id < vocab_size
         {
             if let Some(gate_tokens) = gate_top_tokens_per_layer.get(&layer) {
                 if feat < gate_tokens.len() {
                     let gate_tok = &gate_tokens[feat];
                     if let Some(offset) = compute_offset_direction(
-                        gate_tok, top_token_id,
-                        weights, tokenizer, hidden_size, vocab_size,
+                        gate_tok,
+                        top_token_id,
+                        weights,
+                        tokenizer,
+                        hidden_size,
+                        vocab_size,
                     ) {
                         cluster_directions.extend_from_slice(&offset);
                         cluster_features.push((layer, feat));
-                        let all_tokens: Vec<String> = obj.get("k")
+                        let all_tokens: Vec<String> = obj
+                            .get("k")
                             .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter()
-                                .filter_map(|e| e.get("t").and_then(|t| t.as_str()).map(|s| s.to_string()))
-                                .collect())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|e| {
+                                        e.get("t").and_then(|t| t.as_str()).map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         cluster_top_tokens.push(all_tokens.join("|"));
-                        let out_str = obj.get("t")
+                        let out_str = obj
+                            .get("t")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -651,7 +701,11 @@ pub fn build_vindex_resume(
             eprint!("\r  Read {} features...", count);
         }
     }
-    eprintln!("\r  Read {} features, {} in knowledge layers", count, cluster_features.len());
+    eprintln!(
+        "\r  Read {} features, {} in knowledge layers",
+        count,
+        cluster_features.len()
+    );
 
     run_clustering_pipeline(
         ClusterData {
@@ -669,7 +723,8 @@ pub fn build_vindex_resume(
     )?;
 
     callbacks.on_stage(STAGE_TOKENIZER);
-    let tokenizer_json = tokenizer.to_string(true)
+    let tokenizer_json = tokenizer
+        .to_string(true)
         .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
     std::fs::write(output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
     callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
@@ -739,13 +794,13 @@ pub fn build_vindex_resume(
             })
         },
         fp4: None,
-            ffn_layout: None,
+        ffn_layout: None,
     };
 
     config.checksums = crate::format::checksums::compute_checksums(output_dir).ok();
 
-    let config_json = serde_json::to_string_pretty(&config)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let config_json =
+        serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
 
     Ok(())
@@ -753,12 +808,14 @@ pub fn build_vindex_resume(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use ndarray::ArcArray2;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
-    use crate::{ExtractLevel, SilentBuildCallbacks, SilentLoadCallbacks, StorageDtype, VectorIndex};
     use super::build_vindex;
+    use crate::{
+        ExtractLevel, SilentBuildCallbacks, SilentLoadCallbacks, StorageDtype, VectorIndex,
+    };
 
     // ── synthetic model fixture ──────────────────────────────────────────
 
@@ -773,29 +830,57 @@ mod tests {
 
         for layer in 0..NUM_LAYERS {
             let mut gate = ndarray::Array2::<f32>::zeros((INTERMEDIATE, HIDDEN));
-            for i in 0..INTERMEDIATE { gate[[i, i % HIDDEN]] = 1.0; }
-            tensors.insert(format!("layers.{layer}.mlp.gate_proj.weight"), gate.into_shared());
+            for i in 0..INTERMEDIATE {
+                gate[[i, i % HIDDEN]] = 1.0;
+            }
+            tensors.insert(
+                format!("layers.{layer}.mlp.gate_proj.weight"),
+                gate.into_shared(),
+            );
 
             let mut up = ndarray::Array2::<f32>::zeros((INTERMEDIATE, HIDDEN));
-            for i in 0..INTERMEDIATE { up[[i, (i + 1) % HIDDEN]] = 0.5; }
-            tensors.insert(format!("layers.{layer}.mlp.up_proj.weight"), up.into_shared());
+            for i in 0..INTERMEDIATE {
+                up[[i, (i + 1) % HIDDEN]] = 0.5;
+            }
+            tensors.insert(
+                format!("layers.{layer}.mlp.up_proj.weight"),
+                up.into_shared(),
+            );
 
             let mut down = ndarray::Array2::<f32>::zeros((HIDDEN, INTERMEDIATE));
-            for i in 0..INTERMEDIATE { down[[i % HIDDEN, i]] = 0.3; }
-            tensors.insert(format!("layers.{layer}.mlp.down_proj.weight"), down.into_shared());
+            for i in 0..INTERMEDIATE {
+                down[[i % HIDDEN, i]] = 0.3;
+            }
+            tensors.insert(
+                format!("layers.{layer}.mlp.down_proj.weight"),
+                down.into_shared(),
+            );
 
             for suffix in &["q_proj", "k_proj", "v_proj", "o_proj"] {
                 let mut a = ndarray::Array2::<f32>::zeros((HIDDEN, HIDDEN));
-                for i in 0..HIDDEN { a[[i, i]] = 1.0; }
-                tensors.insert(format!("layers.{layer}.self_attn.{suffix}.weight"), a.into_shared());
+                for i in 0..HIDDEN {
+                    a[[i, i]] = 1.0;
+                }
+                tensors.insert(
+                    format!("layers.{layer}.self_attn.{suffix}.weight"),
+                    a.into_shared(),
+                );
             }
-            vectors.insert(format!("layers.{layer}.input_layernorm.weight"), vec![1.0; HIDDEN]);
-            vectors.insert(format!("layers.{layer}.post_attention_layernorm.weight"), vec![1.0; HIDDEN]);
+            vectors.insert(
+                format!("layers.{layer}.input_layernorm.weight"),
+                vec![1.0; HIDDEN],
+            );
+            vectors.insert(
+                format!("layers.{layer}.post_attention_layernorm.weight"),
+                vec![1.0; HIDDEN],
+            );
         }
         vectors.insert("norm.weight".into(), vec![1.0; HIDDEN]);
 
         let mut embed = ndarray::Array2::<f32>::zeros((VOCAB, HIDDEN));
-        for i in 0..VOCAB { embed[[i, i % HIDDEN]] = 1.0; }
+        for i in 0..VOCAB {
+            embed[[i, i % HIDDEN]] = 1.0;
+        }
         let embed = embed.into_shared();
         let lm_head = embed.clone();
 
@@ -851,11 +936,23 @@ mod tests {
     fn build_browse_writes_required_files() {
         let dir = TempDir::new().unwrap();
         run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
-        assert!(dir.path().join("gate_vectors.bin").exists(), "gate_vectors.bin missing");
-        assert!(dir.path().join("embeddings.bin").exists(), "embeddings.bin missing");
-        assert!(dir.path().join("down_meta.bin").exists(), "down_meta.bin missing");
+        assert!(
+            dir.path().join("gate_vectors.bin").exists(),
+            "gate_vectors.bin missing"
+        );
+        assert!(
+            dir.path().join("embeddings.bin").exists(),
+            "embeddings.bin missing"
+        );
+        assert!(
+            dir.path().join("down_meta.bin").exists(),
+            "down_meta.bin missing"
+        );
         assert!(dir.path().join("index.json").exists(), "index.json missing");
-        assert!(dir.path().join("tokenizer.json").exists(), "tokenizer.json missing");
+        assert!(
+            dir.path().join("tokenizer.json").exists(),
+            "tokenizer.json missing"
+        );
     }
 
     #[test]
@@ -872,9 +969,18 @@ mod tests {
     fn build_all_writes_weight_files() {
         let dir = TempDir::new().unwrap();
         run_build(dir.path(), ExtractLevel::All, StorageDtype::F32);
-        assert!(dir.path().join("attn_weights.bin").exists(), "attn_weights.bin missing");
-        assert!(dir.path().join("up_weights.bin").exists(), "up_weights.bin missing");
-        assert!(dir.path().join("down_weights.bin").exists(), "down_weights.bin missing");
+        assert!(
+            dir.path().join("attn_weights.bin").exists(),
+            "attn_weights.bin missing"
+        );
+        assert!(
+            dir.path().join("up_weights.bin").exists(),
+            "up_weights.bin missing"
+        );
+        assert!(
+            dir.path().join("down_weights.bin").exists(),
+            "down_weights.bin missing"
+        );
     }
 
     // ── index.json content ───────────────────────────────────────────────
@@ -924,7 +1030,10 @@ mod tests {
         run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
         let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
         let checksums = cfg.checksums.unwrap();
-        assert!(checksums.contains_key("gate_vectors.bin"), "gate_vectors.bin not in checksums");
+        assert!(
+            checksums.contains_key("gate_vectors.bin"),
+            "gate_vectors.bin not in checksums"
+        );
     }
 
     #[test]
@@ -935,7 +1044,10 @@ mod tests {
         assert_eq!(cfg.layers.len(), NUM_LAYERS);
         for (i, info) in cfg.layers.iter().enumerate() {
             assert_eq!(info.layer, i, "layer index mismatch at position {i}");
-            assert_eq!(info.num_features, INTERMEDIATE, "wrong feature count at layer {i}");
+            assert_eq!(
+                info.num_features, INTERMEDIATE,
+                "wrong feature count at layer {i}"
+            );
         }
     }
 
@@ -947,7 +1059,9 @@ mod tests {
         run_build(dir.path(), ExtractLevel::Browse, StorageDtype::F32);
         let cfg = crate::format::load::load_vindex_config(dir.path()).unwrap();
         let expected: u64 = cfg.layers.iter().map(|l| l.length).sum();
-        let actual = std::fs::metadata(dir.path().join("gate_vectors.bin")).unwrap().len();
+        let actual = std::fs::metadata(dir.path().join("gate_vectors.bin"))
+            .unwrap()
+            .len();
         assert_eq!(actual, expected, "gate_vectors.bin size mismatch");
     }
 

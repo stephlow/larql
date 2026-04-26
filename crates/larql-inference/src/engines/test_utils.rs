@@ -8,9 +8,9 @@
 //! Dimensions: vocab=32, hidden=16, intermediate=32, 2 q-heads, 1 kv-head,
 //! head_dim=8, 2 layers. Forward pass ≈ 10 ms on CPU.
 
-use std::collections::HashMap;
+use larql_models::{detect_from_json, ModelWeights, WeightArray};
 use ndarray::Array2;
-use larql_models::{ModelWeights, WeightArray, detect_from_json};
+use std::collections::HashMap;
 
 /// Build a synthetic `ModelWeights` with all tensors populated.
 /// Uses `TinyModelArch` key conventions (e.g. `"0.attn.q_proj.weight"`).
@@ -49,7 +49,9 @@ pub fn make_test_weights() -> ModelWeights {
                 (rng_state as u32) as f32 / u32::MAX as f32 * 2.0 * scale - scale
             })
             .collect();
-        Array2::from_shape_vec((rows, cols), data).unwrap().into_shared()
+        Array2::from_shape_vec((rows, cols), data)
+            .unwrap()
+            .into_shared()
     };
 
     // Embed + lm_head
@@ -111,10 +113,14 @@ pub fn make_test_vindex(weights: &ModelWeights) -> larql_vindex::VectorIndex {
     let gate_vectors: Vec<Option<Array2<f32>>> = (0..weights.num_layers)
         .map(|l| {
             let mut state = 0xabcdef_u64.wrapping_add(l as u64 * 0x9e3779b97f4a7c15);
-            let data: Vec<f32> = (0..n_features * hidden).map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                (state as u32) as f32 / u32::MAX as f32 * 0.1 - 0.05
-            }).collect();
+            let data: Vec<f32> = (0..n_features * hidden)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state as u32) as f32 / u32::MAX as f32 * 0.1 - 0.05
+                })
+                .collect();
             Some(Array2::from_shape_vec((n_features, hidden), data).unwrap())
         })
         .collect();
@@ -169,6 +175,10 @@ impl TestFixtures {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let index = make_test_vindex(&weights);
-        Self { weights, tokenizer, index }
+        Self {
+            weights,
+            tokenizer,
+            index,
+        }
     }
 }

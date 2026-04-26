@@ -89,6 +89,10 @@ larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" [OPTIONS]
 | `--cors` | Enable CORS for browser access | false |
 | `--max-concurrent <N>` | Max concurrent requests | 100 |
 | `--api-key <KEY>` | Require Bearer token auth (health exempt) | — |
+| `--rate-limit <SPEC>` | Per-IP rate limit (e.g. `100/min`, `10/sec`) | — |
+| `--trust-forwarded-for` | Trust first `X-Forwarded-For` IP for rate limiting. Enable only behind a trusted reverse proxy. | false |
+| `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results (0 = disabled) | 0 |
+| `--grpc-port <PORT>` | Enable gRPC server alongside HTTP | — |
 | `--log-level <LEVEL>` | Logging level | info |
 | `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
 | `--tls-key <PATH>` | TLS private key | — |
@@ -575,13 +579,31 @@ larql serve gemma3-4b.vindex --max-concurrent 100
 
 ### 8.3 Rate Limiting (implemented)
 
-Per-IP token bucket rate limiting. Supports `N/sec`, `N/min`, `N/hour` formats. `/v1/health` is exempt. Respects `X-Forwarded-For` for proxied clients.
+Per-IP token bucket rate limiting. Supports `N/sec`, `N/min`, `N/hour` formats.
+`/v1/health` is exempt. The default bucket key is the socket peer IP; untrusted
+client-supplied `X-Forwarded-For` is ignored.
 
 ```bash
 larql serve gemma3-4b.vindex --rate-limit "100/min"
+
+# Behind a trusted reverse proxy only:
+larql serve gemma3-4b.vindex --rate-limit "100/min" --trust-forwarded-for
 ```
 
 Excess requests receive `429 Too Many Requests`.
+
+### 8.3.1 Error Envelope
+
+HTTP errors use one JSON shape across REST and embed-service endpoints:
+
+```json
+{"error": "message"}
+```
+
+This includes JSON parsing failures, binary protocol validation failures, token
+ID bounds errors, model lookup failures, and internal load errors. WebSocket
+messages retain their streaming protocol shape:
+`{"type": "error", "message": "..."}`.
 
 ### 8.4 DESCRIBE Cache (implemented)
 

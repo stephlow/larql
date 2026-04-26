@@ -33,9 +33,11 @@ pub(crate) fn q8_staging_size(
     hidden: usize,
     q_dim_fallback: usize,
 ) -> (usize, usize) {
-    let max_layer_q_dim = layers.iter()
+    let max_layer_q_dim = layers
+        .iter()
         .map(|l| l.num_q_heads * l.head_dim)
-        .max().unwrap_or(q_dim_fallback);
+        .max()
+        .unwrap_or(q_dim_fallback);
     let q8_row_max = hidden.max(max_layer_q_dim);
     let q8s_row_bytes = q8_row_max.div_ceil(32) * 4;
     (q8_row_max, q8s_row_bytes)
@@ -63,7 +65,7 @@ pub(super) struct LayerBuffers {
     pub pre_ffn_norm: Vec<Option<Buffer>>,
     pub post_ffn_norm: Vec<Option<Buffer>>,
     // ── Per-layer per-position scratch outputs ──
-    pub h: Vec<Buffer>,           // num_layers + 1: input + each layer's output
+    pub h: Vec<Buffer>, // num_layers + 1: input + each layer's output
     pub norm_out: Vec<Buffer>,
     pub q_out: Vec<Buffer>,
     pub k_out: Vec<Buffer>,
@@ -104,11 +106,20 @@ impl LayerBuffers {
         // Pre-cache attention weight buffers (stable across calls →
         // cache by slice identity skips per-token Metal-buffer alloc).
         let wq: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wq.data)).collect();
-        let wq_scale: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wq.scales.unwrap_or(&[]))).collect();
+        let wq_scale: Vec<_> = layers
+            .iter()
+            .map(|l| bufs.get_f32(l.wq.scales.unwrap_or(&[])))
+            .collect();
         let wk: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wk.data)).collect();
-        let wk_scale: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wk.scales.unwrap_or(&[]))).collect();
+        let wk_scale: Vec<_> = layers
+            .iter()
+            .map(|l| bufs.get_f32(l.wk.scales.unwrap_or(&[])))
+            .collect();
         let wv: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wv.data)).collect();
-        let wv_scale: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wv.scales.unwrap_or(&[]))).collect();
+        let wv_scale: Vec<_> = layers
+            .iter()
+            .map(|l| bufs.get_f32(l.wv.scales.unwrap_or(&[])))
+            .collect();
         let wo: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wo.data)).collect();
         let gate: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.gate.data)).collect();
         let up: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.up.data)).collect();
@@ -116,9 +127,18 @@ impl LayerBuffers {
 
         // Norm weight buffers — also stable.
         let input_norm: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.input_norm)).collect();
-        let post_attn_norm: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.post_attn_norm)).collect();
-        let pre_ffn_norm: Vec<Option<_>> = layers.iter().map(|l| l.pre_ffn_norm.map(|n| bufs.get_f32(n))).collect();
-        let post_ffn_norm: Vec<Option<_>> = layers.iter().map(|l| l.post_ffn_norm.map(|n| bufs.get_f32(n))).collect();
+        let post_attn_norm: Vec<_> = layers
+            .iter()
+            .map(|l| bufs.get_f32(l.post_attn_norm))
+            .collect();
+        let pre_ffn_norm: Vec<Option<_>> = layers
+            .iter()
+            .map(|l| l.pre_ffn_norm.map(|n| bufs.get_f32(n)))
+            .collect();
+        let post_ffn_norm: Vec<Option<_>> = layers
+            .iter()
+            .map(|l| l.post_ffn_norm.map(|n| bufs.get_f32(n)))
+            .collect();
 
         // Q8 staging buffers shared between Q8 attention input and the
         // O-projection input — sized at `max(hidden, max_layer_q_dim)`
@@ -167,15 +187,39 @@ impl LayerBuffers {
         }
 
         Self {
-            wq, wq_scale, wk, wk_scale, wv, wv_scale, wo,
-            gate, up, down,
-            input_norm, post_attn_norm, pre_ffn_norm, post_ffn_norm,
+            wq,
+            wq_scale,
+            wk,
+            wk_scale,
+            wv,
+            wv_scale,
+            wo,
+            gate,
+            up,
+            down,
+            input_norm,
+            post_attn_norm,
+            pre_ffn_norm,
+            post_ffn_norm,
             h,
-            norm_out, q_out, k_out, v_out, attn_out, o_out,
-            h_post_attn, ffn_norm_out,
-            gate_out, up_out, act_buf, down_out,
-            q8, q8s, ffn_q8, ffn_q8s,
-            q8_row_max, q8s_row_bytes,
+            norm_out,
+            q_out,
+            k_out,
+            v_out,
+            attn_out,
+            o_out,
+            h_post_attn,
+            ffn_norm_out,
+            gate_out,
+            up_out,
+            act_buf,
+            down_out,
+            q8,
+            q8s,
+            ffn_q8,
+            ffn_q8s,
+            q8_row_max,
+            q8s_row_bytes,
         }
     }
 }
@@ -189,31 +233,52 @@ mod tests {
     /// weight / norm slices borrow from the leaked statics so a test
     /// can stash multiple layers in one Vec without lifetime
     /// gymnastics. Q4 weights are sized for `K=32` * 18-byte blocks.
-    fn synth_layer(num_q_heads: usize, num_kv_heads: usize, head_dim: usize) -> FullPipelineLayer<'static> {
+    fn synth_layer(
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> FullPipelineLayer<'static> {
         let q4 = Box::leak(vec![0u8; 32 * 18].into_boxed_slice());
         let norm = Box::leak(vec![1.0f32; 32].into_boxed_slice());
-        let q4w = || QuantWeight { data: q4, scales: None, format: QuantFormat::Q4_K };
+        let q4w = || QuantWeight {
+            data: q4,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
         FullPipelineLayer {
-            wq: q4w(), wk: q4w(), wv: q4w(), wo: q4w(),
-            gate: q4w(), up: q4w(), down: q4w(),
-            input_norm: norm, post_attn_norm: norm,
-            pre_ffn_norm: None, post_ffn_norm: None,
-            input_norm_bias: None, post_attn_norm_bias: None,
-            norm_offset: 1.0, qk_norm_offset: 1.0,
+            wq: q4w(),
+            wk: q4w(),
+            wv: q4w(),
+            wo: q4w(),
+            gate: q4w(),
+            up: q4w(),
+            down: q4w(),
+            input_norm: norm,
+            post_attn_norm: norm,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 1.0,
+            qk_norm_offset: 1.0,
             eps: 1e-6,
             has_post_norms: false,
             norm_type: NormType::RmsNorm,
             ffn_type: FfnType::Gated,
             activation: Activation::Silu,
             attn_scale: 0.125,
-            head_dim, num_q_heads, num_kv_heads,
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
             rope_base: 10000.0,
             rotary_dim: 0,
             sliding_window: 0,
             has_v_norm: false,
             layer_scalar: 0.0,
-            q_norm_weight: None, k_norm_weight: None,
-            ffn_up_bias: None, ffn_down_bias: None,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            ffn_up_bias: None,
+            ffn_down_bias: None,
             moe: None,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
@@ -222,7 +287,12 @@ mod tests {
 
     /// Build a fresh Vec of N synth layers (FullPipelineLayer doesn't
     /// implement Clone, so the `vec![…; n]` form doesn't apply).
-    fn synth_layers(n: usize, num_q: usize, num_kv: usize, hd: usize) -> Vec<FullPipelineLayer<'static>> {
+    fn synth_layers(
+        n: usize,
+        num_q: usize,
+        num_kv: usize,
+        hd: usize,
+    ) -> Vec<FullPipelineLayer<'static>> {
         (0..n).map(|_| synth_layer(num_q, num_kv, hd)).collect()
     }
 
@@ -234,14 +304,14 @@ mod tests {
         // Gemma 3 4B: hidden=2560, q_dim = 8*256 = 2048 (q < hidden).
         let layers = synth_layers(4, 8, 4, 256);
         let (q8_row_max, q8s_row_bytes) = q8_staging_size(&layers, 2560, 2048);
-        assert_eq!(q8_row_max, 2560);                  // hidden wins
-        assert_eq!(q8s_row_bytes, 2560 / 32 * 4);     // 80 blocks × 4 bytes = 320
+        assert_eq!(q8_row_max, 2560); // hidden wins
+        assert_eq!(q8s_row_bytes, 2560 / 32 * 4); // 80 blocks × 4 bytes = 320
 
         // Larger Q than hidden: q_dim wins.
-        let layers = synth_layers(4, 16, 4, 256);     // q_dim = 16*256 = 4096
+        let layers = synth_layers(4, 16, 4, 256); // q_dim = 16*256 = 4096
         let (q8_row_max, q8s_row_bytes) = q8_staging_size(&layers, 2560, 4096);
         assert_eq!(q8_row_max, 4096);
-        assert_eq!(q8s_row_bytes, 4096 / 32 * 4);     // 512
+        assert_eq!(q8s_row_bytes, 4096 / 32 * 4); // 512
     }
 
     /// Mixed sliding/global geometry (Gemma 4 31B): different layers
@@ -262,7 +332,10 @@ mod tests {
         // Pass q_dim_fallback=3584 (the sliding layer's value) — the
         // helper must still pick the global layer's 7168.
         let (q8_row_max, _q8s_row_bytes) = q8_staging_size(&layers, 5376, 3584);
-        assert_eq!(q8_row_max, 7168, "mixed geometry: must size to largest layer");
+        assert_eq!(
+            q8_row_max, 7168,
+            "mixed geometry: must size to largest layer"
+        );
     }
 
     /// Empty layer list: helper falls back to `q_dim_fallback`.

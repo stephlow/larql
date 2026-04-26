@@ -176,15 +176,19 @@ enum QuantizeCommand {
 
 pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
-        ConvertCommand::GgufToVindex { input, output, level, f16 } => {
-            run_gguf_to_vindex(&input, &output, &level, f16)
-        }
-        ConvertCommand::SafetensorsToVindex { input, output, level, f16 } => {
-            run_safetensors_to_vindex(&input, &output, &level, f16)
-        }
-        ConvertCommand::GgufInfo { input } => {
-            run_gguf_info(&input)
-        }
+        ConvertCommand::GgufToVindex {
+            input,
+            output,
+            level,
+            f16,
+        } => run_gguf_to_vindex(&input, &output, &level, f16),
+        ConvertCommand::SafetensorsToVindex {
+            input,
+            output,
+            level,
+            f16,
+        } => run_safetensors_to_vindex(&input, &output, &level, f16),
+        ConvertCommand::GgufInfo { input } => run_gguf_info(&input),
         ConvertCommand::Quantize(cmd) => run_quantize(cmd),
         ConvertCommand::AddFeatureMajorDown { input, quiet } => {
             run_add_feature_major_down(&input, quiet)
@@ -228,17 +232,41 @@ fn run_add_feature_major_down(
 fn run_quantize(cmd: QuantizeCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         QuantizeCommand::Fp4 {
-            input, output, policy,
-            compliance_floor, threshold,
-            force, strict, no_sidecar, quiet,
+            input,
+            output,
+            policy,
+            compliance_floor,
+            threshold,
+            force,
+            strict,
+            no_sidecar,
+            quiet,
         } => run_quantize_fp4(QuantizeFp4Opts {
-            input, output, policy,
-            compliance_floor, threshold,
-            force, strict, no_sidecar, quiet,
+            input,
+            output,
+            policy,
+            compliance_floor,
+            threshold,
+            force,
+            strict,
+            no_sidecar,
+            quiet,
         }),
-        QuantizeCommand::Q4K { input, output, down_q4k, feature_major_down, force, quiet } => {
-            run_quantize_q4k(QuantizeQ4kOpts { input, output, down_q4k, feature_major_down, force, quiet })
-        }
+        QuantizeCommand::Q4K {
+            input,
+            output,
+            down_q4k,
+            feature_major_down,
+            force,
+            quiet,
+        } => run_quantize_q4k(QuantizeQ4kOpts {
+            input,
+            output,
+            down_q4k,
+            feature_major_down,
+            force,
+            quiet,
+        }),
     }
 }
 
@@ -264,9 +292,14 @@ fn run_quantize_q4k(opts: QuantizeQ4kOpts) -> Result<(), Box<dyn std::error::Err
         eprintln!("== quantize q4k ==");
         eprintln!("  in       : {}", opts.input.display());
         eprintln!("  out      : {}", opts.output.display());
-        eprintln!("  down_q4k : {} ({})",
+        eprintln!(
+            "  down_q4k : {} ({})",
             opts.down_q4k,
-            if opts.down_q4k { "Q4_K down (uniform)" } else { "Q6_K down (Q4_K_M mix)" }
+            if opts.down_q4k {
+                "Q4_K down (uniform)"
+            } else {
+                "Q6_K down (Q4_K_M mix)"
+            }
         );
         eprintln!();
     }
@@ -281,9 +314,11 @@ fn run_quantize_q4k(opts: QuantizeQ4kOpts) -> Result<(), Box<dyn std::error::Err
             report.dst_ffn_bytes as f64 / 1_073_741_824.0,
             report.compression,
         );
-        eprintln!("  Linked aux  : {} files ({:.2} GB)",
+        eprintln!(
+            "  Linked aux  : {} files ({:.2} GB)",
             report.aux_linked_count,
-            report.aux_linked_bytes as f64 / 1_073_741_824.0);
+            report.aux_linked_bytes as f64 / 1_073_741_824.0
+        );
         eprintln!("  Wall time   : {:.1}s", report.wall_time.as_secs_f64());
         eprintln!("  Walk backend: {}", report.walk_backend);
         eprintln!();
@@ -323,7 +358,11 @@ fn run_quantize_fp4(opts: QuantizeFp4Opts) -> Result<(), Box<dyn std::error::Err
         eprintln!("  in     : {}", opts.input.display());
         eprintln!("  out    : {}", opts.output.display());
         eprintln!("  policy : {}", policy.label());
-        eprintln!("  floor  : {:.1}% @ R<{}", opts.compliance_floor * 100.0, opts.threshold);
+        eprintln!(
+            "  floor  : {:.1}% @ R<{}",
+            opts.compliance_floor * 100.0,
+            opts.threshold
+        );
         eprintln!();
     }
 
@@ -332,7 +371,8 @@ fn run_quantize_fp4(opts: QuantizeFp4Opts) -> Result<(), Box<dyn std::error::Err
     if !opts.quiet {
         eprintln!("── per-projection ──");
         for p in &report.per_projection {
-            let compliance = p.compliance_at_threshold
+            let compliance = p
+                .compliance_at_threshold
                 .map(|c| format!("{:.4}%", c * 100.0))
                 .unwrap_or_else(|| "N/A".into());
             let downgrade_flag = matches!(
@@ -342,7 +382,10 @@ fn run_quantize_fp4(opts: QuantizeFp4Opts) -> Result<(), Box<dyn std::error::Err
             let marker = if downgrade_flag { "⚠" } else { " " };
             eprintln!(
                 "  {marker} {:<5}  compliance={:<12}  → {:?}  ({})",
-                p.name, compliance, p.chosen_precision, p.outcome.action_str(),
+                p.name,
+                compliance,
+                p.chosen_precision,
+                p.outcome.action_str(),
             );
         }
         eprintln!();
@@ -353,14 +396,20 @@ fn run_quantize_fp4(opts: QuantizeFp4Opts) -> Result<(), Box<dyn std::error::Err
             report.dst_ffn_bytes as f64 / 1_073_741_824.0,
             report.compression,
         );
-        eprintln!("  Linked aux  : {} files ({:.2} GB)",
-            report.aux_linked_count, report.aux_linked_bytes as f64 / 1_073_741_824.0);
+        eprintln!(
+            "  Linked aux  : {} files ({:.2} GB)",
+            report.aux_linked_count,
+            report.aux_linked_bytes as f64 / 1_073_741_824.0
+        );
         eprintln!("  Wall time   : {:.1}s", report.wall_time.as_secs_f64());
         eprintln!("  Walk backend: {}", report.walk_backend);
         eprintln!();
-        if report.per_projection.iter().any(|p|
-            matches!(p.outcome, ProjectionOutcome::DowngradedFp4ToFp8 | ProjectionOutcome::DowngradedFp4ToF16)
-        ) {
+        if report.per_projection.iter().any(|p| {
+            matches!(
+                p.outcome,
+                ProjectionOutcome::DowngradedFp4ToFp8 | ProjectionOutcome::DowngradedFp4ToF16
+            )
+        }) {
             eprintln!("⚠ compliance floor missed on ≥ 1 projection; see fp4_compliance.json.");
             if !opts.strict {
                 eprintln!("(Use --strict to treat this as a fatal error.)");
@@ -410,25 +459,26 @@ fn run_gguf_to_vindex(
         larql_vindex::StorageDtype::F32
     };
 
-    let model_name = gguf.metadata.get("general.name")
+    let model_name = gguf
+        .metadata
+        .get("general.name")
         .and_then(|v| v.as_str())
         .unwrap_or("gguf-model")
         .to_string();
 
     // Find tokenizer — check same directory as GGUF file
-    let tokenizer = input.parent()
-        .and_then(|dir| {
-            let tok_path = dir.join(TOKENIZER_JSON);
-            if tok_path.exists() {
-                larql_vindex::tokenizers::Tokenizer::from_file(&tok_path).ok()
-            } else {
-                None
-            }
-        });
+    let tokenizer = input.parent().and_then(|dir| {
+        let tok_path = dir.join(TOKENIZER_JSON);
+        if tok_path.exists() {
+            larql_vindex::tokenizers::Tokenizer::from_file(&tok_path).ok()
+        } else {
+            None
+        }
+    });
 
-    let tokenizer_ref = tokenizer.as_ref().ok_or(
-        "tokenizer.json not found next to GGUF file. Place it in the same directory."
-    )?;
+    let tokenizer_ref = tokenizer
+        .as_ref()
+        .ok_or("tokenizer.json not found next to GGUF file. Place it in the same directory.")?;
 
     eprintln!("\nExtracting to {}", output.display());
 
@@ -465,13 +515,12 @@ fn run_safetensors_to_vindex(
     // This is essentially extract-index
     eprintln!("Loading safetensors: {}", input.display());
     let weights = larql_models::load_model_dir(input)?;
-    let tokenizer = larql_vindex::load_vindex_tokenizer(input)
-        .or_else(|_| {
-            // Try to load from the model directory
-            let tok_path = input.join(TOKENIZER_JSON);
-            larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
-                .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
-        })?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(input).or_else(|_| {
+        // Try to load from the model directory
+        let tok_path = input.join(TOKENIZER_JSON);
+        larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
+    })?;
 
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,
@@ -485,7 +534,8 @@ fn run_safetensors_to_vindex(
         larql_vindex::StorageDtype::F32
     };
 
-    let model_name = input.file_name()
+    let model_name = input
+        .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".into());
 

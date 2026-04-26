@@ -67,12 +67,7 @@ fn cpu_qk_norm(
 }
 
 /// `v_norm_batched` reference: `x * rsqrt(mean(x²) + eps)` per head.
-fn cpu_v_norm_batched(
-    x: &[f32],
-    num_heads: usize,
-    head_dim: usize,
-    eps: f32,
-) -> Vec<f32> {
+fn cpu_v_norm_batched(x: &[f32], num_heads: usize, head_dim: usize, eps: f32) -> Vec<f32> {
     let mut out = vec![0.0f32; x.len()];
     for h in 0..num_heads {
         let base = h * head_dim;
@@ -89,7 +84,9 @@ fn cpu_v_norm_batched(
 
 fn tg_width(head_dim: usize) -> u64 {
     let mut tg: u64 = 1;
-    while (tg as usize) < head_dim && tg < 512 { tg <<= 1; }
+    while (tg as usize) < head_dim && tg < 512 {
+        tg <<= 1;
+    }
     tg
 }
 
@@ -171,12 +168,7 @@ fn synth_weight(head_dim: usize) -> Vec<f32> {
 // ── 1. qk_norm against CPU reference ───────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-fn assert_qk_norm_matches_cpu(
-    label: &str,
-    num_heads: usize,
-    head_dim: usize,
-    offset: f32,
-) {
+fn assert_qk_norm_matches_cpu(label: &str, num_heads: usize, head_dim: usize, offset: f32) {
     let metal = get_metal();
     let eps = 1e-6f32;
     let x = synth_input(num_heads, head_dim);
@@ -186,7 +178,9 @@ fn assert_qk_norm_matches_cpu(
     let in_buf = metal.bufs().transient_from_f32(&x);
     let out_buf = metal.bufs().output((x.len() * 4) as u64);
     let w_buf = metal.bufs().transient_from_f32(&weight);
-    run_qk_norm(&metal, &in_buf, &out_buf, &w_buf, num_heads, head_dim, eps, offset);
+    run_qk_norm(
+        &metal, &in_buf, &out_buf, &w_buf, num_heads, head_dim, eps, offset,
+    );
 
     let result = larql_compute::metal::buffers::read_buffer_f32(&out_buf, x.len());
     let diff = max_diff(&expected, &result);
@@ -227,11 +221,7 @@ fn qk_norm_gemma4_global_offset_zero() {
 /// The critical parity check: prefill applies V-norm via `qk_norm`
 /// with all-ones weight + offset=0, decode applies it via
 /// `v_norm_batched`. Any disagreement here drifts every cached V.
-fn assert_qk_norm_v_mode_matches_v_norm_batched(
-    label: &str,
-    num_heads: usize,
-    head_dim: usize,
-) {
+fn assert_qk_norm_v_mode_matches_v_norm_batched(label: &str, num_heads: usize, head_dim: usize) {
     let metal = get_metal();
     let eps = 1e-6f32;
     let x = synth_input(num_heads, head_dim);
@@ -307,7 +297,9 @@ fn qk_norm_v_mode_matches_cpu_v_norm_reference() {
         let in_buf = metal.bufs().transient_from_f32(&x);
         let out_buf = metal.bufs().output((x.len() * 4) as u64);
         let w_buf = metal.bufs().transient_from_f32(&ones);
-        run_qk_norm(&metal, &in_buf, &out_buf, &w_buf, num_heads, head_dim, eps, 0.0);
+        run_qk_norm(
+            &metal, &in_buf, &out_buf, &w_buf, num_heads, head_dim, eps, 0.0,
+        );
         let result = larql_compute::metal::buffers::read_buffer_f32(&out_buf, x.len());
 
         let diff = max_diff(&expected, &result);
@@ -333,9 +325,9 @@ fn qk_norm_in_place_matches_separate_buffers() {
     // matches the separate-buffer form.
     let metal = get_metal();
     let cases: &[(usize, usize, f32)] = &[
-        (16, 256, 0.0),  // Gemma 4 sliding
-        (4, 512, 0.0),   // Gemma 4 global
-        (8, 256, 1.0),   // Gemma 3 (offset = 1.0)
+        (16, 256, 0.0), // Gemma 4 sliding
+        (4, 512, 0.0),  // Gemma 4 global
+        (8, 256, 1.0),  // Gemma 3 (offset = 1.0)
     ];
     let eps = 1e-6f32;
     for &(num_heads, head_dim, offset) in cases {
@@ -346,13 +338,17 @@ fn qk_norm_in_place_matches_separate_buffers() {
         let in_a = metal.bufs().transient_from_f32(&x);
         let out_a = metal.bufs().output((x.len() * 4) as u64);
         let w_a = metal.bufs().transient_from_f32(&weight);
-        run_qk_norm(&metal, &in_a, &out_a, &w_a, num_heads, head_dim, eps, offset);
+        run_qk_norm(
+            &metal, &in_a, &out_a, &w_a, num_heads, head_dim, eps, offset,
+        );
         let a = larql_compute::metal::buffers::read_buffer_f32(&out_a, x.len());
 
         // In-place
         let inout_b = metal.bufs().transient_from_f32(&x);
         let w_b = metal.bufs().transient_from_f32(&weight);
-        run_qk_norm(&metal, &inout_b, &inout_b, &w_b, num_heads, head_dim, eps, offset);
+        run_qk_norm(
+            &metal, &inout_b, &inout_b, &w_b, num_heads, head_dim, eps, offset,
+        );
         let b = larql_compute::metal::buffers::read_buffer_f32(&inout_b, x.len());
 
         let diff = max_diff(&a, &b);
@@ -403,7 +399,9 @@ fn assert_qk_norm_qk_matches_separate(
     let nq = num_q_heads as u32;
     let total_heads = (num_q_heads + num_kv_heads) as u64;
     let mut tg_w: usize = 1;
-    while tg_w < head_dim && tg_w < 512 { tg_w <<= 1; }
+    while tg_w < head_dim && tg_w < 512 {
+        tg_w <<= 1;
+    }
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
@@ -428,9 +426,15 @@ fn assert_qk_norm_qk_matches_separate(
     let got_k = larql_compute::metal::buffers::read_buffer_f32(&k_buf, num_kv_heads * head_dim);
 
     let dq = max_diff(&ref_q, &got_q);
-    assert!(dq < 1e-5, "qk_norm_qk Q: max_diff {dq:.3e} (nq={num_q_heads} hd={head_dim})");
+    assert!(
+        dq < 1e-5,
+        "qk_norm_qk Q: max_diff {dq:.3e} (nq={num_q_heads} hd={head_dim})"
+    );
     let dk = max_diff(&ref_k, &got_k);
-    assert!(dk < 1e-5, "qk_norm_qk K: max_diff {dk:.3e} (nkv={num_kv_heads} hd={head_dim})");
+    assert!(
+        dk < 1e-5,
+        "qk_norm_qk K: max_diff {dk:.3e} (nkv={num_kv_heads} hd={head_dim})"
+    );
 }
 
 #[test]

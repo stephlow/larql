@@ -95,7 +95,12 @@ impl MetalBackend {
         dims: QkvDims,
     ) {
         use crate::metal::ops::full_pipeline::encode_rms_norm;
-        let QkvDims { hidden, eps, norm_offset, .. } = dims;
+        let QkvDims {
+            hidden,
+            eps,
+            norm_offset,
+            ..
+        } = dims;
 
         if layer.norm_type == crate::NormType::LayerNorm {
             let len_val = hidden as u32;
@@ -124,9 +129,14 @@ impl MetalBackend {
             );
         } else {
             encode_rms_norm(
-                enc, &self.rms_norm_pipeline,
-                bufs.h_in, bufs.input_norm, bufs.norm_out,
-                hidden, eps, norm_offset,
+                enc,
+                &self.rms_norm_pipeline,
+                bufs.h_in,
+                bufs.input_norm,
+                bufs.norm_out,
+                hidden,
+                eps,
+                norm_offset,
             );
         }
     }
@@ -138,7 +148,12 @@ impl MetalBackend {
         bufs: &QkvBufs<'_>,
         dims: QkvDims,
     ) {
-        let QkvDims { hidden, layer_q_dim, layer_kv_dim, .. } = dims;
+        let QkvDims {
+            hidden,
+            layer_q_dim,
+            layer_kv_dim,
+            ..
+        } = dims;
 
         // Three paths, in priority order: uniform Q4_K/Q4_KF → fused
         // single shader; mixed Q4_K Q/K + Q6_K V → dedicated shader;
@@ -157,11 +172,22 @@ impl MetalBackend {
                 &self.q4k_qkv_proj_pipeline
             };
             crate::metal::stages::qkv_proj::encode_fused_f32(
-                enc, &fused_pipe.state,
-                bufs.wq, bufs.wk, bufs.wv,
-                bufs.norm_out, 0,
-                bufs.q_out, 0, bufs.k_out, 0, bufs.v_out, 0,
-                layer_q_dim, layer_kv_dim, hidden,
+                enc,
+                &fused_pipe.state,
+                bufs.wq,
+                bufs.wk,
+                bufs.wv,
+                bufs.norm_out,
+                0,
+                bufs.q_out,
+                0,
+                bufs.k_out,
+                0,
+                bufs.v_out,
+                0,
+                layer_q_dim,
+                layer_kv_dim,
+                hidden,
             );
         } else if mixed_q4k_q6k_v {
             use crate::metal::shaders::q4k_q6k_qkv_proj as sh;
@@ -199,15 +225,38 @@ impl MetalBackend {
                 q4_matvec: &self.q4.matvec,
             };
             qkv_proj::encode_per_proj(
-                enc, &pipes,
-                bufs.norm_out, 0,
+                enc,
+                &pipes,
+                bufs.norm_out,
+                0,
                 // Q8 bufs unused for f32-input formats — pass norm as a
                 // harmless placeholder.
-                bufs.norm_out, 0, bufs.norm_out, 0,
+                bufs.norm_out,
+                0,
+                bufs.norm_out,
+                0,
                 [
-                    Proj { format: layer.wq.format, w_buf: bufs.wq, out_buf: bufs.q_out, out_off: 0, rows: layer_q_dim },
-                    Proj { format: layer.wk.format, w_buf: bufs.wk, out_buf: bufs.k_out, out_off: 0, rows: layer_kv_dim },
-                    Proj { format: layer.wv.format, w_buf: bufs.wv, out_buf: bufs.v_out, out_off: 0, rows: layer_kv_dim },
+                    Proj {
+                        format: layer.wq.format,
+                        w_buf: bufs.wq,
+                        out_buf: bufs.q_out,
+                        out_off: 0,
+                        rows: layer_q_dim,
+                    },
+                    Proj {
+                        format: layer.wk.format,
+                        w_buf: bufs.wk,
+                        out_buf: bufs.k_out,
+                        out_off: 0,
+                        rows: layer_kv_dim,
+                    },
+                    Proj {
+                        format: layer.wv.format,
+                        w_buf: bufs.wv,
+                        out_buf: bufs.v_out,
+                        out_off: 0,
+                        rows: layer_kv_dim,
+                    },
                 ],
                 hidden,
             );
@@ -223,7 +272,13 @@ impl MetalBackend {
         bufs: &QkvBufs<'_>,
         dims: QkvDims,
     ) {
-        let QkvDims { hidden, layer_q_dim, layer_kv_dim, eps, norm_offset } = dims;
+        let QkvDims {
+            hidden,
+            layer_q_dim,
+            layer_kv_dim,
+            eps,
+            norm_offset,
+        } = dims;
         let hidden_val = hidden as u32;
 
         // Fused norm + Q8 quantize (in-place into the FFN scratch
@@ -281,7 +336,13 @@ impl MetalBackend {
         dims: QkvDims,
     ) {
         use crate::metal::shaders::q4k_q6k_qkv_proj as sh;
-        let QkvDims { hidden, layer_q_dim, layer_kv_dim, eps, norm_offset } = dims;
+        let QkvDims {
+            hidden,
+            layer_q_dim,
+            layer_kv_dim,
+            eps,
+            norm_offset,
+        } = dims;
         let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u64;
         let num_tgs = total_rows.div_ceil(sh::ROWS_PER_TG);
         let q_u = layer_q_dim as u32;
@@ -298,11 +359,11 @@ impl MetalBackend {
         enc.set_buffer(5, Some(bufs.q_out), 0);
         enc.set_buffer(6, Some(bufs.k_out), 0);
         enc.set_buffer(7, Some(bufs.v_out), 0);
-        enc.set_bytes(8,  4, &q_u      as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(9,  4, &k_u      as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(10, 4, &v_u      as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(8, 4, &q_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(9, 4, &k_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(10, 4, &v_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(11, 4, &hidden_u as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(12, 4, &eps      as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(12, 4, &eps as *const f32 as *const std::ffi::c_void);
         enc.set_bytes(13, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(num_tgs, 1, 1),

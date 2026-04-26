@@ -1,18 +1,18 @@
 //! Core residual-stream compute: prefill, decode step, K/V recomputation.
 
-use ndarray::{Array2, s};
-use larql_compute::{ComputeBackend, dot_proj_gpu};
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+use ndarray::{s, Array2};
 
-use crate::model::ModelWeights;
-use crate::forward::{embed_tokens_pub, run_ffn, apply_norm, add_bias};
-use crate::attention::{
-    run_attention_with_kv_backend, run_attention_block_decode_step_backend, apply_rope_partial_at,
-};
-use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
-use crate::ffn::BackendFfn;
-use crate::attention::SharedKV;
-use crate::engines::profiler::EngineProfiler;
 use super::store::RsStore;
+use crate::attention::SharedKV;
+use crate::attention::{
+    apply_rope_partial_at, run_attention_block_decode_step_backend, run_attention_with_kv_backend,
+};
+use crate::engines::profiler::EngineProfiler;
+use crate::ffn::BackendFfn;
+use crate::forward::{add_bias, apply_norm, embed_tokens_pub, run_ffn};
+use crate::model::ModelWeights;
+use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
 
 pub struct RsPrefillResult {
     pub hidden: Array2<f32>,
@@ -43,12 +43,18 @@ pub fn rs_prefill(
     }
 
     let mut rs = RsStore {
-        stored, cold_residuals: None, cold_kv: None,
-        cold_abs_start: 0, next_position: seq_len, max_window,
+        stored,
+        cold_residuals: None,
+        cold_kv: None,
+        cold_abs_start: 0,
+        next_position: seq_len,
+        max_window,
     };
 
     let mut cold: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-    for layer in 0..num_layers { rs.clip_layer(layer, &mut cold); }
+    for layer in 0..num_layers {
+        rs.clip_layer(layer, &mut cold);
+    }
     if cold.first().map_or(0, |c| c.shape()[0]) > 0 {
         let cold_kv: Vec<SharedKV> = (0..num_layers)
             .map(|layer| {
@@ -62,8 +68,13 @@ pub fn rs_prefill(
     }
 
     let window_tokens = rs.window_tokens();
-    let memory_bytes  = rs.memory_bytes();
-    RsPrefillResult { hidden: last_row(&h), store: rs, memory_bytes, window_tokens }
+    let memory_bytes = rs.memory_bytes();
+    RsPrefillResult {
+        hidden: last_row(&h),
+        store: rs,
+        memory_bytes,
+        window_tokens,
+    }
 }
 
 pub fn rs_decode_step(
@@ -96,11 +107,15 @@ fn rs_decode_step_inner(
 
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
-    let t_step = if profiler.is_some() { Some(Instant::now()) } else { None };
+    let t_step = if profiler.is_some() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let mut h_new = embed_tokens_pub(weights, &[new_token_id]);
     let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     let mut recompute_cold_us = 0.0f64;
-    let mut recompute_hot_us  = 0.0f64;
+    let mut recompute_hot_us = 0.0f64;
     let mut attention_us = 0.0f64;
     let mut ffn_us = 0.0f64;
 
@@ -111,9 +126,15 @@ fn rs_decode_step_inner(
 
         let (k_full, v_full) = if let Some(cold_kv) = &rs.cold_kv {
             let (k_cold, v_cold) = &cold_kv[layer];
-            let t_hot = if profiler.is_some() { Some(Instant::now()) } else { None };
+            let t_hot = if profiler.is_some() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let (k_hot, v_hot) = recompute_kv(weights, h_hot, layer, hot_abs_start, backend)?;
-            if let Some(t) = t_hot { recompute_hot_us += t.elapsed().as_secs_f64() * 1e6; }
+            if let Some(t) = t_hot {
+                recompute_hot_us += t.elapsed().as_secs_f64() * 1e6;
+            }
             let c = k_cold.shape()[0];
             let kv_dim = k_cold.shape()[1];
             let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
@@ -133,26 +154,53 @@ fn rs_decode_step_inner(
                     combined.slice_mut(s![..s_cold, ..]).assign(h_cold);
                     combined.slice_mut(s![s_cold.., ..]).assign(h_hot);
                     (combined, rs.cold_abs_start)
-                } else { (h_hot.clone(), hot_abs_start) }
-            } else { (h_hot.clone(), hot_abs_start) };
-            let t_cold = if profiler.is_some() { Some(Instant::now()) } else { None };
+                } else {
+                    (h_hot.clone(), hot_abs_start)
+                }
+            } else {
+                (h_hot.clone(), hot_abs_start)
+            };
+            let t_cold = if profiler.is_some() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let (k, v) = recompute_kv(weights, &h_full, layer, full_abs_start, backend)?;
-            if let Some(t) = t_cold { recompute_cold_us += t.elapsed().as_secs_f64() * 1e6; }
+            if let Some(t) = t_cold {
+                recompute_cold_us += t.elapsed().as_secs_f64() * 1e6;
+            }
             (k, v)
         };
 
         new_stored.push(h_new.clone());
 
-        let t_attn = if profiler.is_some() { Some(Instant::now()) } else { None };
+        let t_attn = if profiler.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let (h_post_attn, _new_kv) = run_attention_block_decode_step_backend(
-            weights, &h_new, layer, Some(&(k_full, v_full)), abs_position, Some(backend),
+            weights,
+            &h_new,
+            layer,
+            Some(&(k_full, v_full)),
+            abs_position,
+            Some(backend),
         )?;
-        if let Some(t) = t_attn { attention_us += t.elapsed().as_secs_f64() * 1e6; }
+        if let Some(t) = t_attn {
+            attention_us += t.elapsed().as_secs_f64() * 1e6;
+        }
 
-        let t_ffn = if profiler.is_some() { Some(Instant::now()) } else { None };
+        let t_ffn = if profiler.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let bffn = BackendFfn { weights, backend };
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
-        if let Some(t) = t_ffn { ffn_us += t.elapsed().as_secs_f64() * 1e6; }
+        if let Some(t) = t_ffn {
+            ffn_us += t.elapsed().as_secs_f64() * 1e6;
+        }
         h_new = h_out;
     }
 
@@ -188,7 +236,9 @@ fn rs_decode_step_inner(
     };
 
     let mut overflow: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-    for layer in 0..num_layers { updated_rs.clip_layer(layer, &mut overflow); }
+    for layer in 0..num_layers {
+        updated_rs.clip_layer(layer, &mut overflow);
+    }
     if overflow.first().map_or(0, |c| c.shape()[0]) > 0 {
         match updated_rs.cold_residuals.as_mut() {
             Some(cold) => {
@@ -202,7 +252,9 @@ fn rs_decode_step_inner(
                     cold[layer] = merged;
                 }
             }
-            None => { updated_rs.cold_residuals = Some(overflow); }
+            None => {
+                updated_rs.cold_residuals = Some(overflow);
+            }
         }
         updated_rs.cold_kv = None;
     }
@@ -223,29 +275,55 @@ pub fn recompute_kv(
     let num_kv = arch.num_kv_heads_for_layer(layer);
     let norm_offset = arch.norm_weight_offset();
     let qk_offset = arch.qk_norm_weight_offset();
-    let qk_norm_off = if qk_offset != 0.0 { qk_offset } else { norm_offset };
+    let qk_norm_off = if qk_offset != 0.0 {
+        qk_offset
+    } else {
+        norm_offset
+    };
 
-    let h_norm = apply_norm(weights, h_stored, &arch.input_layernorm_key(layer), norm_offset);
+    let h_norm = apply_norm(
+        weights,
+        h_stored,
+        &arch.input_layernorm_key(layer),
+        norm_offset,
+    );
     let w_k = weights.tensors.get(&arch.attn_k_key(layer))?;
     let v_from_k = !weights.tensors.contains_key(&arch.attn_v_key(layer));
-    let w_v = if v_from_k { w_k } else { weights.tensors.get(&arch.attn_v_key(layer))? };
+    let w_v = if v_from_k {
+        w_k
+    } else {
+        weights.tensors.get(&arch.attn_v_key(layer))?
+    };
 
     let mut k = dot_proj_gpu(&h_norm, w_k, Some(backend));
     let mut v = dot_proj_gpu(&h_norm, w_v, Some(backend));
 
-    if let Some(bias) = arch.attn_k_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    if let Some(bias) = arch
+        .attn_k_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         add_bias(&mut k, bias);
     }
-    if let Some(bias) = arch.attn_v_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    if let Some(bias) = arch
+        .attn_v_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         add_bias(&mut v, bias);
     }
-    if arch.has_v_norm() { v = rms_norm_heads_no_weight(&v, num_kv, head_dim); }
-    let k_normed = match arch.attn_k_norm_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    if arch.has_v_norm() {
+        v = rms_norm_heads_no_weight(&v, num_kv, head_dim);
+    }
+    let k_normed = match arch
+        .attn_k_norm_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         Some(norm_w) => rms_norm_heads(&k, norm_w, num_kv, head_dim, qk_norm_off),
         None => k,
     };
     let k_rope = apply_rope_partial_at(
-        &k_normed, num_kv, head_dim,
+        &k_normed,
+        num_kv,
+        head_dim,
         arch.rope_base_for_layer(layer),
         arch.rotary_fraction_for_layer(layer),
         abs_start,
@@ -272,8 +350,8 @@ pub(super) fn last_row(h: &Array2<f32>) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use larql_compute::CpuBackend;
     use crate::engines::test_utils::make_test_weights;
+    use larql_compute::CpuBackend;
 
     // ── recompute_kv ──────────────────────────────────────────────────────────
 
@@ -282,7 +360,10 @@ mod tests {
         let weights = make_test_weights();
         let h = Array2::from_elem((3, weights.hidden_size), 0.5f32);
         let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend);
-        assert!(result.is_some(), "recompute_kv should return Some with valid weights");
+        assert!(
+            result.is_some(),
+            "recompute_kv should return Some with valid weights"
+        );
     }
 
     #[test]
@@ -301,8 +382,14 @@ mod tests {
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
         let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
-        assert!(k.iter().all(|v| v.is_finite()), "K contains non-finite values");
-        assert!(v.iter().all(|v| v.is_finite()), "V contains non-finite values");
+        assert!(
+            k.iter().all(|v| v.is_finite()),
+            "K contains non-finite values"
+        );
+        assert!(
+            v.iter().all(|v| v.is_finite()),
+            "V contains non-finite values"
+        );
     }
 
     #[test]
@@ -313,7 +400,10 @@ mod tests {
         let (k0, _) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
         let (k5, _) = recompute_kv(&weights, &h, 0, 5, &CpuBackend).unwrap();
         let diff: f32 = k0.iter().zip(k5.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 0.0, "RoPE at different positions should produce different K");
+        assert!(
+            diff > 0.0,
+            "RoPE at different positions should produce different K"
+        );
     }
 
     // ── rs_prefill ────────────────────────────────────────────────────────────
@@ -338,8 +428,11 @@ mod tests {
     fn rs_prefill_with_window_clips_hot_store() {
         let weights = make_test_weights();
         let result = rs_prefill(&weights, &[0u32, 1, 2, 3, 4], Some(2), &CpuBackend);
-        assert!(result.window_tokens <= 2,
-            "window_tokens={} > 2", result.window_tokens);
+        assert!(
+            result.window_tokens <= 2,
+            "window_tokens={} > 2",
+            result.window_tokens
+        );
     }
 
     // ── rs_decode_step ────────────────────────────────────────────────────────
@@ -348,8 +441,7 @@ mod tests {
     fn rs_decode_step_produces_finite_hidden() {
         let weights = make_test_weights();
         let prefill = rs_prefill(&weights, &[0u32], None, &CpuBackend);
-        let (h, _) = rs_decode_step(&weights, 1, prefill.store, &CpuBackend)
-            .expect("decode step");
+        let (h, _) = rs_decode_step(&weights, 1, prefill.store, &CpuBackend).expect("decode step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
     }

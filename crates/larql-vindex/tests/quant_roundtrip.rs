@@ -15,9 +15,7 @@
 //! the assertion.
 
 use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
-use larql_models::quant::ggml::{
-    dequantize_q4_0, dequantize_q4_k, dequantize_q6_k, quantize_q4_0,
-};
+use larql_models::quant::ggml::{dequantize_q4_0, dequantize_q4_k, dequantize_q6_k, quantize_q4_0};
 
 /// Reproducible synthetic block. The values span the realistic
 /// dynamic range we see in real attention/FFN weights — roughly
@@ -61,7 +59,10 @@ fn assert_close(decoded: &[f32], original: &[f32], max_err: f32, format: &str) {
         );
     }
     let rms = (sum_sq / decoded.len() as f64).sqrt() as f32;
-    eprintln!("{format}: max_err={max_seen:.6}, rms={rms:.6}, n={}", decoded.len());
+    eprintln!(
+        "{format}: max_err={max_seen:.6}, rms={rms:.6}, n={}",
+        decoded.len()
+    );
 }
 
 // ── Q4_0 ────────────────────────────────────────────────────────────────
@@ -152,7 +153,9 @@ fn q6_k_more_accurate_than_q4_k() {
     let q6 = dequantize_q6_k(&quantize_q6_k(&original), 256).unwrap();
 
     let rms = |v: &[f32]| -> f32 {
-        let sum_sq: f64 = v.iter().zip(original.iter())
+        let sum_sq: f64 = v
+            .iter()
+            .zip(original.iter())
             .map(|(a, b)| ((a - b) as f64).powi(2))
             .sum();
         (sum_sq / v.len() as f64).sqrt() as f32

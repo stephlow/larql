@@ -44,8 +44,22 @@
 
 ### Per-layer FFN weight format (`layers/`) — unified dense + MoE
 
-**Status**: Not started — blocks MoE GPU dispatch and cleaner server sharding  
-**Measured impact**: SKIP_MOE baseline = 15ms/tok (56.8 tok/s). With current BF16 blob = 241ms/tok. **93.7% of decode time is CPU MoE.**
+**Status**: Phase 1 shipped 2026-04-26 — format written, GPU dispatch wired, conversion tool available. Phase 2 (pre-allocated buffers) open.
+
+**Measured results (Gemma 4 26B A4B, M3 Max, 15 warmup / 30 tokens):**
+
+| Phase | Decode | tok/s | vs baseline |
+|---|---|---|---|
+| BF16 blob baseline | 241ms/tok | 4.1 | — |
+| Q4K GPU dispatch (shipped) | ~190ms/tok | **5.2** | **+27%** |
+| Pre-allocated buffers (planned) | ~50ms/tok | **~20** | **~5×** |
+| SKIP_MOE GPU-only ceiling | 15ms/tok | 56.8 | 14× |
+
+**Phase 1 shipped:** Q4K per-layer format (`layers/layer_{L:02}.weights`), conversion tool (`convert_moe_to_per_layer` example), GPU dispatch via `MetalBackend::gpu_moe_dispatch` + `decode_token_q4k_moe`. Expert bytes written directly to Metal shared-memory buffers (one copy, no intermediate Vec). 59s conversion for 26B A4B (43 GB BF16 → 24 GB Q4K).
+
+**Phase 2 open:** 300 Metal buffer allocations per decode token (8 experts × 30 layers × gate/up/down/act/out) cost ~120ms. Pre-allocate fixed-size scratch buffers once before the decode loop (same pattern as dense `decode_token` scratch buffers) to bring decode toward the ~50ms target.
+
+**SKIP_MOE baseline**: SKIP_MOE baseline = 15ms/tok (56.8 tok/s). With BF16 blob = 241ms/tok. **93.7% of decode time was CPU MoE.**
 
 **Design (see `docs/format-spec.md §5.12` for binary layout):**
 

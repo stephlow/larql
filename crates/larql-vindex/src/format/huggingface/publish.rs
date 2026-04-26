@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use crate::error::VindexError;
 use crate::format::filenames::*;
 
-
 /// Options controlling [`publish_vindex_with_opts`]. Kept as a struct so
 /// the signature can grow without breaking callers.
 #[derive(Clone, Debug)]
@@ -26,20 +25,30 @@ pub struct PublishOptions {
 
 impl Default for PublishOptions {
     fn default() -> Self {
-        Self { skip_unchanged: false, repo_type: "model".into() }
+        Self {
+            skip_unchanged: false,
+            repo_type: "model".into(),
+        }
     }
 }
 
 impl PublishOptions {
     pub fn skip_unchanged() -> Self {
-        Self { skip_unchanged: true, ..Self::default() }
+        Self {
+            skip_unchanged: true,
+            ..Self::default()
+        }
     }
 }
 
 /// Returns the HF API base URL for a repo: `https://huggingface.co/api/{models|datasets}/{repo_id}`.
 #[allow(dead_code)]
 fn hf_api_url(repo_type: &str, repo_id: &str, path: &str) -> String {
-    let plural = if repo_type == "dataset" { "datasets" } else { "models" };
+    let plural = if repo_type == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    };
     format!("https://huggingface.co/api/{plural}/{repo_id}/{path}")
 }
 
@@ -141,7 +150,11 @@ fn fetch_remote_lfs_oids(
     token: &str,
     repo_type: &str,
 ) -> Result<std::collections::HashMap<String, String>, VindexError> {
-    let plural = if repo_type == "dataset" { "datasets" } else { "models" };
+    let plural = if repo_type == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    };
     let url = format!("https://huggingface.co/api/{plural}/{repo_id}/tree/main?recursive=true");
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -222,14 +235,17 @@ pub(super) fn get_hf_token() -> Result<String, VindexError> {
     }
 
     // Try newer cache location
-    let token_path = PathBuf::from(&home).join(".cache").join("huggingface").join("token");
+    let token_path = PathBuf::from(&home)
+        .join(".cache")
+        .join("huggingface")
+        .join("token");
     if token_path.exists() {
         let token = std::fs::read_to_string(&token_path)?;
         return Ok(token.trim().to_string());
     }
 
     Err(VindexError::Parse(
-        "HuggingFace token not found. Set HF_TOKEN or run `huggingface-cli login`.".into()
+        "HuggingFace token not found. Set HF_TOKEN or run `huggingface-cli login`.".into(),
     ))
 }
 
@@ -252,7 +268,9 @@ fn create_hf_repo(repo_id: &str, token: &str, repo_type: &str) -> Result<(), Vin
     } else {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        Err(VindexError::Parse(format!("HF repo create failed ({status}): {body}")))
+        Err(VindexError::Parse(format!(
+            "HF repo create failed ({status}): {body}"
+        )))
     }
 }
 
@@ -311,8 +329,25 @@ fn upload_file_to_hf(
     }
 
     match decision.mode.as_str() {
-        "lfs" => upload_lfs(repo_id, token, local_path, remote_filename, size, &sha256, callbacks, repo_type),
-        "regular" => upload_regular(repo_id, token, local_path, remote_filename, size, callbacks, repo_type),
+        "lfs" => upload_lfs(
+            repo_id,
+            token,
+            local_path,
+            remote_filename,
+            size,
+            &sha256,
+            callbacks,
+            repo_type,
+        ),
+        "regular" => upload_regular(
+            repo_id,
+            token,
+            local_path,
+            remote_filename,
+            size,
+            callbacks,
+            repo_type,
+        ),
         other => Err(VindexError::Parse(format!(
             "HF preupload returned unknown mode `{other}` for {remote_filename}"
         ))),
@@ -348,7 +383,11 @@ fn preupload_decide(
     }
     let sample_b64 = base64::prelude::BASE64_STANDARD.encode(&sample_buf);
 
-    let plural = if repo_type == "dataset" { "datasets" } else { "models" };
+    let plural = if repo_type == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    };
     let url = format!("https://huggingface.co/api/{plural}/{repo_id}/preupload/main");
     let body = serde_json::json!({
         "files": [{
@@ -390,7 +429,10 @@ fn preupload_decide(
         .get("shouldIgnore")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    Ok(PreuploadDecision { mode, should_ignore })
+    Ok(PreuploadDecision {
+        mode,
+        should_ignore,
+    })
 }
 
 /// LFS-mode upload: batch → PUT to signed URL → verify → commit pointer.
@@ -449,24 +491,34 @@ fn upload_regular(
     callbacks.on_file_progress(remote_filename, 0, size);
     let encoded = base64::prelude::BASE64_STANDARD.encode(&data);
 
-    let plural = if repo_type == "dataset" { "datasets" } else { "models" };
+    let plural = if repo_type == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    };
     let url = format!("https://huggingface.co/api/{plural}/{repo_id}/commit/main");
     let mut ndjson = String::new();
-    ndjson.push_str(&serde_json::to_string(&serde_json::json!({
-        "key": "header",
-        "value": {
-            "summary": format!("Upload {remote_filename}"),
-        },
-    })).unwrap());
+    ndjson.push_str(
+        &serde_json::to_string(&serde_json::json!({
+            "key": "header",
+            "value": {
+                "summary": format!("Upload {remote_filename}"),
+            },
+        }))
+        .unwrap(),
+    );
     ndjson.push('\n');
-    ndjson.push_str(&serde_json::to_string(&serde_json::json!({
-        "key": "file",
-        "value": {
-            "path":     remote_filename,
-            "encoding": "base64",
-            "content":  encoded,
-        },
-    })).unwrap());
+    ndjson.push_str(
+        &serde_json::to_string(&serde_json::json!({
+            "key": "file",
+            "value": {
+                "path":     remote_filename,
+                "encoding": "base64",
+                "content":  encoded,
+            },
+        }))
+        .unwrap(),
+    );
     ndjson.push('\n');
 
     let client = reqwest::blocking::Client::new();
@@ -510,7 +562,10 @@ fn lfs_batch_upload(
     size: u64,
     repo_type: &str,
 ) -> Result<LfsBatchResponse, VindexError> {
-    let url = format!("{}.git/info/lfs/objects/batch", hf_repo_url(repo_type, repo_id));
+    let url = format!(
+        "{}.git/info/lfs/objects/batch",
+        hf_repo_url(repo_type, repo_id)
+    );
     let body = serde_json::json!({
         "operation":  "upload",
         "transfers":  ["basic"],
@@ -529,9 +584,7 @@ fn lfs_batch_upload(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        return Err(VindexError::Parse(format!(
-            "LFS batch ({status}): {body}"
-        )));
+        return Err(VindexError::Parse(format!("LFS batch ({status}): {body}")));
     }
     let json: serde_json::Value = resp
         .json()
@@ -546,9 +599,7 @@ fn lfs_batch_upload(
 
     // Per-object error surfaced in-line rather than as an HTTP status.
     if let Some(err) = obj.get("error") {
-        return Err(VindexError::Parse(format!(
-            "LFS batch object error: {err}"
-        )));
+        return Err(VindexError::Parse(format!("LFS batch object error: {err}")));
     }
 
     let actions = obj.get("actions");
@@ -622,8 +673,7 @@ fn stream_put_with_progress(
         match rx.try_recv() {
             Ok(resp) => {
                 let _ = handle.join();
-                let resp = resp
-                    .map_err(|e| VindexError::Parse(format!("LFS PUT failed: {e}")))?;
+                let resp = resp.map_err(|e| VindexError::Parse(format!("LFS PUT failed: {e}")))?;
                 if resp.status().is_success() {
                     callbacks.on_file_progress(remote_filename, size, size);
                     return Ok(());
@@ -692,23 +742,33 @@ fn commit_lfs_file(
     size: u64,
     repo_type: &str,
 ) -> Result<(), VindexError> {
-    let plural = if repo_type == "dataset" { "datasets" } else { "models" };
+    let plural = if repo_type == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    };
     let url = format!("https://huggingface.co/api/{plural}/{repo_id}/commit/main");
     let mut ndjson = String::new();
-    ndjson.push_str(&serde_json::to_string(&serde_json::json!({
-        "key": "header",
-        "value": {"summary": format!("Upload {remote_filename}")},
-    })).unwrap());
+    ndjson.push_str(
+        &serde_json::to_string(&serde_json::json!({
+            "key": "header",
+            "value": {"summary": format!("Upload {remote_filename}")},
+        }))
+        .unwrap(),
+    );
     ndjson.push('\n');
-    ndjson.push_str(&serde_json::to_string(&serde_json::json!({
-        "key": "lfsFile",
-        "value": {
-            "path": remote_filename,
-            "algo": "sha256",
-            "oid":  sha256,
-            "size": size,
-        },
-    })).unwrap());
+    ndjson.push_str(
+        &serde_json::to_string(&serde_json::json!({
+            "key": "lfsFile",
+            "value": {
+                "path": remote_filename,
+                "algo": "sha256",
+                "oid":  sha256,
+                "size": size,
+            },
+        }))
+        .unwrap(),
+    );
     ndjson.push('\n');
 
     let client = reqwest::blocking::Client::new();

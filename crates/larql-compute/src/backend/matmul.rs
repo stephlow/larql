@@ -25,13 +25,15 @@ pub trait MatMul {
     /// Multiple matmuls in one submission. Default: serial dispatch.
     /// GPU backends can override with parallel command buffer encoding.
     fn matmul_batch(&self, ops: &[MatMulOp]) -> Vec<Array2<f32>> {
-        ops.iter().map(|op| {
-            if op.transpose_b {
-                self.matmul_transb(op.a.view(), op.b.view())
-            } else {
-                self.matmul(op.a.view(), op.b.view())
-            }
-        }).collect()
+        ops.iter()
+            .map(|op| {
+                if op.transpose_b {
+                    self.matmul_transb(op.a.view(), op.b.view())
+                } else {
+                    self.matmul(op.a.view(), op.b.view())
+                }
+            })
+            .collect()
     }
 
     /// Dedicated row-per-simdgroup gemv for single-row × large-N × large-K.
@@ -40,13 +42,17 @@ pub trait MatMul {
     ///
     /// Motivating use-case: LM-head logits in autoregressive decode where
     /// the 32×32 tiled sgemm wastes 31/32 threads at `M = 1`.
-    fn f32_gemv(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<Vec<f32>> { None }
+    fn f32_gemv(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
 
     /// GPU gemv + GPU argmax without materialising the full output Vec.
     /// Returns `(token_id, score)` for the top-1 element.
     /// Saves ~0.33ms on Metal by reading back only 8 KB partial results
     /// instead of 1 MB (262K × f32). Returns `None` if not specialised.
-    fn f32_gemv_topk1(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<(u32, f32)> { None }
+    fn f32_gemv_topk1(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<(u32, f32)> {
+        None
+    }
 
     /// Like [`Self::f32_gemv`] but skips the internal CPU-vs-GPU flop
     /// threshold. Use when the caller has already decided the work is
@@ -61,7 +67,9 @@ pub trait MatMul {
     /// the LM head run directly on the mmap'd f16 embeddings without a
     /// 2× f32 clone. Backends without a specialised kernel return
     /// `None`.
-    fn f16_gemv(&self, _w_f16: &[u8], _x: &[f32], _n: usize, _k: usize) -> Option<Vec<f32>> { None }
+    fn f16_gemv(&self, _w_f16: &[u8], _x: &[f32], _n: usize, _k: usize) -> Option<Vec<f32>> {
+        None
+    }
 
     /// Like [`Self::f16_gemv`] but skips the internal flop threshold.
     fn f16_gemv_force(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {

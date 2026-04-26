@@ -47,7 +47,8 @@ impl VectorIndex {
     /// only used for non-Q4K interleaved fallback paths and can
     /// be capped at 1.
     pub fn set_q4k_ffn_cache_max_layers(&self, max_layers: usize) {
-        self.ffn.q4k_ffn_cache_max_layers
+        self.ffn
+            .q4k_ffn_cache_max_layers
             .store(max_layers, std::sync::atomic::Ordering::Relaxed);
         if max_layers > 0 {
             let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
@@ -72,7 +73,9 @@ impl VectorIndex {
         just_inserted: bool,
         cache: &mut [[Option<std::sync::Arc<Vec<f32>>>; 3]],
     ) {
-        let max = self.ffn.q4k_ffn_cache_max_layers
+        let max = self
+            .ffn
+            .q4k_ffn_cache_max_layers
             .load(std::sync::atomic::Ordering::Relaxed);
         if max == 0 {
             return;
@@ -103,10 +106,14 @@ impl VectorIndex {
     /// heap. For fine-grained inference prefer [`Self::q4k_ffn_row_into`],
     /// which decodes a single feature into a caller-provided buffer
     /// without populating the cache.
-    pub fn q4k_ffn_layer(&self, layer: usize, component: usize)
-        -> Option<std::sync::Arc<Vec<f32>>>
-    {
-        if component > 2 { return None; }
+    pub fn q4k_ffn_layer(
+        &self,
+        layer: usize,
+        component: usize,
+    ) -> Option<std::sync::Arc<Vec<f32>>> {
+        if component > 2 {
+            return None;
+        }
         {
             let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
             if let Some(slot) = cache.get(layer) {
@@ -121,7 +128,9 @@ impl VectorIndex {
         let slices = self.interleaved_q4k_layer_data(layer)?;
         let (bytes, format) = slices[component];
         let intermediate = self.num_features(layer);
-        if intermediate == 0 { return None; }
+        if intermediate == 0 {
+            return None;
+        }
         let hidden = self.hidden_size;
         let n = intermediate * hidden;
         let padded = n.div_ceil(256) * 256;
@@ -176,11 +185,15 @@ impl VectorIndex {
         alpha: f32,
         out: &mut [f32],
     ) -> bool {
-        let Some(arc) = self.q4k_ffn_layer(layer, component) else { return false; };
+        let Some(arc) = self.q4k_ffn_layer(layer, component) else {
+            return false;
+        };
         let hidden = self.hidden_size;
         let row_start = feat * hidden;
         let row_end = row_start + hidden;
-        if row_end > arc.len() || out.len() != hidden { return false; }
+        if row_end > arc.len() || out.len() != hidden {
+            return false;
+        }
         for i in 0..hidden {
             out[i] += alpha * arc[row_start + i];
         }

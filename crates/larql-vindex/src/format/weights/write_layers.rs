@@ -26,18 +26,20 @@ use crate::VindexError;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayerWeightFormat {
-    F32   = 0,
-    F16   = 1,
-    BF16  = 2,
-    Q4_0  = 3,
-    Q4_K  = 4,
-    Q6_K  = 5,
-    Q8_0  = 6,
-    FP4   = 7,
+    F32 = 0,
+    F16 = 1,
+    BF16 = 2,
+    Q4_0 = 3,
+    Q4_K = 4,
+    Q6_K = 5,
+    Q8_0 = 6,
+    FP4 = 7,
 }
 
 impl LayerWeightFormat {
-    pub fn as_u32(self) -> u32 { self as u32 }
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
 }
 
 const MAGIC: u32 = u32::from_le_bytes(*b"LYRW");
@@ -45,8 +47,8 @@ const FORMAT_VERSION: u32 = 1;
 
 /// One quantized entry: gate+up bytes and down bytes, both in the same format.
 pub struct LayerEntry {
-    pub gate_up: Vec<u8>,  // Q4_K [2*inter, hidden]
-    pub down: Vec<u8>,     // Q6_K [hidden, inter_padded]  (same format as gate_up)
+    pub gate_up: Vec<u8>, // Q4_K [2*inter, hidden]
+    pub down: Vec<u8>,    // Q6_K [hidden, inter_padded]  (same format as gate_up)
 }
 
 /// Write `layers/layer_{L:02}.weights` for one layer.
@@ -113,7 +115,8 @@ pub fn write_layer_weights(
 
 /// BF16 byte slice (2 bytes per element) → f32 Vec.
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2)
+    bytes
+        .chunks_exact(2)
         .map(|b| {
             let bits = u32::from(u16::from_le_bytes([b[0], b[1]])) << 16;
             f32::from_bits(bits)
@@ -128,9 +131,9 @@ pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 /// nearest block boundary when required by the format).
 pub fn quantize_f32(data: &[f32], format: LayerWeightFormat) -> Vec<u8> {
     match format {
-        LayerWeightFormat::Q4_K  => quantize_q4_k(data),
-        LayerWeightFormat::Q6_K  => quantize_q6_k(data),
-        LayerWeightFormat::F32   => bytemuck_f32_to_bytes(data),
+        LayerWeightFormat::Q4_K => quantize_q4_k(data),
+        LayerWeightFormat::Q6_K => quantize_q6_k(data),
+        LayerWeightFormat::F32 => bytemuck_f32_to_bytes(data),
         LayerWeightFormat::F16 | LayerWeightFormat::BF16 => {
             // Store as f32 — f16/bf16 conversion not yet implemented here.
             // Caller should use F32 format for now.
@@ -199,31 +202,45 @@ pub fn quantize_moe_entries(
     format: LayerWeightFormat,
 ) -> Vec<LayerEntry> {
     let gate_up_stride = 2 * moe_inter * hidden * 2; // bytes per expert (BF16)
-    let down_stride    = hidden * moe_inter * 2;      // bytes per expert (BF16)
+    let down_stride = hidden * moe_inter * 2; // bytes per expert (BF16)
 
-    (0..num_experts).map(|e| {
-        let gu_bytes = &gate_up_bf16[e * gate_up_stride..(e + 1) * gate_up_stride];
-        let gate_up_f32 = bf16_bytes_to_f32(gu_bytes);
-        let gate_up = quantize_f32(&gate_up_f32, format);
+    (0..num_experts)
+        .map(|e| {
+            let gu_bytes = &gate_up_bf16[e * gate_up_stride..(e + 1) * gate_up_stride];
+            let gate_up_f32 = bf16_bytes_to_f32(gu_bytes);
+            let gate_up = quantize_f32(&gate_up_f32, format);
 
-        let dn_bytes = &down_bf16[e * down_stride..(e + 1) * down_stride];
-        let down_f32_src = bf16_bytes_to_f32(dn_bytes);
-        // Pad inter → 256-element boundary (required for block formats like Q4_K)
-        let (down_padded, _) = pad_cols_to_256(&down_f32_src, hidden, moe_inter);
-        let down = quantize_f32(&down_padded, format);
+            let dn_bytes = &down_bf16[e * down_stride..(e + 1) * down_stride];
+            let down_f32_src = bf16_bytes_to_f32(dn_bytes);
+            // Pad inter → 256-element boundary (required for block formats like Q4_K)
+            let (down_padded, _) = pad_cols_to_256(&down_f32_src, hidden, moe_inter);
+            let down = quantize_f32(&down_padded, format);
 
-        LayerEntry { gate_up, down }
-    }).collect()
+            LayerEntry { gate_up, down }
+        })
+        .collect()
 }
 
 /// Parse a `layers/layer_{L}.weights` file header and offset table.
 ///
 /// Returns `(format, num_entries, inter, hidden, offsets)` where
 /// `offsets[e] = (gate_up_offset, gate_up_bytes, down_offset, down_bytes)`.
-pub fn parse_layer_weights_header(data: &[u8]) -> Option<(LayerWeightFormat, usize, usize, usize, Vec<(usize, usize, usize, usize)>)> {
-    if data.len() < 24 { return None; }
+pub fn parse_layer_weights_header(
+    data: &[u8],
+) -> Option<(
+    LayerWeightFormat,
+    usize,
+    usize,
+    usize,
+    Vec<(usize, usize, usize, usize)>,
+)> {
+    if data.len() < 24 {
+        return None;
+    }
     let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
-    if magic != MAGIC { return None; }
+    if magic != MAGIC {
+        return None;
+    }
     // format_version at [4..8] — currently ignored, forward-compatible
     let quant_raw = u32::from_le_bytes(data[8..12].try_into().ok()?);
     let format = match quant_raw {
@@ -238,20 +255,22 @@ pub fn parse_layer_weights_header(data: &[u8]) -> Option<(LayerWeightFormat, usi
         _ => return None,
     };
     let num_entries = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-    let inter  = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
+    let inter = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
     let hidden = u32::from_le_bytes(data[20..24].try_into().ok()?) as usize;
 
     let table_start = 24usize;
     let table_end = table_start + num_entries * 32;
-    if data.len() < table_end { return None; }
+    if data.len() < table_end {
+        return None;
+    }
 
     let mut offsets = Vec::with_capacity(num_entries);
     for e in 0..num_entries {
         let base = table_start + e * 32;
-        let gate_up_off  = u64::from_le_bytes(data[base..base+8].try_into().ok()?) as usize;
-        let gate_up_bytes = u64::from_le_bytes(data[base+8..base+16].try_into().ok()?) as usize;
-        let down_off     = u64::from_le_bytes(data[base+16..base+24].try_into().ok()?) as usize;
-        let down_bytes   = u64::from_le_bytes(data[base+24..base+32].try_into().ok()?) as usize;
+        let gate_up_off = u64::from_le_bytes(data[base..base + 8].try_into().ok()?) as usize;
+        let gate_up_bytes = u64::from_le_bytes(data[base + 8..base + 16].try_into().ok()?) as usize;
+        let down_off = u64::from_le_bytes(data[base + 16..base + 24].try_into().ok()?) as usize;
+        let down_bytes = u64::from_le_bytes(data[base + 24..base + 32].try_into().ok()?) as usize;
         offsets.push((gate_up_off, gate_up_bytes, down_off, down_bytes));
     }
     Some((format, num_entries, inter, hidden, offsets))

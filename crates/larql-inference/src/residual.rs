@@ -14,7 +14,12 @@ pub fn rms_norm(x: &Array2<f32>, weight: Option<&Vec<f32>>, offset: f32) -> Arra
 }
 
 /// RMS norm with explicit epsilon.
-pub fn rms_norm_eps(x: &Array2<f32>, weight: Option<&Vec<f32>>, offset: f32, eps: f64) -> Array2<f32> {
+pub fn rms_norm_eps(
+    x: &Array2<f32>,
+    weight: Option<&Vec<f32>>,
+    offset: f32,
+    eps: f64,
+) -> Array2<f32> {
     let (rows, cols) = (x.shape()[0], x.shape()[1]);
     let mut out = Array2::zeros((rows, cols));
 
@@ -56,10 +61,14 @@ pub fn layer_norm_eps(
     for i in 0..rows {
         let row = x.row(i);
         let mean: f64 = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
-        let var: f64 = row.iter().map(|&v| {
-            let d = v as f64 - mean;
-            d * d
-        }).sum::<f64>() / cols as f64;
+        let var: f64 = row
+            .iter()
+            .map(|&v| {
+                let d = v as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / cols as f64;
         let std = (var + eps).sqrt() as f32;
         let mean_f = mean as f32;
         for j in 0..cols {
@@ -74,11 +83,7 @@ pub fn layer_norm_eps(
 
 /// Per-head RMS norm without learned weights (parameter-free normalization).
 /// Used for V-norm in Gemma 4: just normalizes, no scaling.
-pub fn rms_norm_heads_no_weight(
-    x: &Array2<f32>,
-    num_heads: usize,
-    head_dim: usize,
-) -> Array2<f32> {
+pub fn rms_norm_heads_no_weight(x: &Array2<f32>, num_heads: usize, head_dim: usize) -> Array2<f32> {
     rms_norm_heads_no_weight_eps(x, num_heads, head_dim, DEFAULT_EPS)
 }
 
@@ -172,7 +177,10 @@ mod tests {
     fn rms_norm_output_is_finite() {
         let x = Array2::from_shape_vec((2, 8), (0..16).map(|i| i as f32 * 0.1).collect()).unwrap();
         let out = rms_norm(&x, None, 0.0);
-        assert!(out.iter().all(|v| v.is_finite()), "rms_norm produced non-finite values");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "rms_norm produced non-finite values"
+        );
     }
 
     #[test]
@@ -184,7 +192,10 @@ mod tests {
         let out_no_w = rms_norm(&x, None, 0.0);
         // Both paths should give the same result since effective weight=1 for both
         for (a, b) in out.iter().zip(out_no_w.iter()) {
-            assert!((a - b).abs() < 1e-5, "offset=1 with zero weight should match no-weight norm");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "offset=1 with zero weight should match no-weight norm"
+            );
         }
     }
 
@@ -235,14 +246,21 @@ mod tests {
     fn rms_norm_heads_normalises_each_head_independently() {
         // Two heads with very different magnitudes → both normalised
         let mut data = vec![0.0f32; 8];
-        for i in 0..4 { data[i] = (i + 1) as f32; }        // head 0: [1,2,3,4]
-        for i in 0..4 { data[4 + i] = 100.0 * (i + 1) as f32; } // head 1: [100,200,300,400]
+        for i in 0..4 {
+            data[i] = (i + 1) as f32;
+        } // head 0: [1,2,3,4]
+        for i in 0..4 {
+            data[4 + i] = 100.0 * (i + 1) as f32;
+        } // head 1: [100,200,300,400]
         let x = Array2::from_shape_vec((1, 8), data).unwrap();
         let out = rms_norm_heads_no_weight(&x, 2, 4);
         // Both heads should have similar L2 norm after per-head normalisation
         let h0_norm: f32 = out.row(0).iter().take(4).map(|v| v * v).sum::<f32>().sqrt();
         let h1_norm: f32 = out.row(0).iter().skip(4).map(|v| v * v).sum::<f32>().sqrt();
-        assert!((h0_norm - h1_norm).abs() < 0.1, "both heads should have similar L2 norm");
+        assert!(
+            (h0_norm - h1_norm).abs() < 0.1,
+            "both heads should have similar L2 norm"
+        );
     }
 
     #[test]
@@ -253,7 +271,10 @@ mod tests {
         let out_unscaled = rms_norm_heads_no_weight(&x, 1, 4);
         // Scaled output should be ~2× the unscaled
         for (s, u) in out_scaled.iter().zip(out_unscaled.iter()) {
-            assert!((s - 2.0 * u).abs() < 1e-5, "weight=2 should double the output");
+            assert!(
+                (s - 2.0 * u).abs() < 1e-5,
+                "weight=2 should double the output"
+            );
         }
     }
 }

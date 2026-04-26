@@ -1,13 +1,13 @@
 //! Raw-logits forward passes used by target-delta optimisation and Apollo.
 
-use ndarray::Array2;
+use super::super::embed::embed_tokens;
+use super::super::layer::run_layer_with_ffn;
+use super::super::ple::precompute_per_layer_inputs;
+use super::super::{apply_norm, dot_proj};
 use crate::attention::SharedKV;
 use crate::ffn::WeightFfn;
 use crate::model::ModelWeights;
-use super::super::{apply_norm, dot_proj};
-use super::super::embed::embed_tokens;
-use super::super::ple::precompute_per_layer_inputs;
-use super::super::layer::run_layer_with_ffn;
+use ndarray::Array2;
 
 /// Return type for [`forward_raw_logits`]. `h_pre_norm` is the residual
 /// at the last transformer block's output (pre-final-norm), `h_final`
@@ -25,7 +25,12 @@ pub struct RawForward {
 /// disallowed token positions to `f32::NEG_INFINITY`) before applying argmax.
 pub fn hidden_to_raw_logits(weights: &ModelWeights, h_single: &Array2<f32>) -> Vec<f32> {
     let norm_offset = weights.arch.norm_weight_offset();
-    let h_final = apply_norm(weights, h_single, weights.arch.final_norm_key(), norm_offset);
+    let h_final = apply_norm(
+        weights,
+        h_single,
+        weights.arch.final_norm_key(),
+        norm_offset,
+    );
     let logits_scale = weights.arch.logits_scaling();
     let final_softcap = weights.arch.final_logit_softcapping();
     let logits_raw = dot_proj(&h_final.slice(ndarray::s![0..1, ..]), &weights.lm_head);
@@ -132,8 +137,7 @@ pub fn forward_raw_logits_with_prefix(
     let ple_inputs = precompute_per_layer_inputs(weights, &h, &ple_token_ids);
     let ffn = WeightFfn { weights };
 
-    let mut kv_cache: std::collections::HashMap<usize, SharedKV> =
-        std::collections::HashMap::new();
+    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
 
     for layer in 0..num_layers {
         let shared_kv = weights
@@ -222,15 +226,24 @@ pub fn forward_from_layer(
     let q_len = token_ids.len();
     let total_len = q_len + 1; // +1 for boundary position-0
 
-    assert_eq!(boundary_residual.len(), hidden,
-        "boundary_residual len {} != hidden {}", boundary_residual.len(), hidden);
+    assert_eq!(
+        boundary_residual.len(),
+        hidden,
+        "boundary_residual len {} != hidden {}",
+        boundary_residual.len(),
+        hidden
+    );
 
     // Build h: row 0 = boundary, rows 1..total_len = query embeddings.
     let q_embed = embed_tokens(weights, token_ids);
     let mut h = ndarray::Array2::<f32>::zeros((total_len, hidden));
-    for (i, &v) in boundary_residual.iter().enumerate() { h[[0, i]] = v; }
+    for (i, &v) in boundary_residual.iter().enumerate() {
+        h[[0, i]] = v;
+    }
     for r in 0..q_len {
-        for c in 0..hidden { h[[r + 1, c]] = q_embed[[r, c]]; }
+        for c in 0..hidden {
+            h[[r + 1, c]] = q_embed[[r, c]];
+        }
     }
 
     let ffn = WeightFfn { weights };
@@ -243,21 +256,32 @@ pub fn forward_from_layer(
 
     // Only run layers from_layer..num_layers.
     for layer in from_layer..weights.num_layers {
-        let shared_kv = weights.arch
+        let shared_kv = weights
+            .arch
             .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
 
         if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
-            weights, &h, layer, &ffn, false, ple_inputs.get(layer), shared_kv,
+            weights,
+            &h,
+            layer,
+            &ffn,
+            false,
+            ple_inputs.get(layer),
+            shared_kv,
         ) {
             h = h_new;
-            if let Some(kv) = kv_out { kv_cache.insert(layer, kv); }
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
             if let Some((target, delta)) = perturb {
                 if layer == target {
                     let last = total_len - 1;
                     let mut row = h.row_mut(last);
                     for (i, d) in delta.iter().enumerate() {
-                        if i < row.len() { row[i] += *d; }
+                        if i < row.len() {
+                            row[i] += *d;
+                        }
                     }
                 }
             }
@@ -272,13 +296,23 @@ pub fn forward_from_layer(
     let last_2d = h_final.slice(ndarray::s![total_len - 1..total_len, ..]);
     let logits_raw = dot_proj(&last_2d, &weights.lm_head);
     let inv_scale = 1.0 / logits_scale;
-    let logits: ndarray::Array1<f32> = logits_raw.row(0).iter().map(|&v| {
-        let mut logit = v * inv_scale;
-        if let Some(cap) = final_softcap { logit = (logit / cap).tanh() * cap; }
-        logit
-    }).collect();
+    let logits: ndarray::Array1<f32> = logits_raw
+        .row(0)
+        .iter()
+        .map(|&v| {
+            let mut logit = v * inv_scale;
+            if let Some(cap) = final_softcap {
+                logit = (logit / cap).tanh() * cap;
+            }
+            logit
+        })
+        .collect();
 
-    RawForward { h_pre_norm, h_final, logits }
+    RawForward {
+        h_pre_norm,
+        h_final,
+        logits,
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -292,10 +326,16 @@ mod forward_from_layer_tests {
     fn forward_raw_logits_returns_vocab_logits() {
         let weights = make_test_weights();
         let raw = forward_raw_logits(&weights, &[0u32, 1, 2], None);
-        assert_eq!(raw.logits.len(), weights.vocab_size,
-            "logits length should be vocab_size");
-        assert_eq!(raw.h_pre_norm.shape(), &[3, weights.hidden_size],
-            "h_pre_norm shape");
+        assert_eq!(
+            raw.logits.len(),
+            weights.vocab_size,
+            "logits length should be vocab_size"
+        );
+        assert_eq!(
+            raw.h_pre_norm.shape(),
+            &[3, weights.hidden_size],
+            "h_pre_norm shape"
+        );
     }
 
     #[test]
@@ -303,7 +343,10 @@ mod forward_from_layer_tests {
         let weights = make_test_weights();
         let raw = forward_raw_logits(&weights, &[5u32], None);
         assert_eq!(raw.logits.len(), weights.vocab_size);
-        assert!(raw.logits.iter().all(|v| v.is_finite()), "all logits should be finite");
+        assert!(
+            raw.logits.iter().all(|v| v.is_finite()),
+            "all logits should be finite"
+        );
     }
 
     #[test]
@@ -335,16 +378,28 @@ mod forward_from_layer_tests {
         let from_1 = forward_from_layer(&weights, token_ids, &boundary, 1, None);
 
         // Outputs should differ (layer 0's transform changes the residual)
-        let differ = from_0.logits.iter().zip(from_1.logits.iter())
+        let differ = from_0
+            .logits
+            .iter()
+            .zip(from_1.logits.iter())
             .any(|(a, b)| (a - b).abs() > 1e-6);
-        assert!(differ, "from_layer=0 and from_layer=1 should produce different logits");
+        assert!(
+            differ,
+            "from_layer=0 and from_layer=1 should produce different logits"
+        );
     }
 
     #[test]
     fn forward_from_layer_output_shape() {
         let weights = make_test_weights();
         // 3 query tokens, from_layer=1: h has 4 rows (1 boundary + 3 query)
-        let raw = forward_from_layer(&weights, &[0u32, 1, 2], &vec![0.0; weights.hidden_size], 1, None);
+        let raw = forward_from_layer(
+            &weights,
+            &[0u32, 1, 2],
+            &vec![0.0; weights.hidden_size],
+            1,
+            None,
+        );
         assert_eq!(raw.h_pre_norm.shape(), &[4, weights.hidden_size]);
         assert_eq!(raw.logits.len(), weights.vocab_size);
     }

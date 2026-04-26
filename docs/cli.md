@@ -171,6 +171,7 @@ larql serve --dir <DIR> [OPTIONS]
 | `--cors` | Enable CORS headers for browser access | false |
 | `--api-key <KEY>` | Require Bearer token auth (health exempt) | — |
 | `--rate-limit <SPEC>` | Per-IP rate limit (e.g., "100/min", "10/sec") | — |
+| `--trust-forwarded-for` | Use the first `X-Forwarded-For` IP for rate limiting. Enable only behind a trusted proxy. | false |
 | `--max-concurrent <N>` | Max concurrent requests | 100 |
 | `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results (0 = disabled) | 0 |
 | `--grpc-port <PORT>` | Enable gRPC server on this port | — |
@@ -248,6 +249,9 @@ larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --
 
 # With rate limiting + DESCRIBE cache
 larql serve output/gemma3-4b.vindex --rate-limit "100/min" --cache-ttl 300
+
+# With rate limiting behind a trusted reverse proxy
+larql serve output/gemma3-4b.vindex --rate-limit "100/min" --trust-forwarded-for
 
 # Query from the REPL
 larql repl

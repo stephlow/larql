@@ -11,10 +11,10 @@
 //!
 //! Zero forward passes. Pure matrix multiplication.
 
-use larql_vindex::format::filenames::*;
 use larql_core::core::edge::Edge;
 use larql_core::core::enums::SourceType;
 use larql_core::core::graph::Graph;
+use larql_vindex::format::filenames::*;
 
 use super::utils::{count_threshold, decode_token, partial_top_k, top_entities};
 use super::weight_walker::{LayerResult, LayerStats, WalkCallbacks, WalkConfig};
@@ -62,10 +62,7 @@ impl AttentionWalker {
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| InferenceError::Parse(e.to_string()))?;
 
-        Ok(Self {
-            weights,
-            tokenizer,
-        })
+        Ok(Self { weights, tokenizer })
     }
 
     pub fn num_layers(&self) -> usize {

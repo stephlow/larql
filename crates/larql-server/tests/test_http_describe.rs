@@ -37,7 +37,7 @@ async fn http_describe_empty_vocab_returns_empty_edges() {
 async fn http_describe_missing_entity_returns_400() {
     let app = single_model_router(state(vec![model("test")]));
     let resp = get(app, "/v1/describe").await; // no entity param
-    // axum rejects the missing required query param
+                                               // axum rejects the missing required query param
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -127,14 +127,17 @@ async fn http_describe_if_none_match_returns_304() {
 
     // Second request with If-None-Match → 304.
     let app2 = single_model_router(st.clone());
-    let resp = app2.oneshot(
-        Request::builder()
-            .method("GET")
-            .uri("/v1/describe?entity=France")
-            .header("if-none-match", &etag)
-            .body(Body::empty())
-            .unwrap()
-    ).await.unwrap();
+    let resp = app2
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/describe?entity=France")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
 }
 

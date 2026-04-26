@@ -62,12 +62,21 @@ mod tests {
     #[test]
     fn all_labels_unique() {
         let labels = [
-            STAGE_LOADING, STAGE_GATE_VECTORS, STAGE_ROUTER_WEIGHTS,
-            STAGE_EMBEDDINGS, STAGE_DOWN_META, STAGE_TOKENIZER,
-            STAGE_MODEL_WEIGHTS, STAGE_MODEL_WEIGHTS_Q4K,
+            STAGE_LOADING,
+            STAGE_GATE_VECTORS,
+            STAGE_ROUTER_WEIGHTS,
+            STAGE_EMBEDDINGS,
+            STAGE_DOWN_META,
+            STAGE_TOKENIZER,
+            STAGE_MODEL_WEIGHTS,
+            STAGE_MODEL_WEIGHTS_Q4K,
             STAGE_RELATION_CLUSTERS,
-            COMP_GATE, COMP_DOWN, COMP_ATTN_WEIGHTS,
-            COMP_UP_DOWN_WEIGHTS, COMP_ATTN_Q4K, COMP_FFN_Q4K,
+            COMP_GATE,
+            COMP_DOWN,
+            COMP_ATTN_WEIGHTS,
+            COMP_UP_DOWN_WEIGHTS,
+            COMP_ATTN_Q4K,
+            COMP_FFN_Q4K,
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "duplicate stage label");

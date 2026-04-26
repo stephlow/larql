@@ -84,9 +84,7 @@ pub enum PatchOp {
     },
     /// Architecture B: remove all KNN entries for an entity.
     #[serde(rename = "delete_knn")]
-    DeleteKnn {
-        entity: String,
-    },
+    DeleteKnn { entity: String },
 }
 
 /// Compact down_meta for a patch operation.
@@ -119,8 +117,8 @@ impl PatchOp {
 impl VindexPatch {
     /// Write patch to a .vlp file.
     pub fn save(&self, path: &Path) -> Result<(), VindexError> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| VindexError::Parse(e.to_string()))?;
         std::fs::write(path, json)?;
         Ok(())
     }
@@ -128,8 +126,8 @@ impl VindexPatch {
     /// Load patch from a .vlp file.
     pub fn load(path: &Path) -> Result<Self, VindexError> {
         let text = std::fs::read_to_string(path)?;
-        let patch: VindexPatch = serde_json::from_str(&text)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let patch: VindexPatch =
+            serde_json::from_str(&text).map_err(|e| VindexError::Parse(e.to_string()))?;
         Ok(patch)
     }
 
@@ -165,9 +163,8 @@ impl VindexPatch {
 
 /// Encode a gate vector (f32 slice) as base64 string.
 pub fn encode_gate_vector(vec: &[f32]) -> String {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(vec.as_ptr() as *const u8, vec.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(vec.as_ptr() as *const u8, vec.len() * 4) };
     base64_encode(bytes)
 }
 
@@ -175,12 +172,13 @@ pub fn encode_gate_vector(vec: &[f32]) -> String {
 pub fn decode_gate_vector(b64: &str) -> Result<Vec<f32>, VindexError> {
     let bytes = base64_decode(b64)?;
     if bytes.len() % 4 != 0 {
-        return Err(VindexError::Parse("gate vector bytes not aligned to f32".into()));
+        return Err(VindexError::Parse(
+            "gate vector bytes not aligned to f32".into(),
+        ));
     }
-    let floats: Vec<f32> = unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
-    }
-    .to_vec();
+    let floats: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) }
+            .to_vec();
     Ok(floats)
 }
 
@@ -196,8 +194,16 @@ fn base64_encode(data: &[u8]) -> String {
         let triple = (b0 << 16) | (b1 << 8) | b2;
         result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
         result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 { result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(CHARS[(triple & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
     }
     result
 }
@@ -217,15 +223,21 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, VindexError> {
     let input = input.as_bytes();
     let mut result = Vec::with_capacity(input.len() * 3 / 4);
     for chunk in input.chunks(4) {
-        if chunk.len() < 4 { break; }
+        if chunk.len() < 4 {
+            break;
+        }
         let a = val(chunk[0])?;
         let b = val(chunk[1])?;
         let c = val(chunk[2])?;
         let d = val(chunk[3])?;
         let triple = (a << 18) | (b << 12) | (c << 6) | d;
         result.push(((triple >> 16) & 0xFF) as u8);
-        if chunk[2] != b'=' { result.push(((triple >> 8) & 0xFF) as u8); }
-        if chunk[3] != b'=' { result.push((triple & 0xFF) as u8); }
+        if chunk[2] != b'=' {
+            result.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            result.push((triple & 0xFF) as u8);
+        }
     }
     Ok(result)
 }
@@ -260,7 +272,10 @@ mod tests {
         // "YWJj" is base64 for the 3 bytes b"abc".
         // 3 bytes % 4 != 0, so decode_gate_vector must reject it.
         let result = decode_gate_vector("YWJj");
-        assert!(result.is_err(), "3-byte payload should fail alignment check");
+        assert!(
+            result.is_err(),
+            "3-byte payload should fail alignment check"
+        );
     }
 
     #[test]
@@ -288,13 +303,22 @@ mod tests {
 
     #[test]
     fn patch_op_key_update() {
-        let op = PatchOp::Update { layer: 5, feature: 7, gate_vector_b64: None, down_meta: None };
+        let op = PatchOp::Update {
+            layer: 5,
+            feature: 7,
+            gate_vector_b64: None,
+            down_meta: None,
+        };
         assert_eq!(op.key(), Some((5, 7)));
     }
 
     #[test]
     fn patch_op_key_delete() {
-        let op = PatchOp::Delete { layer: 1, feature: 0, reason: None };
+        let op = PatchOp::Delete {
+            layer: 1,
+            feature: 0,
+            reason: None,
+        };
         assert_eq!(op.key(), Some((1, 0)));
     }
 
@@ -344,10 +368,37 @@ mod tests {
     #[test]
     fn patch_counts_mixed_ops() {
         let ops = vec![
-            PatchOp::Insert { layer: 0, feature: 0, relation: None, entity: "A".into(), target: "B".into(), confidence: None, gate_vector_b64: None, down_meta: None },
-            PatchOp::Insert { layer: 0, feature: 1, relation: None, entity: "C".into(), target: "D".into(), confidence: None, gate_vector_b64: None, down_meta: None },
-            PatchOp::Update { layer: 0, feature: 2, gate_vector_b64: None, down_meta: None },
-            PatchOp::Delete { layer: 0, feature: 3, reason: None },
+            PatchOp::Insert {
+                layer: 0,
+                feature: 0,
+                relation: None,
+                entity: "A".into(),
+                target: "B".into(),
+                confidence: None,
+                gate_vector_b64: None,
+                down_meta: None,
+            },
+            PatchOp::Insert {
+                layer: 0,
+                feature: 1,
+                relation: None,
+                entity: "C".into(),
+                target: "D".into(),
+                confidence: None,
+                gate_vector_b64: None,
+                down_meta: None,
+            },
+            PatchOp::Update {
+                layer: 0,
+                feature: 2,
+                gate_vector_b64: None,
+                down_meta: None,
+            },
+            PatchOp::Delete {
+                layer: 0,
+                feature: 3,
+                reason: None,
+            },
         ];
         let p = make_patch(ops);
         assert_eq!(p.len(), 4);
@@ -359,7 +410,15 @@ mod tests {
     fn patch_counts_knn_ops() {
         let kv = encode_gate_vector(&[1.0]);
         let ops = vec![
-            PatchOp::InsertKnn { layer: 0, entity: "e".into(), relation: "r".into(), target: "t".into(), target_id: 1, confidence: None, key_vector_b64: kv },
+            PatchOp::InsertKnn {
+                layer: 0,
+                entity: "e".into(),
+                relation: "r".into(),
+                target: "t".into(),
+                target_id: 1,
+                confidence: None,
+                key_vector_b64: kv,
+            },
             PatchOp::DeleteKnn { entity: "e".into() },
         ];
         let p = make_patch(ops);
@@ -374,18 +433,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.vlp");
 
-        let ops = vec![
-            PatchOp::Insert {
-                layer: 2,
-                feature: 100,
-                relation: Some("capital".into()),
-                entity: "France".into(),
-                target: "Paris".into(),
-                confidence: Some(0.95),
-                gate_vector_b64: None,
-                down_meta: None,
-            },
-        ];
+        let ops = vec![PatchOp::Insert {
+            layer: 2,
+            feature: 100,
+            relation: Some("capital".into()),
+            entity: "France".into(),
+            target: "Paris".into(),
+            confidence: Some(0.95),
+            gate_vector_b64: None,
+            down_meta: None,
+        }];
         let patch = VindexPatch {
             version: 1,
             base_model: "gemma3-4b".into(),

@@ -41,7 +41,9 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     fn name(&self) -> &str;
 
     /// Device info string (for logging/diagnostics).
-    fn device_info(&self) -> String { self.name().to_string() }
+    fn device_info(&self) -> String {
+        self.name().to_string()
+    }
 
     /// Whether this backend accelerates `cap`. Callers can branch on
     /// this *before* calling, instead of pattern-matching on `None`
@@ -49,7 +51,9 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     ///
     /// Default returns `false` for everything; backends override to
     /// enable. See [`Capability`] for the menu.
-    fn supports(&self, _cap: Capability) -> bool { false }
+    fn supports(&self, _cap: Capability) -> bool {
+        false
+    }
 
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;

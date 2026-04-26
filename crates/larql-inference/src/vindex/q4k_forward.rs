@@ -55,8 +55,8 @@ use larql_vindex::VectorIndex;
 use crate::attention::SharedKV;
 use crate::forward::embed_tokens_pub;
 use crate::forward::ple::precompute_per_layer_inputs;
-use crate::forward::PredictResult;
 use crate::forward::run_layer_with_ffn;
+use crate::forward::PredictResult;
 
 /// Compute the final hidden state for `token_ids` against a Q4_K/Q6_K
 /// vindex, dequantising attn + FFN one layer at a time. Returns the
@@ -91,9 +91,11 @@ pub fn predict_q4k_hidden(
     }
 
     for layer in 0..num_layers {
-        let attn = index.attn_q4k_layer_data(layer)
+        let attn = index
+            .attn_q4k_layer_data(layer)
             .unwrap_or_else(|| panic!("attn Q4K slices missing for layer {layer}"));
-        let ffn = index.interleaved_q4k_layer_data(layer)
+        let ffn = index
+            .interleaved_q4k_layer_data(layer)
             .unwrap_or_else(|| panic!("ffn Q4K slices missing for layer {layer}"));
 
         let arch = &*weights.arch;
@@ -125,9 +127,13 @@ pub fn predict_q4k_hidden(
         weights.tensors.insert(k_key.clone(), w_k.into_shared());
         weights.tensors.insert(v_key.clone(), w_v.into_shared());
         weights.tensors.insert(o_key.clone(), w_o.into_shared());
-        weights.tensors.insert(gate_key.clone(), w_gate.into_shared());
+        weights
+            .tensors
+            .insert(gate_key.clone(), w_gate.into_shared());
         weights.tensors.insert(up_key.clone(), w_up.into_shared());
-        weights.tensors.insert(down_key.clone(), w_down.into_shared());
+        weights
+            .tensors
+            .insert(down_key.clone(), w_down.into_shared());
 
         let shared_kv = weights
             .arch
@@ -194,8 +200,8 @@ pub fn predict_q4k_hidden(
 /// 1. `h_post_attn = h + attn_out`
 /// 2. Dense branch: `h1 = post_ffn_norm_1(dense_mlp(pre_norm(h_post_attn)))`
 /// 3. MoE branch:   `h2 = post_ffn_norm_2(moe_block(h_post_attn))`
-///                  (the MoE block itself applies `pre_experts_norm`, runs
-///                   router + top-k + experts, and applies `post_experts_norm_2`)
+///    (the MoE block itself applies `pre_experts_norm`, runs
+///    router + top-k + experts, and applies `post_experts_norm_2`)
 /// 4. Combine:      `h_out = h_post_attn + outer_post_ffn_norm(h1 + h2)`
 /// 5. Per-layer embedding contribution (PLE)
 /// 6. `h_out *= layer_scalar`
@@ -219,9 +225,8 @@ fn run_moe_layer_cpu(
 
     // ── 1. Attention (with or without shared K/V) ─────────────────────────
     let (h_post_attn, kv_out) = if let Some(shared) = shared_kv {
-        let (h_pa, _, _) = crate::attention::run_attention_block_shared(
-            weights, h, layer, false, Some(shared),
-        )?;
+        let (h_pa, _, _) =
+            crate::attention::run_attention_block_shared(weights, h, layer, false, Some(shared))?;
         (h_pa, None)
     } else {
         let (h_pa, _, _, k_rope, v_final) =
@@ -242,9 +247,8 @@ fn run_moe_layer_cpu(
     if let Some(ref moe) = moe_weights {
         for pos in 0..seq_len {
             let row: Vec<f32> = h_post_attn.row(pos).to_vec();
-            let moe_out = larql_compute::cpu::ops::moe::cpu_moe_forward(
-                &row, moe, norm_offset, eps,
-            );
+            let moe_out =
+                larql_compute::cpu::ops::moe::cpu_moe_forward(&row, moe, norm_offset, eps);
             for (dst, src) in h2.row_mut(pos).iter_mut().zip(moe_out.iter()) {
                 *dst = *src;
             }
@@ -254,7 +258,8 @@ fn run_moe_layer_cpu(
         // fall back to dense-only (behaves like non-MoE path).
         // h_post_ffn_dense already encodes the full dense residual.
         let mut out = h_post_ffn_dense;
-        let mut h_ple = crate::forward::ple::apply_per_layer_embedding(weights, &out, layer, ple_input);
+        let mut h_ple =
+            crate::forward::ple::apply_per_layer_embedding(weights, &out, layer, ple_input);
         crate::forward::layer::apply_layer_scalar(weights, &mut h_ple, layer);
         out = h_ple;
         return Some((out, kv_out));
@@ -266,7 +271,8 @@ fn run_moe_layer_cpu(
     //     weight (matches `moe_combine::apply_outer_combine`'s fallback).
     let combined = &h1 + &h2;
     let combined_normed = if arch.moe_has_combined_output_norm() {
-        let outer_key = arch.moe_post_outer_norm_key(layer)
+        let outer_key = arch
+            .moe_post_outer_norm_key(layer)
             .or_else(|| arch.post_feedforward_layernorm_key(layer));
         match outer_key {
             Some(k) => crate::forward::apply_norm(weights, &combined, &k, norm_offset),
@@ -445,7 +451,8 @@ pub fn predict_q4k_with_ffn(
 
     for layer in 0..num_layers {
         // Attention Q/K/V/O only — FFN lives on the remote server.
-        let attn = index.attn_q4k_layer_data(layer)
+        let attn = index
+            .attn_q4k_layer_data(layer)
             .unwrap_or_else(|| panic!("attn Q4K slices missing for layer {layer}"));
 
         let arch = &*weights.arch;
@@ -495,9 +502,7 @@ pub fn predict_q4k_with_ffn(
         weights.tensors.remove(&o_key);
     }
 
-    crate::forward::predict::logits_to_predictions_pub(
-        weights, &h, tokenizer, top_k, 1.0,
-    )
+    crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
 }
 
 /// End-to-end predict on a Q4_K vindex driven by a Metal (or any Q4-capable)
@@ -521,8 +526,8 @@ pub fn predict_q4k_metal(
     index: &VectorIndex,
     backend: &dyn larql_compute::ComputeBackend,
 ) -> PredictResult {
-    use larql_compute::QuantFormat;
     use crate::layer_graph::pipeline_layer::{build_arch_params, resolve_attn_weights};
+    use larql_compute::QuantFormat;
 
     let arch = &*weights.arch;
     let num_layers = weights.num_layers;
@@ -532,34 +537,49 @@ pub fn predict_q4k_metal(
     // per-matrix layout). Attn weights come from resolve_attn_weights which
     // prefers the Q4K manifest. Norms/layer_scalar/etc come from the arch
     // + weights.vectors map populated by load_model_weights_q4k.
-    let layers: Vec<_> = (0..num_layers).map(|layer| {
-        let (wq, wk, wv, wo) = resolve_attn_weights(index, layer)
-            .expect("attn Q4K slices missing for layer");
-        let [(gate_bytes, gate_fmt), (up_bytes, up_fmt), (down_bytes, down_fmt)] =
-            index.interleaved_q4k_layer_data(layer)
+    let layers: Vec<_> = (0..num_layers)
+        .map(|layer| {
+            let (wq, wk, wv, wo) =
+                resolve_attn_weights(index, layer).expect("attn Q4K slices missing for layer");
+            let [(gate_bytes, gate_fmt), (up_bytes, up_fmt), (down_bytes, down_fmt)] = index
+                .interleaved_q4k_layer_data(layer)
                 .expect("ffn Q4K slices missing for layer");
-        // Translate registry tag → `larql_compute::QuantFormat`. Two
-        // enum systems cross here (vindex registry vs compute pipeline),
-        // and the previous `_ => Q4_K` default silently hid every
-        // other format. Be explicit.
-        fn to_format(s: &str) -> QuantFormat {
-            match s {
-                "Q4_K" => QuantFormat::Q4_K,
-                "Q6_K" => QuantFormat::Q6_K,
-                other => panic!(
-                    "q4k_forward: registry tag {other:?} has no compute::QuantFormat mapping"
-                ),
+            // Translate registry tag → `larql_compute::QuantFormat`. Two
+            // enum systems cross here (vindex registry vs compute pipeline),
+            // and the previous `_ => Q4_K` default silently hid every
+            // other format. Be explicit.
+            fn to_format(s: &str) -> QuantFormat {
+                match s {
+                    "Q4_K" => QuantFormat::Q4_K,
+                    "Q6_K" => QuantFormat::Q6_K,
+                    other => panic!(
+                        "q4k_forward: registry tag {other:?} has no compute::QuantFormat mapping"
+                    ),
+                }
             }
-        }
-        let gate = larql_compute::QuantWeight { data: gate_bytes, scales: None, format: to_format(gate_fmt) };
-        let up   = larql_compute::QuantWeight { data: up_bytes,   scales: None, format: to_format(up_fmt) };
-        let down = larql_compute::QuantWeight { data: down_bytes, scales: None, format: to_format(down_fmt) };
-        build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
-    }).collect();
+            let gate = larql_compute::QuantWeight {
+                data: gate_bytes,
+                scales: None,
+                format: to_format(gate_fmt),
+            };
+            let up = larql_compute::QuantWeight {
+                data: up_bytes,
+                scales: None,
+                format: to_format(up_fmt),
+            };
+            let down = larql_compute::QuantWeight {
+                data: down_bytes,
+                scales: None,
+                format: to_format(down_fmt),
+            };
+            build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
+        })
+        .collect();
 
     // ── Preallocate KV cache with correct per-layer shapes ──
     let max_seq = token_ids.len().max(64);
-    let shapes: Vec<(usize, usize)> = layers.iter()
+    let shapes: Vec<(usize, usize)> = layers
+        .iter()
         .map(|l| (l.num_kv_heads, l.head_dim))
         .collect();
     backend.preallocate_kv_cache_per_layer(&shapes, max_seq);
@@ -596,10 +616,15 @@ pub fn predict_q4k_metal(
 
         let out = backend
             .decode_token(
-                &layers, &x,
-                hidden, weights.intermediate_size,
-                dims_q, dims_kv,
-                layers[0].num_q_heads, layers[0].num_kv_heads, layers[0].head_dim,
+                &layers,
+                &x,
+                hidden,
+                weights.intermediate_size,
+                dims_q,
+                dims_kv,
+                layers[0].num_q_heads,
+                layers[0].num_kv_heads,
+                layers[0].head_dim,
                 layers[0].rope_base,
             )
             .expect("backend doesn't support decode_token — need Metal with Q4 kernels");
@@ -607,11 +632,8 @@ pub fn predict_q4k_metal(
     }
 
     // ── Final norm + lm_head over the last position's residual ──
-    let h_last = ndarray::Array2::from_shape_vec((1, hidden), h_vec)
-        .expect("residual shape");
-    crate::forward::predict::logits_to_predictions_pub(
-        weights, &h_last, tokenizer, top_k, 1.0,
-    )
+    let h_last = ndarray::Array2::from_shape_vec((1, hidden), h_vec).expect("residual shape");
+    crate::forward::predict::logits_to_predictions_pub(weights, &h_last, tokenizer, top_k, 1.0)
 }
 
 /// Run one layer's FFN forward on a Q4_K vindex — dequantise gate/up/down
@@ -630,8 +652,8 @@ pub fn q4k_ffn_forward_layer(
     layer: usize,
     x: &Array2<f32>,
 ) -> Array2<f32> {
+    use crate::ffn::{gelu_tanh_gate_up, silu_gate_up};
     use crate::forward::dot_proj;
-    use crate::ffn::{silu_gate_up, gelu_tanh_gate_up};
 
     let hidden = x.shape()[1];
     let intermediate = index.num_features(layer);
@@ -670,11 +692,14 @@ fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Ar
     let padded = n.div_ceil(256) * 256;
     let info = larql_vindex::quant::registry::lookup(format)
         .unwrap_or_else(|| panic!("unsupported quant format in vindex: {format}"));
-    let floats = (info.dequantize)(bytes, padded)
-        .unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
-    let truncated = if floats.len() > n { floats[..n].to_vec() } else { floats };
-    Array2::from_shape_vec((rows, cols), truncated)
-        .expect("shape mismatch dequantising Q4K matrix")
+    let floats =
+        (info.dequantize)(bytes, padded).unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
+    let truncated = if floats.len() > n {
+        floats[..n].to_vec()
+    } else {
+        floats
+    };
+    Array2::from_shape_vec((rows, cols), truncated).expect("shape mismatch dequantising Q4K matrix")
 }
 
 #[cfg(test)]
@@ -699,7 +724,10 @@ mod tests {
     #[test]
     fn is_end_of_turn_rejects_arbitrary_tokens() {
         for t in ["", " ", "the", "<eos", "eos>", "<EOS>", "<|im_start|>"] {
-            assert!(!is_end_of_turn(t), "did not expect {t:?} to be a terminator");
+            assert!(
+                !is_end_of_turn(t),
+                "did not expect {t:?} to be a terminator"
+            );
         }
     }
 }

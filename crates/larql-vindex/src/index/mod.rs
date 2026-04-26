@@ -10,17 +10,17 @@
 //! - `gate`, `walk`, `accessors`, `attn`, `lm_head`, `fp4_storage` —
 //!   pending split into compute/ and storage/ in a follow-up pass
 
-pub mod types;
+pub mod compute;
 pub mod core;
 #[cfg(test)]
 mod ffn_dispatch_tests;
-pub mod compute;
-pub mod storage;
 pub mod mutate;
+pub mod storage;
+pub mod types;
 
-pub use core::*;
 pub use compute::router::RouterIndex;
-pub use storage::residency::{ResidencyManager, LayerState};
+pub use core::*;
+pub use storage::residency::{LayerState, ResidencyManager};
 
 // Backwards-compatible aliases at the old paths. In-tree code is
 // migrated incrementally; external callers can reach the modules by
@@ -28,8 +28,8 @@ pub use storage::residency::{ResidencyManager, LayerState};
 // users are all updated.
 pub use compute::hnsw;
 pub use compute::router;
-pub use storage::residency;
 pub use storage::attn;
-pub use storage::lm_head;
-pub use storage::gate_accessors;
 pub use storage::fp4_store as fp4_storage;
+pub use storage::gate_accessors;
+pub use storage::lm_head;
+pub use storage::residency;

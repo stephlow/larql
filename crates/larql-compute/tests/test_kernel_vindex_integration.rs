@@ -14,8 +14,8 @@
 
 extern crate blas_src;
 
-use ndarray::Array2;
 use larql_compute::prelude::*;
+use ndarray::Array2;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -62,16 +62,29 @@ fn q4kf_proj_matches_cpu_on_real_vindex_bytes() {
     let bin_path = vindex.join("attn_weights_q4k.bin");
     let manifest_txt = match std::fs::read_to_string(&manifest_path) {
         Ok(t) => t,
-        Err(_) => { eprintln!("skip: manifest unreadable"); return; }
+        Err(_) => {
+            eprintln!("skip: manifest unreadable");
+            return;
+        }
     };
     let entries: Vec<serde_json::Value> = serde_json::from_str(&manifest_txt).unwrap();
-    let q_entry = entries.iter()
-        .find(|e| e["key"].as_str().unwrap_or("").contains("layers.0.self_attn.q_proj"))
+    let q_entry = entries
+        .iter()
+        .find(|e| {
+            e["key"]
+                .as_str()
+                .unwrap_or("")
+                .contains("layers.0.self_attn.q_proj")
+        })
         .expect("layer 0 Q entry in manifest");
     let offset = q_entry["offset"].as_u64().unwrap() as usize;
     let length = q_entry["length"].as_u64().unwrap() as usize;
-    let shape: Vec<usize> = q_entry["shape"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let shape: Vec<usize> = q_entry["shape"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
     let (rows, hidden) = (shape[0], shape[1]);
     let bin = std::fs::read(&bin_path).expect("attn_weights_q4k.bin");
     let q_bytes = &bin[offset..offset + length];
@@ -114,7 +127,11 @@ fn q4kf_proj_matches_cpu_on_real_vindex_bytes() {
     let cpu_max = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let met_max = metal_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let ratio = cpu_max / met_max.max(1e-9);
-    let max_diff_val = cpu_out.iter().zip(&metal_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff_val = cpu_out
+        .iter()
+        .zip(&metal_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!(
         "real-bytes q4kf_proj[{rows}x{hidden}]  cpu_max={cpu_max:.3e}  \
          metal_max={met_max:.3e}  ratio_cpu/metal={ratio:.3}  max_abs_diff={max_diff_val:.3e}"
@@ -140,10 +157,12 @@ fn q4kf_proj_matches_cpu_on_real_vindex_bytes() {
 
 fn build_pipeline(device: &metal::Device, name: &str) -> metal::ComputePipelineState {
     let src = larql_compute::metal::shaders::all_shaders();
-    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
-    device.new_compute_pipeline_state_with_function(
-        &lib.get_function(name, None).unwrap()
-    ).unwrap()
+    let lib = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
+    device
+        .new_compute_pipeline_state_with_function(&lib.get_function(name, None).unwrap())
+        .unwrap()
 }
 
 fn read_f32_buf(buf: &metal::Buffer, n: usize) -> Vec<f32> {
@@ -156,7 +175,10 @@ fn cpu_rms_norm(x: &[f32], w: &[f32], eps: f32, offset: f32) -> Vec<f32> {
     let n = x.len() as f32;
     let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / n;
     let inv = 1.0f32 / (ms + eps).sqrt();
-    x.iter().zip(w).map(|(v, wv)| v * inv * (offset + wv)).collect()
+    x.iter()
+        .zip(w)
+        .map(|(v, wv)| v * inv * (offset + wv))
+        .collect()
 }
 
 /// Stage: `residual::encode_post_attn` in pre-norm mode, no Q8 FFN input.
@@ -177,8 +199,12 @@ fn stage_post_attn_pre_norm_matches_cpu() {
     let eps = 1e-6f32;
     let offset = 0.0f32;
 
-    let h: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.013).sin()).collect();
-    let o: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.017).cos()).collect();
+    let h: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.013).sin())
+        .collect();
+    let o: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.017).cos())
+        .collect();
     let w_post_attn: Vec<f32> = (0..hidden).map(|i| 1.0 + 0.01 * (i as f32).sin()).collect();
 
     // Expected: per-position, h + o → rms_norm(., w_post_attn).
@@ -189,8 +215,12 @@ fn stage_post_attn_pre_norm_matches_cpu() {
         for i in 0..hidden {
             expected_hpa[off + i] = h[off + i] + o[off + i];
         }
-        expected_ffn[off..off + hidden]
-            .copy_from_slice(&cpu_rms_norm(&expected_hpa[off..off + hidden], &w_post_attn, eps, offset));
+        expected_ffn[off..off + hidden].copy_from_slice(&cpu_rms_norm(
+            &expected_hpa[off..off + hidden],
+            &w_post_attn,
+            eps,
+            offset,
+        ));
     }
 
     let h_buf = bufs.transient_from_f32(&h);
@@ -206,12 +236,23 @@ fn stage_post_attn_pre_norm_matches_cpu() {
     let enc = cmd.new_compute_command_encoder();
     let mut scratch = |n: u64| bufs.output(n);
     larql_compute::metal::stages::residual::encode_post_attn(
-        enc, &rms_norm, &residual_add, &q8_quant,
+        enc,
+        &rms_norm,
+        &residual_add,
+        &q8_quant,
         &mut scratch,
-        &h_buf, &o_buf, &h_pa, &ffn_out,
-        &w_buf, &w_buf, // post_attn_norm_buf, pre_ffn_weight_buf (same in pre-norm)
-        &q8, &q8s,
-        seq_len, hidden, eps, offset,
+        &h_buf,
+        &o_buf,
+        &h_pa,
+        &ffn_out,
+        &w_buf,
+        &w_buf, // post_attn_norm_buf, pre_ffn_weight_buf (same in pre-norm)
+        &q8,
+        &q8s,
+        seq_len,
+        hidden,
+        eps,
+        offset,
         /*has_post_norms*/ false,
         /*ffn_needs_q8*/ false,
         (hidden * 4) as u64,
@@ -250,10 +291,16 @@ fn stage_post_attn_post_norm_matches_cpu() {
     let eps = 1e-6f32;
     let offset = 1.0f32; // Gemma-style offset
 
-    let h: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.019).sin()).collect();
-    let o: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.023).cos()).collect();
+    let h: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.019).sin())
+        .collect();
+    let o: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.023).cos())
+        .collect();
     let w_post_attn: Vec<f32> = (0..hidden).map(|i| 0.05 * (i as f32).cos()).collect();
-    let w_pre_ffn: Vec<f32> = (0..hidden).map(|i| 0.08 * ((i as f32) * 0.3).sin()).collect();
+    let w_pre_ffn: Vec<f32> = (0..hidden)
+        .map(|i| 0.08 * ((i as f32) * 0.3).sin())
+        .collect();
 
     let mut expected_hpa = vec![0.0f32; seq_len * hidden];
     let mut expected_ffn = vec![0.0f32; seq_len * hidden];
@@ -263,8 +310,12 @@ fn stage_post_attn_post_norm_matches_cpu() {
         for i in 0..hidden {
             expected_hpa[off + i] = h[off + i] + normed[i];
         }
-        expected_ffn[off..off + hidden]
-            .copy_from_slice(&cpu_rms_norm(&expected_hpa[off..off + hidden], &w_pre_ffn, eps, offset));
+        expected_ffn[off..off + hidden].copy_from_slice(&cpu_rms_norm(
+            &expected_hpa[off..off + hidden],
+            &w_pre_ffn,
+            eps,
+            offset,
+        ));
     }
 
     let h_buf = bufs.transient_from_f32(&h);
@@ -280,12 +331,23 @@ fn stage_post_attn_post_norm_matches_cpu() {
     let enc = cmd.new_compute_command_encoder();
     let mut scratch = |n: u64| bufs.output(n);
     larql_compute::metal::stages::residual::encode_post_attn(
-        enc, &rms_norm, &residual_add, &q8_quant,
+        enc,
+        &rms_norm,
+        &residual_add,
+        &q8_quant,
         &mut scratch,
-        &h_buf, &o_buf, &h_pa, &ffn_out,
-        &w_pa_buf, &w_pf_buf,
-        &q8, &q8s,
-        seq_len, hidden, eps, offset,
+        &h_buf,
+        &o_buf,
+        &h_pa,
+        &ffn_out,
+        &w_pa_buf,
+        &w_pf_buf,
+        &q8,
+        &q8s,
+        seq_len,
+        hidden,
+        eps,
+        offset,
         /*has_post_norms*/ true,
         /*ffn_needs_q8*/ false,
         (hidden * 4) as u64,
@@ -298,8 +360,14 @@ fn stage_post_attn_post_norm_matches_cpu() {
 
     let metal_hpa = read_f32_buf(&h_pa, seq_len * hidden);
     let metal_ffn = read_f32_buf(&ffn_out, seq_len * hidden);
-    assert!(max_diff(&expected_hpa, &metal_hpa) < 1e-4, "post_norm h_pa diff");
-    assert!(max_diff(&expected_ffn, &metal_ffn) < 1e-4, "post_norm ffn_norm diff");
+    assert!(
+        max_diff(&expected_hpa, &metal_hpa) < 1e-4,
+        "post_norm h_pa diff"
+    );
+    assert!(
+        max_diff(&expected_ffn, &metal_ffn) < 1e-4,
+        "post_norm ffn_norm diff"
+    );
 }
 
 /// Stage: `residual::encode_post_ffn` plain (pre-norm) residual.
@@ -314,8 +382,12 @@ fn stage_post_ffn_pre_norm_matches_cpu() {
     let hidden = 192usize;
     let seq_len = 3usize;
 
-    let hpa: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.015).sin()).collect();
-    let dn: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.011).cos()).collect();
+    let hpa: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.015).sin())
+        .collect();
+    let dn: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.011).cos())
+        .collect();
 
     let expected: Vec<f32> = hpa.iter().zip(&dn).map(|(a, b)| a + b).collect();
 
@@ -327,11 +399,18 @@ fn stage_post_ffn_pre_norm_matches_cpu() {
     let enc = cmd.new_compute_command_encoder();
     let mut scratch = |n: u64| bufs.output(n);
     larql_compute::metal::stages::residual::encode_post_ffn(
-        enc, &rms_norm, &residual_add,
+        enc,
+        &rms_norm,
+        &residual_add,
         &mut scratch,
-        &dn_buf, &hpa_buf, &out,
+        &dn_buf,
+        &hpa_buf,
+        &out,
         None,
-        seq_len, hidden, 1e-6, 0.0,
+        seq_len,
+        hidden,
+        1e-6,
+        0.0,
         /*has_post_norms*/ false,
         (hidden * 4) as u64,
     );
@@ -357,9 +436,15 @@ fn stage_post_ffn_post_norm_matches_cpu() {
     let eps = 1e-6f32;
     let offset = 1.0f32;
 
-    let hpa: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.021).sin()).collect();
-    let dn: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.007).cos()).collect();
-    let w_post_ffn: Vec<f32> = (0..hidden).map(|i| 0.1 * ((i as f32) * 0.25).sin()).collect();
+    let hpa: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.021).sin())
+        .collect();
+    let dn: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.007).cos())
+        .collect();
+    let w_post_ffn: Vec<f32> = (0..hidden)
+        .map(|i| 0.1 * ((i as f32) * 0.25).sin())
+        .collect();
 
     let mut expected = vec![0.0f32; seq_len * hidden];
     for p in 0..seq_len {
@@ -379,11 +464,18 @@ fn stage_post_ffn_post_norm_matches_cpu() {
     let enc = cmd.new_compute_command_encoder();
     let mut scratch = |n: u64| bufs.output(n);
     larql_compute::metal::stages::residual::encode_post_ffn(
-        enc, &rms_norm, &residual_add,
+        enc,
+        &rms_norm,
+        &residual_add,
         &mut scratch,
-        &dn_buf, &hpa_buf, &out,
+        &dn_buf,
+        &hpa_buf,
+        &out,
         Some(&w_buf),
-        seq_len, hidden, eps, offset,
+        seq_len,
+        hidden,
+        eps,
+        offset,
         /*has_post_norms*/ true,
         (hidden * 4) as u64,
     );
@@ -407,7 +499,9 @@ fn stage_quant_matvec_routes_format_to_correct_shader() {
 
     let device = metal::Device::system_default().unwrap();
     let src = larql_compute::metal::shaders::all_shaders();
-    let library = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let library = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
 
     let q4kf_proj = build_pipeline(&device, "q4kf_proj");
     let q4k_mv = KernelHandle::from_kernel::<q4k_matvec::Kernel>(&device, &library).unwrap();
@@ -427,14 +521,16 @@ fn stage_quant_matvec_routes_format_to_correct_shader() {
         q4_matvec: &q4_matvec,
     };
 
-    let w_f32: Vec<f32> = (0..rows * hidden).map(|i| ((i as f32) * 0.009).sin()).collect();
+    let w_f32: Vec<f32> = (0..rows * hidden)
+        .map(|i| ((i as f32) * 0.009).sin())
+        .collect();
     let x: Vec<f32> = (0..hidden).map(|i| ((i as f32) * 0.017).cos()).collect();
 
     // Expected reference: f32 gemv, matches the dequantise-then-dot semantics
     // every quant shader approximates.
-    let expected: Vec<f32> = (0..rows).map(|r| {
-        (0..hidden).map(|c| w_f32[r * hidden + c] * x[c]).sum()
-    }).collect();
+    let expected: Vec<f32> = (0..rows)
+        .map(|r| (0..hidden).map(|c| w_f32[r * hidden + c] * x[c]).sum())
+        .collect();
 
     let x_buf = bufs.transient_from_f32(&x);
     let out = bufs.output((rows * 4) as u64);
@@ -446,16 +542,31 @@ fn stage_quant_matvec_routes_format_to_correct_shader() {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         larql_compute::metal::stages::quant_matvec::encode(
-            enc, larql_compute::QuantFormat::Q4_K, &w_q4k_buf,
-            &x_buf, 0, &x_buf, 0, &x_buf, 0,
-            &out, 0, &pipes, rows, hidden,
+            enc,
+            larql_compute::QuantFormat::Q4_K,
+            &w_q4k_buf,
+            &x_buf,
+            0,
+            &x_buf,
+            0,
+            &x_buf,
+            0,
+            &out,
+            0,
+            &pipes,
+            rows,
+            hidden,
         );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
     }
     let got_q4k = read_f32_buf(&out, rows);
-    let max_abs = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let max_abs = expected
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let rel = max_diff(&expected, &got_q4k) / max_abs;
     assert!(rel < 0.05, "Q4_K route rel err {rel:.4}");
 
@@ -466,9 +577,20 @@ fn stage_quant_matvec_routes_format_to_correct_shader() {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         larql_compute::metal::stages::quant_matvec::encode(
-            enc, larql_compute::QuantFormat::Q6_K, &w_q6k_buf,
-            &x_buf, 0, &x_buf, 0, &x_buf, 0,
-            &out, 0, &pipes, rows, hidden,
+            enc,
+            larql_compute::QuantFormat::Q6_K,
+            &w_q6k_buf,
+            &x_buf,
+            0,
+            &x_buf,
+            0,
+            &x_buf,
+            0,
+            &out,
+            0,
+            &pipes,
+            rows,
+            hidden,
         );
         enc.end_encoding();
         cmd.commit();
@@ -488,9 +610,20 @@ fn stage_quant_matvec_routes_format_to_correct_shader() {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         larql_compute::metal::stages::quant_matvec::encode(
-            enc, larql_compute::QuantFormat::Q4_0, &w_q4_0_buf,
-            &x_buf, 0, &q8_x_buf, 0, &q8_x_s_buf, 0,
-            &out, 0, &pipes, rows, hidden,
+            enc,
+            larql_compute::QuantFormat::Q4_0,
+            &w_q4_0_buf,
+            &x_buf,
+            0,
+            &q8_x_buf,
+            0,
+            &q8_x_s_buf,
+            0,
+            &out,
+            0,
+            &pipes,
+            rows,
+            hidden,
         );
         enc.end_encoding();
         cmd.commit();
@@ -528,11 +661,17 @@ fn f32_gemv_matches_ndarray_dot() {
     let expected = w.dot(&x_arr);
 
     // Metal path.
-    let got = metal.f32_gemv(w.view(), &x).expect("gemv should dispatch above threshold");
+    let got = metal
+        .f32_gemv(w.view(), &x)
+        .expect("gemv should dispatch above threshold");
     assert_eq!(got.len(), n);
 
     let diff = max_diff(expected.as_slice().unwrap(), &got);
-    let max_abs = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let max_abs = expected
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     let rel = diff / max_abs;
     assert!(
         rel < 1e-4,
@@ -552,7 +691,10 @@ fn f32_gemv_matches_ndarray_dot() {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .unwrap()
         .0;
-    assert_eq!(exp_argmax, got_argmax, "argmax mismatch between CPU and Metal gemv");
+    assert_eq!(
+        exp_argmax, got_argmax,
+        "argmax mismatch between CPU and Metal gemv"
+    );
 }
 
 /// `f16_gemv` shader: f16 weights × f32 query, matches `f32_gemv` within
@@ -610,7 +752,12 @@ fn f16_gemv_matches_f32_gemv_argmax() {
 
     // Sanity: the scores around the argmax should be within f16 relative
     // noise of the f32 reference.
-    let tol = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1.0) * 5e-3;
+    let tol = expected
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1.0)
+        * 5e-3;
     let diff = (expected[exp_argmax] - got[exp_argmax]).abs();
     assert!(
         diff < tol,
@@ -635,18 +782,30 @@ fn q4k_qkv_proj_matches_per_proj_dispatch() {
     let kv_rows = 1024usize;
     let hidden = 2560usize;
 
-    let wq_f32 = synth(q_rows, hidden, 0xbeef_0001).as_standard_layout().to_owned();
-    let wk_f32 = synth(kv_rows, hidden, 0xbeef_0002).as_standard_layout().to_owned();
-    let wv_f32 = synth(kv_rows, hidden, 0xbeef_0003).as_standard_layout().to_owned();
+    let wq_f32 = synth(q_rows, hidden, 0xbeef_0001)
+        .as_standard_layout()
+        .to_owned();
+    let wk_f32 = synth(kv_rows, hidden, 0xbeef_0002)
+        .as_standard_layout()
+        .to_owned();
+    let wv_f32 = synth(kv_rows, hidden, 0xbeef_0003)
+        .as_standard_layout()
+        .to_owned();
     let x: Vec<f32> = (0..hidden).map(|i| ((i as f32) * 0.017).cos()).collect();
 
     let wq_q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(wq_f32.as_slice().unwrap());
     let wk_q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(wk_f32.as_slice().unwrap());
     let wv_q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(wv_f32.as_slice().unwrap());
 
-    let ref_q = metal.q4k_matvec(&wq_q4k, &x, q_rows, hidden).expect("q4k_matvec Q");
-    let ref_k = metal.q4k_matvec(&wk_q4k, &x, kv_rows, hidden).expect("q4k_matvec K");
-    let ref_v = metal.q4k_matvec(&wv_q4k, &x, kv_rows, hidden).expect("q4k_matvec V");
+    let ref_q = metal
+        .q4k_matvec(&wq_q4k, &x, q_rows, hidden)
+        .expect("q4k_matvec Q");
+    let ref_k = metal
+        .q4k_matvec(&wk_q4k, &x, kv_rows, hidden)
+        .expect("q4k_matvec K");
+    let ref_v = metal
+        .q4k_matvec(&wv_q4k, &x, kv_rows, hidden)
+        .expect("q4k_matvec V");
 
     // Fused dispatch through `q4k_qkv_proj`.
     let wq_buf = metal.bufs().get_bytes(&wq_q4k);
@@ -693,8 +852,10 @@ fn q4k_qkv_proj_matches_per_proj_dispatch() {
     let check = |name: &str, r: &[f32], g: &[f32]| {
         let max_abs = r.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
         let d = max_diff(r, g);
-        assert!(d < max_abs * 1e-3,
-            "{name}: max_diff {d:.3e} exceeds 0.1% of max_abs {max_abs:.3e}");
+        assert!(
+            d < max_abs * 1e-3,
+            "{name}: max_diff {d:.3e} exceeds 0.1% of max_abs {max_abs:.3e}"
+        );
     };
     check("Q", &ref_q, &got_q);
     check("K", &ref_k, &got_k);
@@ -721,9 +882,15 @@ fn q4k_q6k_qkv_proj_matches_per_proj_dispatch() {
     let hidden = 2560usize;
 
     // Synthesise weight matrices and quantise.
-    let wq_f32 = synth(q_rows, hidden, 0xdead_beef_1).as_standard_layout().to_owned();
-    let wk_f32 = synth(kv_rows, hidden, 0xdead_beef_2).as_standard_layout().to_owned();
-    let wv_f32 = synth(kv_rows, hidden, 0xdead_beef_3).as_standard_layout().to_owned();
+    let wq_f32 = synth(q_rows, hidden, 0xdead_beef_1)
+        .as_standard_layout()
+        .to_owned();
+    let wk_f32 = synth(kv_rows, hidden, 0xdead_beef_2)
+        .as_standard_layout()
+        .to_owned();
+    let wv_f32 = synth(kv_rows, hidden, 0xdead_beef_3)
+        .as_standard_layout()
+        .to_owned();
     let x: Vec<f32> = (0..hidden).map(|i| ((i as f32) * 0.011).sin()).collect();
 
     let wq_q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(wq_f32.as_slice().unwrap());
@@ -731,9 +898,15 @@ fn q4k_q6k_qkv_proj_matches_per_proj_dispatch() {
     let wv_q6k = larql_compute::cpu::ops::q4_common::quantize_q6_k(wv_f32.as_slice().unwrap());
 
     // Reference: dispatch each projection through its native shader.
-    let ref_q = metal.q4k_matvec(&wq_q4k, &x, q_rows, hidden).expect("q4k_matvec Q");
-    let ref_k = metal.q4k_matvec(&wk_q4k, &x, kv_rows, hidden).expect("q4k_matvec K");
-    let ref_v = metal.q6k_matvec(&wv_q6k, &x, kv_rows, hidden).expect("q6k_matvec V");
+    let ref_q = metal
+        .q4k_matvec(&wq_q4k, &x, q_rows, hidden)
+        .expect("q4k_matvec Q");
+    let ref_k = metal
+        .q4k_matvec(&wk_q4k, &x, kv_rows, hidden)
+        .expect("q4k_matvec K");
+    let ref_v = metal
+        .q6k_matvec(&wv_q6k, &x, kv_rows, hidden)
+        .expect("q6k_matvec V");
 
     // Fused dispatch.
     let wq_buf = metal.bufs().get_bytes(&wq_q4k);
@@ -783,8 +956,10 @@ fn q4k_q6k_qkv_proj_matches_per_proj_dispatch() {
     let check = |name: &str, r: &[f32], g: &[f32]| {
         let max_abs = r.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
         let d = max_diff(r, g);
-        assert!(d < max_abs * 1e-3,
-            "{name}: max_diff {d:.3e} exceeds 0.1% of max_abs {max_abs:.3e}");
+        assert!(
+            d < max_abs * 1e-3,
+            "{name}: max_diff {d:.3e} exceeds 0.1% of max_abs {max_abs:.3e}"
+        );
     };
     check("Q", &ref_q, &got_q);
     check("K", &ref_k, &got_k);
@@ -807,8 +982,12 @@ fn stage_post_attn_q8_ffn_emits_roundtrippable_q8() {
     let hidden = 256usize;
     let seq_len = 2usize;
 
-    let h: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.009).sin() * 2.0).collect();
-    let o: Vec<f32> = (0..seq_len * hidden).map(|i| ((i as f32) * 0.013).cos() * 1.5).collect();
+    let h: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.009).sin() * 2.0)
+        .collect();
+    let o: Vec<f32> = (0..seq_len * hidden)
+        .map(|i| ((i as f32) * 0.013).cos() * 1.5)
+        .collect();
     let w: Vec<f32> = (0..hidden).map(|i| 1.0 + 0.02 * (i as f32).sin()).collect();
 
     let h_buf = bufs.transient_from_f32(&h);
@@ -823,12 +1002,23 @@ fn stage_post_attn_q8_ffn_emits_roundtrippable_q8() {
     let enc = cmd.new_compute_command_encoder();
     let mut scratch = |n: u64| bufs.output(n);
     larql_compute::metal::stages::residual::encode_post_attn(
-        enc, &rms_norm, &residual_add, &q8_quant,
+        enc,
+        &rms_norm,
+        &residual_add,
+        &q8_quant,
         &mut scratch,
-        &h_buf, &o_buf, &h_pa, &ffn_out,
-        &w_buf, &w_buf,
-        &q8, &q8s,
-        seq_len, hidden, 1e-6, 0.0,
+        &h_buf,
+        &o_buf,
+        &h_pa,
+        &ffn_out,
+        &w_buf,
+        &w_buf,
+        &q8,
+        &q8s,
+        seq_len,
+        hidden,
+        1e-6,
+        0.0,
         /*has_post_norms*/ false,
         /*ffn_needs_q8*/ true,
         (hidden * 4) as u64,
@@ -843,9 +1033,8 @@ fn stage_post_attn_q8_ffn_emits_roundtrippable_q8() {
     // `quantize_q8` writes f32 scales (not f16) — `q8s_stride_bytes` is
     // `blocks_per_row * 4` to reflect that.
     let ffn_f32 = read_f32_buf(&ffn_out, seq_len * hidden);
-    let q8_bytes = unsafe {
-        std::slice::from_raw_parts(q8.contents() as *const i8, seq_len * hidden)
-    };
+    let q8_bytes =
+        unsafe { std::slice::from_raw_parts(q8.contents() as *const i8, seq_len * hidden) };
     let blocks_per_pos = hidden.div_ceil(32);
     let q8s_f32 = unsafe {
         std::slice::from_raw_parts(q8s.contents() as *const f32, seq_len * blocks_per_pos)
@@ -864,6 +1053,8 @@ fn stage_post_attn_q8_ffn_emits_roundtrippable_q8() {
     }
     let max_abs = ffn_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let d = max_diff(&ffn_f32, &dequant);
-    assert!(d < max_abs / 100.0 + 1e-4,
-        "Q8 roundtrip error {d} exceeds 1% of max_abs {max_abs}");
+    assert!(
+        d < max_abs / 100.0 + 1e-4,
+        "Q8 roundtrip error {d} exceeds 1% of max_abs {max_abs}"
+    );
 }

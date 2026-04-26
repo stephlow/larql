@@ -18,8 +18,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::Json;
 use axum::extract::State;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -81,9 +81,7 @@ pub fn warmup_model(model: &LoadedModel, req: &WarmupRequest) -> WarmupResponse 
                 );
             }
             Err(e) => {
-                tracing::warn!(
-                    "warmup[{model_id}]: weight load failed (skipping): {e}"
-                );
+                tracing::warn!("warmup[{model_id}]: weight load failed (skipping): {e}");
             }
         }
     }
@@ -146,10 +144,7 @@ pub fn warmup_model(model: &LoadedModel, req: &WarmupRequest) -> WarmupResponse 
 /// Async wrapper for `warmup_model` that runs the (potentially
 /// multi-second) work on a blocking worker so the tokio runtime
 /// stays responsive.
-pub async fn warmup_model_async(
-    model: Arc<LoadedModel>,
-    req: WarmupRequest,
-) -> WarmupResponse {
+pub async fn warmup_model_async(model: Arc<LoadedModel>, req: WarmupRequest) -> WarmupResponse {
     tokio::task::spawn_blocking(move || warmup_model(&model, &req))
         .await
         .expect("warmup spawn_blocking")

@@ -11,10 +11,10 @@
 //! Expert weights are stored as packed BF16: [num_experts, out_dim, in_dim].
 //! We dequantize only the selected top-k expert slices on demand.
 
-mod math;
+mod cache;
 mod expert;
 mod forward;
-mod cache;
+mod math;
 
 pub use expert::{run_single_expert, run_single_expert_with_norm};
 pub use forward::cpu_moe_forward;
@@ -30,7 +30,7 @@ pub fn cpu_moe_route(
     use math::*;
     let hidden = h.len();
     let num_experts = moe.num_experts;
-    let top_k_val  = moe.top_k;
+    let top_k_val = moe.top_k;
 
     let router_in_normed = if !moe.router_norm.is_empty() {
         rms_norm(h, moe.router_norm, eps, 0.0)
@@ -40,12 +40,18 @@ pub fn cpu_moe_route(
         h.to_vec()
     };
     let mut router_in: Vec<f32> = if !moe.router_scale.is_empty() {
-        router_in_normed.iter().zip(moe.router_scale).map(|(a, b)| a * b).collect()
+        router_in_normed
+            .iter()
+            .zip(moe.router_scale)
+            .map(|(a, b)| a * b)
+            .collect()
     } else {
         router_in_normed
     };
     if moe.router_input_scalar != 1.0 && moe.router_input_scalar != 0.0 {
-        for v in &mut router_in { *v *= moe.router_input_scalar; }
+        for v in &mut router_in {
+            *v *= moe.router_input_scalar;
+        }
     }
 
     let mut logits = matmul_vec(&router_in, moe.router_proj, num_experts, hidden);
@@ -54,7 +60,11 @@ pub fn cpu_moe_route(
 
     // Renormalize selected weights → sum to 1 (gemma4_top_k_softmax).
     let sum: f32 = weights.iter().sum();
-    if sum > 0.0 { for w in &mut weights { *w /= sum; } }
+    if sum > 0.0 {
+        for w in &mut weights {
+            *w /= sum;
+        }
+    }
 
     // Per-expert output scale (Gemma 4 learned per-expert multiplier).
     if !moe.router_per_expert_scale.is_empty() {
@@ -73,8 +83,13 @@ mod tests {
     use crate::MoeLayerWeights;
 
     fn make_moe<'a>(
-        _hidden: usize, inter: usize, num_experts: usize, top_k: usize,
-        gate_up: &'a [u8], down: &'a [u8], router: &'a [f32],
+        _hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        top_k: usize,
+        gate_up: &'a [u8],
+        down: &'a [u8],
+        router: &'a [f32],
     ) -> MoeLayerWeights<'a> {
         MoeLayerWeights {
             experts_gate_up: gate_up,
@@ -112,20 +127,25 @@ mod tests {
         let h = vec![1.0f32; hidden];
         let out = cpu_moe_forward(&h, &moe, 0.0, 1e-6);
         assert_eq!(out.len(), hidden);
-        assert!(out.iter().all(|v| v.abs() < 1e-5), "zero weights → zero output");
+        assert!(
+            out.iter().all(|v| v.abs() < 1e-5),
+            "zero weights → zero output"
+        );
     }
 
     #[test]
     fn cache_eviction_no_panic() {
         // Insert 70 unique heap allocations to trigger LRU eviction (default cap = 64).
         // Keeps all Vecs alive simultaneously so the allocator gives unique addresses.
-        let _bufs: Vec<Vec<u8>> = (0..70usize).map(|i| {
-            // Vary content slightly so the allocator can't trivially reuse the slot,
-            // but the key guarantee is unique heap pointer per live Vec.
-            let data = vec![i as u8, 0x3Fu8, 0x00u8, 0x3Fu8]; // 2 BF16 values
-            let _ = cache::cached_dequant(&data);
-            data
-        }).collect();
+        let _bufs: Vec<Vec<u8>> = (0..70usize)
+            .map(|i| {
+                // Vary content slightly so the allocator can't trivially reuse the slot,
+                // but the key guarantee is unique heap pointer per live Vec.
+                let data = vec![i as u8, 0x3Fu8, 0x00u8, 0x3Fu8]; // 2 BF16 values
+                let _ = cache::cached_dequant(&data);
+                data
+            })
+            .collect();
         // Reaching here without panic confirms eviction path is safe.
         assert_eq!(_bufs.len(), 70);
     }
@@ -137,7 +157,10 @@ mod tests {
         let first = cache::cached_dequant(&data);
         let second = cache::cached_dequant(&data);
         // Both Arcs should point to the same allocation (same pointer).
-        assert!(std::sync::Arc::ptr_eq(&first, &second), "cache hit should return the same Arc");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache hit should return the same Arc"
+        );
     }
 
     #[test]
@@ -165,7 +188,7 @@ mod tests {
             }
         }
         // Expert 0, up rows (rows inter..2*inter): set to 1.0
-        for row in inter..2*inter {
+        for row in inter..2 * inter {
             for col in 0..hidden {
                 let byte_off = (row * hidden + col) * 2;
                 gate_up[byte_off] = one_bf16[0];
@@ -190,6 +213,9 @@ mod tests {
         let out = cpu_moe_forward(&h, &moe, 0.0, 1e-6);
         assert_eq!(out.len(), hidden);
         // Output should be nonzero since gate activates
-        assert!(out.iter().any(|v| v.abs() > 0.01), "expected nonzero output from identity-like expert");
+        assert!(
+            out.iter().any(|v| v.abs() > 0.01),
+            "expected nonzero output from identity-like expert"
+        );
     }
 }

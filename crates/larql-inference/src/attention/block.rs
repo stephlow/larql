@@ -3,10 +3,10 @@
 //! norm → Q/K/V projection → bias → V-norm → QK-norm → RoPE → GQA → O projection → residual.
 //! Supports KV sharing (reuse K/V from a source layer).
 
-use ndarray::Array2;
-use super::{AttentionWeights, SharedKV};
-use super::rope::apply_rope_partial;
 use super::gqa::gqa_attention_with_weights;
+use super::rope::apply_rope_partial;
+use super::{AttentionWeights, SharedKV};
+use ndarray::Array2;
 
 /// Run the full attention block. Returns (h_post_attn, attn_projected, optional_weights).
 #[allow(clippy::too_many_arguments)]
@@ -28,7 +28,13 @@ pub fn run_attention_block_with_kv_out(
     layer: usize,
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
-) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>, Array2<f32>, Array2<f32>)> {
+) -> Option<(
+    Array2<f32>,
+    Array2<f32>,
+    Option<AttentionWeights>,
+    Array2<f32>,
+    Array2<f32>,
+)> {
     let (h_post, attn_proj, attn_w, k, v, _pre_o) =
         run_attention_block_core(weights, h, layer, capture_attention, shared_kv)?;
     Some((h_post, attn_proj, attn_w, k, v))
@@ -56,8 +62,7 @@ pub fn run_attention_block_with_pre_o(
     h: &Array2<f32>,
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
-    let (h_post, _, _, _, _, pre_o) =
-        run_attention_block_core(weights, h, layer, false, None)?;
+    let (h_post, _, _, _, _, pre_o) = run_attention_block_core(weights, h, layer, false, None)?;
     Some((h_post, pre_o))
 }
 
@@ -70,8 +75,15 @@ fn run_attention_block_core(
     layer: usize,
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
-) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>, Array2<f32>, Array2<f32>, Array2<f32>)> {
-    use crate::forward::{dot_proj, add_bias};
+) -> Option<(
+    Array2<f32>,
+    Array2<f32>,
+    Option<AttentionWeights>,
+    Array2<f32>,
+    Array2<f32>,
+    Array2<f32>,
+)> {
+    use crate::forward::{add_bias, dot_proj};
     use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
 
     let arch = &*weights.arch;
@@ -92,8 +104,14 @@ fn run_attention_block_core(
     // capture a specific layer instead — Gemma 4 global layers (5, 11, …)
     // are useful for bisecting partial-RoPE / V-norm interactions.
     let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
-        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-    let stage_dump = if layer == stage_layer { std::env::var("LARQL_CPU_STAGE_DUMP").ok() } else { None };
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let stage_dump = if layer == stage_layer {
+        std::env::var("LARQL_CPU_STAGE_DUMP").ok()
+    } else {
+        None
+    };
     let dump_f32 = |name: &str, arr: &Array2<f32>| {
         if let Some(ref dir) = stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);
@@ -103,22 +121,33 @@ fn run_attention_block_core(
     };
 
     // Input norm
-    let h_norm = crate::forward::apply_norm(weights, h, &arch.input_layernorm_key(layer), norm_offset);
+    let h_norm =
+        crate::forward::apply_norm(weights, h, &arch.input_layernorm_key(layer), norm_offset);
     dump_f32("norm_out", &h_norm);
 
     // Q projection (always from current hidden state)
     let w_q = weights.tensors.get(&arch.attn_q_key(layer))?;
     let w_o = weights.tensors.get(&arch.attn_o_key(layer)).unwrap();
     let mut q_full = dot_proj(&h_norm, w_q);
-    if let Some(bias) = arch.attn_q_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    if let Some(bias) = arch
+        .attn_q_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         add_bias(&mut q_full, bias);
     }
     dump_f32("q_out_raw", &q_full);
 
     // QK norm on Q
     let qk_offset = weights.arch.qk_norm_weight_offset();
-    let qk_norm_off = if qk_offset != 0.0 { qk_offset } else { norm_offset };
-    let q_normed = match arch.attn_q_norm_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    let qk_norm_off = if qk_offset != 0.0 {
+        qk_offset
+    } else {
+        norm_offset
+    };
+    let q_normed = match arch
+        .attn_q_norm_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         Some(norm_w) => rms_norm_heads(&q_full, norm_w, num_q, head_dim, qk_norm_off),
         None => q_full,
     };
@@ -136,11 +165,17 @@ fn run_attention_block_core(
         let w_k = weights.tensors.get(&arch.attn_k_key(layer)).unwrap();
 
         let mut k_full = dot_proj(&h_norm, w_k);
-        if let Some(bias) = arch.attn_k_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+        if let Some(bias) = arch
+            .attn_k_bias_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+        {
             add_bias(&mut k_full, bias);
         }
 
-        let k_normed = match arch.attn_k_norm_key(layer).and_then(|k| weights.vectors.get(&k)) {
+        let k_normed = match arch
+            .attn_k_norm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+        {
             Some(norm_w) => rms_norm_heads(&k_full, norm_w, num_kv, head_dim, qk_norm_off),
             None => k_full.clone(),
         };
@@ -161,7 +196,10 @@ fn run_attention_block_core(
         // reuse `k_full` — matches pre-Q6K-V behaviour.
         let v_full = if let Some(w_v) = weights.tensors.get(&arch.attn_v_key(layer)) {
             let mut v = dot_proj(&h_norm, w_v);
-            if let Some(bias) = arch.attn_v_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+            if let Some(bias) = arch
+                .attn_v_bias_key(layer)
+                .and_then(|k| weights.vectors.get(&k))
+            {
                 add_bias(&mut v, bias);
             }
             if arch.has_v_norm() {
@@ -185,14 +223,25 @@ fn run_attention_block_core(
     // GQA attention
     let softcap = arch.attn_logit_softcapping();
     let (attn_out, attn_weights) = gqa_attention_with_weights(
-        &q_rope, &k_rope, &v_final, num_q, head_dim, reps, scale, seq_len,
-        capture_attention, softcap,
+        &q_rope,
+        &k_rope,
+        &v_final,
+        num_q,
+        head_dim,
+        reps,
+        scale,
+        seq_len,
+        capture_attention,
+        softcap,
     );
     dump_f32("attn_out", &attn_out);
 
     // O projection
     let mut attn_projected = dot_proj(&attn_out, w_o);
-    if let Some(bias) = arch.attn_o_bias_key(layer).and_then(|k| weights.vectors.get(&k)) {
+    if let Some(bias) = arch
+        .attn_o_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
         add_bias(&mut attn_projected, bias);
     }
     dump_f32("o_out", &attn_projected);
@@ -201,28 +250,46 @@ fn run_attention_block_core(
     let res_mult = arch.residual_multiplier();
     let h_post_attn = if arch.has_post_norms() {
         let normed = crate::forward::apply_norm(
-            weights, &attn_projected, &arch.post_attention_layernorm_key(layer), norm_offset,
+            weights,
+            &attn_projected,
+            &arch.post_attention_layernorm_key(layer),
+            norm_offset,
         );
-        if res_mult != 1.0 { h + &(&normed * res_mult) } else { h + &normed }
+        if res_mult != 1.0 {
+            h + &(&normed * res_mult)
+        } else {
+            h + &normed
+        }
     } else if res_mult != 1.0 {
         h + &(&attn_projected * res_mult)
     } else {
         h + &attn_projected
     };
 
-    Some((h_post_attn, attn_projected, attn_weights, k_rope, v_final, attn_out))
+    Some((
+        h_post_attn,
+        attn_projected,
+        attn_weights,
+        k_rope,
+        v_final,
+        attn_out,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
     use crate::engines::test_utils::make_test_weights;
+    use ndarray::Array2;
 
     fn hidden(rows: usize, hidden: usize) -> Array2<f32> {
-        Array2::from_shape_vec((rows, hidden),
-            (0..rows * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect()
-        ).unwrap()
+        Array2::from_shape_vec(
+            (rows, hidden),
+            (0..rows * hidden)
+                .map(|i| (i as f32 + 1.0) * 0.01)
+                .collect(),
+        )
+        .unwrap()
     }
 
     // run_attention_block returns (h_post_attn, attn_proj, attn_weights)
@@ -232,8 +299,8 @@ mod tests {
     fn attention_block_output_shape() {
         let weights = make_test_weights();
         let h = hidden(3, weights.hidden_size);
-        let (h_out, attn_proj, _) = run_attention_block(&weights, &h, 0, false)
-            .expect("run_attention_block failed");
+        let (h_out, attn_proj, _) =
+            run_attention_block(&weights, &h, 0, false).expect("run_attention_block failed");
         assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
         assert_eq!(attn_proj.shape()[0], 3);
     }
@@ -260,8 +327,10 @@ mod tests {
         let weights = make_test_weights();
         let h = hidden(2, weights.hidden_size);
         for layer in 0..weights.num_layers {
-            assert!(run_attention_block(&weights, &h, layer, false).is_some(),
-                "layer {layer} failed");
+            assert!(
+                run_attention_block(&weights, &h, layer, false).is_some(),
+                "layer {layer} failed"
+            );
         }
     }
 

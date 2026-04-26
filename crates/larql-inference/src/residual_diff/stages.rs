@@ -72,8 +72,12 @@ impl StageCapture {
     /// the dump fired (zero stages means the backend didn't honour the
     /// env var, e.g. an env-var typo or the layer didn't reach the
     /// dump point).
-    pub fn len(&self) -> usize { self.stages.len() }
-    pub fn is_empty(&self) -> bool { self.stages.is_empty() }
+    pub fn len(&self) -> usize {
+        self.stages.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
 
     /// Look up one stage by its short name (no `cpu_L0_` /
     /// `decode_layer_NN_` prefix).
@@ -128,8 +132,12 @@ impl StageCapture {
         layer: usize,
     ) -> Result<Self, String> {
         let dir = run_with_two_env_vars(
-            "LARQL_CPU_STAGE_DUMP", "LARQL_STAGE_DUMP_LAYER", &layer.to_string(),
-            || { let _ = crate::vindex::predict_q4k_hidden(weights, ids, index); },
+            "LARQL_CPU_STAGE_DUMP",
+            "LARQL_STAGE_DUMP_LAYER",
+            &layer.to_string(),
+            || {
+                let _ = crate::vindex::predict_q4k_hidden(weights, ids, index);
+            },
         )?;
         let prefix = format!("cpu_L{layer}_");
         Ok(Self {
@@ -156,13 +164,22 @@ impl StageCapture {
         layer: usize,
     ) -> Result<Self, String> {
         let dir = run_with_two_env_vars(
-            "LARQL_METAL_DUMP_LAYERS", "LARQL_STAGE_DUMP_LAYER", &layer.to_string(),
+            "LARQL_METAL_DUMP_LAYERS",
+            "LARQL_STAGE_DUMP_LAYER",
+            &layer.to_string(),
             || {
                 let cached = crate::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
                 let dummy_tok = build_dummy_tokenizer();
                 let n = weights.num_layers;
                 let _ = crate::layer_graph::generate::generate(
-                    weights, &dummy_tok, ids, 1, index, backend, &cached, 0..n,
+                    weights,
+                    &dummy_tok,
+                    ids,
+                    1,
+                    index,
+                    backend,
+                    &cached,
+                    0..n,
                 );
             },
         )?;
@@ -223,8 +240,12 @@ impl StageCapture {
             larql_compute::QuantFormat::Q4_0
         };
         let pipeline_layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
-            weights, index, 0..num_layers,
-            q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+            weights,
+            index,
+            0..num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
         );
 
         let q_dim = weights.num_q_heads * weights.head_dim;
@@ -235,21 +256,42 @@ impl StageCapture {
 
         let h_embed = crate::forward::embed_tokens_pub(weights, prefix_ids);
         let prefill_x: Vec<f32> = h_embed.as_slice().unwrap().to_vec();
-        backend.prefill_q4(
-            &pipeline_layers, &prefill_x, hidden, intermediate, q_dim, kv_dim,
-            prefix_ids.len(),
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
-            rope, qk_norm_val, softcap,
-        ).ok_or("Metal prefill_q4 returned None")?;
+        backend
+            .prefill_q4(
+                &pipeline_layers,
+                &prefill_x,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                prefix_ids.len(),
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
+                qk_norm_val,
+                softcap,
+            )
+            .ok_or("Metal prefill_q4 returned None")?;
 
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[new_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
         let dir = run_with_two_env_vars(
-            "LARQL_DECODE_DUMP_LAYERS", "LARQL_STAGE_DUMP_LAYER", &layer.to_string(),
+            "LARQL_DECODE_DUMP_LAYERS",
+            "LARQL_STAGE_DUMP_LAYER",
+            &layer.to_string(),
             || {
                 let _ = backend.decode_token(
-                    &pipeline_layers, &dec_x, hidden, intermediate, q_dim, kv_dim,
-                    weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+                    &pipeline_layers,
+                    &dec_x,
+                    hidden,
+                    intermediate,
+                    q_dim,
+                    kv_dim,
+                    weights.num_q_heads,
+                    weights.num_kv_heads,
+                    weights.head_dim,
+                    rope,
                 );
             },
         )?;
@@ -291,7 +333,9 @@ pub struct StageReport {
 }
 
 impl StageReport {
-    pub fn is_clean(&self) -> bool { self.first_bad.is_none() }
+    pub fn is_clean(&self) -> bool {
+        self.first_bad.is_none()
+    }
 
     /// Emit a one-line summary per stage, marking the first-bad row
     /// with a "←" so the diverging stage stands out at a glance. Used
@@ -299,11 +343,18 @@ impl StageReport {
     pub fn summary(&self) -> String {
         let mut s = format!(
             "stage diff @L{} ({} vs {}, threshold cos≥{} rel≤{}):\n",
-            self.layer, self.a_backend, self.b_backend,
-            self.threshold.cos, self.threshold.rel_max_abs,
+            self.layer,
+            self.a_backend,
+            self.b_backend,
+            self.threshold.cos,
+            self.threshold.rel_max_abs,
         );
         for (i, p) in self.pairs.iter().enumerate() {
-            let mark = if Some(i) == self.first_bad { " ←" } else { "" };
+            let mark = if Some(i) == self.first_bad {
+                " ←"
+            } else {
+                ""
+            };
             if p.missing {
                 s.push_str(&format!(
                     "  {:<24} MISSING ({}/{}){}\n",
@@ -312,8 +363,11 @@ impl StageReport {
             } else {
                 s.push_str(&format!(
                     "  {:<24} cos={:.6} max_abs={:.3e} rel={:.3}%{}\n",
-                    p.name_a, p.stat.cos, p.stat.max_abs,
-                    100.0 * p.stat.rel_max_abs(), mark,
+                    p.name_a,
+                    p.stat.cos,
+                    p.stat.max_abs,
+                    100.0 * p.stat.rel_max_abs(),
+                    mark,
                 ));
             }
         }
@@ -321,7 +375,9 @@ impl StageReport {
     }
 
     pub fn assert_clean(&self) -> Result<(), String> {
-        if self.first_bad.is_none() { return Ok(()); }
+        if self.first_bad.is_none() {
+            return Ok(());
+        }
         Err(self.summary())
     }
 }
@@ -354,7 +410,9 @@ pub fn compare_stages(
                     },
                     missing: true,
                 });
-                if first_bad.is_none() { first_bad = Some(i); }
+                if first_bad.is_none() {
+                    first_bad = Some(i);
+                }
                 continue;
             }
         };
@@ -362,7 +420,9 @@ pub fn compare_stages(
         let bad = av.len() != bv.len()
             || stat.cos < threshold.cos
             || stat.rel_max_abs() > threshold.rel_max_abs;
-        if bad && first_bad.is_none() { first_bad = Some(i); }
+        if bad && first_bad.is_none() {
+            first_bad = Some(i);
+        }
         out.push(StagePair {
             name_a: name_a.into(),
             name_b: name_b.into(),
@@ -385,7 +445,11 @@ pub fn compare_stages(
 fn stage_stat(layer: usize, a: &[f32], b: &[f32]) -> LayerStat {
     if a.len() != b.len() {
         return LayerStat {
-            layer, cos: 0.0, max_abs: f32::INFINITY, a_norm: 0.0, b_norm: 0.0,
+            layer,
+            cos: 0.0,
+            max_abs: f32::INFINITY,
+            a_norm: 0.0,
+            b_norm: 0.0,
         };
     }
     let mut dot = 0.0f64;
@@ -399,12 +463,22 @@ fn stage_stat(layer: usize, a: &[f32], b: &[f32]) -> LayerStat {
         a_sq += x * x;
         b_sq += y * y;
         let d = (a[i] - b[i]).abs();
-        if d > max_abs { max_abs = d; }
+        if d > max_abs {
+            max_abs = d;
+        }
     }
     let cos = if a_sq > 0.0 && b_sq > 0.0 {
         (dot / (a_sq.sqrt() * b_sq.sqrt())) as f32
-    } else { 0.0 };
-    LayerStat { layer, cos, max_abs, a_norm: a_sq.sqrt() as f32, b_norm: b_sq.sqrt() as f32 }
+    } else {
+        0.0
+    };
+    LayerStat {
+        layer,
+        cos,
+        max_abs,
+        a_norm: a_sq.sqrt() as f32,
+        b_norm: b_sq.sqrt() as f32,
+    }
 }
 
 /// Set two env vars together (a dir-typed one and a layer-index one),
@@ -440,14 +514,20 @@ fn run_with_two_env_vars(
 /// catches that).
 fn read_stage_dir(dir: &Path, prefix: &str) -> Result<HashMap<String, Vec<f32>>, String> {
     let mut out = HashMap::new();
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
         let path = entry.path();
-        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        let Some(rest) = fname.strip_prefix(prefix) else { continue };
-        let Some(stage) = rest.strip_suffix(".f32") else { continue };
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(rest) = fname.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(stage) = rest.strip_suffix(".f32") else {
+            continue;
+        };
         let Some(v) = read_f32_vec(&path) else {
             return Err(format!("could not read f32 file {}", path.display()));
         };
@@ -458,11 +538,14 @@ fn read_stage_dir(dir: &Path, prefix: &str) -> Result<HashMap<String, Vec<f32>>,
 
 fn read_f32_vec(path: &Path) -> Option<Vec<f32>> {
     let bytes = std::fs::read(path).ok()?;
-    if !bytes.len().is_multiple_of(4) { return None; }
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
     Some(
-        bytes.chunks_exact(4)
+        bytes
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+            .collect(),
     )
 }
 
@@ -478,7 +561,10 @@ mod tests {
 
     fn cap(stages: &[(&str, Vec<f32>)], layer: usize, backend: &'static str) -> StageCapture {
         StageCapture {
-            stages: stages.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            stages: stages
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
             layer,
             seq_len: 1,
             backend,
@@ -492,7 +578,10 @@ mod tests {
         backend: &'static str,
     ) -> StageCapture {
         StageCapture {
-            stages: stages.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            stages: stages
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
             layer,
             seq_len,
             backend,
@@ -502,8 +591,8 @@ mod tests {
     #[test]
     fn project_to_last_position_slices_per_stride() {
         // [seq=3, hidden=2] for s0; [seq=3, qdim=4] for s1.
-        let s0 = vec![1.0, 2.0,  10.0, 20.0,  100.0, 200.0];
-        let s1 = vec![0.1, 0.2, 0.3, 0.4,  1.1, 1.2, 1.3, 1.4,  9.1, 9.2, 9.3, 9.4];
+        let s0 = vec![1.0, 2.0, 10.0, 20.0, 100.0, 200.0];
+        let s1 = vec![0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 9.1, 9.2, 9.3, 9.4];
         let cap = cap_with_seq(&[("s0", s0), ("s1", s1)], 0, 3, "cpu");
         let proj = cap.project_to_last_position();
         assert_eq!(proj.seq_len, 1);
@@ -523,10 +612,19 @@ mod tests {
 
     #[test]
     fn compare_stages_clean_when_all_match() {
-        let a = cap(&[("norm_out", vec![1.0, 2.0]), ("q_out", vec![3.0, 4.0])], 0, "a");
-        let b = cap(&[("norm_out", vec![1.0, 2.0]), ("q_out", vec![3.0, 4.0])], 0, "b");
+        let a = cap(
+            &[("norm_out", vec![1.0, 2.0]), ("q_out", vec![3.0, 4.0])],
+            0,
+            "a",
+        );
+        let b = cap(
+            &[("norm_out", vec![1.0, 2.0]), ("q_out", vec![3.0, 4.0])],
+            0,
+            "b",
+        );
         let r = compare_stages(
-            &a, &b,
+            &a,
+            &b,
             &[("norm_out", "norm_out"), ("q_out", "q_out")],
             ParityThreshold::tight(),
         );
@@ -541,7 +639,10 @@ mod tests {
         b1[0] = 100.0;
         let b = cap(&[("s0", vec![1.0; 4]), ("s1", b1)], 0, "b");
         let r = compare_stages(
-            &a, &b, &[("s0", "s0"), ("s1", "s1")], ParityThreshold::tight(),
+            &a,
+            &b,
+            &[("s0", "s0"), ("s1", "s1")],
+            ParityThreshold::tight(),
         );
         assert_eq!(r.first_bad, Some(1));
         assert!(!r.is_clean());
@@ -554,7 +655,10 @@ mod tests {
         let b = cap(&[("s0", vec![1.0])], 0, "b");
         // Asking for "s1" which neither side has.
         let r = compare_stages(
-            &a, &b, &[("s0", "s0"), ("s1", "s1")], ParityThreshold::tight(),
+            &a,
+            &b,
+            &[("s0", "s0"), ("s1", "s1")],
+            ParityThreshold::tight(),
         );
         assert_eq!(r.first_bad, Some(1));
         assert!(r.pairs[1].missing);
@@ -566,7 +670,10 @@ mod tests {
         let a = cap(&[("q_out_after_rope", vec![1.0, 2.0])], 0, "cpu");
         let b = cap(&[("q_out", vec![1.0, 2.0])], 0, "metal");
         let r = compare_stages(
-            &a, &b, &[("q_out_after_rope", "q_out")], ParityThreshold::tight(),
+            &a,
+            &b,
+            &[("q_out_after_rope", "q_out")],
+            ParityThreshold::tight(),
         );
         assert!(r.is_clean());
     }

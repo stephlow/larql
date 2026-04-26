@@ -12,7 +12,7 @@ pub mod streaming;
 pub use build::build_vindex;
 pub use build::build_vindex_resume;
 pub use build_from_vectors::build_vindex_from_vectors;
+pub use callbacks::{IndexBuildCallbacks, SilentBuildCallbacks};
 pub use checkpoint::{Checkpoint, ExtractPhase, CHECKPOINT_FILE};
 pub use metadata::{snapshot_hf_metadata, SNAPSHOT_FILES};
 pub use streaming::build_vindex_streaming;
-pub use callbacks::{IndexBuildCallbacks, SilentBuildCallbacks};

@@ -47,9 +47,15 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, minijinja::Erro
     // `raise_exception(msg)` — HF templates use this to reject malformed
     // conversations (e.g. tool-use template when `tools` arg is missing).
     // Map it to a rendering-time error so the template fails cleanly.
-    env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
-        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-    });
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
 
     // `strftime_now(fmt)` — Llama-3, Qwen, some DeepSeek variants inline
     // the current date in a system message. We return an empty string to
@@ -110,9 +116,8 @@ mod tests {
 
     #[test]
     fn passes_bos_and_eos_from_config() {
-        let cfg: Value = serde_json::from_str(
-            r#"{"bos_token": "<s>", "eos_token": "</s>"}"#,
-        ).unwrap();
+        let cfg: Value =
+            serde_json::from_str(r#"{"bos_token": "<s>", "eos_token": "</s>"}"#).unwrap();
         let tmpl = "{{ bos_token }}/{{ eos_token }}/{{ messages[0].content }}";
         let out = render_chat_template(tmpl, &cfg, "x").unwrap();
         assert_eq!(out, "<s>/</s>/x");
@@ -121,9 +126,9 @@ mod tests {
     #[test]
     fn unwraps_object_form_special_tokens() {
         // HF sometimes serializes bos_token as {"content": "<bos>", ...}.
-        let cfg: Value = serde_json::from_str(
-            r#"{"bos_token": {"content": "<bos>", "lstrip": false}}"#,
-        ).unwrap();
+        let cfg: Value =
+            serde_json::from_str(r#"{"bos_token": {"content": "<bos>", "lstrip": false}}"#)
+                .unwrap();
         let tmpl = "{{ bos_token }}|{{ messages[0].content }}";
         let out = render_chat_template(tmpl, &cfg, "hi").unwrap();
         assert_eq!(out, "<bos>|hi");
@@ -141,8 +146,14 @@ mod tests {
     #[test]
     fn pycompat_startswith_on_string_works() {
         let tmpl = "{% if messages[0]['content'].startswith('hi') %}yes{% else %}no{% endif %}";
-        assert_eq!(render_chat_template(tmpl, &empty_cfg(), "hi there").unwrap(), "yes");
-        assert_eq!(render_chat_template(tmpl, &empty_cfg(), "bye").unwrap(), "no");
+        assert_eq!(
+            render_chat_template(tmpl, &empty_cfg(), "hi there").unwrap(),
+            "yes"
+        );
+        assert_eq!(
+            render_chat_template(tmpl, &empty_cfg(), "bye").unwrap(),
+            "no"
+        );
     }
 
     #[test]

@@ -59,7 +59,9 @@ fn run_v_norm_batched(
     let hd_val = head_dim as u32;
     let nh_val = num_heads as u32;
     let mut tg_w: u64 = 1;
-    while tg_w < head_dim as u64 && tg_w < 512 { tg_w <<= 1; }
+    while tg_w < head_dim as u64 && tg_w < 512 {
+        tg_w <<= 1;
+    }
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
@@ -125,13 +127,7 @@ fn separate_buffers_match_reference_across_shapes() {
     // historically tripped 256-thread-TG kernels (`fused_attention`
     // shipped a similar bug; see `fused_attention_head_dim_512`).
     let metal = get_metal();
-    let cases: &[(usize, usize)] = &[
-        (1, 64),
-        (4, 256),
-        (16, 256),
-        (4, 512),
-        (8, 128),
-    ];
+    let cases: &[(usize, usize)] = &[(1, 64), (4, 256), (16, 256), (4, 512), (8, 128)];
     let eps = 1e-6f32;
     for &(num_heads, head_dim) in cases {
         let n = num_heads * head_dim;
@@ -162,8 +158,8 @@ fn in_place_matches_separate_buffer_reference() {
     // sum_sq is corrupted. Fixed by the threadgroup-barrier reduction.
     let metal = get_metal();
     let cases: &[(usize, usize)] = &[
-        (16, 256),  // Gemma 4 31B sliding L0
-        (4, 512),   // Gemma 4 31B global L5+
+        (16, 256), // Gemma 4 31B sliding L0
+        (4, 512),  // Gemma 4 31B global L5+
     ];
     let eps = 1e-6f32;
     for &(num_heads, head_dim) in cases {

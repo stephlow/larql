@@ -106,7 +106,10 @@ mod tests {
         std::fs::write(&f, b"").unwrap();
         let h = sha256_file(&f).unwrap();
         // SHA-256 of empty input is well-known
-        assert_eq!(h, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            h,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
@@ -154,7 +157,10 @@ mod tests {
         // Overwrite with different content
         std::fs::write(&f, b"tampered").unwrap();
         let results = verify_checksums(dir.path(), &stored).unwrap();
-        let gate_result = results.iter().find(|(name, _)| name == GATE_VECTORS_BIN).unwrap();
+        let gate_result = results
+            .iter()
+            .find(|(name, _)| name == GATE_VECTORS_BIN)
+            .unwrap();
         assert!(!gate_result.1, "tampered file should fail verification");
     }
 

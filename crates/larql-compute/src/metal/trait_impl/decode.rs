@@ -13,19 +13,30 @@ impl DecodeBackend for MetalBackend {
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
-        rope_base: f32, use_qk_norm: bool, softcap: f32,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        use_qk_norm: bool,
+        softcap: f32,
     ) -> Option<Vec<f32>> {
-        let geglu = if layers.first().is_some_and(|l| l.activation == crate::Activation::GeluTanh) {
+        let geglu = if layers
+            .first()
+            .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
+        {
             &self.geglu_gelu_tanh_pipeline
         } else {
             &self.geglu_pipeline
         };
         Some(ops::full_pipeline::dispatch_full_pipeline(
-            &self.queue, &self.bufs, &self.q4,
+            &self.queue,
+            &self.bufs,
+            &self.q4,
             geglu,
             &self.geglu_gelu_tanh_pipeline,
             &self.silu_pipeline,
@@ -34,9 +45,12 @@ impl DecodeBackend for MetalBackend {
             Some(&self.fused_attn_pipeline),
             &self.q8_matvec_pipeline.state,
             &self.q8_qkv_proj_pipeline.state,
-            &self.q4k_matvec_pipeline, &self.q6k_matvec_pipeline,
-            &self.rms_norm_pipeline, &self.residual_add_pipeline,
-            &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
+            &self.q4k_matvec_pipeline,
+            &self.q6k_matvec_pipeline,
+            &self.rms_norm_pipeline,
+            &self.residual_add_pipeline,
+            &self.rms_norm_q8_pipeline,
+            &self.residual_norm_q8_pipeline,
             Some(&self.q4k_qkv_proj_pipeline.state),
             Some(&self.q4kf_qkv_proj_pipeline.state),
             Some(&self.q4kf_proj_pipeline.state),
@@ -48,9 +62,19 @@ impl DecodeBackend for MetalBackend {
             Some(&self.q6k_geglu_silu_down_pipeline),
             Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
             None,
-            layers, x, hidden, inter, q_dim, kv_dim,
-            seq_len, num_q_heads, num_kv_heads, head_dim,
-            rope_base, use_qk_norm, softcap,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            use_qk_norm,
+            softcap,
             None, // moe_fn: no MoE callback for full_pipeline_q4
         ))
     }
@@ -62,35 +86,50 @@ impl DecodeBackend for MetalBackend {
         inter: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
-        Some(MetalBackend::multi_layer_q4_ffn(self, layers_q4, x, inter, hidden))
+        Some(MetalBackend::multi_layer_q4_ffn(
+            self, layers_q4, x, inter, hidden,
+        ))
     }
 
     fn prefill_q4(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
         seq_len: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
-        rope_base: f32, use_qk_norm: bool, softcap: f32,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        use_qk_norm: bool,
+        softcap: f32,
     ) -> Option<Vec<f32>> {
         let num_layers = layers.len();
-        let shapes: Vec<(usize, usize)> = layers.iter()
+        let shapes: Vec<(usize, usize)> = layers
+            .iter()
             .map(|l| (l.num_kv_heads, l.head_dim))
             .collect();
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
-            *cache_guard = Some(ops::kv_cache::KVCache::new_per_layer(&self.bufs, &shapes, 4096));
+            *cache_guard = Some(ops::kv_cache::KVCache::new_per_layer(
+                &self.bufs, &shapes, 4096,
+            ));
         }
         let kv = cache_guard.as_mut().unwrap();
         while kv.layers.len() < num_layers {
             let (nkv, hd) = shapes[kv.layers.len()];
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, nkv, hd));
+            kv.layers
+                .push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, nkv, hd));
         }
 
         let has_moe = layers.iter().any(|l| l.moe.is_some());
-        let geglu = if layers.first().is_some_and(|l| l.activation == crate::Activation::GeluTanh) {
+        let geglu = if layers
+            .first()
+            .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
+        {
             &self.geglu_gelu_tanh_pipeline
         } else {
             &self.geglu_pipeline
@@ -100,7 +139,9 @@ impl DecodeBackend for MetalBackend {
         macro_rules! run_dispatch {
             ($moe_fn:expr) => {
                 ops::full_pipeline::dispatch_full_pipeline(
-                    &self.queue, &self.bufs, &self.q4,
+                    &self.queue,
+                    &self.bufs,
+                    &self.q4,
                     geglu,
                     &self.geglu_gelu_tanh_pipeline,
                     &self.silu_pipeline,
@@ -109,9 +150,12 @@ impl DecodeBackend for MetalBackend {
                     Some(&self.fused_attn_pipeline),
                     &self.q8_matvec_pipeline.state,
                     &self.q8_qkv_proj_pipeline.state,
-                    &self.q4k_matvec_pipeline, &self.q6k_matvec_pipeline,
-                    &self.rms_norm_pipeline, &self.residual_add_pipeline,
-                    &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
+                    &self.q4k_matvec_pipeline,
+                    &self.q6k_matvec_pipeline,
+                    &self.rms_norm_pipeline,
+                    &self.residual_add_pipeline,
+                    &self.rms_norm_q8_pipeline,
+                    &self.residual_norm_q8_pipeline,
                     Some(&self.q4k_qkv_proj_pipeline.state),
                     Some(&self.q4kf_qkv_proj_pipeline.state),
                     Some(&self.q4kf_proj_pipeline.state),
@@ -123,9 +167,19 @@ impl DecodeBackend for MetalBackend {
                     Some(&self.q6k_geglu_silu_down_pipeline),
                     Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
                     Some(kv),
-                    layers, x, hidden, inter, q_dim, kv_dim,
-                    seq_len, num_q_heads, num_kv_heads, head_dim,
-                    rope_base, use_qk_norm, softcap,
+                    layers,
+                    x,
+                    hidden,
+                    inter,
+                    q_dim,
+                    kv_dim,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rope_base,
+                    use_qk_norm,
+                    softcap,
                     $moe_fn,
                 )
             };
@@ -138,7 +192,10 @@ impl DecodeBackend for MetalBackend {
             // (see `is_moe_layer` guard) so this closure owns the combine step.
             let mut moe_closure = |layer_idx: usize, h_post_attn: &[f32], new_h: &mut [f32]| {
                 let layer = &layers[layer_idx];
-                let moe_block = match layer.moe.as_ref() { Some(m) => m, None => return };
+                let moe_block = match layer.moe.as_ref() {
+                    Some(m) => m,
+                    None => return,
+                };
                 let layer_eps = layer.eps;
                 let layer_norm_offset = layer.norm_offset;
 
@@ -146,10 +203,15 @@ impl DecodeBackend for MetalBackend {
                 for pos in 0..seq_len {
                     let ha = &h_post_attn[pos * hidden..(pos + 1) * hidden];
                     let moe_out = crate::cpu::ops::moe::cpu_moe_forward(
-                        ha, moe_block, layer_norm_offset, layer_eps,
+                        ha,
+                        moe_block,
+                        layer_norm_offset,
+                        layer_eps,
                     );
                     let nh = &mut new_h[pos * hidden..(pos + 1) * hidden];
-                    for (i, v) in moe_out.iter().enumerate() { nh[i] += v; }
+                    for (i, v) in moe_out.iter().enumerate() {
+                        nh[i] += v;
+                    }
                 }
 
                 // 2. Outer post-FFN norm + layer_scalar per position.
@@ -161,9 +223,11 @@ impl DecodeBackend for MetalBackend {
                     if layer.moe_combined_output_norm {
                         let outer_w = layer.moe_outer_post_norm.or(layer.post_ffn_norm);
                         if let Some(w) = outer_w {
-                            let combined: Vec<f32> = nh.iter().zip(ha).map(|(h, a)| h - a).collect();
-                            let rms = (combined.iter().map(|v| v * v).sum::<f32>()
-                                / hidden as f32 + layer_eps).sqrt();
+                            let combined: Vec<f32> =
+                                nh.iter().zip(ha).map(|(h, a)| h - a).collect();
+                            let rms = (combined.iter().map(|v| v * v).sum::<f32>() / hidden as f32
+                                + layer_eps)
+                                .sqrt();
                             for (i, (&c, &wt)) in combined.iter().zip(w.iter()).enumerate() {
                                 nh[i] = ha[i] + c / rms * (wt + layer_norm_offset);
                             }
@@ -171,21 +235,33 @@ impl DecodeBackend for MetalBackend {
                     }
 
                     let ls = layer.layer_scalar;
-                    if ls != 0.0 && ls != 1.0 { for v in nh.iter_mut() { *v *= ls; } }
+                    if ls != 0.0 && ls != 1.0 {
+                        for v in nh.iter_mut() {
+                            *v *= ls;
+                        }
+                    }
                 }
             };
-            return Some(run_dispatch!(Some(&mut moe_closure as &mut dyn FnMut(usize, &[f32], &mut [f32]))));
+            return Some(run_dispatch!(Some(
+                &mut moe_closure as &mut dyn FnMut(usize, &[f32], &mut [f32])
+            )));
         }
 
         Some(run_dispatch!(None))
     }
 
-    fn has_kv_cache(&self) -> bool { true }
+    fn has_kv_cache(&self) -> bool {
+        true
+    }
 
     fn populate_kv_layer(
-        &self, layer: usize,
-        k_data: &[f32], v_data: &[f32],
-        seq_len: usize, num_kv_heads: usize, head_dim: usize,
+        &self,
+        layer: usize,
+        k_data: &[f32],
+        v_data: &[f32],
+        seq_len: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
     ) {
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
@@ -193,7 +269,12 @@ impl DecodeBackend for MetalBackend {
         }
         let kv = cache_guard.as_mut().unwrap();
         while kv.layers.len() <= layer {
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, num_kv_heads, head_dim));
+            kv.layers.push(ops::kv_cache::LayerKVCache::new(
+                &self.bufs,
+                4096,
+                num_kv_heads,
+                head_dim,
+            ));
         }
 
         let lc = &mut kv.layers[layer];
@@ -221,9 +302,7 @@ impl DecodeBackend for MetalBackend {
         }
     }
 
-    fn preallocate_kv_cache_per_layer(
-        &self, shapes: &[(usize, usize)], max_seq: usize,
-    ) {
+    fn preallocate_kv_cache_per_layer(&self, shapes: &[(usize, usize)], max_seq: usize) {
         // Replace any existing cache — callers invoke this once per
         // model load, before the first decode dispatch. If we kept an
         // old cache sized with the wrong per-layer dims the first
@@ -236,9 +315,13 @@ impl DecodeBackend for MetalBackend {
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
         rope_base: f32,
     ) -> Option<Vec<f32>> {
         let num_layers = layers.len();
@@ -252,20 +335,39 @@ impl DecodeBackend for MetalBackend {
         while kv.layers.len() < num_layers {
             let l = &layers[kv.layers.len()];
             kv.layers.push(ops::kv_cache::LayerKVCache::new(
-                &self.bufs, 4096, l.num_kv_heads, l.head_dim,
+                &self.bufs,
+                4096,
+                l.num_kv_heads,
+                l.head_dim,
             ));
         }
-        Some(MetalBackend::decode_token(self, kv, layers, x, hidden, inter, q_dim, kv_dim,
-            num_q_heads, num_kv_heads, head_dim, rope_base))
+        Some(MetalBackend::decode_token(
+            self,
+            kv,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+        ))
     }
 
     fn decode_token_with_moe(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
         rope_base: f32,
         moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
@@ -278,21 +380,40 @@ impl DecodeBackend for MetalBackend {
         while kv.layers.len() < num_layers {
             let l = &layers[kv.layers.len()];
             kv.layers.push(ops::kv_cache::LayerKVCache::new(
-                &self.bufs, 4096, l.num_kv_heads, l.head_dim,
+                &self.bufs,
+                4096,
+                l.num_kv_heads,
+                l.head_dim,
             ));
         }
-        Some(MetalBackend::decode_token_with_moe_fn(self, kv, layers, x,
-            hidden, inter, q_dim, kv_dim,
-            num_q_heads, num_kv_heads, head_dim, rope_base, Some(moe_fn)))
+        Some(MetalBackend::decode_token_with_moe_fn(
+            self,
+            kv,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            Some(moe_fn),
+        ))
     }
 
     fn decode_token_split_profile(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],
         x: &[f32],
-        hidden: usize, inter: usize,
-        q_dim: usize, kv_dim: usize,
-        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
         rope_base: f32,
     ) -> (Option<Vec<f32>>, f64, f64, f64) {
         // Whole-token timing today; per-stage split (attn vs gate+up vs
@@ -302,13 +423,26 @@ impl DecodeBackend for MetalBackend {
         use crate::metal::decode::ProfileTimings;
         let t0 = std::time::Instant::now();
         let result = <Self as DecodeBackend>::decode_token(
-            self, layers, x, hidden, inter, q_dim, kv_dim,
-            num_q_heads, num_kv_heads, head_dim, rope_base,
+            self,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
         );
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         // Whole-token cost lives in `attn_ms` until the per-stage
         // split is wired (see `metal::decode::profile`).
-        let timings = ProfileTimings { attn_ms: total_ms, gate_up_ms: 0.0, down_ms: 0.0 };
+        let timings = ProfileTimings {
+            attn_ms: total_ms,
+            gate_up_ms: 0.0,
+            down_ms: 0.0,
+        };
         eprintln!("{}", timings.format_summary(layers.len()));
         (result, timings.attn_ms, timings.gate_up_ms, timings.down_ms)
     }

@@ -13,20 +13,19 @@
 //!     decode time.
 //!  4. Graph Walk       — vindex FFN walk; no forward pass for factual queries.
 
-use larql_inference::engines::{EngineKind, KvEngine};
-use larql_inference::engines::markov_residual::kv_memory_bytes_for_seq;
+use larql_compute::ComputeBackend;
 use larql_inference::engines::accuracy::compare_hidden;
-use larql_inference::forward::{logits_to_predictions_pub, hidden_to_raw_logits};
+use larql_inference::engines::markov_residual::kv_memory_bytes_for_seq;
+use larql_inference::engines::{EngineKind, KvEngine};
+use larql_inference::forward::{hidden_to_raw_logits, logits_to_predictions_pub};
 use larql_inference::model::ModelWeights;
 use larql_vindex::VectorIndex;
-use larql_compute::ComputeBackend;
 
-use super::kv_capture;
-use super::turboquant_layer;
-use super::markov_layer;
 use super::graph_walk_layer;
+use super::kv_capture;
+use super::markov_layer;
+use super::turboquant_layer;
 use crate::turboquant::TurboQuant;
-
 
 /// Result from running one strategy on a real model.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -87,7 +86,12 @@ impl<'a> RealModelBenchmark<'a> {
         index: &'a VectorIndex,
         backend: &'a dyn ComputeBackend,
     ) -> Self {
-        Self { weights, tokenizer, index, backend }
+        Self {
+            weights,
+            tokenizer,
+            index,
+            backend,
+        }
     }
 }
 
@@ -98,7 +102,10 @@ pub fn run_all_strategies(
     top_k: usize,
     window_size: usize,
 ) -> Vec<RealModelResult> {
-    let encoding = bench.tokenizer.encode(prompt, true).expect("tokenize failed");
+    let encoding = bench
+        .tokenizer
+        .encode(prompt, true)
+        .expect("tokenize failed");
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
     let mut results = Vec::with_capacity(4);
@@ -106,13 +113,14 @@ pub fn run_all_strategies(
     // === Strategy 1: Standard KV (baseline) ===
     let t0 = std::time::Instant::now();
     let kv = kv_capture::capture_kv(bench.weights, &token_ids);
-    let baseline_preds = logits_to_predictions_pub(
-        bench.weights, &kv.hidden, bench.tokenizer, top_k, 1.0,
-    );
+    let baseline_preds =
+        logits_to_predictions_pub(bench.weights, &kv.hidden, bench.tokenizer, top_k, 1.0);
     let std_us = t0.elapsed().as_secs_f64() * 1e6;
     let std_mem = kv_capture::kv_memory_bytes(&kv);
 
-    let baseline_top1 = baseline_preds.predictions.first()
+    let baseline_top1 = baseline_preds
+        .predictions
+        .first()
         .map(|(t, _)| t.clone())
         .unwrap_or_default();
 
@@ -121,7 +129,11 @@ pub fn run_all_strategies(
         strategy: "Standard KV (FP16)".to_string(),
         prompt: prompt.to_string(),
         top1_token: baseline_top1.clone(),
-        top1_prob: baseline_preds.predictions.first().map(|(_, p)| *p).unwrap_or(0.0),
+        top1_prob: baseline_preds
+            .predictions
+            .first()
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0),
         top5: baseline_preds.predictions.clone(),
         memory_bytes: std_mem,
         wall_clock_us: std_us,
@@ -142,7 +154,11 @@ pub fn run_all_strategies(
         strategy: format!("TurboQuant 4-bit (cos={:.4})", tq_result.cosine_sim),
         prompt: prompt.to_string(),
         top1_token: baseline_top1.clone(),
-        top1_prob: baseline_preds.predictions.first().map(|(_, p)| *p).unwrap_or(0.0),
+        top1_prob: baseline_preds
+            .predictions
+            .first()
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0),
         top5: baseline_preds.predictions.clone(),
         memory_bytes: tq_result.compressed_bytes,
         wall_clock_us: std_us + tq_us,
@@ -158,22 +174,30 @@ pub fn run_all_strategies(
     // Uses `MarkovResidualEngine::prefill` via the unified `KvEngine` interface.
     // Backend-dispatched: K/V projection matmuls route through the compute backend.
     let t0 = std::time::Instant::now();
-    let mut rs_engine = EngineKind::MarkovResidual { window_size: Some(window_size) }
-        .build(larql_compute::cpu_backend());
-    let rs_hidden = rs_engine.prefill(bench.weights, &token_ids)
+    let mut rs_engine = EngineKind::MarkovResidual {
+        window_size: Some(window_size),
+    }
+    .build(larql_compute::cpu_backend());
+    let rs_hidden = rs_engine
+        .prefill(bench.weights, &token_ids)
         .expect("MarkovRS prefill failed");
-    let rs_preds = logits_to_predictions_pub(
-        bench.weights, &rs_hidden, bench.tokenizer, top_k, 1.0,
-    );
+    let rs_preds =
+        logits_to_predictions_pub(bench.weights, &rs_hidden, bench.tokenizer, top_k, 1.0);
     let rs_us = t0.elapsed().as_secs_f64() * 1e6;
 
-    let rs_top1 = rs_preds.predictions.first().map(|(t, _)| t.clone()).unwrap_or_default();
+    let rs_top1 = rs_preds
+        .predictions
+        .first()
+        .map(|(t, _)| t.clone())
+        .unwrap_or_default();
     let rs_acc = compare_hidden(&kv.hidden, &rs_hidden);
     let rs_cold = rs_engine.cold_bytes();
-    let rs_hot  = rs_engine.memory_bytes().saturating_sub(rs_cold);
+    let rs_hot = rs_engine.memory_bytes().saturating_sub(rs_cold);
     let rs_ratio = if rs_engine.memory_bytes() > 0 {
         kv_ref_bytes as f64 / rs_engine.memory_bytes() as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     results.push(RealModelResult {
         strategy: format!(
@@ -199,11 +223,17 @@ pub fn run_all_strategies(
     // === Strategy 4: Graph Walk ===
     let t0 = std::time::Instant::now();
     let gw = graph_walk_layer::run_graph_walk(
-        bench.weights, bench.tokenizer, bench.index, &token_ids, top_k,
+        bench.weights,
+        bench.tokenizer,
+        bench.index,
+        &token_ids,
+        top_k,
     );
     let gw_us = t0.elapsed().as_secs_f64() * 1e6;
 
-    let gw_top1 = gw.predictions.first()
+    let gw_top1 = gw
+        .predictions
+        .first()
         .map(|(t, _)| t.clone())
         .unwrap_or_default();
 
@@ -245,8 +275,16 @@ pub fn run_all_engines_bench(
     let kv_ref_bytes = kv_memory_bytes_for_seq(weights, token_ids.len());
 
     let engines: &[(&str, EngineKind)] = &[
-        ("markov-rs", EngineKind::MarkovResidual { window_size: Some(window_size) }),
-        ("unlimited-context", EngineKind::UnlimitedContext { window_size }),
+        (
+            "markov-rs",
+            EngineKind::MarkovResidual {
+                window_size: Some(window_size),
+            },
+        ),
+        (
+            "unlimited-context",
+            EngineKind::UnlimitedContext { window_size },
+        ),
     ];
 
     let mut results = Vec::new();
@@ -264,23 +302,35 @@ pub fn run_all_engines_bench(
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let logits = hidden_to_raw_logits(weights, &hidden);
-        let top1_idx = logits.iter().enumerate()
+        let top1_idx = logits
+            .iter()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
         let top1_token = tokenizer.decode(&[top1_idx], true).unwrap_or_default();
-        let top1_match = top1_token == tokenizer.decode(
-            &[logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32).unwrap_or(0)],
-            true,
-        ).unwrap_or_default();
+        let top1_match = top1_token
+            == tokenizer
+                .decode(
+                    &[logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)],
+                    true,
+                )
+                .unwrap_or_default();
 
         let acc = compare_hidden(&kv.hidden, &hidden);
         let cold = engine.cold_bytes();
-        let hot  = engine.memory_bytes().saturating_sub(cold);
+        let hot = engine.memory_bytes().saturating_sub(cold);
         let total = engine.memory_bytes();
-        let ratio = if total > 0 { kv_ref_bytes as f64 / total as f64 } else { 0.0 };
+        let ratio = if total > 0 {
+            kv_ref_bytes as f64 / total as f64
+        } else {
+            0.0
+        };
         let _ = backend; // engines build with cpu_backend(); backend param reserved for future
 
         results.push(EngineTimingResult {
@@ -331,14 +381,20 @@ pub fn run_prompt_suite(
     top_k: usize,
     window_size: usize,
 ) -> Vec<Vec<RealModelResult>> {
-    prompts.iter().map(|p| run_all_strategies(bench, p, top_k, window_size)).collect()
+    prompts
+        .iter()
+        .map(|p| run_all_strategies(bench, p, top_k, window_size))
+        .collect()
 }
 
 /// Format results as a comparison table including compression ratio.
 pub fn format_results(results: &[RealModelResult]) -> String {
     let mut out = String::new();
     if let Some(r) = results.first() {
-        out.push_str(&format!("\n=== Real Model Benchmark: {:?} ===\n\n", r.prompt));
+        out.push_str(&format!(
+            "\n=== Real Model Benchmark: {:?} ===\n\n",
+            r.prompt
+        ));
     }
     out.push_str(&format!(
         "{:<44} {:>8} {:>10} {:>8} {:>7}  {}\n",
@@ -355,7 +411,8 @@ pub fn format_results(results: &[RealModelResult]) -> String {
         } else {
             format!("{}B", r.memory_bytes)
         };
-        let ratio_str = r.compression_ratio
+        let ratio_str = r
+            .compression_ratio
             .map(|c| format!("{c:.0}×"))
             .unwrap_or_else(|| "—".into());
         let accuracy_str = if let Some(cos) = r.hidden_cosine {
@@ -365,8 +422,12 @@ pub fn format_results(results: &[RealModelResult]) -> String {
         };
         out.push_str(&format!(
             "{:<44} {:>8} {:>10} {:>8.1} {:>7}  {}\n",
-            r.strategy, r.top1_token, mem_str,
-            r.wall_clock_us / 1000.0, ratio_str, accuracy_str,
+            r.strategy,
+            r.top1_token,
+            mem_str,
+            r.wall_clock_us / 1000.0,
+            ratio_str,
+            accuracy_str,
         ));
     }
     out

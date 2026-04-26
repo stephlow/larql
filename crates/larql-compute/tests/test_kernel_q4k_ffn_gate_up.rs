@@ -53,11 +53,7 @@ fn synth_input(hidden: usize, seed: f32) -> Vec<f32> {
 
 /// Drive `q4k_ffn_gate_up` against a CPU `q4k_matvec` reference for
 /// each output matrix.
-fn assert_q4k_ffn_gate_up_matches_per_matrix(
-    label: &str,
-    inter: usize,
-    hidden: usize,
-) {
+fn assert_q4k_ffn_gate_up_matches_per_matrix(label: &str, inter: usize, hidden: usize) {
     assert_eq!(hidden % 256, 0, "Q4_K requires hidden divisible by 256");
     let metal = get_metal();
     let cpu = larql_compute::cpu::CpuBackend;
@@ -235,8 +231,12 @@ fn q4k_ffn_gate_up_zero_input() {
         gate_max < 1e-3 && up_max < 1e-3,
         "q4k_ffn_gate_up zero-input: gate_max={gate_max:.3e} up_max={up_max:.3e} (should be ~0)",
     );
-    assert!(!gate_metal.iter().any(|v| v.is_nan()),
-        "q4k_ffn_gate_up zero-input: gate output contains NaN");
-    assert!(!up_metal.iter().any(|v| v.is_nan()),
-        "q4k_ffn_gate_up zero-input: up output contains NaN");
+    assert!(
+        !gate_metal.iter().any(|v| v.is_nan()),
+        "q4k_ffn_gate_up zero-input: gate output contains NaN"
+    );
+    assert!(
+        !up_metal.iter().any(|v| v.is_nan()),
+        "q4k_ffn_gate_up zero-input: up output contains NaN"
+    );
 }

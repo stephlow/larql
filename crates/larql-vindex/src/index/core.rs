@@ -16,8 +16,8 @@
 use ndarray::{Array1, Array2};
 
 // Re-export all shared types from types.rs.
-pub use super::types::*;
 use super::storage::{FfnStore, GateStore, MetadataStore, ProjectionStore};
+pub use super::types::*;
 
 /// The full model as a local vector index.
 ///
@@ -120,7 +120,9 @@ impl VectorIndex {
         if self.is_mmap() {
             return 0;
         }
-        self.gate.gate_vectors.iter()
+        self.gate
+            .gate_vectors
+            .iter()
             .filter_map(|v| v.as_ref())
             .map(|m| m.len() * std::mem::size_of::<f32>())
             .sum()
@@ -144,7 +146,6 @@ impl VectorIndex {
         self.layer_range = Some(range);
     }
 }
-
 
 // ══════════════════════════════════════════════════════════════
 // `impl GateIndex for VectorIndex`
@@ -172,15 +173,24 @@ impl GateIndex for VectorIndex {
     }
 
     fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.metadata.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+        self.metadata
+            .down_overrides
+            .get(&(layer, feature))
+            .map(|v| v.as_slice())
     }
 
     fn up_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.metadata.up_overrides.get(&(layer, feature)).map(|v| v.as_slice())
+        self.metadata
+            .up_overrides
+            .get(&(layer, feature))
+            .map(|v| v.as_slice())
     }
 
     fn has_overrides_at(&self, layer: usize) -> bool {
-        self.metadata.down_overrides.keys().any(|(l, _)| *l == layer)
+        self.metadata
+            .down_overrides
+            .keys()
+            .any(|(l, _)| *l == layer)
             || self.metadata.up_overrides.keys().any(|(l, _)| *l == layer)
     }
 
@@ -273,7 +283,10 @@ impl GateIndex for VectorIndex {
     }
 
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
-        self.ffn.interleaved_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+        self.ffn
+            .interleaved_q4_mmap
+            .as_ref()
+            .map(|m| m.as_ref() as &[u8])
     }
 
     fn has_interleaved_q4k(&self) -> bool {
@@ -281,7 +294,10 @@ impl GateIndex for VectorIndex {
     }
 
     fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
-        self.ffn.interleaved_q4k_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+        self.ffn
+            .interleaved_q4k_mmap
+            .as_ref()
+            .map(|m| m.as_ref() as &[u8])
     }
 
     fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
@@ -292,21 +308,38 @@ impl GateIndex for VectorIndex {
         VectorIndex::interleaved_q4k_layer_data(self, layer)
     }
 
-    fn q4k_ffn_layer(&self, layer: usize, component: usize)
-        -> Option<std::sync::Arc<Vec<f32>>>
-    {
+    fn q4k_ffn_layer(&self, layer: usize, component: usize) -> Option<std::sync::Arc<Vec<f32>>> {
         VectorIndex::q4k_ffn_layer(self, layer, component)
     }
 
-    fn q4k_ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
+    fn q4k_ffn_row_into(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        out: &mut [f32],
+    ) -> bool {
         VectorIndex::q4k_ffn_row_into(self, layer, component, feat, out)
     }
 
-    fn q4k_ffn_row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+    fn q4k_ffn_row_dot(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        x: &[f32],
+    ) -> Option<f32> {
         VectorIndex::q4k_ffn_row_dot(self, layer, component, feat, x)
     }
 
-    fn q4k_ffn_row_scaled_add_via_cache(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+    fn q4k_ffn_row_scaled_add_via_cache(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
         VectorIndex::q4k_ffn_row_scaled_add_via_cache(self, layer, component, feat, alpha, out)
     }
 
@@ -314,11 +347,24 @@ impl GateIndex for VectorIndex {
         VectorIndex::has_down_features_q4k(self)
     }
 
-    fn q4k_down_feature_scaled_add(&self, layer: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+    fn q4k_down_feature_scaled_add(
+        &self,
+        layer: usize,
+        feat: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
         VectorIndex::q4k_down_feature_scaled_add(self, layer, feat, alpha, out)
     }
 
-    fn q4k_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+    fn q4k_ffn_row_scaled_add(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
         VectorIndex::q4k_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
     }
 
@@ -339,15 +385,34 @@ impl GateIndex for VectorIndex {
         VectorIndex::has_fp4_storage(self)
     }
 
-    fn fp4_ffn_row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+    fn fp4_ffn_row_dot(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        x: &[f32],
+    ) -> Option<f32> {
         VectorIndex::fp4_ffn_row_dot(self, layer, component, feat, x)
     }
 
-    fn fp4_ffn_row_scaled_add(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
+    fn fp4_ffn_row_scaled_add(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        alpha: f32,
+        out: &mut [f32],
+    ) -> bool {
         VectorIndex::fp4_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
     }
 
-    fn fp4_ffn_row_into(&self, layer: usize, component: usize, feat: usize, out: &mut [f32]) -> bool {
+    fn fp4_ffn_row_into(
+        &self,
+        layer: usize,
+        component: usize,
+        feat: usize,
+        out: &mut [f32],
+    ) -> bool {
         VectorIndex::fp4_ffn_row_into(self, layer, component, feat, out)
     }
 }
@@ -438,14 +503,7 @@ mod refactor_tests {
         let file = std::fs::File::open(&path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
 
-        let v = VectorIndex::new_mmap(
-            mmap,
-            Vec::new(),
-            crate::StorageDtype::F16,
-            None,
-            4,
-            16,
-        );
+        let v = VectorIndex::new_mmap(mmap, Vec::new(), crate::StorageDtype::F16, None, 4, 16);
         assert_eq!(v.num_layers, 4);
         assert_eq!(v.hidden_size, 16);
         assert!(v.gate.gate_mmap_bytes.is_some());
@@ -465,9 +523,8 @@ mod refactor_tests {
         std::fs::write(&path, vec![0u8; 64]).unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
-        let original = VectorIndex::new_mmap(
-            mmap, Vec::new(), crate::StorageDtype::F32, None, 2, 8,
-        );
+        let original =
+            VectorIndex::new_mmap(mmap, Vec::new(), crate::StorageDtype::F32, None, 2, 8);
 
         let src_arc = original.gate.gate_mmap_bytes.as_ref().unwrap();
         let src_strong_before = Arc::strong_count(src_arc);
@@ -494,7 +551,10 @@ mod refactor_tests {
         assert!(cloned.gate.hnsw_enabled.load(Ordering::Relaxed));
         assert_eq!(cloned.gate.hnsw_ef_search.load(Ordering::Relaxed), 42);
         assert_eq!(cloned.gate.gate_cache_max_layers.load(Ordering::Relaxed), 7);
-        assert_eq!(cloned.ffn.q4k_ffn_cache_max_layers.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            cloned.ffn.q4k_ffn_cache_max_layers.load(Ordering::Relaxed),
+            3
+        );
 
         cloned.gate.hnsw_enabled.store(false, Ordering::Relaxed);
         assert!(v.gate.hnsw_enabled.load(Ordering::Relaxed));
@@ -551,12 +611,20 @@ mod refactor_tests {
     #[test]
     fn clone_preserves_vec_and_hashmap_fields() {
         let mut v = VectorIndex::empty(2, 4);
-        v.metadata.down_overrides.insert((0, 3), vec![1.0, 2.0, 3.0, 4.0]);
+        v.metadata
+            .down_overrides
+            .insert((0, 3), vec![1.0, 2.0, 3.0, 4.0]);
         v.metadata.up_overrides.insert((1, 1), vec![5.0; 4]);
 
         let cloned = v.clone();
-        assert_eq!(cloned.metadata.down_overrides.get(&(0, 3)), Some(&vec![1.0, 2.0, 3.0, 4.0]));
-        assert_eq!(cloned.metadata.up_overrides.get(&(1, 1)), Some(&vec![5.0; 4]));
+        assert_eq!(
+            cloned.metadata.down_overrides.get(&(0, 3)),
+            Some(&vec![1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            cloned.metadata.up_overrides.get(&(1, 1)),
+            Some(&vec![5.0; 4])
+        );
 
         let mut cloned = cloned;
         cloned.metadata.down_overrides.insert((1, 0), vec![9.0; 4]);
@@ -596,7 +664,10 @@ mod refactor_tests {
 
         assert!(cloned.ffn.fp4_storage.is_some());
         assert_eq!(strong_after, strong_before + 1);
-        assert!(Arc::ptr_eq(&src_arc, cloned.ffn.fp4_storage.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            &src_arc,
+            cloned.ffn.fp4_storage.as_ref().unwrap()
+        ));
     }
 
     #[test]
@@ -668,8 +739,11 @@ mod refactor_tests {
         v.gate.gate_vectors[0] = Some(Array2::<f32>::zeros((8, 256)));
         let storage = Fp4Storage {
             manifest: Fp4Config::option_b_default(),
-            gate_mmap: None, up_mmap: None, down_mmap: None,
-            layer_features: vec![16, 16], hidden: 256,
+            gate_mmap: None,
+            up_mmap: None,
+            down_mmap: None,
+            layer_features: vec![16, 16],
+            hidden: 256,
         };
         v.ffn.fp4_storage = Some(Arc::new(storage));
         assert_eq!(v.num_features(0), 8);

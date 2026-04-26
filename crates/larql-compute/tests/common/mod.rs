@@ -13,15 +13,19 @@
 /// available — these tests are gated on `--features metal`, but the
 /// host still has to expose a Metal device.
 pub fn get_metal() -> larql_compute::metal::MetalBackend {
-    larql_compute::metal::MetalBackend::new()
-        .expect("Metal device required for these tests (rerun with --features metal on Apple Silicon)")
+    larql_compute::metal::MetalBackend::new().expect(
+        "Metal device required for these tests (rerun with --features metal on Apple Silicon)",
+    )
 }
 
 /// Largest absolute element-wise diff between two equal-length slices.
 /// The fold-style implementation matches the existing
 /// `test_metal_shaders.rs` helper so error messages stay consistent.
 pub fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// Cosine similarity in `f64` accumulation. Returns `0.0` when either

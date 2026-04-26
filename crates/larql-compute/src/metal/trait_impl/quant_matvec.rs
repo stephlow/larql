@@ -9,29 +9,44 @@ use crate::metal::MetalBackend;
 
 impl QuantMatVec for MetalBackend {
     fn q4_matvec(
-        &self, q4_data: &[u8], q8_x: &[i8], q8_scales: &[f32],
-        num_rows: usize, hidden: usize,
+        &self,
+        q4_data: &[u8],
+        q8_x: &[i8],
+        q8_scales: &[f32],
+        num_rows: usize,
+        hidden: usize,
     ) -> Option<Vec<f32>> {
         Some(self.q4_matvec_direct(q4_data, q8_x, q8_scales, num_rows, hidden))
     }
 
     fn q4_vecmat(
-        &self, activation: &[f32], q4_data: &[u8],
-        intermediate: usize, hidden: usize,
+        &self,
+        activation: &[f32],
+        q4_data: &[u8],
+        intermediate: usize,
+        hidden: usize,
     ) -> Option<Vec<f32>> {
         Some(self.q4_vecmat_direct(activation, q4_data, intermediate, hidden))
     }
 
     fn q4_matvec_pair_batch(
-        &self, gate_q4: &[u8], up_q4: &[u8],
-        x_matrix: &[f32], seq_len: usize,
-        num_rows: usize, hidden: usize,
+        &self,
+        gate_q4: &[u8],
+        up_q4: &[u8],
+        x_matrix: &[f32],
+        seq_len: usize,
+        num_rows: usize,
+        hidden: usize,
     ) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
         Some(self.q4_matvec_pair_batch_direct(gate_q4, up_q4, x_matrix, seq_len, num_rows, hidden))
     }
 
     fn q4k_matvec(
-        &self, q4k_data: &[u8], x: &[f32], num_rows: usize, hidden: usize,
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
     ) -> Option<Vec<f32>> {
         use crate::metal::shaders::q4k_matvec as q4k;
         let buf_w = self.bufs.get_bytes(q4k_data);
@@ -61,7 +76,11 @@ impl QuantMatVec for MetalBackend {
     }
 
     fn q6k_matvec(
-        &self, q6k_data: &[u8], x: &[f32], num_rows: usize, hidden: usize,
+        &self,
+        q6k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
     ) -> Option<Vec<f32>> {
         use crate::metal::shaders::q6k_matvec as q6k;
         let buf_w = self.bufs.get_bytes(q6k_data);
@@ -90,5 +109,7 @@ impl QuantMatVec for MetalBackend {
         Some(crate::metal::buffers::read_buffer_f32(&buf_out, num_rows))
     }
 
-    fn has_q4(&self) -> bool { true }
+    fn has_q4(&self) -> bool {
+        true
+    }
 }

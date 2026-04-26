@@ -8,7 +8,11 @@ use crate::vindex::walk_config::WalkFfnConfig;
 /// as full-K; also caches the check when top-K happens to exceed the
 /// layer's feature count.
 #[inline]
-pub(super) fn hits_len_ge_intermediate(config: &WalkFfnConfig, layer: usize, intermediate: usize) -> bool {
+pub(super) fn hits_len_ge_intermediate(
+    config: &WalkFfnConfig,
+    layer: usize,
+    intermediate: usize,
+) -> bool {
     match config.k_for(layer) {
         Some(k) => k >= (intermediate * 8) / 10,
         None => true,
@@ -26,24 +30,3 @@ pub struct DispatchEntry {
     pub layer: usize,
     pub path: &'static str,
 }
-
-/// Names pinned by the dispatch-trace tests. Renaming a walk path
-/// breaks the trace consumer tests; update this list when that
-/// happens, not the individual call sites.
-pub const TRACE_NAMES: &[&str] = &[
-    "override:sparse",
-    "sparse:gemv_full_k",
-    "sparse:parallel_q4k_down",
-    "sparse:serial",
-    "fp4_storage:sparse",
-    "interleaved_q4:metal",
-    "interleaved_q4:cpu",
-    "interleaved",
-    "full_mmap",
-    "interleaved_q4k:dequant",
-    "exact",
-    "weights_fallback:sparse",
-    "weights_fallback:override",
-    "l1_cache_hit",
-    "zero_features_dense",
-];

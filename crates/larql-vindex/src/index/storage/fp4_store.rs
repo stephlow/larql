@@ -17,8 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use larql_models::quant::fp4_block::{
-    decode_fp4_feature, decode_fp8_feature, fp4_feature_bytes, fp8_feature_bytes,
-    BLOCK_ELEMENTS,
+    decode_fp4_feature, decode_fp8_feature, fp4_feature_bytes, fp8_feature_bytes, BLOCK_ELEMENTS,
 };
 
 use crate::config::types::{Fp4Config, Precision, ProjectionFormat};
@@ -115,7 +114,9 @@ impl Fp4Storage {
         layer_features: &[usize],
         hidden: usize,
     ) -> Result<(), VindexError> {
-        let Some(mmap) = mmap else { return Ok(()); };
+        let Some(mmap) = mmap else {
+            return Ok(());
+        };
         let per_feat = match proj.precision {
             Precision::Fp4 => fp4_feature_bytes(hidden),
             Precision::Fp8 => fp8_feature_bytes(hidden),
@@ -168,11 +169,14 @@ impl Fp4Storage {
         };
 
         // Sum preceding layers' feature counts to land at this layer.
-        if layer >= self.layer_features.len() { return None; }
-        let mut start: usize =
-            self.layer_features[..layer].iter().sum::<usize>() * per_feat;
+        if layer >= self.layer_features.len() {
+            return None;
+        }
+        let mut start: usize = self.layer_features[..layer].iter().sum::<usize>() * per_feat;
         let nf = self.layer_features[layer];
-        if feat >= nf { return None; }
+        if feat >= nf {
+            return None;
+        }
         start += feat * per_feat;
         Some((start, start + per_feat))
     }
@@ -188,11 +192,15 @@ impl Fp4Storage {
         feat: usize,
         out: &mut [f32],
     ) -> bool {
-        if out.len() != self.hidden { return false; }
+        if out.len() != self.hidden {
+            return false;
+        }
         let Some((start, end)) = self.feature_byte_range(component, layer, feat) else {
             return false;
         };
-        let Some(mmap) = self.mmap_for(component) else { return false; };
+        let Some(mmap) = self.mmap_for(component) else {
+            return false;
+        };
         let slice = &mmap[start..end];
         match self.precision(component) {
             Some(Precision::Fp4) => {
@@ -212,14 +220,10 @@ impl Fp4Storage {
     /// buffer of size `hidden` — the allocation cost is trivial next to
     /// the dequant work itself. If a tighter inner loop is needed later
     /// (e.g. skip the Vec alloc), wire a stack-allocated path.
-    pub fn row_dot(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        x: &[f32],
-    ) -> Option<f32> {
-        if x.len() != self.hidden { return None; }
+    pub fn row_dot(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
+        if x.len() != self.hidden {
+            return None;
+        }
         let mut buf = vec![0.0f32; self.hidden];
         if !self.dequant_row_into(layer, component, feat, &mut buf) {
             return None;
@@ -240,7 +244,9 @@ impl Fp4Storage {
         alpha: f32,
         out: &mut [f32],
     ) -> bool {
-        if out.len() != self.hidden { return false; }
+        if out.len() != self.hidden {
+            return false;
+        }
         let mut buf = vec![0.0f32; self.hidden];
         if !self.dequant_row_into(layer, component, feat, &mut buf) {
             return false;
@@ -273,9 +279,7 @@ pub const V1_BLOCK_ELEMENTS: u32 = BLOCK_ELEMENTS as u32;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{
-        ComplianceGate, Fp4Config as Cfg, Projections,
-    };
+    use crate::config::types::{ComplianceGate, Fp4Config as Cfg, Projections};
     use crate::format::filenames::*;
     use crate::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 
@@ -290,18 +294,24 @@ mod tests {
         fn new(label: &str) -> Self {
             let base = std::env::temp_dir();
             let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let seq = TEMPDIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let p = base.join(format!(
                 "fp4storage_{label}_{}_{}_{}",
-                std::process::id(), ts, seq,
+                std::process::id(),
+                ts,
+                seq,
             ));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }
     }
     impl Drop for TempDir {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn option_b_cfg() -> Cfg {
@@ -330,13 +340,19 @@ mod tests {
         let tmp = TempDir::new("minimal");
 
         // Synthetic ground truth per layer.
-        let gate: Vec<Vec<f32>> = layer_features.iter().enumerate()
+        let gate: Vec<Vec<f32>> = layer_features
+            .iter()
+            .enumerate()
             .map(|(i, &n)| synth_layer(n, hidden, i as f32 + 1.0))
             .collect();
-        let up: Vec<Vec<f32>> = layer_features.iter().enumerate()
+        let up: Vec<Vec<f32>> = layer_features
+            .iter()
+            .enumerate()
             .map(|(i, &n)| synth_layer(n, hidden, i as f32 + 10.0))
             .collect();
-        let down: Vec<Vec<f32>> = layer_features.iter().enumerate()
+        let down: Vec<Vec<f32>> = layer_features
+            .iter()
+            .enumerate()
             .map(|(i, &n)| synth_layer(n, hidden, i as f32 + 100.0))
             .collect();
 
@@ -348,12 +364,8 @@ mod tests {
         write_fp4_projection(&tmp.0.join(UP_FEATURES_FP4_BIN), hidden, &up_refs).unwrap();
         write_fp8_projection(&tmp.0.join(DOWN_FEATURES_FP8_BIN), hidden, &down_refs).unwrap();
 
-        let storage = Fp4Storage::load(
-            &tmp.0,
-            option_b_cfg(),
-            layer_features.to_vec(),
-            hidden,
-        ).unwrap();
+        let storage =
+            Fp4Storage::load(&tmp.0, option_b_cfg(), layer_features.to_vec(), hidden).unwrap();
 
         (tmp, storage, gate, up, down)
     }
@@ -379,7 +391,10 @@ mod tests {
         std::fs::write(tmp.0.join(DOWN_FEATURES_FP8_BIN), vec![0u8; 100]).unwrap();
 
         let err = Fp4Storage::load(&tmp.0, option_b_cfg(), layer_features.to_vec(), hidden);
-        assert!(err.is_err(), "expected size validation to fail on truncated down");
+        assert!(
+            err.is_err(),
+            "expected size validation to fail on truncated down"
+        );
         let msg = format!("{err:?}");
         assert!(
             msg.contains("size") || msg.contains("!="),
@@ -433,9 +448,18 @@ mod tests {
         assert_eq!(end, start + fp8_per_feat);
 
         // Out of range.
-        assert!(storage.feature_byte_range(0, 3, 0).is_none(), "layer out of range");
-        assert!(storage.feature_byte_range(0, 0, 99).is_none(), "feat out of range");
-        assert!(storage.feature_byte_range(9, 0, 0).is_none(), "component out of range");
+        assert!(
+            storage.feature_byte_range(0, 3, 0).is_none(),
+            "layer out of range"
+        );
+        assert!(
+            storage.feature_byte_range(0, 0, 99).is_none(),
+            "feat out of range"
+        );
+        assert!(
+            storage.feature_byte_range(9, 0, 0).is_none(),
+            "component out of range"
+        );
     }
 
     #[test]
@@ -455,7 +479,11 @@ mod tests {
                     let src = &layer_values[feat * hidden..(feat + 1) * hidden];
                     let block_max = src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                     // FP4 ≤ block_max/3, FP8 ≤ block_max * 0.15.
-                    let bound = if *component == 2 { block_max * 0.15 } else { block_max / 3.0 };
+                    let bound = if *component == 2 {
+                        block_max * 0.15
+                    } else {
+                        block_max / 3.0
+                    };
                     for i in 0..hidden {
                         let err = (src[i] - out[i]).abs();
                         assert!(
@@ -486,7 +514,10 @@ mod tests {
         let mut out = vec![0.0f32; hidden];
         assert!(!storage.dequant_row_into(99, 0, 0, &mut out), "layer OOB");
         assert!(!storage.dequant_row_into(0, 0, 99, &mut out), "feat OOB");
-        assert!(!storage.dequant_row_into(0, 9, 0, &mut out), "component OOB");
+        assert!(
+            !storage.dequant_row_into(0, 9, 0, &mut out),
+            "component OOB"
+        );
     }
 
     #[test]
@@ -503,7 +534,10 @@ mod tests {
             assert!(storage.dequant_row_into(0, 0, feat, &mut dequant));
             let dot_manual: f32 = dequant.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
 
-            assert_eq!(dot_api, dot_manual, "row_dot must equal dequant + manual dot for feat {feat}");
+            assert_eq!(
+                dot_api, dot_manual,
+                "row_dot must equal dequant + manual dot for feat {feat}"
+            );
 
             // And both should be within loose FP4 bound of the source.
             let src = &gate[0][feat * hidden..(feat + 1) * hidden];
@@ -546,7 +580,12 @@ mod tests {
         assert!(storage.row_scaled_add(0, 2, 0, 2.0, &mut out));
         for i in 0..hidden {
             let exp = snapshot[i] + 2.0 * expected[i];
-            assert!((out[i] - exp).abs() < 1e-5, "accumulate elem {i}: got {}, exp {}", out[i], exp);
+            assert!(
+                (out[i] - exp).abs() < 1e-5,
+                "accumulate elem {i}: got {}, exp {}",
+                out[i],
+                exp
+            );
         }
 
         // And the result should track the source, within FP8 per-element bound × total scale.
@@ -595,9 +634,14 @@ mod tests {
         };
 
         let storage = Fp4Storage::load(&tmp.0, cfg, vec![2], hidden).unwrap();
-        assert!(storage.down_mmap.is_none(), "f16 down must not be mmap'd by Fp4Storage");
-        assert!(!storage.dequant_row_into(0, 2, 0, &mut vec![0.0f32; hidden]),
-                "f16 precision must fall through to legacy path");
+        assert!(
+            storage.down_mmap.is_none(),
+            "f16 down must not be mmap'd by Fp4Storage"
+        );
+        assert!(
+            !storage.dequant_row_into(0, 2, 0, &mut vec![0.0f32; hidden]),
+            "f16 precision must fall through to legacy path"
+        );
         let _ = Projections {
             gate: crate::config::types::ProjectionFormat {
                 precision: Precision::Fp4,
@@ -629,8 +673,10 @@ mod tests {
                 let block_max = src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                 for i in 0..hidden {
                     let err = (src[i] - out[i]).abs();
-                    assert!(err <= block_max / 3.0,
-                            "L{layer_idx} f{feat} elem {i}: err {err}");
+                    assert!(
+                        err <= block_max / 3.0,
+                        "L{layer_idx} f{feat} elem {i}: err {err}"
+                    );
                 }
             }
         }

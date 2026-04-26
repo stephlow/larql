@@ -21,12 +21,17 @@ pub(super) fn log_decode_entry(
     inter: usize,
     layers: &[FullPipelineLayer],
 ) {
-    if std::env::var("DECODE_DEBUG").is_err() || call_n >= 3 { return; }
+    if std::env::var("DECODE_DEBUG").is_err() || call_n >= 3 {
+        return;
+    }
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
     let has_moe = layers.iter().any(|l| l.moe.is_some());
     let has_combined = layers.iter().any(|l| l.moe_combined_output_norm);
     let n = layers.len();
-    let outer_loaded = layers.iter().filter(|l| l.moe_outer_post_norm.is_some()).count();
+    let outer_loaded = layers
+        .iter()
+        .filter(|l| l.moe_outer_post_norm.is_some())
+        .count();
     let post1_loaded = layers.iter().filter(|l| l.post_ffn_norm.is_some()).count();
     eprintln!(
         "[decode_token call={call_n}] x_rms={rms:.4} hidden={hidden} inter={inter} has_moe={has_moe} moe_combined_norm={has_combined} outer_post_norm={outer_loaded}/{n} post_ffn_norm_1={post1_loaded}/{n}"
@@ -92,16 +97,17 @@ pub(super) fn dump_l0_moe_intermediates(
     let ffn_norm_in = crate::metal::buffers::read_buffer_f32(ffn_norm_out, hidden);
     // new_h currently = h_post_attn + _1(dense) + moe_out.
     // Derive h1 = _1(dense) and keep raw moe_out separately.
-    let h1: Vec<f32> = new_h_vec.iter()
-        .zip(ha_vec.iter()).zip(moe_out.iter())
+    let h1: Vec<f32> = new_h_vec
+        .iter()
+        .zip(ha_vec.iter())
+        .zip(moe_out.iter())
         .map(|((&n, &a), &m)| n - a - m)
         .collect();
     let write = |name: &str, data: &[f32]| {
         let path = format!("{dir}/{name}.bin");
         if let Ok(mut f) = std::fs::File::create(&path) {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             let _ = f.write_all(bytes);
             eprintln!("[l0-dump] wrote {path} ({} f32)", data.len());
         }
@@ -142,18 +148,18 @@ pub(super) fn dump_decode_stage_files(dir: &str, l: usize, bufs: &LayerDiagBufs<
             eprintln!("[decode-stage-dump] failed to write {path}: {e}");
         }
     };
-    write_buf("norm_out",     bufs.norm_f32_buf, bufs.hidden);
-    write_buf("q_out",        bufs.q_out,        bufs.layer_q_dim);
-    write_buf("k_out",        bufs.k_out,        bufs.layer_kv_dim);
-    write_buf("v_out",        bufs.v_out,        bufs.layer_kv_dim);
-    write_buf("attn_out",     bufs.attn_out_buf, bufs.layer_q_dim);
-    write_buf("o_out",        bufs.o_out_buf,    bufs.hidden);
-    write_buf("h_post_attn",  bufs.h_post_attn,  bufs.hidden);
+    write_buf("norm_out", bufs.norm_f32_buf, bufs.hidden);
+    write_buf("q_out", bufs.q_out, bufs.layer_q_dim);
+    write_buf("k_out", bufs.k_out, bufs.layer_kv_dim);
+    write_buf("v_out", bufs.v_out, bufs.layer_kv_dim);
+    write_buf("attn_out", bufs.attn_out_buf, bufs.layer_q_dim);
+    write_buf("o_out", bufs.o_out_buf, bufs.hidden);
+    write_buf("h_post_attn", bufs.h_post_attn, bufs.hidden);
     write_buf("ffn_norm_out", bufs.ffn_norm_out, bufs.hidden);
-    write_buf("gate_out",     bufs.gate_out_scratch, bufs.inter);
-    write_buf("up_out",       bufs.up_out,       bufs.inter);
-    write_buf("act_buf",      bufs.act_buf,      bufs.inter);
-    write_buf("down_out",     bufs.down_out,     bufs.hidden);
+    write_buf("gate_out", bufs.gate_out_scratch, bufs.inter);
+    write_buf("up_out", bufs.up_out, bufs.inter);
+    write_buf("act_buf", bufs.act_buf, bufs.inter);
+    write_buf("down_out", bufs.down_out, bufs.hidden);
 }
 
 /// Dump NaN/Inf counts and max-abs for every buffer in `bufs`, tagged with
@@ -254,7 +260,9 @@ impl ResidualDump {
         h_post_attn: &[f32],
         layer_out: &[f32],
     ) {
-        let Some(file) = self.file.as_mut() else { return };
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         use std::io::Write;
         debug_assert_eq!(layer_in.len(), layer_out.len());
         debug_assert_eq!(layer_in.len(), h_post_attn.len());

@@ -23,15 +23,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::types::VindexConfig;
-use crate::format::filenames::*;
 use crate::error::VindexError;
+use crate::format::filenames::*;
 use crate::format::weights::{
     load_model_weights, write_model_weights_q4k_with_opts, Q4kWriteOptions,
 };
 use crate::IndexLoadCallbacks;
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Q4kConvertConfig {
     /// Quantise FFN down-proj as Q4_K instead of Q6_K. Default false
     /// preserves the Ollama-compatible Q4_K_M mix (Q4_K gate/up, Q6_K
@@ -46,7 +45,6 @@ pub struct Q4kConvertConfig {
     /// Overwrite `dst` if it already exists.
     pub force: bool,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct Q4kConvertReport {
@@ -111,7 +109,8 @@ pub fn vindex_to_q4k(
         return Err(VindexError::Parse(format!(
             "src vindex {} has no model weights (extract_level = {:?}); \
              Q4K quantisation requires `--level inference` or higher on the source extract",
-            src.display(), src_config.extract_level,
+            src.display(),
+            src_config.extract_level,
         )));
     }
     if src_config.quant != crate::QuantFormat::None {
@@ -146,7 +145,10 @@ pub fn vindex_to_q4k(
     };
     let mut build_cb = SilentCallbacks;
     write_model_weights_q4k_with_opts(
-        &weights, &dst_tmp, &mut build_cb as &mut dyn crate::IndexBuildCallbacks, opts,
+        &weights,
+        &dst_tmp,
+        &mut build_cb as &mut dyn crate::IndexBuildCallbacks,
+        opts,
     )?;
 
     // Hard-link auxiliary files: gate_vectors (KNN still needs the
@@ -161,7 +163,10 @@ pub fn vindex_to_q4k(
         INTERLEAVED_Q4K_MANIFEST_JSON,
         LM_HEAD_Q4_BIN,
         NORMS_BIN,
-    ].iter().copied().collect();
+    ]
+    .iter()
+    .copied()
+    .collect();
     let skip_from_src: std::collections::HashSet<&str> = [
         // The f32 weight files that the Q4K path replaces — don't
         // hard-link these, they'd bloat the output and be unused.
@@ -175,12 +180,15 @@ pub fn vindex_to_q4k(
         NORMS_BIN,
         WEIGHT_MANIFEST_JSON,
         INDEX_JSON,
-    ].iter().copied().collect();
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     let mut aux_linked = 0usize;
     let mut aux_bytes = 0u64;
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| VindexError::Parse(format!("read src dir: {e}")))?
+    for entry in
+        std::fs::read_dir(src).map_err(|e| VindexError::Parse(format!("read src dir: {e}")))?
     {
         let entry = entry.map_err(|e| VindexError::Parse(format!("{e}")))?;
         let fname = entry.file_name();
@@ -190,8 +198,12 @@ pub fn vindex_to_q4k(
         {
             continue;
         }
-        let meta = entry.metadata().map_err(|e| VindexError::Parse(format!("{e}")))?;
-        if !meta.is_file() { continue; }
+        let meta = entry
+            .metadata()
+            .map_err(|e| VindexError::Parse(format!("{e}")))?;
+        if !meta.is_file() {
+            continue;
+        }
         let dst_path = dst_tmp.join(&fname);
         link_or_copy(&entry.path(), &dst_path)?;
         aux_linked += 1;
@@ -214,10 +226,13 @@ pub fn vindex_to_q4k(
     .map_err(|e| VindexError::Parse(format!("write index.json: {e}")))?;
 
     // Atomic promote.
-    std::fs::rename(&dst_tmp, dst)
-        .map_err(|e| VindexError::Parse(format!(
-            "atomic rename {} → {}: {e}", dst_tmp.display(), dst.display()
-        )))?;
+    std::fs::rename(&dst_tmp, dst).map_err(|e| {
+        VindexError::Parse(format!(
+            "atomic rename {} → {}: {e}",
+            dst_tmp.display(),
+            dst.display()
+        ))
+    })?;
 
     // Size reporting. FFN src = up_weights.bin + down_weights.bin
     // (already dense f32). FFN dst = interleaved_q4k.bin.
@@ -226,12 +241,14 @@ pub fn vindex_to_q4k(
         + size_of(&src.join(GATE_VECTORS_BIN)).unwrap_or(0);
     let dst_ffn_bytes = size_of(&dst.join(INTERLEAVED_Q4K_BIN)).unwrap_or(0)
         + size_of(&dst.join(GATE_VECTORS_BIN)).unwrap_or(0);
-    let compression = if dst_ffn_bytes == 0 { 1.0 } else {
+    let compression = if dst_ffn_bytes == 0 {
+        1.0
+    } else {
         src_ffn_bytes as f64 / dst_ffn_bytes as f64
     };
 
-    let walk_backend = describe_out_backend(dst)
-        .unwrap_or_else(|e| format!("<describe failed: {e:?}>"));
+    let walk_backend =
+        describe_out_backend(dst).unwrap_or_else(|e| format!("<describe failed: {e:?}>"));
 
     Ok(Q4kConvertReport {
         src: src.to_path_buf(),
@@ -266,10 +283,13 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<(), VindexError> {
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
         Err(_) => {
-            std::fs::copy(src, dst)
-                .map_err(|e| VindexError::Parse(format!(
-                    "copy fallback {} → {}: {e}", src.display(), dst.display()
-                )))?;
+            std::fs::copy(src, dst).map_err(|e| {
+                VindexError::Parse(format!(
+                    "copy fallback {} → {}: {e}",
+                    src.display(),
+                    dst.display()
+                ))
+            })?;
             Ok(())
         }
     }
@@ -331,9 +351,7 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
     }
     let manifest_text = std::fs::read_to_string(&interleaved_manifest_path)?;
     let entries: Vec<Q4kManifestEntry> = serde_json::from_str(&manifest_text)
-        .map_err(|e| VindexError::Parse(format!(
-            "{INTERLEAVED_Q4K_MANIFEST_JSON}: {e}"
-        )))?;
+        .map_err(|e| VindexError::Parse(format!("{INTERLEAVED_Q4K_MANIFEST_JSON}: {e}")))?;
 
     let config = crate::format::load::load_vindex_config(vindex_dir)?;
     let num_layers = config.num_layers;
@@ -375,9 +393,8 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
         // Source disk layout for down is `[hidden=rows, padded_intermediate=cols]`.
         let n_padded = rows * cols;
         let bytes = &mmap[down.offset as usize..(down.offset + down.length) as usize];
-        let dequant = (info.dequantize)(bytes, n_padded).map_err(|e| {
-            VindexError::Parse(format!("dequant down layer {layer}: {e}"))
-        })?;
+        let dequant = (info.dequantize)(bytes, n_padded)
+            .map_err(|e| VindexError::Parse(format!("dequant down layer {layer}: {e}")))?;
         // FeatureMajorDownState::append_layer expects the full
         // `[rows × cols]` padded f32 buffer — exactly what the
         // dequantiser produced.
@@ -409,7 +426,10 @@ mod tests {
 
     #[test]
     fn down_q4k_opt_in_toggles_flag() {
-        let c = Q4kConvertConfig { down_q4k: true, ..Default::default() };
+        let c = Q4kConvertConfig {
+            down_q4k: true,
+            ..Default::default()
+        };
         assert!(c.down_q4k);
     }
 }

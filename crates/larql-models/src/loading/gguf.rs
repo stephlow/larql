@@ -10,7 +10,7 @@ use std::path::Path;
 
 use ndarray::{Array2, ShapeBuilder};
 
-use crate::detect::ModelError;
+use crate::detect::{detect_from_json_validated, ModelError};
 use crate::weights::ModelWeights;
 
 // ═══════════════════════════════════════════════════════════════
@@ -404,16 +404,34 @@ pub fn load_gguf(path: &Path) -> Result<ModelWeights, ModelError> {
     load_gguf_filtered(path, &|_| false)
 }
 
+/// Load and validate a GGUF file into ModelWeights (dequantized to f32).
+pub fn load_gguf_validated(path: &Path) -> Result<ModelWeights, ModelError> {
+    load_gguf_filtered_with_validation(path, &|_| false, true)
+}
+
 /// Load a GGUF file into ModelWeights, skipping normalized keys before dequantization.
 pub(crate) fn load_gguf_filtered(
     path: &Path,
     skip_key: &dyn Fn(&str) -> bool,
 ) -> Result<ModelWeights, ModelError> {
+    load_gguf_filtered_with_validation(path, skip_key, false)
+}
+
+/// Load a GGUF file into ModelWeights with optional architecture validation.
+pub(crate) fn load_gguf_filtered_with_validation(
+    path: &Path,
+    skip_key: &dyn Fn(&str) -> bool,
+    validate_config: bool,
+) -> Result<ModelWeights, ModelError> {
     let gguf = GgufFile::open(path)?;
 
     // Detect architecture from GGUF metadata
     let config_json = gguf.to_config_json();
-    let arch = crate::detect_from_json(&config_json);
+    let arch = if validate_config {
+        detect_from_json_validated(&config_json)?
+    } else {
+        crate::detect_from_json(&config_json)
+    };
     let prefixes = arch.key_prefixes_to_strip();
 
     // Load and dequantize all tensors

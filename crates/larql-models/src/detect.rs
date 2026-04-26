@@ -16,6 +16,7 @@ use crate::architectures::qwen::QwenArch;
 use crate::architectures::starcoder2::StarCoder2Arch;
 use crate::architectures::tinymodel::TinyModelArch;
 use crate::config::{ModelArchitecture, ModelConfig, RopeScaling};
+use crate::validation::ConfigValidationError;
 
 /// Error from model detection/config parsing.
 #[derive(Debug, thiserror::Error)]
@@ -34,19 +35,32 @@ pub enum ModelError {
     NotADirectory(std::path::PathBuf),
     #[error("no safetensors files in {0}")]
     NoSafetensors(std::path::PathBuf),
+    #[error("config validation failed: {0:?}")]
+    ConfigValidation(Vec<ConfigValidationError>),
 }
 
 /// Read config.json from a model directory and return the architecture.
 pub fn detect_architecture(model_dir: &Path) -> Result<Box<dyn ModelArchitecture>, ModelError> {
-    let config_path = model_dir.join("config.json");
-    let config_json = if config_path.exists() {
-        let text = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str::<serde_json::Value>(&text)?
-    } else {
-        serde_json::json!({})
-    };
-
+    let config_json = read_config_json(model_dir)?;
     Ok(detect_from_json(&config_json))
+}
+
+/// Read config.json from a model directory, detect the architecture, and validate it.
+pub fn detect_architecture_validated(
+    model_dir: &Path,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    let arch = detect_architecture(model_dir)?;
+    validate_detected_architecture(arch)
+}
+
+fn read_config_json(model_dir: &Path) -> Result<serde_json::Value, ModelError> {
+    let config_path = model_dir.join("config.json");
+    if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)?;
+        Ok(serde_json::from_str::<serde_json::Value>(&text)?)
+    } else {
+        Ok(serde_json::json!({}))
+    }
 }
 
 /// Detect architecture from an already-parsed config.json value.
@@ -81,6 +95,23 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "tinymodel" => Box::new(TinyModelArch::from_config(model_config)),
         // Unknown — generic fallback
         _ => Box::new(GenericArch::from_config(model_config)),
+    }
+}
+
+/// Detect architecture from an already-parsed config.json value and validate it.
+pub fn detect_from_json_validated(
+    config: &serde_json::Value,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    let arch = detect_from_json(config);
+    validate_detected_architecture(arch)
+}
+
+pub(crate) fn validate_detected_architecture(
+    arch: Box<dyn ModelArchitecture>,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    match arch.validate() {
+        Ok(()) => Ok(arch),
+        Err(errors) => Err(ModelError::ConfigValidation(errors)),
     }
 }
 
@@ -138,8 +169,10 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .map(|v| v as usize)
         .unwrap_or(if default_head_dim > 0 {
             default_head_dim
-        } else {
+        } else if num_q_heads > 0 {
             hidden_size / num_q_heads
+        } else {
+            0
         });
     let num_kv_heads = text_config["num_key_value_heads"].as_u64().unwrap_or(4) as usize;
     // RoPE base: check rope_parameters.full_attention.rope_theta (Gemma 4),

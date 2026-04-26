@@ -19,14 +19,18 @@ impl TempDir {
     fn new(label: &str) -> Self {
         let base = std::env::temp_dir();
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let p = base.join(format!("q4k_cli_{label}_{}_{}", std::process::id(), ts));
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
     }
 }
 impl Drop for TempDir {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Minimal index.json fixture parameterised by the two fields Q4K
@@ -55,7 +59,8 @@ fn write_stub_index(dir: &std::path::Path, has_model_weights: bool, quant: &str)
     std::fs::write(
         dir.join("index.json"),
         serde_json::to_string_pretty(&idx).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 #[test]
@@ -66,10 +71,16 @@ fn q4k_refuses_existing_output_without_force() {
     let dst = tmp.0.join("dst.vindex");
     std::fs::create_dir_all(&dst).unwrap();
 
-    let config = Q4kConvertConfig { force: false, ..Default::default() };
+    let config = Q4kConvertConfig {
+        force: false,
+        ..Default::default()
+    };
     let err = vindex_to_q4k(&src, &dst, &config).unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("exists"), "expected 'exists' in error; got {msg}");
+    assert!(
+        msg.contains("exists"),
+        "expected 'exists' in error; got {msg}"
+    );
 }
 
 #[test]
@@ -86,7 +97,10 @@ fn q4k_refuses_source_without_model_weights() {
         msg.contains("no model weights") && msg.contains("--level inference"),
         "error should point at the extract-level mismatch; got {msg}"
     );
-    assert!(!dst.exists(), "dst should not be created on precondition failure");
+    assert!(
+        !dst.exists(),
+        "dst should not be created on precondition failure"
+    );
 }
 
 #[test]
@@ -103,7 +117,10 @@ fn q4k_refuses_already_quantised_source() {
         msg.contains("already quantised") || msg.contains("already"),
         "error should say source is already quantised; got {msg}"
     );
-    assert!(!dst.exists(), "dst should not be created on precondition failure");
+    assert!(
+        !dst.exists(),
+        "dst should not be created on precondition failure"
+    );
 }
 
 #[test]
@@ -174,15 +191,39 @@ fn write_synthetic_llama_model(
     push("model.norm.weight", vec![hidden]);
     for layer in 0..num_layers {
         let lp = format!("model.layers.{layer}");
-        push(&format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.mlp.gate_proj.weight"), vec![intermediate, hidden]);
-        push(&format!("{lp}.mlp.up_proj.weight"), vec![intermediate, hidden]);
-        push(&format!("{lp}.mlp.down_proj.weight"), vec![hidden, intermediate]);
+        push(
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.mlp.gate_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &format!("{lp}.mlp.up_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &format!("{lp}.mlp.down_proj.weight"),
+            vec![hidden, intermediate],
+        );
         push(&format!("{lp}.input_layernorm.weight"), vec![hidden]);
-        push(&format!("{lp}.post_attention_layernorm.weight"), vec![hidden]);
+        push(
+            &format!("{lp}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
     }
 
     let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
@@ -226,7 +267,8 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     let intermediate = 4usize;
     let num_layers = 2usize;
     let vocab = 16usize;
-    let tokenizer = write_synthetic_llama_model(&model_dir, hidden, intermediate, num_layers, vocab);
+    let tokenizer =
+        write_synthetic_llama_model(&model_dir, hidden, intermediate, num_layers, vocab);
 
     // Stream-extract to a *float* vindex (QuantFormat::None) at level=Inference
     // so all weight files land. This is the precondition vindex_to_q4k
@@ -245,7 +287,8 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
         larql_vindex::Q4kWriteOptions::default(),
         false,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Sanity: source carries the float weights vindex_to_q4k expects.
     assert!(src_dir.join("up_weights.bin").exists());
@@ -259,7 +302,10 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     let report = vindex_to_q4k(&src_dir, &dst_dir, &Q4kConvertConfig::default()).unwrap();
 
     // ── Atomic rename: staging is gone, output dir is there ──
-    assert!(!tmp.0.join("dst.vindex.tmp").exists(), "staging dir should be cleaned up");
+    assert!(
+        !tmp.0.join("dst.vindex.tmp").exists(),
+        "staging dir should be cleaned up"
+    );
     assert!(dst_dir.exists());
 
     // ── Output layout ──
@@ -277,19 +323,33 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     }
 
     // The f32 weight files vindex_to_q4k explicitly skips from hard-linking.
-    for f in ["attn_weights.bin", "up_weights.bin", "down_weights.bin", "interleaved.bin", LM_HEAD_BIN] {
-        assert!(!dst_dir.join(f).exists(),
-            "{f} should NOT have been hard-linked (the Q4K weight files replace it)");
+    for f in [
+        "attn_weights.bin",
+        "up_weights.bin",
+        "down_weights.bin",
+        "interleaved.bin",
+        LM_HEAD_BIN,
+    ] {
+        assert!(
+            !dst_dir.join(f).exists(),
+            "{f} should NOT have been hard-linked (the Q4K weight files replace it)"
+        );
     }
 
     // Aux files that ARE hard-linked through.
-    assert!(dst_dir.join("down_meta.bin").exists(), "down_meta.bin should be hard-linked");
+    assert!(
+        dst_dir.join("down_meta.bin").exists(),
+        "down_meta.bin should be hard-linked"
+    );
 
     // ── Manifest ──
     let dst_cfg = larql_vindex::load_vindex_config(&dst_dir).unwrap();
     assert_eq!(dst_cfg.quant, QuantFormat::Q4K);
     assert!(dst_cfg.has_model_weights);
-    assert!(dst_cfg.checksums.is_none(), "checksums must be cleared (source's no longer apply)");
+    assert!(
+        dst_cfg.checksums.is_none(),
+        "checksums must be cleared (source's no longer apply)"
+    );
 
     // ── Round-trip: dequantise the layer-0 Q tensor and confirm we get
     // back the source synthetic ramp (within Q4_K block error). Same
@@ -303,9 +363,8 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
 
     // Q is hidden×hidden = 64 elements, padded to one 256-elem super-block.
     let padded_cols = 256usize;
-    let q_dequant = larql_models::quant::ggml::dequantize_q4_k(
-        slices[0].0, hidden * padded_cols,
-    ).unwrap();
+    let q_dequant =
+        larql_models::quant::ggml::dequantize_q4_k(slices[0].0, hidden * padded_cols).unwrap();
     let expected: Vec<f32> = (0..(hidden * hidden)).map(|i| (i as f32) * 0.01).collect();
     for row in 0..hidden {
         for col in 0..hidden {
@@ -321,8 +380,14 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
 
     // ── Report shape ──
     assert!(report.compression > 0.0, "compression must be reported");
-    assert!(report.aux_linked_count > 0, "at least one aux file should land via hard-link");
-    assert!(!report.walk_backend.is_empty(), "walk_backend description must be populated");
+    assert!(
+        report.aux_linked_count > 0,
+        "at least one aux file should land via hard-link"
+    );
+    assert!(
+        !report.walk_backend.is_empty(),
+        "walk_backend description must be populated"
+    );
 }
 
 /// Round-trip the W2 feature-major down emit: convert with
@@ -343,7 +408,8 @@ fn q4k_feature_major_down_round_trip() {
     let intermediate = 4usize;
     let num_layers = 2usize;
     let vocab = 16usize;
-    let tokenizer = write_synthetic_llama_model(&model_dir, hidden, intermediate, num_layers, vocab);
+    let tokenizer =
+        write_synthetic_llama_model(&model_dir, hidden, intermediate, num_layers, vocab);
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
     larql_vindex::build_vindex_streaming(

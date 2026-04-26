@@ -1,8 +1,8 @@
 //! Tests for HNSW index — correctness, recall, and edge cases.
 
-use ndarray::{Array1, Array2};
 use larql_vindex::index::hnsw::HnswLayer;
 use larql_vindex::VectorIndex;
+use ndarray::{Array1, Array2};
 
 fn synth_vectors(n: usize, dim: usize, seed: u64) -> Array2<f32> {
     let mut state = seed;
@@ -56,8 +56,10 @@ fn recall_at_10() {
     let hnsw_results = index.search(&view, &query, 10, 100);
     let brute_results = brute_force_topk(&vectors, &query, 10);
 
-    let hnsw_ids: std::collections::HashSet<usize> = hnsw_results.iter().map(|(id, _)| *id).collect();
-    let brute_ids: std::collections::HashSet<usize> = brute_results.iter().map(|(id, _)| *id).collect();
+    let hnsw_ids: std::collections::HashSet<usize> =
+        hnsw_results.iter().map(|(id, _)| *id).collect();
+    let brute_ids: std::collections::HashSet<usize> =
+        brute_results.iter().map(|(id, _)| *id).collect();
 
     let overlap = hnsw_ids.intersection(&brute_ids).count();
     assert!(
@@ -79,8 +81,10 @@ fn recall_at_100_large() {
     let hnsw_results = index.search(&view, &query, 100, 200);
     let brute_results = brute_force_topk(&vectors, &query, 100);
 
-    let hnsw_ids: std::collections::HashSet<usize> = hnsw_results.iter().map(|(id, _)| *id).collect();
-    let brute_ids: std::collections::HashSet<usize> = brute_results.iter().map(|(id, _)| *id).collect();
+    let hnsw_ids: std::collections::HashSet<usize> =
+        hnsw_results.iter().map(|(id, _)| *id).collect();
+    let brute_ids: std::collections::HashSet<usize> =
+        brute_results.iter().map(|(id, _)| *id).collect();
 
     let overlap = hnsw_ids.intersection(&brute_ids).count();
     assert!(
@@ -123,7 +127,12 @@ fn scores_are_dot_products() {
     let results = index.search(&view, &query, 10, 50);
 
     for (id, score) in &results {
-        let expected: f32 = vectors.row(*id).iter().zip(query.iter()).map(|(a, b)| a * b).sum();
+        let expected: f32 = vectors
+            .row(*id)
+            .iter()
+            .zip(query.iter())
+            .map(|(a, b)| a * b)
+            .sum();
         assert!(
             (score - expected).abs() < 1e-5,
             "score mismatch for id {id}: got {score}, expected {expected}"
@@ -144,7 +153,9 @@ fn results_sorted_descending() {
         assert!(
             results[i - 1].1 >= results[i].1,
             "results not sorted: [{i}]={} < [{}]={}",
-            results[i].1, i - 1, results[i - 1].1
+            results[i].1,
+            i - 1,
+            results[i - 1].1
         );
     }
 }
@@ -169,15 +180,13 @@ fn gate_knn_hnsw_smoke() {
 
     let query = synth_vectors(1, hidden, 31337).row(0).to_owned();
     let brute = index.gate_knn(0, &query, 10);
-    let brute_ids: std::collections::HashSet<usize> =
-        brute.iter().map(|(id, _)| *id).collect();
+    let brute_ids: std::collections::HashSet<usize> = brute.iter().map(|(id, _)| *id).collect();
 
     index.enable_hnsw(200);
     assert!(index.is_hnsw_enabled());
     let hnsw = index.gate_knn(0, &query, 10);
     assert_eq!(hnsw.len(), 10, "HNSW must return requested top-K");
-    let hnsw_ids: std::collections::HashSet<usize> =
-        hnsw.iter().map(|(id, _)| *id).collect();
+    let hnsw_ids: std::collections::HashSet<usize> = hnsw.iter().map(|(id, _)| *id).collect();
     let overlap = hnsw_ids.intersection(&brute_ids).count();
     assert!(
         overlap >= 4,

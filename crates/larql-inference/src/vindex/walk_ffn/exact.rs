@@ -10,7 +10,6 @@
 
 use ndarray::Array2;
 
-
 use super::WalkFfn;
 
 impl<'a> WalkFfn<'a> {
@@ -49,7 +48,8 @@ impl<'a> WalkFfn<'a> {
             }
         } else {
             let mut proj = crate::forward::dot_proj(x, w_up);
-            if let Some(bias) = arch.ffn_up_bias_key(layer)
+            if let Some(bias) = arch
+                .ffn_up_bias_key(layer)
                 .and_then(|bk| self.weights.vectors.get(&bk))
             {
                 crate::forward::add_bias(&mut proj, bias);
@@ -69,7 +69,8 @@ impl<'a> WalkFfn<'a> {
         };
 
         let mut out = out;
-        if let Some(bias) = arch.ffn_down_bias_key(layer)
+        if let Some(bias) = arch
+            .ffn_down_bias_key(layer)
             .and_then(|k| self.weights.vectors.get(&k))
         {
             crate::forward::add_bias(&mut out, bias);

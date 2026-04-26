@@ -110,12 +110,7 @@ fn metal_fused_q6k_geglu_down(
 }
 
 /// Run the fused-vs-separated parity test for one geometry + activation.
-fn assert_fused_q6k_geglu_down_matches_separated(
-    label: &str,
-    n: usize,
-    inter: usize,
-    silu: bool,
-) {
+fn assert_fused_q6k_geglu_down_matches_separated(label: &str, n: usize, inter: usize, silu: bool) {
     assert_eq!(inter % 256, 0, "Q6_K requires inter divisible by 256");
     let metal = get_metal();
     let cpu = larql_compute::cpu::CpuBackend;
@@ -162,7 +157,10 @@ fn q6k_geglu_gelu_tanh_down_smoke() {
 #[test]
 fn q6k_geglu_gelu_tanh_down_gemma3_4b_ffn() {
     assert_fused_q6k_geglu_down_matches_separated(
-        "gemma3-4b ffn (gelu_tanh, Q6_K down)", 2560, 10240, false,
+        "gemma3-4b ffn (gelu_tanh, Q6_K down)",
+        2560,
+        10240,
+        false,
     );
 }
 
@@ -170,7 +168,10 @@ fn q6k_geglu_gelu_tanh_down_gemma3_4b_ffn() {
 fn q6k_geglu_silu_down_llama2_7b_ffn() {
     // Llama 2 7B FFN: hidden=4096, inter=11008. SiLU activation.
     assert_fused_q6k_geglu_down_matches_separated(
-        "llama2-7b ffn (silu, Q6_K down)", 4096, 11008, true,
+        "llama2-7b ffn (silu, Q6_K down)",
+        4096,
+        11008,
+        true,
     );
 }
 
@@ -181,6 +182,9 @@ fn q6k_geglu_silu_down_llama2_7b_ffn() {
 #[test]
 fn q6k_geglu_gelu_tanh_down_gemma4_31b_ffn() {
     assert_fused_q6k_geglu_down_matches_separated(
-        "gemma4-31b ffn (gelu_tanh, Q6_K down)", 5376, 21504, false,
+        "gemma4-31b ffn (gelu_tanh, Q6_K down)",
+        5376,
+        21504,
+        false,
     );
 }

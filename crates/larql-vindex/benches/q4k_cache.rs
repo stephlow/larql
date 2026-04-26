@@ -45,7 +45,12 @@ fn make_q4k_layer(intermediate: usize, hidden: usize) -> (Vec<u8>, usize, usize)
 /// "Cached" strategy: dequantise the whole layer once, then iterate
 /// features doing plain f32 scaled-adds. Mirrors what
 /// `q4k_ffn_layer` + caller does, minus the Arc/lock overhead.
-fn cached_full_k_scaled_add(bytes: &[u8], intermediate: usize, hidden: usize, k: usize) -> Vec<f32> {
+fn cached_full_k_scaled_add(
+    bytes: &[u8],
+    intermediate: usize,
+    hidden: usize,
+    k: usize,
+) -> Vec<f32> {
     let info = lookup("Q4_K").expect("Q4_K registered");
     let n = intermediate * hidden;
     let f32_layer = (info.dequantize)(bytes, n).expect("dequant");
@@ -71,7 +76,9 @@ fn row_level_scaled_add(bytes: &[u8], _intermediate: usize, hidden: usize, k: us
     for feat in 0..k {
         let start = feat * bytes_per_row;
         let end = start + bytes_per_row;
-        if end > bytes.len() { break; }
+        if end > bytes.len() {
+            break;
+        }
         let alpha = 0.001 * feat as f32;
         scaled_add(&bytes[start..end], alpha, &mut out).expect("scaled_add");
     }
@@ -83,8 +90,8 @@ fn bench_cached_vs_row(c: &mut Criterion) {
 
     let configs: &[(&str, usize, usize, usize)] = &[
         // (label, intermediate, hidden, k)
-        ("gemma3-4b-K100", 10_240, 2560, 100),     // sparse decode
-        ("gemma3-4b-K1024", 10_240, 2560, 1024),   // medium decode
+        ("gemma3-4b-K100", 10_240, 2560, 100), // sparse decode
+        ("gemma3-4b-K1024", 10_240, 2560, 1024), // medium decode
         ("gemma3-4b-fullK", 10_240, 2560, 10_240), // full-K branch
     ];
 
@@ -95,17 +102,13 @@ fn bench_cached_vs_row(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("cached", label),
             &(bytes.clone(), intermediate, hidden, k),
-            |b, (bytes, i, h, k)| {
-                b.iter(|| cached_full_k_scaled_add(bytes, *i, *h, *k))
-            },
+            |b, (bytes, i, h, k)| b.iter(|| cached_full_k_scaled_add(bytes, *i, *h, *k)),
         );
 
         group.bench_with_input(
             BenchmarkId::new("row", label),
             &(bytes, intermediate, hidden, k),
-            |b, (bytes, i, h, k)| {
-                b.iter(|| row_level_scaled_add(bytes, *i, *h, *k))
-            },
+            |b, (bytes, i, h, k)| b.iter(|| row_level_scaled_add(bytes, *i, *h, *k)),
         );
     }
     group.finish();
@@ -197,7 +200,9 @@ fn bench_down_cache_vs_feature_major(c: &mut Criterion) {
                     for feat in 0..k_local {
                         let start = feat * bytes_per_row;
                         let end = start + bytes_per_row;
-                        if end > bytes.len() { break; }
+                        if end > bytes.len() {
+                            break;
+                        }
                         let alpha = 0.001 * feat as f32;
                         scaled_add(&bytes[start..end], alpha, &mut out).unwrap();
                     }
@@ -209,5 +214,9 @@ fn bench_down_cache_vs_feature_major(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_cached_vs_row, bench_down_cache_vs_feature_major);
+criterion_group!(
+    benches,
+    bench_cached_vs_row,
+    bench_down_cache_vs_feature_major
+);
 criterion_main!(benches);

@@ -31,9 +31,8 @@
 use ndarray::Array2;
 use rayon::prelude::*;
 
-
-use super::WalkFfn;
 use super::helpers::hits_len_ge_intermediate;
+use super::WalkFfn;
 
 impl<'a> WalkFfn<'a> {
     /// Sparse walk FFN — see module docs.
@@ -80,22 +79,31 @@ impl<'a> WalkFfn<'a> {
 
         let layer_has_overrides = self.index.has_overrides_at(layer);
         let up_bias_for_layer = if !is_gated {
-            arch.ffn_up_bias_key(layer).and_then(|bk| self.weights.vectors.get(&bk).cloned())
-        } else { None };
+            arch.ffn_up_bias_key(layer)
+                .and_then(|bk| self.weights.vectors.get(&bk).cloned())
+        } else {
+            None
+        };
 
         // ── Full-K gemv fast path ────────────────────────────────────────
         // See module docs for the three variants (A/B/C).
         let k_is_full = hits_len_ge_intermediate(&self.config, layer, intermediate);
         if !layer_has_overrides && is_gated && k_is_full {
             let x_slice_for_matmul: Option<&[f32]> = x.as_slice();
-            if let (Some(gate_scores), Some(x_flat)) =
-                (self.index.gate_scores_batch_backend(layer, x, self.backend), x_slice_for_matmul)
-            {
+            if let (Some(gate_scores), Some(x_flat)) = (
+                self.index.gate_scores_batch_backend(layer, x, self.backend),
+                x_slice_for_matmul,
+            ) {
                 let up_scores: Option<ndarray::Array2<f32>> = if let Some(v) = up_native {
                     Some(larql_compute::dot_proj_gpu(x, &v, self.backend))
-                } else if let Some(y) = self.index.q4k_matmul_transb(layer, 1, x_flat, seq_len, self.backend) {
+                } else if let Some(y) =
+                    self.index
+                        .q4k_matmul_transb(layer, 1, x_flat, seq_len, self.backend)
+                {
                     ndarray::Array2::from_shape_vec((seq_len, intermediate), y).ok()
-                } else { None };
+                } else {
+                    None
+                };
 
                 if let Some(up_scores) = up_scores {
                     let activation = if use_gelu {
@@ -109,8 +117,12 @@ impl<'a> WalkFfn<'a> {
                     } else if let Some(act_flat) = act_slice {
                         self.index
                             .q4k_matmul_transb(layer, 2, act_flat, seq_len, self.backend)
-                            .and_then(|y| ndarray::Array2::from_shape_vec((seq_len, hidden), y).ok())
-                    } else { None };
+                            .and_then(|y| {
+                                ndarray::Array2::from_shape_vec((seq_len, hidden), y).ok()
+                            })
+                    } else {
+                        None
+                    };
                     if let Some(out_matmul) = out_matmul {
                         out.assign(&out_matmul);
                         full_activation.assign(&activation);
@@ -134,20 +146,26 @@ impl<'a> WalkFfn<'a> {
             };
 
             let top_k = self.top_k_for(layer);
-            let hits = self.index.gate_walk(layer, &x_owned, top_k)
-                    .or_else(|| self.backend.and_then(|be| self.index.gate_knn_q4(layer, &x_owned, top_k, be)))
-                    .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, top_k));
+            let hits = self
+                .index
+                .gate_walk(layer, &x_owned, top_k)
+                .or_else(|| {
+                    self.backend
+                        .and_then(|be| self.index.gate_knn_q4(layer, &x_owned, top_k, be))
+                })
+                .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, top_k));
 
             let mut out_row = out.row_mut(s);
 
             // Parallel Q4K-down-cache path — only used when feature
             // count is medium-large (≥ 512) and no native down exists.
-            let parallelisable = !layer_has_overrides
-                && is_gated
-                && hits.len() >= 512
-                && down_native.is_none();
-            let down_cache_local: Option<std::sync::Arc<Vec<f32>>> =
-                if parallelisable { self.index.q4k_ffn_layer(layer, 2) } else { None };
+            let parallelisable =
+                !layer_has_overrides && is_gated && hits.len() >= 512 && down_native.is_none();
+            let down_cache_local: Option<std::sync::Arc<Vec<f32>>> = if parallelisable {
+                self.index.q4k_ffn_layer(layer, 2)
+            } else {
+                None
+            };
             if let Some(down_arc) = down_cache_local.as_ref().filter(|_| parallelisable) {
                 let down_data: &[f32] = down_arc.as_slice();
                 let up_slices = self.index.interleaved_q4k_layer_data(layer);
@@ -156,8 +174,9 @@ impl<'a> WalkFfn<'a> {
                 let up_q4k: Option<(&[u8], &larql_vindex::quant::registry::QuantFormatInfo)> =
                     match (up_native.as_ref(), up_slices) {
                         (Some(_), _) => None,
-                        (None, Some(s)) => larql_vindex::quant::registry::lookup(s[1].1)
-                            .map(|info| (s[1].0, info)),
+                        (None, Some(s)) => {
+                            larql_vindex::quant::registry::lookup(s[1].1).map(|info| (s[1].0, info))
+                        }
                         _ => None,
                     };
                 let n_threads = rayon::current_num_threads().max(1);
@@ -173,7 +192,8 @@ impl<'a> WalkFfn<'a> {
                                 up_view.row(feat).dot(&x_row)
                             } else if let Some((up_bytes, info)) = up_q4k {
                                 let row_dot = info.row_dot.expect("registry: row_dot");
-                                let bytes_per_row = info.bytes_per_row(hidden)
+                                let bytes_per_row = info
+                                    .bytes_per_row(hidden)
                                     .expect("registry: bytes_per_row aligned");
                                 let start = feat * bytes_per_row;
                                 let end = start + bytes_per_row;
@@ -214,7 +234,9 @@ impl<'a> WalkFfn<'a> {
                 let act = if is_gated {
                     let up_ov = if layer_has_overrides {
                         self.index.up_override(layer, feat)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let up_score = if let Some(up_ov) = up_ov.filter(|o| o.len() == hidden) {
                         ndarray::ArrayView1::from(up_ov).dot(&x_row)
                     } else if let Some(ref up_view) = up_native {
@@ -232,9 +254,15 @@ impl<'a> WalkFfn<'a> {
                 } else {
                     let mut v = gate_score;
                     if let Some(ref bias) = up_bias_for_layer {
-                        if feat < bias.len() { v += bias[feat]; }
+                        if feat < bias.len() {
+                            v += bias[feat];
+                        }
                     }
-                    if use_gelu { crate::ffn::gelu_tanh(v) } else { v * crate::ffn::sigmoid(v) }
+                    if use_gelu {
+                        crate::ffn::gelu_tanh(v)
+                    } else {
+                        v * crate::ffn::sigmoid(v)
+                    }
                 };
 
                 full_activation[[s, feat]] = act;
@@ -242,7 +270,9 @@ impl<'a> WalkFfn<'a> {
                 if act.abs() > 1e-10 {
                     let down_ov = if layer_has_overrides {
                         self.index.down_override(layer, feat)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some(override_down) = down_ov.filter(|o| o.len() == hidden) {
                         out_row.scaled_add(act, &ndarray::ArrayView1::from(override_down));
                         continue;
@@ -252,7 +282,10 @@ impl<'a> WalkFfn<'a> {
                     } else {
                         let out_slice = out_row.as_slice_mut().unwrap();
                         // Unified dispatch: FP4 → native → Q4K-via-cache, per GateIndex.
-                        if !self.index.ffn_row_scaled_add(layer, 2, feat, act, out_slice) {
+                        if !self
+                            .index
+                            .ffn_row_scaled_add(layer, 2, feat, act, out_slice)
+                        {
                             return None;
                         }
                     }
@@ -261,7 +294,8 @@ impl<'a> WalkFfn<'a> {
         }
 
         // Down bias
-        if let Some(bias) = arch.ffn_down_bias_key(layer)
+        if let Some(bias) = arch
+            .ffn_down_bias_key(layer)
             .and_then(|k| self.weights.vectors.get(&k))
         {
             crate::forward::add_bias(&mut out, bias);

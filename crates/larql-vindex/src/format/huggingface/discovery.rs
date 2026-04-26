@@ -187,7 +187,11 @@ pub fn dataset_repo_exists(repo_id: &str) -> Result<bool, VindexError> {
 
 pub fn repo_exists(repo_id: &str, repo_type: &str) -> Result<bool, VindexError> {
     let token = get_hf_token().ok();
-    let plural = if repo_type == "dataset" { "datasets" } else { "models" };
+    let plural = if repo_type == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    };
     let url = format!("https://huggingface.co/api/{plural}/{repo_id}");
     let client = reqwest::blocking::Client::new();
     let mut req = client.head(&url);
@@ -211,9 +215,7 @@ pub fn repo_exists(repo_id: &str, repo_type: &str) -> Result<bool, VindexError> 
 
 /// Fetch a collection by slug (or full collection URL) and return its
 /// items as `(type, id)` pairs — typically `("dataset", "owner/name")`.
-pub fn fetch_collection_items(
-    slug_or_url: &str,
-) -> Result<Vec<(String, String)>, VindexError> {
+pub fn fetch_collection_items(slug_or_url: &str) -> Result<Vec<(String, String)>, VindexError> {
     let slug = slug_or_url
         .trim_start_matches("https://huggingface.co/collections/")
         .trim_start_matches("http://huggingface.co/collections/")

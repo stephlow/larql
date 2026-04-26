@@ -28,7 +28,9 @@ pub fn run_single_expert(
     activation: crate::Activation,
 ) -> Vec<f32> {
     let hidden = h_norm.len();
-    if inter == 0 || hidden == 0 { return vec![0.0f32; hidden]; }
+    if inter == 0 || hidden == 0 {
+        return vec![0.0f32; hidden];
+    }
 
     let gate_up_bytes = expert_byte_slice(experts_gate_up, expert_idx, 2 * inter, hidden);
     let gate_up_w = cached_dequant(gate_up_bytes);
@@ -38,7 +40,9 @@ pub fn run_single_expert(
     let gate_out = matmul_vec(h_norm, gate_w, inter, hidden);
     let up_out = matmul_vec(h_norm, up_w, inter, hidden);
 
-    let hidden_state: Vec<f32> = gate_out.iter().zip(up_out.iter())
+    let hidden_state: Vec<f32> = gate_out
+        .iter()
+        .zip(up_out.iter())
         .map(|(&g, &u)| match activation {
             crate::Activation::GeluTanh => gelu_tanh(g) * u,
             _ => silu(g) * u,
@@ -65,7 +69,14 @@ pub fn run_single_expert_with_norm(
     activation: crate::Activation,
 ) -> Vec<f32> {
     let h_norm = rms_norm(h, pre_experts_norm, eps, norm_offset);
-    run_single_expert(&h_norm, experts_gate_up, experts_down, expert_idx, inter, activation)
+    run_single_expert(
+        &h_norm,
+        experts_gate_up,
+        experts_down,
+        expert_idx,
+        inter,
+        activation,
+    )
 }
 
 #[cfg(test)]
@@ -83,7 +94,10 @@ mod tests {
     fn fill_bf16(len: usize, val: f32) -> Vec<u8> {
         let b = bf16_bytes(val);
         let mut v = vec![0u8; len * 2];
-        for i in 0..len { v[i * 2] = b[0]; v[i * 2 + 1] = b[1]; }
+        for i in 0..len {
+            v[i * 2] = b[0];
+            v[i * 2 + 1] = b[1];
+        }
         v
     }
 
@@ -111,7 +125,10 @@ mod tests {
         let h = vec![1.0f32; hidden];
         let out = run_single_expert(&h, &gate_up, &down, 0, inter, Activation::Silu);
         assert_eq!(out.len(), hidden);
-        assert!(out.iter().any(|v| v.abs() > 0.01), "expected nonzero output, got {out:?}");
+        assert!(
+            out.iter().any(|v| v.abs() > 0.01),
+            "expected nonzero output, got {out:?}"
+        );
     }
 
     #[test]
@@ -126,13 +143,34 @@ mod tests {
 
         // Manually apply RMS norm: h_norm[i] = h[i] / rms * w[i]
         let rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32 + eps).sqrt();
-        let h_normed: Vec<f32> = h.iter().zip(norm_w.iter()).map(|(&x, &w)| x / rms * w).collect();
+        let h_normed: Vec<f32> = h
+            .iter()
+            .zip(norm_w.iter())
+            .map(|(&x, &w)| x / rms * w)
+            .collect();
 
         let direct = run_single_expert(&h_normed, &gate_up, &down, 0, inter, Activation::Silu);
-        let via_norm = run_single_expert_with_norm(&h, &gate_up, &down, 0, inter, &norm_w, 0.0, eps, Activation::Silu);
+        let via_norm = run_single_expert_with_norm(
+            &h,
+            &gate_up,
+            &down,
+            0,
+            inter,
+            &norm_w,
+            0.0,
+            eps,
+            Activation::Silu,
+        );
 
-        let max_diff: f32 = direct.iter().zip(&via_norm).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-        assert!(max_diff < 1e-4, "with_norm diverges from manual prenorm: max_diff={max_diff}");
+        let max_diff: f32 = direct
+            .iter()
+            .zip(&via_norm)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "with_norm diverges from manual prenorm: max_diff={max_diff}"
+        );
     }
 
     #[test]
@@ -145,7 +183,14 @@ mod tests {
         let h = vec![0.5f32; hidden];
         let silu_out = run_single_expert(&h, &gate_up, &down, 0, inter, Activation::Silu);
         let gelu_out = run_single_expert(&h, &gate_up, &down, 0, inter, Activation::GeluTanh);
-        let max_diff: f32 = silu_out.iter().zip(&gelu_out).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-        assert!(max_diff > 0.01, "SiLU and GeluTanh should diverge; max_diff={max_diff}");
+        let max_diff: f32 = silu_out
+            .iter()
+            .zip(&gelu_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff > 0.01,
+            "SiLU and GeluTanh should diverge; max_diff={max_diff}"
+        );
     }
 }

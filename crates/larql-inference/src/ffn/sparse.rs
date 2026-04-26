@@ -2,9 +2,9 @@
 
 use ndarray::Array2;
 
-use crate::model::ModelWeights;
+use super::sparse_compute::{select_top_k_features, sparse_ffn_forward};
 use super::FfnBackend;
-use super::sparse_compute::{sparse_ffn_forward, select_top_k_features};
+use crate::model::ModelWeights;
 
 /// Sparse FFN: compute all gate activations, select top-K, then
 /// compute gate/up/down for those K features only.
@@ -44,8 +44,8 @@ impl<'a> FfnBackend for SparseFfn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
     use crate::engines::test_utils::make_test_weights;
+    use ndarray::Array2;
 
     fn input(seq: usize, hidden: usize) -> Array2<f32> {
         let data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect();
@@ -55,14 +55,20 @@ mod tests {
     #[test]
     fn sparse_ffn_name() {
         let weights = make_test_weights();
-        let ffn = SparseFfn { weights: &weights, top_k: 4 };
+        let ffn = SparseFfn {
+            weights: &weights,
+            top_k: 4,
+        };
         assert_eq!(ffn.name(), "sparse");
     }
 
     #[test]
     fn sparse_ffn_forward_shape_single_token() {
         let weights = make_test_weights();
-        let ffn = SparseFfn { weights: &weights, top_k: 4 };
+        let ffn = SparseFfn {
+            weights: &weights,
+            top_k: 4,
+        };
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
@@ -72,7 +78,10 @@ mod tests {
     #[test]
     fn sparse_ffn_forward_shape_multi_token() {
         let weights = make_test_weights();
-        let ffn = SparseFfn { weights: &weights, top_k: 4 };
+        let ffn = SparseFfn {
+            weights: &weights,
+            top_k: 4,
+        };
         let x = input(3, weights.hidden_size);
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[3, weights.hidden_size]);
@@ -82,19 +91,28 @@ mod tests {
     #[test]
     fn sparse_ffn_forward_all_layers() {
         let weights = make_test_weights();
-        let ffn = SparseFfn { weights: &weights, top_k: 8 };
+        let ffn = SparseFfn {
+            weights: &weights,
+            top_k: 8,
+        };
         let x = input(1, weights.hidden_size);
         for layer in 0..weights.num_layers {
             let out = ffn.forward(layer, &x);
             assert_eq!(out.shape(), &[1, weights.hidden_size], "layer {layer}");
-            assert!(out.iter().all(|v| v.is_finite()), "layer {layer} non-finite");
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "layer {layer} non-finite"
+            );
         }
     }
 
     #[test]
     fn sparse_ffn_with_activation_returns_correct_shapes() {
         let weights = make_test_weights();
-        let ffn = SparseFfn { weights: &weights, top_k: 4 };
+        let ffn = SparseFfn {
+            weights: &weights,
+            top_k: 4,
+        };
         let x = input(2, weights.hidden_size);
         let (out, act) = ffn.forward_with_activation(0, &x);
         assert_eq!(out.shape(), &[2, weights.hidden_size]);
@@ -105,7 +123,10 @@ mod tests {
     fn sparse_ffn_top_k_gt_intermediate_falls_back_to_dense() {
         let weights = make_test_weights();
         // top_k > intermediate triggers dense fallback in sparse_ffn_forward
-        let ffn_big = SparseFfn { weights: &weights, top_k: weights.intermediate_size + 100 };
+        let ffn_big = SparseFfn {
+            weights: &weights,
+            top_k: weights.intermediate_size + 100,
+        };
         let ffn_dense = crate::ffn::weight::WeightFfn { weights: &weights };
         let x = input(1, weights.hidden_size);
         let out_sparse = ffn_big.forward(0, &x);

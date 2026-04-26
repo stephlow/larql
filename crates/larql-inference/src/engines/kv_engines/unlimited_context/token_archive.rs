@@ -12,7 +12,9 @@ pub struct TokenArchive {
 }
 
 impl TokenArchive {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn archive(&mut self, window_id: usize, token_ids: Vec<u32>, abs_offset: usize) {
         self.tokens.insert(window_id, token_ids);
@@ -26,10 +28,18 @@ impl TokenArchive {
         Some((toks.as_slice(), off))
     }
 
-    pub fn len(&self) -> usize { self.tokens.len() }
-    pub fn is_empty(&self) -> bool { self.tokens.is_empty() }
-    pub fn total_tokens(&self) -> usize { self.tokens.values().map(|t| t.len()).sum() }
-    pub fn total_bytes(&self) -> usize { self.tokens.values().map(|t| t.len() * 4).sum() }
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+    pub fn total_tokens(&self) -> usize {
+        self.tokens.values().map(|t| t.len()).sum()
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.tokens.values().map(|t| t.len() * 4).sum()
+    }
 }
 
 #[cfg(test)]

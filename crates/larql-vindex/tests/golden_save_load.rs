@@ -27,9 +27,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use larql_models::TopKEntry;
-use larql_vindex::{
-    FeatureMeta, SilentLoadCallbacks, VectorIndex, VindexConfig,
-};
+use larql_vindex::{FeatureMeta, SilentLoadCallbacks, VectorIndex, VindexConfig};
 use ndarray::{Array1, Array2};
 use sha2::{Digest, Sha256};
 
@@ -78,29 +76,38 @@ fn build_synthetic_vindex(num_layers: usize, features: usize, hidden: usize) -> 
         gate_vectors.push(Some(gate));
 
         let metas: Vec<Option<FeatureMeta>> = (0..features)
-            .map(|i| Some(FeatureMeta {
-                top_token: format!("tok{i}"),
-                top_token_id: i as u32,
-                c_score: 0.5,
-                top_k: vec![TopKEntry {
-                    token: format!("tok{i}"),
-                    token_id: i as u32,
-                    logit: 0.5,
-                }],
-            }))
+            .map(|i| {
+                Some(FeatureMeta {
+                    top_token: format!("tok{i}"),
+                    top_token_id: i as u32,
+                    c_score: 0.5,
+                    top_k: vec![TopKEntry {
+                        token: format!("tok{i}"),
+                        token_id: i as u32,
+                        logit: 0.5,
+                    }],
+                })
+            })
             .collect();
         down_meta.push(Some(metas));
     }
     VectorIndex::new(gate_vectors, down_meta, num_layers, hidden)
 }
 
-fn save_full_vindex(index: &VectorIndex, dir: &std::path::Path, num_layers: usize, hidden: usize, features: usize) {
+fn save_full_vindex(
+    index: &VectorIndex,
+    dir: &std::path::Path,
+    num_layers: usize,
+    hidden: usize,
+    features: usize,
+) {
     let layer_infos = index.save_gate_vectors(dir).unwrap();
     index.save_down_meta(dir).unwrap();
 
     // Minimal tokenizer JSON so load_vindex doesn't choke on the
     // tokenizer.json read in load_vindex_tokenizer.
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     let config = VindexConfig {
@@ -136,7 +143,10 @@ fn save_is_deterministic() {
 
     let sha_a = sha256(&a.0.join("gate_vectors.bin"));
     let sha_b = sha256(&b.0.join("gate_vectors.bin"));
-    assert_eq!(sha_a, sha_b, "gate_vectors.bin not deterministic across saves");
+    assert_eq!(
+        sha_a, sha_b,
+        "gate_vectors.bin not deterministic across saves"
+    );
 
     let sha_a_meta = sha256(&a.0.join("down_meta.bin"));
     let sha_b_meta = sha256(&b.0.join("down_meta.bin"));
@@ -211,15 +221,17 @@ fn hnsw_after_reload_overlaps_brute() {
 
     let query = synth_query(hidden, 0x31337);
     let brute = reloaded.gate_knn(0, &query, 10);
-    let brute_ids: std::collections::HashSet<usize> =
-        brute.iter().map(|(id, _)| *id).collect();
+    let brute_ids: std::collections::HashSet<usize> = brute.iter().map(|(id, _)| *id).collect();
 
     reloaded.enable_hnsw(200);
     let hnsw = reloaded.gate_knn(0, &query, 10);
-    assert_eq!(hnsw.len(), 10, "HNSW must return requested top-K post-reload");
+    assert_eq!(
+        hnsw.len(),
+        10,
+        "HNSW must return requested top-K post-reload"
+    );
 
-    let hnsw_ids: std::collections::HashSet<usize> =
-        hnsw.iter().map(|(id, _)| *id).collect();
+    let hnsw_ids: std::collections::HashSet<usize> = hnsw.iter().map(|(id, _)| *id).collect();
     let overlap = hnsw_ids.intersection(&brute_ids).count();
     assert!(
         overlap >= 4,

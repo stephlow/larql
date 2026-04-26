@@ -9,8 +9,10 @@ pub mod engine;
 pub mod q4k;
 pub mod store;
 
-pub use engine::MarkovResidualEngine;
-pub use store::RsStore;
 pub(crate) use compute::rs_decode_step_profiled;
-pub use compute::{RsPrefillResult, rs_prefill, rs_decode_step, recompute_kv, kv_memory_bytes_for_seq};
+pub use compute::{
+    kv_memory_bytes_for_seq, recompute_kv, rs_decode_step, rs_prefill, RsPrefillResult,
+};
+pub use engine::MarkovResidualEngine;
 pub use q4k::ensure_attn_tensors_dequantised;
+pub use store::RsStore;

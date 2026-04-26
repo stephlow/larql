@@ -61,7 +61,7 @@ Items in order. Each depends on the one above it.
 |---|------|-------|--------|
 | 1 | Chat template + EOS stop | larql-inference + larql-cli | not started |
 | 2 | Token streaming | larql-inference + larql-cli | not started |
-| 3 | **Per-layer FFN format** (`layers/`, unified dense+MoE, GPU dispatch) | larql-vindex + larql-compute | not started |
+| 3 | **Per-layer FFN format** (`layers/`, GPU dispatch) Phase 2: pre-alloc buffers | larql-vindex + larql-compute | phase 1 shipped (5.2 tok/s); phase 2 open |
 | 4 | MoE-aware CPU forward pass (non-Metal fallback) | larql-inference | not started |
 | 5 | Wire `RouterIndex` client-side | larql-inference | not started |
 | 6 | `POST /v1/expert/{layer}/{expert_id}` | larql-server | not started |
