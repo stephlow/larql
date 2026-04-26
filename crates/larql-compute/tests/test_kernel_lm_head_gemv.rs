@@ -1,3 +1,5 @@
+#![cfg(feature = "metal")]
+
 //! Kernel-level bisect for the CPU/Metal LM-head divergence surfaced
 //! by `test_logits_goldens` on tied-embedding models (Gemma 3 4B,
 //! Gemma 4 31B).

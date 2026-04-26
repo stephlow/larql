@@ -32,7 +32,7 @@
 //! All 16 tids together cover all 256 elements. ✓
 
 pub const SHADER: &str = r#"
-constant uint Q6K_ROWS_PER_TG = 2;
+constant uint Q6K_ROWS_PER_TG = 4;
 constant uint Q6K_BLOCK_SIZE  = 210;
 
 kernel void q6k_matvec(

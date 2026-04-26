@@ -1,7 +1,7 @@
 # larql-models cross-platform CI
 #
-# Runs check + clippy + tests on Linux, Windows, and macOS for every change
-# to the larql-models crate. Validates cross-platform compatibility:
+# Runs check + clippy + tests + bench test-mode on Linux, Windows, and macOS
+# for every change to the larql-models crate. Validates cross-platform compatibility:
 #   - Linux  (x86_64-unknown-linux-gnu)
 #   - Windows (x86_64-pc-windows-msvc) — HF cache path, mmap, path separators
 #   - macOS  (aarch64-apple-darwin)    — NEON SIMD paths
@@ -13,11 +13,15 @@ on:
     branches: [main]
     paths:
       - 'crates/larql-models/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/larql-models.yml'
   pull_request:
     branches: [main]
     paths:
       - 'crates/larql-models/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/larql-models.yml'
   workflow_dispatch: {}
 
@@ -59,3 +63,6 @@ jobs:
 
       - name: Test
         run: cargo test -p larql-models
+
+      - name: Test benches
+        run: cargo test -p larql-models --benches

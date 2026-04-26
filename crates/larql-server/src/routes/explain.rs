@@ -35,6 +35,57 @@ fn default_band() -> String {
     crate::band_utils::BAND_ALL.into()
 }
 
+fn round_probability(prob: f64) -> f64 {
+    (prob * 10000.0).round() / 10000.0
+}
+
+fn round_gate_score(score: f32) -> f64 {
+    ((score as f64) * 10.0).round() / 10.0
+}
+
+fn round_attention_weight(weight: f32) -> f64 {
+    ((weight as f64) * 1000.0).round() / 1000.0
+}
+
+fn layer_range_for_band(bands: &larql_vindex::LayerBands, band: &str) -> Option<(usize, usize)> {
+    match band {
+        BAND_SYNTAX => Some(bands.syntax),
+        BAND_KNOWLEDGE => Some(bands.knowledge),
+        BAND_OUTPUT => Some(bands.output),
+        _ => None,
+    }
+}
+
+fn format_predictions(predictions: &[(String, f64)]) -> Vec<serde_json::Value> {
+    predictions
+        .iter()
+        .map(|(tok, prob)| {
+            serde_json::json!({
+                "token": tok,
+                "probability": round_probability(*prob),
+            })
+        })
+        .collect()
+}
+
+fn format_attention(attn: &[(String, f32)]) -> Vec<serde_json::Value> {
+    attn.iter()
+        .map(|(tok, weight)| {
+            serde_json::json!({
+                "token": tok,
+                "weight": round_attention_weight(*weight),
+            })
+        })
+        .collect()
+}
+
+fn format_lens(token: &str, probability: f64) -> serde_json::Value {
+    serde_json::json!({
+        "token": token,
+        "probability": round_probability(probability),
+    })
+}
+
 fn explain_infer(
     model: &LoadedModel,
     req: &ExplainRequest,
@@ -134,18 +185,10 @@ fn explain_infer(
         map
     };
 
-    // Resolve band to layer range
     let bands = get_layer_bands(model);
-    let layer_range: Option<(usize, usize)> = match req.band.as_str() {
-        BAND_SYNTAX => Some(bands.syntax),
-        BAND_KNOWLEDGE => Some(bands.knowledge),
-        BAND_OUTPUT => Some(bands.output),
-        _ => None,
-    };
+    let layer_range = layer_range_for_band(&bands, &req.band);
 
-    let predictions: Vec<serde_json::Value> = predictions_raw.iter()
-        .map(|(tok, prob)| serde_json::json!({"token": tok, "probability": (*prob * 10000.0).round() / 10000.0}))
-        .collect();
+    let predictions = format_predictions(&predictions_raw);
 
     let mut layers = Vec::new();
     for (layer, hits) in &trace_layers {
@@ -194,7 +237,7 @@ fn explain_infer(
                     .collect();
                 Some(serde_json::json!({
                     "feature": hit.feature,
-                    "gate_score": (hit.gate_score * 10.0).round() / 10.0,
+                    "gate_score": round_gate_score(hit.gate_score),
                     "top_token": hit.meta.top_token.trim(),
                     "top_tokens": top_tokens,
                     "relation": relation,
@@ -208,13 +251,10 @@ fn explain_infer(
                 "features": features,
             });
             if let Some(attn) = attention_map.get(layer) {
-                let attn_json: Vec<serde_json::Value> = attn.iter()
-                    .map(|(tok, w)| serde_json::json!({"token": tok, "weight": (*w * 1000.0).round() / 1000.0}))
-                    .collect();
-                layer_obj["attention"] = serde_json::json!(attn_json);
+                layer_obj["attention"] = serde_json::json!(format_attention(attn));
             }
             if let Some((tok, prob)) = lens_map.get(layer) {
-                layer_obj["lens"] = serde_json::json!({"token": tok, "probability": (*prob * 10000.0).round() / 10000.0});
+                layer_obj["lens"] = format_lens(tok, *prob);
             }
             layers.push(layer_obj);
         }
@@ -259,4 +299,92 @@ pub async fn handle_explain_multi(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explain_defaults_match_api_contract() {
+        assert_eq!(default_top(), 5);
+        assert_eq!(default_per_layer(), 3);
+        assert_eq!(default_band(), crate::band_utils::BAND_ALL);
+    }
+
+    #[test]
+    fn explain_request_deserializes_optional_fields() {
+        let req: ExplainRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "The capital of France is"
+        }))
+        .unwrap();
+        assert_eq!(req.prompt, "The capital of France is");
+        assert_eq!(req.top, 5);
+        assert_eq!(req.per_layer, 3);
+        assert_eq!(req.band, crate::band_utils::BAND_ALL);
+        assert!(!req.relations_only);
+        assert!(!req.with_attention);
+    }
+
+    #[test]
+    fn explain_request_accepts_explicit_options() {
+        let req: ExplainRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "x",
+            "top": 2,
+            "per_layer": 4,
+            "band": "knowledge",
+            "relations_only": true,
+            "with_attention": true
+        }))
+        .unwrap();
+        assert_eq!(req.top, 2);
+        assert_eq!(req.per_layer, 4);
+        assert_eq!(req.band, BAND_KNOWLEDGE);
+        assert!(req.relations_only);
+        assert!(req.with_attention);
+    }
+
+    #[test]
+    fn layer_range_for_band_maps_named_bands() {
+        let bands = larql_vindex::LayerBands {
+            syntax: (0, 2),
+            knowledge: (3, 7),
+            output: (8, 9),
+        };
+        assert_eq!(layer_range_for_band(&bands, BAND_SYNTAX), Some((0, 2)));
+        assert_eq!(layer_range_for_band(&bands, BAND_KNOWLEDGE), Some((3, 7)));
+        assert_eq!(layer_range_for_band(&bands, BAND_OUTPUT), Some((8, 9)));
+        assert_eq!(
+            layer_range_for_band(&bands, crate::band_utils::BAND_ALL),
+            None
+        );
+        assert_eq!(layer_range_for_band(&bands, "unknown"), None);
+    }
+
+    #[test]
+    fn format_predictions_rounds_probability() {
+        let predictions = format_predictions(&[("Paris".into(), 0.123456)]);
+        assert_eq!(predictions[0]["token"], "Paris");
+        assert_eq!(predictions[0]["probability"], 0.1235);
+    }
+
+    #[test]
+    fn format_attention_rounds_weight() {
+        let attention = format_attention(&[("France".into(), 0.12356)]);
+        assert_eq!(attention[0]["token"], "France");
+        assert_eq!(attention[0]["weight"], 0.124);
+    }
+
+    #[test]
+    fn format_lens_rounds_probability() {
+        let lens = format_lens("Paris", 0.987654);
+        assert_eq!(lens["token"], "Paris");
+        assert_eq!(lens["probability"], 0.9877);
+    }
+
+    #[test]
+    fn score_rounding_matches_response_contract() {
+        assert_eq!(round_gate_score(12.34), 12.3);
+        assert_eq!(round_attention_weight(0.3336), 0.334);
+    }
 }

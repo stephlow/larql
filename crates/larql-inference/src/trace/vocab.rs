@@ -78,3 +78,34 @@ fn apply_norm(
         _ => crate::residual::rms_norm(x, weights.vectors.get(weight_key), norm_offset),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::make_test_weights;
+
+    #[test]
+    fn vec_norm_known_value() {
+        assert!((vec_norm(&[3.0f32, 4.0]) - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn vec_norm_zero_vector() {
+        assert_eq!(vec_norm(&[0.0f32, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn project_to_logits_returns_vocab_size_values() {
+        let w = make_test_weights();
+        let logits = project_to_logits(&w, &vec![0.1f32; w.hidden_size]);
+        assert_eq!(logits.len(), w.vocab_size);
+        assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn project_to_logits_nonzero_input_gives_nonzero_output() {
+        let w = make_test_weights();
+        let logits = project_to_logits(&w, &vec![1.0f32; w.hidden_size]);
+        assert!(logits.iter().any(|v| v.abs() > 1e-8));
+    }
+}

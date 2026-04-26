@@ -60,6 +60,48 @@ fn error_response(error: ServerError) -> Response {
     error.into_response()
 }
 
+fn parse_binary_embed_request(bytes: &[u8]) -> Result<Vec<u32>, ServerError> {
+    if bytes.len() < 4 {
+        return Err(ServerError::BadRequest(
+            "binary embed: need ≥4 bytes".into(),
+        ));
+    }
+    let num_tokens = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let expected_len = 4 + num_tokens * 4;
+    if bytes.len() < expected_len {
+        return Err(ServerError::BadRequest(
+            "binary embed: truncated token_ids".into(),
+        ));
+    }
+    Ok((0..num_tokens)
+        .map(|i| u32::from_le_bytes(bytes[4 + i * 4..4 + i * 4 + 4].try_into().unwrap()))
+        .collect())
+}
+
+fn encode_binary_embed_response(h: &Array2<f32>) -> Vec<u8> {
+    let seq_len = h.shape()[0];
+    let hidden = h.shape()[1];
+    let mut out = Vec::with_capacity(8 + seq_len * hidden * 4);
+    out.extend_from_slice(&(seq_len as u32).to_le_bytes());
+    out.extend_from_slice(&(hidden as u32).to_le_bytes());
+    for val in h.iter() {
+        out.extend_from_slice(&val.to_le_bytes());
+    }
+    out
+}
+
+fn parse_binary_logits_request(bytes: &[u8]) -> Result<Vec<f32>, ServerError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(ServerError::BadRequest(
+            "binary logits: byte length not multiple of 4".into(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
 #[derive(Serialize)]
 pub struct TokenProb {
     pub token_id: u32,
@@ -181,20 +223,10 @@ async fn handle_embed_inner(
     let start = std::time::Instant::now();
 
     let token_ids: Vec<u32> = if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
-        if bytes.len() < 4 {
-            return error_response(ServerError::BadRequest(
-                "binary embed: need ≥4 bytes".into(),
-            ));
+        match parse_binary_embed_request(&bytes) {
+            Ok(token_ids) => token_ids,
+            Err(e) => return error_response(e),
         }
-        let num_tokens = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        if bytes.len() < 4 + num_tokens * 4 {
-            return error_response(ServerError::BadRequest(
-                "binary embed: truncated token_ids".into(),
-            ));
-        }
-        (0..num_tokens)
-            .map(|i| u32::from_le_bytes(bytes[4 + i * 4..4 + i * 4 + 4].try_into().unwrap()))
-            .collect()
     } else {
         let req: EmbedRequest = match serde_json::from_slice(&bytes) {
             Ok(r) => r,
@@ -224,12 +256,7 @@ async fn handle_embed_inner(
 
     // Return binary if the client asked for it.
     if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
-        let mut out = Vec::with_capacity(8 + seq_len * hidden * 4);
-        out.extend_from_slice(&(seq_len as u32).to_le_bytes());
-        out.extend_from_slice(&(hidden as u32).to_le_bytes());
-        for val in h.iter() {
-            out.extend_from_slice(&val.to_le_bytes());
-        }
+        let out = encode_binary_embed_response(&h);
         return ([(header::CONTENT_TYPE, BINARY_FFN_CONTENT_TYPE)], out).into_response();
     }
 
@@ -292,16 +319,10 @@ async fn handle_logits_inner(
 
     let (residual_flat, top_k, temperature): (Vec<f32>, usize, f32) =
         if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
-            if bytes.len() % 4 != 0 {
-                return error_response(ServerError::BadRequest(
-                    "binary logits: byte length not multiple of 4".into(),
-                ));
+            match parse_binary_logits_request(&bytes) {
+                Ok(floats) => (floats, default_top_k(), default_temperature()),
+                Err(e) => return error_response(e),
             }
-            let floats: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            (floats, default_top_k(), default_temperature())
         } else {
             let req: LogitsRequest = match serde_json::from_slice(&bytes) {
                 Ok(r) => r,
@@ -580,6 +601,7 @@ mod tests {
         let body = make_binary_embed_request(&[1, 2, 3]);
         let num = u32::from_le_bytes(body[..4].try_into().unwrap());
         assert_eq!(num, 3);
+        assert_eq!(parse_binary_embed_request(&body).unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -605,12 +627,7 @@ mod tests {
         let seq_len = 2usize;
         let hidden = 4usize;
         let h = Array2::<f32>::from_elem((seq_len, hidden), 1.23);
-        let mut out = Vec::with_capacity(8 + seq_len * hidden * 4);
-        out.extend_from_slice(&(seq_len as u32).to_le_bytes());
-        out.extend_from_slice(&(hidden as u32).to_le_bytes());
-        for val in h.iter() {
-            out.extend_from_slice(&val.to_le_bytes());
-        }
+        let out = encode_binary_embed_response(&h);
         assert_eq!(
             u32::from_le_bytes(out[..4].try_into().unwrap()) as usize,
             seq_len
@@ -656,6 +673,7 @@ mod tests {
     fn binary_logits_request_float_roundtrip() {
         let residual = [1.5f32, -2.0, 0.0, 99.9];
         let body = make_binary_logits_request(&residual);
+        assert_eq!(parse_binary_logits_request(&body).unwrap(), residual);
         for (i, chunk) in body.chunks_exact(4).enumerate() {
             let got = f32::from_le_bytes(chunk.try_into().unwrap());
             assert!((got - residual[i]).abs() < 1e-6);
@@ -667,6 +685,29 @@ mod tests {
         // A body of 5 bytes is not a multiple of 4.
         let body = [0u8; 5];
         assert_ne!(body.len() % 4, 0, "5 bytes must fail the alignment check");
+        assert!(matches!(
+            parse_binary_logits_request(&body),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn binary_embed_rejects_short_header() {
+        assert!(matches!(
+            parse_binary_embed_request(&[0, 1, 2]),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn binary_embed_rejects_truncated_token_ids() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        assert!(matches!(
+            parse_binary_embed_request(&body),
+            Err(ServerError::BadRequest(_))
+        ));
     }
 
     // ── Token decode query parsing ───────────────────────────────────────────

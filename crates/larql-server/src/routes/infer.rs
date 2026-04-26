@@ -28,6 +28,29 @@ fn default_mode() -> String {
     INFER_MODE_WALK.into()
 }
 
+fn round_probability(prob: f64) -> f64 {
+    (prob * 10000.0).round() / 10000.0
+}
+
+fn format_predictions(predictions: &[(String, f64)]) -> Vec<serde_json::Value> {
+    predictions
+        .iter()
+        .map(|(tok, prob)| {
+            serde_json::json!({
+                "token": tok,
+                "probability": round_probability(*prob),
+            })
+        })
+        .collect()
+}
+
+fn infer_mode_flags(mode: &str) -> (bool, bool, bool) {
+    let is_compare = mode == INFER_MODE_COMPARE;
+    let use_walk = mode == INFER_MODE_WALK || is_compare;
+    let use_dense = mode == INFER_MODE_DENSE || is_compare;
+    (is_compare, use_walk, use_dense)
+}
+
 fn run_infer(
     state: &AppState,
     model: &LoadedModel,
@@ -65,9 +88,7 @@ fn run_infer(
 
     let start = std::time::Instant::now();
 
-    let is_compare = req.mode == INFER_MODE_COMPARE;
-    let use_walk = req.mode == INFER_MODE_WALK || is_compare;
-    let use_dense = req.mode == INFER_MODE_DENSE || is_compare;
+    let (is_compare, use_walk, use_dense) = infer_mode_flags(&req.mode);
 
     let mut result = serde_json::Map::new();
     result.insert("prompt".into(), serde_json::json!(req.prompt));
@@ -103,16 +124,7 @@ fn run_infer(
             run_walk(&patched)
         };
 
-        let predictions: Vec<serde_json::Value> = pred
-            .predictions
-            .iter()
-            .map(|(tok, prob)| {
-                serde_json::json!({
-                    "token": tok,
-                    "probability": (*prob * 10000.0).round() / 10000.0,
-                })
-            })
-            .collect();
+        let predictions = format_predictions(&pred.predictions);
 
         if is_compare {
             result.insert(INFER_MODE_WALK.into(), serde_json::json!(predictions));
@@ -131,16 +143,7 @@ fn run_infer(
         let pred = larql_inference::predict(weights, &model.tokenizer, &token_ids, req.top);
         let dense_ms = dense_start.elapsed().as_secs_f64() * 1000.0;
 
-        let predictions: Vec<serde_json::Value> = pred
-            .predictions
-            .iter()
-            .map(|(tok, prob)| {
-                serde_json::json!({
-                    "token": tok,
-                    "probability": (*prob * 10000.0).round() / 10000.0,
-                })
-            })
-            .collect();
+        let predictions = format_predictions(&pred.predictions);
 
         if is_compare {
             result.insert(INFER_MODE_DENSE.into(), serde_json::json!(predictions));
@@ -190,4 +193,60 @@ pub async fn handle_infer_multi(
             .await
             .map_err(|e| ServerError::Internal(e.to_string()))??;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_defaults_match_api_contract() {
+        assert_eq!(default_top(), 5);
+        assert_eq!(default_mode(), INFER_MODE_WALK);
+    }
+
+    #[test]
+    fn infer_request_deserializes_defaults() {
+        let req: InferRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "The capital of France is"
+        }))
+        .unwrap();
+        assert_eq!(req.prompt, "The capital of France is");
+        assert_eq!(req.top, 5);
+        assert_eq!(req.mode, INFER_MODE_WALK);
+    }
+
+    #[test]
+    fn infer_request_accepts_dense_and_compare_modes() {
+        let dense: InferRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "x",
+            "top": 2,
+            "mode": "dense"
+        }))
+        .unwrap();
+        assert_eq!(dense.top, 2);
+        assert_eq!(dense.mode, INFER_MODE_DENSE);
+
+        let compare: InferRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "x",
+            "mode": "compare"
+        }))
+        .unwrap();
+        assert_eq!(compare.mode, INFER_MODE_COMPARE);
+    }
+
+    #[test]
+    fn infer_mode_flags_select_expected_paths() {
+        assert_eq!(infer_mode_flags(INFER_MODE_WALK), (false, true, false));
+        assert_eq!(infer_mode_flags(INFER_MODE_DENSE), (false, false, true));
+        assert_eq!(infer_mode_flags(INFER_MODE_COMPARE), (true, true, true));
+        assert_eq!(infer_mode_flags("unknown"), (false, false, false));
+    }
+
+    #[test]
+    fn format_predictions_rounds_probability() {
+        let predictions = format_predictions(&[("Paris".into(), 0.123456)]);
+        assert_eq!(predictions[0]["token"], "Paris");
+        assert_eq!(predictions[0]["probability"], 0.1235);
+    }
 }

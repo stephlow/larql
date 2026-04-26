@@ -30,6 +30,55 @@ const WS_TYPE_INFER_DONE: &str = "infer_done";
 const WS_CMD_DESCRIBE: &str = "describe";
 const WS_CMD_INFER: &str = "infer";
 
+fn ws_error(message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({"type": WS_TYPE_ERROR, "message": message.into()})
+}
+
+fn ws_layer(layer: usize, edges: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "type": WS_TYPE_LAYER,
+        "layer": layer,
+        "edges": edges,
+    })
+}
+
+fn ws_done(entity: impl Into<String>, total_edges: usize, latency_ms: f64) -> serde_json::Value {
+    serde_json::json!({
+        "type": WS_TYPE_DONE,
+        "entity": entity.into(),
+        "total_edges": total_edges,
+        "latency_ms": latency_ms,
+    })
+}
+
+fn ws_empty_done() -> serde_json::Value {
+    serde_json::json!({"type": WS_TYPE_DONE, "total_edges": 0, "latency_ms": 0})
+}
+
+fn ws_prediction(rank: usize, token: &str, prob: f64) -> serde_json::Value {
+    serde_json::json!({
+        "type": WS_TYPE_PREDICTION,
+        "rank": rank,
+        "token": token,
+        "probability": (prob * 10000.0).round() / 10000.0,
+    })
+}
+
+fn ws_infer_done(
+    prompt: impl Into<String>,
+    mode: impl Into<String>,
+    predictions: usize,
+    latency_ms: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": WS_TYPE_INFER_DONE,
+        "prompt": prompt.into(),
+        "mode": mode.into(),
+        "predictions": predictions,
+        "latency_ms": latency_ms,
+    })
+}
+
 pub async fn handle_stream(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -46,11 +95,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             Ok(v) => v,
             Err(e) => {
                 let _ = socket
-                    .send(Message::Text(
-                        serde_json::json!({"type": WS_TYPE_ERROR, "message": e.to_string()})
-                            .to_string()
-                            .into(),
-                    ))
+                    .send(Message::Text(ws_error(e.to_string()).to_string().into()))
                     .await;
                 continue;
             }
@@ -67,11 +112,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             _ => {
                 let _ = socket
                     .send(Message::Text(
-                        serde_json::json!({
-                            "type": WS_TYPE_ERROR,
-                            "message": format!("unknown message type: {msg_type}. Supported: describe, infer")
-                        })
-                        .to_string().into(),
+                        ws_error(format!(
+                            "unknown message type: {msg_type}. Supported: describe, infer"
+                        ))
+                        .to_string()
+                        .into(),
                     ))
                     .await;
             }
@@ -84,32 +129,29 @@ async fn handle_stream_describe(
     state: &Arc<AppState>,
     request: &serde_json::Value,
 ) {
-    let entity = match request["entity"].as_str() {
-        Some(e) => e.to_string(),
-        None => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "missing entity"})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
+    for msg in stream_describe_messages(state, request).await {
+        if socket
+            .send(Message::Text(msg.to_string().into()))
+            .await
+            .is_err()
+        {
             return;
         }
+    }
+}
+
+async fn stream_describe_messages(
+    state: &AppState,
+    request: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let entity = match request["entity"].as_str() {
+        Some(e) => e.to_string(),
+        None => return vec![ws_error("missing entity")],
     };
 
     let model = match state.model(None) {
         Some(m) => Arc::clone(m),
-        None => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "no model loaded"})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            return;
-        }
+        None => return vec![ws_error("no model loaded")],
     };
 
     let band = request["band"].as_str().unwrap_or("all");
@@ -119,27 +161,11 @@ async fn handle_stream_describe(
 
     let encoding = match model.tokenizer.encode(entity.as_str(), false) {
         Ok(e) => e,
-        Err(e) => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e.to_string()})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            return;
-        }
+        Err(e) => return vec![ws_error(e.to_string())],
     };
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     if token_ids.is_empty() {
-        let _ = socket
-            .send(Message::Text(
-                serde_json::json!({"type": WS_TYPE_DONE, "total_edges": 0, "latency_ms": 0})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        return;
+        return vec![ws_empty_done()];
     }
 
     let hidden = model.embeddings.shape()[1];
@@ -169,6 +195,7 @@ async fn handle_stream_describe(
 
     let entity_lower = entity.to_lowercase();
     let mut total_edges = 0;
+    let mut messages = Vec::new();
 
     // Stream layer by layer.
     for &layer in &scan_layers {
@@ -199,30 +226,11 @@ async fn handle_stream_describe(
 
         total_edges += edges.len();
 
-        let msg = serde_json::json!({
-            "type": WS_TYPE_LAYER,
-            "layer": layer,
-            "edges": edges,
-        });
-
-        if socket
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            return; // Client disconnected.
-        }
+        messages.push(ws_layer(layer, edges));
     }
 
-    let done_msg = serde_json::json!({
-        "type": WS_TYPE_DONE,
-        "entity": entity,
-        "total_edges": total_edges,
-        "latency_ms": elapsed_ms(start),
-    });
-    let _ = socket
-        .send(Message::Text(done_msg.to_string().into()))
-        .await;
+    messages.push(ws_done(entity, total_edges, elapsed_ms(start)));
+    messages
 }
 
 /// Handle streaming INFER: run forward pass and stream top-K predictions.
@@ -242,7 +250,7 @@ async fn handle_stream_infer(
         _ => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "missing or empty prompt"}).to_string().into(),
+                    ws_error("missing or empty prompt").to_string().into(),
                 ))
                 .await;
             return;
@@ -254,9 +262,7 @@ async fn handle_stream_infer(
         None => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "no model loaded"})
-                        .to_string()
-                        .into(),
+                    ws_error("no model loaded").to_string().into(),
                 ))
                 .await;
             return;
@@ -266,7 +272,9 @@ async fn handle_stream_infer(
     if model.infer_disabled {
         let _ = socket
             .send(Message::Text(
-                serde_json::json!({"type": WS_TYPE_ERROR, "message": "inference disabled (--no-infer)"}).to_string().into(),
+                ws_error("inference disabled (--no-infer)")
+                    .to_string()
+                    .into(),
             ))
             .await;
         return;
@@ -276,11 +284,7 @@ async fn handle_stream_infer(
         Ok(w) => w,
         Err(e) => {
             let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e})
-                        .to_string()
-                        .into(),
-                ))
+                .send(Message::Text(ws_error(e).to_string().into()))
                 .await;
             return;
         }
@@ -295,11 +299,7 @@ async fn handle_stream_infer(
         Ok(e) => e,
         Err(e) => {
             let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e.to_string()})
-                        .to_string()
-                        .into(),
-                ))
+                .send(Message::Text(ws_error(e.to_string()).to_string().into()))
                 .await;
             return;
         }
@@ -308,7 +308,7 @@ async fn handle_stream_infer(
     if token_ids.is_empty() {
         let _ = socket
             .send(Message::Text(
-                serde_json::json!({"type": "error", "message": "empty prompt after tokenization"})
+                ws_error("empty prompt after tokenization")
                     .to_string()
                     .into(),
             ))
@@ -335,12 +335,7 @@ async fn handle_stream_infer(
 
     // Stream each prediction.
     for (rank, (token, prob)) in predictions.iter().enumerate() {
-        let msg = serde_json::json!({
-            "type": WS_TYPE_PREDICTION,
-            "rank": rank + 1,
-            "token": token,
-            "probability": (*prob * 10000.0).round() / 10000.0,
-        });
+        let msg = ws_prediction(rank + 1, token, *prob);
         if socket
             .send(Message::Text(msg.to_string().into()))
             .await
@@ -350,14 +345,221 @@ async fn handle_stream_infer(
         }
     }
 
-    let done_msg = serde_json::json!({
-        "type": WS_TYPE_INFER_DONE,
-        "prompt": prompt,
-        "mode": mode,
-        "predictions": predictions.len(),
-        "latency_ms": elapsed_ms(start),
-    });
+    let done_msg = ws_infer_done(prompt, mode, predictions.len(), elapsed_ms(start));
     let _ = socket
         .send(Message::Text(done_msg.to_string().into()))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+
+    use larql_vindex::ndarray::Array2;
+    use larql_vindex::{
+        ExtractLevel, FeatureMeta, LayerBands, PatchedVindex, QuantFormat, VectorIndex,
+        VindexConfig, VindexLayerInfo,
+    };
+    use tokio::sync::RwLock;
+
+    use crate::cache::DescribeCache;
+    use crate::ffn_l2_cache::FfnL2Cache;
+    use crate::session::SessionManager;
+    use crate::state::LoadedModel;
+
+    #[test]
+    fn websocket_error_shape_is_stable() {
+        let msg = ws_error("bad input");
+        assert_eq!(msg["type"], WS_TYPE_ERROR);
+        assert_eq!(msg["message"], "bad input");
+    }
+
+    #[test]
+    fn websocket_layer_shape_includes_edges() {
+        let msg = ws_layer(
+            7,
+            vec![serde_json::json!({
+                "target": "Paris",
+                "gate_score": 9.1,
+                "feature": 3,
+            })],
+        );
+        assert_eq!(msg["type"], WS_TYPE_LAYER);
+        assert_eq!(msg["layer"], 7);
+        assert_eq!(msg["edges"][0]["target"], "Paris");
+    }
+
+    #[test]
+    fn websocket_done_shapes_are_stable() {
+        let empty = ws_empty_done();
+        assert_eq!(empty["type"], WS_TYPE_DONE);
+        assert_eq!(empty["total_edges"], 0);
+
+        let done = ws_done("France", 2, 1.25);
+        assert_eq!(done["type"], WS_TYPE_DONE);
+        assert_eq!(done["entity"], "France");
+        assert_eq!(done["total_edges"], 2);
+        assert_eq!(done["latency_ms"], 1.25);
+    }
+
+    #[test]
+    fn websocket_prediction_rounds_probability() {
+        let msg = ws_prediction(2, "Paris", 0.123456);
+        assert_eq!(msg["type"], WS_TYPE_PREDICTION);
+        assert_eq!(msg["rank"], 2);
+        assert_eq!(msg["token"], "Paris");
+        assert_eq!(msg["probability"], 0.1235);
+    }
+
+    #[test]
+    fn websocket_infer_done_shape_is_stable() {
+        let msg = ws_infer_done("prompt", "walk", 3, 4.5);
+        assert_eq!(msg["type"], WS_TYPE_INFER_DONE);
+        assert_eq!(msg["prompt"], "prompt");
+        assert_eq!(msg["mode"], "walk");
+        assert_eq!(msg["predictions"], 3);
+        assert_eq!(msg["latency_ms"], 4.5);
+    }
+
+    fn functional_tokenizer() -> larql_vindex::tokenizers::Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"France":0,"Germany":1,"capital":2,"UNK":7},"unk_token":"UNK"}}"#;
+        larql_vindex::tokenizers::Tokenizer::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    fn test_model(labels: HashMap<(usize, usize), String>) -> Arc<LoadedModel> {
+        let mut gate = Array2::<f32>::zeros((3, 4));
+        gate[[0, 0]] = 10.0;
+        gate[[1, 1]] = 10.0;
+        gate[[2, 2]] = 1.0;
+        let meta = vec![
+            Some(FeatureMeta {
+                top_token: "Paris".into(),
+                top_token_id: 10,
+                c_score: 0.9,
+                top_k: vec![],
+            }),
+            Some(FeatureMeta {
+                top_token: "French".into(),
+                top_token_id: 11,
+                c_score: 0.8,
+                top_k: vec![],
+            }),
+            Some(FeatureMeta {
+                top_token: "x".into(),
+                top_token_id: 12,
+                c_score: 0.1,
+                top_k: vec![],
+            }),
+        ];
+        let mut embeddings = Array2::<f32>::zeros((8, 4));
+        embeddings[[0, 0]] = 1.0;
+        embeddings[[1, 1]] = 1.0;
+        let config = VindexConfig {
+            version: 2,
+            model: "test/model".into(),
+            family: "test".into(),
+            source: None,
+            checksums: None,
+            num_layers: 1,
+            hidden_size: 4,
+            intermediate_size: 3,
+            vocab_size: 8,
+            embed_scale: 1.0,
+            extract_level: ExtractLevel::Browse,
+            dtype: larql_vindex::StorageDtype::default(),
+            quant: QuantFormat::None,
+            layer_bands: Some(LayerBands {
+                syntax: (0, 0),
+                knowledge: (0, 0),
+                output: (0, 0),
+            }),
+            layers: vec![VindexLayerInfo {
+                layer: 0,
+                num_features: 3,
+                offset: 0,
+                length: 48,
+                num_experts: None,
+                num_features_per_expert: None,
+            }],
+            down_top_k: 5,
+            has_model_weights: false,
+            model_config: None,
+            fp4: None,
+            ffn_layout: None,
+        };
+        Arc::new(LoadedModel {
+            id: "model".into(),
+            path: std::path::PathBuf::from("/nonexistent"),
+            config,
+            patched: RwLock::new(PatchedVindex::new(VectorIndex::new(
+                vec![Some(gate)],
+                vec![Some(meta)],
+                1,
+                4,
+            ))),
+            embeddings,
+            embed_scale: 1.0,
+            tokenizer: functional_tokenizer(),
+            infer_disabled: true,
+            ffn_only: false,
+            embed_only: false,
+            embed_store: None,
+            release_mmap_after_request: false,
+            weights: std::sync::OnceLock::new(),
+            probe_labels: labels,
+            ffn_l2_cache: FfnL2Cache::new(1),
+            expert_filter: None,
+        })
+    }
+
+    fn test_state(models: Vec<Arc<LoadedModel>>) -> Arc<AppState> {
+        Arc::new(AppState {
+            models,
+            started_at: std::time::Instant::now(),
+            requests_served: AtomicU64::new(0),
+            api_key: None,
+            sessions: SessionManager::new(3600),
+            describe_cache: DescribeCache::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn stream_describe_messages_reports_missing_entity() {
+        let state = test_state(vec![test_model(HashMap::new())]);
+        let messages = stream_describe_messages(&state, &serde_json::json!({})).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["type"], WS_TYPE_ERROR);
+        assert_eq!(messages[0]["message"], "missing entity");
+    }
+
+    #[tokio::test]
+    async fn stream_describe_messages_reports_no_model() {
+        let state = test_state(vec![]);
+        let messages =
+            stream_describe_messages(&state, &serde_json::json!({"entity": "France"})).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["type"], WS_TYPE_ERROR);
+        assert_eq!(messages[0]["message"], "no model loaded");
+    }
+
+    #[tokio::test]
+    async fn stream_describe_messages_builds_layer_and_done_messages() {
+        let mut labels = HashMap::new();
+        labels.insert((0, 0), "capital".into());
+        let state = test_state(vec![test_model(labels)]);
+        let messages =
+            stream_describe_messages(&state, &serde_json::json!({"entity": "France"})).await;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"], WS_TYPE_LAYER);
+        assert_eq!(messages[0]["layer"], 0);
+        assert_eq!(messages[0]["edges"][0]["target"], "Paris");
+        assert_eq!(messages[0]["edges"][0]["relation"], "capital");
+        assert_eq!(messages[0]["edges"][0]["source"], PROBE_RELATION_SOURCE);
+        assert_eq!(messages[1]["type"], WS_TYPE_DONE);
+        assert_eq!(messages[1]["entity"], "France");
+        assert_eq!(messages[1]["total_edges"], 1);
+    }
 }

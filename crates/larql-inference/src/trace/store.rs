@@ -442,8 +442,6 @@ mod tests {
     #[test]
     fn open_bad_magic_returns_error() {
         let path = std::env::temp_dir().join("larql_trace_test_bad_magic.trac");
-        std::fs::write(&path, b"XXXX" + &[0u8; 60][..]).ok();
-        // Actually write a proper 64-byte file with wrong magic
         let mut bytes = [0u8; 64];
         bytes[0..4].copy_from_slice(b"XXXX");
         std::fs::write(&path, &bytes).expect("write");

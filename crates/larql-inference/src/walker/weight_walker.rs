@@ -359,3 +359,42 @@ pub fn walk_model(
 
     Ok(results)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ThresholdCounts ───────────────────────────────────────────────────────
+
+    #[test]
+    fn threshold_counts_default_all_zero() {
+        let t = ThresholdCounts::default();
+        assert_eq!(t.t_01, 0);
+        assert_eq!(t.t_05, 0);
+        assert_eq!(t.t_10, 0);
+        assert_eq!(t.t_25, 0);
+        assert_eq!(t.t_50, 0);
+        assert_eq!(t.t_75, 0);
+        assert_eq!(t.t_90, 0);
+    }
+
+    // ── WalkConfig ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_config_default_values() {
+        let c = WalkConfig::default();
+        assert_eq!(c.top_k, 5);
+        assert!((c.min_score - 0.02).abs() < 1e-6);
+    }
+
+    // ── LayerStats ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn layer_stats_default_zero() {
+        let s = LayerStats::default();
+        assert_eq!(s.self_loop_count, 0);
+        assert_eq!(s.self_loop_pct, 0.0);
+        assert!(s.top_subjects.is_empty());
+        assert!(s.top_objects.is_empty());
+    }
+}

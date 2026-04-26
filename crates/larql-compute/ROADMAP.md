@@ -8,6 +8,8 @@
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
 | **Ollama** gemma3:4b | **98–103** | ~10ms | reference (same hardware, same prompt) |
 | **Gap** | LARQL is **~1.30×** slower | ~3ms/tok | per-stage decomposition below |
+| **LARQL Metal** (gemma4-26B-A4B, MoE Q4K GPU dispatch) | **5.1** | ~194ms | Phase 1 shipped; Phase 2 open — see P0 below |
+| **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; expert dispatch accounts for ~179ms gap |
 
 Per-stage (100-token run, 8 warmup, typical):
 
@@ -46,6 +48,62 @@ convention); the q4_KF fast-path doesn't apply to those.
 ## P0: Production gap closers
 
 Remaining gap: **~1.30×** (~77 vs ~100 tok/s, ~3ms/tok).
+
+### Fresh benchmark check (2026-04-26)
+
+Command:
+
+```
+target/release/larql bench output/gemma3-4b-q4k-v2.vindex \
+  --backends metal --tokens 50 --warmup 15 --profile --verbose
+```
+
+Observed on the current tree: **70.5 tok/s** (14.19ms/tok), below the
+75-79 tok/s target. A longer non-EOS prompt measured **68.4 tok/s**
+(14.62ms/tok). The all-Q4_K down comparison measured **71.5 tok/s**
+(13.98ms/tok), so the regression is not isolated to Q6_K down.
+
+Current stage split:
+
+- GPU fwd: 12.3-12.7ms/tok
+- lm_head: 2.1-2.2ms/tok
+- embed/final_norm/detok: negligible
+
+Action: re-baseline with a stable non-EOS prompt and compare against the
+pre-fix commit. If the 75-79 number was collected on the same hardware,
+focus on shared dense-path overhead first (lm_head and full decode
+dispatch), not only Q6_K.
+
+### P0 correctness blockers found in review (2026-04-26)
+
+These must stay ahead of additional perf work because they affect
+production-routed paths or hide regressions:
+
+1. **Mixed Q4_K/Q6_K QKV fused V path is wrong.**
+   `cargo test -p larql-compute --features metal` fails
+   `q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj` with the
+   Q6_K V output differing by ~147. The non-normed
+   `q4k_q6k_qkv_proj_matches_per_proj_dispatch` also fails V parity.
+   Root issue: the dedicated fused-QKV shader's V branch drifted from
+   the standalone `q6k_matvec` implementation. This is production-routed
+   for Gemma 3/4 Ollama-convention layers (`Q4_K` Q/K + `Q6_K` V), so
+   fix before treating QKV fusion as a closed dispatch win.
+2. **Q4_K MoE GPU dispatch does not pad activation scratch.**
+   `gpu_moe_dispatch` dispatches expert down with `K = inter_padded`
+   but allocates/offsets activation scratch with `inter`. For MoE
+   intermediate sizes that are not multiples of 256, the down projection
+   can read past an expert's activation slice or into the next expert's
+   slice. Allocate `top_k * inter_padded * 4`, zero-fill the padded tail,
+   and offset per expert by `inter_padded`.
+3. **CPU-only test target is broken.**
+   `cargo test -p larql-compute` currently compiles Metal-only integration
+   tests without `--features metal`. Gate kernel test files with
+   `#![cfg(feature = "metal")]` and keep CPU/MoE unit coverage available
+   without Metal so Linux/Windows baseline work is not blocked.
+4. **MoE GPU parity coverage is too thin.**
+   Existing MoE tests cover CPU routing and prefill shape/finite smoke
+   tests, but not `gpu_moe_dispatch` parity for Q4_K experts, padded
+   intermediates, missing expert slices, or `valid_count < top_k`.
 
 | Source | Gap | Status |
 |---|---|---|
@@ -515,6 +573,46 @@ the GPU command buffer after that layer's dense FFN, calls the closure
 weight cache utilisation. GPU layer_scalar skipped for MoE layers in the
 dispatch; the callback applies it correctly after combining dense + MoE.
 `kv_copy::populate_kv_one_layer` added for per-layer KV cache population.
+
+### GPU expert dispatch — Phase 2: pre-allocated staging buffers (open)
+
+**Status**: Open — the single remaining fix to reach ~15–20 tok/s on Gemma 4 26B A4B  
+**Measured**: Phase 1 shipped 5.1 tok/s. Phase 2 expected ~4× gain. GPU-only ceiling: 56.8 tok/s.
+
+**Root cause of remaining gap.** `gpu_moe_dispatch` calls `self.bufs.output()` ~10 times per
+MoE layer to allocate gate, up, per-expert-down, activation, and output Metal buffers.
+With 30 MoE layers × ~10 allocations = 300 Metal buffer allocations per decode token,
+each allocation of a 1–9 MB `StorageModeShared` buffer costs ~0.4ms on M3 Max.
+**Total: ~120ms/token in allocation overhead** (measured: 194ms total − ~40ms compute − ~30ms syncs).
+
+There is also avoidable host-copy churn before those Metal allocations:
+`larql-inference::layer_graph::generate::gpu` calls
+`weights.get_layer_entry_bytes(...)?` and immediately `to_vec()`s both
+expert slices before `gpu_moe_dispatch` copies them into Metal staging.
+For Gemma 4 26B A4B, this is 30 layers × top_k=8 × roughly 2.2MB of
+heap copies per decode token. Phase 2 should change the API to pass
+borrowed mmap slices (`&[u8]`) through the closure and copy exactly once
+into reusable Metal buffers.
+
+**Fix.** Pre-allocate all staging buffers once before the layer loop in
+`decode_token_q4k_moe` (in `metal/moe_dispatch.rs`), identical to the pattern that
+eliminated 550→20 allocations in `decode_token_with_moe_fn` (see ship log below):
+
+```
+Pre-allocated once:
+  gate_buf:     [top_k × inter × row_bytes]  (gate Q4K staging)
+  up_buf:       [top_k × inter × row_bytes]  (up Q4K staging)
+  down_bufs:    [top_k] × [hidden × down_row_bytes]  (per-expert down Q4K staging)
+  act_buf:      [top_k × inter × 4]  (f32 activations after GELU)
+  expert_outs:  [top_k × hidden × 4]  (f32 expert outputs)
+```
+
+Sizes are constant per model (determined by `moe.intermediate_size`, `moe.top_k`,
+`hidden`). The pre-allocated buffers are reused for all 30 layers via write-in-place
+to `buffer.contents()` pointers.
+
+**Effort**: ~1 session. No new shaders needed — just restructure the buffer lifecycle
+in `decode_token_q4k_moe`.
 
 ### Fix `dispatch_full_pipeline` layer_scalar
 **Effort**: Low

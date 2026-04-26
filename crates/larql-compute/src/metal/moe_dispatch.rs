@@ -74,9 +74,18 @@ impl MetalBackend {
         };
 
         Some(MetalBackend::decode_token_with_moe_fn(
-            self, kv, layers, x,
-            hidden, inter, q_dim, kv_dim,
-            num_q_heads, num_kv_heads, head_dim, rope_base,
+            self,
+            kv,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
             Some(&mut moe_fn),
         ))
     }
@@ -94,16 +103,19 @@ impl MetalBackend {
         eps: f32,
         get_expert_bytes: &dyn Fn(usize) -> Option<(Vec<u8>, Vec<u8>)>,
     ) -> Vec<f32> {
-        let hidden   = h_post_attn.len();
-        let inter    = moe.intermediate_size;
+        let hidden = h_post_attn.len();
+        let inter = moe.intermediate_size;
         let inter_padded = inter.div_ceil(256) * 256;
-        let top_k    = moe.top_k;
+        let top_k = moe.top_k;
 
         // ── 1. CPU router ──────────────────────────────────────────────────
         let h_norm = if !moe.pre_experts_norm.is_empty() {
-            let rms = (h_post_attn.iter().map(|v| v*v).sum::<f32>() / hidden as f32 + eps).sqrt();
-            h_post_attn.iter().zip(moe.pre_experts_norm)
-                .map(|(x, w)| x / rms * (w + 0.0)).collect::<Vec<f32>>()
+            let rms = (h_post_attn.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
+            h_post_attn
+                .iter()
+                .zip(moe.pre_experts_norm)
+                .map(|(x, w)| x / rms * (w + 0.0))
+                .collect::<Vec<f32>>()
         } else {
             h_post_attn.to_vec()
         };
@@ -111,26 +123,30 @@ impl MetalBackend {
 
         // ── 2. Pre-allocate Metal staging buffers, write expert bytes directly ──
         // Q4_K: bytes per row = (hidden / 256) * 144.
-        let row_bytes      = (hidden / 256) * 144;
-        let gate_half_bytes = inter * row_bytes;      // bytes for gate rows of one expert
-        let up_half_bytes   = inter * row_bytes;      // bytes for up rows of one expert
-        let down_row_bytes  = (inter_padded / 256) * 144; // Q4_K down: cols = inter_padded
-        let down_expert_bytes = hidden * down_row_bytes;   // one expert's down matrix
+        let row_bytes = (hidden / 256) * 144;
+        let gate_half_bytes = inter * row_bytes; // bytes for gate rows of one expert
+        let up_half_bytes = inter * row_bytes; // bytes for up rows of one expert
+        let down_row_bytes = (inter_padded / 256) * 144; // Q4_K down: cols = inter_padded
+        let down_expert_bytes = hidden * down_row_bytes; // one expert's down matrix
 
         // Allocate shared-memory Metal buffers — write CPU→GPU via contents() ptr.
         let gate_buf = self.bufs.output((top_k * gate_half_bytes) as u64);
-        let up_buf   = self.bufs.output((top_k * up_half_bytes)   as u64);
+        let up_buf = self.bufs.output((top_k * up_half_bytes) as u64);
         let gate_ptr = gate_buf.contents() as *mut u8;
-        let up_ptr   = up_buf.contents()   as *mut u8;
+        let up_ptr = up_buf.contents() as *mut u8;
 
         let mut down_bufs: Vec<Buffer> = Vec::with_capacity(top_k);
         let mut valid_weights: Vec<f32> = Vec::with_capacity(top_k);
         let mut valid_count = 0usize;
 
         for (k, &ei) in expert_indices.iter().enumerate() {
-            let Some((gu_bytes, dn_bytes)) = get_expert_bytes(ei) else { continue };
+            let Some((gu_bytes, dn_bytes)) = get_expert_bytes(ei) else {
+                continue;
+            };
             let half = gate_half_bytes;
-            if gu_bytes.len() < 2 * half { continue; }
+            if gu_bytes.len() < 2 * half {
+                continue;
+            }
 
             // Write gate and up directly into pre-allocated Metal buffer.
             // SAFETY: gate_ptr/up_ptr point to Metal shared memory (MTLResourceOptions::StorageModeShared).
@@ -162,13 +178,15 @@ impl MetalBackend {
             valid_count += 1;
         }
 
-        if valid_count == 0 { return vec![0.0f32; hidden]; }
+        if valid_count == 0 {
+            return vec![0.0f32; hidden];
+        }
 
         // ── 3. GPU: q4k_ffn_gate_up for all valid_count experts ──────────
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
 
-        let x_buf  = self.bufs.transient_from_f32(&h_norm);
+        let x_buf = self.bufs.transient_from_f32(&h_norm);
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
         let tgs = (valid_count as u64 * inter as u64)
@@ -179,10 +197,10 @@ impl MetalBackend {
 
         enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
         enc.set_buffer(0, Some(&gate_buf), 0);
-        enc.set_buffer(1, Some(&up_buf),   0);
-        enc.set_buffer(2, Some(&x_buf),    0);
-        enc.set_buffer(3, Some(&g_out),    0);
-        enc.set_buffer(4, Some(&u_out),    0);
+        enc.set_buffer(1, Some(&up_buf), 0);
+        enc.set_buffer(2, Some(&x_buf), 0);
+        enc.set_buffer(3, Some(&g_out), 0);
+        enc.set_buffer(4, Some(&u_out), 0);
         enc.set_bytes(5, 4, &n_rows as *const u32 as *const c_void);
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
@@ -192,10 +210,11 @@ impl MetalBackend {
 
         // ── 4. GPU: GELU-tanh activation ─────────────────────────────────
         let act_len = (valid_count * inter) as u32;
-        let act_buf = self.bufs.output((valid_count * inter * 4) as u64);
+        let act_stride = inter_padded;
+        let act_buf = self.bufs.output((valid_count * act_stride * 4) as u64);
         enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
-        enc.set_buffer(0, Some(&g_out),   0);
-        enc.set_buffer(1, Some(&u_out),   0);
+        enc.set_buffer(0, Some(&g_out), 0);
+        enc.set_buffer(1, Some(&u_out), 0);
         enc.set_buffer(2, Some(&act_buf), 0);
         enc.set_bytes(3, 4, &act_len as *const u32 as *const c_void);
         enc.dispatch_threads(
@@ -204,24 +223,24 @@ impl MetalBackend {
         );
 
         // ── 5–6. GPU: down projection per expert ─────────────────────────
-        // Each expert e uses act[e*inter..(e+1)*inter] as input and produces
-        // expert_outs[e*hidden..(e+1)*hidden]. Inter may be padded to inter_padded;
-        // the activation bytes beyond `inter` are zero-padded in the buffer.
+        // Each expert e uses act[e*inter_padded..e*inter_padded+inter] as input
+        // and produces expert_outs[e*hidden..(e+1)*hidden]. The activation bytes
+        // beyond `inter` stay zero from `bufs.output`, so padded Q4_K down rows
+        // contribute nothing.
         let n_out = hidden as u32;
-        let k_in  = inter_padded as u32;
-        let down_tgs = (hidden as u64)
-            .div_ceil(crate::metal::shaders::q4k_matvec::ROWS_PER_TG);
+        let k_in = inter_padded as u32;
+        let down_tgs = (hidden as u64).div_ceil(crate::metal::shaders::q4k_matvec::ROWS_PER_TG);
         let expert_outs = self.bufs.output((valid_count * hidden * 4) as u64);
 
         for e in 0..valid_count {
-            let act_offset = (e * inter * 4) as u64;
+            let act_offset = (e * act_stride * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
             enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(&down_bufs[e]), 0);
             enc.set_buffer(1, Some(&act_buf), act_offset);
             enc.set_buffer(2, Some(&expert_outs), out_offset);
             enc.set_bytes(3, 4, &n_out as *const u32 as *const c_void);
-            enc.set_bytes(4, 4, &k_in  as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &k_in as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(down_tgs, 1, 1),
                 MTLSize::new(crate::metal::shaders::q4k_matvec::THREADS_PER_TG, 1, 1),
@@ -244,7 +263,7 @@ impl MetalBackend {
 
         // Post-experts norm (Gemma 4 `post_feedforward_layernorm_2`).
         if !moe.post_experts_norm.is_empty() {
-            let rms = (moe_out.iter().map(|v| v*v).sum::<f32>() / hidden as f32 + eps).sqrt();
+            let rms = (moe_out.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
             for (v, &w) in moe_out.iter_mut().zip(moe.post_experts_norm) {
                 *v = *v / rms * (w + 0.0);
             }

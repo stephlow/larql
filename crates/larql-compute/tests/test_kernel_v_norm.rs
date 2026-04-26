@@ -1,3 +1,5 @@
+#![cfg(feature = "metal")]
+
 //! Per-kernel tests for `v_norm_batched` — the parameter-free RMSNorm
 //! used by Gemma 4's V-projection inside KV-cached decode.
 //!

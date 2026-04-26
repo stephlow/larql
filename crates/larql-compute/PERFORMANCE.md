@@ -30,26 +30,45 @@ Per-stage (100-token run, 8 warmup):
 | Q4_K float4 dual-sub-block | Gemma 3 4B | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |
 | Batched MoE prefill | Gemma 4 26B A4B | **+35% tok/s, −31% prefill** | 130 → 26 GPU commits for 5-token prompt |
 | Q4_K `sumy` precompute | Gemma 3 4B | neutral (within noise) | Compiler already hoisting; FMA chain unchanged |
+| Per-layer Q4K format + GPU expert dispatch | Gemma 4 26B A4B | **+75% overall (2.9 → 5.1 tok/s)** | Expert FFNs on GPU; see §26B A4B below |
 
 ---
 
 ## Gemma 4 26B A4B — MoE model (2026-04-26)
 
-Machine: M3 Max, 5-token prompt, 15 warmup / 30 measured tokens
-Vindex: `gemma-4-26B-A4B-it.vindex` (26 decoder layers, 128 experts/layer, top-K=2)
+Machine: M3 Max, 5-token prompt, 15 warmup / 30 measured tokens  
+Vindex: `gemma-4-26B-A4B-it.vindex` (30 layers, 128 experts/layer, top-K=8, inter=704, hidden=2816)
 
-| Metric | Before batched prefill | After | Δ |
+### Progress log
+
+| Optimisation | Decode tok/s | GPU fwd | Δ |
 |---|---|---|---|
-| Prefill | 1889ms | 1297ms | **−31%** |
-| Decode GPU fwd | 334ms/tok | 246ms/tok | **−26%** |
-| Decode tok/s | 2.9 | **3.9** | **+35%** |
+| BF16 blob baseline | 2.9 | 334ms | — |
+| Batched MoE prefill | 3.9 | 246ms | +35% |
+| Q4K per-layer format + GPU expert dispatch | **5.1** | **~194ms** | **+75% from baseline** |
+| GPU-only ceiling (`SKIP_MOE=1`) | 56.8 | 15ms | theoretical max |
 
-GPU fwd accounts for 97–99% of decode time on this model (CPU MoE compute
-for 128 experts × 26 layers dominates; attention is fast vs the dense model).
+### Current bottleneck: Metal buffer allocation overhead
 
-**Why the decode also improved:** batching the prefill leaves weight buffers
-and shader pipelines warmer for the first decode step, reducing cold-start
-latency on the per-layer MoE commit loop.
+GPU fwd 194ms breaks down as:
+- Actual GPU compute (30 × attention + dense FFN + 8 expert dispatches): ~40ms
+- 30 MoE layer syncs (commit + wait for h_post_attn routing): ~30ms
+- **Metal buffer allocation: ~120ms** — root cause of remaining gap
+
+Per decode token, `gpu_moe_dispatch` calls `self.bufs.output()` ~10 times per
+layer (gate buf, up buf, 8 down bufs, act buf, outputs buf) = 300 allocations/token.
+Each `MTLResourceOptions::StorageModeShared` allocation of 1–9 MB takes ~0.4ms
+on M3 Max = ~120ms total.
+
+### Phase 2: pre-allocated scratch buffers (open)
+
+Pre-allocate fixed-size staging buffers once before the decode loop in
+`decode_token_q4k_moe`, same pattern as `decode_token`'s scratch buffer
+pre-allocation (which eliminated 550 allocations → 20 for the dense path).
+Sizes are fixed for a given model — known at init time from `moe.intermediate_size`,
+`moe.num_experts`, `moe.top_k`, `hidden`.
+
+Expected result: ~15–20 tok/s (~4× current), closing most of the gap to the GPU ceiling.
 
 ---
 

@@ -23,10 +23,29 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// LRU cache entry: dequantised expert weights.
 pub(super) type ExpertF32 = Arc<Vec<f32>>;
 
-/// Cache key — the byte slice's start pointer is stable across the lifetime
-/// of the mmap, so different experts in the same packed tensor get distinct
-/// keys via their offset. `usize` wrapping the pointer lets the map be Send.
+/// Cache key — in production the byte slice's start pointer is stable across
+/// the lifetime of the mmap, so different experts in the same packed tensor get
+/// distinct keys via their offset. Tests use short heap Vecs whose addresses can
+/// be recycled between cases, so include a content fingerprint under `cfg(test)`.
+#[cfg(not(test))]
 type Key = usize;
+
+#[cfg(test)]
+type Key = (usize, usize, u64);
+
+#[cfg(not(test))]
+fn cache_key(bytes: &[u8]) -> Key {
+    bytes.as_ptr() as usize
+}
+
+#[cfg(test)]
+fn cache_key(bytes: &[u8]) -> Key {
+    use std::hash::{Hash, Hasher};
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    (bytes.as_ptr() as usize, bytes.len(), h.finish())
+}
 
 struct Inner {
     map: std::collections::HashMap<Key, ExpertF32>,
@@ -89,7 +108,7 @@ fn cell() -> &'static Mutex<Inner> {
 /// Return a cached Arc<Vec<f32>> for `bytes` (the BF16 packed expert slice),
 /// dequantising + inserting on miss. On hit, no allocation happens.
 pub(super) fn cached_dequant(bytes: &[u8]) -> ExpertF32 {
-    let key = bytes.as_ptr() as usize;
+    let key = cache_key(bytes);
     // Fast path: read-only hit under the mutex.
     if let Ok(mut inner) = cell().lock() {
         if let Some(hit) = inner.get(key) {

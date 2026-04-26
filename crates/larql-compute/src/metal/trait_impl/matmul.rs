@@ -162,7 +162,6 @@ impl MetalBackend {
         let argmax_tgs = (n as u64).div_ceil(ARGMAX_TG_SZ);
         let partial_vals = self.bufs.output(argmax_tgs * 4); // f32 per TG
         let partial_idxs = self.bufs.output(argmax_tgs * 4); // u32 per TG
-        let argmax_tg_sz_u32 = ARGMAX_TG_SZ as u32;
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();

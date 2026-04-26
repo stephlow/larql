@@ -317,8 +317,7 @@ fn main() {
             if tok.len() < 2 {
                 continue;
             }
-            #[allow(clippy::if_same_then_else)]
-            let comma = if edge_idx > 0 { "" } else { "" };
+            let comma = if edge_idx + 1 < 4 { "," } else { "" };
             if let Some(label) = probe_labels.get(&(*layer, hit.feature)) {
                 println!(
                     "    {{\"relation\": \"{}\", \"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}, \"source\": \"probe\"}}{}",
@@ -385,7 +384,7 @@ fn main() {
     println!("With --rate-limit \"100/min\":");
     println!("  Per-IP token bucket — 100 requests/min burst, 1.67/sec refill");
     println!("  /v1/health is exempt from rate limiting");
-    println!("  X-Forwarded-For respected for proxied clients");
+    println!("  X-Forwarded-For is trusted only with --trust-forwarded-for");
     println!("  Excess requests → 429 Too Many Requests");
 
     // ── 12. BAND FILTERING ──

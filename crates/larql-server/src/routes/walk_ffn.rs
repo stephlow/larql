@@ -799,4 +799,89 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["layer"].as_u64(), Some(0));
     }
+
+    #[test]
+    fn json_full_output_rounds_latency() {
+        let out = FfnOutput {
+            entries: vec![FfnEntry {
+                layer: 3,
+                output: vec![1.0],
+            }],
+            seq_len: 1,
+            latency_ms: 12.34,
+        };
+        let v = encode_json_full_output(&out);
+        assert_eq!(v["latency_ms"], 12.3);
+    }
+
+    #[test]
+    fn collect_scan_layers_prefers_layers_field() {
+        let req = WalkFfnRequest {
+            layer: Some(9),
+            layers: Some(vec![1, 2, 3]),
+            residual: vec![0.0; 4],
+            seq_len: 1,
+            top_k: 10,
+            full_output: false,
+        };
+        assert_eq!(collect_scan_layers(&req).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn collect_scan_layers_requires_layer_or_layers() {
+        let req = WalkFfnRequest {
+            layer: None,
+            layers: None,
+            residual: vec![0.0; 4],
+            seq_len: 1,
+            top_k: 10,
+            full_output: false,
+        };
+        assert!(matches!(
+            collect_scan_layers(&req),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn validate_residual_features_only_ignores_seq_len() {
+        let req = WalkFfnRequest {
+            layer: Some(0),
+            layers: None,
+            residual: vec![0.0; 4],
+            seq_len: 5,
+            top_k: 10,
+            full_output: false,
+        };
+        validate_residual(&req, 4).unwrap();
+    }
+
+    #[test]
+    fn validate_residual_full_output_requires_seq_len_times_hidden() {
+        let req = WalkFfnRequest {
+            layer: Some(0),
+            layers: None,
+            residual: vec![0.0; 8],
+            seq_len: 2,
+            top_k: 10,
+            full_output: true,
+        };
+        validate_residual(&req, 4).unwrap();
+    }
+
+    #[test]
+    fn validate_residual_detects_seq_len_hidden_overflow() {
+        let req = WalkFfnRequest {
+            layer: Some(0),
+            layers: None,
+            residual: vec![],
+            seq_len: usize::MAX,
+            top_k: 10,
+            full_output: true,
+        };
+        assert!(matches!(
+            validate_residual(&req, 2),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
 }

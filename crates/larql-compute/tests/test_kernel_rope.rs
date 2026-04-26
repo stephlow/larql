@@ -1,3 +1,5 @@
+#![cfg(feature = "metal")]
+
 //! Per-kernel tests for the three RoPE shader variants
 //! (`metal/shaders/rope.rs`):
 //!

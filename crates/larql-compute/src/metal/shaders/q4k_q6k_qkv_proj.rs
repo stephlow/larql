@@ -14,10 +14,9 @@
 //!   sh  = tid & 1       — 0/1: first/last 16 elements
 //!   X preloaded into xl[16] before weight reads.
 //!
-//! **V branch: original scalar loop (known correct, Q6_K all-lanes-per-superblock).**
-//! The Q6_K inter-superblock optimisation is tracked separately — the ix/tid
-//! decomposition for Q6_K (which uses ip/il to split upper/lower 128 elements)
-//! conflicts with the Q4_K decomposition (j/sh) in the same kernel scope.
+//! **V branch: same inter-superblock Q6_K inner loop as `q6k_matvec`.**
+//! Keep this branch mechanically aligned with `q6k_matvec`; it is easy for
+//! fused-QKV parity to drift because Q/K and V use different quant formats.
 
 pub const SHADER: &str = r#"
 constant uint Q4K_Q6K_ROWS_PER_TG  = 4;
@@ -108,32 +107,74 @@ kernel void q4k_q6k_qkv_proj(
         if (lane == 0u) out_buf[local_row] = acc;
 
     } else {
-        // ── V rows: Q6_K — scalar all-lanes-per-superblock (original, correct) ──
-        // TODO: apply inter-superblock treatment once the ix/tid clash with the
-        // Q4_K branch above is resolved (the Q6_K branch needs ip/il which spans
-        // elements 0..127 and 128..255 separately, incompatible with j/sh here).
+        // ── V rows: Q6_K — same inner loop as standalone q6k_matvec ──
         uint local_row = global_row - q_rows - k_rows;
         const uint bytes_per_row = superblocks * Q6K_BLOCK_SIZE_MIXED;
         device const uchar* row = Wv + local_row * bytes_per_row;
 
-        for (uint sb = 0u; sb < superblocks; sb++) {
+        const uint ix6  = lane & 1u;
+        const uint tid6 = lane >> 1u;
+        const uint base = tid6 << 2u;
+        const uint sc_base = tid6 >> 2u;
+
+        for (uint sb = ix6; sb < superblocks; sb += 2u) {
             device const uchar* block = row + sb * Q6K_BLOCK_SIZE_MIXED;
-            device const uchar* ql    = block;
-            device const uchar* qh    = block + 128u;
-            device const char*  sc    = (device const char*)(block + 192u);
+            device const uchar* ql = block;
+            device const uchar* qh = block + 128u;
+            device const char* sc = (device const char*)(block + 192u);
             ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8u);
             float d = decode_f16_metal(d_bits);
 
-            const uint x_base = sb * 256u;
-            for (uint pass = 0u; pass < 8u; pass++) {
-                uint i = pass * 32u + lane;
-                uchar lo_byte = ql[i >> 1u];
-                uint lo4 = (i & 1u) ? ((lo_byte >> 4u) & 0x0Fu) : (lo_byte & 0x0Fu);
-                uchar hi_byte = qh[i >> 2u];
-                uint hi2 = (hi_byte >> ((i & 3u) << 1u)) & 0x03u;
-                int raw = int(lo4 | (hi2 << 4u)) - 32;
-                float val = d * float(sc[i >> 4u]) * float(raw);
-                acc = fma(val, X[x_base + i], acc);
+            const uint xb = sb * 256u + base;
+            float xl[16];
+            xl[ 0] = X[xb      ]; xl[ 1] = X[xb +  1u];
+            xl[ 2] = X[xb +  2u]; xl[ 3] = X[xb +  3u];
+            xl[ 4] = X[xb + 64u]; xl[ 5] = X[xb + 65u];
+            xl[ 6] = X[xb + 66u]; xl[ 7] = X[xb + 67u];
+            xl[ 8] = X[xb +128u]; xl[ 9] = X[xb +129u];
+            xl[10] = X[xb +130u]; xl[11] = X[xb +131u];
+            xl[12] = X[xb +192u]; xl[13] = X[xb +193u];
+            xl[14] = X[xb +194u]; xl[15] = X[xb +195u];
+
+            {
+                const uint b = base;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 0u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[ 0] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[ 1] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[ 2] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[ 3]);
+            }
+            {
+                const uint b = base + 64u;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 4u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[ 4] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[ 5] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[ 6] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[ 7]);
+            }
+            {
+                const uint b = base + 128u;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 8u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[ 8] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[ 9] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[10] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[11]);
+            }
+            {
+                const uint b = base + 192u;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 12u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[12] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[13] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[14] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[15]);
             }
         }
 
@@ -263,7 +304,12 @@ kernel void q4k_q6k_qkv_proj_normed(
         const uint bytes_per_row = superblocks * Q6K_BLOCK_SIZE_MIXED;
         device const uchar* row = Wv + local_row * bytes_per_row;
 
-        for (uint sb = 0u; sb < superblocks; sb++) {
+        const uint ix6  = lane & 1u;
+        const uint tid6 = lane >> 1u;
+        const uint base = tid6 << 2u;
+        const uint sc_base = tid6 >> 2u;
+
+        for (uint sb = ix6; sb < superblocks; sb += 2u) {
             device const uchar* block = row + sb * Q6K_BLOCK_SIZE_MIXED;
             device const uchar* ql    = block;
             device const uchar* qh    = block + 128u;
@@ -271,18 +317,64 @@ kernel void q4k_q6k_qkv_proj_normed(
             ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8u);
             float d = decode_f16_metal(d_bits);
 
-            const uint x_base = sb * 256u;
-            for (uint pass = 0u; pass < 8u; pass++) {
-                uint i = pass * 32u + lane;
-                uchar lo_byte = ql[i >> 1u];
-                uint lo4 = (i & 1u) ? ((lo_byte >> 4u) & 0x0Fu) : (lo_byte & 0x0Fu);
-                uchar hi_byte = qh[i >> 2u];
-                uint hi2 = (hi_byte >> ((i & 3u) << 1u)) & 0x03u;
-                int raw = int(lo4 | (hi2 << 4u)) - 32;
-                float val = d * float(sc[i >> 4u]) * float(raw);
-                // Inline normalization: H[i] * rms * (offset + norm_w[i])
-                float xi = H[x_base + i] * rms * (offset + norm_w[x_base + i]);
-                acc = fma(val, xi, acc);
+            const uint xb = sb * 256u + base;
+            float xl[16];
+            xl[ 0] = H[xb      ] * rms * (offset + norm_w[xb      ]);
+            xl[ 1] = H[xb +  1u] * rms * (offset + norm_w[xb +  1u]);
+            xl[ 2] = H[xb +  2u] * rms * (offset + norm_w[xb +  2u]);
+            xl[ 3] = H[xb +  3u] * rms * (offset + norm_w[xb +  3u]);
+            xl[ 4] = H[xb + 64u] * rms * (offset + norm_w[xb + 64u]);
+            xl[ 5] = H[xb + 65u] * rms * (offset + norm_w[xb + 65u]);
+            xl[ 6] = H[xb + 66u] * rms * (offset + norm_w[xb + 66u]);
+            xl[ 7] = H[xb + 67u] * rms * (offset + norm_w[xb + 67u]);
+            xl[ 8] = H[xb +128u] * rms * (offset + norm_w[xb +128u]);
+            xl[ 9] = H[xb +129u] * rms * (offset + norm_w[xb +129u]);
+            xl[10] = H[xb +130u] * rms * (offset + norm_w[xb +130u]);
+            xl[11] = H[xb +131u] * rms * (offset + norm_w[xb +131u]);
+            xl[12] = H[xb +192u] * rms * (offset + norm_w[xb +192u]);
+            xl[13] = H[xb +193u] * rms * (offset + norm_w[xb +193u]);
+            xl[14] = H[xb +194u] * rms * (offset + norm_w[xb +194u]);
+            xl[15] = H[xb +195u] * rms * (offset + norm_w[xb +195u]);
+
+            {
+                const uint b = base;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 0u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[ 0] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[ 1] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[ 2] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[ 3]);
+            }
+            {
+                const uint b = base + 64u;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 4u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[ 4] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[ 5] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[ 6] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[ 7]);
+            }
+            {
+                const uint b = base + 128u;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 8u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[ 8] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[ 9] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[10] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[11]);
+            }
+            {
+                const uint b = base + 192u;
+                uchar la = ql[b >> 1u], lb = ql[(b >> 1u) + 1u], hi = qh[b >> 2u];
+                float _sc = d * float(sc[sc_base + 12u]);
+                acc += _sc * (
+                    float((char)((la & 0x0Fu) | ((hi & 0x03u) << 4u)) - 32) * xl[12] +
+                    float((char)(((la >> 4u) & 0x0Fu) | ((hi & 0x0Cu) << 2u)) - 32) * xl[13] +
+                    float((char)((lb & 0x0Fu) | ((hi & 0x30u))) - 32) * xl[14] +
+                    float((char)(((lb >> 4u) & 0x0Fu) | ((hi & 0xC0u) >> 2u)) - 32) * xl[15]);
             }
         }
 

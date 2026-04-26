@@ -1,3 +1,5 @@
+#![cfg(feature = "metal")]
+
 //! Per-kernel tests for `rope_at_pos` — the *single-head, single-vector*
 //! RoPE shader used by Metal prefill via `metal/stages/rope.rs`. Looped
 //! per-position per-head into one encoder.

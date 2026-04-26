@@ -1,3 +1,5 @@
+#![cfg(feature = "metal")]
+
 //! Per-kernel tests for `kv_attention` — KV-cached single-token decode
 //! attention. Companion to the prefill-side `fused_attention` tests.
 //!

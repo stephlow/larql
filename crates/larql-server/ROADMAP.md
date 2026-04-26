@@ -7,7 +7,11 @@
   `X-Forwarded-For` by default, route/path strings are centralized,
   server loader options are grouped, embed errors use the standard JSON
   error envelope, and server-local clippy allows were reduced.
-- Test coverage: **63.3% line / 73.2% function** (430 tests, 0 failures). gRPC handler tests unblocked grpc.rs (0%→65%). Magic strings eliminated across stream.rs, grpc.rs, describe.rs.
+- Test coverage: **74.2% line / 81.2% function** (478 tests, 0 failures). gRPC handler tests unblocked grpc.rs (0%→65%); focused unit coverage raised `embed_store.rs` to 98% line, `announce.rs` to 56%, `bootstrap.rs` function coverage to 92%, `routes/stream.rs` to 65%, `routes/embed.rs` to 87%, and `routes/walk_ffn.rs` to 80%.
+- Server-local clippy is clean with
+  `cargo clippy -p larql-server --tests --no-deps -- -D warnings`.
+  The dependency-checking form still stops in `larql-vindex`; that is
+  tracked outside this server-only pass.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
   inclusive layer ranges 0-14 + 15-29).
 - W2 feature-major down retrofittable in-place via
@@ -106,8 +110,6 @@ Shipped:
   exemptions from the vindex loading path.
 
 Follow-up worth keeping open:
-- Move boot/loading/discovery from `main.rs` into a library module if CLI
-  startup needs deeper unit coverage.
 - Consider a route-registration macro/table if route count keeps growing.
 
 ### T1. Test coverage — functional tokenizer + uncovered routes ✅ done 2026-04-26
@@ -141,24 +143,34 @@ maps test words to embeddings with known KNN hits.
 | `embed_store.rs` | 25% | Reads real f16 embedding files |
 | `main.rs` | 0% | CLI entrypoint; skip |
 
-### T2. Test coverage — remaining reachable paths *(in progress)*
+### T2. Test coverage — remaining reachable paths ✅ done 2026-04-26
 
-**Current**: 63.3% line / 73.2% function. 430 tests.
+**Current**: 74.2% line / 81.2% function. 478 tests.
 
 **Completed this pass:**
 - `grpc.rs` 0% → **65%** — 28 direct gRPC handler tests (health, stats, describe, walk, select, relations, walk_ffn, infer, stream_describe)
 - Magic strings: `"probe"` → `PROBE_RELATION_SOURCE`; `"ok"` → `HEALTH_STATUS_OK`; infer mode strings in grpc.rs; WebSocket message types in stream.rs (`WS_TYPE_*`, `WS_CMD_*`)
+- `embed_store.rs` 25% → **98% line** — tiny f16 mmap fixtures cover open, size validation, lookup, L1 cap, out-of-range, subnormal/inf/nan conversion.
+- `announce.rs` 6% → **56% line** — extracted deterministic message builders for announce, heartbeat, dropping, and grid bearer metadata.
+- `main.rs` boot/loading/discovery helpers moved into `bootstrap.rs`; `bootstrap.rs` has **92% function** coverage for parse/discovery/serve-alias/options behavior.
+- `routes/stream.rs` 0% → **65% line** — WebSocket JSON message builders plus pure describe-message planning cover missing-entity, no-model, and functional edge streaming cases.
+- `routes/infer.rs` 32% → **56% line** and `routes/explain.rs` 18% → **46% line** via request/default deserialization tests and response-formatting helpers.
+- `routes/embed.rs` 67% → **87% line** — binary embed/logits parsing extracted into helpers; HTTP tests cover binary success, malformed JSON, truncated binary input, hidden-size mismatches, no-model errors, and cacheable single-token JSON/binary responses.
+- `routes/walk_ffn.rs` 77% → **80% line** — validation helpers now cover layer selection precedence, missing layers, seq_len handling, overflow, and latency rounding.
 
-**Still addressable without real weights:**
+**Remaining hard ceiling:**
 
 | File | Current | Gap | What to add |
 |---|---|---|---|
-| `routes/stream.rs` | 0% | 219 lines | WebSocket inner functions — needs `tokio-tungstenite` or direct `grpc_stream_describe`-style testing |
-| `routes/explain.rs` | 11% | 152 lines | Gated on `get_or_load_weights()`; only handler scaffold reachable |
-| `routes/infer.rs` | 31% | ~70 lines | `has_model_weights=false` + `infer_disabled=false` → 503 |
+| `main.rs` | 0% | 237 lines | Tokio binary entrypoint; boot orchestration is covered through `bootstrap.rs` |
+| `bootstrap.rs` | 43% | 134 lines | Real vindex load path still requires filesystem fixtures with full vindex assets |
+| `routes/stream.rs` | 65% | 148 lines | Full WebSocket socket loop still needs a client harness such as `tokio-tungstenite` |
+| `routes/explain.rs` | 46% | 167 lines | Main path gated on `get_or_load_weights()` and real inference trace |
+| `routes/infer.rs` | 56% | 82 lines | Prediction paths need real or injectable inference backend |
+| `routes/embed.rs` | 87% | 74 lines | Remaining positive logits path requires loadable weights/lm_head fixture |
+| `routes/walk_ffn.rs` | 80% | 125 lines | Remaining full-output path requires loadable weights/FFN fixture |
 | `routes/warmup.rs` | 80% | ~15 lines | `warmup_hnsw=true` warn path (HNSW not enabled) |
-| `embed_store.rs` | 25% | ~72 lines | Reads real f16 files; hard to test in-process |
-| `announce.rs` | 6% | ~98 lines | gRPC stream to real router — defer |
+| `announce.rs` | 56% | ~78 lines | Remaining gap is live gRPC stream lifecycle and retry loop |
 
 ### G1. Cold-start profile ✅ done 2026-04-26
 **Findings**: walk-ffn cold cost decomposes into two distinct phases:
@@ -242,6 +254,38 @@ to add/remove a shard without restarting the router. Pair with
 ---
 
 ## Completed
+
+### 2026-04-26 — coverage round-6 (embed + walk-ffn reachable gaps)
+
+| Item | Outcome |
+|---|---|
+| `routes/embed.rs` modularity | Extracted binary embed/logits parse helpers and binary embed response encoder |
+| `routes/embed.rs` coverage | **66.7% → 86.5% line**, **70.7% → 86.3% function** |
+| `routes/walk_ffn.rs` coverage | **76.7% → 79.5% line**, **77.3% → 82.0% function** |
+| Tests | 458 → **478** tests |
+| Coverage | **71.9% → 74.2% line**, **78.9% → 81.2% function** |
+
+### 2026-04-26 — modularity + coverage round-5
+
+| Item | Outcome |
+|---|---|
+| Boot/loading modularity | Moved parse/discovery/vindex-load helpers out of `main.rs` into `bootstrap.rs`; binary now keeps CLI orchestration while library code is directly testable |
+| `routes/stream.rs` | Extracted pure `stream_describe_messages`; describe stream behavior can be tested without a WebSocket client |
+| `routes/infer.rs` | Extracted mode selection and prediction formatting helpers |
+| `routes/explain.rs` | Extracted band mapping, probability/gate/attention rounding, prediction formatting, and lens formatting helpers |
+| Clippy | Server-local clippy clean with `--no-deps`; full dependency-checking command is blocked by existing `larql-vindex` warnings |
+| Coverage | **69.2% → 71.9% line**, **77.1% → 78.9% function** (458 tests) |
+
+### 2026-04-26 — coverage round-4 (T2 reachable gaps)
+
+| Item | Outcome |
+|---|---|
+| `embed_store.rs` | 25% → **98% line** with tiny f16 mmap fixtures and L1 cache behavior tests |
+| `announce.rs` | 6% → **56% line** by extracting/test-covering announce, heartbeat, dropping, and bearer helpers |
+| `main.rs` | 0% → **23% line** with binary unit tests for parse/discovery/serve-alias helpers |
+| `routes/stream.rs` | 0% → **28% line** with pure WebSocket message shape builders |
+| `routes/infer.rs`, `routes/explain.rs` | Default/request deserialization coverage added; full paths remain weight-gated |
+| Coverage | 63.9% → **69.2% line**, 73.4% → **77.1% function** (430 → 458 tests) |
 
 ### 2026-04-26 — coverage round-3 (T2 partial) + magic strings round-2
 

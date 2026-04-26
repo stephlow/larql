@@ -447,3 +447,73 @@ fn write_f32_slice(file: &mut File, data: &[f32]) -> io::Result<()> {
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     file.write_all(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ContextTier ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_tier_from_u8_roundtrip() {
+        assert_eq!(ContextTier::from_u8(1), ContextTier::Residual);
+        assert_eq!(ContextTier::from_u8(2), ContextTier::FfnDeltas);
+        assert_eq!(ContextTier::from_u8(3), ContextTier::Full);
+    }
+
+    #[test]
+    fn context_tier_from_u8_invalid_defaults_to_residual() {
+        assert_eq!(ContextTier::from_u8(0), ContextTier::Residual);
+        assert_eq!(ContextTier::from_u8(99), ContextTier::Residual);
+    }
+
+    #[test]
+    fn vectors_per_boundary_residual_is_one() {
+        assert_eq!(ContextTier::Residual.vectors_per_boundary(4), 1);
+    }
+
+    #[test]
+    fn vectors_per_boundary_ffn_adds_critical_layers() {
+        // 1 (boundary residual) + n_critical ffn deltas
+        assert_eq!(ContextTier::FfnDeltas.vectors_per_boundary(4), 5);
+        assert_eq!(ContextTier::FfnDeltas.vectors_per_boundary(0), 1);
+    }
+
+    #[test]
+    fn vectors_per_boundary_full_adds_two_per_critical() {
+        // 1 + 2 × n_critical
+        assert_eq!(ContextTier::Full.vectors_per_boundary(4), 9);
+        assert_eq!(ContextTier::Full.vectors_per_boundary(0), 1);
+    }
+
+    // ── ContextWriter + ContextStore create/open roundtrip ────────────────────
+
+    #[test]
+    fn create_open_basic_roundtrip() {
+        let path = std::env::temp_dir().join("larql_context_test_basic.ctxt");
+        let hidden = 4;
+        let n_layers = 2;
+        let critical = vec![0usize, 1];
+
+        let mut writer = ContextWriter::create(
+            &path, hidden, n_layers, 100, ContextTier::Residual, &critical, 50,
+        ).expect("create");
+
+        let residual = vec![1.0f32, 2.0, 3.0, 4.0];
+        writer.append(0, 100, &residual, &[], &[]).expect("append");
+        assert_eq!(writer.n_boundaries(), 1);
+        writer.finish().expect("finish");
+
+        let store = ContextStore::open(&path).expect("open");
+        assert_eq!(store.n_boundaries(), 1);
+        assert_eq!(store.hidden_size(), hidden);
+
+        let r = store.residual(0).expect("boundary residual");
+        assert_eq!(r.len(), hidden);
+        for (i, &v) in r.iter().enumerate() {
+            assert!((v - residual[i]).abs() < 1e-6, "residual[{i}] mismatch");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -12,9 +12,14 @@
 //!
 //! See PERFORMANCE.md for the reference numbers (2026-04-26, M3 Max).
 
-#![cfg(feature = "metal")]
 extern crate blas_src;
 
+#[cfg(not(feature = "metal"))]
+fn main() {
+    eprintln!("This example requires --features metal");
+}
+
+#[cfg(feature = "metal")]
 fn main() {
     let _results = larql_compute::metal::diag::kernel_profile::profile_all(
         34, // n_layers

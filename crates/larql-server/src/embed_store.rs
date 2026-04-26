@@ -211,7 +211,10 @@ mod tests {
     #[test]
     fn open_rejects_missing_file() {
         let dir = unique_temp_dir("embed-missing");
-        let err = EmbedStoreF16::open(&dir, 1.0, 2, 2, 1).unwrap_err();
+        let err = match EmbedStoreF16::open(&dir, 1.0, 2, 2, 1) {
+            Ok(_) => panic!("expected missing file error"),
+            Err(err) => err,
+        };
         assert!(err.contains("open"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -220,7 +223,10 @@ mod tests {
     fn open_rejects_wrong_size() {
         let dir = unique_temp_dir("embed-size");
         write_embeddings(&dir, &[0x3C00, 0x4000, 0x4200]);
-        let err = EmbedStoreF16::open(&dir, 1.0, 2, 2, 1).unwrap_err();
+        let err = match EmbedStoreF16::open(&dir, 1.0, 2, 2, 1) {
+            Ok(_) => panic!("expected wrong size error"),
+            Err(err) => err,
+        };
         assert!(err.contains("expected f16 size"));
         let _ = std::fs::remove_dir_all(dir);
     }

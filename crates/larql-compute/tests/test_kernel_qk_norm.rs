@@ -1,3 +1,5 @@
+#![cfg(feature = "metal")]
+
 //! Per-kernel tests for `qk_norm` — per-head learned-weight RMSNorm.
 //!
 //! ## Why a focused file
