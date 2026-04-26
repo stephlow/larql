@@ -291,3 +291,138 @@ fn moe_gelu_tanh_activation_in_forward() {
     assert_eq!(out.len(), hidden);
     assert!(out.iter().any(|v| v.abs() > 1e-4), "GeluTanh forward should produce nonzero output");
 }
+
+// ── Metal: prefill_q4 with MoE layers ────────────────────────────────────────
+//
+// Integration tests for the batched MoE prefill path introduced in
+// 2026-04-26. They call through the public `DecodeBackend::prefill_q4` API
+// so they exercise the full `dispatch_full_pipeline` + `moe_fn` callback
+// chain without reaching into private internals.
+
+#[cfg(feature = "metal")]
+mod moe_prefill_integration {
+    use larql_compute::backend::DecodeBackend;
+    use larql_compute::metal::MetalBackend;
+    use larql_compute::pipeline::*;
+    use larql_compute::MoeLayerWeights;
+
+    /// Minimal Q4_K weight buffer: one super-block (144 bytes) per row,
+    /// all scales = 1.0 (f16 0x3C00), all nibbles = 0.
+    fn synth_q4k(rows: usize, cols: usize) -> Vec<u8> {
+        let blocks = cols.div_ceil(256);
+        let mut v = vec![0u8; rows * blocks * 144];
+        for b in 0..rows * blocks {
+            v[b * 144 + 1] = 0x3C; // d = f16(1.0) hi byte
+        }
+        v
+    }
+
+    fn layer<'a>(
+        q4k: &'a [u8],
+        norm: &'a [f32],
+        moe: Option<MoeLayerWeights<'a>>,
+    ) -> FullPipelineLayer<'a> {
+        let q4w = || QuantWeight { data: q4k, scales: None, format: QuantFormat::Q4_K };
+        FullPipelineLayer {
+            wq: q4w(), wk: q4w(), wv: q4w(), wo: q4w(),
+            gate: q4w(), up: q4w(), down: q4w(),
+            input_norm: norm, post_attn_norm: norm,
+            pre_ffn_norm: None, post_ffn_norm: None,
+            input_norm_bias: None, post_attn_norm_bias: None,
+            norm_offset: 1.0, qk_norm_offset: 0.0, eps: 1e-6,
+            has_post_norms: false,
+            norm_type: NormType::RmsNorm, ffn_type: FfnType::Gated,
+            activation: Activation::Silu, attn_scale: 0.125,
+            head_dim: 64, num_q_heads: 4, num_kv_heads: 4,
+            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
+            has_v_norm: false, layer_scalar: 0.0,
+            q_norm_weight: None, k_norm_weight: None,
+            ffn_up_bias: None, ffn_down_bias: None,
+            moe, moe_combined_output_norm: false, moe_outer_post_norm: None,
+        }
+    }
+
+    fn null_moe(inter: usize) -> MoeLayerWeights<'static> {
+        // num_experts=0 → cpu_moe_forward returns zeros immediately.
+        // Sufficient to exercise the callback path without real expert weights.
+        MoeLayerWeights {
+            experts_gate_up: &[], experts_down: &[], router_proj: &[],
+            router_scale: &[], router_per_expert_scale: &[], router_norm: &[],
+            router_norm_parameter_free: false, router_input_scalar: 1.0,
+            pre_experts_norm: &[], post_ffn1_norm: &[], post_experts_norm: &[],
+            num_experts: 0, top_k: 1, intermediate_size: inter,
+            activation: Activation::Silu,
+        }
+    }
+
+    /// `prefill_q4` on a model with MoE layers returns a vec of the right
+    /// length and finite values. Exercises the batched-commit path end-to-end.
+    #[test]
+    fn prefill_q4_with_moe_returns_correct_shape() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        let hidden  = 256usize;
+        let inter   = 256usize;
+        let seq_len = 3usize;
+        let q4k  = synth_q4k(hidden.max(inter), hidden);
+        let norm = vec![1.0f32; hidden];
+        let layers = vec![
+            layer(&q4k, &norm, None),
+            layer(&q4k, &norm, Some(null_moe(inter))),
+            layer(&q4k, &norm, None),
+        ];
+        let x = vec![0.0f32; seq_len * hidden];
+        let out = metal.prefill_q4(
+            &layers, &x, hidden, inter, hidden, hidden,
+            seq_len, 4, 4, 64, 10000.0, false, 0.0,
+        );
+        let out = out.expect("prefill_q4 must return Some on Metal");
+        assert_eq!(out.len(), seq_len * hidden, "output length must be seq_len × hidden");
+        assert!(out.iter().all(|v| v.is_finite()), "output must be finite (no NaN/Inf)");
+    }
+
+    /// `prefill_q4` on an all-MoE model (every layer has MoE) uses the
+    /// per-layer commit path. Result shape and finiteness are the minimum bar;
+    /// the benchmark verifies correctness vs. the baseline.
+    #[test]
+    fn prefill_q4_all_moe_layers_returns_correct_shape() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        let hidden  = 256usize;
+        let inter   = 256usize;
+        let seq_len = 4usize;
+        let q4k  = synth_q4k(hidden.max(inter), hidden);
+        let norm = vec![1.0f32; hidden];
+        let layers: Vec<_> = (0..4)
+            .map(|_| layer(&q4k, &norm, Some(null_moe(inter))))
+            .collect();
+        let x = vec![0.0f32; seq_len * hidden];
+        let out = metal.prefill_q4(
+            &layers, &x, hidden, inter, hidden, hidden,
+            seq_len, 4, 4, 64, 10000.0, false, 0.0,
+        ).expect("prefill_q4 must return Some on Metal");
+        assert_eq!(out.len(), seq_len * hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `prefill_q4` without MoE (original path) is unaffected by the new
+    /// callback infrastructure — same shape and finiteness contract.
+    #[test]
+    fn prefill_q4_no_moe_unaffected() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        let hidden  = 256usize;
+        let inter   = 256usize;
+        let seq_len = 2usize;
+        let q4k  = synth_q4k(hidden.max(inter), hidden);
+        let norm = vec![1.0f32; hidden];
+        let layers = vec![
+            layer(&q4k, &norm, None),
+            layer(&q4k, &norm, None),
+        ];
+        let x = vec![0.0f32; seq_len * hidden];
+        let out = metal.prefill_q4(
+            &layers, &x, hidden, inter, hidden, hidden,
+            seq_len, 4, 4, 64, 10000.0, false, 0.0,
+        ).expect("prefill_q4 must return Some on Metal");
+        assert_eq!(out.len(), seq_len * hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+}

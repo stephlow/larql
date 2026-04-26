@@ -473,6 +473,7 @@ fn memit_solve_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::test_utils::make_test_weights;
 
     #[test]
     fn test_memit_fact_creation() {
@@ -484,5 +485,67 @@ mod tests {
         };
         assert_eq!(fact.layer, 10);
         assert_eq!(fact.target_token_id, 42);
+    }
+
+    // ── Empty-facts fast path (no tokenizer needed) ────────────────────────────
+
+    #[test]
+    fn run_memit_empty_facts_returns_empty() {
+        use crate::engines::test_utils::make_test_tokenizer;
+        let weights = make_test_weights();
+        // by_layer is empty → run_memit_inner returns before touching the tokenizer.
+        // Pass a real tokenizer so the test doesn't rely on pointer provenance.
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let result = run_memit_inner(
+            &weights, &[], 1.0, RSource::EmbedShortcut(1.0), &tokenizer,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // ── MemitResult delta shape ────────────────────────────────────────────────
+
+    #[test]
+    fn memit_result_delta_w_shape_matches_weights() {
+        // Build a synthetic MemitResult and verify expected shapes.
+        let weights = make_test_weights();
+        let delta = ndarray::Array2::zeros((weights.hidden_size, weights.intermediate_size));
+        let result = MemitResult {
+            layer: 0,
+            delta_w: delta.clone(),
+            fact_results: vec![],
+        };
+        assert_eq!(result.delta_w.shape(), &[weights.hidden_size, weights.intermediate_size]);
+    }
+
+    // ── Real-model MEMIT (requires LARQL_VINDEX_PATH + LARQL_TOKENIZER_PATH) ──
+    //
+    // Run with:
+    //   LARQL_VINDEX_PATH=/path/to/vindex.vindex \
+    //   cargo test -p larql-inference --lib forward::memit::tests -- --ignored --nocapture
+
+    #[test]
+    #[ignore = "requires LARQL_VINDEX_PATH pointing to a non-Q4K vindex with model weights"]
+    fn run_memit_single_fact_produces_delta() {
+        let vpath = std::env::var("LARQL_VINDEX_PATH").expect("LARQL_VINDEX_PATH not set");
+        let path = std::path::Path::new(&vpath);
+        let mut cb = larql_vindex::SilentLoadCallbacks;
+        let weights = larql_vindex::load_model_weights(path, &mut cb).expect("weights load failed");
+        let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer load failed");
+
+        let enc = tokenizer.encode("The capital of France is", true).unwrap();
+        let fact = MemitFact {
+            prompt_tokens: enc.get_ids().to_vec(),
+            target_token_id: tokenizer.token_to_id("Paris").unwrap_or(1),
+            layer: weights.num_layers - 1,
+            label: "france->paris".into(),
+        };
+
+        let result = run_memit(&weights, &[fact], 1.0, 1.0, &tokenizer);
+        let results = result.expect("MEMIT should succeed");
+        assert!(!results.is_empty(), "should get at least one result");
+        let r = &results[0];
+        assert_eq!(r.delta_w.shape(), &[weights.hidden_size, weights.intermediate_size]);
+        eprintln!("delta_w norm: {:.4}", r.delta_w.iter().map(|v| v * v).sum::<f32>().sqrt());
     }
 }

@@ -35,6 +35,49 @@ P99 under 8-way contention: 24 ms.
 
 Nothing critical-path is blocking right now.
 
+---
+
+## P0: Remote expert protocol (Act 2)
+
+These items are the wire-format half of the "experts live elsewhere" demo.
+The inference-side counterpart (`RemoteExpertBackend`, `cpu_moe_forward`) is
+tracked in `larql-inference/ROADMAP.md`.
+
+### `POST /v1/expert/{layer}/{expert_id}`
+**Status**: Not started  
+Accept a residual vector (hidden-size f32 or bf16), run that expert's gated FFN
+(gate + up + SiLU + down), return the residual delta. Endpoint already declared
+in the completed-items list below as a stub; needs a real handler wired to
+`ModelWeights`.
+
+### `POST /v1/expert/batch`
+**Status**: Not started  
+Body: list of `{layer, expert_id, residual}`. Returns a matching list of deltas.
+Collapses a layer's K active experts into one HTTP round trip per server, avoiding
+K separate requests under MoE top-K dispatch.
+
+### `--experts 0-31` flag on `larql serve`
+**Status**: Not started  
+**Files**: `src/main.rs` (CLI), `src/state.rs`  
+Load and serve only the specified expert ID subset. Allows horizontal sharding
+of a large MoE model across machines: `larql serve --experts 0-31` on host A,
+`--experts 32-63` on host B. Experts outside the owned range return HTTP 404.
+
+### `load_model_weights_ffn_only` — skip attention tensors on `--ffn-only`
+**Status**: Not started  
+**Files**: `src/state.rs`  
+`larql serve --ffn-only` currently loads `ModelWeights` in full (attention,
+norms, embeddings). Add `load_model_weights_ffn_only` that skips attention
+tensors to reduce RSS on expert-only shard machines. Expert servers have no
+use for Q/K/V projections or the lm_head.
+
+### `RemoteExpertBackend` — note
+Implementation lives in `larql-inference` (sharding map, parallel dispatch,
+per-expert error handling). This server owns the endpoint definitions and the
+`--experts` flag; larql-inference owns the client-side routing.
+
+---
+
 ## P1: Active
 
 ### G1. Cold-start profile ✅ done 2026-04-26

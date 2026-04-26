@@ -96,17 +96,23 @@ kernel void q4k_matvec(
         // group*32 selects the 32-byte nibble group; sh*16 selects the 16-byte half.
         device const uchar* qs = block + 16u + group * 32u + sh * 16u;
 
-        // Dot product + sum (used in the deferred min-correction below).
-        float dot_acc = 0.0f, sum_acc = 0.0f;
+        // Precompute sum of X values for the min-correction term.
+        // Separating this from the FMA chain lets the compiler schedule
+        // the dot loop as a pure FMA sequence without interleaved adds.
+        float sumy = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (uint l = 0u; l < 16u; l++) { sumy += xl[l]; }
+
+        // Pure dot product — uninterrupted FMA chain.
+        float dot_acc = 0.0f;
         _Pragma("clang loop unroll(full)")
         for (uint l = 0u; l < 16u; l++) {
             uchar byte = qs[l];
             float nib = hi ? float((byte >> 4u) & 0x0Fu) : float(byte & 0x0Fu);
             dot_acc = fma(nib, xl[l], dot_acc);
-            sum_acc += xl[l];
         }
-        // Q4_K deferred formula: scale*dot - mmin*sum_x
-        acc += scale * dot_acc - mmin * sum_acc;
+        // Q4_K deferred formula: scale*dot - dmin*sum_x
+        acc += scale * dot_acc - mmin * sumy;
     }
 
     acc = simd_sum(acc);

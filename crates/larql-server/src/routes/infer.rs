@@ -7,8 +7,10 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 
+use crate::band_utils::{INFER_MODE_COMPARE, INFER_MODE_DENSE, INFER_MODE_WALK};
 use crate::error::ServerError;
-use crate::state::{AppState, LoadedModel};
+use crate::session::extract_session_id;
+use crate::state::{AppState, LoadedModel, elapsed_ms};
 
 #[derive(Deserialize)]
 pub struct InferRequest {
@@ -20,15 +22,7 @@ pub struct InferRequest {
 }
 
 fn default_top() -> usize { 5 }
-fn default_mode() -> String { "walk".into() }
-
-/// Extract session ID from headers.
-fn session_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-}
+fn default_mode() -> String { INFER_MODE_WALK.into() }
 
 fn run_infer(
     state: &AppState,
@@ -67,9 +61,9 @@ fn run_infer(
 
     let start = std::time::Instant::now();
 
-    let is_compare = req.mode == "compare";
-    let use_walk = req.mode == "walk" || is_compare;
-    let use_dense = req.mode == "dense" || is_compare;
+    let is_compare = req.mode == INFER_MODE_COMPARE;
+    let use_walk = req.mode == INFER_MODE_WALK || is_compare;
+    let use_dense = req.mode == INFER_MODE_DENSE || is_compare;
 
     let mut result = serde_json::Map::new();
     result.insert("prompt".into(), serde_json::json!(req.prompt));
@@ -117,11 +111,11 @@ fn run_infer(
             .collect();
 
         if is_compare {
-            result.insert("walk".into(), serde_json::json!(predictions));
+            result.insert(INFER_MODE_WALK.into(), serde_json::json!(predictions));
             result.insert("walk_ms".into(), serde_json::json!((walk_ms * 10.0).round() / 10.0));
         } else {
             result.insert("predictions".into(), serde_json::json!(predictions));
-            result.insert("mode".into(), serde_json::json!("walk"));
+            result.insert("mode".into(), serde_json::json!(INFER_MODE_WALK));
         }
     }
 
@@ -147,16 +141,15 @@ fn run_infer(
             .collect();
 
         if is_compare {
-            result.insert("dense".into(), serde_json::json!(predictions));
+            result.insert(INFER_MODE_DENSE.into(), serde_json::json!(predictions));
             result.insert("dense_ms".into(), serde_json::json!((dense_ms * 10.0).round() / 10.0));
         } else {
             result.insert("predictions".into(), serde_json::json!(predictions));
-            result.insert("mode".into(), serde_json::json!("dense"));
+            result.insert("mode".into(), serde_json::json!(INFER_MODE_DENSE));
         }
     }
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    result.insert("latency_ms".into(), serde_json::json!((latency_ms * 10.0).round() / 10.0));
+    result.insert("latency_ms".into(), serde_json::json!(elapsed_ms(start)));
 
     Ok(serde_json::Value::Object(result))
 }
@@ -167,11 +160,8 @@ pub async fn handle_infer(
     Json(req): Json<InferRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
-    let model = Arc::clone(model);
-    let sid = session_id(&headers);
+    let model = state.model_or_err(None)?.clone();
+    let sid = extract_session_id(&headers);
     let state2 = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || run_infer(&state2, &model, &req, sid.as_deref()))
         .await
@@ -186,11 +176,8 @@ pub async fn handle_infer_multi(
     Json(req): Json<InferRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(Some(&model_id))
-        .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
-    let model = Arc::clone(model);
-    let sid = session_id(&headers);
+    let model = state.model_or_err(Some(&model_id))?.clone();
+    let sid = extract_session_id(&headers);
     let state2 = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || run_infer(&state2, &model, &req, sid.as_deref()))
         .await

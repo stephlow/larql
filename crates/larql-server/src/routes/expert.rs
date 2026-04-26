@@ -70,9 +70,7 @@ fn run_expert(
     expert_id: usize,
     residual: &[f32],
 ) -> Result<Vec<f32>, ServerError> {
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+    let model = state.model_or_err(None)?;
 
     // Ownership check: reject if this shard doesn't own this expert.
     if let Some((start, end)) = model.expert_filter {

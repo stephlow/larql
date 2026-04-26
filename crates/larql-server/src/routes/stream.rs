@@ -14,7 +14,8 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 
-use crate::state::AppState;
+use crate::band_utils::{INFER_MODE_DENSE, filter_layers_by_band, get_layer_bands};
+use crate::state::{AppState, elapsed_ms};
 
 pub async fn handle_stream(
     State(state): State<Arc<AppState>>,
@@ -133,33 +134,12 @@ async fn handle_stream_describe(
         avg
     };
 
-    let config = &model.config;
-    let last = config.num_layers.saturating_sub(1);
-    let bands = config
-        .layer_bands
-        .clone()
-        .or_else(|| larql_vindex::LayerBands::for_family(&config.family, config.num_layers))
-        .unwrap_or(larql_vindex::LayerBands {
-            syntax: (0, last),
-            knowledge: (0, last),
-            output: (0, last),
-        });
+    let bands = get_layer_bands(&model);
 
     let patched = model.patched.read().await;
     let all_layers = patched.loaded_layers();
 
-    let scan_layers: Vec<usize> = match band {
-        "syntax" => all_layers.iter().copied()
-            .filter(|l| *l >= bands.syntax.0 && *l <= bands.syntax.1)
-            .collect(),
-        "knowledge" => all_layers.iter().copied()
-            .filter(|l| *l >= bands.knowledge.0 && *l <= bands.knowledge.1)
-            .collect(),
-        "output" => all_layers.iter().copied()
-            .filter(|l| *l >= bands.output.0 && *l <= bands.output.1)
-            .collect(),
-        _ => all_layers,
-    };
+    let scan_layers = filter_layers_by_band(all_layers, band, &bands);
 
     let entity_lower = entity.to_lowercase();
     let mut total_edges = 0;
@@ -204,12 +184,11 @@ async fn handle_stream_describe(
         }
     }
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let done_msg = serde_json::json!({
         "type": "done",
         "entity": entity,
         "total_edges": total_edges,
-        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        "latency_ms": elapsed_ms(start),
     });
     let _ = socket.send(Message::Text(done_msg.to_string().into())).await;
 }
@@ -272,7 +251,7 @@ async fn handle_stream_infer(
     };
 
     let top_k = request["top"].as_u64().unwrap_or(5) as usize;
-    let mode = request["mode"].as_str().unwrap_or("walk");
+    let mode = request["mode"].as_str().unwrap_or(crate::band_utils::INFER_MODE_WALK);
 
     let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
         Ok(e) => e,
@@ -297,7 +276,7 @@ async fn handle_stream_infer(
 
     let start = std::time::Instant::now();
 
-    let predictions = if mode == "dense" {
+    let predictions = if mode == INFER_MODE_DENSE {
         larql_inference::predict(weights, &model.tokenizer, &token_ids, top_k).predictions
     } else {
         let patched = model.patched.blocking_read();
@@ -321,13 +300,12 @@ async fn handle_stream_infer(
         }
     }
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let done_msg = serde_json::json!({
         "type": "infer_done",
         "prompt": prompt,
         "mode": mode,
         "predictions": predictions.len(),
-        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        "latency_ms": elapsed_ms(start),
     });
     let _ = socket.send(Message::Text(done_msg.to_string().into())).await;
 }

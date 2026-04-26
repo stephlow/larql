@@ -218,6 +218,7 @@ impl QuantMatVec for MinimalBackend {}   // all methods default to None/false
 impl DecodeBackend for MinimalBackend {} // all methods default to None/no-op
 impl larql_compute::ComputeBackend for MinimalBackend {
     fn name(&self) -> &str { "minimal" }
+    fn as_any(&self) -> &dyn std::any::Any { self }
     // device_info: default → self.name().to_string()
     // supports:    default → false
 }

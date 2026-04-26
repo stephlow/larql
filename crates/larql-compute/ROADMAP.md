@@ -179,6 +179,18 @@ Saves ~0.33ms for top_k=1 callers. Implemented on MetalBackend. Main decode loop
 uses the KNN lm_head path (top_k=5 → KNN fires first), so this doesn't yet
 benefit the bench. Useful for non-KNN models and future greedy-decode APIs.
 
+### Q4_K `sumy` precompute (2026-04-26)
+
+Separated the X-sum used in the min-correction term from the FMA dot-product
+loop in `q4k_matvec` and `q4k_ffn_gate_up`. Previously both shared one loop
+(`dot_acc` and `sum_acc` accumulated together); now a dedicated `sumy` pass
+runs first, leaving the dot loop as a pure FMA chain the compiler can
+schedule without interleaved additions. Applied to both the standalone matvec
+and the fused gate+up shader.
+
+Expected: minor compiler scheduling win on the ALU-limited K=2560 path.
+Measured gain TBD — run `larql bench gemma3-4b-q4k-downq4k` before/after.
+
 ### #6 — Q4_K kernel optimization (explored 2026-04-26, blocked by ALU bound)
 
 **Tried:** (a) inter-superblock interleaving (ix=lane&1 stride-2, already applied).
@@ -480,16 +492,29 @@ Artifacts for future regression checks:
   skip-if-missing for vindexes. Caught the broken output immediately
   and flagged which architecture-specific change broke it.
 
-### Batched MoE prefill
-**Effort**: Medium
-**Status**: Workaround shipped (token-by-token decode loop in `prefill_q4`)
+### Batched MoE prefill — **SHIPPED (2026-04-26)**
 
-Current workaround is correct but serialises `seq_len` decode calls —
-O(seq_len × num_layers) GPU command buffers for a prompt. The real fix
-is a batched prefill that processes all positions in a single pass:
-for each layer, dispatch GPU dense FFN over all positions, then CPU MoE
-over all positions, then proceed to next layer. Requires restructuring
-`dispatch_full_pipeline` to accept a per-layer CPU callback.
+Replaced the O(seq_len × num_layers) token-by-token decode loop with a
+batched approach: `dispatch_full_pipeline` now accepts an optional
+`moe_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>` callback.
+When the callback is present and a layer has MoE, the function commits
+the GPU command buffer after that layer's dense FFN, calls the closure
+(which runs CPU experts for all seq_len positions and applies outer norm
++ layer_scalar), then restarts the command buffer for the next layer.
+
+**Measured on Gemma 4 26B A4B (5-token prompt, 15 warmup / 30 tokens, M3 Max):**
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Prefill | 1889ms | 1297ms | **−31%** |
+| Decode GPU fwd | 334ms/tok | 246ms/tok | **−26%** |
+| Decode tok/s | 2.9 | **3.9** | **+35%** |
+
+**Why:** 5-token prefill now uses 26 GPU commits (one per layer) vs 130
+(5 positions × 26 layers). Batching all positions per layer also improves
+weight cache utilisation. GPU layer_scalar skipped for MoE layers in the
+dispatch; the callback applies it correctly after combining dense + MoE.
+`kv_copy::populate_kv_one_layer` added for per-layer KV cache population.
 
 ### Fix `dispatch_full_pipeline` layer_scalar
 **Effort**: Low
@@ -505,8 +530,7 @@ before the residual add. Call sites: `full_pipeline.rs:844`,
 `tests/test_metal_shaders.rs:2696,2748` — add `None` for non-scaling.
 
 Not urgent: Gemma 3 4B has `layer_scalar = 0.0` (no scaling); Gemma 4
-26B is all-MoE and bypasses `dispatch_full_pipeline` via the new
-decode-loop prefill.
+26B uses the MoE callback path which applies layer_scalar correctly.
 
 ## P1: Production Hardening
 

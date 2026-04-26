@@ -124,7 +124,7 @@ pub fn dispatch_full_pipeline(
     fused_q4k_geglu_gelu_tanh_down: Option<&crate::metal::kernel::KernelHandle>,
     fused_q6k_geglu_silu_down: Option<&crate::metal::kernel::KernelHandle>,
     fused_q6k_geglu_gelu_tanh_down: Option<&crate::metal::kernel::KernelHandle>,
-    kv_cache: Option<&mut crate::metal::ops::kv_cache::KVCache>,
+    mut kv_cache: Option<&mut crate::metal::ops::kv_cache::KVCache>,
     layers: &[crate::FullPipelineLayer],
     x: &[f32],
     hidden: usize,
@@ -138,6 +138,16 @@ pub fn dispatch_full_pipeline(
     _rope_base: f32, // global fallback; per-layer layers[l].rope_base used in loop
     use_qk_norm: bool,
     softcap: f32,
+    // Optional per-layer MoE callback for hybrid MoE models (e.g. Gemma 4 26B A4B).
+    // When provided, the function commits the GPU command buffer after each MoE layer,
+    // calls this closure with `(layer_idx, h_post_attn, new_h)` (both slices are
+    // `[seq_len × hidden]`), and restarts the command buffer for the next layer.
+    // The closure is responsible for running CPU MoE and accumulating the result
+    // into `new_h`, as well as applying any outer post-FFN norm and layer_scalar.
+    // The GPU layer_scalar step (step 11) is skipped for layers where the callback
+    // fires so the closure can apply it correctly after combining dense + MoE.
+    // Pass `None` for models without MoE — behaviour is identical to the prior API.
+    mut moe_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>,
 ) -> Vec<f32> {
     let num_layers = layers.len();
 
@@ -180,6 +190,12 @@ pub fn dispatch_full_pipeline(
     let ffn_q8s_bufs   = &lb.ffn_q8s;
     let q8_row_max     = lb.q8_row_max;
     let q8s_row_bytes  = lb.q8s_row_bytes;
+
+    // Per-layer GPU commit mode: used for hybrid MoE models where the CPU
+    // expert block runs after each layer's dense FFN. When active, we commit
+    // after every layer that has MoE (not once at the end), restart the
+    // command buffer, and call the caller-supplied closure.
+    let needs_per_layer_commit = moe_fn.is_some() && layers.iter().any(|l| l.moe.is_some());
 
     let mut cmd = queue.new_command_buffer().to_owned();
     let dump_path = std::env::var("LARQL_METAL_DUMP_LAYERS").ok();
@@ -440,12 +456,19 @@ pub fn dispatch_full_pipeline(
         }
 
         // ── 11. Per-layer residual scalar (Gemma 4). ──
-        if let Some(scale_pipe) = scale_vector_pipeline {
-            let enc = cmd.new_compute_command_encoder();
-            crate::metal::stages::layer_scalar::encode(
-                enc, scale_pipe, &h_bufs[l + 1], seq_len, hidden, layers[l].layer_scalar,
-            );
-            enc.end_encoding();
+        // Skipped for MoE layers in per-layer-commit mode: the moe_fn
+        // closure applies layer_scalar after combining dense + MoE output,
+        // which is the correct application point (HF: `hidden *= layer_scalar`
+        // after the full FFN block including experts).
+        let is_moe_layer = needs_per_layer_commit && layers[l].moe.is_some();
+        if !is_moe_layer {
+            if let Some(scale_pipe) = scale_vector_pipeline {
+                let enc = cmd.new_compute_command_encoder();
+                crate::metal::stages::layer_scalar::encode(
+                    enc, scale_pipe, &h_bufs[l + 1], seq_len, hidden, layers[l].layer_scalar,
+                );
+                enc.end_encoding();
+            }
         }
 
         // End-of-layer dump (LARQL_METAL_DUMP_LAYERS=<dir>) — bisects
@@ -454,17 +477,52 @@ pub fn dispatch_full_pipeline(
             dump_path.as_deref(), queue, cmd, &lb,
             layers, l, seq_len, hidden, inter,
         );
+
+        // ── Per-layer MoE interleave. ──
+        // After the dense FFN is committed, run the CPU expert block for
+        // each prompt position and accumulate into `h_bufs[l+1]`. Then
+        // restart the command buffer for the next layer.
+        if needs_per_layer_commit {
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // KV cache: copy this layer's K/V before the caller reads
+            // `h_post_attn` or touches `new_h`.
+            if let Some(kv) = kv_cache.as_mut() {
+                super::kv_copy::populate_kv_one_layer(
+                    kv, bufs, &lb, &layers[l], l, seq_len,
+                );
+            }
+
+            if is_moe_layer {
+                if let Some(ref mut f) = moe_fn {
+                    let ha_ptr = lb.h_post_attn[l].contents() as *const f32;
+                    let h_ptr = lb.h[l + 1].contents() as *mut f32;
+                    // SAFETY: GPU finished (wait_until_completed). Both buffers
+                    // are pre-allocated for `seq_len * hidden` f32s.
+                    let ha = unsafe { std::slice::from_raw_parts(ha_ptr, seq_len * hidden) };
+                    let h = unsafe { std::slice::from_raw_parts_mut(h_ptr, seq_len * hidden) };
+                    f(l, ha, h);
+                }
+            }
+
+            if l < num_layers - 1 {
+                cmd = queue.new_command_buffer().to_owned();
+            }
+        }
     }
 
-    cmd.commit();
-    cmd.wait_until_completed();
+    if !needs_per_layer_commit {
+        cmd.commit();
+        cmd.wait_until_completed();
 
-    // Post-commit: populate persistent KV cache from GPU-computed
-    // RoPE'd K/V (buffers are readable now that the command buffer is
-    // finished).
-    super::kv_copy::populate_kv_after_commit(
-        kv_cache, bufs, &lb, layers, seq_len,
-    );
+        // Post-commit: populate persistent KV cache from GPU-computed
+        // RoPE'd K/V (buffers are readable now that the command buffer is
+        // finished).
+        super::kv_copy::populate_kv_after_commit(
+            kv_cache, bufs, &lb, layers, seq_len,
+        );
+    }
 
     // Read final hidden state — `seq_len * hidden` floats, caller reshapes
     // to [seq_len, hidden] (see `layer_graph::generate`).

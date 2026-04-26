@@ -1,207 +1,22 @@
 //! Token generation loop — GPU prefill + KV-cached decode
 
+mod types;
+mod lm_head;
+mod cpu_q4k;
+
+pub use types::{StageTimings, GenerateResult};
+pub use lm_head::lm_head_topk;
+
 use larql_compute::prelude::*;
 use crate::model::ModelWeights;
 use super::CachedLayerGraph;
 
-/// Top-K logits lookup that transparently handles models with tied
-/// input/output embeddings (Gemma 2/3/4) whose vindex has no dedicated
-/// `lm_head.bin` / `lm_head_q4.bin`.
-///
-/// Resolution order:
-/// 1. Vindex-native KNN (`lm_head_knn_backend`) — fastest, used when the
-///    vindex was built with a separate lm_head.
-/// 2. CPU gemv against `weights.lm_head` — the loader fills this from
-///    `embed.clone()` for tied-embedding models, so it's always populated
-///    even when no lm_head file is present.
-///
-/// The second path is O(vocab * hidden) floats through the CPU, but that's
-/// a one-shot matvec per generated token — negligible compared to the
-/// per-layer attention + FFN. It lets every model generate tokens through
-/// the Metal pipeline regardless of how its vindex was packaged.
-pub fn lm_head_topk(
-    index: &larql_vindex::VectorIndex,
-    weights: &ModelWeights,
-    query: &ndarray::Array1<f32>,
-    top_k: usize,
-    backend: &dyn ComputeBackend,
-) -> Vec<(u32, f32)> {
-    let hits = index.lm_head_knn_backend(query, top_k, backend);
-    if !hits.is_empty() {
-        return hits;
-    }
-    backend_lm_head_topk(weights, query, top_k, backend)
-}
-
-/// LM-head top-K via the active ComputeBackend.
-///
-/// Performs a single gemv `scores[vocab] = lm_head[vocab, hidden] · query[hidden]`
-/// by dispatching `matmul_transb(query[1, hidden], lm_head[vocab, hidden])`.
-/// On Metal this is a GPU f32 gemv (under Apple Silicon unified memory the
-/// 2.68 GB `weights.lm_head` is shared, not copied). On CPU it's the
-/// BLAS fallback via the same trait method. Either way this replaces the
-/// previous unconditional CPU `ndarray::dot`, which was ~26 ms/tok on
-/// Gemma 3 4B — the dominant cost of real-vindex decode.
-fn backend_lm_head_topk(
-    weights: &ModelWeights,
-    query: &ndarray::Array1<f32>,
-    top_k: usize,
-    backend: &dyn ComputeBackend,
-) -> Vec<(u32, f32)> {
-    let lm = &weights.lm_head;
-    if lm.is_empty() || query.is_empty() { return Vec::new(); }
-    let vocab = lm.shape()[0];
-    let hidden = lm.shape()[1];
-    if hidden != query.len() { return Vec::new(); }
-
-    let query_slice = match query.as_slice() {
-        Some(s) => s,
-        None => &query.to_vec(),
-    };
-
-    // Fast path for top-1 (greedy decode): GPU gemv + GPU argmax
-    // reads back only 8 KB partial results instead of 1 MB, saving ~0.33ms.
-    if top_k == 1 {
-        if let Some((idx, score)) = backend.f32_gemv_topk1(lm.view(), query_slice) {
-            return vec![(idx, score)];
-        }
-    }
-
-    // General path: GPU gemv → full Vec<f32> → CPU top-k.
-    let scores_vec: Vec<f32> = if let Some(s) = backend.f32_gemv(lm.view(), query_slice) {
-        s
-    } else {
-        let q_row = match query.view().into_shape_with_order((1, hidden)) {
-            Ok(r) => r, Err(_) => return Vec::new(),
-        };
-        backend.matmul_transb(q_row, lm.view()).row(0).to_vec()
-    };
-
-    // Fast path for greedy decode (top_k=1): a single linear scan avoids
-    // allocating the full 262K×8=2MB indexed Vec and the select_nth pass.
-    if top_k == 1 {
-        let best = scores_vec.iter().copied().enumerate()
-            .filter(|(_, s)| s.is_finite())
-            .fold(None::<(usize, f32)>, |acc, (i, s)| {
-                Some(match acc {
-                    None => (i, s),
-                    Some((bi, bs)) => if s > bs { (i, s) } else { (bi, bs) },
-                })
-            });
-        let _ = vocab;
-        return match best {
-            Some((i, s)) => vec![(i as u32, s)],
-            None => vec![],
-        };
-    }
-
-    // Min-heap of size k: O(k) space, O(N log k) time.
-    // Avoids allocating the full 262K×8=2MB indexed Vec.
-    let k = top_k.min(vocab);
-    let _ = vocab;
-    let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
-
-    // sift-down to maintain min-heap property (smallest score at index 0).
-    fn sift_down(h: &mut [(f32, u32)], mut i: usize) {
-        let n = h.len();
-        loop {
-            let mut smallest = i;
-            let l = 2 * i + 1;
-            let r = 2 * i + 2;
-            if l < n && h[l].0 < h[smallest].0 { smallest = l; }
-            if r < n && h[r].0 < h[smallest].0 { smallest = r; }
-            if smallest == i { break; }
-            h.swap(i, smallest);
-            i = smallest;
-        }
-    }
-
-    for (i, &s) in scores_vec.iter().enumerate() {
-        if !s.is_finite() { continue; }
-        if heap.len() < k {
-            heap.push((s, i as u32));
-            if heap.len() == k {
-                // Build min-heap in O(k)
-                for j in (0..k / 2).rev() { sift_down(&mut heap, j); }
-            }
-        } else if s > heap[0].0 {
-            heap[0] = (s, i as u32);
-            sift_down(&mut heap, 0);
-        }
-    }
-    // If we gathered fewer than k finite values, still heapify.
-    if heap.len() < k && heap.len() > 1 {
-        for j in (0..heap.len() / 2).rev() { sift_down(&mut heap, j); }
-    }
-
-    heap.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    heap.into_iter().map(|(s, i)| (i, s)).collect()
-}
-
-/// Kept for the `LARQL_METAL_COMPARE_CPU=1` diagnostic mode which wants a
-/// known-good CPU reference. Not used in the hot path.
-#[allow(dead_code)]
-fn cpu_lm_head_topk(
-    weights: &ModelWeights,
-    query: &ndarray::Array1<f32>,
-    top_k: usize,
-) -> Vec<(u32, f32)> {
-    backend_lm_head_topk(weights, query, top_k, &larql_compute::CpuBackend)
-}
-
-/// Dense LM-head: full `Vec<f32>` of vocabulary scores. Required for
-/// constrained decoding — the sparse vindex KNN can't apply an arbitrary
-/// vocabulary mask because masked-out tokens might fall outside the top-K.
-/// Same compute kernel as [`backend_lm_head_topk`], just no truncation.
-fn backend_lm_head_scores(
-    weights: &ModelWeights,
-    query: &ndarray::Array1<f32>,
-    backend: &dyn ComputeBackend,
-) -> Vec<f32> {
-    let lm = &weights.lm_head;
-    if lm.is_empty() || query.is_empty() { return Vec::new(); }
-    let hidden = lm.shape()[1];
-    if hidden != query.len() { return Vec::new(); }
-    let query_slice = match query.as_slice() {
-        Some(s) => s,
-        None => &query.to_vec(),
-    };
-    if let Some(s) = backend.f32_gemv(lm.view(), query_slice) {
-        s
-    } else {
-        let q_row = match query.view().into_shape_with_order((1, hidden)) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        backend.matmul_transb(q_row, lm.view()).row(0).to_vec()
-    }
-}
-
-/// Apply `mask_fn` to dense logits, then return the argmax `(id, score)`
-/// over finite (post-mask) entries. Returns `None` if every entry is NaN
-/// or `-inf`.
-fn pick_next_token_masked<M>(
-    weights: &ModelWeights,
-    h_1d: &ndarray::Array1<f32>,
-    generated: &[u32],
-    backend: &dyn ComputeBackend,
-    mask_fn: &mut M,
-) -> Option<(u32, f32)>
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-{
-    let mut logits = backend_lm_head_scores(weights, h_1d, backend);
-    if logits.is_empty() {
-        return None;
-    }
-    mask_fn(generated, &mut logits);
-    logits
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| !v.is_nan() && v.is_finite())
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, &s)| (i as u32, s))
-}
+use lm_head::{cpu_lm_head_topk, pick_next_token_masked};
+use cpu_q4k::{
+    backend_supports_fused_q4_pipeline,
+    generate_via_cpu_q4k,
+    generate_constrained_via_cpu_q4k,
+};
 
 /// Multi-token generation: GPU prefill → decode loop with KV cache.
 ///
@@ -729,188 +544,113 @@ where
     }
 }
 
-/// Sum of per-stage decode times across every successful step.
-///
-/// Dividing each field by `GenerateResult::decode_ms.len()` gives the
-/// per-token average. Populated unconditionally — the six
-/// `Instant::now()` calls per step are negligible next to the GPU
-/// forward pass and the LM-head gemv.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StageTimings {
-    pub embed_ms_total: f64,
-    pub gpu_ms_total: f64,
-    pub norm_ms_total: f64,
-    pub lm_head_ms_total: f64,
-    pub detok_ms_total: f64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::layer_graph::CachedLayerGraph;
 
-/// Result of multi-token generation.
-pub struct GenerateResult {
-    pub tokens: Vec<(String, f64)>,
-    pub prefill_ms: f64,
-    pub decode_ms: Vec<f64>,
-    pub stage_timings: StageTimings,
-}
+    // ── lm_head / logit helpers (synthetic, no vindex) ────────────────────────
 
-impl StageTimings {
-    /// Per-token average across `n` decode steps. Returns all-zero if
-    /// `n == 0` (short-circuit no-decode paths safely).
-    pub fn avg_per_step(&self, n: usize) -> StageTimings {
-        if n == 0 { return Self::default(); }
-        let nf = n as f64;
-        StageTimings {
-            embed_ms_total: self.embed_ms_total / nf,
-            gpu_ms_total: self.gpu_ms_total / nf,
-            norm_ms_total: self.norm_ms_total / nf,
-            lm_head_ms_total: self.lm_head_ms_total / nf,
-            detok_ms_total: self.detok_ms_total / nf,
+    #[test]
+    fn backend_lm_head_scores_shape() {
+        let weights = make_test_weights();
+        let q = ndarray::Array1::from_elem(weights.hidden_size, 0.1f32);
+        let scores = lm_head::backend_lm_head_scores(&weights, &q, &larql_compute::CpuBackend);
+        assert_eq!(scores.len(), weights.vocab_size, "scores length should be vocab_size");
+        assert!(scores.iter().all(|v| v.is_finite()), "scores should be finite");
+    }
+
+    #[test]
+    fn cpu_lm_head_topk_length() {
+        let weights = make_test_weights();
+        let q = ndarray::Array1::from_elem(weights.hidden_size, 0.3f32);
+        let hits = lm_head::cpu_lm_head_topk(&weights, &q, 5);
+        assert!(hits.len() <= 5, "top-k should return at most 5 entries");
+        assert!(!hits.is_empty(), "should return at least 1 entry");
+    }
+
+    #[test]
+    fn cpu_lm_head_topk_sorted_descending() {
+        let weights = make_test_weights();
+        let q = ndarray::Array1::from_shape_vec(
+            weights.hidden_size,
+            (0..weights.hidden_size).map(|i| i as f32 * 0.01).collect()
+        ).unwrap();
+        let hits = lm_head::cpu_lm_head_topk(&weights, &q, 4);
+        let scores: Vec<f32> = hits.iter().map(|(_, s)| *s).collect();
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "top-k should be sorted descending: {} >= {}", w[0], w[1]);
         }
     }
-}
 
-impl GenerateResult {
-    pub fn avg_decode_ms(&self) -> f64 {
-        if self.decode_ms.is_empty() { 0.0 }
-        else { self.decode_ms.iter().sum::<f64>() / self.decode_ms.len() as f64 }
-    }
-
-    pub fn decode_tok_s(&self) -> f64 {
-        let avg = self.avg_decode_ms();
-        if avg > 0.0 { 1000.0 / avg } else { 0.0 }
-    }
-
-    pub fn text(&self) -> String {
-        self.tokens.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("")
-    }
-}
-
-// ── Backend capability probe + CPU Q4K delegation ────────────────────────────
-//
-// `generate` / `generate_constrained` assume the backend implements the fused
-// Q4 prefill + KV-cached decode pipeline (currently: Metal). Backends that
-// lack it (CpuBackend) delegate to the per-layer CPU Q4K dequant path
-// (`predict_q4k_hidden`), which mutates `weights.tensors` per layer — that's
-// the single reason these functions take `&mut ModelWeights`.
-
-/// True when the backend can handle the fused Q4 prefill + decode pipeline
-/// directly. Metal: yes. Pure CPU: no — that path produces correct forward
-/// results via the vindex Q4K dequant loop in `crate::vindex::q4k_forward`.
-fn backend_supports_fused_q4_pipeline(backend: &dyn ComputeBackend) -> bool {
-    // CpuBackend reports `has_q4() == true` (it has Q4 matvecs) but does not
-    // override `prefill_q4` — the trait default returns None. A zero-arg
-    // probe would allocate; probe the backend name instead, which is stable
-    // and cheap. Metal's CpuBackend is labelled "cpu (...)".
-    let name = backend.name();
-    !name.starts_with("cpu")
-}
-
-/// CPU Q4K generate path: loops `predict_q4k` one step at a time. O(N²) in
-/// context length (no KV cache), but correct across all supported
-/// architectures including hybrid MoE (if wired — see
-/// `crate::vindex::q4k_forward::predict_q4k_hidden`).
-fn generate_via_cpu_q4k(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-) -> GenerateResult {
-    let prefill_start = std::time::Instant::now();
-    // First-token pass covers the prompt — that's our "prefill" here.
-    let first = crate::vindex::predict_q4k(
-        weights, tokenizer, token_ids, 5, index,
-    );
-    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-
-    let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
-    let mut decode_ms = Vec::with_capacity(max_tokens);
-    let mut t_gpu = 0.0f64;
-
-    let mut ids = token_ids.to_vec();
-    // Seed with the first predicted token from the prefill pass.
-    if let (Some(&id), Some(first_pred)) = (first.token_ids.first(), first.predictions.first()) {
-        tokens.push((first_pred.0.clone(), 1.0));
-        let stop = crate::vindex::is_end_of_turn(first_pred.0.trim());
-        ids.push(id);
-        if stop {
-            return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() };
+    #[test]
+    fn cpu_lm_head_topk_token_ids_in_range() {
+        let weights = make_test_weights();
+        let q = ndarray::Array1::zeros(weights.hidden_size);
+        let hits = lm_head::cpu_lm_head_topk(&weights, &q, 3);
+        for (id, _) in &hits {
+            assert!(*id < weights.vocab_size as u32,
+                "token id {id} should be < vocab_size {}", weights.vocab_size);
         }
-    } else {
-        return GenerateResult { tokens, prefill_ms, decode_ms, stage_timings: StageTimings::default() };
     }
 
-    for _step in 1..max_tokens {
-        let t0 = std::time::Instant::now();
-        let result = crate::vindex::predict_q4k(
-            weights, tokenizer, &ids, 5, index,
+    // ── Real-model generate tests (require LARQL_VINDEX_PATH) ─────────────────
+    //
+    // Run with:
+    //   LARQL_VINDEX_PATH=/path/to/gemma3-4b-q4k-v2.vindex \
+    //   cargo test -p larql-inference --lib layer_graph::generate::tests -- --ignored --nocapture
+
+    fn load_test_vindex() -> Option<(larql_vindex::VectorIndex, larql_models::ModelWeights)> {
+        let vpath = std::env::var("LARQL_VINDEX_PATH").ok()?;
+        let path = std::path::Path::new(&vpath);
+        let mut cb = larql_vindex::SilentLoadCallbacks;
+        let mut index = larql_vindex::VectorIndex::load_vindex(path, &mut cb).ok()?;
+        index.load_attn_q4k(path).ok()?;
+        index.load_interleaved_q4k(path).ok()?;
+        let weights = larql_vindex::load_model_weights_q4k(path, &mut cb).ok()?;
+        Some((index, weights))
+    }
+
+    #[test]
+    #[ignore = "requires LARQL_VINDEX_PATH pointing to a Q4K vindex"]
+    fn generate_returns_tokens() {
+        let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
+        let tokenizer = larql_vindex::load_vindex_tokenizer(
+            std::path::Path::new(&std::env::var("LARQL_VINDEX_PATH").unwrap())
+        ).expect("tokenizer load failed");
+
+        let prompt = "The capital of France is";
+        let token_ids = crate::encode_prompt(&tokenizer, &*weights.arch, prompt)
+            .expect("tokenize failed");
+
+        let backend = larql_compute::default_backend();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        let result = generate(
+            &mut weights, &tokenizer, &token_ids, 5,
+            &index, backend.as_ref(), &cached, 0..num_layers,
         );
-        let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        decode_ms.push(step_ms);
-        t_gpu += step_ms;
 
-        match result.token_ids.first() {
-            Some(&id) => {
-                let tok = result.predictions.first().map(|p| p.0.clone()).unwrap_or_default();
-                let stop = crate::vindex::is_end_of_turn(tok.trim());
-                tokens.push((tok, 1.0));
-                ids.push(id);
-                if stop { break; }
-            }
-            None => break,
-        }
+        assert!(!result.tokens.is_empty(), "should generate at least one token");
+        eprintln!("Generated: {:?}", result.tokens.iter().map(|(t, _)| t).collect::<Vec<_>>());
     }
 
-    GenerateResult {
-        tokens,
-        prefill_ms,
-        decode_ms,
-        stage_timings: StageTimings {
-            embed_ms_total: 0.0,
-            gpu_ms_total: t_gpu,
-            norm_ms_total: 0.0,
-            lm_head_ms_total: 0.0,
-            detok_ms_total: 0.0,
-        },
-    }
-}
-
-/// Constrained variant of [`generate_via_cpu_q4k`]. Thin wrapper over
-/// `vindex::q4k_forward::generate_q4k_cpu_constrained` that adapts the
-/// result shape into `GenerateResult`.
-fn generate_constrained_via_cpu_q4k<M>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    mask_fn: M,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-{
-    let prefill_start = std::time::Instant::now();
-    let out = crate::vindex::generate_q4k_cpu_constrained(
-        weights, tokenizer, token_ids, max_tokens, index, mask_fn,
-    );
-    let total_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-    // Heuristic split: attribute the first token to prefill, the rest to
-    // decode. Matches the semantics of the GPU path closely enough for
-    // bench-report purposes without tracking per-step timing inside the
-    // constrained CPU loop.
-    let n = out.len();
-    let (prefill_ms, decode_ms_each) = if n == 0 {
-        (total_ms, 0.0)
-    } else {
-        let avg = total_ms / n as f64;
-        (avg, avg)
-    };
-    let tokens: Vec<(String, f64)> =
-        out.into_iter().map(|(t, _)| (t, 1.0)).collect();
-    let decode_ms = (1..tokens.len()).map(|_| decode_ms_each).collect();
-    GenerateResult {
-        tokens,
-        prefill_ms,
-        decode_ms,
-        stage_timings: StageTimings::default(),
+    #[test]
+    #[ignore = "requires LARQL_VINDEX_PATH"]
+    fn generate_prefill_ms_positive() {
+        let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set");
+        let tokenizer = larql_vindex::load_vindex_tokenizer(
+            std::path::Path::new(&std::env::var("LARQL_VINDEX_PATH").unwrap())
+        ).unwrap();
+        let prompt = "Hello";
+        let token_ids = crate::encode_prompt(&tokenizer, &*weights.arch, prompt).unwrap();
+        let backend = larql_compute::default_backend();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        let result = generate(&mut weights, &tokenizer, &token_ids, 1,
+            &index, backend.as_ref(), &cached, 0..num_layers);
+        assert!(result.prefill_ms > 0.0, "prefill_ms should be positive (timing was recorded)");
+        assert_eq!(result.decode_ms.len(), result.tokens.len().saturating_sub(1));
     }
 }

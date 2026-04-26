@@ -393,3 +393,146 @@ impl<'a> FfnBackend for WalkFfn<'a> {
         "walk"
     }
 }
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use ndarray::{Array1, Array2};
+    use larql_vindex::{GateIndex, FeatureMeta, WalkHit, WalkTrace};
+    use std::sync::OnceLock;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::model::ModelWeights;
+
+    fn shared_weights() -> &'static ModelWeights {
+        static W: OnceLock<ModelWeights> = OnceLock::new();
+        W.get_or_init(make_test_weights)
+    }
+    use crate::ffn::FfnBackend;
+
+    /// Minimal GateIndex with only the 3 required methods.
+    /// All optional methods fall back to their trait defaults (all return None/false/[]).
+    /// WalkFfn routes through path 9 (last-resort sparse matmul against weights.tensors).
+    struct MockGateIndex {
+        n_features: usize,
+        hidden: usize,
+    }
+
+    impl GateIndex for MockGateIndex {
+        fn gate_knn(&self, _layer: usize, _residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
+            (0..top_k.min(self.n_features))
+                .map(|i| (i, 1.0 / (i as f32 + 1.0)))
+                .collect()
+        }
+        fn feature_meta(&self, _layer: usize, _feature: usize) -> Option<FeatureMeta> { None }
+        fn num_features(&self, _layer: usize) -> usize { self.n_features }
+    }
+
+    fn mock_index(weights: &ModelWeights) -> MockGateIndex {
+        MockGateIndex { n_features: weights.intermediate_size, hidden: weights.hidden_size }
+    }
+
+    fn input(seq: usize, hidden: usize) -> Array2<f32> {
+        Array2::from_shape_vec((seq, hidden),
+            (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect()
+        ).unwrap()
+    }
+
+    // ── WalkFfn construction ──────────────────────────────────────────────────
+
+    #[test]
+    fn walk_ffn_new_unlimited() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        assert_eq!(ffn.name(), "walk");
+    }
+
+    #[test]
+    fn walk_ffn_sparse_k() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new(&weights, &idx, 4);
+        assert_eq!(ffn.name(), "walk");
+    }
+
+    // ── forward shape and finiteness ─────────────────────────────────────────
+
+    #[test]
+    fn walk_ffn_forward_shape_single_token() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let x = input(1, weights.hidden_size);
+        let out = ffn.forward(0, &x);
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn walk_ffn_forward_shape_multi_token() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let x = input(3, weights.hidden_size);
+        let out = ffn.forward(0, &x);
+        assert_eq!(out.shape(), &[3, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn walk_ffn_forward_all_layers() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let x = input(1, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            let out = ffn.forward(layer, &x);
+            assert_eq!(out.shape(), &[1, weights.hidden_size], "layer {layer} wrong shape");
+            assert!(out.iter().all(|v| v.is_finite()), "layer {layer} non-finite");
+        }
+    }
+
+    #[test]
+    fn walk_ffn_sparse_vs_dense_same_shape() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn_sparse = WalkFfn::new(&weights, &idx, 4);
+        let ffn_dense  = WalkFfn::new_unlimited(&weights, &idx);
+        let x = input(1, weights.hidden_size);
+        let out_s = ffn_sparse.forward(0, &x);
+        let out_d = ffn_dense.forward(0, &x);
+        assert_eq!(out_s.shape(), out_d.shape());
+    }
+
+    #[test]
+    fn walk_ffn_with_activation_returns_activation() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let x = input(2, weights.hidden_size);
+        let (out, act) = ffn.forward_with_activation(0, &x);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert_eq!(act.shape()[0], 2, "activation should have seq_len rows");
+    }
+
+    #[test]
+    fn walk_ffn_zero_features_falls_back_to_weight_ffn() {
+        // When MockGateIndex returns 0 features, WalkFfn should fall back to WeightFfn.
+        let weights = shared_weights();
+        let zero_idx = MockGateIndex { n_features: 0, hidden: weights.hidden_size };
+        let ffn = WalkFfn::new_unlimited(&weights, &zero_idx);
+        let x = input(1, weights.hidden_size);
+        let out = ffn.forward(0, &x);
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn walk_ffn_with_backend() {
+        let weights = shared_weights();
+        let idx = mock_index(&weights);
+        let ffn = WalkFfn::new_unlimited_with_backend(&weights, &idx, &larql_compute::CpuBackend);
+        let x = input(1, weights.hidden_size);
+        let out = ffn.forward(0, &x);
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+    }
+}

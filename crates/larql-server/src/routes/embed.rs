@@ -375,9 +375,7 @@ fn handle_token_encode_inner(
     q: TokenEncodeQuery,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(model_id)
-        .ok_or_else(|| ServerError::NotFound("model not found".into()))?;
+    let model = state.model_or_err(model_id)?;
 
     let enc = model
         .tokenizer
@@ -415,9 +413,7 @@ fn handle_token_decode_inner(
     q: TokenDecodeQuery,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(model_id)
-        .ok_or_else(|| ServerError::NotFound("model not found".into()))?;
+    let model = state.model_or_err(model_id)?;
 
     let ids: Vec<u32> = q
         .ids

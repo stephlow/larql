@@ -6,6 +6,7 @@
 
 pub mod announce;
 pub mod auth;
+pub mod band_utils;
 pub mod cache;
 pub mod embed_store;
 pub mod error;

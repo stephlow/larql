@@ -559,3 +559,142 @@ pub fn trace_with_graph(
         attention: attention_captures,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use crate::engines::test_utils::{make_test_weights, make_test_vindex, make_test_tokenizer, TestFixtures};
+    use crate::model::ModelWeights;
+
+    fn fx() -> &'static TestFixtures {
+        static F: OnceLock<TestFixtures> = OnceLock::new();
+        F.get_or_init(TestFixtures::build)
+    }
+    use crate::layer_graph::CachedLayerGraph;
+    use crate::ffn::WeightFfn;
+    use larql_compute::CpuBackend;
+
+    // ── predict_with_ffn ──────────────────────────────────────────────────────
+
+    #[test]
+    fn predict_with_ffn_returns_predictions() {
+        let f = fx();
+        let (weights, tokenizer) = (&f.weights, &f.tokenizer);
+        let ffn = WeightFfn { weights: &weights };
+        let result = crate::forward::predict_with_ffn(&weights, &tokenizer, &[0u32, 1], 3, &ffn);
+        assert!(result.token_ids.len() <= 3);
+        assert_eq!(result.predictions.len(), result.token_ids.len());
+        assert!(result.token_ids.iter().all(|&id| (id as usize) < weights.vocab_size));
+    }
+
+    #[test]
+    fn predict_with_ffn_single_token() {
+        let f = fx();
+        let (weights, tokenizer) = (&f.weights, &f.tokenizer);
+        let ffn = WeightFfn { weights: &weights };
+        let result = crate::forward::predict_with_ffn(&weights, &tokenizer, &[5u32], 1, &ffn);
+        assert!(result.token_ids.len() <= 1);
+    }
+
+    // ── predict_honest (CPU path via VectorIndex::new with no Q4K) ────────────
+
+    #[test]
+    fn predict_honest_runs_without_panic() {
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        // predict_honest falls through to CPU path (no Q4K data in synthetic vindex)
+        let result = predict_honest(
+            &weights, &tokenizer, &[0u32, 1, 2], 5,
+            &index, &CpuBackend, &cached, 0..num_layers,
+        );
+        // lm_head_knn is empty → predictions may be empty, but no panic
+        assert!(result.token_ids.len() <= 5);
+    }
+
+    #[test]
+    fn predict_honest_single_token_decode_path() {
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        let result = predict_honest(
+            &weights, &tokenizer, &[3u32], 3,
+            &index, &CpuBackend, &cached, 0..num_layers,
+        );
+        assert!(result.token_ids.len() <= 3);
+    }
+
+    #[test]
+    fn predict_honest_with_cached_layers() {
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let ffn = WeightFfn { weights: &weights };
+        // Pre-cache layer 0
+        let cached = CachedLayerGraph::build(&weights, &[0u32], &[0], &ffn);
+        let num_layers = weights.num_layers;
+        let result = predict_honest(
+            &weights, &tokenizer, &[0u32], 3,
+            &index, &CpuBackend, &cached, 0..num_layers,
+        );
+        assert!(result.token_ids.len() <= 3);
+    }
+
+    // ── DenseLayerGraph ───────────────────────────────────────────────��───────
+
+    #[test]
+    fn dense_layer_graph_forward_runs() {
+        use crate::layer_graph::{DenseLayerGraph, LayerGraph};
+        let weights = &fx().weights;
+        let ffn = WeightFfn { weights: &weights };
+        let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.1f32);
+        let g = DenseLayerGraph { ffn: &ffn, backend: None, capture_activation: false, capture_attention: false };
+        let out = g.forward_layer(&weights, &h, 0);
+        assert!(out.is_some(), "DenseLayerGraph should forward layer 0");
+        assert_eq!(out.unwrap().residual.shape(), &[2, weights.hidden_size]);
+    }
+
+    #[test]
+    fn dense_layer_graph_all_layers() {
+        use crate::layer_graph::{DenseLayerGraph, LayerGraph};
+        let weights = &fx().weights;
+        let ffn = WeightFfn { weights: &weights };
+        let h = ndarray::Array2::from_elem((1, weights.hidden_size), 0.5f32);
+        let g = DenseLayerGraph { ffn: &ffn, backend: None, capture_activation: false, capture_attention: false };
+        for layer in 0..weights.num_layers {
+            let out = g.forward_layer(&weights, &h, layer);
+            assert!(out.is_some(), "layer {layer} should succeed");
+        }
+    }
+
+    // ── WalkLayerGraph ────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_layer_graph_forward_runs() {
+        use crate::layer_graph::{WalkLayerGraph, LayerGraph};
+        let weights = &fx().weights;
+        let ffn = WeightFfn { weights: &weights };
+        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.1f32);
+        let out = g.forward_layer(&weights, &h, 0);
+        assert!(out.is_some());
+        assert_eq!(out.unwrap().residual.shape(), &[2, weights.hidden_size]);
+    }
+
+    // ── predict_pipeline ─────────────────────────────────────────────────────
+
+    #[test]
+    fn predict_pipeline_runs() {
+        use crate::layer_graph::LayerGraph;
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let ffn = WeightFfn { weights: &weights };
+        let g = crate::layer_graph::WalkLayerGraph { ffn: &ffn, backend: None };
+        let graph: &dyn LayerGraph = &g;
+        // predict_pipeline takes Option<&VectorIndex>
+        let result = predict_pipeline(&weights, &tokenizer, &[0u32, 1], 3, graph, Some(&index));
+        assert!(result.token_ids.len() <= 3);
+    }
+}

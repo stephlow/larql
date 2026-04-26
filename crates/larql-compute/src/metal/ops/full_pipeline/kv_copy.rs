@@ -14,6 +14,36 @@ use crate::metal::buffers::BufferCache;
 use crate::metal::ops::kv_cache::{KVCache, LayerKVCache};
 use crate::FullPipelineLayer;
 
+/// Copy one layer's K/V scratch into the persistent KV cache.
+/// Called inside the per-layer MoE commit loop so the cache is current
+/// before the CPU MoE callback reads `h_post_attn` and writes to `new_h`.
+pub(super) fn populate_kv_one_layer(
+    kv: &mut KVCache,
+    bufs: &BufferCache,
+    lb: &LayerBuffers,
+    layer: &FullPipelineLayer<'_>,
+    layer_idx: usize,
+    seq_len: usize,
+) {
+    let lhd = layer.head_dim;
+    let lnkv = layer.num_kv_heads;
+    while kv.layers.len() <= layer_idx {
+        kv.layers.push(LayerKVCache::new(bufs, 4096, lnkv, lhd));
+    }
+    let total_kv = seq_len * lnkv * lhd;
+    let k_src = lb.k_out[layer_idx].contents() as *const f32;
+    let v_src = lb.v_out[layer_idx].contents() as *const f32;
+    let k_dst = kv.layers[layer_idx].k_cache.contents() as *mut f32;
+    let v_dst = kv.layers[layer_idx].v_cache.contents() as *mut f32;
+    // SAFETY: caller commit + wait before invocation. Destination
+    // pre-allocated for max_seq * lnkv * lhd; copy bounded by max_seq.
+    unsafe {
+        std::ptr::copy_nonoverlapping(k_src, k_dst, total_kv);
+        std::ptr::copy_nonoverlapping(v_src, v_dst, total_kv);
+    }
+    kv.layers[layer_idx].current_len = seq_len;
+}
+
 /// Copy each layer's K/V scratch (post-RoPE) into the persistent KV
 /// cache. Grows the cache's per-layer storage on demand so it sizes
 /// to whichever model variant called us first.
@@ -183,5 +213,66 @@ mod tests {
             assert_eq!(kv.layers[l].num_kv_heads, 4);
             assert_eq!(kv.layers[l].head_dim, 64);
         }
+    }
+
+    // ── populate_kv_one_layer ─────────────────────────────────────────────────
+
+    /// `populate_kv_one_layer` targets exactly one layer — other layers in the
+    /// cache must be untouched. This is the per-layer variant used in the
+    /// batched MoE prefill commit loop.
+    #[test]
+    fn populate_kv_one_layer_updates_only_target_layer() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        let bufs = metal.bufs();
+
+        let head_dim    = 64usize;
+        let num_kv_heads = 4usize;
+        let seq_len     = 3usize;
+        let total_kv    = seq_len * num_kv_heads * head_dim;
+
+        let layers = vec![
+            synth_layer(8, num_kv_heads, head_dim),
+            synth_layer(8, num_kv_heads, head_dim),
+        ];
+        let lb = LayerBuffers::allocate(bufs, &layers, &[0.0; 64], 64, 256, seq_len, 8 * head_dim);
+
+        // Stamp a distinct pattern into layer 1's K/V scratch buffers.
+        let k_pat: Vec<f32> = (0..total_kv).map(|i| 50.0 + i as f32 * 0.1).collect();
+        let v_pat: Vec<f32> = (0..total_kv).map(|i| 60.0 + i as f32 * 0.1).collect();
+        write_metal_f32(&lb.k_out[1], &k_pat);
+        write_metal_f32(&lb.v_out[1], &v_pat);
+
+        let mut kv = KVCache::new(bufs, 2, 4096, num_kv_heads, head_dim);
+        assert_eq!(kv.layers[0].current_len, 0);
+        assert_eq!(kv.layers[1].current_len, 0);
+
+        populate_kv_one_layer(&mut kv, bufs, &lb, &layers[1], 1, seq_len);
+
+        // Layer 0 must be untouched.
+        assert_eq!(kv.layers[0].current_len, 0, "layer 0 must not be updated");
+
+        // Layer 1 must reflect the stamped K/V.
+        assert_eq!(kv.layers[1].current_len, seq_len, "layer 1 current_len updated");
+        let k_got = read_metal_f32(&kv.layers[1].k_cache, total_kv);
+        let v_got = read_metal_f32(&kv.layers[1].v_cache, total_kv);
+        assert_eq!(k_got, k_pat, "K cache mismatch");
+        assert_eq!(v_got, v_pat, "V cache mismatch");
+    }
+
+    /// `populate_kv_one_layer` grows an empty cache on demand (same as the
+    /// `populate_kv_after_commit` grow path, but per layer).
+    #[test]
+    fn populate_kv_one_layer_grows_empty_cache() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        let bufs = metal.bufs();
+
+        let layers = vec![synth_layer(8, 4, 64), synth_layer(8, 4, 64)];
+        let lb = LayerBuffers::allocate(bufs, &layers, &[0.0; 64], 64, 256, 1, 8 * 64);
+
+        let mut kv = KVCache { layers: vec![] };
+        // Populate layer 1 into an empty cache — must grow to at least 2 layers.
+        populate_kv_one_layer(&mut kv, bufs, &lb, &layers[1], 1, 1);
+        assert!(kv.layers.len() >= 2, "cache must grow to hold the target layer");
+        assert_eq!(kv.layers[1].current_len, 1);
     }
 }

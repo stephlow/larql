@@ -96,7 +96,7 @@ use larql_vindex::GateIndex as _;
 use serde::Deserialize;
 
 use crate::error::ServerError;
-use crate::state::{AppState, LoadedModel};
+use crate::state::{AppState, LoadedModel, elapsed_ms};
 
 pub(crate) const BINARY_CT: &str = "application/x-larql-ffn";
 pub(crate) const BATCH_MARKER: u32 = 0xFFFF_FFFF;
@@ -438,8 +438,7 @@ fn run_features_only(
         }));
     }
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let latency_rounded = (latency_ms * 10.0).round() / 10.0;
+    let latency_rounded = elapsed_ms(start);
 
     if scan_layers.len() == 1 {
         let r = &results[0];
@@ -461,9 +460,7 @@ fn run_walk_ffn(
     state: &AppState,
     req: &WalkFfnRequest,
 ) -> Result<serde_json::Value, ServerError> {
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+    let model = state.model_or_err(None)?;
 
     let hidden = model.config.hidden_size;
     validate_residual(req, hidden)?;
@@ -507,9 +504,7 @@ pub async fn handle_walk_ffn(
             ));
         }
         let result = tokio::task::spawn_blocking(move || {
-            let model = state
-                .model(None)
-                .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+            let model = state.model_or_err(None)?;
             validate_residual(&req, model.config.hidden_size)?;
             let scan_layers = collect_scan_layers(&req)?;
             validate_owned(model, &scan_layers)?;

@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use axum::http::HeaderMap;
 use std::time::{Duration, Instant};
 
 use larql_vindex::PatchedVindex;
@@ -131,7 +133,7 @@ impl SessionManager {
                 .iter()
                 .map(|p| {
                     serde_json::json!({
-                        "name": p.description.as_deref().unwrap_or("unnamed"),
+                        "name": p.description.as_deref().unwrap_or(PATCH_UNNAMED),
                         "operations": p.operations.len(),
                         "base_model": p.base_model,
                     })
@@ -156,7 +158,7 @@ impl SessionManager {
             .patched
             .patches
             .iter()
-            .position(|p| p.description.as_deref().unwrap_or("unnamed") == name)
+            .position(|p| p.description.as_deref().unwrap_or(PATCH_UNNAMED) == name)
             .ok_or_else(|| format!("patch '{}' not found in session", name))?;
 
         session.patched.remove_patch(idx);
@@ -173,4 +175,18 @@ impl SessionManager {
     pub async fn session_count(&self) -> usize {
         self.sessions.read().await.len()
     }
+}
+
+/// HTTP header used to scope patches and queries to a session.
+pub const HEADER_SESSION_ID: &str = "x-session-id";
+
+/// Fallback name for unnamed patches and sessions.
+pub const PATCH_UNNAMED: &str = "unnamed";
+
+/// Extract the `X-Session-Id` header value, if present.
+pub fn extract_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }

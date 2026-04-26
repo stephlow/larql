@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 
 use crate::error::ServerError;
-use crate::state::{AppState, LoadedModel};
+use crate::state::{AppState, LoadedModel, elapsed_ms};
 
 /// Content-word filter matching the local executor's `is_content_token`.
 fn is_content_token(tok: &str) -> bool {
@@ -75,17 +75,7 @@ fn list_relations(
     let all_layers = patched.loaded_layers();
 
     // Scan knowledge band layers (14-27 for Gemma, or use config).
-    let config = &model.config;
-    let last = config.num_layers.saturating_sub(1);
-    let bands = config
-        .layer_bands
-        .clone()
-        .or_else(|| larql_vindex::LayerBands::for_family(&config.family, config.num_layers))
-        .unwrap_or(larql_vindex::LayerBands {
-            syntax: (0, last),
-            knowledge: (0, last),
-            output: (0, last),
-        });
+    let bands = crate::band_utils::get_layer_bands(model);
 
     let scan_layers: Vec<usize> = all_layers
         .iter()
@@ -172,14 +162,12 @@ fn list_relations(
         .map(|(name, count)| serde_json::json!({"name": name, "count": count}))
         .collect();
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
     Ok(serde_json::json!({
         "relations": relations,
         "probe_relations": probe_list,
         "probe_count": model.probe_labels.len(),
         "total": tokens.len(),
-        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        "latency_ms": elapsed_ms(start),
     }))
 }
 
@@ -188,10 +176,7 @@ pub async fn handle_relations(
     Query(_params): Query<RelationsParams>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
-    let model = Arc::clone(model);
+    let model = state.model_or_err(None)?.clone();
     let result = tokio::task::spawn_blocking(move || list_relations(&model))
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
@@ -204,10 +189,7 @@ pub async fn handle_relations_multi(
     Query(_params): Query<RelationsParams>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(Some(&model_id))
-        .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
-    let model = Arc::clone(model);
+    let model = state.model_or_err(Some(&model_id))?.clone();
     let result = tokio::task::spawn_blocking(move || list_relations(&model))
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;

@@ -13,6 +13,96 @@ larql bench gemma3-4b-q4k --engine markov-rs,unlimited-context,turbo-quant,apoll
 
 ---
 
+## P0: Generation quality (blocks demo)
+
+### Chat template — inference side
+**Status**: Not started  
+**Files**: `src/forward/generate.rs`, `src/forward/generate_cached.rs`  
+Read `tokenizer_config.json` from the vindex, parse the `chat_template` Jinja
+field with `minijinja` (already in `Cargo.toml`), apply to the token sequence
+before generation. `--no-chat-template` flag to bypass for base models or raw
+prompts. `larql-cli` owns the flag; this crate owns the template application.
+
+### EOS detection
+**Status**: Partial — checks `<eos>`, `</s>`, `<|endoftext|>` but missing Gemma 4 `<end_of_turn>`  
+**Files**: `src/forward/generate.rs`  
+Read `eos_token_id` (and `eos_token_ids` list) from `config.json`; also read
+`stop_strings` from `generation_config.json`. Check decoded token string + token
+ID at every generate step. Gemma 4 lists `<end_of_turn>` in `stop_strings` but
+not in `eos_token_id`; without this fix greedy decode runs to `--max-tokens`.
+
+### Token spacing / detokenisation
+**Status**: Not started  
+**Files**: `src/forward/generate.rs`  
+`tokenizer.decode` is called per-token; accumulate instead, trimming only the
+very first token. HuggingFace tokenizers use a leading-space convention (`▁Paris`)
+that is stripped incorrectly when decoding single tokens, causing "Parisatthe..."
+output.
+
+### Token streaming
+**Status**: Not started  
+**Files**: `src/forward/generate.rs`  
+Change `generate` / `generate_cached` to accept `on_token: impl FnMut(&str, f64)`
+callback. Caller (CLI) prints each token; server uses SSE chunks from the same
+callback. Currently the full token list is collected before returning — the CLI
+is silent for the entire `--max-tokens` run.
+
+### Sampling
+**Status**: Not started  
+**Files**: `src/forward/generate.rs`  
+Add temperature softmax, top-k filtering, and top-p (nucleus) filtering as
+logit post-processing steps after lm_head and before argmax. No GPU changes
+required. Flags (`--temperature`, `--top-p`, `--top-k`) are owned by `larql-cli`.
+
+### Repetition penalty
+**Status**: Not started  
+**Files**: `src/forward/generate.rs`  
+Before argmax / sampling, divide each logit by the repetition penalty if that
+token appears in the recent generation window. Practical fix for greedy looping
+on base models without a chat template. Flag (`--repetition-penalty`) owned by
+`larql-cli`.
+
+### Multi-turn KV state
+**Status**: Not started — `larql chat` resets KV cache per turn today  
+**Files**: `src/forward/generate.rs`, `src/forward/kv_generate.rs`  
+Maintain a running `token_ids` buffer across turns. After each response, append
+response token IDs before the next user turn so the KV cache grows across turns.
+`--max-context N` eviction: drop oldest turns when the buffer exceeds `N`.
+
+### Long context / dynamic KV
+**Status**: Not started — hard-capped at 4096 tokens  
+**Files**: `src/forward/generate.rs`  
+Expose `--max-context N` (default 8192) threaded to `KVCache::new_per_layer`.
+Dynamic Metal buffer growth or sliding-window fallback when `current_len` reaches
+`max_seq`. Interim acceptable: warn and truncate, document the limit.
+
+### Gemma 3 4B regression smoke test
+**Status**: Not started  
+Load `gemma3-4b-q4k-streaming`, run `larql run "The capital of France is" -n 1 --metal`,
+assert first token is `"Paris"`. Gate on `CI_INTEGRATION=1` so it doesn't run
+on every PR but does run before release branches.
+
+---
+
+## P0: MoE inference completions
+
+### MoE-aware CPU forward pass
+**Status**: Not started  
+**Files**: `src/forward/layer.rs`  
+`predict_q4k` / `WeightFfn::forward` has no MoE branch; the non-Metal CPU path
+produces wrong output on Gemma 4 26B A4B. Wire `cpu_moe_forward` (already
+implemented in `larql-compute/src/cpu/ops/moe.rs`) into `forward/layer.rs` for
+the `predict_q4k` path.
+
+### Wire `RouterIndex` client-side
+**Status**: Not started  
+**Files**: `src/forward/layer.rs`  
+`crates/larql-vindex/src/index/router.rs` exists but is not connected to the
+forward pass. Connect it so the MoE router runs locally against the vindex's
+router index before dispatching to local or remote experts.
+
+---
+
 ## P0: Engine performance parity
 
 ### TurboQuant Metal K/V checkpoint compression

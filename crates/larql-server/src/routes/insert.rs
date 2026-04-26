@@ -11,8 +11,10 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 
+use crate::band_utils::{INSERT_MODE_CONSTELLATION, INSERT_MODE_EMBEDDING, get_layer_bands};
 use crate::error::ServerError;
-use crate::state::{AppState, LoadedModel};
+use crate::session::extract_session_id;
+use crate::state::{AppState, LoadedModel, elapsed_ms};
 
 #[derive(Deserialize)]
 pub struct InsertRequest {
@@ -29,14 +31,6 @@ pub struct InsertRequest {
 
 fn default_alpha() -> f32 { 0.25 }
 fn default_confidence() -> f32 { 0.9 }
-
-/// Extract session ID from headers.
-fn session_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-}
 
 /// Compute insert layers and residuals from a forward pass.
 /// Needs only read access to the patched vindex.
@@ -173,14 +167,7 @@ fn run_insert(
     let start = std::time::Instant::now();
 
     // Determine insert layers
-    let last = model.config.num_layers.saturating_sub(1);
-    let bands = model.config.layer_bands.clone()
-        .or_else(|| larql_vindex::LayerBands::for_family(&model.config.family, model.config.num_layers))
-        .unwrap_or(larql_vindex::LayerBands {
-            syntax: (0, last),
-            knowledge: (0, last),
-            output: (0, last),
-        });
+    let bands = get_layer_bands(model);
 
     let insert_layers: Vec<usize> = if let Some(l) = req.layer {
         vec![l]
@@ -215,17 +202,15 @@ fn run_insert(
         apply_insert(model, &mut patched, req, &insert_layers, &residuals)
     };
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
     Ok(serde_json::json!({
         "entity": req.entity,
         "relation": req.relation,
         "target": req.target,
         "inserted": inserted,
-        "mode": if use_constellation { "constellation" } else { "embedding" },
+        "mode": if use_constellation { INSERT_MODE_CONSTELLATION } else { INSERT_MODE_EMBEDDING },
         "alpha": req.alpha,
         "session": session_id,
-        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        "latency_ms": elapsed_ms(start),
     }))
 }
 
@@ -235,11 +220,8 @@ pub async fn handle_insert(
     Json(req): Json<InsertRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
-    let model = Arc::clone(model);
-    let sid = session_id(&headers);
+    let model = Arc::clone(state.model_or_err(None)?);
+    let sid = extract_session_id(&headers);
     let state2 = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
         run_insert(&state2, &model, &req, sid.as_deref())
@@ -256,11 +238,8 @@ pub async fn handle_insert_multi(
     Json(req): Json<InsertRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(Some(&model_id))
-        .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
-    let model = Arc::clone(model);
-    let sid = session_id(&headers);
+    let model = Arc::clone(state.model_or_err(Some(&model_id))?);
+    let sid = extract_session_id(&headers);
     let state2 = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
         run_insert(&state2, &model, &req, sid.as_deref())

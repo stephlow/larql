@@ -42,8 +42,55 @@
 
 ## P0: Active
 
-Nothing in P0 is currently blocking — all known critical-path issues
-have landed.
+### Expert weight format redesign — split blob → per-expert Q4K files
+
+**Status**: Not started — blocks MoE GPU dispatch (4× decode speedup on 26B A4B)  
+**Measured impact**: SKIP_MOE baseline = 15ms/tok (56.8 tok/s). With current BF16 blob = 241ms/tok. **93.7% of decode time is CPU MoE.**
+
+**Root cause (diagnosed 2026-04-26):**
+
+The current `experts_packed.bin` is a single 43 GB BF16 blob (`[num_experts, 2*inter, hidden]` gate+up + `[num_experts, hidden, inter]` down per layer). Three compounding problems:
+
+1. **BF16 format** — incompatible with existing Q4K GPU shaders. Every decode step forces 8 experts × 30 layers × ~12 MB through CPU BF16→f32 dequant (~2.9 GB/token of CPU memory reads). LRU cache (64 entries, 128-expert pool) has near-zero hit rate because expert selection is near-random token to token.
+
+2. **CPU dispatch with 30 GPU syncs** — each layer requires `commit() + wait_until_completed()` to hand `h_post_attn` to the CPU MoE block and receive `moe_out` back. 30 syncs × ~1ms = ~30ms overhead per decode step.
+
+3. **Monolithic blob** — a single file holding all experts for all layers. Cannot mmap individual experts efficiently; shard servers that own only a layer range still load the whole blob.
+
+**Proposed format:**
+
+Replace `experts_packed.bin` with per-expert Q4K files (or a per-layer expert pack), matching the existing `interleaved_q4k.bin` layout:
+
+```
+experts_q4k/
+  layer_{L}_gate_up.bin   # [num_experts * 2 * inter, hidden] Q4K — all experts concatenated
+  layer_{L}_down.bin      # [num_experts * hidden, inter] Q4K — all experts concatenated
+```
+
+Or, if expert-level granularity is needed for shard routing:
+
+```
+experts_q4k/
+  layer_{L}_expert_{E}_gate_up.bin   # [2*inter, hidden] Q4K per expert
+  layer_{L}_expert_{E}_down.bin      # [hidden, inter] Q4K per expert
+```
+
+The per-layer concatenated form is preferred for GPU dispatch: a single `q4k_matvec` call with `N = num_selected * inter` rows processes all top-K experts in one GPU dispatch. The router selects expert indices on CPU (cheap: 2816×128 = 360K ops), then the GPU reads the relevant row ranges.
+
+**Expected outcome after fix:**
+
+- GPU command buffer per decode step: 1 (not 30)
+- Expert computation: GPU Q4K dispatch (same shader as gate/up FFN)
+- Projected decode: ~16ms/tok (GPU baseline 15ms + routing overhead) → **~62 tok/s (15× improvement)**
+
+**Work items:**
+
+- [ ] Add `Q4KExpertWriteOptions` to the extraction pipeline — Q4K-quantize `experts_gate_up` and `experts_down` tensors per layer, emit as `experts_q4k/layer_{L}_{kind}.bin` with accompanying manifest
+- [ ] Update `VindexModelConfig` / `weight_manifest.json` to record expert format (BF16 vs Q4K) and layout (per-layer-concatenated vs per-expert)
+- [ ] Loader: read Q4K expert files into `packed_byte_ranges` (same path as current BF16 entries); update `get_packed_bytes` key naming
+- [ ] `build_moe_weights` in `pipeline_layer.rs`: switch from `get_packed_bytes` (BF16 mmap slice) to a `QuantWeight` struct pointing at Q4K byte ranges, so the caller can dispatch via `q4k_matvec` not `cpu_moe_forward`
+- [ ] GPU MoE dispatch in `decode_token_with_moe_fn`: when expert weights are Q4K, run expert FFNs via `encode_ffn` on GPU (batch gate+up rows for selected experts, then down); remove per-layer CPU commit
+- [ ] Re-extract `gemma-4-26B-A4B-it.vindex` with the new format (current 43 GB BF16 → ~24 GB Q4K)
 
 ## P1: Active
 

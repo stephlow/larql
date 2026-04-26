@@ -166,6 +166,26 @@ impl AppState {
         self.requests_served
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Get a model by ID, or return a `NotFound` error.
+    ///
+    /// Consolidates the 23+ identical `state.model(...).ok_or_else(|| ...)` call
+    /// sites scattered across the route handlers.
+    pub fn model_or_err(&self, id: Option<&str>) -> Result<&Arc<LoadedModel>, crate::error::ServerError> {
+        self.model(id).ok_or_else(|| {
+            let msg = match id {
+                Some(mid) => format!("model '{}' not found", mid),
+                None => "no model loaded".into(),
+            };
+            crate::error::ServerError::NotFound(msg)
+        })
+    }
+}
+
+/// Compute elapsed milliseconds from `start`, rounded to one decimal place.
+pub fn elapsed_ms(start: std::time::Instant) -> f64 {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    (ms * 10.0).round() / 10.0
 }
 
 /// Load probe-confirmed feature labels from feature_labels.json.

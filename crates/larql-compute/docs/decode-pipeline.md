@@ -99,15 +99,64 @@ pub struct LayerKVCache {
 Populated during prefill; extended by `kv_cache_append` each decode step.
 `kv_attention` attends Q against all cached K/V (positions 0..current_len).
 
-## Performance (M3 Max, Gemma 3 4B, 2026-04-25)
+## Hybrid MoE — Batched Prefill Path (2026-04-26)
+
+For hybrid MoE models (e.g. Gemma 4 26B A4B), each decoder layer has both
+a dense FFN block (GPU) and a sparse expert block (CPU). `dispatch_full_pipeline`
+accepts an optional `moe_fn` callback that fires after each MoE layer's dense FFN.
+
+**Before (token-by-token loop):**
+```
+for pos in 0..seq_len:
+    decode_token(layers, h[pos])   // ALL layers per token
+```
+O(seq_len × num_layers) GPU command buffer commits.
+
+**After (batched per layer):**
+```
+for l in 0..num_layers:
+    GPU: dispatch all seq_len positions through layer l's attention + dense FFN
+    commit + wait
+    if layer l has MoE:
+        CPU: moe_fn(l, h_post_attn[0..seq_len], new_h[0..seq_len])
+             ↳ experts for all positions + outer_norm + layer_scalar
+```
+O(num_layers) commits. For a 5-token prefill on 26 MoE layers: **26 commits vs 130**.
+
+**Key invariant:** The GPU `layer_scalar` step (step 11) is skipped for MoE layers
+when `moe_fn` is provided. The callback applies `layer_scalar` itself after
+combining dense + MoE output — matching HF's `hidden_states *= layer_scalar`
+placement at the end of `Gemma4TextDecoderLayer.forward`.
+
+**Measured gain (Gemma 4 26B A4B, M3 Max, 15 warmup / 30 tokens):**
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Prefill (5-token) | 1889ms | 1297ms | **−31%** |
+| Decode GPU fwd | 334ms/tok | 246ms/tok | **−26%** |
+| Decode tok/s | 2.9 | **3.9** | **+35%** |
+
+**KV cache:** Per-layer variant `populate_kv_one_layer` (in `kv_copy.rs`)
+copies one layer's K/V scratch immediately after each per-layer commit,
+so the cache is current before the MoE callback reads `h_post_attn`.
+
+## Performance (M3 Max, 2026-04-26)
+
+### Gemma 3 4B (dense, 34 layers)
 
 | Path | GPU fwd | tok/s | vs Ollama |
 |---|---|---|---|
-| **Q4_K+Q6_K decode (34L)** | **11.1ms** | **75–77** | **1.28–1.30×** |
+| **Q4_K+Q6_K decode (34L)** | **11.1ms** | **75–79** | **1.24–1.30×** |
 | Ollama gemma3:4b | ~8.5ms | 97–103 | 1.0× |
 
 Per-stage: GPU fwd 83%, lm_head 17%.
 
-Effective bandwidth: LARQL ~329 GB/s, Ollama ~348 GB/s.
+### Gemma 4 26B A4B (hybrid MoE, 26 layers, batched prefill)
+
+| Metric | tok/s | GPU fwd/tok |
+|---|---|---|
+| **LARQL Metal** | **3.9** | **246ms** |
+
+Effective bandwidth: LARQL ~329 GB/s, Ollama ~348 GB/s (Gemma 3).
 Total weight data per token: 3029 MB (34 layers × 89.1 MB/layer).
 See `PERFORMANCE.md` for the full bandwidth budget and gap analysis.

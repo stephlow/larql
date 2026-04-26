@@ -83,9 +83,7 @@ pub async fn handle_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+    let model = state.model_or_err(None)?;
     let stats = build_stats(model);
     Ok(Json(add_q4k_ffn(model, stats).await))
 }
@@ -95,9 +93,7 @@ pub async fn handle_stats_multi(
     Path(model_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(Some(&model_id))
-        .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
+    let model = state.model_or_err(Some(&model_id))?;
     let stats = build_stats(model);
     Ok(Json(add_q4k_ffn(model, stats).await))
 }

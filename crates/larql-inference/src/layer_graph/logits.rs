@@ -60,3 +60,32 @@ pub(super) fn softmax_prob(score: f32, hits: &[(u32, f32)], logits_scale: f32, s
     if let Some(cap) = softcap { target = (target / cap).tanh() * cap; }
     ((target - max_l) as f64).exp() / exp_sum
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::{make_test_weights, make_test_vindex, make_test_tokenizer};
+    use larql_compute::CpuBackend;
+
+    #[test]
+    fn finalize_logits_runs_without_panic() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let index = make_test_vindex(&weights);
+        let h = ndarray::Array2::from_elem((1, weights.hidden_size), 0.1f32);
+        let norm_offset = weights.arch.norm_weight_offset();
+        let result = finalize_logits(&weights, &tokenizer, &h, 5, &index, &CpuBackend, norm_offset);
+        // lm_head_knn returns empty for synthetic vindex → empty predictions
+        assert!(result.token_ids.len() <= 5);
+    }
+
+    #[test]
+    fn softmax_prob_basic() {
+        let hits = vec![(0u32, 3.0f32), (1u32, 2.0f32), (2u32, 1.0f32)];
+        let p = softmax_prob(3.0, &hits, 1.0, None);
+        assert!(p > 0.0 && p <= 1.0, "probability should be in (0,1]");
+        // Highest logit should have highest probability
+        let p2 = softmax_prob(2.0, &hits, 1.0, None);
+        assert!(p > p2, "logit=3 should have higher prob than logit=2");
+    }
+}

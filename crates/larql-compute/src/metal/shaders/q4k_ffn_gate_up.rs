@@ -83,15 +83,18 @@ kernel void q4k_ffn_gate_up(
 
         device const uchar* qs = block + 16u + group * 32u + sh * 16u;
 
-        float dot_acc = 0.0f, sum_acc = 0.0f;
+        float sumy = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (uint l = 0u; l < 16u; l++) { sumy += xl[l]; }
+
+        float dot_acc = 0.0f;
         _Pragma("clang loop unroll(full)")
         for (uint l = 0u; l < 16u; l++) {
             uchar byte = qs[l];
             float nib = hi ? float((byte >> 4u) & 0x0Fu) : float(byte & 0x0Fu);
             dot_acc = fma(nib, xl[l], dot_acc);
-            sum_acc += xl[l];
         }
-        acc += scale * dot_acc - mmin * sum_acc;
+        acc += scale * dot_acc - mmin * sumy;
     }
 
     acc = simd_sum(acc);

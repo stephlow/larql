@@ -6,8 +6,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use serde::Deserialize;
 
+use crate::band_utils::{BAND_KNOWLEDGE, BAND_OUTPUT, BAND_SYNTAX, get_layer_bands};
 use crate::error::ServerError;
-use crate::state::{AppState, LoadedModel};
+use crate::state::{AppState, LoadedModel, elapsed_ms};
 
 #[derive(Deserialize)]
 pub struct ExplainRequest {
@@ -26,7 +27,7 @@ pub struct ExplainRequest {
 
 fn default_top() -> usize { 5 }
 fn default_per_layer() -> usize { 3 }
-fn default_band() -> String { "all".into() }
+fn default_band() -> String { crate::band_utils::BAND_ALL.into() }
 
 fn explain_infer(
     model: &LoadedModel,
@@ -108,18 +109,11 @@ fn explain_infer(
     };
 
     // Resolve band to layer range
-    let last = model.config.num_layers.saturating_sub(1);
-    let bands = model.config.layer_bands.clone()
-        .or_else(|| larql_vindex::LayerBands::for_family(&model.config.family, model.config.num_layers))
-        .unwrap_or(larql_vindex::LayerBands {
-            syntax: (0, last),
-            knowledge: (0, last),
-            output: (0, last),
-        });
+    let bands = get_layer_bands(model);
     let layer_range: Option<(usize, usize)> = match req.band.as_str() {
-        "syntax" => Some(bands.syntax),
-        "knowledge" => Some(bands.knowledge),
-        "output" => Some(bands.output),
+        BAND_SYNTAX => Some(bands.syntax),
+        BAND_KNOWLEDGE => Some(bands.knowledge),
+        BAND_OUTPUT => Some(bands.output),
         _ => None,
     };
 
@@ -192,13 +186,11 @@ fn explain_infer(
         }
     }
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
     let mut body = serde_json::json!({
         "prompt": req.prompt,
         "predictions": predictions,
         "trace": layers,
-        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        "latency_ms": elapsed_ms(start),
     });
     if let Some(ovr) = knn_override {
         body["knn_override"] = serde_json::json!({
@@ -215,10 +207,7 @@ pub async fn handle_explain(
     Json(req): Json<ExplainRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
-    let model = Arc::clone(model);
+    let model = state.model_or_err(None)?.clone();
     let result = tokio::task::spawn_blocking(move || explain_infer(&model, &req))
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
@@ -231,10 +220,7 @@ pub async fn handle_explain_multi(
     Json(req): Json<ExplainRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(Some(&model_id))
-        .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
-    let model = Arc::clone(model);
+    let model = state.model_or_err(Some(&model_id))?.clone();
     let result = tokio::task::spawn_blocking(move || explain_infer(&model, &req))
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;

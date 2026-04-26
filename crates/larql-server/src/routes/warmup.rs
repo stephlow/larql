@@ -161,9 +161,6 @@ pub async fn handle_warmup(
 ) -> Result<Json<WarmupResponse>, ServerError> {
     state.bump_requests();
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?
-        .clone();
+    let model = state.model_or_err(None)?.clone();
     Ok(Json(warmup_model_async(model, req).await))
 }

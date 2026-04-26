@@ -11,7 +11,10 @@ use axum::http::HeaderMap;
 use serde::Deserialize;
 
 use crate::error::ServerError;
+use crate::session::{PATCH_UNNAMED, extract_session_id};
 use crate::state::AppState;
+
+const PATCH_INLINE_NAME: &str = "inline-patch";
 
 #[derive(Deserialize)]
 pub struct ApplyPatchRequest {
@@ -21,14 +24,6 @@ pub struct ApplyPatchRequest {
     pub patch: Option<larql_vindex::VindexPatch>,
 }
 
-/// Extract session ID from headers (if present).
-fn session_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-}
-
 /// Resolve a patch from the request body (inline or URL).
 fn resolve_patch(req: &ApplyPatchRequest) -> Result<(larql_vindex::VindexPatch, String), ServerError> {
     if let Some(ref patch) = req.patch {
@@ -36,7 +31,7 @@ fn resolve_patch(req: &ApplyPatchRequest) -> Result<(larql_vindex::VindexPatch, 
             .url
             .clone()
             .or_else(|| patch.description.clone())
-            .unwrap_or_else(|| "inline-patch".into());
+            .unwrap_or_else(|| PATCH_INLINE_NAME.into());
         return Ok((patch.clone(), name));
     }
 
@@ -125,9 +120,7 @@ async fn apply_patch_to_model(
     headers: &HeaderMap,
     req: ApplyPatchRequest,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let model = state
-        .model(model_id)
-        .ok_or_else(|| ServerError::NotFound("model not found".into()))?;
+    let model = state.model_or_err(model_id)?;
 
     let (mut patch, name) = resolve_patch(&req)?;
 
@@ -137,7 +130,7 @@ async fn apply_patch_to_model(
     let op_count = patch.operations.len();
 
     // Session-scoped or global?
-    if let Some(sid) = session_id(headers) {
+    if let Some(sid) = extract_session_id(headers) {
         let (ops, active) = state.sessions.apply_patch(&sid, model, patch).await;
         Ok(Json(serde_json::json!({
             "applied": name,
@@ -181,11 +174,9 @@ async fn list_patches_for_model(
     model_id: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let _model = state
-        .model(model_id)
-        .ok_or_else(|| ServerError::NotFound("model not found".into()))?;
+    let _model = state.model_or_err(model_id)?;
 
-    if let Some(sid) = session_id(headers) {
+    if let Some(sid) = extract_session_id(headers) {
         let patches = state.sessions.list_patches(&sid).await;
         return Ok(Json(serde_json::json!({
             "patches": patches,
@@ -200,7 +191,7 @@ async fn list_patches_for_model(
         .iter()
         .map(|p| {
             serde_json::json!({
-                "name": p.description.as_deref().unwrap_or("unnamed"),
+                "name": p.description.as_deref().unwrap_or(PATCH_UNNAMED),
                 "operations": p.operations.len(),
                 "base_model": p.base_model,
             })
@@ -233,7 +224,7 @@ async fn remove_patch_from_model(
     headers: &HeaderMap,
     name: &str,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    if let Some(sid) = session_id(headers) {
+    if let Some(sid) = extract_session_id(headers) {
         let remaining = state
             .sessions
             .remove_patch(&sid, name)
@@ -246,16 +237,14 @@ async fn remove_patch_from_model(
         })));
     }
 
-    let model = state
-        .model(model_id)
-        .ok_or_else(|| ServerError::NotFound("model not found".into()))?;
+    let model = state.model_or_err(model_id)?;
 
     let mut patched = model.patched.write().await;
 
     let idx = patched
         .patches
         .iter()
-        .position(|p| p.description.as_deref().unwrap_or("unnamed") == name)
+        .position(|p| p.description.as_deref().unwrap_or(PATCH_UNNAMED) == name)
         .ok_or_else(|| ServerError::NotFound(format!("patch '{}' not found", name)))?;
 
     patched.remove_patch(idx);

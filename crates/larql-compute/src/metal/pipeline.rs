@@ -73,6 +73,7 @@ impl MetalBackend {
             None,       // no KV cache
             &full_layers, x, hidden, inter, q_dim, kv_dim,
             1, 0, 0, 0, 0.0, false, 0.0,
+            None,       // no MoE callback (legacy benchmark path, no MoE layers)
         )
     }
 

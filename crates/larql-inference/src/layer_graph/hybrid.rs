@@ -135,3 +135,41 @@ fn predict_hybrid_metal(
         weights, tokenizer, &h, top_k, index, backend, norm_offset,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::{make_test_weights, make_test_vindex, make_test_tokenizer};
+    use crate::layer_graph::CachedLayerGraph;
+    use larql_compute::CpuBackend;
+
+    #[test]
+    fn predict_hybrid_runs_with_empty_cache() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let index = make_test_vindex(&weights);
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        let result = predict_hybrid(
+            &weights, &tokenizer, &[0u32, 1], 3,
+            &index, &CpuBackend, &cached, 0..num_layers,
+        );
+        assert!(result.token_ids.len() <= 3);
+    }
+
+    #[test]
+    fn predict_hybrid_with_partial_cache() {
+        use crate::ffn::WeightFfn;
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let index = make_test_vindex(&weights);
+        let ffn = WeightFfn { weights: &weights };
+        let cached = CachedLayerGraph::build(&weights, &[0u32], &[0], &ffn);
+        let num_layers = weights.num_layers;
+        let result = predict_hybrid(
+            &weights, &tokenizer, &[0u32, 1], 2,
+            &index, &CpuBackend, &cached, 0..num_layers,
+        );
+        assert!(result.token_ids.len() <= 2);
+    }
+}

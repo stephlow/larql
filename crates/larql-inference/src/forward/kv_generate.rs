@@ -339,3 +339,89 @@ fn masked_argmax(logits: &[f32], tokenizer: &tokenizers::Tokenizer) -> Option<(u
     let decoded = tokenizer.decode(&[id], true).ok()?;
     Some((id, decoded))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::{make_test_weights, make_test_tokenizer};
+    use crate::ffn::WeightFfn;
+
+    #[test]
+    fn generate_cached_returns_token_ids() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let mut decoded_tokens: Vec<String> = Vec::new();
+        let ids = generate_cached(
+            &weights, &tokenizer, &ffn,
+            &[0u32, 1], 3,
+            |_id, text| decoded_tokens.push(text.to_string()),
+        );
+        assert!(ids.len() <= 3, "should generate at most 3 tokens");
+        assert_eq!(ids.len(), decoded_tokens.len(), "callback called once per token");
+    }
+
+    #[test]
+    fn generate_cached_with_window_limits_cache() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let ids = generate_cached_with_window(
+            &weights, &tokenizer, &ffn,
+            &[0u32], 4,
+            Some(2), // sliding window of 2
+            |_, _| {},
+        );
+        assert!(ids.len() <= 4);
+    }
+
+    #[test]
+    fn generate_cached_backend_cpu() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let ids = generate_cached_backend(
+            &weights, &tokenizer, &ffn,
+            &[2u32, 3], 2,
+            None, None, // no backend override, no window
+            |_, _| {},
+        );
+        assert!(ids.len() <= 2);
+    }
+
+    #[test]
+    fn generate_cached_constrained_restricts_tokens() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        // Allow only tokens 0..8 by masking the rest to NEG_INFINITY
+        let allowed: std::collections::HashSet<u32> = (0u32..8).collect();
+        let ids = generate_cached_constrained(
+            &weights, &tokenizer, &ffn,
+            &[0u32], 3,
+            |_generated, logits| {
+                for (id, logit) in logits.iter_mut().enumerate() {
+                    if !allowed.contains(&(id as u32)) {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+            },
+            |_, _| {},
+        );
+        // All generated tokens should be in the allowed set (or empty if all masked)
+        for &id in &ids {
+            assert!(allowed.contains(&id),
+                "generated token {id} outside allowed set");
+        }
+    }
+
+    #[test]
+    fn generate_cached_empty_prompt() {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        // Empty prompt still generates (starts from embed of nothing → zeros)
+        let ids = generate_cached(&weights, &tokenizer, &ffn, &[], 2, |_, _| {});
+        assert!(ids.len() <= 2);
+    }
+}

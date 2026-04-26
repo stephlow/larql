@@ -51,6 +51,7 @@ impl DecodeBackend for MetalBackend {
             layers, x, hidden, inter, q_dim, kv_dim,
             seq_len, num_q_heads, num_kv_heads, head_dim,
             rope_base, use_qk_norm, softcap,
+            None, // moe_fn: no MoE callback for full_pipeline_q4
         ))
     }
 
@@ -88,63 +89,95 @@ impl DecodeBackend for MetalBackend {
             kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, nkv, hd));
         }
 
-        // Hybrid MoE models (Gemma 4 26B A4B): each layer requires a
-        // CPU MoE pass after the GPU dense FFN, so batched
-        // dispatch_full_pipeline (GPU-only) would skip MoE entirely.
-        // Instead, run token-by-token decode — each call correctly
-        // interleaves GPU dense FFN + CPU MoE + GPU scalars. The
-        // caller (generate.rs) only uses the last row of the prefill
-        // output, so we return a zero-padded vec with only the final
-        // position filled.
         let has_moe = layers.iter().any(|l| l.moe.is_some());
-        if has_moe {
-            let mut last_h = vec![0.0f32; hidden];
-            for pos in 0..seq_len {
-                let x_pos = &x[pos * hidden..(pos + 1) * hidden];
-                last_h = MetalBackend::decode_token(
-                    self, kv, layers, x_pos, hidden, inter, q_dim, kv_dim,
-                    num_q_heads, num_kv_heads, head_dim, rope_base,
-                );
-            }
-            let mut result = vec![0.0f32; seq_len * hidden];
-            let dst_off = seq_len.saturating_sub(1) * hidden;
-            result[dst_off..dst_off + hidden].copy_from_slice(&last_h);
-            return Some(result);
-        }
-
         let geglu = if layers.first().is_some_and(|l| l.activation == crate::Activation::GeluTanh) {
             &self.geglu_gelu_tanh_pipeline
         } else {
             &self.geglu_pipeline
         };
-        Some(ops::full_pipeline::dispatch_full_pipeline(
-            &self.queue, &self.bufs, &self.q4,
-            geglu,
-            &self.geglu_gelu_tanh_pipeline,
-            &self.silu_pipeline,
-            &self.gelu_tanh_pipeline,
-            &self.q8_quant_pipeline,
-            Some(&self.fused_attn_pipeline),
-            &self.q8_matvec_pipeline.state,
-            &self.q8_qkv_proj_pipeline.state,
-            &self.q4k_matvec_pipeline, &self.q6k_matvec_pipeline,
-            &self.rms_norm_pipeline, &self.residual_add_pipeline,
-            &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
-            Some(&self.q4k_qkv_proj_pipeline.state),
-            Some(&self.q4kf_qkv_proj_pipeline.state),
-            Some(&self.q4kf_proj_pipeline.state),
-            Some(&self.rope_at_pos_pipeline),
-            Some(&self.qk_norm_pipeline),
-            Some(&self.scale_vector_pipeline),
-            Some(&self.q4k_geglu_silu_down_pipeline),
-            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
-            Some(&self.q6k_geglu_silu_down_pipeline),
-            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
-            Some(kv),
-            layers, x, hidden, inter, q_dim, kv_dim,
-            seq_len, num_q_heads, num_kv_heads, head_dim,
-            rope_base, use_qk_norm, softcap,
-        ))
+
+        // Concrete macro to avoid duplicating the 30-param dispatch call.
+        macro_rules! run_dispatch {
+            ($moe_fn:expr) => {
+                ops::full_pipeline::dispatch_full_pipeline(
+                    &self.queue, &self.bufs, &self.q4,
+                    geglu,
+                    &self.geglu_gelu_tanh_pipeline,
+                    &self.silu_pipeline,
+                    &self.gelu_tanh_pipeline,
+                    &self.q8_quant_pipeline,
+                    Some(&self.fused_attn_pipeline),
+                    &self.q8_matvec_pipeline.state,
+                    &self.q8_qkv_proj_pipeline.state,
+                    &self.q4k_matvec_pipeline, &self.q6k_matvec_pipeline,
+                    &self.rms_norm_pipeline, &self.residual_add_pipeline,
+                    &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
+                    Some(&self.q4k_qkv_proj_pipeline.state),
+                    Some(&self.q4kf_qkv_proj_pipeline.state),
+                    Some(&self.q4kf_proj_pipeline.state),
+                    Some(&self.rope_at_pos_pipeline),
+                    Some(&self.qk_norm_pipeline),
+                    Some(&self.scale_vector_pipeline),
+                    Some(&self.q4k_geglu_silu_down_pipeline),
+                    Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
+                    Some(&self.q6k_geglu_silu_down_pipeline),
+                    Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+                    Some(kv),
+                    layers, x, hidden, inter, q_dim, kv_dim,
+                    seq_len, num_q_heads, num_kv_heads, head_dim,
+                    rope_base, use_qk_norm, softcap,
+                    $moe_fn,
+                )
+            };
+        }
+
+        if has_moe {
+            // Per-layer MoE callback: runs CPU experts for all seq_len positions,
+            // accumulates into new_h, then applies outer post-FFN norm + layer_scalar.
+            // GPU layer_scalar step is skipped for MoE layers in dispatch_full_pipeline
+            // (see `is_moe_layer` guard) so this closure owns the combine step.
+            let mut moe_closure = |layer_idx: usize, h_post_attn: &[f32], new_h: &mut [f32]| {
+                let layer = &layers[layer_idx];
+                let moe_block = match layer.moe.as_ref() { Some(m) => m, None => return };
+                let layer_eps = layer.eps;
+                let layer_norm_offset = layer.norm_offset;
+
+                // 1. CPU MoE for each position: accumulate into new_h.
+                for pos in 0..seq_len {
+                    let ha = &h_post_attn[pos * hidden..(pos + 1) * hidden];
+                    let moe_out = crate::cpu::ops::moe::cpu_moe_forward(
+                        ha, moe_block, layer_norm_offset, layer_eps,
+                    );
+                    let nh = &mut new_h[pos * hidden..(pos + 1) * hidden];
+                    for (i, v) in moe_out.iter().enumerate() { nh[i] += v; }
+                }
+
+                // 2. Outer post-FFN norm + layer_scalar per position.
+                // Matches moe_combine::apply_outer_combine for batched positions.
+                for pos in 0..seq_len {
+                    let ha = &h_post_attn[pos * hidden..(pos + 1) * hidden];
+                    let nh = &mut new_h[pos * hidden..(pos + 1) * hidden];
+
+                    if layer.moe_combined_output_norm {
+                        let outer_w = layer.moe_outer_post_norm.or(layer.post_ffn_norm);
+                        if let Some(w) = outer_w {
+                            let combined: Vec<f32> = nh.iter().zip(ha).map(|(h, a)| h - a).collect();
+                            let rms = (combined.iter().map(|v| v * v).sum::<f32>()
+                                / hidden as f32 + layer_eps).sqrt();
+                            for (i, (&c, &wt)) in combined.iter().zip(w.iter()).enumerate() {
+                                nh[i] = ha[i] + c / rms * (wt + layer_norm_offset);
+                            }
+                        }
+                    }
+
+                    let ls = layer.layer_scalar;
+                    if ls != 0.0 && ls != 1.0 { for v in nh.iter_mut() { *v *= ls; } }
+                }
+            };
+            return Some(run_dispatch!(Some(&mut moe_closure as &mut dyn FnMut(usize, &[f32], &mut [f32]))));
+        }
+
+        Some(run_dispatch!(None))
     }
 
     fn has_kv_cache(&self) -> bool { true }

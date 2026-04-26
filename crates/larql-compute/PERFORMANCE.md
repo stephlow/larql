@@ -23,11 +23,33 @@ Per-stage (100-token run, 8 warmup):
 
 **Recent changes (2026-04-26):**
 
-| Change | Effect | Notes |
-|---|---|---|
-| `q6k_matvec` ROWS_PER_TG 4→2 | +1-2 tok/s | 64 threads/TG → 2× concurrent TGs per CU |
-| `f32_gemv_topk1` GPU argmax | 0 in bench (KNN fires first) | Saves 0.33ms for top_k=1 non-KNN callers |
-| Q4_K float4 dual-sub-block | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |
+| Change | Model | Effect | Notes |
+|---|---|---|---|
+| `q6k_matvec` ROWS_PER_TG 4→2 | Gemma 3 4B | +1-2 tok/s | 64 threads/TG → 2× concurrent TGs |
+| `f32_gemv_topk1` GPU argmax | any | 0 in bench (KNN fires first) | Saves 0.33ms for top_k=1 non-KNN callers |
+| Q4_K float4 dual-sub-block | Gemma 3 4B | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |
+| Batched MoE prefill | Gemma 4 26B A4B | **+35% tok/s, −31% prefill** | 130 → 26 GPU commits for 5-token prompt |
+| Q4_K `sumy` precompute | Gemma 3 4B | neutral (within noise) | Compiler already hoisting; FMA chain unchanged |
+
+---
+
+## Gemma 4 26B A4B — MoE model (2026-04-26)
+
+Machine: M3 Max, 5-token prompt, 15 warmup / 30 measured tokens
+Vindex: `gemma-4-26B-A4B-it.vindex` (26 decoder layers, 128 experts/layer, top-K=2)
+
+| Metric | Before batched prefill | After | Δ |
+|---|---|---|---|
+| Prefill | 1889ms | 1297ms | **−31%** |
+| Decode GPU fwd | 334ms/tok | 246ms/tok | **−26%** |
+| Decode tok/s | 2.9 | **3.9** | **+35%** |
+
+GPU fwd accounts for 97–99% of decode time on this model (CPU MoE compute
+for 128 experts × 26 layers dominates; attention is fast vs the dense model).
+
+**Why the decode also improved:** batching the prefill leaves weight buffers
+and shader pipelines warmer for the first decode step, reducing cold-start
+latency on the per-layer MoE commit loop.
 
 ---
 

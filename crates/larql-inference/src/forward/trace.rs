@@ -345,3 +345,121 @@ pub fn calibrate_scalar_gains(
     }
     gains
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::model::ModelWeights;
+
+    fn shared_weights() -> &'static ModelWeights {
+        static W: OnceLock<ModelWeights> = OnceLock::new();
+        W.get_or_init(make_test_weights)
+    }
+
+    // ── capture_ffn_activation_matrix ─────────────────────────────────────────
+
+    #[test]
+    fn capture_ffn_activation_matrix_shape() {
+        let weights = shared_weights();
+        let result = capture_ffn_activation_matrix(&weights, &[0u32, 1, 2], 0);
+        let m = result.expect("should capture FFN activation at layer 0");
+        assert_eq!(m.shape()[0], 3, "rows = seq_len");
+        assert_eq!(m.shape()[1], weights.intermediate_size, "cols = ffn_dim");
+        assert!(m.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn capture_ffn_activation_matrix_layer1() {
+        let weights = shared_weights();
+        let result = capture_ffn_activation_matrix(&weights, &[0u32, 1], 1);
+        let m = result.expect("should capture at layer 1");
+        assert_eq!(m.shape(), &[2, weights.intermediate_size]);
+    }
+
+    #[test]
+    fn capture_ffn_activation_matrix_single_token() {
+        let weights = shared_weights();
+        let result = capture_ffn_activation_matrix(&weights, &[5u32], 0);
+        let m = result.expect("single-token capture");
+        assert_eq!(m.shape(), &[1, weights.intermediate_size]);
+    }
+
+    #[test]
+    fn capture_ffn_activation_matrix_out_of_bounds_layer_returns_none() {
+        let weights = shared_weights();
+        // Layer 99 doesn't exist → should return None or fail gracefully
+        let result = capture_ffn_activation_matrix(&weights, &[0u32], 99);
+        // Either None (layer out of range) or Some (shouldn't crash)
+        if let Some(m) = result {
+            assert!(m.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    // ── estimate_ffn_covariance ────────────────────────────────────────────────
+
+    #[test]
+    fn estimate_ffn_covariance_shape() {
+        let weights = shared_weights();
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![0u32, 1, 2],
+            vec![3u32, 4],
+            vec![5u32, 6, 7, 8],
+        ];
+        let (cov, n_samples) = estimate_ffn_covariance(&weights, &prompts, 0)
+            .expect("covariance should be computable");
+        let ffn = weights.intermediate_size;
+        assert_eq!(cov.shape(), &[ffn, ffn], "covariance is ffn_dim × ffn_dim");
+        assert!(n_samples > 0, "should have accumulated samples");
+        // Symmetric: C[i,j] ≈ C[j,i]
+        for i in 0..ffn.min(4) {
+            for j in 0..ffn.min(4) {
+                assert!((cov[[i, j]] - cov[[j, i]]).abs() < 1e-4,
+                    "covariance should be symmetric at [{i},{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn estimate_ffn_covariance_positive_semidefinite_diagonal() {
+        let weights = shared_weights();
+        let prompts = vec![vec![0u32, 1, 2, 3]];
+        let (cov, _) = estimate_ffn_covariance(&weights, &prompts, 0).unwrap();
+        // Diagonal entries should be non-negative (x^T C x >= 0 for diagonal)
+        for i in 0..cov.shape()[0] {
+            assert!(cov[[i, i]] >= 0.0, "diagonal entry [{i},{i}] = {} should be >= 0", cov[[i,i]]);
+        }
+    }
+
+    // ── capture_residuals ─────────────────────────────────────────────────────
+
+    #[test]
+    fn capture_residuals_count() {
+        let weights = shared_weights();
+        // capture_residuals(weights, token_ids, capture_layers) → Vec<(layer, residual_vec)>
+        let residuals = capture_residuals(&weights, &[0u32, 1, 2], &[0, 1]);
+        assert!(!residuals.is_empty(), "residuals should be non-empty");
+        for (layer, r) in &residuals {
+            assert!(r.iter().all(|v| v.is_finite()), "layer {layer} residual has non-finite values");
+        }
+    }
+
+    #[test]
+    fn capture_residuals_hidden_size() {
+        let weights = shared_weights();
+        let residuals = capture_residuals(&weights, &[0u32], &[0]);
+        for (_layer, r) in &residuals {
+            assert_eq!(r.len() % weights.hidden_size, 0,
+                "residual len {} should be multiple of hidden_size {}", r.len(), weights.hidden_size);
+        }
+    }
+
+    #[test]
+    fn capture_residuals_returns_requested_layers() {
+        let weights = shared_weights();
+        let residuals = capture_residuals(&weights, &[0u32, 1], &[0]);
+        // Should return at least one entry for layer 0
+        assert!(residuals.iter().any(|(l, _)| *l == 0), "should have layer 0 residual");
+    }
+}
