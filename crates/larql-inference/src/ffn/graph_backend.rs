@@ -431,3 +431,105 @@ impl GateIndex {
         features
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::make_test_weights;
+
+    const TOP_TOKENS: usize = 3;
+    const FEATURES_PER_TOK: usize = 4;
+
+    fn build_small_index(weights: &ModelWeights) -> GateIndex {
+        GateIndex::build(weights, &[0, 1], FEATURES_PER_TOK, TOP_TOKENS, &mut SilentIndexCallbacks)
+    }
+
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_indexes_requested_layers() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        assert_eq!(idx.num_layers(), 2, "should have indexed 2 layers");
+        assert_eq!(idx.features_per_token, FEATURES_PER_TOK);
+        assert_eq!(idx.top_tokens, TOP_TOKENS);
+    }
+
+    #[test]
+    fn total_entries_non_zero() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        assert!(idx.total_entries() > 0, "index should have some entries");
+    }
+
+    #[test]
+    fn build_empty_layers_is_empty() {
+        let weights = make_test_weights();
+        let idx = GateIndex::build(
+            &weights, &[], FEATURES_PER_TOK, TOP_TOKENS, &mut SilentIndexCallbacks,
+        );
+        assert_eq!(idx.num_layers(), 0);
+        assert_eq!(idx.total_entries(), 0);
+    }
+
+    // ── lookup_from_tokens ────────────────────────────────────────────────────
+
+    #[test]
+    fn lookup_from_tokens_returns_at_most_top_k() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let tok_scores = vec![(0usize, 1.0f32), (1, 0.9)];
+        let features = idx.lookup_from_tokens(&tok_scores, 0, 3);
+        assert!(features.len() <= 3, "got {} features, expected ≤ 3", features.len());
+    }
+
+    #[test]
+    fn lookup_from_tokens_unknown_layer_returns_empty() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let features = idx.lookup_from_tokens(&[(0, 1.0)], 99, 10);
+        assert!(features.is_empty());
+    }
+
+    #[test]
+    fn lookup_from_tokens_empty_scores_returns_empty() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        assert!(idx.lookup_from_tokens(&[], 0, 10).is_empty());
+    }
+
+    #[test]
+    fn lookup_from_tokens_out_of_range_token_skipped() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let big_tok = weights.vocab_size + 999;
+        let features = idx.lookup_from_tokens(&[(big_tok, 1.0)], 0, 10);
+        assert!(features.is_empty(), "out-of-range token should produce no features");
+    }
+
+    // ── precompute_entity ─────────────────────────────────────────────────────
+
+    #[test]
+    fn precompute_entity_has_features_for_known_token() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let entity = idx.precompute_entity(&[0u32], 4);
+        assert!(!entity.is_empty());
+        let has_features = entity.iter().any(|f| !f.is_empty());
+        assert!(has_features, "precompute_entity should find features for token 0");
+    }
+
+    // ── save / load roundtrip ─────────────────────────────────────────────────
+
+    #[test]
+    fn save_load_roundtrip_preserves_structure() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let path = std::env::temp_dir().join("larql_gate_index_test.ndjson");
+        idx.save(&path).expect("save failed");
+        let loaded = GateIndex::load(&path, TOP_TOKENS).expect("load failed");
+        assert_eq!(loaded.num_layers(), idx.num_layers());
+        assert_eq!(loaded.features_per_token, idx.features_per_token);
+        let _ = std::fs::remove_file(&path);
+    }
+}

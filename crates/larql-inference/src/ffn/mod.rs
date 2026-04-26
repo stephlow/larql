@@ -12,6 +12,7 @@ pub mod sparse;
 pub mod sparse_compute;
 pub mod remote;
 pub mod moe_remote;
+pub mod graph_backend;
 #[cfg(test)]
 mod tests;
 

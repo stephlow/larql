@@ -22,6 +22,13 @@ pub const INFER_MODE_COMPARE: &str = "compare";
 pub const INSERT_MODE_CONSTELLATION: &str = "constellation";
 pub const INSERT_MODE_EMBEDDING: &str = "embedding";
 
+/// Source label applied to probe-confirmed relation edges.
+/// Used in JSON responses (describe, walk) and gRPC edge structs.
+pub const PROBE_RELATION_SOURCE: &str = "probe";
+
+/// Status string returned by the health endpoint and gRPC HealthResponse.
+pub const HEALTH_STATUS_OK: &str = "ok";
+
 /// Resolve the layer-bands for a model, falling back to family-derived bands
 /// and then to a flat range covering all layers.
 pub fn get_layer_bands(model: &LoadedModel) -> LayerBands {

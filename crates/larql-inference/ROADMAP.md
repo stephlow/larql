@@ -17,70 +17,44 @@ larql bench gemma3-4b-q4k --engine markov-rs,unlimited-context,turbo-quant,apoll
 
 ### Chat template — inference side
 **Status**: Not started  
-**Files**: `src/forward/generate.rs`, `src/forward/generate_cached.rs`  
+**Files**: `layer_graph/generate/gpu.rs`, `layer_graph/generate/cpu.rs`  
 Read `tokenizer_config.json` from the vindex, parse the `chat_template` Jinja
 field with `minijinja` (already in `Cargo.toml`), apply to the token sequence
 before generation. `--no-chat-template` flag to bypass for base models or raw
-prompts. `larql-cli` owns the flag; this crate owns the template application.
+prompts.
 
 ### EOS detection
 **Status**: Partial — checks `<eos>`, `</s>`, `<|endoftext|>` but missing Gemma 4 `<end_of_turn>`  
-**Files**: `src/forward/generate.rs`  
-Read `eos_token_id` (and `eos_token_ids` list) from `config.json`; also read
-`stop_strings` from `generation_config.json`. Check decoded token string + token
-ID at every generate step. Gemma 4 lists `<end_of_turn>` in `stop_strings` but
-not in `eos_token_id`; without this fix greedy decode runs to `--max-tokens`.
+**Files**: `layer_graph/generate/gpu.rs`  
+Read `eos_token_id` and `stop_strings` from `generation_config.json`. Gemma 4
+lists `<end_of_turn>` in `stop_strings` but not in `eos_token_id`; without this
+fix greedy decode runs to `--max-tokens`.
 
 ### Token spacing / detokenisation
 **Status**: Not started  
-**Files**: `src/forward/generate.rs`  
-`tokenizer.decode` is called per-token; accumulate instead, trimming only the
-very first token. HuggingFace tokenizers use a leading-space convention (`▁Paris`)
-that is stripped incorrectly when decoding single tokens, causing "Parisatthe..."
-output.
+Accumulate tokens before decoding; trim only the first token. HuggingFace
+tokenizers use a leading-space convention (`▁Paris`) that is stripped incorrectly
+when decoding single tokens.
 
 ### Token streaming
 **Status**: Not started  
-**Files**: `src/forward/generate.rs`  
 Change `generate` / `generate_cached` to accept `on_token: impl FnMut(&str, f64)`
-callback. Caller (CLI) prints each token; server uses SSE chunks from the same
-callback. Currently the full token list is collected before returning — the CLI
-is silent for the entire `--max-tokens` run.
+callback. Currently the full token list is collected before returning.
 
 ### Sampling
 **Status**: Not started  
-**Files**: `src/forward/generate.rs`  
-Add temperature softmax, top-k filtering, and top-p (nucleus) filtering as
-logit post-processing steps after lm_head and before argmax. No GPU changes
-required. Flags (`--temperature`, `--top-p`, `--top-k`) are owned by `larql-cli`.
-
-### Repetition penalty
-**Status**: Not started  
-**Files**: `src/forward/generate.rs`  
-Before argmax / sampling, divide each logit by the repetition penalty if that
-token appears in the recent generation window. Practical fix for greedy looping
-on base models without a chat template. Flag (`--repetition-penalty`) owned by
-`larql-cli`.
+Add temperature softmax, top-k, and top-p (nucleus) filtering after lm_head and
+before argmax. Flags (`--temperature`, `--top-p`, `--top-k`) owned by `larql-cli`.
 
 ### Multi-turn KV state
 **Status**: Not started — `larql chat` resets KV cache per turn today  
-**Files**: `src/forward/generate.rs`, `src/forward/kv_generate.rs`  
-Maintain a running `token_ids` buffer across turns. After each response, append
-response token IDs before the next user turn so the KV cache grows across turns.
-`--max-context N` eviction: drop oldest turns when the buffer exceeds `N`.
-
-### Long context / dynamic KV
-**Status**: Not started — hard-capped at 4096 tokens  
-**Files**: `src/forward/generate.rs`  
-Expose `--max-context N` (default 8192) threaded to `KVCache::new_per_layer`.
-Dynamic Metal buffer growth or sliding-window fallback when `current_len` reaches
-`max_seq`. Interim acceptable: warn and truncate, document the limit.
+Maintain a running `token_ids` buffer across turns. `--max-context N` eviction:
+drop oldest turns when the buffer exceeds `N`.
 
 ### Gemma 3 4B regression smoke test
 **Status**: Not started  
-Load `gemma3-4b-q4k-streaming`, run `larql run "The capital of France is" -n 1 --metal`,
-assert first token is `"Paris"`. Gate on `CI_INTEGRATION=1` so it doesn't run
-on every PR but does run before release branches.
+Load `gemma3-4b-q4k-streaming`, run one-token generation, assert first token is
+`"Paris"`. Gate on `CI_INTEGRATION=1`.
 
 ---
 
@@ -88,181 +62,192 @@ on every PR but does run before release branches.
 
 ### MoE-aware CPU forward pass
 **Status**: Not started  
-**Files**: `src/forward/layer.rs`  
-`predict_q4k` / `WeightFfn::forward` has no MoE branch; the non-Metal CPU path
-produces wrong output on Gemma 4 26B A4B. Wire `cpu_moe_forward` (already
-implemented in `larql-compute/src/cpu/ops/moe.rs`) into `forward/layer.rs` for
-the `predict_q4k` path.
+`predict_q4k` / `WeightFfn::forward` has no MoE branch. Wire `cpu_moe_forward`
+(already in `larql-compute/src/cpu/ops/moe.rs`) into `forward/layer.rs`.
 
 ### Wire `RouterIndex` client-side
 **Status**: Not started  
-**Files**: `src/forward/layer.rs`  
-`crates/larql-vindex/src/index/router.rs` exists but is not connected to the
-forward pass. Connect it so the MoE router runs locally against the vindex's
-router index before dispatching to local or remote experts.
+`larql-vindex/src/index/router.rs` exists but is not connected to the forward
+pass. Connect so MoE router runs locally against the vindex before dispatching.
 
 ---
 
 ## P0: Engine performance parity
 
 ### TurboQuant Metal K/V checkpoint compression
-**Impact**: Reduces boundary checkpoint from 278 KB → 36 KB/window (7.7×) for long contexts.
-**Effort**: Medium
+**Impact**: Reduces boundary checkpoint from 278 KB → 36 KB/window (7.7×) for long contexts.  
 **Status**: TurboQuant runs at Metal speed. Compressed boundary checkpoints require
-Metal K/V read-back (saving last-position K/V to CPU after each window close).
-Add `backend.get_kv_last_position(layer)` to the Metal backend.
+Metal K/V read-back. Add `backend.get_kv_last_position(layer)` to the Metal backend.
 
 ### Apollo `prefill_to_layer` — true layer-skip
-**Impact**: Apollo's compressed path currently starts `forward_from_layer` at
-`crystal_layer=30` but still embeds query tokens from scratch. True skip would
-start the forward pass with the boundary residual as the KV context, saving
-another ~20% per step.
-**Effort**: Low — `forward_from_layer` exists; need to pass prior K/V correctly.
-**Status**: `forward_from_layer` ships; K/V seeding at crystal_layer is a follow-up.
+**Impact**: ~20% faster per step in compressed path.  
+**Status**: `forward_from_layer` ships; K/V seeding at `crystal_layer` is a follow-up.
 
 ### Apollo store builder
-**Impact**: Currently requires pre-built NPY/NPZ store files. Add
-`ApolloEngine::build_from_document(weights, tokenizer, document_tokens)` that
-builds the store in memory without disk files.
-**Effort**: Medium (needs residual capture at crystal_layer during prefill).
-**Status**: Not started.
+**Impact**: Currently requires pre-built NPY/NPZ files.  
+**Status**: Not started. `ApolloEngine::build_from_document(weights, tokenizer, tokens)`.
 
 ---
 
 ## P1: Architecture coverage
 
 ### Wire v_shares_k into forward pass
-**Impact**: Correct K=V handling for Gemma 4 without runtime tensor probing  
-**Effort**: Low  
-**Status**: `v_shares_k()` trait method done in larql-models (returns `config.attention_k_eq_v`). Forward pass currently detects K=V by checking for a missing `v_proj` tensor at runtime — swap to use the config flag directly.
+**Effort**: Low — `v_shares_k()` already in larql-models; swap runtime check.
 
-### Validate PLE (per-layer embeddings) end-to-end
-**Impact**: Correct Gemma 4 E2B inference  
-**Effort**: Medium  
-**Status**: Keys and config parsed in larql-models (`per_layer_embed_key`, `per_layer_input_gate_key`, `per_layer_projection_key`, `post_per_layer_input_norm_key`). Forward pass not yet wired. Need to add the gated per-layer embedding lookup and verify against HuggingFace reference outputs.
+### Validate PLE end-to-end (Gemma 4 E2B)
+**Effort**: Medium — config parsed; forward pass not yet wired.
 
 ### KV layer sharing for Gemma 4
-**Impact**: 20 fewer KV caches for Gemma 4 (20 shared layers)  
-**Effort**: Medium  
-**Status**: `kv_shared_source_layer()` returns correct sources in larql-models. KV cache allocation and lookup not yet sharing across layers in the inference path.
+**Effort**: Medium — `kv_shared_source_layer()` returns correct sources; cache allocation not yet sharing.
 
 ### Llama 3 / Gemma 4 engine validation
-All four engines are validated on Gemma 3 4B. Llama 3 and Gemma 4 E2B/E4B pass
-the architecture preconditions (RoPE, deterministic norm) but need empirical
-validation of the `cos h = 1.000000` contract for MarkovRS.
+All four engines validated on Gemma 3 4B. Need empirical `cos h = 1.000000` validation on Llama 3 / Gemma 4.
 
 ### MarkovRS batched K/V recompute kernel
-**Impact**: `recompute_kv` currently uses f32 BLAS for `[W, hidden] @ [hidden, kv_dim]`.
-A Metal kernel for batched Q4K projection would eliminate the 2000× FLOP overhead
-and bring MarkovRS close to UnlimitedContext for CPU decode.
-**Effort**: Medium (new Metal shader).
+**Impact**: Eliminate 2000× FLOP overhead on CPU decode path.  
+**Effort**: Medium (new Metal shader for `[W, hidden] @ [hidden, kv_dim]` Q4K projection).
 
 ---
 
-## P1: Code quality — modularity & magic strings
+## P1: Structure & file layout
+
+From 2026-04-26 code review. All public APIs preserved; changes are internal re-organisation.
 
 ### High priority
 
-**Centralise env-var names**
-Inline string literals `"LARQL_CPU_STAGE_DUMP"` (`forward/layer.rs:63`),
-`"LARQL_WALK_TRACE"` (`vindex/walk_ffn/mod.rs:131`), and others scattered
-across modules. A typo is a silent no-op. Create an `env_config` module with
-typed accessors (`fn stage_dump_dir() -> Option<PathBuf>`, etc.) as the single
-source of truth.
+**`ffn/remote.rs` (893 LOC) — split into `remote/`** ✅ Done 2026-04-26  
+`ffn/remote/codec.rs` — binary codec, wire types, latency stats, codec tests.  
+`ffn/remote/http.rs` — RemoteFfnConfig, RemoteWalkBackend, RemoteFfnError, HTTP tests.  
+`ffn/remote/mod.rs` — thin re-export + protocol doc.  
+No magic strings: `BINARY_CT`, `BATCH_MARKER`, `STATS_PATH`, `WALK_FFN_PATH` are named constants.
 
-**Deduplicate `current_date()`**
-Identical implementation in `capture.rs:288` and `walker/utils.rs:55`, both
-using the same approximate `days/365` arithmetic. Delete one, expose from a
-shared utility.
+**`turbo_quant/mod.rs` → `turbo_quant/engine.rs`** ✅ Done 2026-04-26  
+TurboQuantEngine + TurboQuant codec moved to `engine.rs`. `mod.rs` is a thin re-export of sub-modules + `pub use engine::{TurboQuantEngine, TurboQuant}`.
 
-**Magic batch size in `graph_ffn.rs`**
-`let batch_size = 8192` appears at lines 82 and 166 with the memory rationale
-only in an inline comment. Promote to `const GATE_INDEX_BATCH_SIZE: usize = 8192`
-at module level with the doc.
+**`vindex/walk_ffn/mod.rs` → `walk_ffn/engine.rs`**  
+Deferred: walk path submodules use `pub(super) impl WalkFfn` blocks that are
+architecturally tied to `mod.rs` as the parent. Requires changing visibility to
+`pub(in crate::vindex::walk_ffn)` across 6 files — low risk/reward compared to
+other P1 items. Backlog.
 
-**GELU approximation coefficients**
-`ffn/mod.rs:86-87` has bare `0.797_884_6` and `0.044715`. Name them
-`GELU_TANH_COEFF` / `GELU_TANH_CUBIC` with a source citation.
+**`layer_graph/predict.rs` (700 LOC) — split**  
+Five `predict_*` variant functions sharing a shell. Extract to `predict/base.rs`
+(shared embed→loop→logits shell) + `predict/variants.rs` (per-strategy overloads).
 
-**Embedding layer −1 sentinel**
-`trace/store.rs:43,150` and `trace/types.rs:10` special-case layer −1 inline.
-`const EMBEDDING_LAYER: i32 = -1` plus a `fn is_embedding_layer(layer: i32) -> bool` helper.
+**`residual.rs` at crate root → `forward/norm.rs`**  
+It's a collection of norm primitives used exclusively by the forward pass. Moving
+it co-locates it with the other forward utilities (`ops.rs`, `layer.rs`).
 
----
+**`capture.rs` at crate root → `trace/`**  
+`InferenceModel` / `CaptureConfig` belong with the trace infrastructure.
 
-### Medium priority — modularity
+### Medium priority
 
-**Engine dispatch on string literals**
-`engines/mod.rs:156-175` matches `"markov-rs"`, `"unlimited-context"`,
-`"turbo-quant"`, `"apollo"` as bare strings. `EngineInfo.backend: String`
-exposes the same problem in the public API. Define `BackendKind { Cpu, Metal }`
-and `EngineKind { MarkovRs, UnlimitedContext, TurboQuant, Apollo }` enums as
-the source of truth; derive `Display` to keep the string interface externally.
+**Softmax in 5 locations — unify**  
+`trace/vocab.rs`, `engines/accuracy.rs`, `ffn/moe_remote.rs`,
+`layer_graph/logits.rs`, `forward/target_delta.rs` each have a private softmax.
+Promote `engines/accuracy.rs::softmax` to `forward/ops.rs` (or `residual.rs`);
+have the others `use crate::forward::softmax`.
 
-**Forward-pass loop duplicated 4+ times**
-`predict_with_temperature`, `predict_with_ffn`, `predict_with_router`, and
-`predict_with_strategy` all repeat the embed→loop-layers→lm_head shell with
-minor per-layer variation. Extract a `predict_impl(weights, tokenizer, tokens,
-layer_fn: impl Fn) -> PredictResult` that owns the shell; callers pass a
-closure for per-layer logic.
+**`embed_tokens_pub` / `run_attention_public` naming**  
+The `_pub` suffix is redundant on public functions. Rename to `embed_tokens` and
+`run_attention` or document why the suffix exists. `_pub` vs `_public` is also
+inconsistent.
 
-**KV cache loop duplicated across engines**
-`MarkovResidualEngine`, `UnlimitedContextEngine`, `TurboQuantEngine` each
-re-implement the prefill→token→extend loop. Define a `KVCacheStrategy` trait
-(or shared loop helper) to consolidate the common structure.
+**`ApolloEngine` and `TurboQuantEngine` not re-exported at crate root**  
+`MarkovResidualEngine` and `UnlimitedContextEngine` are re-exported; the other
+two engines are not. Either export all four or none.
 
-**`infer_patched.rs` hard-wires `WalkFfn` internals**
-`forward/infer_patched.rs:67-91` calls `WalkFfn::new_unlimited_with_trace`
-directly then extracts residuals, coupling the INFER pipeline to WalkFfn
-internals. Expose residual capture via a callback/trait on `FfnBackend` instead.
+**`walker/` and `experts/` have no module-level docs**  
+Add `//!` headers explaining purpose and entry points.
 
-**Chat template family-matching duplicated**
-`"gemma"`, `"mistral"`, `"llama"` family strings matched independently in
-`chat/fallback.rs:30` and `chat/source.rs`. Extract a single `FamilyMatcher`
-type reused by both the HF-file path and the hardcoded fallback.
-
-**Trace capture re-implements forward pass**
-`trace/capture.rs` duplicates the embedding and layer computation from
-`forward/embed.rs` / `forward/layer.rs` to intercept residuals, creating two
-parallel implementations that drift on any attention/FFN change. Add a
-`capture_residual` callback to the main forward loop instead.
-
----
+**`vindex/` module doc is vague**  
+"Vindex integration" says nothing to a new reader. Expand to explain what the
+vindex is and what this module provides.
 
 ### Low priority
 
-**RoPE base constant in tests**
-`attention/rope.rs` hard-codes `10000.0` in 7 test methods. Define
-`const DEFAULT_ROPE_BASE: f64 = 10000.0` at module level and use it uniformly.
+**`forward` re-export block is 70+ items with no sub-grouping**  
+Split into clearly commented groups: prediction, tracing, raw logits, analysis
+(memit, target_delta, infer_patched).
 
-**Walker threshold table**
-`walker/utils.rs:30-52` has 7 sequential `if` statements for threshold buckets
-(0.01, 0.05, 0.10, …). Replace with a `const THRESHOLD_BUCKETS: &[(f64, &str)]`
-slice iterated once.
+**`trace as trace_decomposed` alias in `lib.rs`**  
+Aliases a naming problem rather than fixing it. Rename the function itself.
 
-**`head_dim` inferred from `kv_dim` in TurboQuant**
-`engines/kv_engines/turbo_quant/mod.rs:99` guesses `head_dim` from `kv_dim`
-instead of reading it from arch. Pass `head_dim` as a parameter from engine
-init.
+**`RawForward` is an implementation detail in the public API**  
+Users never construct `RawForward` directly; it's only returned by
+`forward_raw_logits`. Consider whether it needs to be pub.
 
-**`L1_DEFAULT_MAX_ENTRIES` unused at call sites**
-`vindex/l1_cache.rs:12` defines the constant but call sites hard-code the same
-value independently. Audit and use the constant everywhere.
+**`generate_cached*` in `forward/` vs `generate` in `layer_graph/`**  
+Two generation APIs with similar names but different semantics (CPU KV-cache step
+vs Metal fused pipeline). Add a clear doc comment on each explaining the difference.
+
+---
+
+## P1: Test coverage gaps
+
+From 2026-04-26 coverage review (49% line coverage overall).
+
+### Critical
+
+**`markov_residual/` — zero tests across all 5 new files** ✅ Done 2026-04-26  
+`store.rs`: clip_layer edge cases (no-window noop, at-limit, over-limit), memory_bytes, window_tokens.  
+`engine.rs`: name, memory lifecycle, prefill→decode cycle, window clipping, multi-step shapes.  
+`compute.rs`: recompute_kv shape/finiteness/RoPE shift, rs_prefill result shape + window, rs_decode_step position advance.
+
+**`ffn/sparse_compute.rs` and `ffn/sparse.rs` — zero tests** ✅ Done 2026-04-26  
+`sparse_compute.rs`: empty-features→zeros, single/multi-token shape, top-K ordering, dense-fallback equivalence, down-override effect.  
+`sparse.rs`: name, all-layers shape/finiteness, top-k vs dense match, with_activation shapes.
+
+**`ffn/graph_backend.rs` — zero tests** ✅ Done 2026-04-26  
+Construction (layer count, empty layers), lookup_from_tokens (top-K limit, unknown layer, empty scores, out-of-range tokens), precompute_entity, save/load roundtrip.
+
+**`layer_graph/` — 7 of 17 files untested**  
+`dense.rs`, `walk.rs`, `prefill.rs`, `template.rs`, `grid.rs`,
+`pipeline_layer.rs`, `mod.rs` have zero coverage. Add synthetic tests using
+`make_test_weights()` + `make_test_vindex()`.
+
+### High priority
+
+**`forward/ops.rs` — zero tests** ✅ Done 2026-04-26  
+`dot_proj`: shape, identity-weight, value-correctness.  
+`add_bias`: all-rows updated, shorter-bias safe, zero-bias noop.  
+`apply_norm`: shape, finite output, offset produces different result.
+
+**`forward/ple.rs` — zero tests**  
+Per-layer embeddings (Gemma 4 E2B gating logic) are complex and untested.
+
+**`engines/kv_engines/unlimited_context/extend.rs` — zero tests**  
+`rs_extend_from_checkpoint` and `rs_extend_from_checkpoint_q4k` are core
+UnlimitedContext compute paths with no direct tests.
+
+### Medium priority
+
+**GQA head grouping (`reps` parameter) not tested**  
+`gqa.rs` tests don't cover the case where `num_q > num_kv`
+(i.e. `reps > 1`). Add a test with 2 Q-heads per KV-head.
+
+**RoPE missing property tests**  
+Add: reversibility (applying with negated position recovers original),
+frequency scaling (different `rope_base` produces different output),
+`partial_fraction` boundary at 0 and 1.
+
+**No synthetic end-to-end tests for `generate()`**  
+`generate()` (Metal GPU path) is only tested with `#[ignore]` real-model tests.
+Add a synthetic CPU-backend integration test using `make_test_weights()`.
 
 ---
 
 ## P2: Research
 
 ### Hybrid head caching (RS+CA)
-95.5% of attention heads are static (cacheable). Caching only those heads while
-keeping 4.5% dynamic KV would give ~180-370× compression at 370K tokens —
-between TurboQuant (4×) and MarkovRS (287×) but with near-exact accuracy.
+95.5% of attention heads are static (cacheable). Would give ~180-370× compression
+at 370K tokens — between TurboQuant (4×) and MarkovRS (287×) with near-exact accuracy.
 
 ### Graph Walk engine
-FFN-only graph walk is proven (348K features, 34 layers, zero accuracy loss via
-vindex). Full RS Graph Walk requires "cracked attention" (static head caching).
-When that ships, `GraphWalkEngine` can eliminate the forward pass entirely for
-parametric queries.
+FFN graph walk is proven (348K features, 34 layers, zero accuracy loss).
+Full RS Graph Walk requires cracked attention (static head caching).
+`GraphWalkEngine` would eliminate the forward pass entirely for parametric queries.
 
 ---
 
@@ -280,8 +265,6 @@ parametric queries.
 | Q4_K FFN format wiring | 2026-04-07 | Vindex Q4_K FFN → FullPipelineLayer |
 | GELU-tanh activation | 2026-04-07 | Gemma3 correct on GPU |
 | Post-norm guard | 2026-04-07 | Gemma3 falls to CPU correctly |
-| Zero warnings | 2026-04-07 | Clean build |
-| PERFORMANCE.md | 2026-04-07 | Benchmark data documented |
 | KvEngine trait + EngineKind | 2026-04-25 | Pluggable engine selector + CLI params |
 | MarkovResidualEngine | 2026-04-25 | Residual-based KV (exact, 287×) |
 | UnlimitedContextEngine | 2026-04-25 | Window checkpoints (exact within window, 254×) |
@@ -292,6 +275,19 @@ parametric queries.
 | ApolloEngine | 2026-04-26 | Retrieval+injection (20,000×, compressed path) |
 | `forward_from_layer` | 2026-04-26 | Start forward at crystal_layer; 8.5× Apollo speedup |
 | Metal Q4K path for all engines | 2026-04-26 | ~95 tok/s across all 4 engines |
-| kv_engines/ subfolder | 2026-04-26 | Organised engine hierarchy |
-| 106 engine unit tests | 2026-04-26 | Codec quality, routing, compliance, construction |
-| kv-cache-benchmark rewired | 2026-04-25 | turbo_quant/ + apollo/ re-export from larql-inference |
+| `generate/` split (cpu/gpu/lm_head/types) | 2026-04-26 | Structured generation directory |
+| `markov_residual/` split (store/engine/compute/q4k) | 2026-04-26 | Structured engine directory |
+| `forward/predict/` split (types/raw/dense/ffn) | 2026-04-26 | Forward predict directory |
+| `forward/ops.rs` extracted | 2026-04-26 | Shared math primitives |
+| `graph_ffn.rs` → `ffn/graph_backend.rs` | 2026-04-26 | Correct placement in ffn/ |
+| 400+ unit tests | 2026-04-26 | Synthetic weights, no disk I/O |
+| 49% line coverage (llvm-cov) | 2026-04-26 | Baseline measured |
+| Code quality review (3-agent) | 2026-04-26 | Unsafe removed, LCG fixed, OnceLock added |
+| P1 code quality fixes (magic strings, duplication) | 2026-04-25 | env-var names, GELU constants |
+| `ffn/remote.rs` → `remote/codec.rs` + `remote/http.rs` | 2026-04-26 | No magic strings; codec/HTTP separation |
+| `turbo_quant/mod.rs` → `engine.rs` | 2026-04-26 | Consistent engine layout; thin mod.rs |
+| Tests: `markov_residual/` (store, engine, compute) | 2026-04-26 | 0 → 15 tests; prefill/decode/clip coverage |
+| Tests: `ffn/sparse_compute.rs` + `ffn/sparse.rs` | 2026-04-26 | 0 → 14 tests; sparse FFN validated |
+| Tests: `ffn/graph_backend.rs` | 2026-04-26 | 0 → 10 tests; GateIndex build/lookup/save |
+| Tests: `forward/ops.rs` | 2026-04-26 | 0 → 8 tests; dot_proj/add_bias/apply_norm |
+| 457 unit tests total | 2026-04-26 | +~50 tests vs previous session |

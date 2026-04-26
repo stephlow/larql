@@ -124,6 +124,19 @@ impl BufferCache {
         )
     }
 
+    /// Create a transient buffer from raw bytes. Used for staging concatenated
+    /// Q4K expert weight slices before a GPU matvec dispatch.
+    pub fn transient_from_bytes(&self, data: &[u8]) -> Buffer {
+        if data.is_empty() {
+            return self.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        }
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
 
     /// Create an empty output buffer of given byte size.
     pub fn output(&self, bytes: u64) -> Buffer {

@@ -198,6 +198,7 @@ fn make_loaded_model(
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     // Build ModelWeights with expert data in raw_bytes (no mmap needed).
@@ -302,6 +303,7 @@ fn local_output(
             top_k: TOP_K,
             intermediate_size: INTER,
             activation: larql_compute::Activation::Silu,
+            expert_data_format: larql_compute::QuantFormat::F32,
         },
         0.0,
         1e-6,

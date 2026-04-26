@@ -71,6 +71,14 @@ pub struct VindexConfig {
     /// authoritative and loaders use the legacy codepath.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fp4: Option<Fp4Config>,
+
+    /// FFN weight storage layout (§5.12). When `"per_layer"`, FFN weights live
+    /// in `layers/layer_{L:02}.weights` — one file per layer, format declared
+    /// in each file's header. Works for both dense (num_entries=1) and MoE
+    /// (num_entries=num_experts). Absent → legacy flat-file layout
+    /// (`interleaved_q4k.bin` / `experts_packed.bin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn_layout: Option<String>,
 }
 
 /// Provenance: which model checkpoint this vindex was built from.
@@ -266,6 +274,7 @@ mod fp4_schema_tests {
             has_model_weights: false,
             model_config: None,
             fp4: None,
+            ffn_layout: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("\"fp4\""), "legacy config leaked fp4 field: {json}");
@@ -297,6 +306,7 @@ mod fp4_schema_tests {
             has_model_weights: false,
             model_config: None,
             fp4: Some(Fp4Config::option_b_default()),
+            ffn_layout: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"fp4\""));

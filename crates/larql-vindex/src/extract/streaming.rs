@@ -583,6 +583,7 @@ pub fn build_vindex_streaming(
             final_logit_softcapping: cfg.final_logit_softcapping,
         }),
         fp4: None,
+            ffn_layout: None,
     };
 
     // Write preliminary index.json (needed by write_model_weights which reads dtype from it)

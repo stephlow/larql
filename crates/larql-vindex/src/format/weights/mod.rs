@@ -18,6 +18,7 @@
 pub mod load;
 pub mod manifest;
 pub mod write_f32;
+pub mod write_layers;
 pub mod write_q4k;
 
 pub use write_f32::{

@@ -63,6 +63,7 @@ pub trait QuantMatVec {
                     crate::cpu::ops::q4_common::quantize_to_q8(x);
                 self.q4_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
             }
+            QuantFormat::BF16 | QuantFormat::F16 | QuantFormat::F32 => None,
         }
     }
 
@@ -101,6 +102,7 @@ pub trait QuantMatVec {
                 let x_f32 = dequantise_q8(q8_x, q8_scales);
                 self.quant_matvec(format, weights, &x_f32, num_rows, hidden)
             }
+            QuantFormat::BF16 | QuantFormat::F16 | QuantFormat::F32 => None,
         }
     }
 

@@ -10,7 +10,7 @@ use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::band_utils::{BAND_KNOWLEDGE, filter_layers_by_band, get_layer_bands};
+use crate::band_utils::{BAND_KNOWLEDGE, PROBE_RELATION_SOURCE, filter_layers_by_band, get_layer_bands};
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel, elapsed_ms};
 
@@ -161,7 +161,7 @@ fn describe_entity(
             // Probe-confirmed relation label.
             if let Some(label) = model.probe_labels.get(&(info.best_layer, info.best_feature)) {
                 edge["relation"] = serde_json::json!(label);
-                edge["source"] = serde_json::json!("probe");
+                edge["source"] = serde_json::json!(PROBE_RELATION_SOURCE);
             }
 
             if params.verbose {

@@ -32,6 +32,7 @@ pub mod diag;
 mod direct_ops;
 mod decode;
 mod decode_hybrid;
+mod moe_dispatch;
 mod pipeline;
 mod prefill;
 mod trait_impl;

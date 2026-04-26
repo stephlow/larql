@@ -19,6 +19,54 @@ mod cache;
 pub use expert::{run_single_expert, run_single_expert_with_norm};
 pub use forward::cpu_moe_forward;
 
+/// CPU router: returns `(top_k_indices, renormalized_weights)` for the given
+/// hidden state. Used by GPU dispatch paths that route on CPU but run expert
+/// FFNs on GPU. Mirrors the routing logic in `forward::cpu_moe_forward`.
+pub fn cpu_moe_route(
+    h: &[f32],
+    moe: &crate::MoeLayerWeights<'_>,
+    eps: f32,
+) -> (Vec<usize>, Vec<f32>) {
+    use math::*;
+    let hidden = h.len();
+    let num_experts = moe.num_experts;
+    let top_k_val  = moe.top_k;
+
+    let router_in_normed = if !moe.router_norm.is_empty() {
+        rms_norm(h, moe.router_norm, eps, 0.0)
+    } else if moe.router_norm_parameter_free {
+        rms_norm_no_weight(h, eps)
+    } else {
+        h.to_vec()
+    };
+    let mut router_in: Vec<f32> = if !moe.router_scale.is_empty() {
+        router_in_normed.iter().zip(moe.router_scale).map(|(a, b)| a * b).collect()
+    } else {
+        router_in_normed
+    };
+    if moe.router_input_scalar != 1.0 && moe.router_input_scalar != 0.0 {
+        for v in &mut router_in { *v *= moe.router_input_scalar; }
+    }
+
+    let mut logits = matmul_vec(&router_in, moe.router_proj, num_experts, hidden);
+    softmax(&mut logits);
+    let (indices, mut weights) = top_k(&logits, top_k_val);
+
+    // Renormalize selected weights → sum to 1 (gemma4_top_k_softmax).
+    let sum: f32 = weights.iter().sum();
+    if sum > 0.0 { for w in &mut weights { *w /= sum; } }
+
+    // Per-expert output scale (Gemma 4 learned per-expert multiplier).
+    if !moe.router_per_expert_scale.is_empty() {
+        for (i, &ei) in indices.iter().enumerate() {
+            if ei < moe.router_per_expert_scale.len() {
+                weights[i] *= moe.router_per_expert_scale[ei];
+            }
+        }
+    }
+    (indices, weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -31,6 +79,7 @@ mod tests {
         MoeLayerWeights {
             experts_gate_up: gate_up,
             experts_down: down,
+            expert_data_format: crate::QuantFormat::BF16,
             router_proj: router,
             router_scale: &[],
             router_per_expert_scale: &[],

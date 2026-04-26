@@ -303,56 +303,36 @@ pub fn write_model_weights_q4k_with_opts(
         state.finalize(&dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON))?;
     }
 
-    // ── experts_packed.bin (hybrid MoE PackedBF16, e.g. Gemma 4 26B A4B) ──
+    // ── layers/ — per-layer FFN weights (§5.12) ──────────────────────────
     //
-    // Expert gate_up_proj and down_proj are stored as raw BF16 bytes — NOT Q4_K.
-    // Converting to f32 would double the footprint (~50 GB); BF16 keeps it to ~26 GB.
-    // The forward pass reads these directly at inference time.
-    let mut packed_entries: Vec<WeightEntry> = Vec::new();
+    // For MoE models (hybrid MoE PackedBF16, e.g. Gemma 4 26B A4B):
+    //   Source BF16 tensors are quantized to Q4_K per expert, written to
+    //   layers/layer_{L:02}.weights with num_entries=num_experts.
+    //
+    // For dense models: interleaved_q4k.bin remains the primary FFN store.
+    // Per-layer format for dense is a future migration (--ffn-layout flag).
+    //
+    // Replaces the old BF16 experts_packed.bin monolithic blob.
     if arch.is_hybrid_moe() && arch.expert_format() == larql_models::ExpertFormat::PackedBF16 {
-        let num_experts = arch.num_experts();
-        let moe_inter = arch.moe_intermediate_size();
-        let hidden = arch.config().hidden_size;
+        use super::write_layers::{write_layer_weights, quantize_moe_entries, LayerWeightFormat};
 
-        let packed_path = dir.join("experts_packed.bin");
-        let mut packed_file = BufWriter::new(std::fs::File::create(&packed_path)?);
-        let mut packed_offset: u64 = 0;
+        let num_experts = arch.num_experts();
+        let moe_inter   = arch.moe_intermediate_size();
+        let hidden      = arch.config().hidden_size;
 
         for layer in 0..num_layers {
-            // gate_up: [num_experts, 2*moe_inter, hidden] in BF16
-            if let Some(key) = arch.packed_experts_gate_up_key(layer) {
-                if let Some(bytes) = source.get_packed_bf16(&key) {
-                    packed_file.write_all(&bytes)?;
-                    let len = bytes.len() as u64;
-                    packed_entries.push(WeightEntry {
-                        key,
-                        kind: "packed_bf16".into(),
-                        shape: vec![num_experts, 2 * moe_inter, hidden],
-                        offset: packed_offset,
-                        length: len,
-                        file: "experts_packed.bin".into(),
-                    });
-                    packed_offset += len;
-                }
-            }
-            // down: [num_experts, hidden, moe_inter] in BF16
-            if let Some(key) = arch.packed_experts_down_key(layer) {
-                if let Some(bytes) = source.get_packed_bf16(&key) {
-                    packed_file.write_all(&bytes)?;
-                    let len = bytes.len() as u64;
-                    packed_entries.push(WeightEntry {
-                        key,
-                        kind: "packed_bf16".into(),
-                        shape: vec![num_experts, hidden, moe_inter],
-                        offset: packed_offset,
-                        length: len,
-                        file: "experts_packed.bin".into(),
-                    });
-                    packed_offset += len;
-                }
+            let gu_key = arch.packed_experts_gate_up_key(layer);
+            let dn_key = arch.packed_experts_down_key(layer);
+            let gu_bytes = gu_key.as_ref().and_then(|k| source.get_packed_bf16(k));
+            let dn_bytes = dn_key.as_ref().and_then(|k| source.get_packed_bf16(k));
+
+            if let (Some(gu), Some(dn)) = (gu_bytes, dn_bytes) {
+                // Default: Q4_K for the whole file. Format is uniform — no mixing.
+                let fmt = LayerWeightFormat::Q4_K;
+                let entries = quantize_moe_entries(&gu, &dn, num_experts, moe_inter, hidden, fmt);
+                write_layer_weights(dir, layer, fmt, &entries, moe_inter, hidden)?;
             }
         }
-        packed_file.flush()?;
     }
 
     // ── norms.bin (f32, small) ──
@@ -589,9 +569,8 @@ pub fn write_model_weights_q4k_with_opts(
         });
     }
 
-    // norms + packed experts + lm_head manifest
+    // norms + lm_head manifest (expert weights now in layers/ files, not manifest)
     let mut all_entries = norm_entries;
-    all_entries.extend(packed_entries);
     let manifest_json = serde_json::to_string_pretty(&all_entries)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
@@ -604,6 +583,9 @@ pub fn write_model_weights_q4k_with_opts(
 
     config.has_model_weights = true;
     config.quant = crate::QuantFormat::Q4K;
+    if arch.is_hybrid_moe() {
+        config.ffn_layout = Some("per_layer".into());
+    }
 
     let cfg = arch.config();
     config.model_config = Some(VindexModelConfig {

@@ -476,6 +476,7 @@ impl<'a> BuildContext<'a> {
                 })
             },
             fp4: None,
+            ffn_layout: None,
         };
 
         // Preliminary write — `write_model_weights` reads the index.
@@ -738,6 +739,7 @@ pub fn build_vindex_resume(
             })
         },
         fp4: None,
+            ffn_layout: None,
     };
 
     config.checksums = crate::format::checksums::compute_checksums(output_dir).ok();

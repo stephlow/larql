@@ -937,6 +937,58 @@ POST /v1/walk-ffn {"layer": 20, "residual": [...]}
 
 ---
 
+### 13.4 Expert Sharding (`--experts`) — planned
+
+Restrict the server to a contiguous range of expert IDs within each MoE layer. Requires vindexes using the `per_layer` expert format (§5.12 of `vindex-format-spec.md`).
+
+```bash
+larql-server gemma4-26b-a4b.vindex --experts 0-31  --port 8080
+larql-server gemma4-26b-a4b.vindex --experts 32-63  --port 8081
+larql-server gemma4-26b-a4b.vindex --experts 64-95  --port 8082
+larql-server gemma4-26b-a4b.vindex --experts 96-127 --port 8083
+```
+
+`START-END` bounds are **inclusive**. Gemma 4 26B A4B (128 experts/layer) split four ways:
+
+| Shard | Experts | RSS per layer file |
+|-------|---------|-------------------|
+| A | 0–31 (32 experts) | ~25% of layer file |
+| B | 32–63 | ~25% |
+| C | 64–95 | ~25% |
+| D | 96–127 | ~25% |
+
+**Memory model.**
+
+Each `layer_L.experts` file is mmap'd in full (virtual address only — one `mmap()` syscall per file, no RSS). The OS faults in only pages that are actually read. For a shard owning experts 0–31, experts 32–127 are never read and never resident. `is_expert_owned(layer, expert)` is a bitmap lookup; out-of-range expert requests return HTTP 404 before touching any file data.
+
+**Endpoint behaviour under `--experts`.**
+
+`POST /v1/expert/{layer}/{expert_id}` accepts only expert IDs within the shard's range. All other expert IDs return 404 with:
+```json
+{"error": "expert 47 not owned by this shard (owns 0-31)"}
+```
+
+`GET /v1/stats` reports:
+```json
+{
+  "mode": "expert-shard",
+  "experts": "0-31",
+  "layers": "all",
+  "num_experts_owned": 32
+}
+```
+
+**CLI flag summary.**
+
+| Flag | Meaning |
+|------|---------|
+| `--experts START-END` | Expert ID range to load and serve (inclusive) |
+| `--experts START-END --layers START-END` | Combined expert + layer range (for fine-grained grid shards) |
+
+**Note:** `--experts` requires `ffn_layout: "per_layer"` in `index.json`. Starting a shard against a vindex without this field returns an error at startup.
+
+---
+
 ### 13.3 Deployment with a Router
 
 Layer-sharded servers are not meant to be addressed directly. Use `larql-router`

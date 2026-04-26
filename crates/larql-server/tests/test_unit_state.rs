@@ -68,6 +68,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
             has_model_weights: false,
             model_config: None,
             fp4: None,
+            ffn_layout: None,
         },
         patched: tokio::sync::RwLock::new(patched),
         embeddings: Array2::<f32>::zeros((4, hidden)),
@@ -123,6 +124,7 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
@@ -311,6 +313,7 @@ fn test_config_has_inference_capability() {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     // Browse level → no inference
@@ -1060,6 +1063,7 @@ fn test_infer_weights_required() {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     };
     // Browse level + no model weights → can't infer
     let can_infer = config.has_model_weights
@@ -1119,4 +1123,136 @@ fn test_error_nonexistent_model_in_multi() {
     let models = ["model-a", "model-b"];
     let find = |id: &str| models.iter().find(|m| **m == id);
     assert!(find("model-c").is_none()); // → 404
+}
+
+// ══════════════════════════════════════════════════════════════
+// RATELIMIT MIDDLEWARE
+// ══════════════════════════════════════════════════════════════
+
+use larql_server::ratelimit::rate_limit_middleware;
+use axum::{Router, routing::get, middleware};
+use tower::ServiceExt as TowerServiceExt;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+
+async fn ok_handler() -> &'static str { "ok" }
+
+fn router_with_limiter(rl: Arc<RateLimiter>) -> Router {
+    Router::new()
+        .route("/v1/stats", get(ok_handler))
+        .route("/v1/health", get(ok_handler))
+        .layer(middleware::from_fn_with_state(rl, rate_limit_middleware))
+}
+
+#[tokio::test]
+async fn rate_limit_blocks_when_exhausted() {
+    // 1/sec → first request with X-Forwarded-For passes, second is rejected.
+    // The middleware uses the X-Forwarded-For IP for per-IP rate limiting.
+    let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
+    let app1 = router_with_limiter(Arc::clone(&rl));
+    let resp1 = app1.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK, "first request should pass");
+
+    let app2 = router_with_limiter(Arc::clone(&rl));
+    let resp2 = app2.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS, "second request should be rate-limited");
+}
+
+#[tokio::test]
+async fn rate_limit_health_exempt() {
+    // Even with a 1/sec limiter exhausted, /v1/health is exempt.
+    let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
+
+    // Exhaust the limiter for 127.0.0.1 via X-Forwarded-For.
+    let app1 = router_with_limiter(Arc::clone(&rl));
+    let resp1 = app1.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    // Verify exhausted on /v1/stats.
+    let app2 = router_with_limiter(Arc::clone(&rl));
+    let resp2 = app2.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Health check is exempt — should still pass.
+    let app3 = router_with_limiter(Arc::clone(&rl));
+    let resp3 = app3.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/health")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK, "/v1/health should be exempt from rate limiting");
+}
+
+#[tokio::test]
+async fn rate_limit_forwarded_for_header_used_as_ip() {
+    // X-Forwarded-For: 10.0.0.1 → uses that IP, different from 10.0.0.2.
+    let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
+
+    // Exhaust 10.0.0.1 bucket.
+    let app1 = router_with_limiter(Arc::clone(&rl));
+    let _ = app1.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+
+    // 10.0.0.1 is now blocked.
+    let app2 = router_with_limiter(Arc::clone(&rl));
+    let resp_blocked = app2.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 10.0.0.2 has its own bucket — should pass.
+    let app3 = router_with_limiter(Arc::clone(&rl));
+    let resp_other = app3.oneshot(
+        Request::builder()
+            .method("GET").uri("/v1/stats")
+            .header("x-forwarded-for", "10.0.0.2")
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp_other.status(), StatusCode::OK, "different IP should have its own bucket");
+}
+
+#[tokio::test]
+async fn rate_limit_no_ip_passes_through() {
+    // No X-Forwarded-For and no ConnectInfo → middleware has no IP to check.
+    // Per the implementation: if ip is None, the check is skipped entirely.
+    let rl = Arc::new(RateLimiter::parse("1/sec").unwrap());
+    // Make multiple requests with no IP info — all should pass (no IP → no rate limit applied).
+    for _ in 0..3 {
+        let app = router_with_limiter(Arc::clone(&rl));
+        let resp = app.oneshot(
+            Request::builder()
+                .method("GET").uri("/v1/stats")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        // Without an IP, rate_limit_middleware skips the check and passes through.
+        assert_eq!(resp.status(), StatusCode::OK, "no IP → should pass through even beyond limit");
+    }
 }

@@ -75,6 +75,21 @@ impl ModelWeights {
         self.raw_bytes.get(key).map(|v| v.as_slice())
     }
 
+    /// Return the gate+up and down byte slices for one FFN entry at a given
+    /// layer, using the `layers/{layer}/{entry}/gate_up` and `.../down` keys
+    /// populated by the per-layer loader. Returns `None` if the vindex uses
+    /// the legacy flat-file layout or the entry is out of range.
+    pub fn get_layer_entry_bytes(&self, layer: usize, entry: usize) -> Option<(&[u8], &[u8])> {
+        let gu = self.get_packed_bytes(&format!("layers/{layer}/{entry}/gate_up"))?;
+        let dn = self.get_packed_bytes(&format!("layers/{layer}/{entry}/down"))?;
+        Some((gu, dn))
+    }
+
+    /// Whether FFN weights are stored in the per-layer format (`layers/`).
+    pub fn has_per_layer_ffn(&self) -> bool {
+        self.packed_byte_ranges.contains_key("layers/0/0/gate_up")
+    }
+
     /// Drop FFN weight tensors (gate, up, down projections) from memory.
     /// After this, only attention, embedding, norm, and logits weights remain.
     /// Returns the number of bytes freed.

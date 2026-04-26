@@ -216,3 +216,24 @@ async fn http_insert_bumps_request_counter() {
     })).await;
     assert_eq!(st.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+// ══════════════════════════════════════════════════════════════
+// POST /v1/infer — no weights (has_model_weights=false, Browse level)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn http_infer_no_weights_check_returns_503() {
+    // infer_disabled=false but has_model_weights=false + ExtractLevel::Browse
+    // → handler should return 503 "vindex does not contain model weights".
+    // model_infer_enabled() uses infer_disabled=false + empty tokenizer.
+    // The infer route checks has_model_weights before calling get_or_load_weights.
+    // Since extract_level=Browse and has_model_weights=false, it returns 503.
+    let app = single_model_router(state(vec![model_infer_enabled("test")]));
+    let resp = post_json(app, "/v1/infer", serde_json::json!({"prompt": "hello"})).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_json(resp.into_body()).await;
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("model weights"),
+        "expected 'model weights' in error, got: {:?}", body["error"]
+    );
+}

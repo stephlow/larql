@@ -42,55 +42,45 @@
 
 ## P0: Active
 
-### Expert weight format redesign — split blob → per-expert Q4K files
+### Per-layer FFN weight format (`layers/`) — unified dense + MoE
 
-**Status**: Not started — blocks MoE GPU dispatch (4× decode speedup on 26B A4B)  
+**Status**: Not started — blocks MoE GPU dispatch and cleaner server sharding  
 **Measured impact**: SKIP_MOE baseline = 15ms/tok (56.8 tok/s). With current BF16 blob = 241ms/tok. **93.7% of decode time is CPU MoE.**
 
-**Root cause (diagnosed 2026-04-26):**
+**Design (see `docs/format-spec.md §5.12` for binary layout):**
 
-The current `experts_packed.bin` is a single 43 GB BF16 blob (`[num_experts, 2*inter, hidden]` gate+up + `[num_experts, hidden, inter]` down per layer). Three compounding problems:
-
-1. **BF16 format** — incompatible with existing Q4K GPU shaders. Every decode step forces 8 experts × 30 layers × ~12 MB through CPU BF16→f32 dequant (~2.9 GB/token of CPU memory reads). LRU cache (64 entries, 128-expert pool) has near-zero hit rate because expert selection is near-random token to token.
-
-2. **CPU dispatch with 30 GPU syncs** — each layer requires `commit() + wait_until_completed()` to hand `h_post_attn` to the CPU MoE block and receive `moe_out` back. 30 syncs × ~1ms = ~30ms overhead per decode step.
-
-3. **Monolithic blob** — a single file holding all experts for all layers. Cannot mmap individual experts efficiently; shard servers that own only a layer range still load the whole blob.
-
-**Proposed format:**
-
-Replace `experts_packed.bin` with per-expert Q4K files (or a per-layer expert pack), matching the existing `interleaved_q4k.bin` layout:
+One file per transformer layer, for both dense and MoE models. Dense layers have `num_entries=1`; MoE layers have `num_entries=num_experts`. The file header declares the quantization format — all entries in the file use it uniformly. No mixing formats within a file.
 
 ```
-experts_q4k/
-  layer_{L}_gate_up.bin   # [num_experts * 2 * inter, hidden] Q4K — all experts concatenated
-  layer_{L}_down.bin      # [num_experts * hidden, inter] Q4K — all experts concatenated
+layers/
+  layer_00.weights   ← header (magic, quant_format, num_entries, inter, hidden)
+  layer_01.weights      offset table (num_entries × 4 × u64)
+  ...                   entry data in declared quant_format
 ```
 
-Or, if expert-level granularity is needed for shard routing:
+**Key properties:**
+- **Structure ⊥ quantization**: `layers/` is the layout; the quant (Q4_K, Q6_K, Q8, FP4, …) lives in the file header. Re-quantizing = replacing one file.
+- **Unified path**: dense and MoE share identical file format and GPU dispatch code. Dense is `num_entries=1`.
+- **Native OS addressability**: `--layers 0-14` maps 15 files; `--experts 0-31` reads only those entry byte ranges per file.
+- **Replaces both** `interleaved_q4k.bin` (dense flat file) and `experts_packed.bin` (43 GB BF16 blob).
 
-```
-experts_q4k/
-  layer_{L}_expert_{E}_gate_up.bin   # [2*inter, hidden] Q4K per expert
-  layer_{L}_expert_{E}_down.bin      # [hidden, inter] Q4K per expert
-```
+**Why old formats fail:**
+- `experts_packed.bin`: BF16 incompatible with GPU shaders → CPU dequant at ~2.9 GB/token; 30 GPU syncs per decode step; no per-expert mmap slicing.
+- `interleaved_q4k.bin`: OS faults in full virtual range for `--layers` shards; layer replacement requires full-file rewrite.
 
-The per-layer concatenated form is preferred for GPU dispatch: a single `q4k_matvec` call with `N = num_selected * inter` rows processes all top-K experts in one GPU dispatch. The router selects expert indices on CPU (cheap: 2816×128 = 360K ops), then the GPU reads the relevant row ranges.
-
-**Expected outcome after fix:**
-
+**Expected outcome (MoE, 26B A4B):**
 - GPU command buffer per decode step: 1 (not 30)
-- Expert computation: GPU Q4K dispatch (same shader as gate/up FFN)
-- Projected decode: ~16ms/tok (GPU baseline 15ms + routing overhead) → **~62 tok/s (15× improvement)**
+- Projected decode: ~16ms/tok → **~62 tok/s (15× vs current 4.1 tok/s)**
 
 **Work items:**
 
-- [ ] Add `Q4KExpertWriteOptions` to the extraction pipeline — Q4K-quantize `experts_gate_up` and `experts_down` tensors per layer, emit as `experts_q4k/layer_{L}_{kind}.bin` with accompanying manifest
-- [ ] Update `VindexModelConfig` / `weight_manifest.json` to record expert format (BF16 vs Q4K) and layout (per-layer-concatenated vs per-expert)
-- [ ] Loader: read Q4K expert files into `packed_byte_ranges` (same path as current BF16 entries); update `get_packed_bytes` key naming
-- [ ] `build_moe_weights` in `pipeline_layer.rs`: switch from `get_packed_bytes` (BF16 mmap slice) to a `QuantWeight` struct pointing at Q4K byte ranges, so the caller can dispatch via `q4k_matvec` not `cpu_moe_forward`
-- [ ] GPU MoE dispatch in `decode_token_with_moe_fn`: when expert weights are Q4K, run expert FFNs via `encode_ffn` on GPU (batch gate+up rows for selected experts, then down); remove per-layer CPU commit
-- [ ] Re-extract `gemma-4-26B-A4B-it.vindex` with the new format (current 43 GB BF16 → ~24 GB Q4K)
+- [ ] Add `layers/` writer to extraction pipeline — quantize FFN weights per layer using the declared format (default: Q4_K), write binary format with header + offset table + data. Dense: `num_entries=1`. MoE: `num_entries=num_experts`, quantize each expert's gate+up and down from BF16 source.
+- [ ] Add `"ffn_layout": "per_layer"` to `VindexConfig` / `index.json`
+- [ ] Loader (`load.rs`): detect `ffn_layout == "per_layer"`, mmap each `layers/layer_{L}.weights`, parse headers + offset tables, expose per-entry byte ranges
+- [ ] Extend `ModelWeights` with per-layer offset table access (parallel to existing `packed_byte_ranges`)
+- [ ] `build_moe_weights` / `pipeline_layer.rs`: build `QuantWeight` structs from Q4K byte ranges instead of `get_packed_bytes` (BF16). Dense path: wire `layers/` as the source for `gate`/`up`/`down` `QuantWeight`s.
+- [ ] GPU dispatch in `decode_token_with_moe_fn`: for per-layer format, gather selected expert Q4K slices into staging buffer, dispatch `quant_matvec` on GPU; eliminate per-layer CPU MoE commit
+- [ ] Re-extract `gemma-4-26B-A4B-it.vindex` with new format (43 GB BF16 → ~24 GB Q4_K)
 
 ## P1: Active
 

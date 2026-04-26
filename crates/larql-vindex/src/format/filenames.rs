@@ -63,6 +63,19 @@ pub const ATTN_WEIGHTS_Q4K_MANIFEST_JSON: &str = "attn_weights_q4k_manifest.json
 pub const ATTN_WEIGHTS_Q8_BIN: &str = "attn_weights_q8.bin";
 pub const ATTN_WEIGHTS_Q8_MANIFEST_JSON: &str = "attn_weights_q8_manifest.json";
 
+// ── Per-layer FFN weights (§5.12) ──────────────────────────────────────
+//
+// Unified format for both dense and MoE FFN weights. One file per layer.
+// File header declares the quantization format; all entries within a file
+// use it uniformly (no mixing formats). Dense: num_entries=1.
+// MoE: num_entries=num_experts.
+pub const LAYERS_DIR: &str = "layers";
+
+/// Return the path of `layers/layer_{L:02}.weights` for layer `L`.
+pub fn layer_weights_filename(layer: usize) -> String {
+    format!("layers/layer_{layer:02}.weights")
+}
+
 // ── LM head ────────────────────────────────────────────────────────────
 pub const LM_HEAD_BIN: &str = "lm_head.bin";
 pub const LM_HEAD_Q4_BIN: &str = "lm_head_q4.bin";

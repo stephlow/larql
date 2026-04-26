@@ -4,8 +4,8 @@
 **Date:** 2026-04-24
 **Status:** Implemented (~98%); FP4/FP8 storage in progress (exp 26)
 **Implementation:** `larql-vindex` crate (Rust)
-**Companion specs:** [Operations](vindex-operations-spec.md), [Ecosystem](vindex-ecosystem-spec.md), [LQL](lql-spec.md)
-**FP4 companion specs:** [FP4 format](fp4-format-spec.md), [FP4 precision policy](fp4-precision-policy.md), [Quantize CLI](quantize-cli-spec.md)
+**Companion specs:** [Operations](operations-spec.md), [Ecosystem](ecosystem-spec.md), [LQL](../../larql-lql/docs/spec.md)
+**FP4 companion specs:** [FP4 format](fp4-format-spec.md), [FP4 precision policy](fp4-precision-policy.md), [Quantize CLI](../../larql-cli/docs/quantize-spec.md)
 
 **Implementation coverage:** File layout, binary formats, extract levels, f16 storage, checksums, mmap loading, streaming extraction, `larql verify`, Q4_K quantisation — all implemented. **FP4/FP8 block storage** — codec layer landed (see §5.10), writer and walk-kernel dispatch in progress.
 
@@ -185,7 +185,7 @@ Raw floats (f32 or f16 per `dtype` in config), contiguous, no headers. Layer-by-
 
 **Index:** `VindexLayerInfo` in `index.json` stores byte offset and length for each layer, enabling random access without reading the entire file.
 
-**MoE layout:** Experts are contiguous within each layer:
+**MoE layout (superseded — see §5.12):** Experts are contiguous within each layer. The `layers/layer_{L}.weights` per-layer format described in §5.12 replaces this for both dense and MoE models.
 ```
 [Layer 0, Expert 0: intermediate_size × hidden_size]
 [Layer 0, Expert 1: intermediate_size × hidden_size]
@@ -376,6 +376,95 @@ gate, was downgraded after failing it, or was set by policy regardless).
 
 ---
 
+### 5.12 Per-layer FFN weight storage (`layers/`)
+
+**Status:** Planned — replaces both `interleaved_q4k.bin` (dense) and `experts_packed.bin` (MoE BF16 blob). Activated when `index.json` carries `"ffn_layout": "per_layer"`.
+
+**Design principles.**
+
+1. **Structure is orthogonal to quantization.** The file format is `per_layer` — one file per transformer layer. The *quantization* is declared in the file header. All entries within a file use the same format; there is no mixing (no "Q4_K gate/up + Q6_K down" within one file). Re-quantizing a layer is replacing one file.
+
+2. **Unified for dense and MoE.** A dense layer is `num_entries = 1`. A MoE layer is `num_entries = num_experts`. The binary format and GPU dispatch path are identical.
+
+3. **Native OS addressability.** Each file is independently mmap'd. A server shard with `--layers 0-14` maps only its 15 files; a shard with `--experts 0-31` reads only those entries' byte ranges within each file. No offset arithmetic into a shared flat blob.
+
+**Why the old formats fail.**
+
+*`interleaved_q4k.bin` (dense):* One flat file for all 34 layers. Server `--layers` sharding works via byte-offset filtering but the OS faults in the full virtual range. Layer-level replacement or re-quantization requires rewriting the whole file.
+
+*`experts_packed.bin` (MoE BF16):* 43 GB monolithic BF16 blob. CPU BF16→f32 dequant at ~2.9 GB/token on Gemma 4 26B A4B; near-zero LRU cache hit rate. 30 GPU commit/wait syncs per decode step. No per-expert addressability.
+
+Measured on Gemma 4 26B A4B: 4.1 tok/s with BF16 blob vs 56.8 tok/s GPU-only baseline. 93.7% of decode time is CPU MoE.
+
+**File layout.**
+
+```
+layers/
+  layer_00.weights   ← dense: 1 entry. MoE: 128 entries.
+  layer_01.weights
+  ...
+  layer_{L-1}.weights
+```
+
+Each file is self-describing:
+
+```
+[header]
+  magic:         u32   0x4C595257 ("LYRW")
+  format_version: u32  = 1
+  quant_format:  u32   0=f32, 1=f16, 2=bf16, 3=q4_0, 4=q4_k, 5=q6_k, 6=q8_0, 7=fp4, ...
+  num_entries:   u32   1 (dense) or num_experts (MoE)
+  intermediate:  u32   intermediate_size or moe_intermediate_size
+  hidden:        u32   hidden_size
+
+[offset table]   num_entries × 4 × u64:
+                   gate_up_offset, gate_up_bytes,
+                   down_offset,    down_bytes
+                 (all offsets from start of file)
+
+[entry 0 gate+up]   quant_format blocks, shape [2*inter, hidden]
+[entry 0 down]      quant_format blocks, shape [hidden, inter]
+[entry 1 gate+up]
+[entry 1 down]
+...
+```
+
+The `quant_format` field is the **single source of truth** for the encoding. Adding a new quantization (FP8, FP4, Q3_K, …) is a new enum value; the file structure is unchanged.
+
+**Access pattern (decode).**
+
+```
+Startup:   mmap layers/layer_{L}.weights for owned layers
+           read header + offset table into memory (~4 KB per file at 128 experts)
+
+Dense (num_entries=1):
+           read entry 0 gate+up + down slices → GPU dispatch via existing FFN shaders
+
+MoE (num_entries=128):
+           router projection → top-K indices {e0, ..., eK-1}
+           copy gate_up slices for eK into contiguous staging buffer
+           GPU dispatch: quant_matvec, N = K × inter, K = hidden
+           copy down slices for eK into staging buffer
+           GPU dispatch: quant_matvec, N = K × hidden, K = inter
+           CPU weighted sum (K scalars × hidden — trivial)
+```
+
+One GPU command buffer per decode step for both dense and MoE paths.
+
+**Server-side sharding.**
+
+`--layers START-END`: map only those layer files — other layers never touch RAM.  
+`--experts START-END` (MoE): mmap all layer files in range, read only the assigned entry byte ranges. Out-of-range entry requests return HTTP 404 before any byte is read. See §13.4.
+
+**File sizes (Gemma 4 26B A4B, Q4_K).**
+
+| Old format | Size | New format | Size |
+|---|---|---|---|
+| `experts_packed.bin` (BF16) | 43 GB | `layers/*.weights` (Q4_K) | ~24 GB |
+| `interleaved_q4k.bin` (dense) | — | `layers/*.weights` (Q4_K) | same bytes, per-layer |
+
+---
+
 ## 6. index.json (VindexConfig)
 
 The central configuration file. Version 2 is the current format.
@@ -434,6 +523,11 @@ The central configuration file. Version 2 is the current format.
     "activation": "geglu",
     "tie_word_embeddings": true
   },
+
+  // FFN weight layout. "per_layer" = layers/layer_{L}.weights, one file per layer,
+  // format declared in file header (see §5.12). Works for both dense and MoE.
+  // Absent = legacy flat-file layout (interleaved_q4k.bin / experts_packed.bin).
+  "ffn_layout": "per_layer",
 
   "fp4": {
     "fp4_format_version": 1,
@@ -698,7 +792,7 @@ hierarchy (FP8 E4M3 sub-block scales + FP8 E4M3 block scale) to absorb
 the per-feature magnitude distributions measured in exp 26. The value
 encoding is compatible; the scale format is LARQL's own extension.
 
-See [Operations Spec Section 6](vindex-operations-spec.md) for strategies.
+See [Operations Spec Section 6](operations-spec.md) for strategies.
 
 ### 12.3 Streaming Build — IMPLEMENTED
 

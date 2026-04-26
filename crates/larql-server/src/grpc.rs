@@ -5,6 +5,10 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::band_utils::{
+    HEALTH_STATUS_OK, INFER_MODE_COMPARE, INFER_MODE_DENSE, INFER_MODE_WALK,
+    PROBE_RELATION_SOURCE,
+};
 use crate::state::AppState;
 
 pub mod proto {
@@ -31,7 +35,7 @@ impl VindexService for VindexGrpcService {
             .requests_served
             .load(std::sync::atomic::Ordering::Relaxed);
         Ok(Response::new(HealthResponse {
-            status: "ok".into(),
+            status: HEALTH_STATUS_OK.into(),
             uptime_seconds: uptime,
             requests_served: served,
         }))
@@ -285,7 +289,7 @@ fn grpc_describe(
             let (relation, source) = model
                 .probe_labels
                 .get(&(*layer, hit.feature))
-                .map(|r| (r.clone(), "probe".to_string()))
+                .map(|r| (r.clone(), PROBE_RELATION_SOURCE.to_string()))
                 .unwrap_or_default();
 
             edges.push(DescribeEdge {
@@ -442,14 +446,14 @@ fn grpc_infer(
 
     let top_k = if req.top > 0 { req.top as usize } else { 5 };
     let start = std::time::Instant::now();
-    let mode = if req.mode.is_empty() { "walk" } else { &req.mode };
+    let mode = if req.mode.is_empty() { INFER_MODE_WALK } else { &req.mode };
 
     let to_preds = |preds: &[(String, f64)]| -> Vec<Prediction> {
         preds.iter().map(|(t, p)| Prediction { token: t.clone(), probability: *p }).collect()
     };
 
     match mode {
-        "compare" => {
+        INFER_MODE_COMPARE => {
             let patched = model.patched.blocking_read();
             let walk_pred = larql_inference::infer_patched(
                 weights, &model.tokenizer, &*patched,
@@ -464,7 +468,7 @@ fn grpc_infer(
             Ok(InferResponse {
                 prompt: req.prompt.clone(),
                 predictions: vec![],
-                mode: "compare".into(),
+                mode: INFER_MODE_COMPARE.into(),
                 walk_predictions: to_preds(&walk_pred.predictions),
                 dense_predictions: to_preds(&dense_pred.predictions),
                 walk_ms,
@@ -472,12 +476,12 @@ fn grpc_infer(
                 latency_ms: start.elapsed().as_secs_f64() as f32 * 1000.0,
             })
         }
-        "dense" => {
+        INFER_MODE_DENSE => {
             let pred = larql_inference::predict(weights, &model.tokenizer, &token_ids, top_k);
             Ok(InferResponse {
                 prompt: req.prompt.clone(),
                 predictions: to_preds(&pred.predictions),
-                mode: "dense".into(),
+                mode: INFER_MODE_DENSE.into(),
                 walk_predictions: vec![],
                 dense_predictions: vec![],
                 walk_ms: 0.0,
@@ -494,7 +498,7 @@ fn grpc_infer(
             Ok(InferResponse {
                 prompt: req.prompt.clone(),
                 predictions: to_preds(&pred.predictions),
-                mode: "walk".into(),
+                mode: INFER_MODE_WALK.into(),
                 walk_predictions: vec![],
                 dense_predictions: vec![],
                 walk_ms: 0.0,
@@ -696,7 +700,7 @@ fn grpc_stream_describe(
                 let (relation, source) = model
                     .probe_labels
                     .get(&(layer, *feature))
-                    .map(|r| (r.clone(), "probe".to_string()))
+                    .map(|r| (r.clone(), PROBE_RELATION_SOURCE.to_string()))
                     .unwrap_or_default();
                 edges.push(DescribeEdge {
                     target: tok.to_string(),

@@ -104,14 +104,27 @@ pub(crate) fn build_moe_weights<'a>(
     layer: usize,
 ) -> Option<MoeLayerWeights<'a>> {
     if !arch.is_hybrid_moe() { return None; }
-
-    let gate_up_key = arch.packed_experts_gate_up_key(layer)?;
-    let down_key = arch.packed_experts_down_key(layer)?;
     let router_key = arch.moe_router_key(layer)?;
-
-    let experts_gate_up = weights.get_packed_bytes(&gate_up_key)?;
-    let experts_down = weights.get_packed_bytes(&down_key)?;
     let router_proj = weights.vectors.get(&router_key)?.as_slice();
+
+    // Per-layer Q4_K format: expert 0 gate+up/down are stored in
+    // `layers/{layer}/0/gate_up` and `layers/{layer}/0/down`.
+    // In this path `experts_gate_up`/`experts_down` hold only expert 0's bytes;
+    // the GPU dispatch path reads per-expert slices via `get_layer_entry_bytes`.
+    let (experts_gate_up, experts_down, expert_data_format) =
+        if weights.has_per_layer_ffn() {
+            // Per-layer Q4_K: expose expert 0 as a sentinel; real dispatch
+            // uses get_layer_entry_bytes per selected expert.
+            let (gu, dn) = weights.get_layer_entry_bytes(layer, 0)?;
+            (gu, dn, larql_compute::QuantFormat::Q4_K)
+        } else {
+            // Legacy BF16 monolithic blob path.
+            let gate_up_key = arch.packed_experts_gate_up_key(layer)?;
+            let down_key    = arch.packed_experts_down_key(layer)?;
+            let gu = weights.get_packed_bytes(&gate_up_key)?;
+            let dn = weights.get_packed_bytes(&down_key)?;
+            (gu, dn, larql_compute::QuantFormat::BF16)
+        };
 
     let router_scale = arch.moe_router_scale_key(layer)
         .and_then(|k| weights.vectors.get(&k))
@@ -148,6 +161,7 @@ pub(crate) fn build_moe_weights<'a>(
     Some(MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        expert_data_format,
         router_proj,
         router_scale,
         router_per_expert_scale,

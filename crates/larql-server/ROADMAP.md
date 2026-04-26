@@ -2,6 +2,8 @@
 
 ## Current state (as of 2026-04-26)
 
+- Code quality pass complete: modularity refactor + magic string cleanup + test restructure (see Completed below).
+- Test coverage: **58.0% line / 65.3% function** (402 tests, 0 failures). Functional tokenizer unblocked describe/walk/walk-ffn paths.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
   inclusive layer ranges 0-14 + 15-29).
 - W2 feature-major down retrofittable in-place via
@@ -79,6 +81,49 @@ per-expert error handling). This server owns the endpoint definitions and the
 ---
 
 ## P1: Active
+
+### T1. Test coverage — functional tokenizer + uncovered routes ✅ done 2026-04-26
+
+**Outcome**: 49.1% → **58.0% line**, 56.4% → **65.3% function**. 345 → 402 tests.
+
+**Root cause fixed**: added `functional_tokenizer()` (WordLevel, France→0 etc.) to
+`tests/common/mod.rs`. The empty BPE tokenizer that previously blocked all
+tokenize-dependent routes is now supplemented by a real in-memory tokenizer that
+maps test words to embeddings with known KNN hits.
+
+**Files moved:**
+
+| File | Before | After |
+|---|---|---|
+| `band_utils.rs` | 35% | **100%** |
+| `routes/describe.rs` | 48% | **95%** |
+| `routes/walk.rs` | 38% | **96%** |
+| `ratelimit.rs` | 70% | **98%** |
+| `routes/walk_ffn.rs` | 54% | **77%** |
+| `routes/patches.rs` | 63% | **91%** |
+| `routes/relations.rs` | 83% | **91%** |
+
+**Remaining hard ceiling** (no path forward without real weights or real sockets):
+
+| File | Coverage | Reason |
+|---|---|---|
+| `grpc.rs` | 0% | Needs full gRPC server+client; defer |
+| `routes/stream.rs` | 0% | WebSocket — needs `tokio-tungstenite`; defer |
+| `routes/explain.rs` | 11% | Calls `get_or_load_weights()`; rest gated on real model |
+| `embed_store.rs` | 25% | Reads real f16 embedding files |
+| `main.rs` | 0% | CLI entrypoint; skip |
+
+### T2. Test coverage — remaining reachable paths
+
+**Current**: 58.0% line. Addressable without real weights:
+
+| File | Current | Gap | What to add |
+|---|---|---|---|
+| `routes/infer.rs` | 31% | ~70 lines | `has_model_weights=false` + `infer_disabled=false` → 503 |
+| `routes/warmup.rs` | 80% | ~15 lines | `warmup_hnsw=true` warn path (HNSW not enabled) |
+| `routes/insert.rs` | 78% | ~40 lines | Constellation path (requires weights → skipped to embedding fallback detail) |
+| `session.rs` | 91% | ~12 lines | TTL eviction in `get_or_create` |
+| `routes/walk_ffn.rs` | 77% | ~118 lines | Full-output path (needs weights), binary path detail |
 
 ### G1. Cold-start profile ✅ done 2026-04-26
 **Findings**: walk-ffn cold cost decomposes into two distinct phases:
@@ -162,6 +207,32 @@ to add/remove a shard without restarting the router. Pair with
 ---
 
 ## Completed
+
+### 2026-04-26 — coverage round-2 (T1)
+
+| Item | Outcome |
+|---|---|
+| `functional_tokenizer()` in common | WordLevel tokenizer (France→0, …) added to test infra; unblocks describe/walk/walk-ffn body paths |
+| `test_http_full_routes.rs` | 39 new HTTP integration tests exercising full describe/walk/walk-ffn code paths |
+| `test_unit_band_utils.rs` | 13 pure unit tests for `band_utils.rs` constants + helpers |
+| Infer + ratelimit branches | `infer_disabled=false` model builder; ratelimit middleware axum tests |
+| Coverage | 49.1% → **58.0% line**, 56.4% → **65.3% function** (345 → 402 tests) |
+
+### 2026-04-26 — code quality round-1
+
+| Item | Outcome |
+|---|---|
+| Modularity — deduplicate `session_id()` | 3 identical private fn definitions → 1 `pub fn extract_session_id` in `session.rs` |
+| Modularity — `get_layer_bands()` / `filter_layers_by_band()` | 5 / 3 duplicated blocks → `src/band_utils.rs` |
+| Modularity — `model_or_err()` | 25 repeated `ok_or_else(NotFound)` sites → `AppState::model_or_err()` |
+| Modularity — `elapsed_ms()` | 20 repeated latency-rounding expressions → `src/state::elapsed_ms()` |
+| Magic strings — band names | `"syntax"/"knowledge"/"output"/"all"` → `BAND_*` constants in `band_utils.rs` |
+| Magic strings — infer modes | `"walk"/"dense"/"compare"` → `INFER_MODE_*` constants |
+| Magic strings — insert modes | `"constellation"/"embedding"` → `INSERT_MODE_*` constants |
+| Magic strings — patch names | `"unnamed"/"inline-patch"` → `PATCH_UNNAMED`/`PATCH_INLINE_NAME` constants |
+| Magic strings — HTTP headers | `"x-session-id"` → `HEADER_SESSION_ID`; `"etag"/"cache-control"/"if-none-match"` → axum `header::*` |
+| Test restructure | `test_api.rs` (2600 L) + `test_http.rs` (1400 L) → 10 focused files (100–350 L each) + `tests/common/mod.rs` |
+| Coverage baseline | 39.7% → **49.1% line**, 41.6% → **56.4% function** (345 tests, 0 failures) |
 
 ### 2026-04-26 — perf round-1 (G1+G2+G3)
 

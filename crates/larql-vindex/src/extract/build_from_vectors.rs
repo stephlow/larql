@@ -296,6 +296,7 @@ use crate::config::{
             layer_bands: None,
             model_config: None,
             fp4: None,
+            ffn_layout: None,
         };
 
         let config_json = serde_json::to_string_pretty(&config)

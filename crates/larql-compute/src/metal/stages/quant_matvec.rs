@@ -141,5 +141,9 @@ pub fn encode(
                 MTLSize::new(kernel.threads_per_tg, 1, 1),
             );
         }
+        crate::QuantFormat::BF16 | crate::QuantFormat::F16 | crate::QuantFormat::F32 => {
+            // Not dispatchable via this Q4 shader path — caller should use
+            // a float matvec or dequantize before calling.
+        }
     }
 }

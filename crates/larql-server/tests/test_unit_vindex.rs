@@ -108,6 +108,7 @@ fn test_config() -> VindexConfig {
         has_model_weights: false,
         model_config: None,
         fp4: None,
+        ffn_layout: None,
     }
 }
 

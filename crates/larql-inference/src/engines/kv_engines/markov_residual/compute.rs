@@ -268,3 +268,100 @@ pub(super) fn last_row(h: &Array2<f32>) -> Array2<f32> {
     let last = h.shape()[0] - 1;
     h.slice(s![last..=last, ..]).to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use larql_compute::CpuBackend;
+    use crate::engines::test_utils::make_test_weights;
+
+    // ── recompute_kv ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn recompute_kv_returns_some_with_valid_weights() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((3, weights.hidden_size), 0.5f32);
+        let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend);
+        assert!(result.is_some(), "recompute_kv should return Some with valid weights");
+    }
+
+    #[test]
+    fn recompute_kv_output_shape_correct() {
+        let weights = make_test_weights();
+        let seq_len = 4;
+        let h = Array2::from_elem((seq_len, weights.hidden_size), 1.0f32);
+        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        assert_eq!(k.shape(), &[seq_len, kv_dim], "K shape mismatch");
+        assert_eq!(v.shape(), &[seq_len, kv_dim], "V shape mismatch");
+    }
+
+    #[test]
+    fn recompute_kv_output_is_finite() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
+        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
+        assert!(k.iter().all(|v| v.is_finite()), "K contains non-finite values");
+        assert!(v.iter().all(|v| v.is_finite()), "V contains non-finite values");
+    }
+
+    #[test]
+    fn recompute_kv_abs_start_shifts_rope() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((1, weights.hidden_size), 0.5f32);
+        // Different abs_start should produce different RoPE-applied K
+        let (k0, _) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
+        let (k5, _) = recompute_kv(&weights, &h, 0, 5, &CpuBackend).unwrap();
+        let diff: f32 = k0.iter().zip(k5.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 0.0, "RoPE at different positions should produce different K");
+    }
+
+    // ── rs_prefill ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rs_prefill_returns_correct_shape() {
+        let weights = make_test_weights();
+        let result = rs_prefill(&weights, &[0u32, 1, 2], None, &CpuBackend);
+        assert_eq!(result.hidden.shape(), &[1, weights.hidden_size]);
+        assert!(result.hidden.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn rs_prefill_stores_all_layers() {
+        let weights = make_test_weights();
+        let result = rs_prefill(&weights, &[0u32], None, &CpuBackend);
+        assert_eq!(result.store.stored.len(), weights.num_layers);
+        assert_eq!(result.store.next_position, 1);
+    }
+
+    #[test]
+    fn rs_prefill_with_window_clips_hot_store() {
+        let weights = make_test_weights();
+        let result = rs_prefill(&weights, &[0u32, 1, 2, 3, 4], Some(2), &CpuBackend);
+        assert!(result.window_tokens <= 2,
+            "window_tokens={} > 2", result.window_tokens);
+    }
+
+    // ── rs_decode_step ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rs_decode_step_produces_finite_hidden() {
+        let weights = make_test_weights();
+        let prefill = rs_prefill(&weights, &[0u32], None, &CpuBackend);
+        let (h, _) = rs_decode_step(&weights, 1, prefill.store, &CpuBackend)
+            .expect("decode step");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(h.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn rs_decode_step_advances_position() {
+        let weights = make_test_weights();
+        let prefill = rs_prefill(&weights, &[0u32, 1], None, &CpuBackend);
+        assert_eq!(prefill.store.next_position, 2);
+        let (_, rs2) = rs_decode_step(&weights, 2, prefill.store, &CpuBackend).unwrap();
+        assert_eq!(rs2.next_position, 3);
+        let (_, rs3) = rs_decode_step(&weights, 3, rs2, &CpuBackend).unwrap();
+        assert_eq!(rs3.next_position, 4);
+    }
+}

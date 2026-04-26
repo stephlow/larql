@@ -15,6 +15,9 @@ pub enum QuantFormat {
     Q4_KF,  // 160 bytes per 256 values (pre-baked half scales — fast decode)
     Q6_K,   // 210 bytes per 256 values (6-bit with sub-block scales)
     Q8_0,   // int8 values + separate f32 scales
+    BF16,   // raw bfloat16 (2 bytes per value, no quantization scales)
+    F16,    // raw float16  (2 bytes per value)
+    F32,    // raw float32  (4 bytes per value)
 }
 
 /// A quantized weight matrix — raw bytes with format tag.
@@ -57,12 +60,20 @@ pub enum Activation {
 /// Gemma 4 26B A4B runs a dense MLP and an expert block in parallel per layer,
 /// summing their outputs. This struct carries the expert-block tensors.
 pub struct MoeLayerWeights<'a> {
-    /// Packed expert gate+up weights as raw BF16 bytes.
-    /// Shape: [num_experts, 2 * moe_intermediate_size, hidden_size].
+    /// Expert gate+up weight bytes. Format declared by `expert_data_format`.
+    ///
+    /// Legacy BF16 layout: [num_experts, 2 * inter, hidden] contiguous.
+    /// Per-layer Q4_K layout: NOT used here — per-layer format exposes
+    /// individual expert slices via `ModelWeights::get_layer_entry_bytes`.
+    /// When `expert_data_format == QuantFormat::Q4_K`, dispatch via
+    /// `get_layer_entry_bytes` rather than these fields.
     pub experts_gate_up: &'a [u8],
-    /// Packed expert down weights as raw BF16 bytes.
-    /// Shape: [num_experts, hidden_size, moe_intermediate_size].
+    /// Expert down weight bytes. See `experts_gate_up` note.
     pub experts_down: &'a [u8],
+    /// Format of the expert weight bytes. `Q4_K` = per-layer Q4_K files
+    /// (GPU-dispatchable); anything else = legacy BF16 (CPU dequant path).
+    #[allow(dead_code)]
+    pub expert_data_format: QuantFormat,
     /// Router linear projection weight [num_experts, hidden_size].
     pub router_proj: &'a [f32],
     /// Router learned input-scale [hidden_size].
@@ -269,6 +280,7 @@ mod tests {
             post_ffn1_norm: &[], post_experts_norm: &[],
             num_experts: 2, top_k: 1, intermediate_size: 4,
             activation: Activation::Silu,
+            expert_data_format: QuantFormat::BF16,
         };
         let with_moe = minimal_layer(&[], &norms, FfnType::Gated, Some(moe));
         assert!(with_moe.is_hybrid_moe());

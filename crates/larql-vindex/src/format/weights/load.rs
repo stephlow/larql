@@ -511,6 +511,39 @@ pub fn load_model_weights_q4k(
         }
     }
 
+    // ── Per-layer FFN weights: layers/layer_{L:02}.weights (§5.12) ──────────
+    // Loaded when index.json carries `ffn_layout: "per_layer"`. For each
+    // layer file: mmap it, parse the header + offset table, record per-entry
+    // byte ranges keyed as `"layers/{layer}/{entry}/gate_up"` and `"layers/{layer}/{entry}/down"`.
+    if config.ffn_layout.as_deref() == Some("per_layer") {
+        use super::write_layers::parse_layer_weights_header;
+        use crate::format::filenames::layer_weights_filename;
+        for l in 0..config.num_layers {
+            let filename = layer_weights_filename(l);
+            let fpath = dir.join(&filename);
+            if !fpath.exists() { continue; }
+            if let Ok(f) = std::fs::File::open(&fpath) {
+                if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
+                    if let Some((_fmt, num_entries, _inter, _hidden, offsets)) =
+                        parse_layer_weights_header(&mmap)
+                    {
+                        for (e, (gu_off, gu_bytes, dn_off, dn_bytes)) in offsets.iter().enumerate() {
+                            packed_byte_ranges.insert(
+                                format!("layers/{l}/{e}/gate_up"),
+                                (filename.clone(), *gu_off, *gu_bytes),
+                            );
+                            packed_byte_ranges.insert(
+                                format!("layers/{l}/{e}/down"),
+                                (filename.clone(), *dn_off, *dn_bytes),
+                            );
+                        }
+                        packed_mmaps.insert(filename, mmap);
+                    }
+                }
+            }
+        }
+    }
+
     // lm_head_q4.bin (Q4_K of the output projection) — dequant to f32. If
     // absent (tied embeddings), fall back to embed.clone() below.
     let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);

@@ -14,8 +14,19 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 
-use crate::band_utils::{INFER_MODE_DENSE, filter_layers_by_band, get_layer_bands};
+use crate::band_utils::{INFER_MODE_DENSE, PROBE_RELATION_SOURCE, filter_layers_by_band, get_layer_bands};
 use crate::state::{AppState, elapsed_ms};
+
+// WebSocket message type strings (outbound protocol contract).
+const WS_TYPE_ERROR: &str = "error";
+const WS_TYPE_LAYER: &str = "layer";
+const WS_TYPE_DONE: &str = "done";
+const WS_TYPE_PREDICTION: &str = "prediction";
+const WS_TYPE_INFER_DONE: &str = "infer_done";
+
+// Inbound message type strings.
+const WS_CMD_DESCRIBE: &str = "describe";
+const WS_CMD_INFER: &str = "infer";
 
 pub async fn handle_stream(
     State(state): State<Arc<AppState>>,
@@ -37,7 +48,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             Err(e) => {
                 let _ = socket
                     .send(Message::Text(
-                        serde_json::json!({"type": "error", "message": e.to_string()}).to_string().into(),
+                        serde_json::json!({"type": WS_TYPE_ERROR, "message": e.to_string()}).to_string().into(),
                     ))
                     .await;
                 continue;
@@ -46,17 +57,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
         let msg_type = request["type"].as_str().unwrap_or("");
         match msg_type {
-            "describe" => {
+            WS_CMD_DESCRIBE => {
                 handle_stream_describe(&mut socket, &state, &request).await;
             }
-            "infer" => {
+            WS_CMD_INFER => {
                 handle_stream_infer(&mut socket, &state, &request).await;
             }
             _ => {
                 let _ = socket
                     .send(Message::Text(
                         serde_json::json!({
-                            "type": "error",
+                            "type": WS_TYPE_ERROR,
                             "message": format!("unknown message type: {msg_type}. Supported: describe, infer")
                         })
                         .to_string().into(),
@@ -77,7 +88,7 @@ async fn handle_stream_describe(
         None => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": "missing entity"}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "missing entity"}).to_string().into(),
                 ))
                 .await;
             return;
@@ -89,7 +100,7 @@ async fn handle_stream_describe(
         None => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": "no model loaded"}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "no model loaded"}).to_string().into(),
                 ))
                 .await;
             return;
@@ -106,7 +117,7 @@ async fn handle_stream_describe(
         Err(e) => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": e.to_string()}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e.to_string()}).to_string().into(),
                 ))
                 .await;
             return;
@@ -116,7 +127,7 @@ async fn handle_stream_describe(
     if token_ids.is_empty() {
         let _ = socket
             .send(Message::Text(
-                serde_json::json!({"type": "done", "total_edges": 0, "latency_ms": 0}).to_string().into(),
+                serde_json::json!({"type": WS_TYPE_DONE, "total_edges": 0, "latency_ms": 0}).to_string().into(),
             ))
             .await;
         return;
@@ -165,7 +176,7 @@ async fn handle_stream_describe(
                 });
                 if let Some(label) = model.probe_labels.get(&(layer, *feature)) {
                     edge["relation"] = serde_json::json!(label);
-                    edge["source"] = serde_json::json!("probe");
+                    edge["source"] = serde_json::json!(PROBE_RELATION_SOURCE);
                 }
                 edges.push(edge);
             }
@@ -174,7 +185,7 @@ async fn handle_stream_describe(
         total_edges += edges.len();
 
         let msg = serde_json::json!({
-            "type": "layer",
+            "type": WS_TYPE_LAYER,
             "layer": layer,
             "edges": edges,
         });
@@ -185,7 +196,7 @@ async fn handle_stream_describe(
     }
 
     let done_msg = serde_json::json!({
-        "type": "done",
+        "type": WS_TYPE_DONE,
         "entity": entity,
         "total_edges": total_edges,
         "latency_ms": elapsed_ms(start),
@@ -210,7 +221,7 @@ async fn handle_stream_infer(
         _ => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": "missing or empty prompt"}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "missing or empty prompt"}).to_string().into(),
                 ))
                 .await;
             return;
@@ -222,7 +233,7 @@ async fn handle_stream_infer(
         None => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": "no model loaded"}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": "no model loaded"}).to_string().into(),
                 ))
                 .await;
             return;
@@ -232,7 +243,7 @@ async fn handle_stream_infer(
     if model.infer_disabled {
         let _ = socket
             .send(Message::Text(
-                serde_json::json!({"type": "error", "message": "inference disabled (--no-infer)"}).to_string().into(),
+                serde_json::json!({"type": WS_TYPE_ERROR, "message": "inference disabled (--no-infer)"}).to_string().into(),
             ))
             .await;
         return;
@@ -243,7 +254,7 @@ async fn handle_stream_infer(
         Err(e) => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": e}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e}).to_string().into(),
                 ))
                 .await;
             return;
@@ -258,7 +269,7 @@ async fn handle_stream_infer(
         Err(e) => {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": e.to_string()}).to_string().into(),
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e.to_string()}).to_string().into(),
                 ))
                 .await;
             return;
@@ -290,7 +301,7 @@ async fn handle_stream_infer(
     // Stream each prediction.
     for (rank, (token, prob)) in predictions.iter().enumerate() {
         let msg = serde_json::json!({
-            "type": "prediction",
+            "type": WS_TYPE_PREDICTION,
             "rank": rank + 1,
             "token": token,
             "probability": (*prob * 10000.0).round() / 10000.0,
@@ -301,7 +312,7 @@ async fn handle_stream_infer(
     }
 
     let done_msg = serde_json::json!({
-        "type": "infer_done",
+        "type": WS_TYPE_INFER_DONE,
         "prompt": prompt,
         "mode": mode,
         "predictions": predictions.len(),

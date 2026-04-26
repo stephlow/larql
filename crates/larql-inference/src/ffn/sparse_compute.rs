@@ -390,6 +390,116 @@ fn gather_columns(
     buf
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use crate::engines::test_utils::make_test_weights;
+
+    fn input(seq: usize, hidden: usize) -> Array2<f32> {
+        let data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        Array2::from_shape_vec((seq, hidden), data).unwrap()
+    }
+
+    // ── sparse_ffn_forward ────────────────────────────────────────────────────
+
+    #[test]
+    fn sparse_forward_empty_features_returns_zeros() {
+        let weights = make_test_weights();
+        let x = input(2, weights.hidden_size);
+        let (out, act) = sparse_ffn_forward(&weights, 0, &x, &[]);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.abs() < 1e-9), "empty features → zero output");
+        assert_eq!(act.shape()[0], 2);
+    }
+
+    #[test]
+    fn sparse_forward_single_feature_output_shape() {
+        let weights = make_test_weights();
+        let x = input(1, weights.hidden_size);
+        let (out, act) = sparse_ffn_forward(&weights, 0, &x, &[0]);
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+        assert_eq!(act.shape()[0], 1);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn sparse_forward_multi_token_shape() {
+        let weights = make_test_weights();
+        let x = input(3, weights.hidden_size);
+        let (out, act) = sparse_ffn_forward(&weights, 0, &x, &[0, 1, 2]);
+        assert_eq!(out.shape(), &[3, weights.hidden_size]);
+        assert_eq!(act.shape()[0], 3);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn sparse_forward_top_k_selection_is_sorted() {
+        let weights = make_test_weights();
+        let x = input(1, weights.hidden_size);
+        let x_row = x.row(0);
+        let feats = select_top_k_features(&weights, 0, &x_row, 4);
+        // select_top_k_features sorts by feature index (ascending)
+        for w in feats.windows(2) {
+            assert!(w[0] <= w[1], "features not sorted: {:?}", feats);
+        }
+    }
+
+    #[test]
+    fn sparse_forward_top_k_respects_k() {
+        let weights = make_test_weights();
+        let x = input(1, weights.hidden_size);
+        let x_row = x.row(0);
+        for k in [1, 4, 8] {
+            let feats = select_top_k_features(&weights, 0, &x_row, k);
+            assert!(feats.len() <= k, "got {} features but requested {k}", feats.len());
+        }
+    }
+
+    #[test]
+    fn sparse_forward_all_features_matches_dense_fallback() {
+        let weights = make_test_weights();
+        let x = input(1, weights.hidden_size);
+        // When K >= 80% of intermediate, sparse_ffn_forward falls back to dense.
+        // Request all features to trigger that path.
+        let all: Vec<usize> = (0..weights.intermediate_size).collect();
+        let (sparse_out, _) = sparse_ffn_forward(&weights, 0, &x, &all);
+        let (dense_out, _) = crate::ffn::weight::dense_ffn_forward(&weights, 0, &x);
+        for (s, d) in sparse_out.iter().zip(dense_out.iter()) {
+            assert!((s - d).abs() < 1e-4, "sparse/dense mismatch: {s} vs {d}");
+        }
+    }
+
+    // ── sparse_ffn_forward_with_overrides ─────────────────────────────────────
+
+    #[test]
+    fn overrides_replace_down_contribution() {
+        let weights = make_test_weights();
+        let x = input(1, weights.hidden_size);
+        let feats = &[0usize];
+        let custom_down = vec![99.0f32; weights.hidden_size];
+        let (out_override, _) = sparse_ffn_forward_with_overrides(
+            &weights, 0, &x, feats, &[(0, &custom_down)],
+        );
+        let (out_baseline, _) = sparse_ffn_forward(&weights, 0, &x, feats);
+        // The two outputs should differ because the down vector was replaced.
+        let diff: f32 = out_override.iter().zip(out_baseline.iter())
+            .map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 0.0, "override had no effect on output");
+    }
+
+    // ── gather_rows / gather_columns (indirectly) ─────────────────────────────
+
+    #[test]
+    fn gather_rows_all_features_produces_correct_shape() {
+        // Test via sparse_ffn_forward by requesting two specific features
+        let weights = make_test_weights();
+        let x = input(2, weights.hidden_size);
+        let (out, _) = sparse_ffn_forward(&weights, 0, &x, &[0, weights.intermediate_size - 1]);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+    }
+}
+
 /// Select top-K features by gate activation magnitude (architecture-correct).
 pub fn select_top_k_features(
     weights: &ModelWeights,

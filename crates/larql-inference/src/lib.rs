@@ -7,7 +7,6 @@ pub mod engines;
 pub mod error;
 pub mod ffn;
 pub mod forward;
-pub mod graph_ffn;
 pub mod layer_graph;
 pub mod model;
 pub mod prompt;
@@ -72,7 +71,7 @@ pub use forward::{
     forward_raw_logits, forward_from_layer, RawForward, hidden_to_raw_logits,
     generate_cached_constrained,
 };
-pub use graph_ffn::{GateIndex, IndexBuildCallbacks, SilentIndexCallbacks};
+pub use ffn::graph_backend::{GateIndex, IndexBuildCallbacks, SilentIndexCallbacks};
 pub use trace::{
     trace_residuals, trace as trace_decomposed, AnswerWaypoint, LayerSummary,
     ResidualTrace, TraceNode, TracePositions, TraceStore, TraceWriter,

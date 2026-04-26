@@ -104,6 +104,7 @@ fn encode_quant_matvec_at_offset(
                 MTLSize::new(256, 1, 1),
             );
         }
+        crate::QuantFormat::BF16 | crate::QuantFormat::F16 | crate::QuantFormat::F32 => {}
     }
 }
 
