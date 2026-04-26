@@ -197,6 +197,7 @@ fn make_loaded_model(
         down_top_k: 1,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
     };
 
     // Build ModelWeights with expert data in raw_bytes (no mmap needed).

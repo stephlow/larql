@@ -108,6 +108,7 @@ fn test_config() -> VindexConfig {
         down_top_k: 5,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
     }
 }
 
@@ -2015,6 +2016,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
             down_top_k: 2,
             has_model_weights: false,
             model_config: None,
+            fp4: None,
         },
         patched: tokio::sync::RwLock::new(patched),
         embeddings: Array2::<f32>::zeros((4, hidden)),
@@ -2100,7 +2102,6 @@ fn test_app_state_bump_requests_increments() {
 
 #[test]
 fn test_load_probe_labels_from_json_file() {
-    use std::io::Write;
     let dir = std::env::temp_dir().join("larql_test_labels_01");
     std::fs::create_dir_all(&dir).unwrap();
     let json = r#"{"L0_F0": "capital", "L1_F2": "language", "L5_F10": "continent"}"#;
@@ -2329,24 +2330,29 @@ fn test_rate_limiter_zero_count_rejects_immediately() {
 
 #[test]
 fn test_rate_limiter_per_minute_long_form() {
+    // "60/minute" is valid; verify it allows 60 consecutive requests.
     let rl = RateLimiter::parse("60/minute").unwrap();
-    assert_eq!(rl.max_tokens, 60.0);
-    assert!((rl.refill_per_sec - 1.0).abs() < 0.001);
+    let ip: std::net::IpAddr = "10.0.0.60".parse().unwrap();
+    for _ in 0..60 { assert!(rl.check(ip)); }
+    assert!(!rl.check(ip)); // 61st request blocked
 }
 
 #[test]
 fn test_rate_limiter_per_second_long_form() {
+    // "10/second" is valid; verify it allows 10 consecutive requests.
     let rl = RateLimiter::parse("10/second").unwrap();
-    assert_eq!(rl.max_tokens, 10.0);
-    assert_eq!(rl.refill_per_sec, 10.0);
+    let ip: std::net::IpAddr = "10.0.0.10".parse().unwrap();
+    for _ in 0..10 { assert!(rl.check(ip)); }
+    assert!(!rl.check(ip)); // 11th request blocked
 }
 
 #[test]
 fn test_rate_limiter_fractional_count() {
-    // "1/hour" → refill = 1/3600 per sec.
+    // "1/hour" → bucket holds 1 token; second request is blocked.
     let rl = RateLimiter::parse("1/hour").unwrap();
-    assert_eq!(rl.max_tokens, 1.0);
-    assert!((rl.refill_per_sec - 1.0 / 3600.0).abs() < 1e-9);
+    let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+    assert!(rl.check(ip));
+    assert!(!rl.check(ip)); // no refill within the test
 }
 
 #[test]

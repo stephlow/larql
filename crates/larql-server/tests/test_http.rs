@@ -81,6 +81,7 @@ fn test_config() -> VindexConfig {
         down_top_k: 5,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
     }
 }
 
@@ -783,6 +784,11 @@ async fn session_manager_apply_patch_and_list() {
     let sm = SessionManager::new(3600);
     let m = model("test");
 
+    // Pre-create the session with get_or_create (uses read().await, safe in async).
+    // apply_patch's or_insert_with calls blocking_read only when the session doesn't
+    // exist, so we must create it first.
+    sm.get_or_create("sess-1", &m).await;
+
     let patch = larql_vindex::VindexPatch {
         version: 1,
         base_model: "test".into(),
@@ -807,7 +813,8 @@ async fn session_manager_apply_patch_and_list() {
 async fn session_manager_remove_nonexistent_patch_returns_err() {
     let sm = SessionManager::new(3600);
     let m = model("test");
-    // Apply one patch so the session exists.
+    // Pre-create the session, then apply one patch.
+    sm.get_or_create("sess-1", &m).await;
     let patch = larql_vindex::VindexPatch {
         version: 1,
         base_model: "test".into(),
@@ -830,6 +837,8 @@ async fn session_manager_remove_patch_by_name() {
     let sm = SessionManager::new(3600);
     let m = model("test");
 
+    // Pre-create session, then apply two patches.
+    sm.get_or_create("sess-2", &m).await;
     for name in &["patch-a", "patch-b"] {
         let patch = larql_vindex::VindexPatch {
             version: 1,
