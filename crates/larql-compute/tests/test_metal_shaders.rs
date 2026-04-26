@@ -201,6 +201,178 @@ fn q4_matvec_small_matrix() {
 }
 
 #[test]
+fn f16_gemv_topk1_matches_full_argmax() {
+    let metal = get_metal();
+    let n = 4096usize; // vocab dim
+    let k = 256usize; // hidden dim — multiple of 32 keeps the gemv kernel happy
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.011).sin()).collect();
+    let w_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.0007).cos()).collect();
+    let w_f16 = larql_models::quant::half::encode_f16(&w_f32);
+
+    let topk1 = metal
+        .f16_gemv_topk1(&w_f16, &x, n, k)
+        .expect("metal must produce a top-1 result");
+
+    use larql_compute::MatMul;
+    let scores = metal
+        .f16_gemv_force(&w_f16, &x, n, k)
+        .expect("f16_gemv_force fallback for argmax reference");
+    let (best_i, best_v) = scores
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+            if v > bv {
+                (i, v)
+            } else {
+                (bi, bv)
+            }
+        });
+
+    assert_eq!(topk1.0 as usize, best_i, "f16 topk1 idx mismatches argmax");
+    assert!(
+        (topk1.1 - best_v).abs() < 1e-2,
+        "f16 topk1 score {} vs argmax {}",
+        topk1.1,
+        best_v
+    );
+}
+
+#[test]
+fn f16_gemv_topk_matches_cpu_topk() {
+    let metal = get_metal();
+    let n = 4096usize;
+    let k = 256usize;
+    let top_k = 5;
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
+    let w_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.00091).cos()).collect();
+    let w_f16 = larql_models::quant::half::encode_f16(&w_f32);
+
+    use larql_compute::MatMul;
+    let gpu_hits = metal
+        .f16_gemv_topk(&w_f16, &x, n, k, top_k)
+        .expect("topk path must fire");
+    let scores = metal
+        .f16_gemv_force(&w_f16, &x, n, k)
+        .expect("scores path must fire");
+
+    let mut indexed: Vec<(u32, f32)> = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let cpu_hits: Vec<(u32, f32)> = indexed.into_iter().take(top_k).collect();
+
+    assert_eq!(gpu_hits.len(), top_k);
+    for (g, c) in gpu_hits.iter().zip(cpu_hits.iter()) {
+        assert!(
+            (g.1 - c.1).abs() < 1e-2,
+            "f16 topk score mismatch at rank: gpu={:?} cpu={:?}",
+            g,
+            c
+        );
+    }
+    for (idx, score) in gpu_hits.iter() {
+        assert!(
+            (scores[*idx as usize] - *score).abs() < 1e-2,
+            "f16 topk idx {} reports score {} but scores[idx] = {}",
+            idx,
+            score,
+            scores[*idx as usize]
+        );
+    }
+}
+
+/// `top_k > K_TOPK` exceeds the per-TG capacity → method returns None.
+/// The `lm_head_knn_backend` wiring relies on this to fall back to the
+/// full-Vec sort path for unusually large top_k requests.
+#[test]
+fn topk_capacity_edges_return_none() {
+    let metal = get_metal();
+    let hidden = 256usize;
+    let rows = 1024usize;
+
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin()).collect();
+    let matrix: Vec<f32> = (0..rows * hidden)
+        .map(|i| (i as f32 * 0.001).cos())
+        .collect();
+    let q4_data = quantize_q4_0(&matrix);
+    let (q8_x, q8_scales) = q4::quantize_to_q8(&x);
+    let w_f16 = larql_models::quant::half::encode_f16(&matrix);
+
+    use larql_compute::QuantMatVec;
+    // top_k = 0 → None (caller wants nothing)
+    assert!(metal
+        .q4_matvec_topk(&q4_data, &q8_x, &q8_scales, rows, hidden, 0)
+        .is_none());
+    assert!(metal.f16_gemv_topk(&w_f16, &x, rows, hidden, 0).is_none());
+
+    // top_k > K_TOPK = 8 → None (per-TG capacity exceeded)
+    assert!(metal
+        .q4_matvec_topk(&q4_data, &q8_x, &q8_scales, rows, hidden, 9)
+        .is_none());
+    assert!(metal.f16_gemv_topk(&w_f16, &x, rows, hidden, 9).is_none());
+}
+
+#[test]
+fn q4_matvec_topk_matches_cpu_topk() {
+    let metal = get_metal();
+    let hidden = 2560;
+    let rows = 10240;
+    let top_k = 5;
+
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.001).sin()).collect();
+    let matrix: Vec<f32> = (0..rows * hidden)
+        .map(|i| (i as f32 * 0.0001).cos())
+        .collect();
+    let q4_data = quantize_q4_0(&matrix);
+    let (q8_x, q8_scales) = q4::quantize_to_q8(&x);
+
+    use larql_compute::QuantMatVec;
+    let gpu_hits = metal
+        .q4_matvec_topk(&q4_data, &q8_x, &q8_scales, rows, hidden, top_k)
+        .expect("topk path must fire");
+
+    let scores = metal
+        .q4_matvec(&q4_data, &q8_x, &q8_scales, rows, hidden)
+        .expect("scores path must fire");
+    let mut indexed: Vec<(u32, f32)> = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let cpu_hits: Vec<(u32, f32)> = indexed.into_iter().take(top_k).collect();
+
+    assert_eq!(gpu_hits.len(), top_k);
+    // Score positions must match (Q4 quantization ties are real but the
+    // sorted-descending ordering is deterministic). GPU and CPU may pick
+    // different indices on ties — so compare scores by position only.
+    for (g, c) in gpu_hits.iter().zip(cpu_hits.iter()) {
+        assert!(
+            (g.1 - c.1).abs() < 1e-3,
+            "topk score mismatch at rank: gpu={:?} cpu={:?}",
+            g,
+            c
+        );
+    }
+    // Each returned idx must point at a score equal to what we returned
+    // (proving the GPU index is one of the legitimate top-K, not stale).
+    for (idx, score) in gpu_hits.iter() {
+        assert!(
+            (scores[*idx as usize] - *score).abs() < 1e-3,
+            "topk idx {} reports score {} but scores[idx] = {}",
+            idx,
+            score,
+            scores[*idx as usize]
+        );
+    }
+}
+
+#[test]
 fn q4_matvec_topk1_matches_full_argmax() {
     let metal = get_metal();
     let hidden = 2560;

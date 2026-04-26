@@ -68,6 +68,20 @@ pub trait MatMul {
         None
     }
 
+    /// f16 gemv + GPU partial top-K. Generalises [`Self::f16_gemv_topk1`]
+    /// to `top_k > 1` (capped at the kernel's `K_TOPK` constant). Returns
+    /// `None` when not specialised or `top_k` exceeds the per-TG capacity.
+    fn f16_gemv_topk(
+        &self,
+        _w_f16: &[u8],
+        _x: &[f32],
+        _n: usize,
+        _k: usize,
+        _top_k: usize,
+    ) -> Option<Vec<(u32, f32)>> {
+        None
+    }
+
     /// Like [`Self::f32_gemv`] but skips the internal CPU-vs-GPU flop
     /// threshold. Use when the caller has already decided the work is
     /// worth a GPU dispatch — e.g. the per-layer gate matmul that fires

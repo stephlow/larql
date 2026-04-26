@@ -135,6 +135,10 @@ pub struct MetalBackend {
     /// up as the dominant per-token cost.
     pub f32_gemv_pipeline: KernelHandle,
     pub f32_argmax_partial_pipeline: ComputePipelineState,
+    /// Per-TG top-K reduction over a scores buffer. Produces `K_TOPK = 8`
+    /// (val, idx) pairs per TG; CPU final reduction merges into the caller's
+    /// requested top-k. Used by the lm_head top_k=5 path on Gemma 3/4.
+    pub f32_topk_partial_pipeline: ComputePipelineState,
     /// Same layout as [`Self::f32_gemv_pipeline`], but with a `half`
     /// weight matrix. Halves bandwidth for tied-embedding models whose
     /// lm_head would otherwise live as a 5.6 GB f32 clone on 31B.
@@ -245,6 +249,8 @@ impl MetalBackend {
             KernelHandle::from_kernel::<shaders::f32_gemv::Kernel>(&device, &library)?;
         let f32_argmax_partial_pipeline =
             get_shader_pipeline::<shaders::f32_gemv::ArgmaxKernel>(&device, &library)?;
+        let f32_topk_partial_pipeline =
+            get_shader_pipeline::<shaders::f32_gemv::TopKKernel>(&device, &library)?;
         let f16_gemv_pipeline =
             KernelHandle::from_kernel::<shaders::f16_gemv::Kernel>(&device, &library)?;
 
@@ -358,6 +364,7 @@ impl MetalBackend {
             residual_norm_store_pipeline,
             f32_gemv_pipeline,
             f32_argmax_partial_pipeline,
+            f32_topk_partial_pipeline,
             f16_gemv_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),
         })

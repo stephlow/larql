@@ -625,14 +625,25 @@ pub fn load_model_weights_q4k(
                     if let Some((_fmt, num_entries, _inter, _hidden, offsets)) =
                         parse_layer_weights_header(&mmap)
                     {
+                        // Use the shared key builder from larql-models so the
+                        // loader and `ModelWeights::get_layer_entry_bytes` stay
+                        // in lockstep. Drift here causes silent None returns.
                         for (e, (gu_off, gu_bytes, dn_off, dn_bytes)) in offsets.iter().enumerate()
                         {
                             packed_byte_ranges.insert(
-                                format!("layers/{l}/{e}/gate_up"),
+                                larql_models::weights::per_layer_ffn_key(
+                                    l,
+                                    e,
+                                    larql_models::weights::PER_LAYER_FFN_GATE_UP,
+                                ),
                                 (filename.clone(), *gu_off, *gu_bytes),
                             );
                             packed_byte_ranges.insert(
-                                format!("layers/{l}/{e}/down"),
+                                larql_models::weights::per_layer_ffn_key(
+                                    l,
+                                    e,
+                                    larql_models::weights::PER_LAYER_FFN_DOWN,
+                                ),
                                 (filename.clone(), *dn_off, *dn_bytes),
                             );
                         }

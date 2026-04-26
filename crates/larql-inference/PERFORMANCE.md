@@ -148,3 +148,46 @@ All measurements on M3 Max, Gemma 3 4B (34 layers, hidden=2560).
 | **Vindex** | Gate KNN (Q4 Metal) | vindex | 0.5ms/layer | 6x faster |
 | **Vindex** | Walk (14 layers) | vindex | 14ms | Mmap zero-copy |
 | **Ollama** | Full layer | external | 0.30ms/layer | Metal GPU, merged dispatches |
+
+## Sampling Overhead (2026-04-26)
+
+Per-call cost of `Sampler::sample` over realistic vocab sizes. Measured
+1000 iterations after 50 warmup, M3 Max release build. Reference: Metal
+Q4K decode budget ≈ 10ms/tok = 10,000 µs.
+
+### Sparse top-K path — `sample_from_topk` (production hot path)
+
+`generate_with_sampling` requests `K=5` for greedy or `K=64` for sampling
+from the LM-head KNN, then calls `sample_from_topk`. This is the only
+sampling path that runs per generated token in the inference loop.
+
+| Config | Hits | µs/call | % of decode budget |
+|--------|-----:|--------:|-------------------:|
+| greedy | 5 | <0.01 | 0.00% |
+| temperature=0.8 | 64 | 0.28 | 0.003% |
+| temperature=1.0 + top_p=0.9 | 64 | 1.67 | 0.017% |
+| temperature=1.0 + top_k=40 | 64 | 0.63 | 0.006% |
+
+Sparse-path sampling is effectively free — well below the per-step decode
+budget across every config. Switching from greedy to non-greedy moves the
+needle on tok/s by less than 0.02%.
+
+### Full-vocab path — `sample` (reserved for OpenAI-API logprobs)
+
+Sampling from a dense logit vector. Not on the inference hot path today
+— used by the planned OpenAI-compatible HTTP API for `logprobs` and
+likelihood-class evals (HellaSwag, MMLU, ARC).
+
+| Config | Vocab=32K | Vocab=128K | Vocab=256K |
+|--------|----------:|-----------:|-----------:|
+| greedy | 181 µs | 748 µs | 1.5 ms |
+| temperature=0.8 | 134 µs | 572 µs | 1.2 ms |
+| temperature=1.0 + top_p=0.9 | 2.5 ms | 5.4 ms | 8.0 ms |
+| temperature=1.0 + top_k=40 | 104 µs | 423 µs | 820 µs |
+
+The top-p path is ~10× slower than the others at 256K vocab — it does a
+full sort + HashSet membership rather than a partial nth-element. Not
+hot-path-relevant today; revisit if/when full-vocab sampling moves to
+the decode loop.
+
+Reproduce with `cargo run --release -p larql-inference --example bench_sampling`.

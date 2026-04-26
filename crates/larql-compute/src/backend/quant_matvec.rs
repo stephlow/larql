@@ -138,6 +138,22 @@ pub trait QuantMatVec {
         None
     }
 
+    /// Q4 matvec + GPU partial top-K. Generalises
+    /// [`Self::q4_matvec_topk1`] to `top_k > 1` (capped at the kernel's
+    /// `K_TOPK` constant). Returns `None` when not specialised or `top_k`
+    /// exceeds the per-TG capacity.
+    fn q4_matvec_topk(
+        &self,
+        _q4_data: &[u8],
+        _q8_x: &[i8],
+        _q8_scales: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+        _top_k: usize,
+    ) -> Option<Vec<(u32, f32)>> {
+        None
+    }
+
     /// Q4 vector-matrix: `out[K] = activation[N] @ Q4[N, K]`.
     fn q4_vecmat(
         &self,

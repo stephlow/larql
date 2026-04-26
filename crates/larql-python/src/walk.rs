@@ -63,7 +63,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
         "up_weights.bin",
         "down_weights.bin",
         "norms.bin",
-        LM_HEAD_BIN,
+        "lm_head.bin",
     ];
     for fname in &weight_files {
         let path = dir.join(fname);

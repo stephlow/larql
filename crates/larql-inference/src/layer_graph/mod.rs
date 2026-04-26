@@ -24,7 +24,10 @@ pub mod prefill;
 mod template;
 mod walk;
 
-pub use generate::{generate, generate_constrained, lm_head_topk, GenerateResult, StageTimings};
+pub use generate::{
+    generate, generate_constrained, generate_with_sampling, lm_head_topk, Detokenizer, EosConfig,
+    GenerateResult, Sampler, SamplingConfig, StageTimings,
+};
 
 use ndarray::Array2;
 

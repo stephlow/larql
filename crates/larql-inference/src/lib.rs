@@ -80,6 +80,7 @@ pub use layer_graph::{
     build_adaptive_graph,
     detect_template,
     generate,
+    generate_with_sampling,
     // Expert grid generation
     grid::{generate_with_remote_moe, GridGenerateResult},
     hybrid::predict_hybrid,
@@ -93,6 +94,9 @@ pub use layer_graph::{
     AttentionCache,
     CachedLayerGraph,
     DenseLayerGraph,
+    // Generation building blocks (EOS, detok, sampling)
+    Detokenizer,
+    EosConfig,
     GenerateResult,
     GuidedWalkLayerGraph,
     // Production
@@ -100,6 +104,8 @@ pub use layer_graph::{
     LayerOutput,
     PerLayerGraph,
     PipelinedLayerGraph,
+    Sampler,
+    SamplingConfig,
     // Analysis/validation
     TemplatePattern,
     TemplateUniverse,

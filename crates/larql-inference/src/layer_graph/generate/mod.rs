@@ -1,12 +1,23 @@
 //! Token generation — GPU and CPU paths.
+//!
+//! Sub-modules:
+//! - [`eos`]: stop-token detection (built-in markers + `generation_config.json`).
+//! - [`detok`]: incremental detokeniser preserving HF leading-space semantics.
+//! - [`sampling`]: greedy / temperature / top-k / top-p sampler.
 
 mod cpu;
+pub mod detok;
+pub mod eos;
 mod gpu;
 mod lm_head;
+pub mod sampling;
 mod types;
 
-pub use gpu::{generate, generate_constrained};
+pub use detok::Detokenizer;
+pub use eos::{EosConfig, BUILTIN_STOP_STRINGS, GENERATION_CONFIG_FILENAME};
+pub use gpu::{generate, generate_constrained, generate_with_sampling};
 pub use lm_head::lm_head_topk;
+pub use sampling::{Sampler, SamplingConfig};
 pub use types::{GenerateResult, StageTimings};
 
 #[cfg(test)]

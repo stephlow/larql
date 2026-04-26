@@ -1,5 +1,8 @@
 //! Metal GPU generate paths — fused prefill + KV-cached decode loop.
 
+use super::detok::Detokenizer;
+use super::eos::EosConfig;
+use super::sampling::{Sampler, SamplingConfig};
 use super::types::{GenerateResult, StageTimings};
 use crate::layer_graph::CachedLayerGraph;
 use crate::model::ModelWeights;
@@ -12,14 +15,27 @@ use super::lm_head::{
     backend_lm_head_scores, cpu_lm_head_topk, lm_head_topk, pick_next_token_masked,
 };
 
-/// Multi-token generation: GPU prefill → decode loop with KV cache.
-///
-/// 1. GPU prefill: full_pipeline_q4 populates KV cache for all layers
-/// 2. Decode loop: decode_token reads from KV cache, generates one token at a time
-/// 3. Logits: vindex lm_head KNN (no dense matmul)
-///
-/// Returns: Vec of (token_string, probability) for each generated token,
-/// plus timing (prefill_ms, per_token_ms).
+/// LM-head top-K size when running greedy decode. Matches the historical
+/// behaviour preserved by [`generate`].
+const LMHEAD_TOPK_GREEDY: usize = 5;
+/// LM-head top-K minimum when sampling. Larger K gives the sampler enough
+/// distribution mass to apply temperature / top-p meaningfully without
+/// paying for a full-vocab gemv. `cfg.top_k.unwrap_or(0).max(this)` is
+/// what actually gets requested.
+const LMHEAD_TOPK_SAMPLING_MIN: usize = 64;
+
+fn lmhead_k_for_sampling(cfg: &SamplingConfig) -> usize {
+    if cfg.is_greedy() {
+        LMHEAD_TOPK_GREEDY
+    } else {
+        cfg.top_k.unwrap_or(0).max(LMHEAD_TOPK_SAMPLING_MIN)
+    }
+}
+
+/// Greedy multi-token generation. Thin wrapper over
+/// [`generate_with_sampling`] with [`SamplingConfig::greedy`] and
+/// [`EosConfig::builtin`] — preserves the historical behaviour of every
+/// caller in the crate.
 #[allow(clippy::too_many_arguments)]
 pub fn generate(
     weights: &mut ModelWeights,
@@ -30,6 +46,50 @@ pub fn generate(
     backend: &dyn ComputeBackend,
     cached_layers: &CachedLayerGraph,
     layer_range: std::ops::Range<usize>,
+) -> GenerateResult {
+    generate_with_sampling(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        SamplingConfig::greedy(),
+        &EosConfig::builtin(),
+    )
+}
+
+/// Multi-token generation with explicit sampling and EOS configuration.
+///
+/// Pipeline:
+///
+/// 1. GPU prefill: `prefill_q4` populates KV cache for all layers.
+/// 2. Decode loop: `decode_token` reads from KV cache, generates one token
+///    at a time.
+/// 3. Logits: vindex lm_head KNN (size depends on sampling config —
+///    [`LMHEAD_TOPK_GREEDY`] for greedy, larger for sampling so the
+///    distribution has enough mass to apply temperature / top-p).
+/// 4. Pick: greedy → argmax of KNN; sampling → temperature + top-k +
+///    top-p over the KNN hits via [`Sampler::sample_from_topk`].
+/// 5. Surface form via [`Detokenizer`], which preserves HF leading-space
+///    semantics by emitting only the cumulative-decode delta.
+/// 6. EOS check via `eos.is_eos(tid, &tok_str)`.
+///
+/// Returns `(token_string, probability)` per generated token plus timing.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_sampling(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
 ) -> GenerateResult {
     // Backends that don't implement the fused Q4 prefill (today: CpuBackend)
     // delegate to the CPU Q4K per-layer dequant path. It mutates `weights.tensors`
@@ -285,12 +345,22 @@ pub fn generate(
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut decode_ms = Vec::with_capacity(max_tokens);
 
-    let first_hits = lm_head_topk(index, weights, &h_1d, 5, backend);
-    if let Some(&(tid, score)) = first_hits.first() {
-        // Keep the raw token text (with leading spaces); trimming here
-        // caused multi-token outputs like " Paris", " and", " it" to
-        // concatenate into "Parisandit" in `GenerateResult::text()`.
-        let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
+    let mut sampler = Sampler::new(sampling);
+    let mut detok = Detokenizer::new(tokenizer);
+    detok.seed(token_ids);
+
+    let knn_k = lmhead_k_for_sampling(&sampling);
+    let first_hits = lm_head_topk(index, weights, &h_1d, knn_k, backend);
+    let first_pick = sampler.sample_from_topk(&first_hits);
+    if let Some(picked_id) = first_pick {
+        // Detokenizer.push emits the cumulative-decode delta — handles HF
+        // leading-space (`▁`) correctly across SP and BPE tokenizers.
+        let tok_str = detok.push(picked_id);
+        let score = first_hits
+            .iter()
+            .find(|(t, _)| *t == picked_id)
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0);
         let prob = crate::layer_graph::logits::softmax_prob(
             score,
             &first_hits,
@@ -301,7 +371,7 @@ pub fn generate(
     }
 
     // ── Phase 2: GPU decode loop ──
-    let mut current_token_id = first_hits.first().map(|&(tid, _)| tid).unwrap_or(0);
+    let mut current_token_id = first_pick.unwrap_or(0);
 
     // Per-stage decode profiling. Set LARQL_PROFILE_DECODE=1 to log a
     // one-line per-step breakdown of embed / GPU forward / final norm /
@@ -459,7 +529,7 @@ pub fn generate(
             let norm_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
             let t3 = std::time::Instant::now();
-            let hits = lm_head_topk(index, weights, &h_1d, 5, backend);
+            let hits = lm_head_topk(index, weights, &h_1d, knn_k, backend);
             let lmhead_ms = t3.elapsed().as_secs_f64() * 1000.0;
             if profile && _step <= 2 {
                 let h_nan = h_1d.iter().filter(|v| v.is_nan()).count();
@@ -483,22 +553,22 @@ pub fn generate(
             let step_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
             decode_ms.push(step_ms);
 
-            if let Some(&(tid, score)) = hits.first() {
+            if let Some(picked_id) = sampler.sample_from_topk(&hits) {
                 let t4 = std::time::Instant::now();
-                // Preserve raw token text so GenerateResult::text() reads
-                // naturally; trim only for EOS marker matching.
-                let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
+                let tok_str = detok.push(picked_id);
                 let detok_ms = t4.elapsed().as_secs_f64() * 1000.0;
+                let score = hits
+                    .iter()
+                    .find(|(t, _)| *t == picked_id)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0.0);
                 let prob = crate::layer_graph::logits::softmax_prob(
                     score,
                     &hits,
                     weights.arch.logits_scaling(),
                     weights.arch.final_logit_softcapping(),
                 );
-                let tok_trimmed = tok_str.trim();
-                let is_eos = tok_trimmed == "<eos>"
-                    || tok_trimmed == "</s>"
-                    || tok_trimmed == "<|endoftext|>";
+                let is_eos = eos.is_eos(picked_id, &tok_str);
                 if profile {
                     eprintln!(
                         "[profile] step={} total={:.1}ms  embed={:.2}  gpu={:.1}  norm={:.2}  lm_head={:.1}  detok={:.2}",
@@ -511,7 +581,7 @@ pub fn generate(
                 t_lmhead += lmhead_ms;
                 t_detok += detok_ms;
                 tokens.push((tok_str, prob));
-                current_token_id = tid;
+                current_token_id = picked_id;
                 if is_eos {
                     break;
                 }

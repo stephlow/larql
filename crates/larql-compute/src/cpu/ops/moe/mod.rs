@@ -226,4 +226,155 @@ mod tests {
             "expected nonzero output from identity-like expert"
         );
     }
+
+    /// Q4_K path: build per-expert tables of quantised bytes (one super-block
+    /// per expert in this fixture: hidden=256, inter=128 so the matmul shapes
+    /// are 2*128*256 = 65536 elements = 256 super-blocks per gate+up entry).
+    /// The test confirms `cpu_moe_forward` produces a finite, non-NaN output
+    /// when the format dispatch routes to the Q4_K dequantiser.
+    #[test]
+    fn cpu_moe_forward_q4k_dispatch() {
+        use crate::cpu::ops::q4_common::quantize_q4_k;
+
+        // Smallest legal Q4_K MoE shape: hidden must be multiple of 256.
+        let hidden = 256;
+        let inter = 256; // multiple of 256 → no padding
+        let num_experts = 2;
+        let top_k = 1;
+
+        let gate_up_floats = 2 * inter * hidden; // = 131072 = 512 super-blocks
+        let down_floats = hidden * inter;
+
+        // Same f32 ramp for both experts; routes to expert 0 via router.
+        let ramp: Vec<f32> = (0..gate_up_floats)
+            .map(|i| (i as f32 / gate_up_floats as f32 - 0.5) * 0.2)
+            .collect();
+        let down_ramp: Vec<f32> = (0..down_floats)
+            .map(|i| (i as f32 / down_floats as f32 - 0.5) * 0.1)
+            .collect();
+        let gu_q = quantize_q4_k(&ramp);
+        let dn_q = quantize_q4_k(&down_ramp);
+
+        // Per-expert table: same bytes for both experts — fine for the smoke test.
+        let experts_gate_up: Vec<&[u8]> = vec![&gu_q, &gu_q];
+        let experts_down: Vec<&[u8]> = vec![&dn_q, &dn_q];
+
+        // Router: high logit on expert 0.
+        let mut router = vec![0.0f32; num_experts * hidden];
+        router[..hidden].fill(1.0);
+
+        let h = vec![0.5f32; hidden];
+        let moe = MoeLayerWeights {
+            experts_gate_up,
+            experts_down,
+            expert_data_format: crate::QuantFormat::Q4_K,
+            router_proj: &router,
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts,
+            top_k,
+            intermediate_size: inter,
+            activation: crate::Activation::Silu,
+        };
+
+        let out = cpu_moe_forward(&h, &moe, 0.0, 1e-6);
+        assert_eq!(out.len(), hidden);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "Q4_K MoE output must be finite (no NaN/Inf): {:?}",
+            out.iter().take(4).collect::<Vec<_>>()
+        );
+        assert!(
+            out.iter().any(|v| v.abs() > 1e-6),
+            "Q4_K dispatch produced all-zeros — format routing likely broken"
+        );
+    }
+
+    /// Per-expert table indexing: routing to expert 1 must use `experts_*[1]`,
+    /// not `experts_*[0]` plus a stride. Build a fixture where expert 0's gate
+    /// is zero and expert 1's gate is non-zero — output should be non-zero
+    /// (proves the router selected expert 1 AND the indexing pulled the right
+    /// per-expert byte slice).
+    #[test]
+    fn per_expert_indexing_routes_correctly() {
+        let hidden = 4;
+        let inter = 2;
+        let num_experts = 2;
+        let top_k = 1;
+
+        // BF16: 1.0 = [0x80, 0x3F]; 0.0 = [0x00, 0x00].
+        let one_bf16 = [0x80u8, 0x3Fu8];
+        let zero_bf16 = [0x00u8, 0x00u8];
+        // Expert 0: all zeros (gate_up + down). Expert 1: gate=5.0, up=down=1.0.
+        // gate_up shape [2*inter, hidden] = 16 floats = 32 bytes per expert.
+        let mut e0_gu = vec![0u8; 2 * inter * hidden * 2];
+        for chunk in e0_gu.chunks_exact_mut(2) {
+            chunk.copy_from_slice(&zero_bf16);
+        }
+        let mut e1_gu = vec![0u8; 2 * inter * hidden * 2];
+        // Expert 1 gate rows (rows 0..inter): 5.0 BF16 = [0xA0, 0x40].
+        let five_bf16 = [0xA0u8, 0x40u8];
+        for row in 0..inter {
+            for col in 0..hidden {
+                let off = (row * hidden + col) * 2;
+                e1_gu[off] = five_bf16[0];
+                e1_gu[off + 1] = five_bf16[1];
+            }
+        }
+        // Expert 1 up rows: 1.0.
+        for row in inter..2 * inter {
+            for col in 0..hidden {
+                let off = (row * hidden + col) * 2;
+                e1_gu[off] = one_bf16[0];
+                e1_gu[off + 1] = one_bf16[1];
+            }
+        }
+        // Down: e0 zero, e1 1.0 everywhere.
+        let e0_dn = vec![0u8; hidden * inter * 2];
+        let mut e1_dn = vec![0u8; hidden * inter * 2];
+        for chunk in e1_dn.chunks_exact_mut(2) {
+            chunk.copy_from_slice(&one_bf16);
+        }
+
+        // Router: row for expert 1 is 1.0, row for expert 0 is 0.0 →
+        // expert 1 wins, output should be non-zero. If indexing were swapped,
+        // the router would still pick expert id 1 but pull expert 0's bytes
+        // (all zeros) and the output would be 0.
+        let mut router = vec![0.0f32; num_experts * hidden];
+        router[hidden..].fill(1.0); // expert 1 row
+
+        let moe = MoeLayerWeights {
+            experts_gate_up: vec![&e0_gu, &e1_gu],
+            experts_down: vec![&e0_dn, &e1_dn],
+            expert_data_format: crate::QuantFormat::BF16,
+            router_proj: &router,
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts,
+            top_k,
+            intermediate_size: inter,
+            activation: crate::Activation::Silu,
+        };
+
+        let h = vec![1.0f32; hidden];
+        let out = cpu_moe_forward(&h, &moe, 0.0, 1e-6);
+        assert_eq!(out.len(), hidden);
+        assert!(
+            out.iter().any(|v| v.abs() > 0.01),
+            "expert 1 has non-zero weights; output must be non-zero. \
+             Got {out:?} — per-expert indexing is likely confusing 0 and 1."
+        );
+    }
 }

@@ -24,27 +24,36 @@ before generation. `--no-chat-template` flag to bypass for base models or raw
 prompts.
 
 ### EOS detection
-**Status**: Partial — checks `<eos>`, `</s>`, `<|endoftext|>` but missing Gemma 4 `<end_of_turn>`  
-**Files**: `layer_graph/generate/gpu.rs`  
-Read `eos_token_id` and `stop_strings` from `generation_config.json`. Gemma 4
-lists `<end_of_turn>` in `stop_strings` but not in `eos_token_id`; without this
-fix greedy decode runs to `--max-tokens`.
+**Status**: ✅ Done 2026-04-26 — see `layer_graph/generate/eos.rs`  
+`EosConfig` reads `eos_token_id` (scalar or array) and `stop_strings` from
+`generation_config.json`, layered on top of `BUILTIN_STOP_STRINGS` (covers
+Gemma `<end_of_turn>`, ChatML `<|im_end|>`, Llama-3 `<|eot_id|>`/`<|eom_id|>`).
+Wired into `generate_with_sampling` via `eos.is_eos(id, &decoded)`. Greedy
+`generate` defaults to `EosConfig::builtin()` so existing callers Just Work.
 
 ### Token spacing / detokenisation
-**Status**: Not started  
-Accumulate tokens before decoding; trim only the first token. HuggingFace
-tokenizers use a leading-space convention (`▁Paris`) that is stripped incorrectly
-when decoding single tokens.
+**Status**: ✅ Done 2026-04-26 — see `layer_graph/generate/detok.rs`  
+`Detokenizer` keeps the cumulative ID buffer and emits only the freshly-grown
+suffix on each `push`. Equivalent to llama.cpp `llama_token_to_piece` and HF
+Python `decode_stream`. Handles HF leading-space (`▁`) for SP tokenizers and
+multi-byte UTF-8 chars that straddle a token boundary. Demo at
+`examples/detok_demo.rs` shows the bug ("thecapitaloffranceisparis") and the
+fix ("the capital of france is paris").
 
 ### Token streaming
 **Status**: Not started  
 Change `generate` / `generate_cached` to accept `on_token: impl FnMut(&str, f64)`
-callback. Currently the full token list is collected before returning.
+callback. Currently the full token list is collected before returning. Detok
+buffer is already in place via `Detokenizer::push`; this is now glue.
 
 ### Sampling
-**Status**: Not started  
-Add temperature softmax, top-k, and top-p (nucleus) filtering after lm_head and
-before argmax. Flags (`--temperature`, `--top-p`, `--top-k`) owned by `larql-cli`.
+**Status**: ✅ Done 2026-04-26 — see `layer_graph/generate/sampling.rs`  
+`Sampler` + `SamplingConfig` covers greedy / temperature / top-k / top-p with
+optional `seed` for reproducibility. Two paths: full-vocab `sample(logits)`
+for the OpenAI-API logprob future, sparse `sample_from_topk(hits)` for the
+production hot path. Wired into `generate_with_sampling`. Sparse-path
+overhead is <2µs/call at top-K=64 (<0.02% of decode budget). CLI flags
+(`--temperature`/`--top-p`/`--top-k`) are still owned by `larql-cli`.
 
 ### Multi-turn KV state
 **Status**: Not started — `larql chat` resets KV cache per turn today  
@@ -86,6 +95,112 @@ Metal K/V read-back. Add `backend.get_kv_last_position(layer)` to the Metal back
 ### Apollo store builder
 **Impact**: Currently requires pre-built NPY/NPZ files.  
 **Status**: Not started. `ApolloEngine::build_from_document(weights, tokenizer, tokens)`.
+
+---
+
+## P0: Evaluation parity (blocks architecture claims)
+
+larql is a research engine for novel architectures (WalkFfn, vindex KV engines, gate
+KNN, layer-skip via Apollo). To show an architecture is competitive we need to run
+the same eval harnesses other engines run — otherwise we are only ever comparing
+synthetic prompts to synthetic prompts. The items below build on the generation-quality
+P0 above (sampling, streaming, chat templates, multi-turn KV); without those, none
+of the harnesses load at all. Goal is parity for fair evaluation, not feature
+parity for its own sake.
+
+### Per-position logprobs / top-k logprobs
+**Status**: Not started  
+**Files**: `forward/predict/raw.rs`, expose via `lib.rs`  
+Add `forward_logprobs(weights, token_ids, target_ids) -> Vec<f32>` returning
+per-position log-likelihood of `target_ids[i]` given prefix `token_ids[..i]`.
+Also expose top-k logprobs from `forward_raw_logits`. lm-evaluation-harness and
+most multiple-choice benchmarks (HellaSwag, ARC, MMLU, WinoGrande, PIQA) score
+by sequence log-likelihood, not generation. Without this no likelihood-class
+benchmark can run, so no architecture claim has a published comparator.
+
+### OpenAI-compatible HTTP API
+**Status**: Not started  
+**Files**: `crates/larql-server/src/openai/` (new), thin wrapper over inference  
+`larql-server` exposes `/v1/infer` and `/v1/walk`; eval frameworks (lm-eval-harness,
+simple-evals, evalplus, AlpacaEval, swe-bench harnesses) plug into
+`/v1/chat/completions` and `/v1/completions`. Add OpenAI-shape endpoints as a
+wrapper over `generate` + sampling + chat-template rendering + logprob fields.
+Unlocks every harness without per-harness adapters.
+
+### Batch inference (independent prompts)
+**Status**: Not started  
+**Files**: `forward/predict/`, new `predict_batch`  
+Distinct from continuous batching. Eval suites issue thousands of independent
+prompts; serial execution makes a single benchmark run take hours-to-days. Add
+`predict_batch(weights, prompts: &[Vec<u32>]) -> Vec<Vec<f32>>` that prefills each
+prompt against the same weight mmap. Each prompt gets its own KV-engine instance,
+so all four engines work unchanged.
+
+### LoRA / adapter loading at runtime
+**Status**: Not started  
+**Files**: `forward/layer.rs`, `larql-models` weight loader  
+Many arch papers ship LoRA-tuned variants (instruction-tuned on top of a base).
+Without LoRA, larql cannot compare `WalkFfn` on `Gemma-3-4B-base` vs
+`Gemma-3-4B-it` without re-quantising a merged model. Add
+`WeightSet::with_lora(adapter_path)` wrapping `gate/up/down/q/k/v/o` matmuls as
+`W·x + α·B(A·x)`. Stretch: composable adapter stack for ablation
+(WalkFfn + LoRA-A vs WalkFfn + LoRA-B on the same base).
+
+### Eval-harness smoke run
+**Status**: Not started  
+End-to-end test: run lm-eval-harness `hellaswag` (10 samples) against
+`larql-server` and assert non-zero accuracy. Gate on `CI_INTEGRATION=1`. This
+is what moves "we have logprobs" from a unit test to "harnesses actually plug in."
+
+---
+
+## P1: Eval-class coverage
+
+Each item below unlocks a specific class of evaluation. Land in the order an arch
+claim needs them — no need to do all up front. Prerequisite for all of them: the
+P0 evaluation-parity stack above.
+
+### Structured output / GBNF grammar / JSON Schema
+**Status**: Partial — regex/grammar hook exists in `generate`; not wired to JSON
+Schema or BNF.  
+**Unlocks**: JSONSchemaBench, BFCL (function-calling leaderboard), any eval
+requiring schema-conformant output.  
+Apply a constrained-decoding mask over logits before sampling. Minimum viable:
+GBNF parser (port from `llama.cpp` grammar.cpp); JSON Schema compiles to GBNF.
+
+### Vision / multimodal forward
+**Status**: Not started  
+**Unlocks**: MMMU, ChartQA, DocVQA, multimodal subsets of larger suites.
+Validates that WalkFfn and the four KV engines work on multimodal weights, not
+just text.  
+Gemma 3 (4B/12B/27B) and Llama 3.2 ship vision variants; vision-tower weights
+are already in safetensors. Add image-embedding pipeline → token-mixing →
+existing decoder forward. No new KV-engine work required (image tokens look
+like text tokens to the decoder).
+
+### Tool / function calling
+**Status**: Not started — depends on chat templates (P0) + structured output
+(P1 above).  
+**Unlocks**: BFCL, ToolBench, AgentBench, any agent-style eval.  
+Once the two prerequisites land this is template glue: parse tool-call markers
+in the rendered chat template, emit structured calls via the constrained-decoding
+path.
+
+### Speculative decoding
+**Status**: Not started  
+**Why this matters for arch claims**: any "WalkFfn at X tok/s" comparison
+against engines that ship speculative decoding (vLLM, TGI, llama.cpp `--draft`)
+is misleading without it. Speculative decoding also interacts non-trivially with
+gate KNN — draft and target may diverge on top-k feature selection, which is its
+own arch question worth answering.  
+**Path**: self-spec via `forward_from_layer` (early-exit verification) is the
+cheapest entry; full draft-target spec is a follow-up.
+
+### Trace capture during eval batches
+**Status**: Partial — `trace_forward_full` works on single prompts.  
+Extend to the batch + logprob path so mechanistic interpretability can use
+eval-set inputs without re-running. This is what makes "we ran HellaSwag and
+the WalkFfn-replaced layers behaved like X" a single-pass measurement.
 
 ---
 
@@ -275,6 +390,18 @@ FFN graph walk is proven (348K features, 34 layers, zero accuracy loss).
 Full RS Graph Walk requires cracked attention (static head caching).
 `GraphWalkEngine` would eliminate the forward pass entirely for parametric queries.
 
+### Continuous batching + paged attention (deferred)
+**Why deferred**: arch claims larql cares about are likelihood-bounded, not
+throughput-bounded. PagedAttention-style KV management interacts with all four
+KV engines (each has its own checkpoint geometry), and the design work isn't
+worth it until a specific eval forces it. Revisit if a throughput-class
+benchmark becomes load-bearing for an arch claim.
+
+### Multi-GPU / tensor-parallel (deferred)
+`larql-grid` already shards layers across hosts. Tensor-parallel within a layer
+is a separate problem and not on the critical path until 70B+ models become the
+bottleneck.
+
 ---
 
 ## Completed
@@ -335,3 +462,10 @@ Full RS Graph Walk requires cracked attention (static head caching).
 | Integration tests: `test_layer_graph_integration.rs` | 2026-04-26 | 7 ignored tests; real vindex prefill/pipeline/template |
 | Fix: `residual_diff/capture.rs` missing PathBuf import | 2026-04-26 | Pre-existing bug; broke lib test compilation |
 | 525 unit tests total | 2026-04-26 | All passing |
+| `generate/eos.rs` — `EosConfig` | 2026-04-26 | Built-in stops + `generation_config.json`; fixes Gemma 4 `<end_of_turn>` bug |
+| `generate/detok.rs` — `Detokenizer` | 2026-04-26 | Cumulative-decode delta; preserves HF `▁` leading-space across SP and BPE |
+| `generate/sampling.rs` — `Sampler` + `SamplingConfig` | 2026-04-26 | Greedy / temp / top-k / top-p + seed; <2µs/call sparse path |
+| `generate_with_sampling` wired into GPU path | 2026-04-26 | Greedy `generate` is a thin wrapper; backward compatible |
+| Examples: `sampling_demo`, `eos_demo`, `detok_demo` | 2026-04-26 | End-to-end demos; detok runs without a model |
+| `bench_sampling` benchmark | 2026-04-26 | Per-call cost across 4 configs × 3 vocab sizes; results in PERFORMANCE.md |
+| 35 sampling/eos/detok tests | 2026-04-26 | All passing; 613 lib tests total |

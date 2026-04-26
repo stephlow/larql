@@ -55,7 +55,12 @@ pub fn all_shaders() -> String {
     src.push_str(sgemm::SHADER);
     src.push_str(sgemm_transb::SHADER);
     src.push_str(f32_gemv::SHADER);
-    src.push_str(f32_gemv::ARGMAX_SHADER);
+    // Templated MSL: substitutes `MAX_SIMDGROUPS_PER_TG` (argmax) and
+    // `K_TOPK` / `PARTIAL_TG_SZ` / `MAX_SIMDGROUPS_PER_TG` (topk) from
+    // the Rust constants of the same name so the shaders can't drift
+    // from their dispatchers.
+    src.push_str(&f32_gemv::argmax_shader_source());
+    src.push_str(&f32_gemv::topk_shader_source());
     src.push_str(f16_gemv::SHADER);
     // Q4 dense matvec
     src.push_str(q4_matvec_v4::SHADER);

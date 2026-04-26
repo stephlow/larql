@@ -60,6 +60,55 @@ impl QuantMatVec for MetalBackend {
         Self::reduce_argmax_partial(&partial_vals, &partial_idxs, n_partials)
     }
 
+    /// Q4 matvec + GPU partial top-K. Returns up to `top_k` entries
+    /// (`top_k ≤ K_TOPK = 8`) sorted descending. Caller falls back to
+    /// `q4_matvec` + CPU sort when this returns `None`.
+    fn q4_matvec_topk(
+        &self,
+        q4_data: &[u8],
+        q8_x: &[i8],
+        q8_scales: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        top_k: usize,
+    ) -> Option<Vec<(u32, f32)>> {
+        if top_k == 0 || top_k > crate::metal::shaders::f32_gemv::K_TOPK {
+            return None;
+        }
+        if num_rows == 0 || q8_x.len() != hidden {
+            return None;
+        }
+        let buf_q4 = self.bufs.get_bytes(q4_data);
+        let buf_q8 = self.bufs.transient_from_i8(q8_x);
+        let buf_scales = self.bufs.transient_from_f32(q8_scales);
+        let scores = self.bufs.output((num_rows * 4) as u64);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        crate::metal::ops::q4_matvec::encode(
+            enc,
+            &self.q4.matvec,
+            &buf_q4,
+            &buf_q8,
+            &buf_scales,
+            &scores,
+            num_rows as u32,
+            hidden as u32,
+            num_rows,
+        );
+        let (partial_vals, partial_idxs, num_tgs) =
+            self.encode_topk_partial(enc, &scores, num_rows);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        Some(MetalBackend::reduce_topk_partial(
+            &partial_vals,
+            &partial_idxs,
+            num_tgs,
+            top_k,
+        ))
+    }
+
     fn q4_vecmat(
         &self,
         activation: &[f32],

@@ -378,7 +378,11 @@ gate, was downgraded after failing it, or was set by policy regardless).
 
 ### 5.12 Per-layer FFN weight storage (`layers/`)
 
-**Status:** Planned — replaces both `interleaved_q4k.bin` (dense) and `experts_packed.bin` (MoE BF16 blob). Activated when `index.json` carries `"ffn_layout": "per_layer"`.
+**Status:** Shipped 2026-04-26 for MoE — `experts_packed.bin` (BF16 monolith) is no longer written. Dense layers still use `interleaved_q4k.bin` for now; per-layer dense is a future migration. Activated when `index.json` carries `"ffn_layout": "per_layer"`.
+
+**Reading code (current):** `format/weights/load.rs:614` mmaps each `layers/layer_{L}.weights`, parses the LYRW header + offset table, and exposes per-expert byte ranges via `ModelWeights::get_layer_entry_bytes(layer, entry)`. The CPU MoE path (`larql-compute::cpu::ops::moe`) and the remote-expert HTTP handler (`larql-server::routes::expert::run_expert`) both consume per-expert slices directly — no monolith arithmetic.
+
+**Migrating an old MoE vindex:** run `cargo run --release -p larql-cli --example convert_moe_to_per_layer -- <vindex>` to write the `layers/*.weights` files and set `"ffn_layout": "per_layer"`, then strip the `packed_bf16` rows referencing `experts_packed.bin` from `weight_manifest.json` and delete the file. Validated end-to-end on Gemma 4 26B A4B: `forward_moe` warm latency 4.86 → 1.91 ms (2.5×), 30-layer sweep 866 → 56 ms (15×), RSS 16.6 → 9.7 GB, disk 58 → 16 GB.
 
 **Design principles.**
 
@@ -392,9 +396,9 @@ gate, was downgraded after failing it, or was set by policy regardless).
 
 *`interleaved_q4k.bin` (dense):* One flat file for all 34 layers. Server `--layers` sharding works via byte-offset filtering but the OS faults in the full virtual range. Layer-level replacement or re-quantization requires rewriting the whole file.
 
-*`experts_packed.bin` (MoE BF16):* 43 GB monolithic BF16 blob. CPU BF16→f32 dequant at ~2.9 GB/token on Gemma 4 26B A4B; near-zero LRU cache hit rate. 30 GPU commit/wait syncs per decode step. No per-expert addressability.
+*`experts_packed.bin` (MoE BF16):* historical 43 GB monolithic BF16 blob. CPU BF16→f32 dequant at ~2.9 GB/token on Gemma 4 26B A4B; near-zero LRU cache hit rate. 30 GPU commit/wait syncs per decode step. No per-expert addressability. **Removed from new MoE vindexes 2026-04-26.**
 
-Measured on Gemma 4 26B A4B: 4.1 tok/s with BF16 blob vs 56.8 tok/s GPU-only baseline. 93.7% of decode time is CPU MoE.
+Measured on Gemma 4 26B A4B: 4.1 tok/s with BF16 blob vs 56.8 tok/s GPU-only baseline (decode dominated by CPU MoE). After per-layer migration the CPU MoE remote-expert path runs at 1.91 ms / call warm.
 
 **File layout.**
 

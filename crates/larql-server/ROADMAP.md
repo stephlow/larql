@@ -33,6 +33,8 @@
 
 ## Live perf snapshot (M3 Max, 2-shard grid, 26B-A4B)
 
+### Dense walk-ffn / gate-KNN path
+
 | Operation | Cold | Warm |
 |---|---|---|
 | `walk-ffn` 1 layer (router) | 12.8 ms | **0.2–0.3 ms** |
@@ -45,6 +47,25 @@
 
 P99 under 8-way contention: 24 ms.
 
+### Remote MoE expert path (Gemma 4 26B-A4B, single in-process shard, layer 15, top-K=8)
+
+`bench_expert_server` against per-layer Q4_K vindex (post `experts_packed.bin`
+removal). Hidden=2816, 128 experts, moe_intermediate=704, 30 MoE layers.
+
+| Operation | Result |
+|---|---|
+| Vindex load | 4.6 s, +6.0 GB RSS |
+| Lazy `get_or_load_weights()` | 1.2 s, +2.9 GB RSS |
+| Per-expert bytes (one bench layer, all 128) | 285 MB gate_up + 156 MB down (Q4_K) |
+| `forward_moe` warm (router + batched HTTP + combine) | **1.91 ms** mean / 1.91 p50 / 2.43 p99 |
+| `cpu_moe_forward` floor (no HTTP, same weights) | **0.10 ms** mean (LRU-warm Q4_K decode) |
+| 30-layer sweep (1 decode-step's worth of MoE blocks) | **56.0 ms** (1.87 ms/layer) |
+| Steady RSS | **9.7 GB** |
+
+For comparison, before the per-expert refactor + Q4_K migration the same bench
+on the BF16 monolith was 4.86 ms `forward_moe` warm, 28.9 ms/layer cold-page
+sweep, and 16.6 GB steady RSS — i.e. the change cut latency 2.5× and RSS 1.7×.
+
 ---
 
 ## P0: Active
@@ -52,45 +73,6 @@ P99 under 8-way contention: 24 ms.
 Nothing critical-path is blocking right now.
 
 ---
-
-## P0: Remote expert protocol (Act 2)
-
-These items are the wire-format half of the "experts live elsewhere" demo.
-The inference-side counterpart (`RemoteExpertBackend`, `cpu_moe_forward`) is
-tracked in `larql-inference/ROADMAP.md`.
-
-### `POST /v1/expert/{layer}/{expert_id}`
-**Status**: Not started  
-Accept a residual vector (hidden-size f32 or bf16), run that expert's gated FFN
-(gate + up + SiLU + down), return the residual delta. Endpoint already declared
-in the completed-items list below as a stub; needs a real handler wired to
-`ModelWeights`.
-
-### `POST /v1/expert/batch`
-**Status**: Not started  
-Body: list of `{layer, expert_id, residual}`. Returns a matching list of deltas.
-Collapses a layer's K active experts into one HTTP round trip per server, avoiding
-K separate requests under MoE top-K dispatch.
-
-### `--experts 0-31` flag on `larql serve`
-**Status**: Not started  
-**Files**: `src/main.rs` (CLI), `src/state.rs`  
-Load and serve only the specified expert ID subset. Allows horizontal sharding
-of a large MoE model across machines: `larql serve --experts 0-31` on host A,
-`--experts 32-63` on host B. Experts outside the owned range return HTTP 404.
-
-### `load_model_weights_ffn_only` — skip attention tensors on `--ffn-only`
-**Status**: Not started  
-**Files**: `src/state.rs`  
-`larql serve --ffn-only` currently loads `ModelWeights` in full (attention,
-norms, embeddings). Add `load_model_weights_ffn_only` that skips attention
-tensors to reduce RSS on expert-only shard machines. Expert servers have no
-use for Q/K/V projections or the lm_head.
-
-### `RemoteExpertBackend` — note
-Implementation lives in `larql-inference` (sharding map, parallel dispatch,
-per-expert error handling). This server owns the endpoint definitions and the
-`--experts` flag; larql-inference owns the client-side routing.
 
 ---
 
@@ -260,6 +242,28 @@ to add/remove a shard without restarting the router. Pair with
 ---
 
 ## Completed
+
+### 2026-04-26 — Per-expert byte table refactor + `experts_packed.bin` removal
+
+`MoeLayerWeights.experts_{gate_up,down}` migrated from `&[u8]` (monolith +
+`expert_idx * stride` arithmetic in the compute path) to `Vec<&[u8]>`
+(per-expert slice table). The CPU MoE consumer (`cpu_moe_forward` and
+`run_single_expert{,_with_norm}`) now indexes by expert id directly, with
+format dispatch (BF16 vs Q4_K) at the cache layer.
+
+| Item | Outcome |
+|---|---|
+| `larql-compute` | `cpu/ops/moe/{cache,expert,forward,mod}.rs` and `pipeline.rs::MoeLayerWeights`. `cached_dequant(bytes, format, expected_floats)` dispatches BF16/Q4_K. `expert_byte_slice` deleted. Tests updated. 94/94 pass. |
+| `larql-vindex` | `cpu/ops/q4_common.rs::dequantize_q4_k` lifted to module scope so the compute crate can dequant Q4_K without a `larql-models` dependency. |
+| `larql-inference` | `build_moe_weights` builds per-expert tables from either `weights.get_layer_entry_bytes(...)` (per-layer Q4_K) or BF16 stride slicing (legacy). `QuantFormat` re-exported. |
+| `larql-server` | `routes/expert.rs::run_expert` resolves per-expert bytes through whichever path the vindex provides; honours `expert_filter` ownership. `tests/test_expert_endpoint.rs` updated to slice synthetic monoliths into per-expert tables. 4/4 parity tests pass. |
+| 26B-A4B vindex | `weight_manifest.json` stripped of `packed_bf16` rows for experts (60 → 421 entries). `experts_packed.bin` deleted (43 GB freed; vindex 58 → 16 GB). |
+| Bench parity | `bench_expert_server` re-runs end-to-end against the per-layer-only vindex. `forward_moe` warm latency unchanged at 1.91 ms (was 1.93 ms when monolith was still on disk). 30-layer sweep at 56 ms (cold-page sweep on BF16 monolith was 866 ms). |
+
+`bench_expert_server` and the parity tests both detect the format
+automatically (`weights.has_per_layer_ffn()`); legacy BF16 vindexes still work
+unchanged. Future MoE vindexes only emit per-layer files — the q4k extractor
+at `format/weights/write_q4k/mod.rs` already does this.
 
 ### 2026-04-26 — examples, synthetic benchmark, grid checks
 

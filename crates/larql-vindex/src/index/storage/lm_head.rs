@@ -154,6 +154,12 @@ impl VectorIndex {
                         {
                             return vec![(idx, score)];
                         }
+                    } else if let Some(hits) =
+                        backend.q4_matvec_topk(q4_data, &q8_x, &q8_scales, vocab, hidden, top_k)
+                    {
+                        if !hits.is_empty() {
+                            return hits;
+                        }
                     }
                     if let Some(scores_vec) =
                         backend.q4_matvec(q4_data, &q8_x, &q8_scales, vocab, hidden)
@@ -177,6 +183,12 @@ impl VectorIndex {
                                 backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
                             {
                                 return vec![(idx, score)];
+                            }
+                        } else if let Some(hits) =
+                            backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
+                        {
+                            if !hits.is_empty() {
+                                return hits;
                             }
                         }
                         if let Some(scores_vec) =
@@ -347,6 +359,74 @@ mod tests {
         assert_eq!(all.len(), 5);
         let probs: Vec<f32> = all.iter().map(|(_, s)| *s).collect();
         assert!(probs.windows(2).all(|w| w[0] >= w[1]));
+    }
+
+    /// `top_k = 0` returns an empty Vec, never the input.
+    #[test]
+    fn top_k_sorted_zero_returns_empty() {
+        let scores = vec![0.5f32, 0.1, 0.9];
+        let out = VectorIndex::top_k_sorted(scores, 0);
+        assert!(out.is_empty());
+    }
+
+    /// Empty score vector → empty output (no panic).
+    #[test]
+    fn top_k_sorted_empty_input_returns_empty() {
+        let out = VectorIndex::top_k_sorted(Vec::new(), 5);
+        assert!(out.is_empty());
+    }
+
+    /// `top_k = 1` takes the argmax fast path. Filter is `is_finite()` —
+    /// NaN, +∞ and -∞ are all skipped (matching `backend_lm_head_topk` in
+    /// the inference crate). Test pins this contract: the highest finite
+    /// score wins, regardless of any ±∞ entries.
+    #[test]
+    fn top_k_sorted_k1_argmax_skips_non_finite() {
+        let scores = vec![0.2f32, f32::NAN, 0.9, f32::NEG_INFINITY, 0.5, f32::INFINITY];
+        let out = VectorIndex::top_k_sorted(scores, 1);
+        assert_eq!(out.len(), 1, "expected one finite winner");
+        assert_eq!(out[0].0, 2, "highest finite score is 0.9 at idx 2");
+        assert!((out[0].1 - 0.9).abs() < 1e-6);
+    }
+
+    /// All-NaN scores yield an empty argmax (no garbage token id).
+    #[test]
+    fn top_k_sorted_k1_all_nan_returns_empty() {
+        let scores = vec![f32::NAN; 10];
+        let out = VectorIndex::top_k_sorted(scores, 1);
+        assert!(out.is_empty());
+    }
+
+    /// Heap path (k=3) skips non-finite values and returns sorted descending.
+    #[test]
+    fn top_k_sorted_heap_skips_non_finite() {
+        let scores = vec![0.1f32, f32::NAN, 0.9, 0.5, f32::NEG_INFINITY, 0.3];
+        let out = VectorIndex::top_k_sorted(scores, 3);
+        let tokens: Vec<u32> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tokens, vec![2, 3, 5]);
+    }
+
+    /// Fewer finite values than k → return only the finite ones, sorted.
+    #[test]
+    fn top_k_sorted_heap_fewer_finite_than_k() {
+        let scores = vec![0.7f32, f32::NAN, 0.3, f32::NAN, f32::NAN];
+        let out = VectorIndex::top_k_sorted(scores, 5);
+        let tokens: Vec<u32> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tokens, vec![0, 2]);
+    }
+
+    /// Tied scores: return is descending by score; tied tokens are still
+    /// distinct (no duplicate index). Stability of which tied index wins
+    /// is implementation-defined.
+    #[test]
+    fn top_k_sorted_handles_ties() {
+        let scores = vec![0.5f32, 0.7, 0.5, 0.7, 0.1];
+        let out = VectorIndex::top_k_sorted(scores, 3);
+        assert_eq!(out.len(), 3);
+        let probs: Vec<f32> = out.iter().map(|(_, s)| *s).collect();
+        assert!(probs.windows(2).all(|w| w[0] >= w[1]));
+        let tokens: std::collections::HashSet<u32> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tokens.len(), 3, "no duplicate token ids in top-k output");
     }
 
     /// `synthesize_lm_head_q4` converts f16 embeddings to Q4_0 in RAM.

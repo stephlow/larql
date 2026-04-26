@@ -4,20 +4,33 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **78–79** | ~12.7ms | q6k_matvec ROWS_PER_TG=4 (correctness fix restored perf) |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **81–84** | ~12.0ms | q6k_matvec ROWS_PER_TG=4 + lm_head GPU top-K (2026-04-26) |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
 | **Ollama** gemma3:4b | **98–103** | ~10ms | reference (same hardware, same prompt) |
-| **Gap** | LARQL is **~1.30×** slower | ~3ms/tok | per-stage decomposition below |
+| **Gap** | LARQL is **~1.22×** slower | ~2.2ms/tok | per-stage decomposition below |
 | **LARQL Metal** (gemma4-26B-A4B, MoE Q4K GPU dispatch) | **5.1** | ~194ms | Phase 1 shipped; Phase 2 open — see P0 below |
 | **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; expert dispatch accounts for ~179ms gap |
 
-Per-stage (100-token run, 8 warmup, typical):
+Per-stage (50-token decode after 3 warmup, typical):
 
 | Stage | LARQL | Ollama (est.) | Gap |
 |---|---|---|---|
-| GPU fwd | ~11.0ms | ~8.5ms | ~2.5ms |
-| lm_head | ~2.3ms | ~1.3ms | ~1.0ms |
-| **Total** | **~13.1ms** | **~9.9ms** | **~3.2ms** |
+| GPU fwd | ~11.2ms | ~8.5ms | ~2.7ms |
+| lm_head | ~1.84ms | ~1.3ms | ~0.5ms |
+| **Total** | **~12.3ms** | **~9.9ms** | **~2.4ms** |
+
+**lm_head shipped 2026-04-26**: 2.28ms → 1.84ms (~0.44ms saved). Two
+pieces — (1) `top_k_sorted` in `larql-vindex/index/storage/lm_head.rs` now
+runs an argmax fast path for `k=1` and a size-K min-heap for `k>1` instead
+of allocating a 2MB `Vec<(u32, f32)>` and `select_nth_unstable` over 262K
+elements (~0.25ms saved). (2) New `f32_topk_partial` MSL shader emits
+`K_TOPK = 8` (val, idx) pairs per TG via repeated simd_max + index-mask;
+backend methods `f16_gemv_topk` / `q4_matvec_topk` route the bench's
+`top_k = 5` lm_head call through GPU partial top-K + 64KB readback +
+size-K CPU heap, avoiding the 1MB scores readback and the linear scan
+over 262K floats (~0.2ms additional). Greedy-decode `f16_gemv_topk1` /
+`q4_matvec_topk1` are also wired (no production caller yet — bench /
+generate both use top_k=5).
 
 **Gap analysis (2026-04-26, measured + per-kernel profiling):**
 
@@ -25,7 +38,7 @@ Per-stage (100-token run, 8 warmup, typical):
 |---|---|---|---|
 | Dispatch overhead | ~1.87ms (374 × 5µs) | ~1.36ms (272 × 5µs) | **0.51ms** |
 | Kernel compute | ~9.1ms | ~7.1ms | **~2.0ms** |
-| lm_head overhead | ~2.3ms | ~1.30ms | **~1.0ms** |
+| lm_head overhead | ~1.84ms | ~1.30ms | **~0.5ms** |
 
 **Per-kernel profiler results** (run `diag_profile_kernels`, see PERFORMANCE.md):
 
@@ -92,7 +105,7 @@ The stash that fixed the dispatch to `ROWS_PER_TG = 2` made the output correct b
 | Source | Gap | Status |
 |---|---|---|
 | **Kernel compute** | **~2.0ms** | gate+up compute-bound (K=2560 ALU-limited); open |
-| **lm_head overhead** | **~1.0ms** | GPU argmax shipped (fires for top_k=1); open for main decode path |
+| **lm_head overhead** | **~0.5ms** | GPU argmax_partial (top_k=1) + GPU topk_partial K_TOPK=8 (top_k=5) shipped 2026-04-26 (`f32_topk_partial` shader, `f16_gemv_topk` / `q4_matvec_topk` wired into `lm_head_knn_backend`) |
 | **Dispatch overhead** | **~0.5ms** | Mostly closed (374 vs Ollama ~272 dispatches) |
 
 **Achievable targets:**

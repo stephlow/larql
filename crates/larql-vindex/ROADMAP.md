@@ -88,13 +88,20 @@ layers/
 
 **Work items:**
 
-- [ ] Add `layers/` writer to extraction pipeline — quantize FFN weights per layer using the declared format (default: Q4_K), write binary format with header + offset table + data. Dense: `num_entries=1`. MoE: `num_entries=num_experts`, quantize each expert's gate+up and down from BF16 source.
-- [ ] Add `"ffn_layout": "per_layer"` to `VindexConfig` / `index.json`
-- [ ] Loader (`load.rs`): detect `ffn_layout == "per_layer"`, mmap each `layers/layer_{L}.weights`, parse headers + offset tables, expose per-entry byte ranges
-- [ ] Extend `ModelWeights` with per-layer offset table access (parallel to existing `packed_byte_ranges`)
-- [ ] `build_moe_weights` / `pipeline_layer.rs`: build `QuantWeight` structs from Q4K byte ranges instead of `get_packed_bytes` (BF16). Dense path: wire `layers/` as the source for `gate`/`up`/`down` `QuantWeight`s.
-- [ ] GPU dispatch in `decode_token_with_moe_fn`: for per-layer format, gather selected expert Q4K slices into staging buffer, dispatch `quant_matvec` on GPU; eliminate per-layer CPU MoE commit
-- [ ] Re-extract `gemma-4-26B-A4B-it.vindex` with new format (43 GB BF16 → ~24 GB Q4_K)
+- [x] Add `layers/` writer to extraction pipeline — `format/weights/write_layers.rs`, called from `format/weights/write_q4k/mod.rs`. Dense: `num_entries=1`. MoE: `num_entries=num_experts`.
+- [x] Add `"ffn_layout": "per_layer"` to `VindexConfig` / `index.json`.
+- [x] Loader (`load.rs:614`): detect `ffn_layout == "per_layer"`, mmap each `layers/layer_{L}.weights`, parse headers + offset tables, populate `packed_byte_ranges` keyed `"layers/{L}/{e}/gate_up"` / `"layers/{L}/{e}/down"`.
+- [x] Extend `ModelWeights::get_layer_entry_bytes(layer, entry)` for per-expert byte access.
+- [x] `build_moe_weights` (`larql-inference/src/layer_graph/pipeline_layer.rs`) builds per-expert `Vec<&[u8]>` tables from either `get_layer_entry_bytes` (per-layer Q4_K) or BF16 monolith strides (legacy). 2026-04-26.
+- [x] CPU consumer migration — `cpu_moe_forward` and `run_single_expert{,_with_norm}` now take per-expert byte tables; `cached_dequant` dispatches BF16 / Q4_K. `expert_byte_slice` arithmetic removed. 2026-04-26.
+- [x] `routes/expert.rs::run_expert` (larql-server) resolves per-expert via either path. 2026-04-26.
+- [x] Convert + strip + delete on the existing 26B-A4B vindex (manifest stripped of `packed_bf16` expert rows, `experts_packed.bin` deleted, 43 GB freed). 2026-04-26.
+- [x] GPU dispatch in `decode_token_with_moe_fn`: per-layer Q4_K slices gathered into staging buffer, single GPU command buffer per decode token.
+- [ ] Phase 2 (separate work in progress) — pre-allocated Metal scratch buffers to skip ~120 ms allocation overhead per decode token.
+
+**Result on Gemma 4 26B A4B (M3 Max, single-shard `bench_expert_server`):**
+`forward_moe` warm 4.86 → 1.91 ms (2.5×). 30-layer sweep 866 → 56 ms (15×).
+RSS 16.6 → 9.7 GB. Disk 58 → 16 GB.
 
 ## P1: Active
 

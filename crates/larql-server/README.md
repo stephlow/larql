@@ -61,6 +61,7 @@ larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --
 | `--ffn-only` | Run as an FFN-service endpoint for `RemoteWalkBackend` clients. Skips the f16→f32 gate warmup (10× smaller startup RSS on 31B Q4_K) | false |
 | `--embed-only` | Run as an embed-service endpoint (ADR-0008). Loads only embeddings + lm_head + tokenizer; skips all FFN and attention weights. Enables `/v1/embed`, `/v1/logits`, `/v1/token/*`. Advertises `mode: embed-service`. | false |
 | `--layers <START-END>` | Serve only this layer range (inclusive). Out-of-range requests return HTTP 400. Pages outside the range are never touched. | all |
+| `--experts <START-END>` | (MoE) Serve only this expert ID range (inclusive). Used to shard the expert bank across machines: `larql-server <vindex> --experts 0-63` on host A, `--experts 64-127` on host B. Requests for out-of-range expert IDs are rejected with HTTP 400. The remote-MoE inference client (`RemoteMoeBackend` in larql-inference) handles per-expert routing across shards. See "Remote-MoE expert sharding" below. | all |
 | `--max-gate-cache-layers <N>` | LRU cap on decoded f16 gate layers. `0` = unlimited. Each decoded layer is ~433 MB on 31B. | 0 |
 | `--max-q4k-cache-layers <N>` | LRU cap on the legacy `q4k_ffn_layer` whole-layer dequant cache. `0` = unlimited. Recommended `1` (or 0 once the vindex has W2 feature-major down — see `--feature-major-down` at extract time). | 0 |
 | `--hnsw` | Use HNSW for gate KNN instead of brute-force matmul. Approximate (recall 80–95%); wins for high-feature MoE (e.g. 64-expert: ~230 → 60 ms/layer). Net loss for dense ≤ 10K-feature models — leave off. | false |
@@ -142,6 +143,82 @@ cargo run --release -p larql-server --example bench_embed_server -- \
 cargo run --release -p larql-server --example bench_embed_server -- \
   output/gemma3-4b-q4k-v2.vindex --logits
 ```
+
+For a hybrid-MoE vindex (Gemma 4 26B-A4B etc.), `bench_expert_server`
+exercises the per-expert HTTP path end-to-end:
+
+```bash
+cargo run --release -p larql-server --example bench_expert_server -- \
+  output/gemma4-26b-a4b-q4k.vindex
+# Optional --ffn-only / --two-shard flags.
+```
+
+Reference numbers on M3 Max with the per-layer Q4_K layout
+(`forward_moe` warm 1.91 ms, 30-layer sweep 56 ms, steady RSS 9.7 GB)
+are in `ROADMAP.md` → "Live perf snapshot → Remote MoE expert path".
+
+## Recommended setups
+
+### Layer-range sharding (dense + MoE attention/router)
+
+Two shards, one router:
+
+```bash
+# Router (advertises a gRPC grid port for shards to register against):
+larql-router --grid-port 50051 --port 9090 --grid-key SECRET
+
+# Shard A — layers 0..14:
+larql-server <vindex> --layers 0-14 --port 8881 --no-infer \
+  --join http://router-host:50051 --public-url http://shard-a:8881 \
+  --grid-key SECRET
+
+# Shard B — layers 15..29:
+larql-server <vindex> --layers 15-29 --port 8882 --no-infer \
+  --join http://router-host:50051 --public-url http://shard-b:8882 \
+  --grid-key SECRET
+```
+
+Clients POST to `http://router:9090/v1/walk-ffn` with `{model_id, residual,
+layers, top_k}`; the router fans out to the owning shards and merges results.
+
+### Remote-MoE expert sharding
+
+For hybrid-MoE models (e.g. Gemma 4 26B A4B's 128 experts), shard by expert
+ID instead of layer. Each shard mmaps the full vindex but only the
+configured experts are reachable:
+
+```bash
+# Shard A — experts 0..63:
+larql-server output/gemma4-26b-a4b-q4k.vindex --experts 0-63 --port 8881 \
+  --ffn-only
+
+# Shard B — experts 64..127:
+larql-server output/gemma4-26b-a4b-q4k.vindex --experts 64-127 --port 8882 \
+  --ffn-only
+```
+
+Inference-side routing lives in `larql-inference::RemoteMoeBackend`
+(`crates/larql-inference/src/ffn/moe_remote.rs`) — it runs the router
+locally, picks the top-K experts per layer, groups by shard, and POSTs one
+`/v1/expert/batch` per shard in parallel via rayon. End-to-end latency for
+one MoE block on the 26B vindex is **1.91 ms warm** (single in-process
+shard, layer 15, top-K=8, hidden=2816).
+
+### Per-layer FFN format
+
+MoE vindexes store expert weights as per-layer Q4_K files
+(`layers/layer_{L:02}.weights`); the legacy `experts_packed.bin` BF16
+monolith is no longer written. To migrate an old MoE vindex in place:
+
+```bash
+cargo run --release -p larql-cli --example convert_moe_to_per_layer -- \
+  output/<vindex>
+# Then strip `packed_bf16` rows from weight_manifest.json and rm experts_packed.bin.
+```
+
+The loader (`format/weights/load.rs:614`) auto-detects the layout via
+`index.json`'s `"ffn_layout": "per_layer"`. Both old and new vindexes are
+supported through the same code path.
 
 ## API Endpoints
 

@@ -98,8 +98,10 @@ impl ModelWeights {
     /// populated by the per-layer loader. Returns `None` if the vindex uses
     /// the legacy flat-file layout or the entry is out of range.
     pub fn get_layer_entry_bytes(&self, layer: usize, entry: usize) -> Option<(&[u8], &[u8])> {
-        let gu = self.get_packed_bytes(&per_layer_ffn_key(layer, entry, "gate_up"))?;
-        let dn = self.get_packed_bytes(&per_layer_ffn_key(layer, entry, "down"))?;
+        let gu = self
+            .get_packed_bytes(&per_layer_ffn_key(layer, entry, PER_LAYER_FFN_GATE_UP))?;
+        let dn = self
+            .get_packed_bytes(&per_layer_ffn_key(layer, entry, PER_LAYER_FFN_DOWN))?;
         Some((gu, dn))
     }
 
@@ -227,6 +229,21 @@ impl ModelWeights {
     }
 }
 
-fn per_layer_ffn_key(layer: usize, entry: usize, component: &str) -> String {
+/// Key naming for per-layer FFN entries inside a vindex's
+/// `packed_byte_ranges` map.
+///
+/// Shared between the writer (`larql-vindex::format::weights::load.rs` —
+/// builds these on mmap of `layers/layer_{L}.weights`) and the reader
+/// (`ModelWeights::get_layer_entry_bytes`). Drift here breaks the per-layer
+/// dispatch silently — the loader populates one key shape and the consumer
+/// looks up another, returning `None`.
+///
+/// `component` must be `"gate_up"` or `"down"`.
+pub fn per_layer_ffn_key(layer: usize, entry: usize, component: &str) -> String {
     format!("layers/{layer}/{entry}/{component}")
 }
+
+/// Component string for the gate+up half of a per-layer FFN entry.
+pub const PER_LAYER_FFN_GATE_UP: &str = "gate_up";
+/// Component string for the down half of a per-layer FFN entry.
+pub const PER_LAYER_FFN_DOWN: &str = "down";
