@@ -100,6 +100,7 @@ impl MetalBackend {
             &self.q8_matvec_pipeline.state,
             &self.q8_qkv_proj_pipeline.state,
             &self.q4k_matvec_pipeline,
+            Some(&self.q4k_matmul_pipeline),
             &self.q6k_matvec_pipeline,
             &self.rms_norm_pipeline,
             &self.residual_add_pipeline,

@@ -15,12 +15,19 @@ pub mod stats;
 pub mod stream;
 pub mod walk;
 pub mod walk_ffn;
+pub mod topology;
 pub mod warmup;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
+
+// Expert batch payloads can be large when the client batches all sequence
+// positions into one call per layer (N_positions × top_K × hidden floats as
+// JSON). 64 MB covers: 512 positions × 8 experts × 2816 floats × ~7 bytes/float.
+const EXPERT_BATCH_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 use crate::state::AppState;
 
@@ -36,8 +43,9 @@ const PATCHES_APPLY: &str = "/v1/patches/apply";
 const PATCHES: &str = "/v1/patches";
 const PATCH_BY_NAME: &str = "/v1/patches/{name}";
 const WALK_FFN: &str = "/v1/walk-ffn";
-const EXPERT: &str = "/v1/expert/{layer}/{expert_id}";
+const EXPERT_TOPOLOGY: &str = "/v1/expert/topology";
 const EXPERT_BATCH: &str = "/v1/expert/batch";
+const EXPERT: &str = "/v1/expert/{layer}/{expert_id}";
 const EXPLAIN_INFER: &str = "/v1/explain-infer";
 const INSERT: &str = "/v1/insert";
 const STREAM: &str = "/v1/stream";
@@ -78,8 +86,13 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(PATCHES, get(patches::handle_list_patches))
         .route(PATCH_BY_NAME, delete(patches::handle_remove_patch))
         .route(WALK_FFN, post(walk_ffn::handle_walk_ffn))
+        .route(EXPERT_TOPOLOGY, get(topology::handle_topology))
+        .route(
+            EXPERT_BATCH,
+            post(expert::handle_expert_batch)
+                .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
+        )
         .route(EXPERT, post(expert::handle_expert))
-        .route(EXPERT_BATCH, post(expert::handle_expert_batch))
         .route(EXPLAIN_INFER, post(explain::handle_explain))
         .route(INSERT, post(insert::handle_insert))
         .route(STREAM, get(stream::handle_stream))

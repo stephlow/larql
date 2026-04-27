@@ -165,6 +165,62 @@ impl QuantMatVec for MetalBackend {
         Some(crate::metal::buffers::read_buffer_f32(&buf_out, num_rows))
     }
 
+    /// Q4_K matrix-matrix multiply: `C[m, n] = sum_k W[n, k] * X[m, k]`.
+    ///
+    /// `W` is `[num_rows, hidden]` Q4_K row-major. `X` is `[seq_len,
+    /// hidden]` f32 row-major. Output is `[seq_len, num_rows]` f32
+    /// row-major (one row per input position, matching the convention
+    /// downstream attention/FFN stages expect).
+    ///
+    /// Parity contract: the result of this call MUST equal stacking
+    /// `q4k_matvec(W, X[m..m+1])` for `m=0..seq_len`. The matmul kernel
+    /// just amortises the Q4_K dequant across `seq_len` positions —
+    /// the per-element math is identical. Verified by
+    /// `q4k_matmul_matches_stacked_matvec`.
+    fn q4k_matmul(
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::metal::shaders::q4k_matmul as q4k_mm;
+        if seq_len == 0 || num_rows == 0 || hidden == 0 {
+            return Some(Vec::new());
+        }
+        let buf_w = self.bufs.get_bytes(q4k_data);
+        let buf_x = self.bufs.transient_from_f32(x);
+        let buf_out = self.bufs.output((seq_len * num_rows * 4) as u64);
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let m = seq_len as u32;
+        let row_tgs = (num_rows as u64).div_ceil(q4k_mm::ROWS_PER_TG);
+        let col_tgs = (seq_len as u64).div_ceil(q4k_mm::COLS_PER_TG);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.q4k_matmul_pipeline.state);
+        enc.set_buffer(0, Some(&buf_w), 0);
+        enc.set_buffer(1, Some(&buf_x), 0);
+        enc.set_buffer(2, Some(&buf_out), 0);
+        enc.set_bytes(3, 4, &n as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &m as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(col_tgs, row_tgs, 1),
+            metal::MTLSize::new(q4k_mm::THREADS_PER_TG, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        Some(crate::metal::buffers::read_buffer_f32(
+            &buf_out,
+            seq_len * num_rows,
+        ))
+    }
+
     fn q6k_matvec(
         &self,
         q6k_data: &[u8],

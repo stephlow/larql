@@ -146,6 +146,24 @@ pub struct RunArgs {
     /// Slightly slower per token; large reliability win on small Q4K models.
     #[arg(long)]
     pub constrained: bool,
+
+    /// MoE expert shard map: `"START-END=URL,START-END=URL,..."`
+    ///
+    /// Enables remote expert dispatch for hybrid-MoE models (e.g. Gemma 4 26B-A4B).
+    /// Each segment maps an inclusive expert-ID range to a shard server URL.
+    ///
+    ///   larql serve output/gemma4-26b-a4b-q4k.vindex --experts 0-63 --port 8081
+    ///   larql serve output/gemma4-26b-a4b-q4k.vindex --experts 64-127 --port 8082
+    ///   larql run   output/gemma4-26b-a4b-q4k.vindex \
+    ///               --moe-shards "0-63=http://localhost:8081,64-127=http://localhost:8082" \
+    ///               "The capital of France is"
+    ///
+    /// Client loads attention + dense-FFN + router weights locally (~2 GB).
+    /// Expert weights (4 MB × experts_owned × layers) stay on the shard servers.
+    /// Router runs locally per layer; top-K expert residuals are dispatched in
+    /// parallel to the owning shard(s) via `POST /v1/expert/batch`.
+    #[arg(long, value_name = "SHARDS")]
+    pub moe_shards: Option<String>,
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -160,6 +178,13 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.experts {
         return experts::run(&vindex_path, &args);
+    }
+
+    if let Some(ref shards_str) = args.moe_shards {
+        let prompt = args.prompt.as_deref().ok_or(
+            "--moe-shards requires a prompt argument (chat mode not yet supported)",
+        )?;
+        return run_with_moe_shards(&vindex_path, prompt, shards_str, args.max_tokens);
     }
 
     if let Some(prompt) = args.prompt.as_deref() {
@@ -246,6 +271,95 @@ fn build_walk_args(
         ffn_remote: args.ffn.clone(),
         ffn_remote_timeout_secs: args.ffn_timeout_secs,
     }
+}
+
+/// `--moe-shards` dispatch path.
+///
+/// Metal runs attention + dense FFN on GPU (same as normal `larql run --metal`).
+/// MoE expert blocks are dispatched to remote mini-processes via binary
+/// `POST /v1/expert/batch` instead of running locally.
+fn run_with_moe_shards(
+    vindex_path: &std::path::Path,
+    prompt: &str,
+    shards_str: &str,
+    max_tokens: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use larql_inference::ffn::moe_remote::{RemoteMoeBackend, ShardConfig};
+    use larql_inference::generate_with_remote_moe;
+
+    // Parse "START-END=URL,START-END=URL,..." into Vec<ShardConfig>.
+    let mut configs: Vec<ShardConfig> = Vec::new();
+    for segment in shards_str.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let mut parts = segment.splitn(2, '=');
+        let range_str = parts
+            .next()
+            .ok_or_else(|| format!("malformed shard segment: {segment:?}"))?;
+        let url = parts
+            .next()
+            .ok_or_else(|| format!("missing URL in shard segment: {segment:?}"))?;
+        let (start, end_incl) = ShardConfig::parse_range(range_str)
+            .ok_or_else(|| format!("bad expert range {range_str:?} in --moe-shards"))?;
+        configs.push(ShardConfig::new(start, end_incl, url));
+    }
+    if configs.is_empty() {
+        return Err("--moe-shards: no valid shard segments found".into());
+    }
+
+    eprintln!("Connecting to {} MoE shard(s)…", configs.len());
+    let remote = RemoteMoeBackend::connect(configs)
+        .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;
+
+    // Client loads attn + dense FFN + norms + router weights — no expert bytes.
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load client weights: {e}"))?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
+        .map_err(|e| format!("failed to load tokenizer: {e}"))?;
+    let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load vindex: {e}"))?;
+    index
+        .load_attn_q4k(vindex_path)
+        .map_err(|e| format!("failed to load attn Q4K: {e}"))?;
+    index
+        .load_interleaved_q4k(vindex_path)
+        .map_err(|e| format!("failed to load interleaved Q4K: {e}"))?;
+    let _ = index.load_lm_head_q4(vindex_path);
+
+    // Metal: attention + dense FFN on GPU; MoE experts dispatched to shards.
+    let backend = larql_compute::default_backend();
+
+    let wrapped = larql_inference::wrap_chat_prompt(vindex_path, None, prompt);
+    let prompt_ids =
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped.prompt)
+            .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
+
+    let result = generate_with_remote_moe(
+        &weights,
+        &tokenizer,
+        prompt_ids,
+        max_tokens,
+        &index,
+        &remote,
+        &*backend,
+    )
+    .map_err(|e| format!("grid generate failed: {e}"))?;
+
+    for tok in &result.tokens {
+        print!("{tok}");
+    }
+    if !result.tokens.is_empty() {
+        println!();
+    }
+    let n = result.decode_ms.len();
+    if n > 0 {
+        let avg = result.decode_ms.iter().sum::<f64>() / n as f64;
+        eprintln!("[grid] {n} tokens · {avg:.0} ms/tok · {:.1} tok/s", 1000.0 / avg);
+    }
+    Ok(())
 }
 
 /// `--experts` wiring: load registry, wrap prompt, generate, dispatch.

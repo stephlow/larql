@@ -117,36 +117,65 @@ impl ShardConfig {
 
 // ── Internal shard state ──────────────────────────────────────────────────────
 
-#[derive(Clone)]
+struct GrpcState {
+    runtime: tokio::runtime::Runtime,
+    client: larql_router_protocol::ExpertServiceClient<tonic::transport::Channel>,
+}
+
+enum ShardTransport {
+    Http(reqwest::blocking::Client),
+    Grpc(std::sync::Arc<GrpcState>),
+}
+
 struct Shard {
     config: ShardConfig,
-    client: reqwest::blocking::Client,
+    transport: ShardTransport,
 }
 
 impl Shard {
     fn connect(config: ShardConfig) -> Result<Self, RemoteMoeError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| RemoteMoeError::Client(e.to_string()))?;
+        // `grpc://` URL → tonic gRPC over HTTP/2 persistent channel.
+        // `http://` URL → reqwest blocking HTTP/1.1 (legacy path).
+        let transport = if config.url.starts_with("grpc://") {
+            let grpc_endpoint = config.url.replacen("grpc://", "http://", 1);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| RemoteMoeError::Client(e.to_string()))?;
+            let client = rt
+                .block_on(larql_router_protocol::ExpertServiceClient::connect(
+                    grpc_endpoint.clone(),
+                ))
+                .map_err(|e| RemoteMoeError::Unreachable {
+                    url: grpc_endpoint,
+                    cause: e.to_string(),
+                })?;
+            ShardTransport::Grpc(std::sync::Arc::new(GrpcState { runtime: rt, client }))
+        } else {
+            let http = reqwest::blocking::Client::builder()
+                .timeout(config.timeout)
+                .build()
+                .map_err(|e| RemoteMoeError::Client(e.to_string()))?;
+            // Health check on HTTP shards only (gRPC connect already verifies).
+            let health_url = format!("{}/v1/health", config.url);
+            let resp = http
+                .get(&health_url)
+                .send()
+                .map_err(|e| RemoteMoeError::Unreachable {
+                    url: health_url.clone(),
+                    cause: e.to_string(),
+                })?;
+            if !resp.status().is_success() {
+                return Err(RemoteMoeError::ServerError {
+                    status: resp.status().as_u16(),
+                    body: resp.text().unwrap_or_default(),
+                });
+            }
+            ShardTransport::Http(http)
+        };
 
-        // Health check — fail fast rather than dying mid-forward-pass.
-        let health_url = format!("{}/v1/health", config.url);
-        let resp = client
-            .get(&health_url)
-            .send()
-            .map_err(|e| RemoteMoeError::Unreachable {
-                url: health_url.clone(),
-                cause: e.to_string(),
-            })?;
-        if !resp.status().is_success() {
-            return Err(RemoteMoeError::ServerError {
-                status: resp.status().as_u16(),
-                body: resp.text().unwrap_or_default(),
-            });
-        }
-
-        Ok(Self { config, client })
+        Ok(Self { config, transport })
     }
 
     fn owns(&self, expert_id: usize) -> bool {
@@ -154,34 +183,195 @@ impl Shard {
     }
 
     /// Send a batch of expert calls to this shard.
+    ///
+    /// Dispatches via gRPC (persistent HTTP/2) when the shard URL starts with
+    /// `grpc://`, otherwise falls back to binary HTTP.
     fn call_batch(
         &self,
         requests: &[ExpertCallItem],
     ) -> Result<Vec<ExpertResultItem>, RemoteMoeError> {
-        let url = format!("{}/v1/expert/batch", self.config.url);
-        let body = BatchRequest { requests };
-        let resp =
-            self.client
-                .post(&url)
-                .json(&body)
-                .send()
-                .map_err(|e| RemoteMoeError::Unreachable {
-                    url: url.clone(),
-                    cause: e.to_string(),
-                })?;
+        match &self.transport {
+            ShardTransport::Grpc(grpc) => {
+                // Build protobuf items — raw bytes for residuals avoids varint overhead.
+                let items: Vec<larql_router_protocol::ExpertBatchItem> = requests
+                    .iter()
+                    .map(|r| larql_router_protocol::ExpertBatchItem {
+                        layer: r.layer as u32,
+                        expert_id: r.expert_id as u32,
+                        residual: r
+                            .residual
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    })
+                    .collect();
 
-        if !resp.status().is_success() {
-            return Err(RemoteMoeError::ServerError {
-                status: resp.status().as_u16(),
-                body: resp.text().unwrap_or_default(),
-            });
+                let grpc_req = larql_router_protocol::ExpertBatchRequest { items };
+                // Block on the async gRPC call from this sync context.
+                let mut client = grpc.client.clone();
+                let resp = grpc.runtime
+                    .block_on(client.expert_batch(tonic::Request::new(grpc_req)))
+                    .map_err(|e| RemoteMoeError::ServerError {
+                        status: e.code() as u16,
+                        body: e.message().to_string(),
+                    })?
+                    .into_inner();
+
+                // Decode proto results back to ExpertResultItem.
+                resp.results
+                    .into_iter()
+                    .map(|r| {
+                        if r.output.len() % 4 != 0 {
+                            return Err(RemoteMoeError::BadResponse(
+                                "output bytes not divisible by 4".into(),
+                            ));
+                        }
+                        let output: Vec<f32> = r
+                            .output
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                            .collect();
+                        Ok(ExpertResultItem {
+                            layer: r.layer as usize,
+                            expert_id: r.expert_id as usize,
+                            output,
+                        })
+                    })
+                    .collect()
+            }
+
+            ShardTransport::Http(client) => {
+                // Binary HTTP fallback (application/x-larql-expert).
+                let url = format!("{}/v1/expert/batch", self.config.url);
+                let body = encode_expert_request(requests);
+                let resp = client
+                    .post(&url)
+                    .header("Content-Type", EXPERT_BINARY_CONTENT_TYPE)
+                    .header("Accept", EXPERT_BINARY_CONTENT_TYPE)
+                    .body(body)
+                    .send()
+                    .map_err(|e| RemoteMoeError::Unreachable {
+                        url: url.clone(),
+                        cause: e.to_string(),
+                    })?;
+
+                if !resp.status().is_success() {
+                    return Err(RemoteMoeError::ServerError {
+                        status: resp.status().as_u16(),
+                        body: resp.text().unwrap_or_default(),
+                    });
+                }
+
+                let bytes = resp
+                    .bytes()
+                    .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                decode_expert_response(&bytes)
+                    .ok_or_else(|| RemoteMoeError::BadResponse("binary response truncated".into()))
+            }
         }
-
-        let parsed: BatchResponse = resp
-            .json()
-            .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
-        Ok(parsed.results)
     }
+}
+
+// ── Binary wire format ────────────────────────────────────────────────────────
+//
+// Content-Type: application/x-larql-expert
+//
+// Request:  [N u32][hidden u32] + N × [layer u32][expert_id u32][f32 × hidden]
+// Response: [N u32][hidden u32][latency_ms f32] + N × [layer u32][expert_id u32][f32 × hidden]
+//
+// All integers and floats are little-endian.  This is ~6× smaller than JSON
+// for typical 2816-float payloads and avoids serde_json float formatting.
+
+pub const EXPERT_BINARY_CONTENT_TYPE: &str = "application/x-larql-expert";
+
+/// Encode a batch of expert requests as binary.
+pub fn encode_expert_request(items: &[ExpertCallItem]) -> Vec<u8> {
+    let n = items.len();
+    let hidden = items.first().map(|r| r.residual.len()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(8 + n * (8 + hidden * 4));
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    for item in items {
+        buf.extend_from_slice(&(item.layer as u32).to_le_bytes());
+        buf.extend_from_slice(&(item.expert_id as u32).to_le_bytes());
+        for &v in &item.residual {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    buf
+}
+
+/// Decode a binary expert response. Returns None on truncation.
+pub fn decode_expert_response(bytes: &[u8]) -> Option<Vec<ExpertResultItem>> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    // bytes[8..12] = latency_ms f32 (informational, skip)
+    let mut pos = 12usize;
+    let item_bytes = 8 + hidden * 4;
+    if bytes.len() < 12 + n * item_bytes {
+        return None;
+    }
+    let mut results = Vec::with_capacity(n);
+    for _ in 0..n {
+        let layer = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        let expert_id = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        pos += 8;
+        let output: Vec<f32> = bytes[pos..pos + hidden * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        pos += hidden * 4;
+        results.push(ExpertResultItem { layer, expert_id, output });
+    }
+    Some(results)
+}
+
+/// Decode a binary expert request from the server side.
+pub fn decode_expert_request(bytes: &[u8]) -> Option<Vec<ExpertCallItem>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let mut pos = 8usize;
+    let item_bytes = 8 + hidden * 4;
+    if bytes.len() < 8 + n * item_bytes {
+        return None;
+    }
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        let layer = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        let expert_id = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        pos += 8;
+        let residual: Vec<f32> = bytes[pos..pos + hidden * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        pos += hidden * 4;
+        items.push(ExpertCallItem { layer, expert_id, residual });
+    }
+    Some(items)
+}
+
+/// Encode a batch of expert results as binary (server-side response).
+pub fn encode_expert_response(items: &[ExpertResultItem], latency_ms: f32) -> Vec<u8> {
+    let n = items.len();
+    let hidden = items.first().map(|r| r.output.len()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(12 + n * (8 + hidden * 4));
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    buf.extend_from_slice(&latency_ms.to_le_bytes());
+    for item in items {
+        buf.extend_from_slice(&(item.layer as u32).to_le_bytes());
+        buf.extend_from_slice(&(item.expert_id as u32).to_le_bytes());
+        for &v in &item.output {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    buf
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -192,10 +382,10 @@ struct BatchRequest<'a> {
 }
 
 #[derive(Serialize, Clone)]
-struct ExpertCallItem {
-    layer: usize,
-    expert_id: usize,
-    residual: Vec<f32>,
+pub struct ExpertCallItem {
+    pub layer: usize,
+    pub expert_id: usize,
+    pub residual: Vec<f32>,
 }
 
 #[derive(Deserialize)]
@@ -204,10 +394,10 @@ struct BatchResponse {
 }
 
 #[derive(Deserialize)]
-struct ExpertResultItem {
-    layer: usize,
-    expert_id: usize,
-    output: Vec<f32>,
+pub struct ExpertResultItem {
+    pub layer: usize,
+    pub expert_id: usize,
+    pub output: Vec<f32>,
 }
 
 // ── Local routing math ────────────────────────────────────────────────────────
@@ -502,6 +692,132 @@ impl RemoteMoeBackend {
 
         // 5. Post-experts norm.
         Ok(rms_norm(&out, router.post_experts_norm, eps, norm_offset))
+    }
+
+    /// Batch MoE forward for a full sequence of positions in one shot.
+    ///
+    /// Runs the router on every row of `h`, then issues **one** HTTP batch
+    /// call per shard per layer (instead of one call per position). For a
+    /// prefill of N positions this reduces dispatch from `N × shards` calls
+    /// to `shards` calls — 18× fewer round trips for an 18-token context.
+    ///
+    /// Results are stitched back into an `[N, hidden]` output array by
+    /// sequential index: the server returns items in request order, so we
+    /// can match result[i] → request[i] without a position tag in the
+    /// wire format.
+    pub fn forward_moe_seq(
+        &self,
+        layer: usize,
+        h: &ndarray::Array2<f32>,
+        router: &MoeRouterWeights<'_>,
+        norm_offset: f32,
+        eps: f32,
+    ) -> Result<ndarray::Array2<f32>, RemoteMoeError> {
+        let seq_len = h.nrows();
+        let hidden = h.ncols();
+        if hidden == 0 || router.num_experts == 0 || router.top_k == 0 {
+            return Ok(ndarray::Array2::zeros((seq_len, hidden)));
+        }
+
+        // 1. Route every position locally.
+        // routing[pos] = (expert_indices, expert_weights)
+        let mut routing: Vec<(Vec<usize>, Vec<f32>)> = Vec::with_capacity(seq_len);
+        for pos in 0..seq_len {
+            let row: Vec<f32> = h.row(pos).to_vec();
+            let (_, idx, wts) = router.route(&row, norm_offset, eps);
+            routing.push((idx, wts));
+        }
+
+        // 2. Build per-shard call lists preserving (pos, local_idx) so we
+        //    can reconstruct the output ordering.
+        //    shard_items[si] = Vec<(pos, expert_id, residual)>
+        let shards = self.shards.read().unwrap();
+        let mut shard_items: Vec<Vec<(usize, usize, Vec<f32>)>> =
+            (0..shards.len()).map(|_| Vec::new()).collect();
+
+        for pos in 0..seq_len {
+            let row: Vec<f32> = h.row(pos).to_vec();
+            for &expert_id in &routing[pos].0 {
+                let si = shards
+                    .iter()
+                    .position(|s| s.owns(expert_id))
+                    .ok_or(RemoteMoeError::NoShard { expert_id })?;
+                shard_items[si].push((pos, expert_id, row.clone()));
+            }
+        }
+
+        // 3. One batch call per shard that has work (parallel).
+        let non_empty: Vec<(usize, &Vec<(usize, usize, Vec<f32>)>)> = shard_items
+            .iter()
+            .enumerate()
+            .filter(|(_, items)| !items.is_empty())
+            .collect();
+
+        let dispatch_results: Vec<(usize, Result<Vec<ExpertResultItem>, RemoteMoeError>)> =
+            non_empty
+                .par_iter()
+                .map(|(si, items)| {
+                    let calls: Vec<ExpertCallItem> = items
+                        .iter()
+                        .map(|(_, expert_id, residual)| ExpertCallItem {
+                            layer,
+                            expert_id: *expert_id,
+                            residual: residual.clone(),
+                        })
+                        .collect();
+                    (*si, shards[*si].call_batch(&calls))
+                })
+                .collect();
+
+        // 4. Reassemble: for each shard, result[i] corresponds to
+        //    shard_items[si][i].  Accumulate weighted sums per position.
+        let mut out = ndarray::Array2::<f32>::zeros((seq_len, hidden));
+
+        for (si, result) in dispatch_results {
+            let items = &shard_items[si];
+            let results = result?;
+            if results.len() != items.len() {
+                return Err(RemoteMoeError::BadResponse(format!(
+                    "shard returned {} results for {} requests at layer {layer}",
+                    results.len(),
+                    items.len()
+                )));
+            }
+            for ((pos, expert_id, _), item) in items.iter().zip(results.iter()) {
+                if item.output.len() != hidden {
+                    return Err(RemoteMoeError::BadResponse(format!(
+                        "expert {expert_id} at pos {pos} returned {} floats, expected {hidden}",
+                        item.output.len()
+                    )));
+                }
+                // Find the weight for this expert at this position.
+                let weight = routing[*pos]
+                    .0
+                    .iter()
+                    .zip(routing[*pos].1.iter())
+                    .find(|(&eid, _)| eid == *expert_id)
+                    .map(|(_, &w)| w)
+                    .unwrap_or(0.0);
+
+                let mut row = out.row_mut(*pos);
+                for (acc, &val) in row.iter_mut().zip(item.output.iter()) {
+                    *acc += weight * val;
+                }
+            }
+        }
+
+        // 5. Post-experts norm per position.
+        if !router.post_experts_norm.is_empty() {
+            for pos in 0..seq_len {
+                let row_vec: Vec<f32> = out.row(pos).to_vec();
+                let normed = rms_norm(&row_vec, router.post_experts_norm, eps, norm_offset);
+                for (dst, src) in out.row_mut(pos).iter_mut().zip(normed.iter()) {
+                    *dst = *src;
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 

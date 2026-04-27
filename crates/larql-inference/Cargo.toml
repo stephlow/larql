@@ -51,6 +51,11 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # Remote FFN backend (RemoteWalkBackend → POST /v1/walk-ffn)
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
+# gRPC expert client (RemoteMoeBackend → ExpertService via tonic)
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tonic = "0.13"
+larql-router-protocol = { path = "../larql-router-protocol" }
+
 # WASM expert registry
 wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = "29"

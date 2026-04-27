@@ -62,6 +62,51 @@ convention); the q4_KF fast-path doesn't apply to those.
 
 Remaining gap: **~1.30×** (~77 vs ~100 tok/s, ~3ms/tok).
 
+### Prefill: per-position matvec → matmul (4-14× gap, biggest end-to-end win)
+
+**Measured 2026-04-27** (gemma3-4b-q4k-v2.vindex). The gap **scales with prompt length**:
+
+| prompt length | larql prefill | ollama prefill | gap |
+|---|---|---|---|
+| 18 tok (chat) | 196 ms (10.9 ms/tok) | 50 ms (2.8 ms/tok) | **3.9×** |
+| 340 tok (long) | 2933 ms (8.6 ms/tok) | 210 ms (0.62 ms/tok) | **14×** |
+
+The widening ratio is the smoking gun: larql is per-position linear (`prefill ≈ seq_len × decode_per_tok`); ollama is sublinear via gemm. Decode itself (seq=1) is only 1.30× behind.
+
+**Root cause** (verified 2026-04-27 by reading `metal/ops/full_pipeline/dispatch.rs`): `prefill_q4 → dispatch_full_pipeline` IS already wired and IS allocating `[seq_len × hidden]` buffers, but every per-stage compute step issues per-position matvec dispatches. For an 18-token × 34-layer prefill that's ~600+ matvec calls vs ollama's ~34 gemm calls per stage.
+
+**The earlier "wire dispatch_prefill" suggestion was wrong** — `metal/prefill.rs::dispatch_prefill` is dead code; production already goes through `prefill_q4`. Infrastructure isn't missing, the kernel approach is.
+
+**Three actionable wins, ordered by effort × impact:**
+
+1. **Encoder coalescing** — **SHIPPED 2026-04-27**, marginal impact.
+   Hoisted `cmd.new_compute_command_encoder()` out of the per-position loops in `dispatch.rs::399` (O proj) and `stages.rs::97`, `:174` (input_norm + QKV). One encoder per stage instead of `seq_len` of them. **Measured: saves ~5% on long prompts, within noise on short prompts.** The 5 µs × seq_len savings is real but dwarfed by per-dispatch kernel compute time. No regression on decode (seq=1 path runs the loop once, identical semantics). 135 Metal tests still pass.
+
+2. **Q4_K threadgroup memory reuse across positions** (M, 2-3 days, ~20-30% on long prompts — speculative)
+   The current matvec loads the same Q4_K weight rows from device memory once per position dispatch. Cache one super-block of weights in threadgroup memory and run all `seq_len` positions through it before advancing rows. Same matvec primitive, reordered loops. Closes a chunk without writing new shaders. **Caveat**: the gate+up kernel is already compute-bound (272 GB/s, ALU-limited dequant), so weight-side caching may not help much; output-side caching across positions might.
+
+3. **Q4_K matmul (gemm) kernel** — **SHIPPED 2026-04-27** (kernel + parity tests; not yet wired into prefill).
+   `crates/larql-compute/src/metal/shaders/q4k_matmul.rs` — amortises Q4_K dequant across `COLS_PER_TG=4` positions per super-block. Same `ROWS_PER_TG=4` simdgroup geometry as `q4k_matvec`, plus a per-thread `acc[4]` accumulator array (16 bytes register footprint, fits comfortably). 5 parity tests in `tests/test_kernel_q4k_matmul.rs` assert bit-equivalence with stacked matvec calls across basic / seq_len=1 / ragged-tail / production shapes. Perf spot-check (`tests/test_kernel_q4k_matmul_perf.rs`, gated on `LARQL_PERF_SPOT_CHECK=1`) on N=2560, K=8192, M=18: **3.82× speedup** (4.99 ms stacked matvec → 1.31 ms matmul). At full closure that's ~196 ms → ~51 ms prefill on Gemma 3 4B (ollama parity).
+
+   **Wiring status — partial 2026-04-27**: Wired into the O projection site (`dispatch.rs::5. O projection`). Added `q4k_matmul: Option<&KernelHandle>` to `quant_matvec::Pipelines`; threaded through `dispatch_full_pipeline` signature and all callers. Branches on `seq_len > 1 && format == Q4_K && pipeline.is_some()` and falls back to per-position matvec otherwise. Decode (seq=1) keeps the matvec path, decode tests (135 lib) all pass.
+
+   **Measured impact of partial wiring**: WITHIN NOISE. Short prompt 196 → 203 ms; long prompt 2933 → 3006 ms; decode 13.78 → 13.45 ms/tok. O projection is only ~1/7 of the per-position Q4_K work in prefill — the 3.8× kernel speedup applied to one site saves ~2 ms on an 18-tok prompt, below the ±5% prefill noise floor. The kernel works, but a single call site doesn't show in the headline number.
+
+   **Open — full wiring** (the actual perf delivery):
+   - `metal/stages/ffn.rs::76,135,172`: FFN gate, up, and down matvec loops. Each is a clean per-position Q4_K matvec — direct matmul swap, no fused-kernel complications. Combined ~3× the work of O proj; should be the largest measurable win.
+   - `metal/ops/full_pipeline/stages.rs::97` (QKV f32 path): fused `q4kf_qkv_proj` / `q4k_qkv_proj` kernels do Q+K+V in one dispatch per position. Either (a) write a fused Q+K+V matmul kernel (mirrors the per-position fused convention, biggest one-time effort), or (b) fall back to per-projection matmul (3 calls per layer, simpler but loses the per-position fusion win). Bench-test both to decide.
+   - `metal/ops/full_pipeline/stages.rs::174` (Q8 path): same pattern; Q8 has its own fused QKV kernel.
+
+   Once gate/up/down + QKV are all wired, total Q4_K per-position dispatches drop from ~7×seq_len per layer to ~5 per layer (matmul replaces gate/up/down/QKV; activation + residual stay per-position because they're not matmuls). At that point the 3.8× kernel speedup should translate to a ~3× prefill improvement, closing most of the 4-14× gap.
+
+   For the long-haul (matching ollama on 340-token prompts): the current matmul uses simdgroup-sum reduction; a future step is `simdgroup_matrix` operations (the existing P2 entry below). The current kernel is "matvec amortised", not true gemm — but the perf headroom from amortisation alone is enough to close the short-prompt gap if all sites are wired.
+
+**What landed in #1 (for future-me)**: encoder coalescing at three sites (`dispatch.rs::5. O projection`, `stages.rs::QKV f32 path`, `stages.rs::QKV Q8 path`). The FFN stage was already coalesced — `ffn::encode_gated/encode_standard` take a single encoder and iterate per-position dispatches inside. `residual::encode_post_attn/post_ffn` similarly. So the only remaining waste was at the dispatch.rs/stages.rs level.
+
+**Bench reproduction**:
+- Short: `larql bench <vindex> --backends metal --ollama gemma3:4b --tokens 100 --warmup 8`
+- Long: same with `--prompt "<340+ token prompt>"` to surface the full gap.
+
 ### q6k_matvec ROWS_PER_TG shader/dispatch mismatch — **FIXED (2026-04-26)**
 
 **Root cause of the "regression" to 68-70 tok/s:** the shader constant

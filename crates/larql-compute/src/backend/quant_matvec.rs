@@ -190,6 +190,24 @@ pub trait QuantMatVec {
         None
     }
 
+    /// Q4_K matmul: `C[m, n] = sum_k W[n, k] * X[m, k]`.
+    ///
+    /// `W` is `[num_rows, hidden]` Q4_K, `X` is `[seq_len, hidden]` f32,
+    /// output is `[seq_len, num_rows]` f32 row-major. Returns `None`
+    /// when the backend doesn't implement amortised matmul (callers
+    /// fall back to repeated `q4k_matvec`). Used by prefill where
+    /// `seq_len > 1` to amortise dequant cost across positions.
+    fn q4k_matmul(
+        &self,
+        _q4k_data: &[u8],
+        _x: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+        _seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Q6_K matvec: `scores[N] = Q6_K[N, K] @ f32_x[K]`.
     fn q6k_matvec(
         &self,

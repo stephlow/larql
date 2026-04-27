@@ -91,11 +91,19 @@ pub(super) fn encode_input_norm_and_qkv(
             None
         };
 
+    // Encoder coalescing: hoist `cmd.new_compute_command_encoder()` and
+    // `enc.end_encoding()` out of the per-position loop so we pay one
+    // encoder-create + end_encoding per layer per stage instead of
+    // `seq_len` of them. The per-position dispatches inside don't touch
+    // encoder lifecycle (only set_pipeline_state / set_buffer / dispatch),
+    // so they run back-to-back on the GPU. Saves ~5 µs × seq_len per layer
+    // on prefill — see ROADMAP P0 "Prefill: per-position matvec → matmul"
+    // entry, 2026-04-27.
     if uses_f32_input {
         // Q4_K / Q6_K / Q4_KF: f32 norm output, then either fused or
         // per-projection QKV matvec.
+        let enc = cmd.new_compute_command_encoder();
         for pos in 0..seq_len {
-            let enc = cmd.new_compute_command_encoder();
             input_norm::encode_f32(
                 enc,
                 pipes.rms_norm,
@@ -167,12 +175,12 @@ pub(super) fn encode_input_norm_and_qkv(
                     hidden,
                 );
             }
-            enc.end_encoding();
         }
+        enc.end_encoding();
     } else {
         // Q8_0: fused rms_norm+Q8-quantise, then fused Q8 QKV projection.
+        let enc = cmd.new_compute_command_encoder();
         for pos in 0..seq_len {
-            let enc = cmd.new_compute_command_encoder();
             input_norm::encode_q8(
                 enc,
                 pipes.rms_norm_q8,
@@ -210,7 +218,7 @@ pub(super) fn encode_input_norm_and_qkv(
                 ctx.layer_kv_dim,
                 hidden,
             );
-            enc.end_encoding();
         }
+        enc.end_encoding();
     }
 }

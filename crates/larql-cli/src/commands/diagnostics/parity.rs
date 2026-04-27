@@ -534,7 +534,7 @@ fn run_layer_diff(
     std::env::set_var("LARQL_CPU_DUMP_LAYERS", cpu_path);
     std::env::set_var("LARQL_CPU_STAGE_DUMP", cpu_path);
     println!("Running CPU…");
-    predict_q4k_hidden(&mut w_cpu, &token_ids, &q4_index);
+    predict_q4k_hidden(&mut w_cpu, &token_ids, &q4_index, None);
     std::env::remove_var("LARQL_CPU_DUMP_LAYERS");
     std::env::remove_var("LARQL_CPU_STAGE_DUMP");
 

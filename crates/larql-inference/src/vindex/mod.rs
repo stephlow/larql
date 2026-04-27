@@ -13,8 +13,9 @@ mod walk_ffn;
 pub use l1_cache::FfnL1Cache;
 pub use loader::open_inference_vindex;
 pub use q4k_forward::{
-    generate_q4k_cpu, generate_q4k_cpu_constrained, is_end_of_turn, predict_q4k,
-    predict_q4k_hidden, predict_q4k_metal, predict_q4k_with_ffn, q4k_ffn_forward_layer,
+    generate_q4k_cpu, generate_q4k_cpu_constrained, generate_q4k_cpu_remote, is_end_of_turn,
+    predict_q4k, predict_q4k_hidden, predict_q4k_metal, predict_q4k_with_ffn,
+    q4k_ffn_forward_layer,
 };
 pub use walk_config::WalkFfnConfig;
 pub use walk_ffn::WalkFfn;

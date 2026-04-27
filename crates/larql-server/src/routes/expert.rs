@@ -16,13 +16,20 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
+use axum::http::header;
+use axum::response::Response;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
 use crate::state::AppState;
 use larql_inference;
+use larql_inference::ffn::moe_remote::{
+    decode_expert_request, encode_expert_response, ExpertCallItem, ExpertResultItem,
+    EXPERT_BINARY_CONTENT_TYPE,
+};
 
 // ── Request / response types ──────────────────────────────────────────────────
 
@@ -202,31 +209,82 @@ pub async fn handle_expert(
 
 pub async fn handle_expert_batch(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<BatchExpertRequest>,
-) -> Result<Json<BatchExpertResponse>, ServerError> {
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<Response, ServerError> {
     state.bump_requests();
     let start = std::time::Instant::now();
 
-    let results = tokio::task::spawn_blocking(move || {
+    // Accept both binary (application/x-larql-expert) and JSON.
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let binary = content_type.contains(EXPERT_BINARY_CONTENT_TYPE);
+
+    // Decode request items from either wire format.
+    let items: Vec<ExpertCallItem> = if binary {
+        decode_expert_request(&body)
+            .ok_or_else(|| ServerError::BadRequest("binary expert request truncated".into()))?
+    } else {
+        let req: BatchExpertRequest = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::BadRequest(format!("JSON parse: {e}")))?;
         req.requests
+            .into_iter()
+            .map(|r| ExpertCallItem {
+                layer: r.layer,
+                expert_id: r.expert_id,
+                residual: r.residual,
+            })
+            .collect()
+    };
+
+    let result_items = tokio::task::spawn_blocking(move || {
+        items
             .iter()
             .map(|item| {
                 run_expert(&state, item.layer, item.expert_id, &item.residual).map(|output| {
-                    BatchExpertResult {
+                    ExpertResultItem {
                         layer: item.layer,
                         expert_id: item.expert_id,
                         output,
                     }
                 })
             })
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<ExpertResultItem>, ServerError>>()
     })
     .await
     .map_err(|e| ServerError::Internal(e.to_string()))??;
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    Ok(Json(BatchExpertResponse {
-        results,
-        latency_ms,
-    }))
+    let latency_ms = (start.elapsed().as_secs_f64() * 1000.0) as f32;
+
+    // Respond in the same wire format the client requested.
+    let response = if binary {
+        let body = encode_expert_response(&result_items, latency_ms);
+        Response::builder()
+            .header(header::CONTENT_TYPE, EXPERT_BINARY_CONTENT_TYPE)
+            .body(axum::body::Body::from(body))
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        let resp = BatchExpertResponse {
+            results: result_items
+                .into_iter()
+                .map(|r| BatchExpertResult {
+                    layer: r.layer,
+                    expert_id: r.expert_id,
+                    output: r.output,
+                })
+                .collect(),
+            latency_ms: latency_ms as f64,
+        };
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&resp)
+                    .map_err(|e| ServerError::Internal(e.to_string()))?,
+            ))
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+    };
+
+    Ok(response)
 }

@@ -89,6 +89,11 @@ pub struct MetalBackend {
     pub residual_add_pipeline: ComputePipelineState,
     pub q8_qkv_proj_pipeline: KernelHandle,
     pub q4k_matvec_pipeline: KernelHandle,
+    /// Q4_K matmul (gemm) — `[N, K] × [M, K] → [M, N]`. Used by prefill
+    /// and seq>1 dispatch when amortising dequant across positions is
+    /// worth the per-thread accumulator footprint. Decode (M=1) still
+    /// routes through `q4k_matvec_pipeline` for minimal register pressure.
+    pub q4k_matmul_pipeline: KernelHandle,
     pub q4k_ffn_gate_up_pipeline: KernelHandle,
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
     pub q4k_geglu_silu_down_pipeline: KernelHandle,
@@ -210,6 +215,8 @@ impl MetalBackend {
         // Q4_K + Q6_K matvec (KernelHandle).
         let q4k_matvec_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_matvec::Kernel>(&device, &library)?;
+        let q4k_matmul_pipeline =
+            KernelHandle::from_kernel::<shaders::q4k_matmul::Kernel>(&device, &library)?;
         let q6k_matvec_pipeline =
             KernelHandle::from_kernel::<shaders::q6k_matvec::Kernel>(&device, &library)?;
 
@@ -332,6 +339,7 @@ impl MetalBackend {
             residual_add_pipeline,
             q8_qkv_proj_pipeline,
             q4k_matvec_pipeline,
+            q4k_matmul_pipeline,
             q4k_ffn_gate_up_pipeline,
             q4kf_ffn_gate_up_pipeline,
             q4k_geglu_silu_down_pipeline,

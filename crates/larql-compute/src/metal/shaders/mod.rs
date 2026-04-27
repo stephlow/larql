@@ -30,6 +30,7 @@ pub mod q4_sparse_matvec;
 pub mod q4_vecmat;
 pub mod q4k_ffn_gate_up;
 pub mod q4k_geglu_down;
+pub mod q4k_matmul;
 pub mod q4k_matvec;
 pub mod q4k_q6k_qkv_proj;
 pub mod q4k_qkv_proj;
@@ -82,6 +83,7 @@ pub fn all_shaders() -> String {
     src.push_str(fused_ops::SHADER);
     src.push_str(q8_attn_proj::SHADER);
     src.push_str(q4k_matvec::SHADER);
+    src.push_str(q4k_matmul::SHADER);
     src.push_str(q4k_qkv_proj::SHADER);
     src.push_str(q4k_q6k_qkv_proj::SHADER);
     src.push_str(q4kf_qkv_proj::SHADER);

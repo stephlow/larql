@@ -1,26 +1,48 @@
-//! Generate benchmark: CPU prefill → GPU decode loop.
-//! Proves the compute crate's 59 tok/s on a real model.
+//! Generate benchmark: prefill + decode timing on a real vindex.
 //!
 //! Usage:
 //!   cargo run --release --features metal -p larql-inference --example bench_generate -- \
-//!     --vindex output/gemma3-4b-v2.vindex
+//!     --vindex output/gemma3-4b-q4k-v2.vindex
+//!
+//! Optional flags:
+//!   --prompt "<text>"   (default: "The capital of France is")
+//!   --max-tokens N      (default: 20)
+//!   --warmup N          (default: 0; discard the first N generated tokens)
+//!   --model HF_ID       (override; default reads it from vindex index.json)
+//!
+//! Like `streaming_demo`, this loads weights + tokenizer + arch from the
+//! vindex (`load_model_weights_q4k`) rather than re-downloading the
+//! safetensors via `InferenceModel::load`. The vindex's transformed
+//! `norms.bin` doesn't match HF's raw norms — using the wrong source
+//! produced first-token gibberish on Gemma 4 26B-A4B even though every
+//! per-layer residual matched cos=1.0 in the parity diagnostic.
 
-use larql_inference::ffn::WeightFfn;
 use larql_inference::{
-    default_backend, generate, open_inference_vindex, CachedLayerGraph, InferenceModel,
+    default_backend, encode_prompt, generate, open_inference_vindex, wrap_chat_prompt,
+    CachedLayerGraph,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let mut vindex_path = std::path::PathBuf::from("output/gemma3-4b-v2.vindex");
+    let mut vindex_path = std::path::PathBuf::from("output/gemma3-4b-q4k-v2.vindex");
     let mut max_tokens = 20usize;
     let mut warmup = 0usize;
+    let mut prompt = "The capital of France is".to_string();
+    let mut model_override: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--vindex" => {
                 i += 1;
                 vindex_path = std::path::PathBuf::from(&args[i]);
+            }
+            "--model" => {
+                i += 1;
+                model_override = Some(args[i].clone());
+            }
+            "--prompt" => {
+                i += 1;
+                prompt = args[i].clone();
             }
             "--max-tokens" => {
                 i += 1;
@@ -35,37 +57,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let mut model = InferenceModel::load("google/gemma-3-4b-it")?;
-    let num_layers = model.weights().num_layers;
-    let tokenizer = model.tokenizer().clone();
+    // Load weights + tokenizer + arch directly from the vindex. See the
+    // module-level comment for why `InferenceModel::load(<hf_id>)` is
+    // not used here.
+    let config = larql_vindex::load_vindex_config(&vindex_path)?;
+    let model_name: String = model_override.unwrap_or(config.model.clone());
+
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let mut weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
+    let num_layers = weights.num_layers;
 
     let index = open_inference_vindex(&vindex_path)?;
-
     let gpu_be = default_backend();
-    let cached_layers: Vec<usize> = (0..=12).collect();
-    let prompt = "The capital of France is";
-    let encoding = tokenizer.encode(prompt, true).map_err(|e| format!("{e}"))?;
-    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-    // Build the residual cache with an immutable borrow; scope drops it so the
-    // subsequent mutable borrow for `generate` can proceed.
-    let cache = {
-        let weights = model.weights();
-        let dense_ffn = WeightFfn { weights };
-        CachedLayerGraph::build(weights, &token_ids, &cached_layers, &dense_ffn)
-    };
-    let weights = model.weights_mut();
+
+    // Apply the chat template for instruction-tuned models — bare-prompt
+    // encoding produces multilingual gibberish on `-it` / `-instruct`
+    // variants since they're trained only on chat-wrapped sequences.
+    let wrapped = wrap_chat_prompt(&vindex_path, Some(&model_name), &prompt);
+    let token_ids: Vec<u32> = encode_prompt(&tokenizer, &*weights.arch, &wrapped.prompt)?;
+
+    // Empty cache + full layer range. The earlier
+    // `CachedLayerGraph::build(0..=12)` + `generate(13..num_layers)`
+    // shortcut is invalid for any model whose layers 0-12 contribute
+    // anything beyond a dense FFN: hybrid-MoE in particular skips every
+    // expert block in those layers (the cache is built from `WeightFfn`)
+    // and emits multilingual gibberish. Match `streaming_demo` /
+    // `walk_cmd` instead.
+    let cache = CachedLayerGraph::from_residuals(Vec::new());
 
     println!("╔═══════════════════════════════════════════════╗");
     println!("║       LARQL Generate Benchmark                ║");
     println!("╚═══════════════════════════════════════════════╝");
     println!();
-    println!("  Prompt: \"{prompt}\" ({} tokens)", token_ids.len());
+    println!("  Model:   {model_name} ({num_layers} layers)");
+    println!("  Vindex:  {}", vindex_path.display());
+    println!("  Prompt:  \"{prompt}\" ({} tokens)", token_ids.len());
     println!("  Backend: {}", gpu_be.name());
-    println!(
-        "  Layers: {} (cached 0-12, compute 13-{})",
-        num_layers,
-        num_layers - 1
-    );
     println!();
 
     if warmup > 0 {
@@ -74,25 +102,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the measured average. Compute-layer benchmarks (78.7 tok/s
         // headline) use 8 warmup + 100 measured.
         let _ = generate(
-            weights,
+            &mut weights,
             &tokenizer,
             &token_ids,
             warmup,
             &index,
             &*gpu_be,
             &cache,
-            13..num_layers,
+            0..num_layers,
         );
     }
     let result = generate(
-        weights,
+        &mut weights,
         &tokenizer,
         &token_ids,
         max_tokens,
         &index,
         &*gpu_be,
         &cache,
-        13..num_layers,
+        0..num_layers,
     );
 
     println!("  Prefill:       {:.0}ms", result.prefill_ms);
@@ -135,7 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result.decode_tok_s()
         );
     }
-    println!("  │ Ollama:    8.5ms/tok = 117 tok/s          │");
+    // Reference: median of 5×100-tok runs on the same M3 Max against
+    // `gemma3:4b` at ollama 0.20 (2026-04-27, gemma3-4b-q4k-v2.vindex).
+    // Update via `larql bench <vindex> --ollama gemma3:4b` if the gap
+    // closes — the older "117 tok/s" footer was stale by ~25%.
+    println!("  │ Ollama:   10.5ms/tok =  95 tok/s (median)  │");
     println!("  └───────────────────────────────────────────┘");
 
     Ok(())

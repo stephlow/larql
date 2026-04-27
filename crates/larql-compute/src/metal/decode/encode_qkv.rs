@@ -225,6 +225,8 @@ impl MetalBackend {
                 q4k_matvec_fallback: &self.q4k_matvec_pipeline,
                 q6k_matvec: &self.q6k_matvec_pipeline,
                 q4_matvec: &self.q4.matvec,
+                // Decode is seq=1; matmul amortisation has nothing to amortise.
+                q4k_matmul: None,
             };
             qkv_proj::encode_per_proj(
                 enc,

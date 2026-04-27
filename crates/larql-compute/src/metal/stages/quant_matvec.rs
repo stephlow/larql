@@ -73,6 +73,12 @@ pub struct Pipelines<'a> {
     pub q4k_matvec_fallback: &'a KernelHandle,
     pub q6k_matvec: &'a KernelHandle,
     pub q4_matvec: &'a KernelHandle,
+    /// Q4_K matmul (gemm) — amortises dequant across `seq_len` positions
+    /// in a single dispatch. When present and the call-site has
+    /// `seq_len > 1`, the dispatcher prefers this over `seq_len`
+    /// independent matvec calls. `None` falls back to per-position matvec
+    /// (e.g. legacy benchmarks that don't bind the matmul pipeline).
+    pub q4k_matmul: Option<&'a KernelHandle>,
 }
 
 /// Encode a single-vector matvec `out[N] = W[N×K] · x[K]` onto `enc`.

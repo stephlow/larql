@@ -136,7 +136,7 @@ impl StageCapture {
             "LARQL_STAGE_DUMP_LAYER",
             &layer.to_string(),
             || {
-                let _ = crate::vindex::predict_q4k_hidden(weights, ids, index);
+                let _ = crate::vindex::predict_q4k_hidden(weights, ids, index, None);
             },
         )?;
         let prefix = format!("cpu_L{layer}_");

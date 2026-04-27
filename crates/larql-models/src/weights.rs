@@ -106,9 +106,16 @@ impl ModelWeights {
     }
 
     /// Whether FFN weights are stored in the per-layer format (`layers/`).
+    ///
+    /// Checks for any key with the `"layers/"` prefix rather than the
+    /// probe key `"layers/0/0/gate_up"` specifically, so shard processes
+    /// that own a non-zero expert range (e.g. experts 64-127) still
+    /// return true — they have `"layers/0/64/gate_up"` etc. but not
+    /// `"layers/0/0/gate_up"`.
     pub fn has_per_layer_ffn(&self) -> bool {
         self.packed_byte_ranges
-            .contains_key(PER_LAYER_FFN_PROBE_KEY)
+            .keys()
+            .any(|k| k.starts_with("layers/"))
     }
 
     /// Drop FFN weight tensors (gate, up, down projections) from memory.

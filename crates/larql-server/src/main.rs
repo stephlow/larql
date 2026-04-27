@@ -14,7 +14,7 @@ use larql_server::bootstrap::{
 use larql_server::cache::DescribeCache;
 use larql_server::session::SessionManager;
 use larql_server::state::{AppState, LoadedModel};
-use larql_server::{announce, auth, grpc, ratelimit, routes};
+use larql_server::{announce, auth, grpc, grpc_expert, ratelimit, routes};
 
 #[derive(Parser)]
 #[command(
@@ -384,9 +384,11 @@ async fn main() -> Result<(), BoxError> {
         let grpc_state = Arc::clone(&state);
         info!("gRPC: listening on {}", grpc_addr);
         tokio::spawn(async move {
-            let svc = grpc::VindexGrpcService { state: grpc_state };
+            let vindex_svc = grpc::VindexGrpcService { state: Arc::clone(&grpc_state) };
+            let expert_svc = grpc_expert::ExpertGrpcService { state: Arc::clone(&grpc_state) };
             if let Err(e) = tonic::transport::Server::builder()
-                .add_service(grpc::proto::vindex_service_server::VindexServiceServer::new(svc))
+                .add_service(grpc::proto::vindex_service_server::VindexServiceServer::new(vindex_svc))
+                .add_service(larql_router_protocol::ExpertServiceServer::new(expert_svc))
                 .serve(grpc_addr)
                 .await
             {

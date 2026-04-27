@@ -68,6 +68,7 @@ pub fn predict_q4k_hidden(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
+    moe_remote: Option<&crate::ffn::RemoteMoeBackend>,
 ) -> ndarray::Array2<f32> {
     let num_layers = weights.num_layers;
     let hidden = weights.hidden_size;
@@ -163,6 +164,7 @@ pub fn predict_q4k_hidden(
                 &ffn_backend,
                 ple_inputs.get(layer),
                 shared_kv,
+                moe_remote,
             ) {
                 h = h_new;
                 if let Some(kv) = kv_out {
@@ -205,6 +207,37 @@ pub fn predict_q4k_hidden(
     h
 }
 
+/// Build `MoeRouterWeights` for a single layer from the model's vector store.
+///
+/// Mirrors the inline construction in `layer_graph/grid.rs` so remote dispatch
+/// uses the same routing math as the Metal path. Returns `None` if the required
+/// router projection is absent (non-MoE layer or weights not loaded).
+fn build_moe_router_weights<'a>(
+    weights: &'a larql_models::ModelWeights,
+    arch: &dyn larql_models::ModelArchitecture,
+    layer: usize,
+) -> Option<crate::ffn::MoeRouterWeights<'a>> {
+    let router_key = arch.moe_router_key(layer)?;
+    let router_proj = weights.vectors.get(&router_key)?.as_slice();
+    let sl = |k: Option<String>| -> &'a [f32] {
+        k.and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+    Some(crate::ffn::MoeRouterWeights {
+        router_proj,
+        router_scale:            sl(arch.moe_router_scale_key(layer)),
+        router_per_expert_scale: sl(arch.moe_router_per_expert_scale_key(layer)),
+        router_norm:             sl(arch.moe_router_norm_key(layer)),
+        router_norm_parameter_free: arch.moe_router_norm_parameter_free(),
+        router_input_scalar: arch.moe_router_input_scalar().unwrap_or(1.0),
+        pre_experts_norm:  sl(arch.moe_pre_experts_norm_key(layer)),
+        post_experts_norm: sl(arch.moe_post_experts_norm_key(layer)),
+        num_experts: arch.num_experts(),
+        top_k:       arch.num_experts_per_token(),
+    })
+}
+
 /// CPU forward for one hybrid-MoE layer (Gemma 4 26B A4B).
 ///
 /// Matches HF's `Gemma4TextDecoderLayer.forward` for MoE-enabled layers:
@@ -229,6 +262,7 @@ fn run_moe_layer_cpu(
     ffn: &dyn crate::ffn::FfnBackend,
     ple_input: Option<&Array2<f32>>,
     shared_kv: Option<&SharedKV>,
+    moe_remote: Option<&crate::ffn::RemoteMoeBackend>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let arch = &*weights.arch;
     let norm_offset = arch.norm_weight_offset();
@@ -262,30 +296,50 @@ fn run_moe_layer_cpu(
     let (h_post_ffn_dense, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, ffn, false);
     let h1 = &h_post_ffn_dense - &h_post_attn;
 
-    // ── 3. MoE branch (h2). Per-position call — one row of h_post_attn at
-    //     a time, since `cpu_moe_forward` takes a 1D hidden-size slice.
-    let moe_weights = crate::layer_graph::pipeline_layer::build_moe_weights(weights, arch, layer);
+    // ── 3. MoE branch (h2).
+    //
+    // Remote path: router runs locally, top-K expert matmuls are dispatched
+    // to the warm mini-processes via POST /v1/expert/batch.
+    //
+    // Local path: router + expert matmuls run on CPU (the original path).
     let seq_len = h_post_attn.nrows();
     let mut h2 = Array2::<f32>::zeros((seq_len, hidden));
-    if let Some(ref moe) = moe_weights {
-        for pos in 0..seq_len {
-            let row: Vec<f32> = h_post_attn.row(pos).to_vec();
-            let moe_out =
-                larql_compute::cpu::ops::moe::cpu_moe_forward(&row, moe, norm_offset, eps);
-            for (dst, src) in h2.row_mut(pos).iter_mut().zip(moe_out.iter()) {
-                *dst = *src;
+
+    if let Some(remote) = moe_remote {
+        // Remote dispatch: one batch call per shard per layer across ALL
+        // positions. forward_moe_seq replaces the per-position loop,
+        // reducing HTTP round trips from seq_len×shards to shards.
+        if let Some(router) = build_moe_router_weights(weights, arch, layer) {
+            match remote.forward_moe_seq(layer, &h_post_attn, &router, norm_offset, eps) {
+                Ok(out) => h2 = out,
+                Err(e) => eprintln!(
+                    "[run_moe_layer_cpu] remote dispatch error L{layer}: {e}"
+                ),
             }
         }
+        // If router weights unavailable, h2 stays zero (dense-only degradation).
     } else {
-        // Arch says hybrid-MoE but we couldn't assemble the weights —
-        // fall back to dense-only (behaves like non-MoE path).
-        // h_post_ffn_dense already encodes the full dense residual.
-        let mut out = h_post_ffn_dense;
-        let mut h_ple =
-            crate::forward::ple::apply_per_layer_embedding(weights, &out, layer, ple_input);
-        crate::forward::layer::apply_layer_scalar(weights, &mut h_ple, layer);
-        out = h_ple;
-        return Some((out, kv_out));
+        // Local CPU path.
+        let moe_weights =
+            crate::layer_graph::pipeline_layer::build_moe_weights(weights, arch, layer);
+        if let Some(ref moe) = moe_weights {
+            for pos in 0..seq_len {
+                let row: Vec<f32> = h_post_attn.row(pos).to_vec();
+                let moe_out =
+                    larql_compute::cpu::ops::moe::cpu_moe_forward(&row, moe, norm_offset, eps);
+                for (dst, src) in h2.row_mut(pos).iter_mut().zip(moe_out.iter()) {
+                    *dst = *src;
+                }
+            }
+        } else {
+            // Arch says hybrid-MoE but weights unavailable — dense-only fallback.
+            let mut out = h_post_ffn_dense;
+            let mut h_ple =
+                crate::forward::ple::apply_per_layer_embedding(weights, &out, layer, ple_input);
+            crate::forward::layer::apply_layer_scalar(weights, &mut h_ple, layer);
+            out = h_ple;
+            return Some((out, kv_out));
+        }
     }
 
     // ── 4. Combine via outer post-FFN norm + residual + layer_scalar.
@@ -377,7 +431,7 @@ pub fn predict_q4k(
     top_k: usize,
     index: &VectorIndex,
 ) -> PredictResult {
-    let h = predict_q4k_hidden(weights, token_ids, index);
+    let h = predict_q4k_hidden(weights, token_ids, index, None);
     crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
 }
 
@@ -439,6 +493,54 @@ pub fn generate_q4k_cpu(
     out
 }
 
+/// Like [`generate_q4k_cpu`] but dispatches MoE expert matmuls to remote
+/// shard servers via [`crate::ffn::RemoteMoeBackend`].
+///
+/// The client holds attention weights, dense-FFN weights, norms, and router
+/// weights (loaded via [`larql_vindex::load_model_weights_q4k`] — no expert
+/// bytes needed locally). Expert bytes live on the mini-processes launched
+/// with `larql serve --experts START-END`.
+///
+/// Router runs locally per layer; the top-K expert residuals are dispatched
+/// in parallel to the owning shard(s) via `POST /v1/expert/batch`; the
+/// client assembles the weighted sum.
+pub fn generate_q4k_cpu_remote(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    moe_remote: &crate::ffn::RemoteMoeBackend,
+) -> Vec<(String, u32)> {
+    let mut ids = prompt_ids.to_vec();
+    let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
+    for _ in 0..max_tokens {
+        let h = predict_q4k_hidden(weights, &ids, index, Some(moe_remote));
+        // Extract last-position hidden state then compute lm_head logits.
+        // predict_q4k_hidden returns [seq_len, hidden]; next-token prediction
+        // uses only the last row (the most recent token's output state).
+        let last = h.nrows().saturating_sub(1);
+        let h_last = h.slice(ndarray::s![last..last + 1, ..]).to_owned();
+        let logits = crate::forward::hidden_to_raw_logits(weights, &h_last);
+        let next_id = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        let tok = tokenizer.decode(&[next_id], true).unwrap_or_default();
+        let stop = is_end_of_turn(&tok);
+        out.push((tok, next_id));
+        ids.push(next_id);
+        if stop {
+            break;
+        }
+    }
+    out
+}
+
 /// Constrained variant of [`generate_q4k_cpu`].
 ///
 /// Computes raw logits at each step, calls `mask_fn(generated_ids, &mut logits)`
@@ -465,7 +567,7 @@ where
 
     for _ in 0..max_tokens {
         // Forward pass to the final hidden state.
-        let h = predict_q4k_hidden(weights, &ids, index);
+        let h = predict_q4k_hidden(weights, &ids, index, None);
         let last_hidden = h.row(h.nrows().saturating_sub(1)).to_owned();
         let last_2d = ndarray::Array2::from_shape_vec((1, last_hidden.len()), last_hidden.to_vec())
             .expect("shape");

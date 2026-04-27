@@ -20,13 +20,21 @@
 //!   --top-p F           (default: not applied)
 //!   --top-k N           (default: not applied)
 //!   --seed N            (default: 42 if any sampling flag is set)
+//!   --model HF_ID       (override; default reads it from vindex index.json)
+//!
+//! The model architecture (layer count, head dims, etc.) comes from the HF
+//! model name. If you point `--vindex` at a non-4B vindex without overriding
+//! `--model`, the example used to panic on `attn Q4K slices missing for
+//! layer N` because the loaded arch had a different layer count than the
+//! vindex shipped. The `--model` flag (or `index.json`'s `model` field)
+//! keeps the two in sync.
 
 use std::io::Write;
 use std::time::Instant;
 
 use larql_inference::{
-    default_backend, generate_streaming, open_inference_vindex, CachedLayerGraph, EosConfig,
-    InferenceModel, SamplingConfig,
+    default_backend, encode_prompt, generate_streaming, open_inference_vindex, wrap_chat_prompt,
+    CachedLayerGraph, EosConfig, SamplingConfig,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut top_p: Option<f32> = None;
     let mut top_k: Option<usize> = None;
     let mut seed: u64 = 42;
+    let mut model_override: Option<String> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -45,6 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--vindex" => {
                 i += 1;
                 vindex_path = std::path::PathBuf::from(&args[i]);
+            }
+            "--model" => {
+                i += 1;
+                model_override = Some(args[i].clone());
             }
             "--prompt" => {
                 i += 1;
@@ -86,17 +99,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sampling = sampling.with_seed(seed);
     }
 
-    let mut model = InferenceModel::load("google/gemma-3-4b-it")?;
-    let num_layers = model.weights().num_layers;
-    let tokenizer = model.tokenizer().clone();
+    // Load weights, tokenizer, and arch directly from the vindex — same
+    // path the `larql parity` tool uses. Earlier this loaded HF weights
+    // via `InferenceModel::load(<hardcoded model name>)`, which had two
+    // failure modes on non-4B vindexes: (a) `weights.num_layers` came
+    // from the HF arch (e.g. 34 for 4B) and panicked when the vindex
+    // only shipped 30 layers; (b) the HF f32 norms didn't match the
+    // vindex's transformed `norms.bin`, producing first-token gibberish
+    // on the same input that parity decoded as "Paris". The vindex's
+    // `index.json` carries the canonical model name; pass `--model` to
+    // override.
+    let config = larql_vindex::load_vindex_config(&vindex_path)?;
+    let model_name: String = model_override.unwrap_or(config.model.clone());
+
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let mut weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
+    let num_layers = weights.num_layers;
 
     let index = open_inference_vindex(&vindex_path)?;
 
     let gpu_be = default_backend();
-    let encoding = tokenizer
-        .encode(prompt.as_str(), true)
-        .map_err(|e| format!("{e}"))?;
-    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+    // Apply the chat template when the model is instruction-tuned. The
+    // bare-prompt path works for Gemma 3 4B, but Gemma 4 26B-A4B-it (and
+    // any other `-it` / `-instruct` variant) trained only on chat-wrapped
+    // sequences emits multilingual gibberish on raw prompts. `wrap_chat_prompt`
+    // reads `vindex/chat_template.jinja` first, falls back to model-name
+    // hints, and finally passes through unchanged for base models.
+    let wrapped = wrap_chat_prompt(&vindex_path, Some(&model_name), &prompt);
+    let token_ids: Vec<u32> = encode_prompt(&tokenizer, &*weights.arch, &wrapped.prompt)?;
     // No precomputed cache — stream the full transformer end-to-end. The
     // earlier `CachedLayerGraph::build` over `(0..=12)` + generate range
     // `13..num_layers` is invalid for any model whose layers 0-12 contribute
@@ -108,6 +140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eos = EosConfig::from_vindex_dir(&vindex_path);
 
     println!("=== larql-inference: Streaming Demo ===\n");
+    println!("Model:       {model_name} ({num_layers} layers)");
+    println!("Vindex:      {}", vindex_path.display());
     println!("Prompt:      \"{prompt}\"");
     println!("Sampling:    {sampling:?}");
     println!("Max tokens:  {max_tokens}");
@@ -116,9 +150,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::io::stdout().flush().ok();
 
     let start = Instant::now();
-    let weights = model.weights_mut();
     let result = generate_streaming(
-        weights,
+        &mut weights,
         &tokenizer,
         &token_ids,
         max_tokens,

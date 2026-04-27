@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // twice.
     let t0 = Instant::now();
     let cpu_hidden_full =
-        larql_inference::vindex::predict_q4k_hidden(&mut w_cpu, &appended_ids, &q4_index);
+        larql_inference::vindex::predict_q4k_hidden(&mut w_cpu, &appended_ids, &q4_index, None);
     let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let cpu_last = cpu_hidden_full
         .row(cpu_hidden_full.nrows().saturating_sub(1))

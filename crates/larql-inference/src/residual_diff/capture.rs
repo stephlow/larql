@@ -87,7 +87,7 @@ impl ResidualCapture {
         let seq_len = ids.len();
 
         let dir = run_with_dump_dir("LARQL_CPU_DUMP_LAYERS", || {
-            let _ = crate::vindex::predict_q4k_hidden(weights, ids, index);
+            let _ = crate::vindex::predict_q4k_hidden(weights, ids, index, None);
         })?;
 
         let layers = (0..num_layers)
