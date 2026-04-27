@@ -131,6 +131,40 @@ impl EosConfig {
         }
         self.stop_strings.iter().any(|s| s == trimmed)
     }
+
+    /// Same as [`Self::is_eos`] but falls back to a `skip_special=false`
+    /// decode of `id` when `decoded` is empty.
+    ///
+    /// HuggingFace tokenizers emit special markers (Gemma's
+    /// `<end_of_turn>`, ChatML's `<|im_end|>`, Llama-3's `<|eot_id|>`)
+    /// as registered `added_tokens`. Decoding them with
+    /// `skip_special_tokens=true` — which is what the streaming
+    /// [`super::detok::Detokenizer`] does to keep the user-facing text
+    /// clean — drops them entirely, leaving an empty string.
+    /// `is_eos(id, "")` then returns `false` (no string match) and
+    /// generation runs to `--max-tokens`.
+    ///
+    /// This helper does the raw decode only on the empty-decoded path,
+    /// so the hot path stays at one decode per token. Use it from the
+    /// generate loop instead of `is_eos` whenever the surface form
+    /// passed in came from a `skip_special_tokens=true` decoder.
+    pub fn is_eos_with_tokenizer(
+        &self,
+        id: u32,
+        decoded_clean: &str,
+        tokenizer: &tokenizers::Tokenizer,
+    ) -> bool {
+        if self.eos_token_ids.contains(&id) {
+            return true;
+        }
+        if !decoded_clean.trim().is_empty() {
+            return self.is_eos(id, decoded_clean);
+        }
+        // Empty decoded surface → likely a special token. Re-decode with
+        // specials kept so the stop-string match has something to work on.
+        let raw = tokenizer.decode(&[id], false).unwrap_or_default();
+        self.is_eos(id, &raw)
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +261,67 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = EosConfig::from_vindex_dir(tmp.path());
         assert!(cfg.is_eos(0, "<eos>"));
+    }
+
+    fn tokenizer_with_end_of_turn() -> tokenizers::Tokenizer {
+        // Word-level tokenizer with `<end_of_turn>` registered as an
+        // `added_token` flagged `special: true` — mirrors what HF
+        // tokenizer.json emits for Gemma. Decoding the special token
+        // with `skip_special_tokens=true` returns ""; with
+        // `skip_special_tokens=false` returns "<end_of_turn>".
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                { "id": 99, "content": "<end_of_turn>", "single_word": false,
+                  "lstrip": false, "rstrip": false, "normalized": false, "special": true }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "[UNK]": 0, "hi": 1, "<end_of_turn>": 99 },
+                "unk_token": "[UNK]",
+            },
+        });
+        tokenizers::Tokenizer::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn is_eos_with_tokenizer_catches_end_of_turn_after_skip_special_decode() {
+        // Streaming detokenizer uses skip_special_tokens=true → returns
+        // "" for the <end_of_turn> token. Plain `is_eos(id, "")` would
+        // miss the marker and run to max_tokens (the bug the user hit
+        // in eos_demo).
+        let tok = tokenizer_with_end_of_turn();
+        let cfg = EosConfig::builtin();
+        // Plain is_eos sees "" and returns false:
+        assert!(!cfg.is_eos(99, ""));
+        // is_eos_with_tokenizer re-decodes with specials kept and matches:
+        assert!(cfg.is_eos_with_tokenizer(99, "", &tok));
+    }
+
+    #[test]
+    fn is_eos_with_tokenizer_short_circuits_on_id_match() {
+        // When eos_token_ids matches, no decode happens.
+        let tok = tokenizer_with_end_of_turn();
+        let cfg = EosConfig::empty().with_eos_id(99);
+        assert!(cfg.is_eos_with_tokenizer(99, "", &tok));
+        assert!(!cfg.is_eos_with_tokenizer(1, "", &tok));
+    }
+
+    #[test]
+    fn is_eos_with_tokenizer_uses_clean_decode_when_non_empty() {
+        // For ordinary tokens the clean decode is non-empty; the
+        // fallback decode shouldn't fire and the result must match
+        // plain `is_eos(id, decoded_clean)`.
+        let tok = tokenizer_with_end_of_turn();
+        let cfg = EosConfig::builtin();
+        assert!(cfg.is_eos_with_tokenizer(0, "<eos>", &tok));
+        assert!(!cfg.is_eos_with_tokenizer(1, "hi", &tok));
     }
 
     #[test]

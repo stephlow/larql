@@ -125,7 +125,7 @@ pub use trace::{
     ContextStore, ContextTier, ContextWriter, LayerSummary, ResidualTrace, TraceNode,
     TracePositions, TraceStore, TraceWriter,
 };
-pub use vindex::{predict_q4k, FfnL1Cache, WalkFfn, WalkFfnConfig};
+pub use vindex::{open_inference_vindex, predict_q4k, FfnL1Cache, WalkFfn, WalkFfnConfig};
 
 // Engine re-exports.
 pub use engines::accuracy::{

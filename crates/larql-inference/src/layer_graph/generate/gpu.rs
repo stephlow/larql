@@ -608,7 +608,7 @@ where
                     weights.arch.logits_scaling(),
                     weights.arch.final_logit_softcapping(),
                 );
-                let is_eos = eos.is_eos(picked_id, &tok_str);
+                let is_eos = eos.is_eos_with_tokenizer(picked_id, &tok_str, tokenizer);
                 if profile {
                     eprintln!(
                         "[profile] step={} total={:.1}ms  embed={:.2}  gpu={:.1}  norm={:.2}  lm_head={:.1}  detok={:.2}",

@@ -22,10 +22,9 @@ use std::io::Write;
 
 use larql_inference::ffn::WeightFfn;
 use larql_inference::{
-    default_backend, generate_streaming, CachedLayerGraph, ChatSession, EosConfig,
-    InferenceModel, SamplingConfig,
+    default_backend, generate_streaming, open_inference_vindex, CachedLayerGraph, ChatSession,
+    EosConfig, InferenceModel, SamplingConfig,
 };
-use larql_vindex::{SilentLoadCallbacks, VectorIndex};
 
 const TURNS: &[&str] = &[
     "Hi! What's the capital of France?",
@@ -63,14 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_layers = model.weights().num_layers;
     let tokenizer = model.tokenizer().clone();
 
-    let mut cb = SilentLoadCallbacks;
-    let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    let _ = index.load_lm_head(&vindex_path);
-    let _ = index.load_lm_head_q4(&vindex_path);
-    let _ = index.load_attn_q4k(&vindex_path);
-    let _ = index.load_attn_q8(&vindex_path);
-    let _ = index.load_interleaved_q4(&vindex_path);
-    let _ = index.load_interleaved_q4k(&vindex_path);
+    let index = open_inference_vindex(&vindex_path)?;
 
     let gpu_be = default_backend();
     let eos = EosConfig::from_vindex_dir(&vindex_path);

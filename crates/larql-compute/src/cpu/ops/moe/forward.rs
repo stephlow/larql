@@ -147,12 +147,21 @@ pub fn cpu_moe_forward(
     use rayon::prelude::*;
     let activation = moe.activation;
     let format = moe.expert_data_format;
-    // Q4_K rounds inner dim up to a multiple of 256. For Gemma 4 MoE
-    // (inter=704), the dequantised matrix is 768 wide; we matmul the
-    // first `inter` columns. BF16 has no padding.
-    let (inter_dequant, inter_matmul) = match format {
-        crate::QuantFormat::Q4_K => (inter.div_ceil(256) * 256, inter),
-        _ => (inter, inter),
+    // Storage layout per Gemma 4 26B-A4B (and the per-layer Q4_K writer):
+    //   gate_up: [2*inter, hidden]              — never padded; quantises
+    //                                             cleanly because hidden is
+    //                                             already a 256-multiple.
+    //   down:    [hidden, inter_padded]         — Q4_K pads `inter` up to
+    //                                             the next 256 super-block
+    //                                             (704 → 768). BF16 stores
+    //                                             un-padded.
+    // Mirror Metal's `inter_padded` handling (`metal/moe_dispatch.rs`):
+    // dequant down at the padded width, zero-pad the hidden_state so
+    // the matmul reads `inter_padded` columns with the padding
+    // contributing zero.
+    let inter_padded = match format {
+        crate::QuantFormat::Q4_K => inter.div_ceil(256) * 256,
+        _ => inter,
     };
     let per_expert: Vec<(f32, Vec<f32>)> = expert_indices
         .par_iter()
@@ -165,33 +174,36 @@ pub fn cpu_moe_forward(
             // tables; cached_dequant LRU-keys on the byte pointer so a
             // re-selected expert skips both allocation and decode.
             let gate_up_bytes = *moe.experts_gate_up.get(ei)?;
-            let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter_dequant * hidden);
+            let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
             if gate_up_w.is_empty() {
                 return None;
             }
-            let gate_w = &gate_up_w[..inter_dequant * hidden];
-            let up_w = &gate_up_w[inter_dequant * hidden..];
+            let gate_w = &gate_up_w[..inter * hidden];
+            let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
 
-            let gate_out = matmul_vec(&h_norm, gate_w, inter_dequant, hidden);
-            let up_out = matmul_vec(&h_norm, up_w, inter_dequant, hidden);
+            let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
+            let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
 
             // Gated activation: ACT(gate) * up.  Gemma 4 uses GELU-tanh; Mixtral uses SiLU.
-            let hidden_state: Vec<f32> = gate_out
-                .iter()
-                .zip(up_out.iter())
-                .take(inter)
-                .map(|(&g, &u)| match activation {
+            // Build the inner activation at `inter_padded` so the down matmul
+            // (which expects `inter_padded` columns under Q4_K) sees zero in
+            // the padding region.
+            let mut hidden_state: Vec<f32> = vec![0.0f32; inter_padded];
+            for j in 0..inter {
+                let g = gate_out[j];
+                let u = up_out[j];
+                hidden_state[j] = match activation {
                     crate::Activation::GeluTanh => gelu_tanh(g) * u,
                     _ => silu(g) * u,
-                })
-                .collect();
+                };
+            }
 
             let down_bytes = *moe.experts_down.get(ei)?;
-            let down_w = cached_dequant(down_bytes, format, hidden * inter_dequant);
+            let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
             if down_w.is_empty() {
                 return None;
             }
-            let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter_matmul);
+            let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter_padded);
             Some((weight, expert_contribution))
         })
         .collect();

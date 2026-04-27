@@ -28,7 +28,7 @@
 
 use larql_compute::default_backend;
 use larql_inference::layer_graph::{generate, CachedLayerGraph};
-use larql_vindex::SilentLoadCallbacks;
+use larql_inference::open_inference_vindex;
 
 const DEFAULT_PROMPT: &str = "The capital of France is";
 const DEFAULT_EXPECTED_FIRST_TOKEN: &str = "Paris";
@@ -56,13 +56,8 @@ fn first_token_matches_expected_surface() {
         std::env::var(ENV_EXPECTED).unwrap_or_else(|_| DEFAULT_EXPECTED_FIRST_TOKEN.to_string());
 
     let path = std::path::Path::new(&vindex_path);
-    let mut cb = SilentLoadCallbacks;
-    let mut index = larql_vindex::VectorIndex::load_vindex(path, &mut cb)
-        .expect("failed to load vindex");
-    index.load_lm_head(path).expect("load lm_head");
-    let _ = index.load_lm_head_q4(path);
-    index.load_attn_q4k(path).expect("load attn Q4K");
-    index.load_interleaved_q4k(path).expect("load FFN Q4K");
+    let index = open_inference_vindex(path).expect("failed to open vindex for inference");
+    let mut cb = larql_vindex::SilentLoadCallbacks;
     let mut weights = larql_vindex::load_model_weights_q4k(path, &mut cb)
         .expect("failed to load weights");
     let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer load");

@@ -30,39 +30,45 @@ pub fn run_single_expert(
         return vec![0.0f32; hidden];
     }
 
-    // Q4_K rounds inner dim up to a multiple of 256. Gemma 4 MoE has
-    // inter=704, so the dequantised matrix is 768 wide; matmul reads the
-    // first `inter` columns. BF16 has no padding.
-    let (inter_dequant, inter_matmul) = match format {
-        crate::QuantFormat::Q4_K => (inter.div_ceil(256) * 256, inter),
-        _ => (inter, inter),
+    // Storage layout (matches `format/weights/write_layers.rs::quantize_moe_entries`):
+    //   gate_up: [2*inter, hidden]              never padded
+    //   down:    [hidden, inter_padded]         Q4_K pads inter→256 multiple
+    // BF16 has no padding for either. See `forward::cpu_moe_forward` for the
+    // expanded explanation; this single-expert path mirrors it exactly so the
+    // remote-expert HTTP endpoint and local in-process MoE share the same
+    // numerics.
+    let inter_padded = match format {
+        crate::QuantFormat::Q4_K => inter.div_ceil(256) * 256,
+        _ => inter,
     };
 
-    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter_dequant * hidden);
+    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
     if gate_up_w.is_empty() {
         return vec![0.0f32; hidden];
     }
-    let gate_w = &gate_up_w[..inter_dequant * hidden];
-    let up_w = &gate_up_w[inter_dequant * hidden..];
+    let gate_w = &gate_up_w[..inter * hidden];
+    let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
 
-    let gate_out = matmul_vec(h_norm, gate_w, inter_dequant, hidden);
-    let up_out = matmul_vec(h_norm, up_w, inter_dequant, hidden);
+    let gate_out = matmul_vec(h_norm, gate_w, inter, hidden);
+    let up_out = matmul_vec(h_norm, up_w, inter, hidden);
 
-    let hidden_state: Vec<f32> = gate_out
-        .iter()
-        .zip(up_out.iter())
-        .take(inter)
-        .map(|(&g, &u)| match activation {
+    // Build inner activation at `inter_padded` so the down matmul (which
+    // expects `inter_padded` columns under Q4_K) sees zero in the padding.
+    let mut hidden_state: Vec<f32> = vec![0.0f32; inter_padded];
+    for j in 0..inter {
+        let g = gate_out[j];
+        let u = up_out[j];
+        hidden_state[j] = match activation {
             crate::Activation::GeluTanh => gelu_tanh(g) * u,
             _ => silu(g) * u,
-        })
-        .collect();
+        };
+    }
 
-    let down_w = cached_dequant(down_bytes, format, hidden * inter_dequant);
+    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
     if down_w.is_empty() {
         return vec![0.0f32; hidden];
     }
-    matmul_vec(&hidden_state, &down_w, hidden, inter_matmul)
+    matmul_vec(&hidden_state, &down_w, hidden, inter_padded)
 }
 
 /// Apply pre-experts norm then run a single expert. Used by the remote
