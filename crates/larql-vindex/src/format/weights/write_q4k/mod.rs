@@ -16,7 +16,7 @@ use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::format::filenames::*;
 
-use super::write_f32::{WeightEntry, WeightSource};
+use super::write_f32::{kind, WeightEntry, WeightSource};
 
 // ── Q4_K / Q6_K streaming writer ──────────────────────────────────────────
 
@@ -47,7 +47,8 @@ use feature_major_down::FeatureMajorDownState;
 /// each row as a fixed number of super-blocks.
 #[cfg(test)]
 fn pad_to_256(data: &[f32]) -> Vec<f32> {
-    let padded_len = data.len().div_ceil(256) * 256;
+    let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+    let padded_len = data.len().div_ceil(block) * block;
     if padded_len == data.len() {
         data.to_vec()
     } else {
@@ -72,7 +73,8 @@ fn pad_to_256(data: &[f32]) -> Vec<f32> {
 /// zero-pads the input vector to `padded_cols`).
 pub(super) fn pad_rows_to_256(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
     debug_assert_eq!(data.len(), rows * cols);
-    let padded_cols = cols.div_ceil(256) * 256;
+    let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+    let padded_cols = cols.div_ceil(block) * block;
     if padded_cols == cols {
         return (data.to_vec(), cols);
     }
@@ -387,7 +389,7 @@ pub fn write_model_weights_q4k_with_opts(
                 norms_file.write_all(&bytes)?;
                 norm_entries.push(WeightEntry {
                     key: key.clone(),
-                    kind: "vector".into(),
+                    kind: kind::VECTOR.into(),
                     shape: vec![data.len()],
                     offset: norms_offset,
                     length: bytes.len() as u64,
@@ -408,7 +410,7 @@ pub fn write_model_weights_q4k_with_opts(
                     norms_file.write_all(&bytes)?;
                     norm_entries.push(WeightEntry {
                         key: key.clone(),
-                        kind: "vector".into(),
+                        kind: kind::VECTOR.into(),
                         shape: vec![data.len()],
                         offset: norms_offset,
                         length: bytes.len() as u64,
@@ -439,7 +441,7 @@ pub fn write_model_weights_q4k_with_opts(
                     norms_file.write_all(&bytes)?;
                     norm_entries.push(WeightEntry {
                         key: key.clone(),
-                        kind: "vector".into(),
+                        kind: kind::VECTOR.into(),
                         shape: vec![data.len()],
                         offset: norms_offset,
                         length: bytes.len() as u64,
@@ -457,7 +459,7 @@ pub fn write_model_weights_q4k_with_opts(
         norms_file.write_all(&bytes)?;
         norm_entries.push(WeightEntry {
             key: "norm.weight".into(),
-            kind: "vector".into(),
+            kind: kind::VECTOR.into(),
             shape: vec![data.len()],
             offset: norms_offset,
             length: bytes.len() as u64,
@@ -473,7 +475,7 @@ pub fn write_model_weights_q4k_with_opts(
             norms_file.write_all(&bytes)?;
             norm_entries.push(WeightEntry {
                 key: "per_layer_projection_norm.weight".into(),
-                kind: "vector".into(),
+                kind: kind::VECTOR.into(),
                 shape: vec![data.len()],
                 offset: norms_offset,
                 length: bytes.len() as u64,
@@ -514,7 +516,7 @@ pub fn write_model_weights_q4k_with_opts(
                 file.write_all(&bytes)?;
                 manifest.push(WeightEntry {
                     key,
-                    kind: "tensor_f16".into(),
+                    kind: kind::TENSOR_F16.into(),
                     shape: vec![rows, cols],
                     offset: *offset,
                     length: bytes.len() as u64,
@@ -582,7 +584,7 @@ pub fn write_model_weights_q4k_with_opts(
         // input activation buffer is zero-padded to match.
         norm_entries.push(WeightEntry {
             key: "lm_head.weight".into(),
-            kind: "tensor_q4k".into(),
+            kind: kind::TENSOR_Q4K.into(),
             shape: vec![rows, padded_cols],
             offset: 0,
             length: q_bytes.len() as u64,

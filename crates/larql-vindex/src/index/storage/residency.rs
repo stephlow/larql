@@ -71,10 +71,13 @@ impl ResidencyManager {
         }
     }
 
-    /// Q4 byte size for a layer's gate vectors.
+    /// Q4 byte size for a layer's gate vectors. Assumes legacy Q4_0
+    /// (32-element blocks, 18 B/block); the named constants assert the
+    /// rate so a future format change forces a recompile here.
     pub fn layer_q4_bytes(&self, layer: usize) -> usize {
         let floats = self.layer_features[layer] * self.hidden_size;
-        floats / 32 * 18 // Q4_0: 18 bytes per 32 elements
+        floats / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
+            * larql_models::quant::ggml::Q4_0_BLOCK_BYTES
     }
 
     /// Current state of a layer.
@@ -397,9 +400,10 @@ mod tests {
 
     #[test]
     fn layer_q4_bytes_formula() {
-        // floats = features * hidden_size; q4 bytes = floats / 32 * 18
+        use larql_models::quant::ggml::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS};
+        // floats = features * hidden_size; q4 bytes = floats / Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES
         let m = ResidencyManager::new(100, 1, 64, vec![32]);
-        let expected = (32 * 64) / 32 * 18;
+        let expected = (32 * 64) / Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES;
         assert_eq!(m.layer_q4_bytes(0), expected);
     }
 

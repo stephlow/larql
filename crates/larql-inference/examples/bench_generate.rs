@@ -6,17 +6,31 @@
 //!     --vindex output/gemma3-4b-v2.vindex
 
 use larql_inference::ffn::WeightFfn;
-use larql_inference::{default_backend, generate, CachedLayerGraph, InferenceModel};
-use larql_vindex::{SilentLoadCallbacks, VectorIndex};
+use larql_inference::{
+    default_backend, generate, open_inference_vindex, CachedLayerGraph, InferenceModel,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut vindex_path = std::path::PathBuf::from("output/gemma3-4b-v2.vindex");
+    let mut max_tokens = 20usize;
+    let mut warmup = 0usize;
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--vindex" {
-            i += 1;
-            vindex_path = std::path::PathBuf::from(&args[i]);
+        match args[i].as_str() {
+            "--vindex" => {
+                i += 1;
+                vindex_path = std::path::PathBuf::from(&args[i]);
+            }
+            "--max-tokens" => {
+                i += 1;
+                max_tokens = args[i].parse()?;
+            }
+            "--warmup" => {
+                i += 1;
+                warmup = args[i].parse()?;
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -25,14 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_layers = model.weights().num_layers;
     let tokenizer = model.tokenizer().clone();
 
-    let mut cb = SilentLoadCallbacks;
-    let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    index.load_lm_head(&vindex_path)?;
-    let _ = index.load_lm_head_q4(&vindex_path);
-    let _ = index.load_attn_q4k(&vindex_path);
-    let _ = index.load_attn_q8(&vindex_path);
-    let _ = index.load_interleaved_q4(&vindex_path);
-    let _ = index.load_interleaved_q4k(&vindex_path);
+    let index = open_inference_vindex(&vindex_path)?;
 
     let gpu_be = default_backend();
     let cached_layers: Vec<usize> = (0..=12).collect();
@@ -61,11 +68,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
+    if warmup > 0 {
+        // Discard a short warmup run so JIT compilation, command-buffer
+        // pool growth, and KV-cache first-allocation costs don't drag
+        // the measured average. Compute-layer benchmarks (78.7 tok/s
+        // headline) use 8 warmup + 100 measured.
+        let _ = generate(
+            weights,
+            &tokenizer,
+            &token_ids,
+            warmup,
+            &index,
+            &*gpu_be,
+            &cache,
+            13..num_layers,
+        );
+    }
     let result = generate(
         weights,
         &tokenizer,
         &token_ids,
-        20,
+        max_tokens,
         &index,
         &*gpu_be,
         &cache,

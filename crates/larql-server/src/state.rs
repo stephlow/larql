@@ -86,7 +86,7 @@ impl LoadedModel {
                      FFN dequantises per layer from interleaved_q4k.bin on request"
                 );
             }
-            larql_vindex::load_model_weights_q4k(&self.path, &mut cb)
+            larql_vindex::load_model_weights_q4k_shard(&self.path, &mut cb, self.expert_filter)
                 .map_err(|e| format!("failed to load q4k model weights: {e}"))?
         } else {
             let opts = if self.embed_only {

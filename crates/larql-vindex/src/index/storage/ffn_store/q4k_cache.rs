@@ -133,7 +133,8 @@ impl VectorIndex {
         }
         let hidden = self.hidden_size;
         let n = intermediate * hidden;
-        let padded = n.div_ceil(256) * 256;
+        let padded = n.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+            * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         let info = crate::quant::registry::lookup(format)?;
         let decoded = (info.dequantize)(bytes, padded).ok()?;
         // Gate (0) and up (1) are stored row-major [intermediate, hidden] — row

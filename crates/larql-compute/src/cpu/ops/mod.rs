@@ -8,6 +8,7 @@ pub mod f32_matmul;
 pub mod geglu;
 pub mod linalg;
 pub mod moe;
+pub mod outer_combine;
 pub mod q4_common;
 pub mod q4_matvec;
 pub mod q4_vecmat;

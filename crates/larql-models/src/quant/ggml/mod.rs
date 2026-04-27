@@ -49,6 +49,52 @@ pub const TYPE_Q5_K: u32 = 13;
 pub const TYPE_Q6_K: u32 = 14;
 pub const TYPE_BF16: u32 = 30;
 
+// ── Block geometry (canonical GGML wire format) ─────────────────────────
+//
+// Legacy quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) pack 32 elements per block.
+// K-quants (Q4_K/Q6_K) pack 256 elements per super-block.
+//
+// Block byte sizes are exact and must never be rederived inline — they
+// are part of the on-disk wire format. Q4_K and Q4_0 happen to share the
+// same effective rate (0.5625 B/elem), which is exactly why we silently
+// shipped a Q4_K file that the reader dispatched as Q4_0 once. Constants
+// remove that footgun: callers compare to `Q4_K_BLOCK_BYTES` directly.
+
+/// Elements per block for legacy quants (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0).
+pub const LEGACY_BLOCK_ELEMS: usize = 32;
+
+/// Elements per super-block for K-quants (Q4_K, Q6_K).
+pub const K_QUANT_BLOCK_ELEMS: usize = 256;
+
+/// Bytes per Q4_0 block (32 elements + f16 scale): 2 + 16.
+pub const Q4_0_BLOCK_BYTES: usize = 18;
+/// Elements per Q4_0 block.
+pub const Q4_0_BLOCK_ELEMS: usize = LEGACY_BLOCK_ELEMS;
+
+/// Bytes per Q4_1 block (32 elements + f16 scale + f16 min): 2 + 2 + 16.
+pub const Q4_1_BLOCK_BYTES: usize = 20;
+
+/// Bytes per Q5_0 block (32 elements + f16 scale + 4-byte high-bits + 16 nibbles).
+pub const Q5_0_BLOCK_BYTES: usize = 22;
+
+/// Bytes per Q5_1 block (32 elements + f16 scale + f16 min + 4-byte high-bits + 16 nibbles).
+pub const Q5_1_BLOCK_BYTES: usize = 24;
+
+/// Bytes per Q8_0 block (32 elements + f16 scale): 2 + 32.
+pub const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Bytes per Q4_K super-block (256 elements): 2 + 2 + 12 + 128.
+///
+/// Layout: f16 d (2) + f16 dmin (2) + 12 packed (scale, min) bytes + 128 nibble bytes.
+pub const Q4_K_BLOCK_BYTES: usize = 144;
+/// Elements per Q4_K super-block.
+pub const Q4_K_BLOCK_ELEMS: usize = K_QUANT_BLOCK_ELEMS;
+
+/// Bytes per Q6_K super-block (256 elements): 128 + 64 + 16 + 2.
+pub const Q6_K_BLOCK_BYTES: usize = 210;
+/// Elements per Q6_K super-block.
+pub const Q6_K_BLOCK_ELEMS: usize = K_QUANT_BLOCK_ELEMS;
+
 /// Validate that `data` holds at least `n_blocks` blocks of
 /// `block_size` bytes for `n_elements` total elements (which must be a
 /// multiple of `block_elems`). Returns the block count.
@@ -91,13 +137,13 @@ pub fn tensor_data_size(tensor_type: u32, n_elements: usize) -> Result<usize, Mo
     match tensor_type {
         TYPE_F32 => Ok(n_elements * 4),
         TYPE_F16 | TYPE_BF16 => Ok(n_elements * 2),
-        TYPE_Q4_0 => Ok(n_elements / 32 * 18),
-        TYPE_Q4_1 => Ok(n_elements / 32 * 20),
-        TYPE_Q5_0 => Ok(n_elements / 32 * 22),
-        TYPE_Q5_1 => Ok(n_elements / 32 * 24),
-        TYPE_Q8_0 => Ok(n_elements / 32 * 34),
-        TYPE_Q4_K => Ok(n_elements / 256 * 144),
-        TYPE_Q6_K => Ok(n_elements / 256 * 210),
+        TYPE_Q4_0 => Ok(n_elements / LEGACY_BLOCK_ELEMS * Q4_0_BLOCK_BYTES),
+        TYPE_Q4_1 => Ok(n_elements / LEGACY_BLOCK_ELEMS * Q4_1_BLOCK_BYTES),
+        TYPE_Q5_0 => Ok(n_elements / LEGACY_BLOCK_ELEMS * Q5_0_BLOCK_BYTES),
+        TYPE_Q5_1 => Ok(n_elements / LEGACY_BLOCK_ELEMS * Q5_1_BLOCK_BYTES),
+        TYPE_Q8_0 => Ok(n_elements / LEGACY_BLOCK_ELEMS * Q8_0_BLOCK_BYTES),
+        TYPE_Q4_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q4_K_BLOCK_BYTES),
+        TYPE_Q6_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q6_K_BLOCK_BYTES),
         _ => Err(ModelError::Parse(format!(
             "tensor_data_size: unsupported type id {tensor_type}"
         ))),

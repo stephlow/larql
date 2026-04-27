@@ -166,6 +166,15 @@ impl VectorIndex {
             hidden_size,
         );
 
+        // Propagate `vocab_size` from index.json. Previously this only got
+        // set inside the embeddings-as-tied-lm_head adoption block below,
+        // so a vindex with `lm_head_q4.bin` but no `lm_head.bin` ended up
+        // with `vocab_size = 0` — silently disabling the Q4 lm_head path
+        // (4× slower fallback to the f32 BLAS gemv).
+        if config.vocab_size > 0 {
+            index.vocab_size = config.vocab_size;
+        }
+
         // Opportunistically wire up FFN payload mmaps so walk_ffn_sparse can
         // find up/down data without callers needing to know which flavour
         // is on disk. Each load_* returns Err(_) if its file isn't present;
@@ -323,7 +332,8 @@ fn synthesize_gate_from_q4k(
         })?;
         let q_bytes = &iq4_mmap[offset..offset + length];
         let n = info.num_features * hidden_size;
-        let padded = n.div_ceil(256) * 256;
+        let padded = n.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+            * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         let gate_f32 = (format_info.dequantize)(q_bytes, padded)
             .map_err(|e| VindexError::Parse(format!("dequantize layer {}: {e}", info.layer)))?;
         let gate_f16_bytes = larql_models::quant::half::encode_f16(&gate_f32[..n]);

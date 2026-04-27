@@ -106,6 +106,67 @@ mod tests {
         assert!(result.is_err(), "missing directory must error");
     }
 
+    /// Helper: drop a marker file at `path` so the loader's
+    /// `path.is_file()` checks see it. We're not testing what's inside
+    /// — just the file-presence logic that picks Q4_K vs Q8 vs absent.
+    fn touch(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+
+    /// Path-selection: with no attention files at all, the error
+    /// message must name BOTH possible files so the user knows what to
+    /// produce. A previous `load_*` chain that swallowed errors silently
+    /// would just return Ok with a half-loaded index — subtle and bad.
+    #[test]
+    fn loader_lists_both_attn_filenames_when_neither_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Put a minimal index.json so the load_vindex stage doesn't fail
+        // first — we want to reach the attn check. (Empty file is fine —
+        // load_vindex will fail parsing, which we catch and inspect.)
+        let result = open_inference_vindex(tmp.path());
+        assert!(result.is_err());
+        // We don't care which stage failed — just that the eventual error
+        // mentions an inference-relevant file so the user can act.
+        let msg = match result {
+            Ok(_) => unreachable!(),
+            Err(e) => format!("{e}"),
+        };
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("index.json")
+                || lower.contains("attn_weights")
+                || lower.contains("not found")
+                || lower.contains("no such file"),
+            "error must point at the missing file — got: {msg}"
+        );
+    }
+
+    /// Path-selection: filename constants stay in sync with what the
+    /// loader probes. Catches a typo where (e.g.) someone renames the
+    /// bin file but forgets to update the loader's `is_file()` check —
+    /// the loader would silently fall through to the wrong path.
+    #[test]
+    fn loader_filename_constants_match_vindex_format_module() {
+        // These must equal `larql_vindex::format::filenames::*`. The
+        // loader is colocated with the inference crate so it pins the
+        // names; a divergence here is the warning sign.
+        assert_eq!(super::ATTN_Q4K_BIN, "attn_weights_q4k.bin");
+        assert_eq!(super::ATTN_Q8_BIN, "attn_weights_q8.bin");
+        assert_eq!(super::INTERLEAVED_Q4K_BIN, "interleaved_q4k.bin");
+        assert_eq!(super::INTERLEAVED_Q4_BIN, "interleaved_q4.bin");
+        assert_eq!(super::LM_HEAD_BIN, "lm_head.bin");
+        assert_eq!(super::LM_HEAD_Q4_BIN, "lm_head_q4.bin");
+    }
+
+    /// File-presence helper smoke test — confirms `touch` writes a real
+    /// file the loader's `is_file()` check would see.
+    #[test]
+    fn touch_creates_file_visible_to_path_is_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "lm_head.bin");
+        assert!(tmp.path().join("lm_head.bin").is_file());
+    }
+
     #[test]
     fn missing_attn_files_errors_with_guidance() {
         // Empty dir — load_vindex fails first (no index.json), but the

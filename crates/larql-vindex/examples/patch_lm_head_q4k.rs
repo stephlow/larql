@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     manifest.retain(|e| e["key"].as_str() != Some("lm_head.weight"));
     manifest.push(serde_json::json!({
         "key":    "lm_head.weight",
-        "kind":   "tensor_q4k",
+        "kind":   larql_vindex::format::weights::write_f32::kind::TENSOR_Q4K,
         "shape":  [vocab, hidden],
         "offset": 0,
         "length": q4k_bytes.len(),

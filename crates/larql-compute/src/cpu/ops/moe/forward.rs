@@ -47,20 +47,26 @@ pub fn cpu_moe_forward(
         return vec![0.0f32; hidden];
     }
 
-    // 1. Pre-experts norm — input for the expert matmuls (NOT the router).
+    // 1. Pre-experts norm — input for the expert matmuls.
+    //
+    //    The router norm composes ON TOP of this — verified by `larql parity
+    //    --component moe-block`: raw-h routing and h_norm routing pick
+    //    different top-K experts on the 26B-A4B vindex (e.g. layer 0:
+    //    [55,101,126,12,52,114,84,79] vs [101,52,126,55,12,34,68,79], 2 of 8
+    //    differ). Metal's `gpu_moe_dispatch` calls `cpu_moe_route(&h_norm,
+    //    ...)` and produces correct generation ("Paris."); CPU paths that
+    //    route on raw h produce garbage. Aligning to Metal here.
     let h_norm = rms_norm(h, moe.pre_experts_norm, eps, norm_offset);
 
-    // 2. Router input norm. HF Gemma 4's `Gemma4TextRouter.norm` is
-    //    `Gemma4RMSNorm(with_scale=False)` — parameter-free, no tensor on
-    //    disk. Resolution order:
-    //      1. learned router_norm weight (archs that ship one),
-    //      2. parameter-free RMSNorm (Gemma 4 sets the flag),
-    //      3. fallback: experts' pre-norm output (legacy / archs where no
-    //         distinct router norm is declared).
+    // 2. Router input norm. Resolution order:
+    //      1. learned router_norm weight (architectures that ship one),
+    //      2. parameter-free RMSNorm (HF Gemma 4 — `Gemma4RMSNorm(with_scale=False)`),
+    //      3. fallback: just use the pre-experts-norm output directly.
+    //    All three apply on top of h_norm so the routing matches Metal.
     let router_in_normed: Vec<f32> = if !moe.router_norm.is_empty() {
-        rms_norm(h, moe.router_norm, eps, norm_offset)
+        rms_norm(&h_norm, moe.router_norm, eps, norm_offset)
     } else if moe.router_norm_parameter_free {
-        rms_norm_no_weight(h, eps)
+        rms_norm_no_weight(&h_norm, eps)
     } else {
         h_norm.clone()
     };
@@ -160,7 +166,10 @@ pub fn cpu_moe_forward(
     // the matmul reads `inter_padded` columns with the padding
     // contributing zero.
     let inter_padded = match format {
-        crate::QuantFormat::Q4_K => inter.div_ceil(256) * 256,
+        crate::QuantFormat::Q4_K => {
+            let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+            inter.div_ceil(block) * block
+        }
         _ => inter,
     };
     let per_expert: Vec<(f32, Vec<f32>)> = expert_indices

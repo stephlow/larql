@@ -24,7 +24,6 @@
 use std::io::Write;
 use std::time::Instant;
 
-use larql_inference::ffn::WeightFfn;
 use larql_inference::{
     default_backend, generate_streaming, open_inference_vindex, CachedLayerGraph, EosConfig,
     InferenceModel, SamplingConfig,
@@ -98,12 +97,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .encode(prompt.as_str(), true)
         .map_err(|e| format!("{e}"))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-    let cache = {
-        let weights = model.weights();
-        let dense_ffn = WeightFfn { weights };
-        let cached_layers: Vec<usize> = (0..=12).collect();
-        CachedLayerGraph::build(weights, &token_ids, &cached_layers, &dense_ffn)
-    };
+    // No precomputed cache — stream the full transformer end-to-end. The
+    // earlier `CachedLayerGraph::build` over `(0..=12)` + generate range
+    // `13..num_layers` is invalid for any model whose layers 0-12 contribute
+    // anything beyond a dense FFN (hybrid-MoE in particular: the cache built
+    // from `WeightFfn` would skip every MoE expert block in those layers and
+    // produce multilingual gibberish). Match the convention used by
+    // `walk_cmd` and `bench_generate`: empty cache, full layer range.
+    let cache = CachedLayerGraph::from_residuals(Vec::new());
     let eos = EosConfig::from_vindex_dir(&vindex_path);
 
     println!("=== larql-inference: Streaming Demo ===\n");
@@ -124,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &index,
         &*gpu_be,
         &cache,
-        13..num_layers,
+        0..num_layers,
         sampling,
         &eos,
         |_id, text, _prob| {

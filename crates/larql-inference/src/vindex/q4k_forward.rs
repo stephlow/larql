@@ -121,7 +121,19 @@ pub fn predict_q4k_hidden(
 
         let w_gate = dequantize_matrix(ffn[0].0, ffn[0].1, intermediate, hidden);
         let w_up = dequantize_matrix(ffn[1].0, ffn[1].1, intermediate, hidden);
-        let w_down = dequantize_matrix(ffn[2].0, ffn[2].1, hidden, intermediate);
+        // down_proj: stored at the Q6_K-padded column width (inter_padded).
+        // Reading with `intermediate` as the column count gives the wrong row
+        // stride when intermediate is not a multiple of K_QUANT_BLOCK_ELEMS
+        // (e.g., 2112 → padded 2304 for Gemma 4 26B-A4B dense FFN). Dequantize
+        // at the padded width, then slice off the padding columns.
+        let inter_padded = intermediate.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+            * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+        let w_down = if inter_padded != intermediate {
+            let w = dequantize_matrix(ffn[2].0, ffn[2].1, hidden, inter_padded);
+            w.slice(ndarray::s![.., ..intermediate]).to_owned()
+        } else {
+            dequantize_matrix(ffn[2].0, ffn[2].1, hidden, intermediate)
+        };
 
         weights.tensors.insert(q_key.clone(), w_q.into_shared());
         weights.tensors.insert(k_key.clone(), w_k.into_shared());
@@ -234,6 +246,17 @@ fn run_moe_layer_cpu(
         (h_pa, Some((k_rope, v_final)))
     };
 
+    // Dump h_post_attn for layer-by-layer parity vs Metal
+    // (LARQL_DUMP_RESIDUALS). Same hook the dense path uses in
+    // `forward/layer.rs:182`; missing here means the MoE-bisect tools
+    // can't tell whether attention or the FFN-side is off.
+    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+        let slice = h_post_attn.as_slice().unwrap_or(&[]);
+        let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
+        let _ = std::fs::write(&path, &bytes);
+    }
+
     // ── 2. Dense FFN branch (h1). `run_ffn` returns `h_post_attn + _1(dense)`
     //     plus residual; subtract h_post_attn to isolate `_1(dense) = h1`.
     let (h_post_ffn_dense, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, ffn, false);
@@ -265,29 +288,78 @@ fn run_moe_layer_cpu(
         return Some((out, kv_out));
     }
 
-    // ── 4. Combine via outer post-FFN norm, then residual add. The outer
-    //     weight is a distinct tensor (un-suffixed `post_feedforward_layernorm`);
-    //     if the extractor didn't emit it, fall back to the dense-branch _1
-    //     weight (matches `moe_combine::apply_outer_combine`'s fallback).
+    // ── 4. Combine via outer post-FFN norm + residual + layer_scalar.
+    //
+    // Routed through `larql_compute::cpu::ops::outer_combine` so this
+    // CPU path and Metal's `apply_outer_combine` share a single
+    // implementation of the math. Earlier the two backends had
+    // independent transcriptions of the same formula and silently
+    // drifted (CPU used f64 RMS / fell back to identity-scale norm;
+    // Metal used f32 RMS / skipped the norm entirely on missing
+    // weights), producing cos=0.63 layer-output divergence on
+    // Gemma 4 26B-A4B even though h_post_attn matched at cos=1.0.
     let combined = &h1 + &h2;
-    let combined_normed = if arch.moe_has_combined_output_norm() {
-        let outer_key = arch
-            .moe_post_outer_norm_key(layer)
-            .or_else(|| arch.post_feedforward_layernorm_key(layer));
-        match outer_key {
-            Some(k) => crate::forward::apply_norm(weights, &combined, &k, norm_offset),
-            None => combined,
-        }
-    } else {
-        combined
-    };
-    let mut h_out = &h_post_attn + &combined_normed;
 
-    // ── 5 + 6. PLE then whole-layer `layer_scalar` — same order as
-    //     `run_layer_with_ffn`, so non-MoE and MoE paths produce the same
-    //     shape of residual downstream.
-    h_out = crate::forward::ple::apply_per_layer_embedding(weights, &h_out, layer, ple_input);
-    crate::forward::layer::apply_layer_scalar(weights, &mut h_out, layer);
+    // Layer-0 stage dumps (LARQL_CPU_STAGE_DUMP=<dir>) for hybrid-MoE
+    // bisection vs Metal's `metal/decode/moe_combine.rs`.
+    let l0_stage_dump = if layer == 0 {
+        std::env::var("LARQL_CPU_STAGE_DUMP").ok()
+    } else {
+        None
+    };
+    let dump_l0_arr = |name: &str, arr: &Array2<f32>| {
+        if let Some(ref dir) = l0_stage_dump {
+            let slice = arr.as_slice().unwrap_or(&[]);
+            let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/cpu_L0_{name}.f32"), &bytes);
+        }
+    };
+    dump_l0_arr("h1_dense_norm1", &h1);
+    dump_l0_arr("h2_moe_norm2", &h2);
+    dump_l0_arr("combined_h1_plus_h2", &combined);
+
+    // Resolve the outer norm weight the same way Metal does:
+    // `moe_outer_post_norm` first, fall back to the dense-branch
+    // `post_ffn_norm` (the `_1` variant on Gemma 4). `None` means
+    // the vindex didn't ship either; the helper then skips the norm
+    // entirely instead of silently applying an identity scale.
+    let outer_w_vec: Option<&Vec<f32>> = if arch.moe_has_combined_output_norm() {
+        arch.moe_post_outer_norm_key(layer)
+            .or_else(|| arch.post_feedforward_layernorm_key(layer))
+            .and_then(|k| weights.vectors.get(&k))
+    } else {
+        None
+    };
+
+    let seq = combined.nrows();
+    let mut out_buf = Array2::<f32>::zeros((seq, hidden));
+    for pos in 0..seq {
+        let h_post_attn_row = h_post_attn.row(pos);
+        let combined_row = combined.row(pos);
+        let combined_normed = larql_compute::cpu::ops::outer_combine::outer_post_norm_residual(
+            h_post_attn_row.as_slice().expect("contiguous row"),
+            combined_row.as_slice().expect("contiguous row"),
+            outer_w_vec.map(|v| v.as_slice()),
+            norm_offset,
+            eps,
+        );
+        for (dst, src) in out_buf.row_mut(pos).iter_mut().zip(combined_normed.iter()) {
+            *dst = *src;
+        }
+    }
+    dump_l0_arr("h_out_pre_layer_scalar", &out_buf);
+
+    // ── 5 + 6. PLE then whole-layer `layer_scalar`.
+    let mut h_out =
+        crate::forward::ple::apply_per_layer_embedding(weights, &out_buf, layer, ple_input);
+    if let Some(scalar_key) = arch.layer_scalar_key(layer) {
+        if let Some(scalars) = weights.vectors.get(&scalar_key) {
+            if let Some(&scalar) = scalars.first() {
+                let flat = h_out.as_slice_mut().expect("contiguous out_buf");
+                larql_compute::cpu::ops::outer_combine::apply_layer_scalar_in_place(flat, scalar);
+            }
+        }
+    }
 
     Some((h_out, kv_out))
 }
@@ -667,7 +739,14 @@ pub fn q4k_ffn_forward_layer(
 
     let w_gate = dequantize_matrix(ffn[0].0, ffn[0].1, intermediate, hidden);
     let w_up = dequantize_matrix(ffn[1].0, ffn[1].1, intermediate, hidden);
-    let w_down = dequantize_matrix(ffn[2].0, ffn[2].1, hidden, intermediate);
+    let inter_padded = intermediate.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+        * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+    let w_down = if inter_padded != intermediate {
+        let w = dequantize_matrix(ffn[2].0, ffn[2].1, hidden, inter_padded);
+        w.slice(ndarray::s![.., ..intermediate]).to_owned()
+    } else {
+        dequantize_matrix(ffn[2].0, ffn[2].1, hidden, intermediate)
+    };
 
     let gate = dot_proj(x, &w_gate);
     let up = dot_proj(x, &w_up);
@@ -689,7 +768,11 @@ pub fn q4k_ffn_forward_layer(
 /// `None` arm is unreachable in well-formed inputs.
 fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Array2<f32> {
     let n = rows * cols;
-    let padded = n.div_ceil(256) * 256;
+    // Q4_K and Q6_K quantise in K_QUANT_BLOCK_ELEMS-sized super-blocks; the
+    // vindex writer pads up to that boundary (e.g. moe_intermediate=704 →
+    // 768 padded). Use the canonical constant rather than re-hardcoding 256.
+    let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+    let padded = n.div_ceil(block) * block;
     let info = larql_vindex::quant::registry::lookup(format)
         .unwrap_or_else(|| panic!("unsupported quant format in vindex: {format}"));
     let floats =

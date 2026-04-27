@@ -64,10 +64,13 @@ pub(super) struct MoeScratch {
 
 impl MoeScratch {
     pub(super) fn new(bufs: &BufferCache, top_k: usize, hidden: usize, inter: usize) -> Self {
-        let inter_padded = inter.div_ceil(256) * 256;
-        // Q4_K row stride: one super-block per 256 elements, 144 bytes per super-block.
-        let row_bytes = (hidden / 256) * 144;
-        let down_row_bytes = (inter_padded / 256) * 144;
+        let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+        let bytes_per_block = larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
+        let inter_padded = inter.div_ceil(block) * block;
+        // Q4_K row stride: one super-block per Q4_K_BLOCK_ELEMS elements,
+        // Q4_K_BLOCK_BYTES bytes per super-block.
+        let row_bytes = (hidden / block) * bytes_per_block;
+        let down_row_bytes = (inter_padded / block) * bytes_per_block;
 
         let gate_buf = bufs.output((top_k * inter * row_bytes) as u64);
         let up_buf = bufs.output((top_k * inter * row_bytes) as u64);

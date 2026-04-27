@@ -151,7 +151,8 @@ fn bytemuck_f32_to_bytes(data: &[f32]) -> Vec<u8> {
 /// multiple of 256 (required for Q4_K super-block alignment).
 /// Returns the original slice unchanged if already aligned.
 pub fn pad_cols_to_256(data: &[f32], out_rows: usize, in_cols: usize) -> (Vec<f32>, usize) {
-    let padded = in_cols.div_ceil(256) * 256;
+    let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+    let padded = in_cols.div_ceil(block) * block;
     if padded == in_cols {
         return (data.to_vec(), in_cols);
     }

@@ -536,7 +536,9 @@ impl VectorIndex {
         }
 
         let floats_per_matrix = intermediate * self.hidden_size;
-        let q4_bytes_per_matrix = floats_per_matrix / 32 * 18; // Q4_0: 18 bytes per 32 elements
+        let q4_bytes_per_matrix = floats_per_matrix
+            / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
+            * larql_models::quant::ggml::Q4_0_BLOCK_BYTES;
         let q4_bytes_per_layer = q4_bytes_per_matrix * 3;
 
         let start = layer * q4_bytes_per_layer + component * q4_bytes_per_matrix;
@@ -577,7 +579,9 @@ impl VectorIndex {
             if intermediate == 0 {
                 return;
             }
-            let q4_bytes_per_matrix = intermediate * self.hidden_size / 32 * 18;
+            let q4_bytes_per_matrix = intermediate * self.hidden_size
+                / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
+                * larql_models::quant::ggml::Q4_0_BLOCK_BYTES;
             let q4_bytes_per_layer = q4_bytes_per_matrix * 3;
             let start = layer * q4_bytes_per_layer;
             let end = (start + q4_bytes_per_layer).min(mmap.len());
@@ -664,7 +668,9 @@ impl VectorIndex {
         for layer in 0..self.num_layers {
             let num_features = self.num_features(layer);
             let floats = num_features * self.hidden_size;
-            let q4_bytes = floats / 32 * 18; // Q4_0: 18 bytes per 32 elements
+            let q4_bytes = floats
+                / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
+                * larql_models::quant::ggml::Q4_0_BLOCK_BYTES;
             slices.push(crate::index::types::GateQ4Slice {
                 byte_offset: offset,
                 byte_len: q4_bytes,

@@ -70,6 +70,140 @@ sweep, and 16.6 GB steady RSS — i.e. the change cut latency 2.5× and RSS 1.7�
 
 ## P0: Active
 
+### F0. CPU MoE correctness — unfinished, blocks the remote-MoE story
+
+**Status**: Open — bug found 2026-04-27, not yet root-caused.
+
+The per-expert refactor + `experts_packed.bin` removal landed without a
+correctness end-to-end check. `larql run` on the 26B-A4B vindex via the CPU
+MoE path produces incoherent text ("ever own로 el"), while `larql run --metal`
+on the same vindex produces "Paris." The server-side remote-expert endpoint
+inherits the same bug because `run_single_expert` and `cpu_moe_forward` share
+the same per-expert compute.
+
+**What I tried that did not help:**
+- Aligning `cpu_moe_forward`'s router-norm input to `h_norm` (matching Metal's
+  `cpu_moe_route(&h_norm, ...)` convention) — different garbage, not "Paris".
+- Swapping gate/up row order in the `[2*inter, hidden]` slice — different
+  garbage, not "Paris".
+- Verified `dequantize_q4_k` is bit-identical to the `larql_models` reference
+  via `tests/test_q4k_parity.rs` on synthetic ramp data (3 super-blocks of
+  varied content, plus round-trip-within-noise).
+- Verified `inter_padded` handling matches Metal's convention (zero-pad
+  hidden_state to `inter_padded`, dequant down at `hidden * inter_padded`).
+
+**What's still suspect:**
+- Q4_K dequant on the **real per-layer file's bytes** has not been compared
+  against Metal's GPU dequant. Synthetic parity ≠ real-data parity.
+- The **gate/up convention in HF Gemma 4** could differ from what
+  `quantize_moe_entries` assumes about the source BF16 layout.
+- BLAS `sgemv` on Apple Accelerate vs Metal's `q4k_matvec` shader could have
+  precision drift at 26B scale, though both should be IEEE-754 correct.
+
+**Why the bench numbers were misleading:**
+`bench_expert_server` measured `forward_moe` warm at 1.91 ms and the
+`cpu_moe_forward` floor at 0.10 ms. Post-fix the floor jumped to 1.81 ms (18×).
+The 0.10 ms number was the buggy old code silently returning empty buffers
+when the dequant length didn't match the bytes — fast because no work was
+happening. This was not flagged because no test compared **output values**,
+only latency.
+
+**Diagnosis status (2026-04-27, via `larql parity` + dump-and-diff):**
+
+Layer-by-layer cosine-similarity diff between CPU `predict_q4k` and Metal
+`predict_q4k_metal` on the 26B-A4B vindex, using `LARQL_CPU_DUMP_LAYERS` +
+`LARQL_DUMP_RESIDUALS`:
+
+| Stage at layer 0 | cos(cpu, metal) |
+|---|---|
+| h_embed (input to layer 0) | 1.000000 |
+| h_post_attn (post-attention) | 1.000000 |
+| layer_out (post-FFN+MoE+combine) | **0.626708** ← divergence |
+
+Attention is correct on layer 0; the divergence is in the **FFN + MoE +
+combine** between `h_post_attn` and `layer_out`. The CPU MoE block routes
+to the same top-K experts as Metal at layer 0 (verified via `MOE_DEBUG=1`:
+both pick `[79, 114, 16, 92, 89, 101, 67, 46]` with the same `moe_out_rms`).
+Per-expert math is provably correct (parity test). The bug is therefore in
+how `run_moe_layer_cpu` composes h1 (dense), h2 (MoE), the outer
+post-FFN norm, and `layer_scalar` — and it has drifted from Metal's
+`metal/decode/moe_combine.rs::apply_outer_combine`.
+
+`larql parity` v1 shipped (CLI subcommand, `larql-cli/src/commands/diagnostics/parity.rs`)
+with `--component moe-expert` + `--component moe-block` and `--backends reference,cpu`.
+Run on the 26B-A4B vindex the tool reports:
+
+| Component | reference vs cpu max abs diff | Verdict |
+|---|---|---|
+| `moe-expert` layer 0 / expert 0 | 4.3 × 10⁻⁶ | within fp32+BLAS noise |
+| `moe-block` layer 0 (router → top-K → K experts → sum → post-norm) | 8.4 × 10⁻⁵ | within fp32+BLAS noise |
+
+So the entire MoE expert pathway — Q4_K dequant, gate matmul, up matmul,
+activation, down matmul, router, top-K, weighted sum, post-experts norm — is
+mathematically correct end-to-end. The bug producing garbage on `larql run`
+is **outside** the MoE block. Suspect surface area:
+
+- attention block (Q/K/V proj, RoPE, softmax, O proj) — Metal vs CPU
+- hybrid combine: `h1 + h2 → moe_post_outer_norm → + h_post_attn` in
+  `larql-inference/src/vindex/q4k_forward.rs::layer_step`
+- `apply_layer_scalar` and PLE (`apply_per_layer_embedding`) afterwards
+- per-position iteration loop on prefill (`for pos in 0..seq_len`)
+
+**Root cause (further localised 2026-04-27):**
+
+The CPU and Metal paths use **two different forward implementations** for
+hybrid-MoE Q4_K vindexes — they have drifted:
+
+- **Metal**: `predict_q4k_metal` builds `FullPipelineLayer` per layer and
+  calls `backend.decode_token(&layers, ...)`. Hybrid MoE handled by
+  `decode_token_with_moe` → `gpu_moe_dispatch`. This works.
+- **CPU**: legacy `q4k_forward.rs::predict_q4k_step` →
+  `run_moe_layer_cpu` (hand-rolled) → `cpu_moe_forward` per position +
+  hand-rolled hybrid combine (`combined = h1 + h2`,
+  `combined_normed = outer_norm(combined)`, `h_out = h_post_attn + combined_normed`).
+  Doc comment in that function says it's "verified against HF bf16 via
+  residual-cosine diff in the Metal `diag.rs` dumps" — but the file has
+  since drifted from Metal and the verification is stale. This produces
+  garbage end-to-end on Gemma 4 26B-A4B.
+
+Routing-convention fix (apply router_norm to `h_norm`, not raw `h`,
+matching Metal's `cpu_moe_route(&h_norm, ...)`) was applied to
+`cpu_moe_forward` and `MoeRouterWeights::route`, with regression tests in
+`larql-compute/src/cpu/ops/moe/mod.rs`. Necessary but not sufficient — the
+hybrid combine in `run_moe_layer_cpu` is still wrong.
+
+**Next steps for F0 (proper fix):**
+
+The cleanest path is to **delete `run_moe_layer_cpu` and route CPU
+predictions through the same `FullPipelineLayer` + `decode_token` pipeline
+Metal uses**, swapping `MetalBackend` for `CpuBackend`. That requires
+`CpuBackend::decode_token` to support Q4 layers (it currently doesn't —
+`predict_q4k_metal` literally `expect()`s "need Metal with Q4 kernels").
+
+Either:
+- Implement `CpuBackend::decode_token` for Q4 layers — substantial work
+  porting the Metal kernels' algorithm to CPU + BLAS, but unifies the two
+  paths and resolves all class-of-bug drifts at once.
+- Patch `run_moe_layer_cpu` to match Metal's exact hybrid combine. Faster
+  but leaves the dual-path drift surface in place; another knob will go
+  out of sync next session.
+
+A `larql parity --component layer` (parity v2) component would catch this
+class of bug going forward — diffing the **full hybrid layer output**
+between CPU and Metal would have surfaced the combine drift immediately.
+That's the right next investment.
+
+**Implication for the remote-MoE story:**
+The wire format, `--experts` shard ownership (with the off-by-one fix),
+the per-expert byte-table API, and the per-layer Q4_K layout all work
+correctly. What does **not** work is the CPU numerical compute on the
+server side. Until F0 is closed, "remote MoE on Gemma 4 26B-A4B" is
+plumbing-correct but inference-incorrect — clients pointing at a remote
+larql-server shard will get garbage output. Workaround: use `--metal` for
+all-local generation; remote-MoE is on hold.
+
+---
+
 Functional gaps from the 2026-04-27 server review. Numbering is stable so we
 can reference items in commits and reviews.
 

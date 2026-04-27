@@ -91,7 +91,8 @@ pub use format::huggingface::{
     PublishOptions, SilentPublishCallbacks,
 };
 pub use format::weights::{
-    load_model_weights, load_model_weights_q4k, load_model_weights_with_opts, write_model_weights,
+    load_model_weights, load_model_weights_q4k, load_model_weights_q4k_shard,
+    load_model_weights_with_opts, write_model_weights,
     write_model_weights_q4k, write_model_weights_q4k_with_opts, write_model_weights_with_opts,
     LoadWeightsOptions, Q4kWriteOptions, StreamingWeights, WeightSource, WriteWeightsOptions,
 };

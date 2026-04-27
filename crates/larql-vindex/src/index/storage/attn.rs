@@ -253,11 +253,12 @@ mod tests {
         VectorIndex::empty(1, 2560)
     }
 
-    /// Q4_K shape `[2048, 2560]` at the canonical 144-byte GGUF stride
+    /// Q4_K shape `[2048, 2560]` at the canonical Q4_K_BLOCK_BYTES stride
     /// must load cleanly.
     #[test]
     fn load_attn_q4k_accepts_correct_144_byte_stride() {
-        let len = 2048 * (2560 / 256) * 144; // 2_949_120
+        use larql_models::quant::ggml::{Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS};
+        let len = 2048 * (2560 / Q4_K_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES; // 2_949_120
         let payload = vec![0u8; len];
         let manifest = serde_json::json!([
             {
@@ -333,8 +334,11 @@ mod tests {
     /// silent-drift class of bug.
     #[test]
     fn load_attn_q4k_validates_q6k_v_projection() {
-        let q4k_len = 1024 * (2560 / 256) * 144; // K projection: 1024 × 1440 = 1_474_560
-        let q6k_len = 1024 * (2560 / 256) * 210; // V projection: 1024 × 2100 = 2_150_400
+        use larql_models::quant::ggml::{
+            K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        };
+        let q4k_len = 1024 * (2560 / K_QUANT_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES; // K proj: 1024 × 1440
+        let q6k_len = 1024 * (2560 / K_QUANT_BLOCK_ELEMS) * Q6_K_BLOCK_BYTES; // V proj: 1024 × 2100
         let total = q4k_len + q6k_len;
         let payload = vec![0u8; total];
         let manifest = serde_json::json!([
@@ -363,7 +367,8 @@ mod tests {
     /// 144 confusion at write time) must be rejected.
     #[test]
     fn load_attn_q4k_rejects_q6k_with_q4k_stride() {
-        let wrong_len = 1024 * (2560 / 256) * 144; // Q4_K stride applied to a Q6_K tensor
+        use larql_models::quant::ggml::{K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES};
+        let wrong_len = 1024 * (2560 / K_QUANT_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES; // Q4_K stride for Q6_K tensor
         let payload = vec![0u8; wrong_len];
         let manifest = serde_json::json!([
             {

@@ -17,7 +17,7 @@ use crate::format::filenames::*;
 use crate::format::load::load_vindex_config;
 use crate::index::core::IndexLoadCallbacks;
 
-use super::write_f32::WeightEntry;
+use super::write_f32::{kind, WeightEntry};
 
 /// Options for [`load_model_weights_with_opts`]. Filter which
 /// component tensors are actually mmap'd + decoded at load time —
@@ -281,7 +281,7 @@ pub fn load_model_weights_with_opts(
         let floats = crate::config::dtype::decode_floats(raw_bytes, actual_dtype);
 
         match entry.kind.as_str() {
-            "tensor" => {
+            kind::TENSOR => {
                 let arr = Array2::from_shape_vec((entry.shape[0], entry.shape[1]), floats)
                     .map_err(|e| VindexError::Parse(e.to_string()))?;
                 if entry.key == "lm_head.weight" {
@@ -290,7 +290,7 @@ pub fn load_model_weights_with_opts(
                     tensors.insert(entry.key.clone(), arr.into_shared());
                 }
             }
-            "vector" => {
+            kind::VECTOR => {
                 vectors.insert(entry.key.clone(), floats);
             }
             _ => {}
@@ -339,7 +339,9 @@ pub fn load_model_weights_with_opts(
             }
             let bytes = std::fs::read(&lm_q4_path)?;
             let num_floats = config.vocab_size * config.hidden_size;
-            let padded_floats = num_floats.div_ceil(256) * 256;
+            let padded_floats = num_floats
+                .div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+                * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
             if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, padded_floats) {
                 if floats.len() >= num_floats {
                     if let Ok(arr) = Array2::from_shape_vec(
@@ -405,6 +407,26 @@ pub fn load_model_weights_with_opts(
 pub fn load_model_weights_q4k(
     dir: &Path,
     callbacks: &mut dyn IndexLoadCallbacks,
+) -> Result<ModelWeights, VindexError> {
+    load_model_weights_q4k_shard(dir, callbacks, None)
+}
+
+/// Expert-shard variant of [`load_model_weights_q4k`].
+///
+/// Identical to the full loader except that when `expert_filter` is `Some((start,
+/// end_excl))`, per-layer expert entries outside `[start, end_excl)` are not
+/// inserted into `packed_byte_ranges`. Only the owned experts' byte-range
+/// records are kept; the mmap of each layer file still covers the whole file
+/// (the OS pages for unowned experts simply stay unpopulated).
+///
+/// A mini-process launched with `--experts 0-15` sets
+/// `expert_filter = Some((0, 16))` and loads only experts 0–15, reducing
+/// steady-state RSS from ~15 GB (all 128 experts) to ~120 MB (16 experts × 30
+/// layers × 4 MB each).
+pub fn load_model_weights_q4k_shard(
+    dir: &Path,
+    callbacks: &mut dyn IndexLoadCallbacks,
+    expert_filter: Option<(usize, usize)>,
 ) -> Result<ModelWeights, VindexError> {
     let config = load_vindex_config(dir)?;
 
@@ -524,10 +546,10 @@ pub fn load_model_weights_q4k(
             if entry.file.is_empty() {
                 continue;
             }
-            if entry.kind != "vector"
-                && entry.kind != "tensor_q4k"
-                && entry.kind != "tensor_f16"
-                && entry.kind != "packed_bf16"
+            if entry.kind != kind::VECTOR
+                && entry.kind != kind::TENSOR_Q4K
+                && entry.kind != kind::TENSOR_F16
+                && entry.kind != kind::PACKED_BF16
             {
                 continue;
             }
@@ -551,14 +573,14 @@ pub fn load_model_weights_q4k(
             }
             let raw_bytes = &data[byte_offset..byte_offset + byte_count];
 
-            if entry.kind == "packed_bf16" {
+            if entry.kind == kind::PACKED_BF16 {
                 // Record the byte range into the mmap — do NOT clone (could be 43 GB).
                 // The mmap stays alive in packed_mmaps; get_packed_bytes() returns the slice.
                 packed_byte_ranges.insert(
                     entry.key.clone(),
                     (entry.file.clone(), byte_offset, byte_count),
                 );
-            } else if entry.kind == "vector" {
+            } else if entry.kind == kind::VECTOR {
                 let expected_floats: usize = entry.shape.iter().product();
                 let actual_dtype = if byte_count == expected_floats * 4 {
                     crate::config::dtype::StorageDtype::F32
@@ -579,8 +601,10 @@ pub fn load_model_weights_q4k(
                 let rows = entry.shape[0];
                 let cols = entry.shape[1];
                 let n = rows * cols;
-                let floats: Option<Vec<f32>> = if entry.kind == "tensor_q4k" {
-                    let padded = n.div_ceil(256) * 256;
+                let floats: Option<Vec<f32>> = if entry.kind == kind::TENSOR_Q4K {
+                    let padded = n
+                        .div_ceil(larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
+                        * larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
                     larql_models::quant::ggml::dequantize_q4_k(raw_bytes, padded).ok()
                 } else {
                     // tensor_f16 — raw bytes are IEEE half-precision.
@@ -630,6 +654,12 @@ pub fn load_model_weights_q4k(
                         // in lockstep. Drift here causes silent None returns.
                         for (e, (gu_off, gu_bytes, dn_off, dn_bytes)) in offsets.iter().enumerate()
                         {
+                            // Skip experts outside the owned range [start, end_excl).
+                            if let Some((start, end_excl)) = expert_filter {
+                                if e < start || e >= end_excl {
+                                    continue;
+                                }
+                            }
                             packed_byte_ranges.insert(
                                 larql_models::weights::per_layer_ffn_key(
                                     l,
@@ -660,7 +690,8 @@ pub fn load_model_weights_q4k(
     if lm_q4_path.exists() {
         let bytes = std::fs::read(&lm_q4_path)?;
         let num_floats = config.vocab_size * config.hidden_size;
-        let padded = num_floats.div_ceil(256) * 256;
+        let padded = num_floats.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+            * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, padded) {
             if floats.len() >= num_floats {
                 if let Ok(arr) = Array2::from_shape_vec(

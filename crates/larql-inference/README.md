@@ -19,6 +19,59 @@ let result = larql_inference::predict(
 println!("Top prediction: {} ({:.1}%)", result.predictions[0].0, result.predictions[0].1 * 100.0);
 ```
 
+## Generation stack
+
+```rust
+use larql_inference::{
+    open_inference_vindex, generate_streaming, ChatSession,
+    SamplingConfig, EosConfig, Detokenizer,
+};
+
+let index = open_inference_vindex(&vindex_path)?;            // strict loader
+let result = generate_streaming(
+    weights, &tokenizer, &token_ids, max_tokens,
+    &index, &*backend, &cache, 13..num_layers,
+    SamplingConfig::temperature(0.8).with_top_p(0.9).with_seed(42),
+    &EosConfig::from_vindex_dir(&vindex_path),
+    |_id, text, _prob| { print!("{text}"); std::io::stdout().flush().ok(); },
+);
+```
+
+| Type | Role |
+|------|------|
+| [`SamplingConfig`] / [`Sampler`] | Greedy / temperature / top-k / top-p / seeded. Sparse hot path is <2µs/call (<0.02% of decode budget) — see [PERFORMANCE.md](PERFORMANCE.md#sampling-overhead). |
+| [`EosConfig`] | Stop-token detection. Reads `generation_config.json::eos_token_id` + `stop_strings`, layered on a built-in list (Gemma `<end_of_turn>`, ChatML `<|im_end|>`, Llama-3 `<|eot_id|>`). Falls back to `skip_special=false` decode when the streaming detok strips a special EOS marker. |
+| [`Detokenizer`] | Cumulative-decode delta for streaming output. Preserves HF `▁` leading-space across SP and BPE tokenizers. Equivalent to llama.cpp `llama_token_to_piece`. |
+| [`ChatSession`] | Multi-turn token buffer with whole-turn eviction at `max_context`. Pluggable [`TurnRenderer`] (Gemma / ChatML / Llama-3 built in). |
+| [`generate`] / [`generate_with_sampling`] / [`generate_streaming`] | Three public entry points — greedy → sampled → streamed. Each thinly wraps the next so adding sampling or a callback is opt-in without breaking existing callers. |
+| [`open_inference_vindex`] | Strict vindex loader. Propagates stride / manifest errors loudly (rebuild guidance) instead of silently degrading to a slower path. Use this in any tool that loads a vindex for inference. |
+
+[`SamplingConfig`]: layer_graph::SamplingConfig
+[`Sampler`]: layer_graph::Sampler
+[`EosConfig`]: layer_graph::EosConfig
+[`Detokenizer`]: layer_graph::Detokenizer
+[`ChatSession`]: layer_graph::ChatSession
+[`TurnRenderer`]: layer_graph::TurnRenderer
+[`generate`]: layer_graph::generate
+[`generate_with_sampling`]: layer_graph::generate_with_sampling
+[`generate_streaming`]: layer_graph::generate_streaming
+[`open_inference_vindex`]: vindex::open_inference_vindex
+
+## Engine diagnostic
+
+`larql diag <vindex>` (CLI) reports which kernel paths the loader will pick, validates Q4_K/Q6_K manifest strides, and (with `--probe`) runs a real forward to print the per-stage timing breakdown. Catches the silent-slowdown classes (stale 148-byte Q4_K stride → all-NaN; `vocab_size=0` → 4× slower lm_head fallback) at a glance:
+
+```
+$ larql diag output/gemma3-4b-v2.vindex
+Stride validation:
+  ✓ 238 entries match canonical stride
+LM-head path resolution (which kernel fires per next-token):
+  → Q4 matvec (Metal fast)   lm_head_q4 mmap = true, vocab_size > 0 = true  → ~1.9 ms
+     f16 gemv (tied embed)    ...
+     f32 KNN (lm_head.bin)    ...
+     f32 BLAS gemv (slow)     ...
+```
+
 ## Key Components
 
 | Module | Purpose |
@@ -26,10 +79,10 @@ println!("Top prediction: {} ({:.1}%)", result.predictions[0].0, result.predicti
 | `attention/` | BLAS-fused GQA attention: block, GQA, GPU dispatch, RoPE |
 | `forward/` | Forward pass: embed, layer, predict, PLE (per-layer embeddings), trace |
 | `ffn/` | FFN evaluation: dense, sparse, highway, route-guided (experimental backends deprecated) |
-| `layer_graph/` | Layer graphs + prediction pipeline: `pipeline_layer` (shared FullPipelineLayer construction), `predict` (entry points), `generate` (token loop), `logits` (KNN logits), `prefill` (KV cache) |
+| `layer_graph/` | Layer graphs + generation: `pipeline_layer`, `predict`, `prefill`, plus `generate/` (eos, detok, sampling, chat_session, gpu/cpu loops, lm_head, types) |
 | `residual.rs` | RMS norm, layer norm |
 | `trace/` | Residual stream decomposition and tiered storage |
-| `vindex/walk_ffn.rs` | WalkFfn: mmap'd FFN — faster than dense (517ms vs 535ms) |
+| `vindex/` | `open_inference_vindex` (strict loader) + `WalkFfn` (mmap'd FFN, faster than dense at 517ms vs 535ms) |
 | `capture.rs` | Residual stream vector capture for probing |
 | `walker/` | Weight-level graph walkers (no forward pass) |
 | `model.rs` | Model loading (re-exports from larql-models) |
@@ -104,6 +157,30 @@ curl -X POST http://localhost:8080/v1/infer \
 
 ## Examples
 
+### Generation stack
+
+```bash
+# Token spacing — standalone, no model. Shows the bug
+# ("thecapitaloffranceisparis") and the fix.
+cargo run --release -p larql-inference --example detok_demo
+
+# Sampling overhead — standalone benchmark across vocab sizes
+# (32K/128K/256K) and configs (greedy/temp/top-p/top-k).
+cargo run --release -p larql-inference --example bench_sampling
+
+# Sampling, EOS, streaming, chat — model-backed.
+cargo run --release --features metal -p larql-inference \
+  --example sampling_demo  -- --vindex output/gemma3-4b-v2.vindex
+cargo run --release --features metal -p larql-inference \
+  --example streaming_demo -- --vindex output/gemma3-4b-v2.vindex --max-tokens 24
+cargo run --release --features metal -p larql-inference \
+  --example eos_demo       -- --vindex output/gemma3-4b-v2.vindex --max-tokens 80
+cargo run --release --features metal -p larql-inference \
+  --example chat_demo      -- --vindex output/gemma3-4b-v2.vindex --max-context 256
+```
+
+### Other
+
 ```bash
 # Walk inference benchmark (dense vs walk vs HNSW, needs model + vindex)
 cargo run --release -p larql-inference --example bench_walk_inference -- \
@@ -156,7 +233,14 @@ cargo run --release -p larql-vindex --example build_down_features -- path/to/vin
 ## Tests
 
 ```bash
-# Inference tests (96 tests)
+# Inference lib tests (631 tests)
+cargo test -p larql-inference --lib
+
+# Gemma 3 4B regression smoke test (set the env var):
+LARQL_VINDEX_PATH=$(pwd)/output/gemma3-4b-v2.vindex CI_INTEGRATION=1 \
+  cargo test --release -p larql-inference --test test_gemma3_smoke -- --ignored
+
+# All tests including ignored (per-component, kept for reference)
 cargo test -p larql-inference
 
 # HNSW tests
@@ -173,13 +257,16 @@ cargo test -p larql-inference --test test_walker_utils      # 10 tests
 
 | Area | Tests | Coverage |
 |------|-------|----------|
+| Generation: EOS / detok / sampling / chat session | 38 | Builtin stops, special-token EOS via tokenizer fallback, leading-space, seed reproducibility, top-k/top-p truncation, whole-turn eviction |
+| Vindex strict loader | 2 | open_inference_vindex error paths |
 | Backend (ComputeBackend) | 13 | Shape, correctness, batch, Metal vs CPU |
 | Fused attention | 23 | GQA, softcap, capture, reference agreement, edge cases |
 | FFN + modules | 15 | SiLU, GELU, dense, highway, multi-position |
 | Trace stores | 14 | Write/read, tiers, boundaries, additive property |
 | Walkers | 12 | Weight/attention walkers, vector extractor |
 | Utils | 10 | Top-k, rounding, entity sorting |
-| Unit (lib) | 9 | Core module tests |
+| Unit (lib) | total 631 | Core module tests + everything above |
+| Gemma 3 4B smoke (`#[ignore]`) | 1 | First-token regression — gated on `LARQL_VINDEX_PATH` + `CI_INTEGRATION=1` |
 
 ## Crate Dependencies
 

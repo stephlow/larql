@@ -2,6 +2,48 @@
 
 Machine: M3 Max, macOS. Gemma 3 4B (34 layers, hidden=2560, vocab=262K).
 
+## Real-vindex headline (2026-04-27)
+
+`larql bench output/gemma3-4b-q4k-v2.vindex --tokens 100 --warmup 8`:
+
+```
+Backend       prefill    ms/tok    tok/s    steps
+larql-metal   65 ms     13.4 ms    74.6      99
+Ollama        ~10 ms/tok = 98–103 tok/s (reference, same model)
+```
+
+Per-stage breakdown of one decode step:
+
+| Stage | ms/tok | % | What runs |
+|---|---:|---:|---|
+| GPU forward | 11.8 | 86% | `dispatch_full_pipeline` per-token Metal compute (Q4_K matvecs, fused QKV proj, GQA attention, FFN, norms) |
+| LM head    |  1.9 | 14% | Q4 matvec on `lm_head_q4.bin` + GPU argmax reduction (256K vocab) |
+| Embed / final norm / detok / sample / EOS |  0.05 | <1% | All the per-step CPU work outside the Metal compute path |
+| **Total** | **13.7** | **100%** | **= 73 tok/s** |
+
+### Headline-vs-reality reading guide
+
+The number you measure depends on **how the run is timed**:
+
+| Run shape | tok/s | Why |
+|---|---:|---|
+| `larql bench --warmup 8 --tokens 100` (steady-state) | **74.6** | Drops the 54-ms cold token, averages over enough steps for variance to wash out. **Use this for any speed comparison.** |
+| Short bench (`--max-tokens 20`, no warmup) | 67 | Cold token 1 (54 ms) dragged into the average; the per-token decode after warmup is still ~12 ms (= 80 tok/s) but the average reports 14.8. |
+| Compute `PERFORMANCE.md` 78.7 tok/s claim | 78.7 | Snapshot from the q6k_matvec correctness fix. Current state regressed ~1 ms/tok in the GPU phase. |
+
+## LM head path matters
+
+Four lm_head paths exist; which one fires is determined by what the loader finds:
+
+| Path | When it fires | ms/tok | Note |
+|---|---|---:|---|
+| **Q4 matvec (Metal)** | `lm_head_q4.bin` present + `vocab_size > 0` | **~1.9** | Production fast path. Saves the 1MB readback + 262K-element CPU sort by computing argmax on the GPU. |
+| f16 gemv (tied embed) | Tied-embedding model + embeddings adopted as lm_head | ~3-5 | Half the bandwidth of f32, 2× of Q4. |
+| f32 KNN (`lm_head.bin`) | Separate untied lm_head shipped at f32 | ~2 | Untied models only. |
+| f32 BLAS gemv (slow) | None of the above — falls back to `weights.lm_head` full gemv | ~8 | What you hit when `vocab_size = 0` silently bails the Q4 path. |
+
+`larql diag <vindex>` prints which path will fire and surfaces the silent-slowdown classes (stale 148-byte stride, `vocab_size = 0`) at a glance.
+
 ## Production Benchmark: "The capital of France is"
 
 Real vindex (`output/gemma3-4b-v2.vindex`), 6-token prompt.

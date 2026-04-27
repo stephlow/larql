@@ -7,6 +7,7 @@ mod commands;
 mod formatting;
 mod utils;
 
+use commands::diagnostics::parity as parity_cmd;
 use commands::extraction::*;
 use commands::primary::*;
 use commands::query::*;
@@ -67,6 +68,17 @@ enum Commands {
 
     /// Benchmark decode throughput on a real vindex (Metal / CPU / Ollama).
     Bench(bench_cmd::BenchArgs),
+
+    /// Engine diagnostic — show which inference paths the loader will pick
+    /// for a vindex (lm_head fast/slow, attn fused/per-proj, FFN, stride
+    /// validation). `--probe` runs a real forward and prints per-stage
+    /// timings. Catches silent slowdowns at a glance.
+    Diag(diag_cmd::DiagArgs),
+
+    /// Cross-backend numerical diff for inference components (MoE expert,
+    /// MoE block, ...). Catches silent regressions in quantisation,
+    /// activation, norm, or expert-routing math when refactoring.
+    Parity(parity_cmd::ParityArgs),
 
     // ── Server ──────────────────────────────────────────────────────
     #[command(next_help_heading = "Server")]
@@ -433,6 +445,8 @@ fn main() {
         Commands::Run(args) => run_cmd::run(args),
         Commands::Chat(args) => run_cmd::run(args.into()),
         Commands::Bench(args) => bench_cmd::run(args),
+        Commands::Diag(args) => diag_cmd::run(args),
+        Commands::Parity(args) => parity_cmd::run(args),
         Commands::Pull(args) => pull_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
         Commands::List(args) => list_cmd::run(args),

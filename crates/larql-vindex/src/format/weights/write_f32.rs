@@ -26,15 +26,36 @@ use crate::format::load::load_vindex_config;
 
 use larql_models::ModelWeights;
 
+/// Manifest `kind` discriminators — wire-format strings written into
+/// `weights.json`. Constants exist so writers and the loader's match
+/// arm dispatch on the same source-of-truth. A typo on a constant
+/// fails to compile; a typo in a string literal would silently route
+/// the wrong format and reproduce the Q4_K-vs-Q4_0 lm_head bug.
+pub mod kind {
+    /// 1D float vector (norms, biases, scalars), stored as f32 or f16
+    /// raw bytes. Decoded via `crate::config::dtype::decode_floats`.
+    pub const VECTOR: &str = "vector";
+    /// 2D f32/f16 dense tensor (raw row-major bytes). Used by the legacy
+    /// `write_f32` writer for attn/FFN weights.
+    pub const TENSOR: &str = "tensor";
+    /// 2D Q4_K-quantised tensor (256-element super-blocks, 144 B/block).
+    pub const TENSOR_Q4K: &str = "tensor_q4k";
+    /// 2D f16 tensor (e.g. Gemma 4 PLE weights).
+    pub const TENSOR_F16: &str = "tensor_f16";
+    /// 3D BF16-packed expert tensor (Gemma 4 26B-A4B `experts.gate_up_proj`,
+    /// `experts.down_proj`). Range-tracked, not cloned (can be 43 GB).
+    pub const PACKED_BF16: &str = "packed_bf16";
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct WeightEntry {
-    pub(super) key: String,
-    pub(super) kind: String,
-    pub(super) shape: Vec<usize>,
-    pub(super) offset: u64,
-    pub(super) length: u64,
+    pub key: String,
+    pub kind: String,
+    pub shape: Vec<usize>,
+    pub offset: u64,
+    pub length: u64,
     #[serde(default)]
-    pub(super) file: String,
+    pub file: String,
 }
 
 // ── WeightSource trait ──
@@ -287,7 +308,7 @@ pub fn write_model_weights_with_opts(
                     let len = write_floats(&mut attn_file, &data, dtype)?;
                     entries.push(WeightEntry {
                         key: key.clone(),
-                        kind: "tensor".into(),
+                        kind: kind::TENSOR.into(),
                         shape: vec![rows, cols],
                         offset: attn_offset,
                         length: len,
@@ -307,7 +328,7 @@ pub fn write_model_weights_with_opts(
                     attn_file.write_all(&bytes)?;
                     entries.push(WeightEntry {
                         key: key.clone(),
-                        kind: "vector".into(),
+                        kind: kind::VECTOR.into(),
                         shape: vec![data.len()],
                         offset: attn_offset,
                         length: bytes.len() as u64,
@@ -359,7 +380,7 @@ pub fn write_model_weights_with_opts(
                             let len = write_floats(&mut up_file, &data, dtype)?;
                             entries.push(WeightEntry {
                                 key,
-                                kind: "tensor".into(),
+                                kind: kind::TENSOR.into(),
                                 shape: vec![rows, cols],
                                 offset: up_offset,
                                 length: len,
@@ -373,7 +394,7 @@ pub fn write_model_weights_with_opts(
                             let len = write_floats(&mut down_file, &data, dtype)?;
                             entries.push(WeightEntry {
                                 key,
-                                kind: "tensor".into(),
+                                kind: kind::TENSOR.into(),
                                 shape: vec![rows, cols],
                                 offset: down_offset,
                                 length: len,
@@ -388,7 +409,7 @@ pub fn write_model_weights_with_opts(
                         let len = write_floats(&mut up_file, &data, dtype)?;
                         entries.push(WeightEntry {
                             key,
-                            kind: "tensor".into(),
+                            kind: kind::TENSOR.into(),
                             shape: vec![rows, cols],
                             offset: up_offset,
                             length: len,
@@ -403,7 +424,7 @@ pub fn write_model_weights_with_opts(
                     let len = write_floats(&mut up_file, &data, dtype)?;
                     entries.push(WeightEntry {
                         key: up_key,
-                        kind: "tensor".into(),
+                        kind: kind::TENSOR.into(),
                         shape: vec![rows, cols],
                         offset: up_offset,
                         length: len,
@@ -417,7 +438,7 @@ pub fn write_model_weights_with_opts(
                     let len = write_floats(&mut down_file, &data, dtype)?;
                     entries.push(WeightEntry {
                         key: down_key,
-                        kind: "tensor".into(),
+                        kind: kind::TENSOR.into(),
                         shape: vec![rows, cols],
                         offset: down_offset,
                         length: len,
@@ -475,7 +496,7 @@ pub fn write_model_weights_with_opts(
                     norms_file.write_all(&bytes)?;
                     entries.push(WeightEntry {
                         key,
-                        kind: "vector".into(),
+                        kind: kind::VECTOR.into(),
                         shape: vec![data.len()],
                         offset: norms_offset,
                         length: bytes.len() as u64,
@@ -492,7 +513,7 @@ pub fn write_model_weights_with_opts(
             norms_file.write_all(&bytes)?;
             entries.push(WeightEntry {
                 key: "norm.weight".into(),
-                kind: "vector".into(),
+                kind: kind::VECTOR.into(),
                 shape: vec![data.len()],
                 offset: norms_offset,
                 length: bytes.len() as u64,
@@ -509,7 +530,7 @@ pub fn write_model_weights_with_opts(
             std::fs::write(dir.join(LM_HEAD_BIN), &lm_bytes)?;
             entries.push(WeightEntry {
                 key: "lm_head.weight".into(),
-                kind: "tensor".into(),
+                kind: kind::TENSOR.into(),
                 shape: vec![rows, cols],
                 offset: 0,
                 length: lm_bytes.len() as u64,

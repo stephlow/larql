@@ -314,6 +314,41 @@ Output files: `attn_weights_q4k.bin` + `interleaved_q4k.bin` with
 per-tensor manifests. `VindexConfig.quant = Q4k` in `index.json` so
 loaders can dispatch on config.
 
+### Stride validation (loud failure on stale vindexes)
+
+`load_attn_q4k` walks every manifest entry and compares its `length`
+to `QuantFormatInfo::expected_bytes(&shape)`. On mismatch it returns
+`VindexError::Parse` with rebuild guidance:
+
+```
+attn_weights_q4k_manifest: tensor "layers.0.self_attn.q_proj.weight"
+(Q4_K, shape [2048, 2560]) has length 3031040 but format expects 2949120
+(144 bytes/block × 21048). Likely cause: vindex built with legacy
+148-byte block_q4_K layout — rebuild the vindex with current code.
+```
+
+Pre-stride-validation, a vindex written before the GGUF-canonical
+144-byte writer landed (the legacy `block_q4_K` MSL struct uses 148
+bytes/block — 4 extra `mins[4]` padding) loaded silently. The kernel
+read off-stride by 4 bytes per superblock, drift accumulated across
+rows, and GPU prefill produced all-NaN. The validator catches this at
+load time so callers see a clear "rebuild" error rather than garbage
+decode output. See `index/storage/attn.rs::load_attn_q4k_rejects_legacy_148_byte_stride`.
+
+### `vocab_size` propagation
+
+`load_vindex` propagates `config.vocab_size` from `index.json` to the
+loaded `VectorIndex` unconditionally. Previously this only happened in
+the embeddings-as-tied-lm_head adoption block, so a vindex shipping
+`lm_head_q4.bin` (current Q4_K writer's default) but no `lm_head.bin`
+loaded with `vocab_size = 0`. The Q4 lm_head fast path then silently
+bailed (`if vocab > 0`), forcing a 4× slower fallback through the f32
+BLAS gemv — measured 8.4 ms vs 1.9 ms per token on Gemma 3 4B. Belt
+and braces: `load_lm_head_q4` also derives `vocab_size` from the file
+size when it's still 0 (Q4_K and Q4_0 both work out to 0.5625
+bytes/element). Regression test:
+`load_lm_head_q4_sets_vocab_size_from_file_size`.
+
 When `quant != None`, `--level browse` is implicitly promoted to
 `--level all` — the Q4_K writer emits all of attention, FFN, norms,
 and `lm_head` in one pass, and a browse-only Q4k vindex would be

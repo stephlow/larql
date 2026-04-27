@@ -305,17 +305,21 @@ impl MoeRouterWeights<'_> {
         let hidden = h.len();
 
         // Experts' input norm (used by callers for the expert matmuls).
+        // Router norm composes on top of h_norm — see the matching note in
+        // `larql-compute/src/cpu/ops/moe/forward.rs` (verified via
+        // `larql parity --component moe-block` against Metal's GPU
+        // dispatch convention).
         let h_norm = rms_norm(h, self.pre_experts_norm, eps, norm_offset);
 
         // Router input norm. Priority:
         //   1. learned router_norm weight (architectures that ship one),
         //   2. parameter-free RMSNorm (HF Gemma 4 — `with_scale=False`),
-        //   3. fallback: experts' pre-norm (legacy / archs without an explicit
-        //      router norm).
+        //   3. fallback: experts' pre-norm.
+        // All apply on top of h_norm so routing matches Metal.
         let router_in_normed = if !self.router_norm.is_empty() {
-            rms_norm(h, self.router_norm, eps, norm_offset)
+            rms_norm(&h_norm, self.router_norm, eps, norm_offset)
         } else if self.router_norm_parameter_free {
-            rms_norm_no_weight(h, eps)
+            rms_norm_no_weight(&h_norm, eps)
         } else {
             h_norm.clone()
         };

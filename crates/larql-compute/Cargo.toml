@@ -13,6 +13,9 @@ categories = ["science"]
 ndarray = { version = "0.16", features = ["blas"] }
 # MoE expert parallelism: top-k experts run independently per token.
 rayon = "1.10"
+# Wire-format constants (Q4_K_BLOCK_ELEMS, etc.) for padding decisions.
+# Tests/benches depend on it too — keep both lists in sync.
+larql-models = { path = "../larql-models" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
@@ -43,7 +46,6 @@ libc = "0.2"
 criterion = "0.5"
 serde_json = "1"
 memmap2 = "0.9"
-larql-models = { path = "../larql-models" }
 
 [[bench]]
 name = "matmul"

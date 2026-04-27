@@ -6,6 +6,7 @@
 
 pub mod bench_cmd;
 pub mod cache;
+pub mod diag_cmd;
 pub mod link_cmd;
 pub mod list_cmd;
 pub mod publish_cmd;

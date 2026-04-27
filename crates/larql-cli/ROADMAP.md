@@ -11,6 +11,77 @@ Primary verbs: `run`, `chat`, `pull`, `list`, `show`, `rm`, `link`, `serve`, `be
 
 ## P0: Generation UX (blocks demo)
 
+### `larql parity` — backend parity diagnostic
+**Status**: Designed 2026-04-27, not started.
+**Files**: new `src/commands/diagnostics/parity.rs` and a `Subcommand::Parity`
+  variant in `src/main.rs`. Trace-point infrastructure lives in
+  `larql-inference/src/diagnostics/` (new module).
+
+Cross-backend numerical diff tool. Catches "I refactored quantization /
+activation / norm and silently broke something" regressions that latency
+benches and synthetic-weight unit tests miss. Today's specific motivation:
+the CPU MoE path on Gemma 4 26B-A4B produces incoherent text while Metal
+produces "Paris." (See `larql-server/ROADMAP.md` P0 F0.)
+
+**Shape:**
+```bash
+larql parity <vindex> --component <C> [--prompt "..."] [--seed N]
+                                       [--layer N] [--expert M]
+                                       [--backends cpu,metal,hf]
+                                       [--tolerance 1e-3] [--verbose]
+```
+
+**Components (in order of build priority):**
+| Component | What it diffs | When it lands |
+|---|---|---|
+| `moe-expert` | Single expert forward (gate matmul, up matmul, gelu_tanh, down matmul) | v1 |
+| `moe-block` | Full MoE block, one layer (router → top-K → K experts → weighted sum → post-norm) | v1 — finds today's bug |
+| `attention` | Single attention block (Q/K/V proj, RoPE, softmax, O proj) | v2 |
+| `dense-ffn` | Dense FFN layer (gate, up, act, down) | v2 |
+| `layer` | Full transformer layer end-to-end | v2 |
+| `forward` | Full forward pass; per-layer divergence trace | v3 |
+
+**Backends (in order of build priority):**
+| Backend | Source of truth | When |
+|---|---|---|
+| `reference` | Slow naive triple-loop CPU; f64 accumulators; no BLAS, no padding tricks. The bedrock other backends compare against. | v1 |
+| `cpu` | Production `cpu_moe_forward` / `predict_q4k` paths | v1 |
+| `metal` | `gpu_moe_dispatch` / Metal `predict_q4k_metal`. Requires exposing public entry points or adding `gpu_dispatch_one_<component>` shims. | v2 |
+| `hf` | HuggingFace `transformers` reference loaded from a sidecar dump. Python script (`tools/hf_capture.py`) runs `model.forward` with intermediate captures, writes `.safetensors`; Rust harness loads and compares. | v3 |
+
+**Architecture:**
+- Trace points at well-defined checkpoints (`post_pre_norm`, `post_router_softmax`,
+  `post_gate_matmul`, `post_activation`, `post_down_matmul`, `post_combine`,
+  `post_post_norm`). Each checkpoint emits `(name: &str, &[f32])` to a
+  registered `TraceSink`.
+- One sink per backend. The diagnostic runs the same input through each
+  backend with its sink attached, then walks the merged traces and prints
+  the **first divergence** beyond `--tolerance` along with magnitude, index,
+  and surrounding context.
+- Trace points are zero-overhead in release builds (gated on a `diagnostics`
+  feature flag in `larql-inference`). When the feature is off, sinks are no-ops
+  and the compiler optimises them away.
+
+**v1 has already been validated as a one-shot prototype** (deleted after
+proving the approach): a slow naive reference matches `cpu_moe_forward`
+bit-identically (max diff 4.3e-6) on layer 0, expert 0 of the 26B-A4B vindex
+— so today's bug is **not** in per-expert compute. It must be in routing or
+expert combination, which v1's `moe-block` component will catch.
+
+**Testing strategy:**
+- `cargo test -p larql-cli --test test_parity_smoke`: synthetic 4-expert
+  MoE built from known weights; reference and CPU must agree to fp32 noise.
+- `cargo run -p larql-cli -- parity <real-vindex> --component moe-block`
+  in CI on a representative MoE vindex once we have one in the test fleet.
+
+**Open scoping decisions:**
+- Output format: human-readable table by default, `--json` for CI consumption?
+- Should `larql parity` accept `--from-recording <path>` to replay a previously
+  captured trace (avoids loading the model twice for repeated diffs)? Probably
+  yes for v3 once HF sidecar exists.
+- Tolerance per-component: `forward` after 30 layers will accumulate to
+  ~1e-2 even for "correct" backends; need component-specific defaults.
+
 ### Chat template — CLI side
 **Status**: Not started  
 **Files**: `src/commands/run_cmd.rs`  

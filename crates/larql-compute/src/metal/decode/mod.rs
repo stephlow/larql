@@ -83,7 +83,8 @@ impl MetalBackend {
         // activation buffer fed into down_proj gets allocated at this size
         // and zero-initialised so the padding columns contribute nothing.
         // (The per-stage-as-u32 forms now live inside `encode_ffn`.)
-        let inter_padded = inter.div_ceil(256) * 256;
+        let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+        let inter_padded = inter.div_ceil(block) * block;
 
         // Residual dump (env-gated) for HF-reference diffs. Active only when
         // `LARQL_DUMP_RESIDUALS=<path>` is set.

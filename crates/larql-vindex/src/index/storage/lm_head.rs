@@ -15,21 +15,100 @@
 
 use std::sync::Arc;
 
+use larql_models::quant::ggml::{
+    K_QUANT_BLOCK_ELEMS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS,
+};
+
 use crate::error::VindexError;
 use crate::format::filenames::*;
 use crate::mmap_util::mmap_optimized;
 
 use crate::index::core::VectorIndex;
 
+/// Numerator/denominator used to back-derive `vocab_size` from a Q4-packed
+/// lm_head file's byte length. Q4_K (144 B / 256 elems) and Q4_0 (18 B / 32
+/// elems) both rate at 0.5625 B/element, i.e. `9/16`. Knowing only the file
+/// size and `hidden_size`, the inverse is `vocab = bytes * 16 / (hidden * 9)`.
+const Q4_BYTES_PER_ELEM_NUM: usize = 9;
+const Q4_BYTES_PER_ELEM_DEN: usize = 16;
+
+// Compile-time invariants — if either constant ever changes, this assertion
+// catches the byte-rate calc immediately rather than producing silent vocab
+// inference drift.
+const _: () = assert!(
+    Q4_K_BLOCK_BYTES * Q4_BYTES_PER_ELEM_DEN == Q4_K_BLOCK_ELEMS * Q4_BYTES_PER_ELEM_NUM,
+    "Q4_K byte rate drift: 144/256 must equal 9/16",
+);
+const _: () = assert!(
+    Q4_0_BLOCK_BYTES * Q4_BYTES_PER_ELEM_DEN == Q4_0_BLOCK_ELEMS * Q4_BYTES_PER_ELEM_NUM,
+    "Q4_0 byte rate drift: 18/32 must equal 9/16",
+);
+
+/// Read the manifest entry for `lm_head.weight` from `weight_manifest.json`,
+/// if the manifest exists and contains an entry for that key. Returns `None`
+/// when the manifest is absent (older vindexes) or doesn't list lm_head.
+///
+/// Used by `load_lm_head_q4` to assert the on-disk file matches the format
+/// the reader is about to dispatch. The Q4_K-vs-Q4_0 byte-rate collision
+/// (0.5625 B/elem in both formats) made silent format mismatches invisible
+/// to file-size validation; checking the manifest's `kind` discriminator
+/// catches the mismatch at load-time.
+fn read_lm_head_manifest_kind(dir: &std::path::Path) -> Option<String> {
+    let manifest_path = dir.join(WEIGHT_MANIFEST_JSON);
+    let text = std::fs::read_to_string(&manifest_path).ok()?;
+    let entries: Vec<crate::format::weights::write_f32::WeightEntry> =
+        serde_json::from_str(&text).ok()?;
+    entries
+        .into_iter()
+        .find(|e| e.key == "lm_head.weight")
+        .map(|e| e.kind)
+}
+
 impl VectorIndex {
     /// Load Q4 lm_head for GPU logits (replaces CPU f32 lm_head KNN).
+    ///
+    /// When `weight_manifest.json` is present and lists `lm_head.weight`, the
+    /// entry's `kind` must be `kind::TENSOR_Q4K` — anything else is treated
+    /// as a writer/reader contract violation and rejected, since the matvec
+    /// kernel dispatched here (`q4k_matvec` via `lm_head_knn_backend`) is
+    /// Q4_K-specific. This blocks the regression where a Q4_0 file shipped
+    /// under the Q4_K filename produced silent garbage logits.
+    ///
+    /// Older vindexes without a manifest entry for lm_head still load (the
+    /// extractor wrote the file directly), but no format check happens.
     pub fn load_lm_head_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
         let path = dir.join(LM_HEAD_Q4_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("lm_head_q4.bin not found".into()));
         }
+        if let Some(manifest_kind) = read_lm_head_manifest_kind(dir) {
+            if manifest_kind != crate::format::weights::write_f32::kind::TENSOR_Q4K {
+                return Err(VindexError::Parse(format!(
+                    "lm_head_q4.bin manifest mismatch: expected kind \"{}\", \
+                     found \"{}\". This indicates the vindex was extracted with \
+                     a writer that disagrees with the Q4_K matvec dispatch path \
+                     — refusing to load to avoid silent garbage logits.",
+                    crate::format::weights::write_f32::kind::TENSOR_Q4K,
+                    manifest_kind
+                )));
+            }
+        }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };
+        // Derive `vocab_size` from the file size when it's still 0. Q4_K and
+        // Q4_0 share the 9/16 byte-rate (`Q4_BYTES_PER_ELEM_*`), so the same
+        // divisor handles both formats. Mirrors the pattern in `load_lm_head`
+        // for f32 lm_head files.
+        if self.vocab_size == 0 && self.hidden_size > 0 {
+            let bytes = mmap.len();
+            let denom = self.hidden_size * Q4_BYTES_PER_ELEM_NUM;
+            if denom > 0 {
+                let vocab = (bytes * Q4_BYTES_PER_ELEM_DEN) / denom;
+                if vocab > 0 {
+                    self.vocab_size = vocab;
+                }
+            }
+        }
         self.projections.lm_head_q4_mmap = Some(Arc::new(mmap));
         Ok(())
     }
@@ -48,7 +127,15 @@ impl VectorIndex {
         }
         let vocab = self.vocab_size;
         let hidden = self.hidden_size;
-        if vocab == 0 || hidden == 0 || !hidden.is_multiple_of(32) {
+        // Q4_K quantises in `K_QUANT_BLOCK_ELEMS`-element super-blocks, so
+        // `hidden` must be a multiple of that (matches the on-disk
+        // `lm_head_q4.bin` writer in `format/weights/write_q4k/mod.rs`).
+        // Earlier code used Q4_0 (32-element blocks) here but
+        // `lm_head_knn_backend` dispatches `q4k_matvec` for both the mmap and
+        // synth paths — keeping the synth bytes in Q4_K avoids the format-
+        // collision bug that broke gemma3-4b-v2.vindex (writer Q4_K vs reader
+        // Q4_0).
+        if vocab == 0 || hidden == 0 || !hidden.is_multiple_of(K_QUANT_BLOCK_ELEMS) {
             return;
         }
         let f16_mmap = match self.projections.lm_head_f16_mmap.as_ref() {
@@ -59,21 +146,19 @@ impl VectorIndex {
         if f16_mmap.len() < expected {
             return;
         }
-        let blocks_per_row = hidden / 32;
-        let bytes_per_row = blocks_per_row * 18;
-        let mut out = Vec::with_capacity(vocab * bytes_per_row);
-        let mut row_f32 = vec![0.0f32; hidden];
-        for row in 0..vocab {
-            let base = row * hidden * 2;
-            for (i, slot) in row_f32.iter_mut().enumerate().take(hidden) {
-                let off = base + i * 2;
-                let bits = u16::from_le_bytes([f16_mmap[off], f16_mmap[off + 1]]);
-                *slot = larql_models::quant::half::f16_to_f32(bits);
-            }
-            let q4 = larql_compute::cpu::q4::quantize_q4_0(&row_f32);
-            out.extend_from_slice(&q4);
+        // Decode the whole f16 mmap to f32 in one pass, then Q4_K-quantise
+        // the flat `[vocab, hidden]` row-major data. Q4_K's 256-element
+        // super-blocks fit cleanly into one row when `hidden` is a multiple
+        // of 256, so a flat call gives the same row-by-row layout the
+        // matvec kernel expects.
+        let mut all_f32 = vec![0.0f32; vocab * hidden];
+        for (i, slot) in all_f32.iter_mut().enumerate() {
+            let off = i * 2;
+            let bits = u16::from_le_bytes([f16_mmap[off], f16_mmap[off + 1]]);
+            *slot = larql_models::quant::half::f16_to_f32(bits);
         }
-        self.projections.lm_head_q4_synth = Some(Arc::new(out));
+        let q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(&all_f32);
+        self.projections.lm_head_q4_synth = Some(Arc::new(q4k));
     }
 
     /// Adopt the vindex's f16 `embeddings.bin` mmap as an f16 view of the
@@ -129,7 +214,18 @@ impl VectorIndex {
         top_k: usize,
         backend: &dyn larql_compute::ComputeBackend,
     ) -> Vec<(u32, f32)> {
-        // 1. Q4 path — ~1 ms on Metal (mmap file or synthesized from f16 embeddings).
+        // 1. Q4_K path — ~1 ms on Metal (mmap file or synthesized from f16 embeddings).
+        //
+        // The on-disk `lm_head_q4.bin` is written by `format/weights/write_q4k`
+        // as **Q4_K** (144 bytes per 256 elements with sub-block scales/mins).
+        // Earlier code dispatched `q4_matvec` (which is Q4_0 — 18 bytes per 32
+        // elements with one f16 scale): the byte-rate happens to match
+        // (0.5625 B/element) so file size was identical, but the kernel read
+        // Q4_K bytes as Q4_0 scales/quants and silently produced garbage
+        // logits. Symptom: multilingual gibberish under `--metal` on any
+        // vindex with a fresh `lm_head_q4.bin` (e.g. gemma3-4b-v2 extracted
+        // 2026-04-27). Routing through `q4k_matvec` (which takes raw f32 x,
+        // no Q8 step) restores the format match.
         if backend.has_q4() {
             let q4_bytes: Option<&[u8]> = self
                 .projections
@@ -146,25 +242,10 @@ impl VectorIndex {
                 let vocab = self.vocab_size;
                 let hidden = self.hidden_size;
                 if vocab > 0 {
-                    let x = query.as_slice().unwrap();
-                    let (q8_x, q8_scales) = larql_compute::cpu::q4::quantize_to_q8(x);
-                    if top_k == 1 {
-                        if let Some((idx, score)) =
-                            backend.q4_matvec_topk1(q4_data, &q8_x, &q8_scales, vocab, hidden)
-                        {
-                            return vec![(idx, score)];
+                    if let Some(x) = query.as_slice() {
+                        if let Some(scores_vec) = backend.q4k_matvec(q4_data, x, vocab, hidden) {
+                            return Self::top_k_sorted(scores_vec, top_k);
                         }
-                    } else if let Some(hits) =
-                        backend.q4_matvec_topk(q4_data, &q8_x, &q8_scales, vocab, hidden, top_k)
-                    {
-                        if !hits.is_empty() {
-                            return hits;
-                        }
-                    }
-                    if let Some(scores_vec) =
-                        backend.q4_matvec(q4_data, &q8_x, &q8_scales, vocab, hidden)
-                    {
-                        return Self::top_k_sorted(scores_vec, top_k);
                     }
                 }
             }
@@ -441,7 +522,12 @@ mod tests {
         use std::sync::Arc;
 
         let vocab: usize = 16;
-        let hidden: usize = 64; // must be multiple of 32
+        // Q4_K uses 256-element super-blocks; the synth path now matches
+        // the on-disk `lm_head_q4.bin` writer (Q4_K) so hidden must be a
+        // multiple of 256. Earlier this used 64 (Q4_0's 32-elem blocks)
+        // and the synth emitted Q4_0, which silently corrupted logits
+        // when `lm_head_knn_backend` dispatched `q4k_matvec` on it.
+        let hidden: usize = 256;
 
         // Build a synthetic f16 embedding table: row i = constant (i+1) * 0.01
         let mut f16_bytes = vec![0u8; vocab * hidden * 2];
@@ -476,14 +562,21 @@ mod tests {
         index.synthesize_lm_head_q4();
         assert!(index.has_lm_head_q4(), "should have Q4 after synthesis");
 
-        // Byte length check.
+        // Byte length check uses canonical Q4_K block geometry from
+        // `larql-models::quant::ggml` so the test fails immediately if the
+        // writer ever switches blocks under us.
         let synth = index.projections.lm_head_q4_synth.as_ref().unwrap();
-        let blocks_per_row = hidden / 32;
-        let bytes_per_row = blocks_per_row * 18;
+        let super_blocks = (vocab * hidden) / Q4_K_BLOCK_ELEMS;
         assert_eq!(
             synth.len(),
-            vocab * bytes_per_row,
-            "synthesized Q4 byte length should be vocab × (hidden/32 × 18)"
+            super_blocks * Q4_K_BLOCK_BYTES,
+            "synthesized Q4_K byte length should be \
+             (vocab × hidden / Q4_K_BLOCK_ELEMS) × Q4_K_BLOCK_BYTES — \
+             a different rate (e.g. /Q4_0_BLOCK_ELEMS × Q4_0_BLOCK_BYTES) means \
+             the synth path has drifted from the on-disk Q4_K writer and \
+             `q4k_matvec` will read it as garbage. Same byte rate (0.5625 \
+             B/elem) makes this regression silent without an explicit \
+             super-block count check."
         );
 
         // Calling again should be a no-op (idempotent).
@@ -496,5 +589,305 @@ mod tests {
             .unwrap()
             .as_ptr();
         assert_eq!(ptr_before, ptr_after, "second call should not reallocate");
+    }
+
+    /// Regression: a vindex shipping `lm_head_q4.bin` but no `lm_head.bin`
+    /// (the post-2026-04-26 Q4_K writer's default) used to leave
+    /// `vocab_size = 0`. The Q4 lm_head fast path then silently bailed
+    /// (`if vocab > 0`), forcing a 4× slower fallback through the f32
+    /// BLAS gemv on `weights.lm_head`. This test pins the fix:
+    /// `load_lm_head_q4` must populate `vocab_size` from the file size
+    /// when no other source has set it.
+    #[test]
+    fn load_lm_head_q4_sets_vocab_size_from_file_size() {
+        // Q4_K and Q4_0 both rate at `Q4_BYTES_PER_ELEM_NUM /
+        // Q4_BYTES_PER_ELEM_DEN` (= 9/16 = 0.5625 B/elem), so the same
+        // formula handles both. vocab=256 × hidden=128 → 18432 bytes.
+        let hidden = 128usize;
+        let vocab = 256usize;
+        let bytes = vocab * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
+        let payload = vec![0u8; bytes];
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), &payload).unwrap();
+
+        // Build a minimal index — vocab_size starts at 0.
+        let mut index = VectorIndex::empty(1, hidden);
+        assert_eq!(index.vocab_size, 0);
+
+        index.load_lm_head_q4(tmp.path()).expect("load lm_head_q4");
+
+        assert_eq!(
+            index.vocab_size, vocab,
+            "load_lm_head_q4 must derive vocab_size from file size when it's 0"
+        );
+    }
+
+    /// Companion: when `vocab_size` is *already* set (by index.json or
+    /// `load_lm_head`), `load_lm_head_q4` must not clobber it.
+    #[test]
+    fn load_lm_head_q4_does_not_overwrite_existing_vocab_size() {
+        let hidden = 128usize;
+        let bytes = 256 * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
+        let payload = vec![0u8; bytes];
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), &payload).unwrap();
+
+        let mut index = VectorIndex::empty(1, hidden);
+        index.vocab_size = 999; // pretend index.json already set this
+        index.load_lm_head_q4(tmp.path()).unwrap();
+
+        assert_eq!(index.vocab_size, 999, "must not clobber preset vocab_size");
+    }
+
+    /// Companion: `load_lm_head_q4` is a no-op for vocab_size when the
+    /// hidden_size is 0 (avoid div-by-zero / nonsense vocab).
+    #[test]
+    fn load_lm_head_q4_skips_vocab_inference_when_hidden_size_zero() {
+        let payload = vec![0u8; 100];
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), &payload).unwrap();
+
+        let mut index = VectorIndex::empty(1, 0);
+        index.load_lm_head_q4(tmp.path()).unwrap();
+        assert_eq!(index.vocab_size, 0, "no inference possible without hidden_size");
+    }
+
+    /// Regression test for the gemma3-4b-v2 garbage-output bug (2026-04-27):
+    /// `format/weights/write_q4k::write_model_weights_q4k` writes
+    /// `lm_head_q4.bin` as **Q4_K** (144 B / 256 elems with sub-block
+    /// scales/mins). `lm_head_knn_backend` previously dispatched
+    /// `backend.q4_matvec` which is **Q4_0** (18 B / 32 elems with one f16
+    /// scale): same byte rate, completely different layout, silent garbage.
+    ///
+    /// This pins the contract that the two ends of the pipeline agree on
+    /// the format. Round-trip a known matrix through the writer's
+    /// quantiser, run it through `lm_head_knn_backend`, and assert the
+    /// top-1 token matches the f32 dot-product reference.
+    #[test]
+    fn lm_head_q4k_writer_reader_format_round_trip() {
+        // Q4_K constraint: hidden must be a multiple of 256, vocab*hidden
+        // must be a multiple of 256. 256×256 satisfies both with cheap
+        // numerical work for a unit test.
+        let vocab = 256usize;
+        let hidden = 256usize;
+
+        // Build a deterministic, well-conditioned [vocab, hidden] matrix.
+        // Each row has a peak at one column so the f32 reference has an
+        // unambiguous top-1 answer for any one-hot-ish query, while
+        // sub-block scales/mins are non-trivial (Q4_K is structure-aware).
+        let mut lm_head = vec![0.0f32; vocab * hidden];
+        for v in 0..vocab {
+            for h in 0..hidden {
+                // Peak shaped like a smooth Gaussian centred at column v%hidden,
+                // with a small ramp for off-diagonal values.
+                let dist = ((h as f32) - (v as f32 % hidden as f32)).abs();
+                lm_head[v * hidden + h] = (-dist * 0.05).exp() + 0.001 * (h as f32);
+            }
+        }
+
+        // Quantise via the SAME writer the production extractor uses.
+        let q4k_bytes = larql_compute::cpu::ops::q4_common::quantize_q4_k(&lm_head);
+        // Sanity: byte count matches the canonical Q4_K rate.
+        assert_eq!(
+            q4k_bytes.len(),
+            vocab * hidden / Q4_K_BLOCK_ELEMS * Q4_K_BLOCK_BYTES,
+            "Q4_K quant should produce Q4_K_BLOCK_BYTES per Q4_K_BLOCK_ELEMS-element super-block"
+        );
+
+        // Inject into a synthetic VectorIndex via the synth path.
+        let mut index = VectorIndex::empty(1, hidden);
+        index.vocab_size = vocab;
+        index.projections.lm_head_q4_synth = Some(Arc::new(q4k_bytes));
+
+        // Pick a query that points at a known peak — token 42's row peaks
+        // at column 42, so the dot product is highest at row 42.
+        let target_token = 42u32;
+        let mut query = ndarray::Array1::<f32>::zeros(hidden);
+        query[target_token as usize] = 1.0;
+
+        // f32 reference: dot product of `query` against every row of `lm_head`.
+        let ref_scores: Vec<f32> = (0..vocab)
+            .map(|v| (0..hidden).map(|h| lm_head[v * hidden + h] * query[h]).sum())
+            .collect();
+        let ref_top1 = ref_scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        assert_eq!(
+            ref_top1, target_token,
+            "fixture sanity: f32 reference must pick token 42"
+        );
+
+        // Run through the production dispatch with a CPU backend.
+        let cpu = larql_compute::CpuBackend;
+        let hits = index.lm_head_knn_backend(&query, 5, &cpu);
+        assert!(
+            !hits.is_empty(),
+            "lm_head_knn_backend returned empty — Q4_K dispatch silently failed; \
+             this is exactly the format-collision bug the test exists to catch"
+        );
+        let (top_token, _) = hits[0];
+        assert_eq!(
+            top_token, target_token,
+            "Q4_K-quantised lm_head must select the same top-1 token as the \
+             f32 reference (within Q4_K noise on a Gaussian-peak fixture). \
+             A mismatch here means the writer and reader disagree on the \
+             quantisation format — most likely a regression of the \
+             Q4_K-vs-Q4_0 dispatch confusion fixed in 2026-04-27. \
+             ref_top1={ref_top1}, got={top_token}"
+        );
+
+        // Stronger: top-5 must include the target (ranking can shift by
+        // ±1 from Q4_K noise on the smooth fixture, but not by hundreds).
+        let top5_tokens: Vec<u32> = hits.iter().map(|(t, _)| *t).collect();
+        assert!(
+            top5_tokens.contains(&target_token),
+            "top-5 must contain target token {target_token}, got {top5_tokens:?}"
+        );
+    }
+
+    /// Companion: the synth path (`synthesize_lm_head_q4`) must produce
+    /// the same Q4_K format as the on-disk writer. Earlier the synth path
+    /// emitted Q4_0 while the writer emitted Q4_K — both ended up routed
+    /// through `q4k_matvec` after the dispatch fix, so a Q4_0 synth would
+    /// silently corrupt logits for tied-embedding models that take the
+    /// synth branch.
+    #[test]
+    fn synth_q4_lm_head_uses_q4k_format() {
+        let vocab = 256usize;
+        let hidden = 256usize;
+
+        // Build an f16 mmap-shaped buffer (vocab × hidden × 2 bytes).
+        // Use simple values so f16 conversion round-trips cleanly.
+        let mut f16_buf = vec![0u8; vocab * hidden * 2];
+        for v in 0..vocab {
+            for h in 0..hidden {
+                let val = if h == v { 1.0f32 } else { 0.01 };
+                let bits = larql_models::quant::half::f32_to_f16(val);
+                let off = (v * hidden + h) * 2;
+                f16_buf[off] = (bits & 0xff) as u8;
+                f16_buf[off + 1] = ((bits >> 8) & 0xff) as u8;
+            }
+        }
+
+        let mut index = VectorIndex::empty(1, hidden);
+        index.vocab_size = vocab;
+        index.set_lm_head_f16_mmap(Arc::new(memmap_from_bytes(&f16_buf)));
+        index.synthesize_lm_head_q4();
+
+        let synth = index
+            .projections
+            .lm_head_q4_synth
+            .as_ref()
+            .expect("synth must populate lm_head_q4_synth");
+        // Q4_K size invariant: Q4_K_BLOCK_BYTES per Q4_K_BLOCK_ELEMS-element super-block.
+        assert_eq!(
+            synth.len(),
+            vocab * hidden / Q4_K_BLOCK_ELEMS * Q4_K_BLOCK_BYTES,
+            "synth must produce Q4_K-sized bytes \
+             (Q4_K_BLOCK_BYTES B / Q4_K_BLOCK_ELEMS elems), not Q4_0-sized \
+             (Q4_0_BLOCK_BYTES B / Q4_0_BLOCK_ELEMS elems). Same byte rate \
+             per element makes this regression silent without this assert."
+        );
+
+        // Functional check: top-1 against an indicator query points at the
+        // expected diagonal token.
+        let target = 17u32;
+        let mut query = ndarray::Array1::<f32>::zeros(hidden);
+        query[target as usize] = 1.0;
+        let cpu = larql_compute::CpuBackend;
+        let hits = index.lm_head_knn_backend(&query, 5, &cpu);
+        let top: Vec<u32> = hits.iter().map(|(t, _)| *t).collect();
+        assert!(
+            top.contains(&target),
+            "synth Q4_K lm_head must rank target token {target} in top-5 \
+             of an indicator query; got {top:?}"
+        );
+    }
+
+    /// Helper: build a memmap2::Mmap-shaped byte source for tests. Writes
+    /// to a tempfile and mmaps it back — the synth function holds an
+    /// `Arc<Mmap>` so we can't fake it inline.
+    fn memmap_from_bytes(bytes: &[u8]) -> memmap2::Mmap {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        unsafe { memmap2::Mmap::map(&f).unwrap() }
+    }
+
+    /// Architectural regression test: when `weight_manifest.json` lists
+    /// `lm_head.weight` with `kind != tensor_q4k`, `load_lm_head_q4` must
+    /// refuse to load. This is the bug class that produced silent garbage
+    /// logits in gemma3-4b-v2.vindex (writer Q4_K, reader Q4_0 dispatch).
+    #[test]
+    fn load_lm_head_q4_rejects_manifest_kind_mismatch() {
+        let hidden = 128usize;
+        let vocab = 256usize;
+        let bytes = vocab * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), vec![0u8; bytes]).unwrap();
+
+        // Manifest claims lm_head is f16 — incompatible with Q4_K dispatch.
+        let manifest = serde_json::json!([{
+            "key": "lm_head.weight",
+            "kind": crate::format::weights::write_f32::kind::TENSOR_F16,
+            "shape": [vocab, hidden],
+            "offset": 0,
+            "length": bytes,
+            "file": "lm_head_q4.bin",
+        }]);
+        std::fs::write(
+            tmp.path().join(WEIGHT_MANIFEST_JSON),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut index = VectorIndex::empty(1, hidden);
+        let result = index.load_lm_head_q4(tmp.path());
+        assert!(
+            result.is_err(),
+            "load_lm_head_q4 must reject when manifest kind disagrees with TENSOR_Q4K"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("manifest mismatch"),
+            "error must explain the mismatch, got: {err_msg}"
+        );
+    }
+
+    /// Companion: when the manifest correctly tags lm_head as TENSOR_Q4K,
+    /// loading proceeds normally.
+    #[test]
+    fn load_lm_head_q4_accepts_correct_manifest_kind() {
+        let hidden = 128usize;
+        let vocab = 256usize;
+        let bytes = vocab * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), vec![0u8; bytes]).unwrap();
+
+        let manifest = serde_json::json!([{
+            "key": "lm_head.weight",
+            "kind": crate::format::weights::write_f32::kind::TENSOR_Q4K,
+            "shape": [vocab, hidden],
+            "offset": 0,
+            "length": bytes,
+            "file": "lm_head_q4.bin",
+        }]);
+        std::fs::write(
+            tmp.path().join(WEIGHT_MANIFEST_JSON),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut index = VectorIndex::empty(1, hidden);
+        index
+            .load_lm_head_q4(tmp.path())
+            .expect("matching manifest kind should load");
+        assert_eq!(index.vocab_size, vocab);
     }
 }

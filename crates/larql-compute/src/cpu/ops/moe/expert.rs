@@ -38,7 +38,10 @@ pub fn run_single_expert(
     // remote-expert HTTP endpoint and local in-process MoE share the same
     // numerics.
     let inter_padded = match format {
-        crate::QuantFormat::Q4_K => inter.div_ceil(256) * 256,
+        crate::QuantFormat::Q4_K => {
+            let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+            inter.div_ceil(block) * block
+        }
         _ => inter,
     };
 
