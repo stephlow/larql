@@ -42,39 +42,38 @@ impl ExpertService for ExpertGrpcService {
         let req = request.into_inner();
         let state = Arc::clone(&self.state);
 
-        let results = tokio::task::spawn_blocking(move || {
-            req.items
-                .iter()
-                .map(|item| {
+        let futs: Vec<_> = req.items
+            .into_iter()
+            .map(|item| {
+                let s = Arc::clone(&state);
+                tokio::task::spawn_blocking(move || {
                     let layer = item.layer as usize;
                     let expert_id = item.expert_id as usize;
-
                     if item.residual.len() % 4 != 0 {
                         return Err(Status::invalid_argument("residual not 4-byte aligned"));
                     }
-                    let residual: Vec<f32> = item
-                        .residual
-                        .chunks_exact(4)
+                    let residual: Vec<f32> = item.residual.chunks_exact(4)
                         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                         .collect();
-
-                    let output =
-                        crate::routes::expert::run_expert(&state, layer, expert_id, &residual)
-                            .map_err(|e| Status::internal(e.to_string()))?;
-
-                    let output_bytes: Vec<u8> =
-                        output.iter().flat_map(|v| v.to_le_bytes()).collect();
-
+                    let output = crate::routes::expert::run_expert(&s, layer, expert_id, &residual)
+                        .map_err(|e| Status::internal(e.to_string()))?;
                     Ok(ExpertBatchResult {
                         layer: item.layer,
                         expert_id: item.expert_id,
-                        output: output_bytes,
+                        output: output.iter().flat_map(|v| v.to_le_bytes()).collect(),
                     })
                 })
-                .collect::<Result<Vec<_>, Status>>()
-        })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))??;
+            })
+            .collect();
+
+        let results: Vec<ExpertBatchResult> = {
+            let mut v = Vec::new();
+            for task in futures::future::join_all(futs).await {
+                v.push(task.map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(|e| e)?);
+            }
+            v
+        };
 
         let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
         Ok(Response::new(ExpertBatchResponse {
@@ -140,35 +139,37 @@ impl ExpertService for ExpertGrpcService {
 
                 let state2 = Arc::clone(&state);
 
-                // Run on the blocking pool — expert matmuls are CPU-bound.
-                let h2 = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, Status> {
-                    let hidden = residual.len();
-                    let mut out = vec![0.0f32; hidden];
+                // Spawn each expert as a separate non-blocking tokio task.
+                // The stream handler stays async throughout — it awaits all
+                // expert futures concurrently via join_all rather than
+                // blocking on any of them.  4 experts run on 4 separate
+                // blocking-pool threads, truly in parallel.
+                let futs: Vec<_> = expert_ids
+                    .iter()
+                    .zip(expert_weights.iter())
+                    .filter(|(_, &w)| w != 0.0)
+                    .map(|(&eid, &w)| {
+                        let s = Arc::clone(&state2);
+                        let r = residual.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::routes::expert::run_expert(&s, layer, eid, &r)
+                                .map(|out| (out, w))
+                                .map_err(|e| Status::internal(e.to_string()))
+                        })
+                    })
+                    .collect();
 
-                    for (&expert_id, &weight) in
-                        expert_ids.iter().zip(expert_weights.iter())
-                    {
-                        if weight == 0.0 {
-                            continue;
-                        }
-                        let expert_out =
-                            crate::routes::expert::run_expert(&state2, layer, expert_id, &residual)
-                                .map_err(|e| Status::internal(e.to_string()))?;
-                        for (acc, &v) in out.iter_mut().zip(expert_out.iter()) {
-                            *acc += weight * v;
-                        }
+                let hidden = residual.len();
+                let mut out = vec![0.0f32; hidden];
+                for task in futures::future::join_all(futs).await {
+                    let (expert_out, weight) = task
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(|e| e)?;
+                    for (acc, &v) in out.iter_mut().zip(expert_out.iter()) {
+                        *acc += weight * v;
                     }
-
-                    // Post-experts norm is applied by the CLIENT after combining
-                    // all shards' partial sums.  Applying it here (on a partial
-                    // sum) then summing would be wrong:
-                    //   norm(A) + norm(B) ≠ norm(A + B)
-                    // The server returns the raw partial weighted sum; the client
-                    // does the final post_experts_norm over the combined result.
-                    Ok(out)
-                })
-                .await
-                .map_err(|e| Status::internal(e.to_string()))??;
+                }
+                let h2 = out;
 
                 let h2_bytes: Vec<u8> = h2.iter().flat_map(|v| v.to_le_bytes()).collect();
                 yield ExpertLayerOutput {

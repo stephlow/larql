@@ -95,6 +95,12 @@ pub struct MetalBackend {
     /// routes through `q4k_matvec_pipeline` for minimal register pressure.
     pub q4k_matmul_pipeline: KernelHandle,
     pub q4k_ffn_gate_up_pipeline: KernelHandle,
+    /// Experimental Q4_K gate+up with f16 inner accumulators — opt-in
+    /// via `LARQL_F16_ACC=1` while precision is being validated.
+    /// Hypothesis: 2× f16 FMA throughput on Apple GPUs frees ALU cycles
+    /// even on bandwidth-bound kernels. See
+    /// `shaders/q4k_ffn_gate_up_f16acc.rs`.
+    pub q4k_ffn_gate_up_f16acc_pipeline: KernelHandle,
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
     pub q4k_geglu_silu_down_pipeline: KernelHandle,
     pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
@@ -223,6 +229,9 @@ impl MetalBackend {
         // Fused Q4_K / Q4_KF FFN gate+up (KernelHandle).
         let q4k_ffn_gate_up_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up::Kernel>(&device, &library)?;
+        let q4k_ffn_gate_up_f16acc_pipeline = KernelHandle::from_kernel::<
+            shaders::q4k_ffn_gate_up_f16acc::Kernel,
+        >(&device, &library)?;
         let q4kf_ffn_gate_up_pipeline =
             KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(&device, &library)?;
         // Fused activation+down (KernelHandle).
@@ -341,6 +350,7 @@ impl MetalBackend {
             q4k_matvec_pipeline,
             q4k_matmul_pipeline,
             q4k_ffn_gate_up_pipeline,
+            q4k_ffn_gate_up_f16acc_pipeline,
             q4kf_ffn_gate_up_pipeline,
             q4k_geglu_silu_down_pipeline,
             q4k_geglu_gelu_tanh_down_pipeline,

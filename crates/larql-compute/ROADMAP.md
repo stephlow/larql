@@ -1,23 +1,36 @@
 # Roadmap — larql-compute
 
-## Current state (2026-04-26, M3 Max, real vindex)
+## Current state (2026-04-28, M3 Max, real vindex)
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **81–84** | ~12.0ms | q6k_matvec ROWS_PER_TG=4 + lm_head GPU top-K (2026-04-26) |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **78–79** | ~12.7ms | corrected baseline (see ⚠ note below) |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **98–103** | ~10ms | reference (same hardware, same prompt) |
-| **Gap** | LARQL is **~1.22×** slower | ~2.2ms/tok | per-stage decomposition below |
+| **Ollama** gemma3:4b | **94–98** | ~10.5ms | reference (same hardware, same prompt) |
+| **Gap** | LARQL is **~1.27×** slower | ~2.2ms/tok | per-stage decomposition below |
 | **LARQL Metal** (gemma4-26B-A4B, MoE Q4K GPU dispatch) | **5.1** | ~194ms | Phase 1 shipped; Phase 2 open — see P0 below |
 | **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; expert dispatch accounts for ~179ms gap |
 
-Per-stage (50-token decode after 3 warmup, typical):
+> ⚠ **The earlier "81–84 tok/s" number was on broken code.** Bisected
+> 2026-04-28: commit `077884b "working on performance"` (2026-04-27)
+> corrected a silent dispatch bug in
+> `metal/stages/quant_matvec.rs::encode` where Q4_K weights were routed
+> through the **Q4_KF kernel** with Q4_KF's threadgroup geometry
+> (4 rows/TG, 64 threads) — leaving **~75% of output rows unwritten**.
+> The 81–84 was real wall-clock throughput but the model was producing
+> wrong logits. After 077884b, Q4_K dispatches its own kernel (8 rows/TG,
+> 256 threads) and writes all rows. Output is now correct, ~5 tok/s
+> slower. **Don't try to recover 81–84 by reverting** — that
+> re-introduces the bug. Real gains from here require actual Q4_K kernel
+> optimisation (see P0 entries).
+
+Per-stage (50-token decode after 5 warmup, quiet system, 2026-04-28):
 
 | Stage | LARQL | Ollama (est.) | Gap |
 |---|---|---|---|
-| GPU fwd | ~11.2ms | ~8.5ms | ~2.7ms |
-| lm_head | ~1.84ms | ~1.3ms | ~0.5ms |
-| **Total** | **~12.3ms** | **~9.9ms** | **~2.4ms** |
+| GPU fwd | ~11.6ms | ~8.5ms | ~3.1ms |
+| lm_head | ~1.93ms | ~1.3ms | ~0.6ms |
+| **Total** | **~12.7ms** | **~10.5ms** | **~2.2ms** |
 
 **lm_head shipped 2026-04-26**: 2.28ms → 1.84ms (~0.44ms saved). Two
 pieces — (1) `top_k_sorted` in `larql-vindex/index/storage/lm_head.rs` now
@@ -60,7 +73,82 @@ convention); the q4_KF fast-path doesn't apply to those.
 
 ## P0: Production gap closers
 
-Remaining gap: **~1.30×** (~77 vs ~100 tok/s, ~3ms/tok).
+Remaining gap: **~1.30×** (~76 vs ~99 tok/s, ~3ms/tok).
+
+### Decode gap diagnosis (2026-04-28, 3-iter median)
+
+Measured per-stage on `gemma3-4b-q4k-v2.vindex`, 50-token decode after 5 warmup, ollama gemma3:4b reference on same machine:
+
+| stage | LARQL | Ollama (est.) | gap (ms) | gap (% of total) |
+|---|---|---|---|---|
+| **GPU forward** (34 layers) | **11.91 ms** | **~8.5 ms** | **3.41 ms** | **90% of gap** |
+| **lm_head** (262K × 2560) | **1.89 ms** | **~1.5 ms** | 0.39 ms | 10% of gap |
+| embed + final_norm + detok | <0.05 ms | <0.15 ms | ~0 | ~0% |
+| **total** | **13.16 ms/tok = 76 tok/s** | **10.15 ms/tok = 99 tok/s** | **3.01 ms** | **1.30×** |
+
+The gap is **almost entirely in the GPU forward**. Within GPU forward (~0.35 ms/layer × 34 layers):
+
+| kernel | shape | batched GB/s | est. share | utilisation |
+|---|---|---|---|---|
+| `q4k_ffn_gate_up` (fused gate+up) | 10240 × 2560 | **274 GB/s** | ~31% (~3.7 ms) | bandwidth-bound, **74% of LPDDR5X peak** |
+| `q6k_matvec` (down) | 2560 × 10240 | **311 GB/s** | ~19% (~2.3 ms) | bandwidth-bound, **84% of peak** |
+| Wo + QKV + attn + 4× RMS norms | mixed | mixed | ~50% (~5.9 ms) | mixed, presumed near-peak |
+| **GPU fwd total** | — | — | 100% (~11.9 ms) | — |
+
+**lm_head**: `f32_gemv` runs at 374 GB/s — within 1% of LPDDR5X peak (370 GB/s). Bandwidth is NOT the bottleneck there; remaining gap is CPU-side readback + size-K heap.
+
+⚠ The earlier "103 GB/s ALU-bound on q4k_ffn_gate_up" diagnosis was a **profiler bug** — the "batched" measurement was creating a fresh cmd buffer per call (with commit+wait per call) instead of running `n_layers` dispatches in ONE cmd buffer. The per-call overhead dominated, undercounting throughput 2-4×. Fixed 2026-04-28 in `metal/diag/kernel_profile.rs::measure_single_cmdbuf_batched`. With the fix, both big FFN kernels are bandwidth-bound at 74-84% of LPDDR5X peak — no compute-bound headroom.
+
+Reproduction: `cargo run --release --features metal -p larql-cli --bin larql -- bench output/gemma3-4b-q4k-v2.vindex --backends metal --ollama gemma3:4b --tokens 50 --warmup 5` on a quiet system. Per-kernel detail: `cargo run --release --features metal -p larql-compute --example diag_profile_kernels`.
+
+### Decode kernel optimization — the path forward (2026-04-28, revised)
+
+**Both big FFN kernels are already bandwidth-bound near LPDDR5X peak.** The earlier "compute-bound, ALU-throttled" framing was a profiler artifact. The remaining 3 ms gap to ollama isn't sitting in any single kernel with obvious headroom — it's distributed across the dispatch pipeline.
+
+#### Track A — profiler harness fixed ✓ (2026-04-28, done)
+
+`metal/diag/kernel_profile.rs` now uses `measure_single_cmdbuf_batched` for q6k_matvec and q4k_ffn_gate_up. Old `measure_batched` is kept (with a "DON'T USE for kernel throughput" doc note) for callers who genuinely want per-call cmd-buffer overhead. **Follow-up**: same fix for q4k_matvec (Wo) and any future kernels added.
+
+#### Track B — `q4k_ffn_gate_up_f16acc` SHIPPED 2026-04-28 (opt-in, no end-to-end win on this hardware)
+
+`metal/shaders/q4k_ffn_gate_up_f16acc.rs` — variant with f16 inner accumulators (per-superblock dot product). Outer accumulator and `sumy` stay f32. Safe because Q4_K nibbles are 0..15 (exact in f16) and RMS-normed X has |x| < ~5, so the 16-FMA partial sum stays well under f16 max (65504).
+
+**Measured 2026-04-28**:
+
+| measurement | f32 (default) | f16 acc | delta |
+|---|---|---|---|
+| Kernel isolated (N=10240, K=2560) | 0.607 ms | 0.340 ms | **1.79× kernel speedup** |
+| End-to-end decode, **thermally loaded** GPU | 16.40 ms/tok | 13.34 ms/tok | +23% (apparent) |
+| End-to-end decode, **quiet** GPU | 12.95 ms/tok | 13.06 ms/tok | **at parity (~1% slower)** |
+| Numerical drift (max abs in kernel output) | — | 0.155 (≈1.5% relative) | — |
+| Output text on 10-prompt corpus | bit-identical to f16 | bit-identical to f32 | full parity ✓ |
+
+**The end-to-end perf win does not reproduce on a quiet GPU.** Initial 5-iter measurement showed +23% throughput, but that was on a thermally-loaded system where the f32 kernel was throttling. On a quiet system both paths run at the same wall-clock — f16 freed ALU cycles get absorbed into pipeline stalls or thermal headroom the surrounding kernels reclaim. The 1.79× kernel speedup is real in isolation; it doesn't translate to end-to-end decode improvement because the kernel was already bandwidth-bound (274 GB/s, 74% of LPDDR5X peak), not ALU-bound.
+
+**Numerical parity is solid**: 10-prompt greedy-decode sweep (knowledge / code / math / creative / translation, 32 tokens each) — all outputs bit-identical between f32 and f16 paths. The 1.5% per-call drift never crosses a top-1 token boundary in the validated corpus.
+
+**Status: kept as `LARQL_F16_ACC=1` opt-in.** Default stays f32. Useful as future-proofing if (a) hardware changes the ALU/bandwidth balance, (b) a future kernel re-fuses the path so ALU becomes the bottleneck, or (c) a sustained-load workload benefits from less thermal pressure. Not promoted to default because there's no measurable steady-state win to justify the precision risk on unvalidated workloads.
+
+**Lesson for future kernel work**: the kernel-isolated profiler can be misleading. A 1.79× isolated speedup ≠ 1.79× end-to-end if the kernel was bandwidth-bound or part of a longer pipeline where other resources serialise the GPU. Always validate end-to-end on a quiet system before adopting.
+
+#### Remaining decode gap (after f16 acc explored)
+
+Decode at ~78 tok/s vs ollama ~95 tok/s, ~1.30×. With f16 acc not paying off end-to-end, the remaining options are:
+- **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis likely applies; expected to also wash out end-to-end. Lower priority unless the gate+up finding turns out to be situational.
+- **Dispatch overhead reduction** (~100-dispatch gap to ollama) — closing this means more aggressive kernel fusion. The fused FFN gate+up + GEGLU + down for Q6_K models was tried (#1 below) and regressed — re-enable might require a cheaper activation variant.
+- **Accept ~1.30× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 25% likely requires fundamental architecture changes.
+
+**Effort**: f16 accumulator try is ~1 day (write variant, run parity tests, bench). Other tracks are larger.
+
+#### Acceptance criterion
+
+**Close 1.5 ms of the 3 ms decode gap to reach ~12 tok/s (~85 tok/s, 1.16× of ollama)**. Closing the full 3 ms requires `simdgroup_matrix` for matvec (no llama.cpp precedent for matvec — they use it for matmul/prefill only). Above that ceiling we're chasing Apple-specific intrinsics not exposed publicly.
+
+### #0 — Decode kernel optimisation (NEW, 2026-04-28)
+
+See "Decode kernel optimization" section above. Replaces the older "#6 — Q4_K kernel optimization" P0 entry below; that entry now serves as the historical record of what was tried and ruled out.
+
+
 
 ### Prefill: per-position matvec → matmul (4-14× gap, biggest end-to-end win)
 

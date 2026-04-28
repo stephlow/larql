@@ -3,14 +3,25 @@
 Machine: M3 Max, macOS 24.6.0, Gemma 3 4B (34 layers, hidden=2560, inter=10240, vocab=262K)
 Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention)
 
+> **Note on the historical "81–84 tok/s"**: an earlier ROADMAP table cited
+> 81–84 tok/s for this same vindex on 2026-04-26. Bisect (2026-04-28)
+> traced that to a silent dispatch bug fixed in commit `077884b "working
+> on performance"`: Q4_K weights were routed through the **Q4_KF kernel**
+> with the wrong threadgroup geometry (4 rows/TG instead of 8), leaving
+> ~75% of output rows unwritten. The 81–84 was real wall-clock
+> throughput on broken (wrong-output) code. **78.7 tok/s is the correct
+> baseline for valid output.** Reverting 077884b would re-introduce the
+> bug; future gains here come from optimising the Q4_K kernel itself
+> (it's already at 8 rows/TG, ALU-limited at ~272 GB/s on K=2560).
+
 ---
 
-## Current state (2026-04-26)
+## Current state (2026-04-28)
 
 ```
 larql-metal  gemma3-4b-q4k-v2     78.7 tok/s   12.7ms/tok  (100-token run, 8 warmup)
-Ollama       gemma3:4b            98–103 tok/s  ~10ms/tok
-Gap          ~1.28×               ~2.7ms/tok
+Ollama       gemma3:4b            94–98 tok/s   ~10.5ms/tok
+Gap          ~1.27×               ~2.2ms/tok
 
 larql-metal  gemma4-26B-A4B         5.1 tok/s  ~194ms/tok  (Phase 1 GPU dispatch; Phase 2 open)
 SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok  (attention + dense FFN only)
@@ -24,10 +35,11 @@ Per-stage (Gemma 3 4B, 100-token run, 8 warmup):
 | lm_head | ~2.2ms | 17% |
 | embed + norm + detok | ~0.01ms | ~0% |
 
-**Recent changes (2026-04-26):**
+**Recent changes (2026-04-26 → 2026-04-28):**
 
 | Change | Model | Effect | Notes |
 |---|---|---|---|
+| **Q4_K dispatch correctness fix** (commit 077884b) | Gemma 3 4B | **−5 tok/s** (84 → 79) | Q4_K was routed through Q4_KF kernel, leaving 75% of output rows unwritten; 81-84 was on broken code, 79 is correct baseline |
 | **`q6k_matvec` ROWS_PER_TG=4 correctness fix** | Gemma 3 4B | **78.7 tok/s, GPU fwd 10.8ms** | Silent bug: rows 1282-2559 were zeros; fixed to ROWS_PER_TG=4 everywhere |
 | `f32_gemv_topk1` GPU argmax | any | 0 in bench (KNN fires first) | Saves 0.33ms for top_k=1 non-KNN callers |
 | Q4_K float4 dual-sub-block | Gemma 3 4B | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |

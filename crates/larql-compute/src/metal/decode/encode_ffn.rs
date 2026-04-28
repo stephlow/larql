@@ -188,7 +188,33 @@ impl MetalBackend {
 
         if layer.is_gated() {
             let n_tgs_per_mat = (inter as u64).div_ceil(q4k_gu::ROWS_PER_TG);
-            enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+            // f16-accumulator gate+up: kernel-isolated 1.79× faster
+            // than f32 (measured 2026-04-28, see
+            // `tests/test_kernel_q4k_ffn_gate_up_f16acc.rs`). End-to-end
+            // greedy-decode parity validated on a 10-prompt corpus —
+            // all outputs bit-identical to f32.
+            //
+            // **End-to-end perf win does NOT reproduce reliably.**
+            // Initial measurement showed +23% on a thermally-loaded GPU,
+            // but on a quiet system f32 and f16 run at parity (within
+            // 1%). The kernel was already bandwidth-bound at 274 GB/s
+            // (74% of LPDDR5X peak); freeing ALU cycles only helps when
+            // ALU is the bottleneck, which it isn't here. The 1.79×
+            // kernel speedup gets absorbed into pipeline stalls
+            // elsewhere or thermal headroom that the surrounding
+            // kernels reclaim.
+            //
+            // Kept as opt-in via `LARQL_F16_ACC=1` for future
+            // experiments (e.g. on different hardware where the ALU
+            // pressure profile differs, or for prompts where thermal
+            // headroom matters). Default stays f32.
+            let use_f16 = std::env::var("LARQL_F16_ACC").is_ok();
+            let pipeline = if use_f16 {
+                &self.q4k_ffn_gate_up_f16acc_pipeline.state
+            } else {
+                &self.q4k_ffn_gate_up_pipeline.state
+            };
+            enc.set_compute_pipeline_state(pipeline);
             enc.set_buffer(0, Some(bufs.gate_w), 0);
             enc.set_buffer(1, Some(bufs.up_w), 0);
             enc.set_buffer(2, Some(bufs.ffn_norm_out), 0);
