@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
-use ndarray::{Array2, ShapeBuilder};
+use ndarray::Array2;
 
 use crate::detect::{detect_from_json_validated, ModelError};
 use crate::weights::ModelWeights;
@@ -295,23 +295,16 @@ impl GgufFile {
 
             match info.n_dims {
                 2 => {
-                    // GGUF/GGML uses column-major (Fortran) dimension ordering:
+                    // GGUF/GGML stores tensor dimensions in reverse order:
                     //   dims[0] = number of columns (innermost/fastest)
                     //   dims[1] = number of rows (outermost)
-                    // Data is laid out in column-major order.
-                    //
-                    // ndarray expects row-major (C) order by default.
-                    // To get the correct [rows, cols] matrix in row-major ndarray,
-                    // we swap the dimensions and use Fortran (column-major) layout,
-                    // then convert to standard (C) layout via .as_standard_layout().
+                    // The raw bytes are contiguous along dims[0], so after swapping
+                    // to the conventional [rows, cols] shape, ndarray's standard
+                    // row-major layout preserves the matrix values.
                     let ne0 = info.dims[0] as usize; // columns in GGML
                     let ne1 = info.dims[1] as usize; // rows in GGML
-                                                     // Shape is (rows, cols) = (ne1, ne0) in standard math convention.
-                                                     // Data is column-major, so we create with Fortran layout.
-                    let arr = Array2::from_shape_vec((ne1, ne0).f(), floats)
+                    let arr = Array2::from_shape_vec((ne1, ne0), floats)
                         .map_err(|e| ModelError::Parse(format!("tensor {}: {}", info.name, e)))?;
-                    // Convert to standard (C/row-major) layout for compatibility
-                    let arr = arr.as_standard_layout().into_owned();
                     tensors.insert(key, arr.into_shared());
                 }
                 1 => {
@@ -352,11 +345,14 @@ impl GgufFile {
             }
             0
         };
+        let get_arch_u32_opt = |suffix: &str| {
+            let key = format!("{prefix}{suffix}");
+            self.metadata.get(&key).and_then(|v| v.as_u32())
+        };
         let get_arch_f64 = |suffix: &str| {
             self.metadata
                 .get(&format!("{prefix}{suffix}"))
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0)
         };
 
         // Map GGUF architecture names to HF model_type
@@ -385,7 +381,7 @@ impl GgufFile {
             get_arch_u32(GGUF_ATTENTION_KEY_LENGTH)
         };
 
-        serde_json::json!({
+        let mut config = serde_json::json!({
             HF_MODEL_TYPE: model_type,
             HF_HIDDEN_SIZE: hidden_size,
             HF_NUM_HIDDEN_LAYERS: get_arch_u32(GGUF_BLOCK_COUNT),
@@ -393,9 +389,16 @@ impl GgufFile {
             HF_NUM_ATTENTION_HEADS: num_heads,
             HF_NUM_KEY_VALUE_HEADS: get_arch_u32(GGUF_ATTENTION_HEAD_COUNT_KV),
             HF_HEAD_DIM: head_dim,
-            HF_ROPE_THETA: get_arch_f64(GGUF_ROPE_FREQ_BASE),
-            HF_VOCAB_SIZE: get_arch_u32(GGUF_VOCAB_SIZE),
-        })
+        });
+
+        if let Some(rope_base) = get_arch_f64(GGUF_ROPE_FREQ_BASE) {
+            config[HF_ROPE_THETA] = serde_json::json!(rope_base);
+        }
+        if let Some(vocab_size) = get_arch_u32_opt(GGUF_VOCAB_SIZE) {
+            config[HF_VOCAB_SIZE] = serde_json::json!(vocab_size);
+        }
+
+        config
     }
 }
 
@@ -703,6 +706,12 @@ mod tests {
 
         assert_eq!(down.shape(), &[2, 4]);
         assert_eq!(down[[0, 0]], 1.0);
+        assert_eq!(down[[0, 1]], 2.0);
+        assert_eq!(down[[0, 2]], 3.0);
+        assert_eq!(down[[0, 3]], 4.0);
+        assert_eq!(down[[1, 0]], 5.0);
+        assert_eq!(down[[1, 1]], 6.0);
+        assert_eq!(down[[1, 2]], 7.0);
         assert_eq!(down[[1, 3]], 8.0);
     }
 
@@ -758,6 +767,42 @@ mod tests {
         assert_eq!(cfg["num_attention_heads"], 8);
         assert_eq!(cfg["num_key_value_heads"], 1);
         assert_eq!(cfg["vocab_size"], 262144);
+    }
+
+    #[test]
+    fn test_gguf_to_config_json_omits_absent_rope_base_for_arch_default() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufValue::String("llama".to_string()),
+        );
+        metadata.insert("llama.embedding_length".to_string(), GgufValue::U32(4096));
+        metadata.insert("llama.block_count".to_string(), GgufValue::U32(32));
+        metadata.insert(
+            "llama.feed_forward_length".to_string(),
+            GgufValue::U32(11008),
+        );
+        metadata.insert("llama.attention.head_count".to_string(), GgufValue::U32(32));
+        metadata.insert(
+            "llama.attention.head_count_kv".to_string(),
+            GgufValue::U32(8),
+        );
+        metadata.insert(
+            "llama.attention.key_length".to_string(),
+            GgufValue::U32(128),
+        );
+
+        let gguf = GgufFile {
+            metadata,
+            tensor_infos: Vec::new(),
+            data_offset: 0,
+            path: std::path::PathBuf::from("<no-file>"),
+        };
+        let cfg = gguf.to_config_json();
+
+        assert!(cfg.get(HF_ROPE_THETA).is_none());
+        let arch = crate::detect_from_json_validated(&cfg).unwrap();
+        assert_eq!(arch.config().rope_base, 10_000.0);
     }
 
     /// Build a minimal GGUF file with one 2-D F32 tensor, but truncate the

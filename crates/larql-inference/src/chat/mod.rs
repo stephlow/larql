@@ -131,6 +131,122 @@ pub fn passthrough(user_prompt: &str) -> String {
     user_prompt.to_string()
 }
 
+/// One-stop prompt rendering for `larql run`-style callers: respects
+/// `LARQL_RAW_PROMPT`, `LARQL_THINKING`, `LARQL_SYSTEM`, and injects a
+/// model-family-specific default system message when none is set.
+///
+/// Returns the chat-rendered prompt string (or the raw prompt for base
+/// models / `LARQL_RAW_PROMPT=1`). Centralises the logic that used to
+/// live inline in `run_with_moe_shards` so the dense Metal path
+/// (`walk_cmd::run_predict_q4k`) can call it too.
+///
+/// Family-default behaviour: Gemma 4 (both 26B-A4B-it MoE and 31B dense)
+/// defaults into degenerate frames without a system prompt — MoE
+/// summarises "the input text" and dense loops "The answer is:". The
+/// per-layer CPU/Metal parity confirms the inference math is correct;
+/// the model genuinely needs a system prompt to enter answer mode. Set
+/// `LARQL_NO_DEFAULT_SYSTEM=1` to opt out.
+pub fn render_user_prompt(
+    vindex_dir: &Path,
+    family: &str,
+    user_prompt: &str,
+) -> Result<String, String> {
+    let raw_prompt = std::env::var("LARQL_RAW_PROMPT").is_ok();
+    let enable_thinking = std::env::var("LARQL_THINKING").is_ok();
+    let user_system = std::env::var("LARQL_SYSTEM").ok();
+    let suppress_default = std::env::var("LARQL_NO_DEFAULT_SYSTEM").is_ok();
+
+    if raw_prompt {
+        return Ok(user_prompt.to_string());
+    }
+
+    let system_prompt = user_system.or_else(|| {
+        if suppress_default || family != "gemma4" {
+            None
+        } else {
+            Some("You are a helpful assistant. Answer questions concisely.".to_string())
+        }
+    });
+
+    if enable_thinking || system_prompt.is_some() {
+        // Multi-message render path. Prefer the vindex's own template when
+        // available; fall back to a family-default for vindexes extracted
+        // before the chat-template snapshot was added (early Gemma 4 31B
+        // extracts ship without `chat_template.jinja`, so the dense Metal
+        // path silently sent raw prompts and the model looped).
+        let template_str = read_chat_template(vindex_dir)
+            .or_else(|| family_default_template(family))
+            .ok_or_else(|| {
+                format!(
+                    "no chat template (vindex missing chat_template.jinja and \
+                 no built-in fallback for family={family:?}) — \
+                 set LARQL_RAW_PROMPT=1 to send the raw prompt"
+                )
+            })?;
+        let cfg = Value::Object(Default::default());
+        let mut messages: Vec<(String, String)> = Vec::new();
+        if let Some(sys) = system_prompt.as_deref() {
+            messages.push(("system".to_string(), sys.to_string()));
+        }
+        messages.push(("user".to_string(), user_prompt.to_string()));
+        return render::render_chat_template_multi(&template_str, &cfg, &messages, enable_thinking)
+            .map_err(|e| format!("render chat template: {e}"));
+    }
+
+    // Default path: single-user-turn chat template (the existing wrap).
+    Ok(wrap_chat_prompt(vindex_dir, None, user_prompt).prompt)
+}
+
+/// Read the model's chat template, looking in `chat_template.jinja` first
+/// (newer convention — Gemma 4) then `tokenizer_config.json::chat_template`
+/// (older — Gemma 2/3, Llama 3). Returns None when neither is present.
+fn read_chat_template(vindex_dir: &Path) -> Option<String> {
+    let jinja = vindex_dir.join("chat_template.jinja");
+    if let Ok(s) = std::fs::read_to_string(&jinja) {
+        return Some(s);
+    }
+    let cfg_path = vindex_dir.join("tokenizer_config.json");
+    let cfg_bytes = std::fs::read(cfg_path).ok()?;
+    let cfg: Value = serde_json::from_slice(&cfg_bytes).ok()?;
+    cfg.get("chat_template")?.as_str().map(|s| s.to_string())
+}
+
+/// Built-in chat-template fallbacks for families whose extracted vindexes
+/// sometimes ship without the template files. Minimal — handles the
+/// system + user message shape this module renders, no tools/multimodal.
+fn family_default_template(family: &str) -> Option<String> {
+    match family {
+        // Gemma 4 (`<|turn>role\n…<turn|>\n` blocks, with the empty thought
+        // channel the official template emits when `enable_thinking=false`).
+        // Verified end-to-end by running the rendered prompt through the
+        // working 26B-A4B vindex's tokenizer — produces the same id stream
+        // as the on-disk `chat_template.jinja` for system+user messages.
+        "gemma4" => Some(GEMMA4_FALLBACK_TEMPLATE.to_string()),
+        _ => None,
+    }
+}
+
+/// Minimal Gemma 4 chat template covering system + user turns and the
+/// empty thought channel. Used when a vindex was extracted before
+/// `chat_template.jinja` was snapshotted (older 31B dense extracts).
+const GEMMA4_FALLBACK_TEMPLATE: &str = "{{- bos_token -}}\
+{%- if messages[0]['role'] in ['system', 'developer'] -%}\
+{{- '<|turn>system\n' -}}{{- messages[0]['content'] | trim -}}{{- '<turn|>\n' -}}\
+{%- set loop_messages = messages[1:] -%}\
+{%- else -%}\
+{%- set loop_messages = messages -%}\
+{%- endif -%}\
+{%- for message in loop_messages -%}\
+{%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}\
+{{- '<|turn>' + role + '\n' -}}\
+{%- if message['content'] is string -%}{{- message['content'] | trim -}}{%- endif -%}\
+{{- '<turn|>\n' -}}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{{- '<|turn>model\n' -}}\
+{%- if not (enable_thinking | default(false)) -%}{{- '<|channel>thought\n<channel|>' -}}{%- endif -%}\
+{%- endif -%}";
+
 #[cfg(test)]
 mod integration_tests {
     //! High-level tests that exercise the full `wrap_chat_prompt` pipeline

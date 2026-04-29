@@ -623,6 +623,76 @@ fn walk_only_excludes_gpt_oss_packed_mxfp4_experts() {
 }
 
 #[test]
+fn packed_bf16_experts_are_mmap_backed_not_copied() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
+            "vocab_size": 10,
+            "enable_moe_block": true,
+            "num_experts": 1,
+            "top_k_experts": 1,
+            "moe_intermediate_size": 1
+        }
+    });
+    let gate_up_bytes: Vec<u8> = (0u8..16).collect();
+    let down_bytes: Vec<u8> = (16u8..24).collect();
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.experts.gate_up_proj",
+                "BF16",
+                &[1, 2, 4],
+                gate_up_bytes.clone(),
+            ),
+            (
+                "layers.0.experts.down_proj",
+                "BF16",
+                &[1, 4, 1],
+                down_bytes.clone(),
+            ),
+        ],
+    );
+
+    let weights = load_model_dir(dir.path()).unwrap();
+
+    assert!(
+        weights.raw_bytes.is_empty(),
+        "large packed BF16 tensors should stay in mmap ranges, not heap raw_bytes"
+    );
+    assert_eq!(weights.packed_mmaps.len(), 1);
+    assert_eq!(
+        weights
+            .get_packed_bytes("layers.0.experts.gate_up_proj")
+            .unwrap(),
+        gate_up_bytes.as_slice()
+    );
+    assert_eq!(
+        weights
+            .get_packed_bytes("layers.0.experts.down_proj")
+            .unwrap(),
+        down_bytes.as_slice()
+    );
+}
+
+#[test]
 fn filtered_custom_predicate_skips_target() {
     let dir = TempDir::new().unwrap();
     write_model_dir(

@@ -98,7 +98,7 @@ weights.drop_embed();
 
 | Format | Source | Handling |
 |--------|--------|----------|
-| **Safetensors** | HuggingFace | mmap + dtype conversion (f16/bf16 → f32), prefix stripping |
+| **Safetensors** | HuggingFace | mmap + dtype conversion (f16/bf16 → f32), prefix stripping, packed BF16 expert ranges kept mmap-backed |
 | **GGUF** | llama.cpp | Parse + dequantize (F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q6_K → f32) |
 
 ### HuggingFace Cache Resolution
@@ -179,8 +179,8 @@ src/
   validation.rs       ModelArchitecture::validate implementation + diagnostic field constants
 
 tests/
-  test_architectures.rs  Integration tests (75): all 12 architectures, MoE, MLA, bias, scaling, quant, config validation, ModelWeights drop methods
-  test_loading.rs        Loading tests (21): synthetic safetensors + GGUF, dtype conversion, walk-only filtering, validated loading, error paths
+  test_architectures.rs  Integration tests (81): all 12 architectures, MoE, MLA, bias, scaling, quant, config validation, ModelWeights drop methods
+  test_loading.rs        Loading tests (22): synthetic safetensors + GGUF, dtype conversion, walk-only filtering, mmap-backed packed BF16, validated loading, error paths
 
 examples/
   architecture_demo.rs   Guided tour: detection, keys, sliding window, MoE, quant formats
@@ -195,15 +195,15 @@ benches/
 ## Tests
 
 ```bash
-cargo test -p larql-models           # 274 tests
-cargo llvm-cov --package larql-models --summary-only  # 88.02% line coverage
+cargo test -p larql-models           # 282 tests
+cargo llvm-cov --package larql-models --summary-only  # 81.41% line coverage
 cargo bench -p larql-models --bench models            # Criterion benchmark suite
 ```
 
-274 tests (178 unit + 75 architecture integration + 21 loading integration) covering:
+282 tests (179 unit + 81 architecture integration + 22 loading integration) covering:
 - All 12 architectures: detection, tensor key patterns, config validation, MoE expert formats (PerExpert / PackedMxfp4 / PackedBF16), MLA compression keys, Gemma 2 softcapping + QK norm offsets, Gemma 3 sliding window + dual RoPE, Gemma 4 per-layer geometry (head_dim, KV heads, partial RoPE, KV sharing, PLE, V-norm, K=V), Qwen attention bias, StarCoder2 bias + LayerNorm + non-gated FFN, DeepSeek shared experts + MLA, Granite scaling multipliers, generic fallback
 - Quantization: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q6_K round-trips, NEON vs scalar parity, fused row-dot vs manual dot, scaled-add correctness, MXFP4 dequant + `split_gate_up_experts`, malformed-input rejection across all dequantizers
-- Loading: synthetic safetensors (F32/F16/BF16 dtype conversion, 1D vectors, walk-only, custom filter, unsupported dtype → `skipped_tensors`, missing embed error, MLX weights/ subdir), synthetic GGUF (metadata parsing, tensor loading, walk-only FFN filtering, key normalisation, truncated-data rejection), GPT-OSS packed MXFP4 walk-only filtering, StarCoder2 FFN filtering, `drop_attn_weights` / `drop_lm_head` / `drop_embed`, `get_packed_bytes`
+- Loading: synthetic safetensors (F32/F16/BF16 dtype conversion, 1D vectors, walk-only, custom filter, unsupported dtype → `skipped_tensors`, missing embed error, MLX weights/ subdir, packed BF16 expert tensors served from retained mmap ranges), synthetic GGUF (metadata parsing, tensor loading with full matrix-layout assertions, architecture-default RoPE fallback, walk-only FFN filtering, key normalisation, truncated-data rejection), GPT-OSS packed MXFP4 walk-only filtering, StarCoder2 FFN filtering, `drop_attn_weights` / `drop_lm_head` / `drop_embed`, `get_packed_bytes`
 
 The benchmark suite covers the same non-compute hot paths: config detection and
 validation, architecture tensor-key generation, FFN tensor classification,
@@ -211,7 +211,7 @@ synthetic safetensors loading, and GGML Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q6_K
 dequantization. Current baseline: validation is ~24 ns for Llama, ~149 ns for
 Gemma 4, and ~23 ns for GPT-OSS; validated detection is sub-microsecond for
 Llama/GPT-OSS; synthetic validated safetensors loading is ~156 µs; Q4_K
-dequantization is ~3.4 Gelem/s on the synthetic bench; line coverage is 88.02%.
+dequantization is ~3.4 Gelem/s on the synthetic bench; line coverage is 81.41%.
 
 ## Examples
 

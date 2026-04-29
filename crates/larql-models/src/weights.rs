@@ -3,7 +3,7 @@
 use crate::ModelArchitecture;
 use memmap2::Mmap;
 use ndarray::ArcArray2;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Type alias for weight tensors — ArcArray2 supports both owned and shared storage.
 /// Owned: from safetensors loading (heap). Shared: from mmap (zero-copy).
@@ -11,7 +11,6 @@ pub type WeightArray = ArcArray2<f32>;
 
 pub(crate) const PACKED_EXPERTS_GATE_UP_PROJ: &str = "experts.gate_up_proj";
 pub(crate) const PACKED_EXPERTS_DOWN_PROJ: &str = "experts.down_proj";
-pub(crate) const PER_LAYER_FFN_PROBE_KEY: &str = "layers/0/0/gate_up";
 
 /// Tensor key substrings that identify FFN weight tensors.
 /// Shared between `drop_ffn_weights` and `loading::safetensors::is_ffn_tensor`
@@ -98,10 +97,8 @@ impl ModelWeights {
     /// populated by the per-layer loader. Returns `None` if the vindex uses
     /// the legacy flat-file layout or the entry is out of range.
     pub fn get_layer_entry_bytes(&self, layer: usize, entry: usize) -> Option<(&[u8], &[u8])> {
-        let gu = self
-            .get_packed_bytes(&per_layer_ffn_key(layer, entry, PER_LAYER_FFN_GATE_UP))?;
-        let dn = self
-            .get_packed_bytes(&per_layer_ffn_key(layer, entry, PER_LAYER_FFN_DOWN))?;
+        let gu = self.get_packed_bytes(&per_layer_ffn_key(layer, entry, PER_LAYER_FFN_GATE_UP))?;
+        let dn = self.get_packed_bytes(&per_layer_ffn_key(layer, entry, PER_LAYER_FFN_DOWN))?;
         Some((gu, dn))
     }
 
@@ -164,6 +161,31 @@ impl ModelWeights {
             if let Some(v) = self.raw_bytes.remove(key) {
                 freed += v.len();
             }
+        }
+        // Drop mmap-backed packed FFN tensors and release mmaps no longer referenced.
+        let packed_keys: Vec<String> = self
+            .packed_byte_ranges
+            .keys()
+            .filter(|k| {
+                FFN_TENSOR_PATTERNS.iter().any(|p| k.contains(p))
+                    || k.contains(PACKED_EXPERTS_GATE_UP_PROJ)
+                    || k.contains(PACKED_EXPERTS_DOWN_PROJ)
+            })
+            .cloned()
+            .collect();
+        for key in &packed_keys {
+            if let Some((_, _, length)) = self.packed_byte_ranges.remove(key) {
+                freed += length;
+            }
+        }
+        if !packed_keys.is_empty() {
+            let referenced_files: HashSet<&str> = self
+                .packed_byte_ranges
+                .values()
+                .map(|(file, _, _)| file.as_str())
+                .collect();
+            self.packed_mmaps
+                .retain(|file, _| referenced_files.contains(file.as_str()));
         }
         freed
     }

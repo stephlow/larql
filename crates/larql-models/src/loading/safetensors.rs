@@ -174,7 +174,9 @@ fn load_model_dir_filtered_with_validation(
 
     let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
     let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut raw_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    let raw_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut packed_mmaps: HashMap<String, memmap2::Mmap> = HashMap::new();
+    let mut packed_byte_ranges: HashMap<String, (String, usize, usize)> = HashMap::new();
     let mut skipped_tensors: Vec<(String, String)> = Vec::new();
 
     let expert_format = arch.expert_format();
@@ -193,83 +195,113 @@ fn load_model_dir_filtered_with_validation(
     for st_path in &st_files {
         let file = std::fs::File::open(st_path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let st = safetensors::SafeTensors::deserialize(&mmap)
+        let (header_len, metadata) = safetensors::SafeTensors::read_metadata(&mmap)
             .map_err(|e| ModelError::Parse(e.to_string()))?;
+        let data_base = header_len
+            .checked_add(8)
+            .ok_or_else(|| ModelError::Parse("safetensors data offset overflow".to_string()))?;
+        let file_key = st_path.to_string_lossy().into_owned();
+        let mut retain_mmap = false;
 
-        // Check for MXFP4 packed expert tensors (GPT-OSS format)
-        let tensor_names: Vec<String> = st.names().iter().map(|n| n.to_string()).collect();
+        {
+            let st = safetensors::SafeTensors::deserialize(&mmap)
+                .map_err(|e| ModelError::Parse(e.to_string()))?;
 
-        if is_packed_mxfp4 {
-            // MXFP4 path: dequantize packed expert blocks+scales into per-expert tensors
-            load_mxfp4_expert_tensors(&st, &tensor_names, prefixes, &skip_key, &mut tensors)?;
-            // Also load normal float tensors (router, norms, attn, embeddings)
-            for (name, view) in st.tensors() {
-                let key = normalize_key(&name, prefixes);
-                let shape = view.shape();
-                if name.ends_with(MXFP4_BLOCKS_SUFFIX) || name.ends_with(MXFP4_SCALES_SUFFIX) {
-                    continue;
-                }
-                if skip_key(&key) {
-                    continue;
-                }
-                let data = match tensor_to_f32(&view) {
-                    Ok(d) => d,
-                    Err(ModelError::UnsupportedDtype(ref dtype)) => {
-                        skipped_tensors.push((key, dtype.clone()));
+            // Check for MXFP4 packed expert tensors (GPT-OSS format)
+            let tensor_names: Vec<String> = st.names().iter().map(|n| n.to_string()).collect();
+
+            if is_packed_mxfp4 {
+                // MXFP4 path: dequantize packed expert blocks+scales into per-expert tensors
+                load_mxfp4_expert_tensors(&st, &tensor_names, prefixes, &skip_key, &mut tensors)?;
+                // Also load normal float tensors (router, norms, attn, embeddings)
+                for (name, view) in st.tensors() {
+                    let key = normalize_key(&name, prefixes);
+                    let shape = view.shape();
+                    if name.ends_with(MXFP4_BLOCKS_SUFFIX) || name.ends_with(MXFP4_SCALES_SUFFIX) {
                         continue;
                     }
-                    Err(e) => return Err(e),
-                };
-                match shape.len() {
-                    2 => {
-                        let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
-                            .map_err(|e| ModelError::Parse(e.to_string()))?;
-                        tensors.insert(key, arr.into_shared());
-                    }
-                    1 => {
-                        vectors.insert(key, data);
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            for (name, view) in st.tensors() {
-                let key = normalize_key(&name, prefixes);
-                let shape = view.shape();
-                if skip_key(&key) {
-                    continue;
-                }
-
-                // PackedBF16 expert tensors: preserve raw bytes, skip f32 conversion
-                if should_keep_raw(&key) {
-                    raw_bytes.insert(key, view.data().to_vec());
-                    continue;
-                }
-
-                let data = match tensor_to_f32(&view) {
-                    Ok(d) => d,
-                    Err(ModelError::UnsupportedDtype(ref dtype)) => {
-                        skipped_tensors.push((key, dtype.clone()));
+                    if skip_key(&key) {
                         continue;
                     }
-                    Err(e) => return Err(e),
-                };
-                match shape.len() {
-                    2 => {
-                        let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
-                            .map_err(|e| ModelError::Parse(e.to_string()))?;
-                        tensors.insert(key, arr.into_shared());
+                    let data = match tensor_to_f32(&view) {
+                        Ok(d) => d,
+                        Err(ModelError::UnsupportedDtype(ref dtype)) => {
+                            skipped_tensors.push((key, dtype.clone()));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    match shape.len() {
+                        2 => {
+                            let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
+                                .map_err(|e| ModelError::Parse(e.to_string()))?;
+                            tensors.insert(key, arr.into_shared());
+                        }
+                        1 => {
+                            vectors.insert(key, data);
+                        }
+                        _ => {}
                     }
-                    1 => {
-                        vectors.insert(key, data);
+                }
+            } else {
+                for (name, view) in st.tensors() {
+                    let key = normalize_key(&name, prefixes);
+                    let shape = view.shape();
+                    if skip_key(&key) {
+                        continue;
                     }
-                    // 0D scalar tensors (e.g., layer_scalar) → store as 1-element vector
-                    0 => {
-                        vectors.insert(key, data);
+
+                    // PackedBF16 expert tensors: preserve mmap byte ranges,
+                    // skip f32 conversion, and avoid cloning multi-GB tensors.
+                    if should_keep_raw(&key) {
+                        let info = metadata.info(&name).ok_or_else(|| {
+                            ModelError::Parse(format!("missing safetensors metadata for {name}"))
+                        })?;
+                        let offset =
+                            data_base.checked_add(info.data_offsets.0).ok_or_else(|| {
+                                ModelError::Parse(format!("tensor {name}: data offset overflow"))
+                            })?;
+                        let length = info
+                            .data_offsets
+                            .1
+                            .checked_sub(info.data_offsets.0)
+                            .ok_or_else(|| {
+                                ModelError::Parse(format!("tensor {name}: invalid data offsets"))
+                            })?;
+                        packed_byte_ranges.insert(key, (file_key.clone(), offset, length));
+                        retain_mmap = true;
+                        continue;
                     }
-                    _ => {}
+
+                    let data = match tensor_to_f32(&view) {
+                        Ok(d) => d,
+                        Err(ModelError::UnsupportedDtype(ref dtype)) => {
+                            skipped_tensors.push((key, dtype.clone()));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    match shape.len() {
+                        2 => {
+                            let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
+                                .map_err(|e| ModelError::Parse(e.to_string()))?;
+                            tensors.insert(key, arr.into_shared());
+                        }
+                        1 => {
+                            vectors.insert(key, data);
+                        }
+                        // 0D scalar tensors (e.g., layer_scalar) → store as 1-element vector
+                        0 => {
+                            vectors.insert(key, data);
+                        }
+                        _ => {}
+                    }
                 }
             }
+        }
+
+        if retain_mmap {
+            packed_mmaps.insert(file_key, mmap);
         }
     }
 
@@ -292,8 +324,8 @@ fn load_model_dir_filtered_with_validation(
         vectors,
         raw_bytes,
         skipped_tensors,
-        packed_mmaps: std::collections::HashMap::new(),
-        packed_byte_ranges: std::collections::HashMap::new(),
+        packed_mmaps,
+        packed_byte_ranges,
         embed,
         lm_head,
         num_layers: cfg.num_layers,

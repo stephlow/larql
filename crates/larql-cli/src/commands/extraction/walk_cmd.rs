@@ -447,12 +447,34 @@ fn run_predict_q4k(
     _index: &VectorIndex,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let verbose = args.verbose;
-    let token_ids = larql_inference::encode_prompt(tokenizer, &*weights.arch, args.prompt.as_str())
-        .map_err(|e| format!("tokenize error: {e}"))?;
+    // Apply the same chat-template wrapping the gRPC path uses, so dense
+    // Gemma 4 (and any other instruct family) doesn't see the raw user
+    // prompt and fall into degenerate "answer-from-text" / "The answer is:"
+    // loops. Falls back to raw prompt for vindexes without a chat template.
+    let vindex_dir_for_chat = args.index.as_deref();
+    let wrapped_prompt = match vindex_dir_for_chat {
+        Some(dir) => larql_inference::chat::render_user_prompt(
+            dir,
+            weights.arch.family(),
+            args.prompt.as_str(),
+        )
+        .unwrap_or_else(|e| {
+            vlog!(
+                verbose,
+                "[chat] wrap failed ({e}) — falling back to raw prompt"
+            );
+            args.prompt.clone()
+        }),
+        None => args.prompt.clone(),
+    };
+    let token_ids =
+        larql_inference::encode_prompt(tokenizer, &*weights.arch, wrapped_prompt.as_str())
+            .map_err(|e| format!("tokenize error: {e}"))?;
     vlog!(
         verbose,
-        "Prompt: {:?} ({} tokens)",
+        "Prompt: {:?} (wrapped {} chars, {} tokens)",
         args.prompt,
+        wrapped_prompt.len(),
         token_ids.len()
     );
 

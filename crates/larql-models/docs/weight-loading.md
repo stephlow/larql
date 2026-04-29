@@ -72,6 +72,9 @@ For each shard:
   For each tensor:
     Strip key prefix (e.g., "model." → "")
     Read raw bytes from mmap region
+    If tensor is a packed BF16 expert block:
+      store a retained mmap byte range instead of copying to heap
+      skip f32 conversion
     Convert dtype:
       f32 → use directly
       f16 → quant::half::decode_f16
@@ -140,6 +143,12 @@ GGUF metadata keys map to config.json fields:
 | `{arch}.attention.head_count_kv` | `num_kv_heads` |
 | `{arch}.rope.freq_base` | `rope_base` |
 
+Absent optional GGUF metadata is omitted from the synthesized config so the
+same architecture defaults and loader fallbacks used by safetensors configs
+still apply. For example, a Llama GGUF without `{arch}.rope.freq_base` gets the
+standard 10,000 RoPE base instead of an explicit zero, and missing vocab size
+can still fall back to tokenizer metadata.
+
 ### 3. Load Tensors
 
 ```
@@ -162,7 +171,8 @@ For each tensor descriptor:
     Q6_K → quant::ggml::dequantize
     other → ModelError::UnsupportedDtype
   ↓
-  Reshape + insert into tensors
+  Reshape GGUF `[cols, rows]` dimensions into standard `[rows, cols]`
+  row-major ndarray matrices and insert into tensors
 ```
 
 `load_gguf_filtered` applies the predicate after key normalization and before
@@ -189,9 +199,9 @@ forms there rather than scattering ad-hoc rewrites through loading code.
 pub struct ModelWeights {
     pub tensors: HashMap<String, WeightArray>,   // 2D weight matrices
     pub vectors: HashMap<String, Vec<f32>>,      // 1D vectors (norms, biases)
-    pub raw_bytes: HashMap<String, Vec<u8>>,     // Packed BF16 expert blocks (Gemma 4 A4B)
+    pub raw_bytes: HashMap<String, Vec<u8>>,     // Small packed-byte fallback/test tensors
     pub skipped_tensors: Vec<(String, String)>,  // (key, dtype) for unsupported dtypes
-    pub packed_mmaps: HashMap<String, Mmap>,     // Memory-mapped packed files
+    pub packed_mmaps: HashMap<String, Mmap>,     // Retained memory-mapped packed files
     pub packed_byte_ranges: HashMap<String, (String, usize, usize)>, // key → (file, offset, len)
     pub embed: WeightArray,                       // Embedding matrix [vocab, hidden]
     pub lm_head: WeightArray,                     // Output projection (may be tied to embed)
@@ -221,6 +231,11 @@ All return freed bytes. Typical savings for a 4B model:
 - `drop_ffn_weights`: ~13 GB (~80% of parameters)
 - `drop_attn_weights`: ~1 GB
 - `drop_lm_head` / `drop_embed`: ~2.7 GB each
+
+Packed byte tensors are read through `ModelWeights::get_packed_bytes()`, which
+checks retained mmap ranges first and falls back to `raw_bytes`. Gemma 4 A4B
+packed BF16 expert tensors are kept in mmap ranges during safetensors loading
+so loading does not clone multi-GB expert blocks into heap memory.
 
 Pattern matching for `drop_ffn_weights`:
 - `gate_proj`, `up_proj`, `down_proj` (dense models)

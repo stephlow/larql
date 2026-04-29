@@ -137,7 +137,9 @@ pub fn run(args: ParityArgs) -> Result<(), Box<dyn std::error::Error>> {
         return run_layer_diff(&path, &config, &args);
     }
 
-    if !arch.is_hybrid_moe() {
+    // lm-head parity is backend-agnostic (Q4_K matvec vs f32 reference) —
+    // works on any vindex that has an lm_head, MoE or dense.
+    if !arch.is_hybrid_moe() && args.component != "lm-head" {
         return Err(format!(
             "vindex {} is not hybrid-MoE — moe-* components are MoE-only",
             args.model
@@ -307,12 +309,28 @@ fn run_moe_expert(
     for backend in backends {
         let out = match *backend {
             "reference" => reference_one_expert(
-                &h, gu_bytes, dn_bytes, hidden, inter, inter_padded, pre_norm, arch.norm_weight_offset(),
-                arch.norm_eps(), activation, args.verbose,
+                &h,
+                gu_bytes,
+                dn_bytes,
+                hidden,
+                inter,
+                inter_padded,
+                pre_norm,
+                arch.norm_weight_offset(),
+                arch.norm_eps(),
+                activation,
+                args.verbose,
             ),
             "cpu" => run_single_expert_with_norm(
-                &h, gu_bytes, dn_bytes, inter, pre_norm, arch.norm_weight_offset(), arch.norm_eps(),
-                QuantFormat::Q4_K, activation,
+                &h,
+                gu_bytes,
+                dn_bytes,
+                inter,
+                pre_norm,
+                arch.norm_weight_offset(),
+                arch.norm_eps(),
+                QuantFormat::Q4_K,
+                activation,
             ),
             _ => return Err(format!("backend '{backend}' not yet wired for moe-expert").into()),
         };
@@ -395,10 +413,25 @@ fn run_moe_block(
     for backend in backends {
         let out = match *backend {
             "reference" => reference_moe_block(
-                &h, &experts_gate_up, &experts_down, &router_proj, &router_per_expert_scale,
-                &router_norm, router_norm_parameter_free, router_input_scalar, pre_norm,
-                post_norm, hidden, inter, inter_padded, num_experts, top_k, activation,
-                norm_offset, eps, args.verbose,
+                &h,
+                &experts_gate_up,
+                &experts_down,
+                &router_proj,
+                &router_per_expert_scale,
+                &router_norm,
+                router_norm_parameter_free,
+                router_input_scalar,
+                pre_norm,
+                post_norm,
+                hidden,
+                inter,
+                inter_padded,
+                num_experts,
+                top_k,
+                activation,
+                norm_offset,
+                eps,
+                args.verbose,
             ),
             "cpu" => cpu_moe_forward(&h, &moe, norm_offset, eps),
             _ => return Err(format!("backend '{backend}' not yet wired for moe-block").into()),
@@ -419,20 +452,54 @@ fn run_moe_block(
     println!("=== Routing-convention comparison ===");
     let h_norm = naive_rms_norm(&h, pre_norm, eps, norm_offset);
     let (idx_raw, w_raw) = compute_top_k(
-        &h, &router_proj, &router_per_expert_scale, &router_norm,
-        router_norm_parameter_free, router_input_scalar, num_experts, top_k, hidden, eps, norm_offset,
+        &h,
+        &router_proj,
+        &router_per_expert_scale,
+        &router_norm,
+        router_norm_parameter_free,
+        router_input_scalar,
+        num_experts,
+        top_k,
+        hidden,
+        eps,
+        norm_offset,
     );
     let (idx_norm, w_norm) = compute_top_k(
-        &h_norm, &router_proj, &router_per_expert_scale, &router_norm,
-        router_norm_parameter_free, router_input_scalar, num_experts, top_k, hidden, eps, norm_offset,
+        &h_norm,
+        &router_proj,
+        &router_per_expert_scale,
+        &router_norm,
+        router_norm_parameter_free,
+        router_input_scalar,
+        num_experts,
+        top_k,
+        hidden,
+        eps,
+        norm_offset,
     );
     println!("  router_in=raw_h    top_k: {idx_raw:?}");
-    println!("    weights:                 {}",
-        w_raw.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>().join(" "));
+    println!(
+        "    weights:                 {}",
+        w_raw
+            .iter()
+            .map(|w| format!("{w:.4}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     println!("  router_in=h_norm   top_k: {idx_norm:?}  ← Metal/GPU convention");
-    println!("    weights:                 {}",
-        w_norm.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>().join(" "));
-    let same: Vec<usize> = idx_raw.iter().filter(|&&e| idx_norm.contains(&e)).copied().collect();
+    println!(
+        "    weights:                 {}",
+        w_norm
+            .iter()
+            .map(|w| format!("{w:.4}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let same: Vec<usize> = idx_raw
+        .iter()
+        .filter(|&&e| idx_norm.contains(&e))
+        .copied()
+        .collect();
     if same.len() == top_k {
         println!("  ✓ SAME top-{top_k} experts selected — routing input choice is not the bug");
     } else {
@@ -472,10 +539,7 @@ fn run_layer_diff(
     let num_layers = config.num_layers;
     let hidden = config.hidden_size;
 
-    let prompt = args
-        .prompt
-        .as_deref()
-        .unwrap_or("The capital of France is");
+    let prompt = args.prompt.as_deref().unwrap_or("The capital of France is");
 
     println!("Prompt:    {prompt:?}");
     println!("Backends:  metal (reference) → cpu");
@@ -485,12 +549,15 @@ fn run_layer_diff(
     let base = std::env::temp_dir().join(format!("larql_parity_{}", std::process::id()));
     let cpu_path_buf = base.join("cpu");
     let metal_path_buf = base.join("metal_residuals.bin");
+    let metal_dense_dir = base.join("metal_dense");
     std::fs::create_dir_all(&cpu_path_buf)?;
     let cpu_path = cpu_path_buf.as_path();
     let metal_path = metal_path_buf.as_path();
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
     let _cleanup = Cleanup(base);
 
@@ -505,13 +572,28 @@ fn run_layer_diff(
     let mut w_cpu = larql_vindex::load_model_weights_q4k(path, &mut cb)?;
 
     let wrapped = larql_inference::wrap_chat_prompt(path, Some(config.model.as_str()), prompt);
-    let token_ids =
-        larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrapped.prompt)?;
+    let token_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrapped.prompt)?;
     println!("  seq_len: {} tokens post-template", token_ids.len());
     println!();
 
+    // The MoE decode path writes a single LARQL_DUMP_RESIDUALS binary
+    // covering every layer; the dense Metal decode path doesn't fire that
+    // hook (it only runs in the MoE branch of decode_token_with_moe_split_fn).
+    // For dense models we use LARQL_METAL_DUMP_LAYERS, which fires inside
+    // prefill_q4 and writes one file per layer (metal_layer_NN_h_out.f32 +
+    // metal_layer_NN_h_post_attn.f32). This aligns with the CPU dumps,
+    // which are also captured during prefill.
+    let is_moe = w_metal.arch.is_hybrid_moe();
+    if !is_moe {
+        std::fs::create_dir_all(&metal_dense_dir)?;
+    }
+
     // ── Metal run (reference — produces correct output) ──────────────────────
-    std::env::set_var("LARQL_DUMP_RESIDUALS", metal_path);
+    if is_moe {
+        std::env::set_var("LARQL_DUMP_RESIDUALS", metal_path);
+    } else {
+        std::env::set_var("LARQL_METAL_DUMP_LAYERS", &metal_dense_dir);
+    }
     println!("Running Metal…");
     let metal_result = {
         let backend = larql_compute::metal::MetalBackend::new()
@@ -529,6 +611,7 @@ fn run_layer_diff(
         )
     };
     std::env::remove_var("LARQL_DUMP_RESIDUALS");
+    std::env::remove_var("LARQL_METAL_DUMP_LAYERS");
     println!("  Metal output: {:?}", metal_result.text().trim());
 
     // ── CPU run ──────────────────────────────────────────────────────────────
@@ -539,12 +622,56 @@ fn run_layer_diff(
     std::env::remove_var("LARQL_CPU_DUMP_LAYERS");
     std::env::remove_var("LARQL_CPU_STAGE_DUMP");
 
-    // ── Parse Metal DUMP_RESIDUALS binary ────────────────────────────────────
-    let metal_bytes = std::fs::read(metal_path)?;
-    let metal_layers = parse_residual_dump(&metal_bytes);
-    if metal_layers.is_empty() {
-        return Err("Metal dump is empty — LARQL_DUMP_RESIDUALS may not have fired (dense model? MoE decode path required)".into());
-    }
+    // ── Load per-layer Metal output ──────────────────────────────────────────
+    // MoE: parse binary residual dump (richer — includes h_post_attn).
+    // Dense: read decode_layer_NN.f32 written by LARQL_DECODE_DUMP_LAYERS.
+    let metal_layers: std::collections::BTreeMap<usize, ResidualRecord> = if is_moe {
+        let metal_bytes = std::fs::read(metal_path)?;
+        let parsed = parse_residual_dump(&metal_bytes);
+        if parsed.is_empty() {
+            return Err(
+                "Metal residual dump is empty — LARQL_DUMP_RESIDUALS may not have fired".into(),
+            );
+        }
+        parsed.into_iter().collect()
+    } else {
+        // Prefill dumps: metal_layer_NN_h_out.f32 (post-FFN residual) and
+        // metal_layer_NN_h_post_attn.f32 (post-attention residual).
+        // Both have shape [seq_len * hidden]; we take the last position.
+        let last_pos_slice = |v: Vec<f32>| -> Vec<f32> {
+            let n = v.len() / hidden;
+            if n == 0 {
+                v
+            } else {
+                v[(n - 1) * hidden..].to_vec()
+            }
+        };
+        let mut out = std::collections::BTreeMap::new();
+        for l in 0..num_layers {
+            let h_out_path = metal_dense_dir.join(format!("metal_layer_{l:02}_h_out.f32"));
+            let h_pa_path = metal_dense_dir.join(format!("metal_layer_{l:02}_h_post_attn.f32"));
+            let layer_out = match read_parity_f32(&h_out_path) {
+                Some(v) => last_pos_slice(v),
+                None => continue,
+            };
+            let h_post_attn = read_parity_f32(&h_pa_path)
+                .map(last_pos_slice)
+                .unwrap_or_default();
+            out.insert(
+                l,
+                ResidualRecord {
+                    h_post_attn,
+                    layer_out,
+                },
+            );
+        }
+        if out.is_empty() {
+            return Err(
+                "Metal dense dump is empty — LARQL_METAL_DUMP_LAYERS may not have fired".into(),
+            );
+        }
+        out
+    };
 
     // ── Compare per layer ────────────────────────────────────────────────────
     println!();
@@ -589,11 +716,21 @@ fn run_layer_diff(
         let norm_cpu = naive_rms_mag(&cpu_last);
         let norm_mtl = naive_rms_mag(&metal_rec.layer_out);
 
-        let cos_pa = read_parity_f32(&cpu_pa_path).map(|v| {
-            let n = v.len() / hidden;
-            let last = if n > 0 { v[(n - 1) * hidden..].to_vec() } else { v };
-            naive_cos_sim(&last, &metal_rec.h_post_attn)
-        });
+        // Dense path doesn't capture h_post_attn separately, so cos(h_pa)
+        // is only computed when we have it (MoE).
+        let cos_pa = if metal_rec.h_post_attn.is_empty() {
+            None
+        } else {
+            read_parity_f32(&cpu_pa_path).map(|v| {
+                let n = v.len() / hidden;
+                let last = if n > 0 {
+                    v[(n - 1) * hidden..].to_vec()
+                } else {
+                    v
+                };
+                naive_cos_sim(&last, &metal_rec.h_post_attn)
+            })
+        };
 
         if cos_out < DRIFT && first_bad.is_none() {
             first_bad = Some(l);
@@ -606,7 +743,9 @@ fn run_layer_diff(
             Some(_) => "clean",
             None => "?",
         };
-        let hpa_s = cos_pa.map(|c| format!("{c:>10.6}")).unwrap_or_else(|| "         -".into());
+        let hpa_s = cos_pa
+            .map(|c| format!("{c:>10.6}"))
+            .unwrap_or_else(|| "         -".into());
         println!(
             "  L{l:02}  {hpa_s}  {cos_out:>10.6}  {norm_cpu:>10.4}  {norm_mtl:>12.4}  {note}{flag}"
         );
@@ -670,7 +809,13 @@ fn parse_residual_dump(bytes: &[u8]) -> std::collections::HashMap<usize, Residua
             .collect();
         pos += n_bytes;
         let _ = layer_in; // used for format validation only
-        map.insert(layer_idx, ResidualRecord { h_post_attn, layer_out });
+        map.insert(
+            layer_idx,
+            ResidualRecord {
+                h_post_attn,
+                layer_out,
+            },
+        );
     }
     map
 }
@@ -815,7 +960,10 @@ fn reference_moe_block(
         println!(
             "  ref top_k indices: {:?}  weights: {:?}",
             indices,
-            weights.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>()
+            weights
+                .iter()
+                .map(|w| format!("{w:.4}"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -827,8 +975,17 @@ fn reference_moe_block(
             continue;
         }
         let contrib = reference_one_expert(
-            h, experts_gate_up[ei], experts_down[ei], hidden, inter, inter_padded, pre_norm,
-            norm_offset, eps, activation, false,
+            h,
+            experts_gate_up[ei],
+            experts_down[ei],
+            hidden,
+            inter,
+            inter_padded,
+            pre_norm,
+            norm_offset,
+            eps,
+            activation,
+            false,
         );
         for (acc, &v) in moe_out.iter_mut().zip(contrib.iter()) {
             *acc += w * v;
@@ -913,8 +1070,7 @@ fn naive_rms_norm(x: &[f32], w: &[f32], eps: f32, offset: f32) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    let rms = (x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64
-        + eps as f64)
+    let rms = (x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64 + eps as f64)
         .sqrt() as f32;
     if w.is_empty() {
         return x.iter().map(|v| v / rms).collect();
@@ -1051,7 +1207,10 @@ fn make_residual(hidden: usize, seed: u32) -> Vec<f32> {
 
 fn diff_against_first(traces: &[(&str, Vec<f32>)], tolerance: f64) {
     let (ref_name, ref_v) = &traces[0];
-    println!("Reference backend: {ref_name}  (first {} elems used as the truth)", ref_v.len());
+    println!(
+        "Reference backend: {ref_name}  (first {} elems used as the truth)",
+        ref_v.len()
+    );
     let n = ref_v.len();
     print!("  {ref_name:<10} [0..3] = [");
     for (i, x) in ref_v.iter().take(3).enumerate() {

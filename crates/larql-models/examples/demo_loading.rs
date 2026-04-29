@@ -112,13 +112,30 @@ fn main() {
         .sum();
     let embed_bytes = weights.embed.len() * std::mem::size_of::<f32>();
     let lm_head_bytes = weights.lm_head.len() * std::mem::size_of::<f32>();
-    let total = tensor_bytes + vector_bytes + embed_bytes + lm_head_bytes;
+    let raw_bytes: usize = weights.raw_bytes.values().map(Vec::len).sum();
+    let packed_range_bytes: usize = weights
+        .packed_byte_ranges
+        .values()
+        .map(|(_, _, len)| *len)
+        .sum();
+    let total =
+        tensor_bytes + vector_bytes + embed_bytes + lm_head_bytes + raw_bytes + packed_range_bytes;
 
     println!("\n--- Memory ---");
     println!("  Tensors:         {:.1} MB", tensor_bytes as f64 / 1e6);
     println!("  Vectors:         {:.1} MB", vector_bytes as f64 / 1e6);
     println!("  Embed:           {:.1} MB", embed_bytes as f64 / 1e6);
     println!("  LM head:         {:.1} MB", lm_head_bytes as f64 / 1e6);
+    if raw_bytes > 0 {
+        println!("  Raw bytes:       {:.1} MB", raw_bytes as f64 / 1e6);
+    }
+    if packed_range_bytes > 0 {
+        println!(
+            "  Packed mmaps:    {:.1} MB across {} mmap(s)",
+            packed_range_bytes as f64 / 1e6,
+            weights.packed_mmaps.len()
+        );
+    }
     println!("  Total:           {:.1} GB", total as f64 / 1e9);
 
     // Sample tensor keys

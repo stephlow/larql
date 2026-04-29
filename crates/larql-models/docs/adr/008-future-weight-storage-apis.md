@@ -2,7 +2,7 @@
 
 **Status**: Proposed  
 **Date**: 2026-04-26  
-**Context**: `ModelWeights` is intentionally simple: retained tensors are f32 `ArcArray2`s, with selected packed expert tensors kept as raw bytes. This works for current extraction and inference flows, but two roadmap items need different ownership: lazy safetensors loading and GGUF quantized inference without f32 dequantization.
+**Context**: `ModelWeights` is intentionally simple: retained dense tensors are f32 `ArcArray2`s, with selected packed expert tensors exposed through byte slices backed by retained mmap ranges or small in-memory fallback buffers. This works for current extraction and inference flows, but two roadmap items need broader ownership: lazy safetensors loading and GGUF quantized inference without f32 dequantization.
 
 ## Decision
 
@@ -17,7 +17,8 @@ pub enum LoadedWeights {
 }
 ```
 
-`ModelWeights` remains the eager f32 representation used by existing callers.
+`ModelWeights` remains the eager f32 representation used by existing callers,
+with `get_packed_bytes()` as the compatibility path for packed expert blobs.
 Future APIs should be additive:
 
 ```rust

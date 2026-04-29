@@ -134,10 +134,24 @@ pub fn encode_gated(
     // of TG-memory caching (gate/up bandwidth was never the bottleneck).
     // Re-enable when a cheaper activation variant or act[] precompute
     // avoids the per-row tanh explosion.
-    let fused_kernel = match (down_format, activation) {
-        (crate::QuantFormat::Q4_K, Activation::SiLU) => fused_down.q4k_silu,
-        (crate::QuantFormat::Q4_K, Activation::GeluTanh) => fused_down.q4k_gelu_tanh,
-        _ => None,
+    // The fused Q4_K geglu+down kernel produces NaN in the dense prefill
+    // path on Gemma 3 4B (q4k-downq4k) and Gemma 4 31B (q4k) — the model
+    // emits empty output because every hidden-state value comes back NaN.
+    // The kernel's own unit test (`test_kernel_q4k_geglu_down.rs`) passes,
+    // so the bug is shape- or data-pattern-specific and not visible from
+    // synthetic inputs. The separated path (GEGLU dispatch + q4k_matvec)
+    // produces correct, generative output for the same weights, so default
+    // is now SEPARATED. Set `LARQL_FUSED_DOWN=1` to re-enable the fused
+    // path for benchmarking once the kernel is fixed.
+    let use_fused = std::env::var("LARQL_FUSED_DOWN").is_ok();
+    let fused_kernel = if use_fused {
+        match (down_format, activation) {
+            (crate::QuantFormat::Q4_K, Activation::SiLU) => fused_down.q4k_silu,
+            (crate::QuantFormat::Q4_K, Activation::GeluTanh) => fused_down.q4k_gelu_tanh,
+            _ => None,
+        }
+    } else {
+        None
     };
     let _ = (fused_down.q6k_silu, fused_down.q6k_gelu_tanh); // silence unused-field warnings
 

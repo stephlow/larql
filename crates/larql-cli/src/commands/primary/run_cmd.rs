@@ -333,17 +333,14 @@ fn run_with_moe_shards(
     max_tokens: usize,
     dispatch: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use larql_inference::ffn::moe_remote::{
-        parse_unit_manifest, RemoteMoeBackend, ShardConfig,
-    };
+    use larql_inference::ffn::moe_remote::{parse_unit_manifest, RemoteMoeBackend, ShardConfig};
     use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
 
     // Pick ownership mode: legacy `--moe-shards` (layer-uniform ranges) or
     // `--moe-units-manifest` (fine-grained per-(layer, expert) sets).  The
     // mutually-exclusive guard at the caller means at most one is set here.
     let configs: Vec<ShardConfig> = if let Some(path) = units_manifest {
-        let cfgs = parse_unit_manifest(path)
-            .map_err(|e| format!("--moe-units-manifest: {e}"))?;
+        let cfgs = parse_unit_manifest(path).map_err(|e| format!("--moe-units-manifest: {e}"))?;
         if cfgs.is_empty() {
             return Err("--moe-units-manifest: manifest contains no shards".into());
         }
@@ -403,76 +400,28 @@ fn run_with_moe_shards(
     // Metal: attention + dense FFN on GPU; MoE experts dispatched to shards.
     let backend = larql_compute::default_backend();
 
-    // Prompt-shape options for diagnostic:
-    //   default  → wrap_chat_prompt with the model's chat_template.jinja
-    //   LARQL_RAW_PROMPT=1   → raw user string with <bos> prepended
+    // Prompt-shape options (centralised in `larql_inference::chat::render_user_prompt`):
+    //   default              → chat_template.jinja with auto-injected default system prompt for Gemma 4
+    //   LARQL_RAW_PROMPT=1   → raw user string with <bos> prepended (no template)
     //   LARQL_THINKING=1     → enable_thinking=true (skips empty thought block)
-    //   LARQL_SYSTEM=<text>  → prepend a system message before the user turn
-    //                          (Gemma 4 26B-A4B-it relies on one to avoid the
-    //                          "answer from the text" reading-comprehension
-    //                          fallback — see default below)
-    //   LARQL_NO_DEFAULT_SYSTEM=1 → suppress the auto-injected default for
-    //                                Gemma-4-MoE (use raw chat_template only)
-    let raw_prompt = std::env::var("LARQL_RAW_PROMPT").is_ok();
-    let enable_thinking = std::env::var("LARQL_THINKING").is_ok();
-    // Gemma 4 26B-A4B-it (and Gemma 4 MoE in general) defaults into a
-    // "summarise the input text" frame without a system prompt, so the
-    // answer to "What is the capital of France?" comes back as
-    // "**not specified in the text**" instead of "Paris". Inject a minimal
-    // helpful-assistant system message when none is set, unless the user
-    // explicitly opts out with LARQL_NO_DEFAULT_SYSTEM=1.
-    let user_system = std::env::var("LARQL_SYSTEM").ok();
-    let suppress_default = std::env::var("LARQL_NO_DEFAULT_SYSTEM").is_ok();
-    let system_prompt = user_system.or_else(|| {
-        if suppress_default || !weights.arch.is_moe() || weights.arch.family() != "gemma4" {
-            None
-        } else {
-            Some("You are a helpful assistant. Answer questions concisely.".to_string())
-        }
-    });
-    let wrapped_prompt = if raw_prompt {
-        // Base-model style: just <bos>prompt.  Tokenizer adds <bos> when its
-        // config says so; encode_prompt handles the prefix.
-        prompt.to_string()
-    } else if enable_thinking || system_prompt.is_some() {
-        // System prompt and/or enable_thinking flag → render the model's
-        // chat_template.jinja with the augmented context.  Uses the same
-        // pycompat-enabled minijinja env that wrap_chat_prompt uses, so
-        // template features like `message.get(...)` work.
-        let template_path = vindex_path.join("chat_template.jinja");
-        let template_str = std::fs::read_to_string(&template_path)
-            .map_err(|e| format!("read chat_template.jinja: {e}"))?;
-        let cfg = serde_json::Value::Object(Default::default());
-        let mut messages: Vec<(String, String)> = Vec::new();
-        if let Some(sys) = system_prompt.as_deref() {
-            messages.push(("system".to_string(), sys.to_string()));
-        }
-        messages.push(("user".to_string(), prompt.to_string()));
-        larql_inference::chat::render_chat_template_multi(
-            &template_str,
-            &cfg,
-            &messages,
-            enable_thinking,
-        )
-        .map_err(|e| format!("render chat template: {e}"))?
-    } else {
-        let wrap = larql_inference::wrap_chat_prompt(vindex_path, None, prompt);
-        eprintln!(
-            "[chat] applied={} note={} prompt_len={}",
-            wrap.applied, wrap.note, wrap.prompt.len()
-        );
-        wrap.prompt
-    };
+    //   LARQL_SYSTEM=<text>  → explicit system message
+    //   LARQL_NO_DEFAULT_SYSTEM=1 → suppress the auto-injected Gemma 4 default
+    let wrapped_prompt =
+        larql_inference::chat::render_user_prompt(vindex_path, weights.arch.family(), prompt)?;
     if std::env::var("LARQL_DUMP_PROMPT").is_ok() {
+        let mode = if std::env::var("LARQL_RAW_PROMPT").is_ok() {
+            "raw"
+        } else if std::env::var("LARQL_THINKING").is_ok() {
+            "thinking"
+        } else {
+            "default"
+        };
         eprintln!(
-            "[chat] mode={} ---PROMPT START---\n{}\n[chat] ---PROMPT END---",
-            if raw_prompt { "raw" } else if enable_thinking { "thinking" } else { "default" },
-            wrapped_prompt
+            "[chat] mode={mode} ---PROMPT START---\n{wrapped_prompt}\n[chat] ---PROMPT END---"
         );
     }
-    let prompt_ids =
-        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
-            .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
+    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
+        .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
     eprintln!("[chat] tokenised to {} ids", prompt_ids.len());
 
     let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
@@ -496,7 +445,10 @@ fn run_with_moe_shards(
     let n = result.decode_ms.len();
     if n > 0 {
         let avg = result.decode_ms.iter().sum::<f64>() / n as f64;
-        eprintln!("[grid] {n} tokens · {avg:.0} ms/tok · {:.1} tok/s", 1000.0 / avg);
+        eprintln!(
+            "[grid] {n} tokens · {avg:.0} ms/tok · {:.1} tok/s",
+            1000.0 / avg
+        );
     }
     Ok(())
 }

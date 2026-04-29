@@ -1,10 +1,10 @@
 # Roadmap — larql-models
 
-## Current: 12 architectures, 274 tests, safetensors + GGUF loading, 88.02% line / 86.29% function coverage
+## Current: 12 architectures, 282 tests, safetensors + GGUF loading, 81.41% line / 82.06% function coverage
 
 ## Roadmap Review 2026-04-26
 
-The 2026-04-26 quality pass closed the known P0 items for `larql-models`: walk-only filtering, silent dtype reporting, quant test gaps, loader string constants, MXFP4 consolidation, config validation adoption, clippy, examples, benchmark coverage, and coverage refresh are complete.
+The 2026-04-26 quality pass closed the known P0 items for `larql-models`: walk-only filtering, silent dtype reporting, quant test gaps, loader string constants, MXFP4 consolidation, config validation adoption, clippy, examples, benchmark coverage, and coverage refresh are complete. The 2026-04-30 follow-up fixed packed BF16 expert ownership, GGUF matrix layout/config-default handling, and refreshed coverage to the current baseline.
 
 Recommended next sequence:
 - Add Phi-3 / Phi-4 architecture support first. It is low effort, exercises the new validation path, and expands coverage without changing the trait.
@@ -48,7 +48,7 @@ Would require extending the trait beyond transformer assumptions (no attention k
 **Effort**: Medium  
 **Status**: Not started
 
-Current loader mmaps shards but eagerly converts retained tensors into f32 `ModelWeights`. For 70B+ models, per-layer/lazy loading would reduce peak memory. Already have mmap infrastructure — extend to lazy loading with `Arc<Mmap>` references and explicit tensor lifetimes.
+Current loader mmaps shards but eagerly converts retained dense tensors into f32 `ModelWeights`; packed BF16 expert tensors are already retained as mmap byte ranges. For 70B+ models, per-layer/lazy loading would reduce peak memory further. Already have mmap infrastructure — extend to lazy loading with `Arc<Mmap>` references and explicit tensor lifetimes.
 
 Design direction: ADR-008 proposes additive `LazyModelWeights` / `load_model_dir_lazy(_validated)` APIs rather than overloading eager `ModelWeights`.
 
@@ -116,3 +116,6 @@ Current sliding window is boolean per layer. Future models may have more complex
 | Criterion benchmark suite | 2026-04-26 | `cargo bench -p larql-models --bench models` covers detection, validation, key mapping, FFN classification, synthetic loading, and GGML dequant |
 | Documentation refresh | 2026-04-26 | README, roadmap, performance notes, loading/quant docs, and ADRs updated for validation and current metrics |
 | Example suite (3 demos) | 2026-04-07 | architecture_demo (all 12), demo_tensor_keys (all 12), demo_loading |
+| Packed BF16 mmap retention | 2026-04-30 | Gemma 4 A4B packed BF16 expert tensors are retained as mmap byte ranges instead of heap-cloned raw bytes |
+| GGUF loader correctness fixes | 2026-04-30 | 2D tensors load as standard `[rows, cols]`; absent optional RoPE/vocab metadata falls back through architecture/tokenizer defaults |
+| Coverage baseline refresh | 2026-04-30 | 282 tests; 81.41% line / 82.06% function coverage |

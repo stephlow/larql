@@ -102,7 +102,9 @@ Walk-only mode skips FFN tensors during loading where possible. Safetensors keys
 are filtered before dtype conversion, GGUF keys are normalized and filtered
 before dequantization, and GPT-OSS packed MXFP4 experts are not expanded when
 their generated expert keys are filtered. `drop_ffn_weights()` remains available
-for already-loaded `ModelWeights`.
+for already-loaded `ModelWeights`. Gemma 4 A4B packed BF16 expert blocks are
+kept as retained mmap byte ranges instead of heap-cloned raw bytes, and
+`drop_ffn_weights()` releases their ranges and any unreferenced packed mmaps.
 
 | Model | Before | After | Freed | Savings |
 |-------|--------|-------|-------|---------|
@@ -124,6 +126,7 @@ MoE and MLA notes:
 - DeepSeek MLA is mostly architecture metadata and key mapping in this crate; loading still follows the same safetensors/GGUF tensor paths.
 - Per-expert MoE tensors are ordinary tensors unless a model packs experts into a custom format.
 - GPT-OSS packed MXFP4 experts are predicate-aware: walk-only filtering avoids expanding packed gate/up/down experts into f32 when the generated expert keys are filtered out.
+- Gemma 4 A4B packed BF16 experts stay mmap-backed and are served through `ModelWeights::get_packed_bytes()`.
 
 ## Architecture Detection
 
