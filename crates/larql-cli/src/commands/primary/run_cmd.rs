@@ -410,10 +410,26 @@ fn run_with_moe_shards(
     //   LARQL_SYSTEM=<text>  → prepend a system message before the user turn
     //                          (Gemma 4 26B-A4B-it relies on one to avoid the
     //                          "answer from the text" reading-comprehension
-    //                          fallback)
+    //                          fallback — see default below)
+    //   LARQL_NO_DEFAULT_SYSTEM=1 → suppress the auto-injected default for
+    //                                Gemma-4-MoE (use raw chat_template only)
     let raw_prompt = std::env::var("LARQL_RAW_PROMPT").is_ok();
     let enable_thinking = std::env::var("LARQL_THINKING").is_ok();
-    let system_prompt = std::env::var("LARQL_SYSTEM").ok();
+    // Gemma 4 26B-A4B-it (and Gemma 4 MoE in general) defaults into a
+    // "summarise the input text" frame without a system prompt, so the
+    // answer to "What is the capital of France?" comes back as
+    // "**not specified in the text**" instead of "Paris". Inject a minimal
+    // helpful-assistant system message when none is set, unless the user
+    // explicitly opts out with LARQL_NO_DEFAULT_SYSTEM=1.
+    let user_system = std::env::var("LARQL_SYSTEM").ok();
+    let suppress_default = std::env::var("LARQL_NO_DEFAULT_SYSTEM").is_ok();
+    let system_prompt = user_system.or_else(|| {
+        if suppress_default || !weights.arch.is_moe() || weights.arch.family() != "gemma4" {
+            None
+        } else {
+            Some("You are a helpful assistant. Answer questions concisely.".to_string())
+        }
+    });
     let wrapped_prompt = if raw_prompt {
         // Base-model style: just <bos>prompt.  Tokenizer adds <bos> when its
         // config says so; encode_prompt handles the prefix.

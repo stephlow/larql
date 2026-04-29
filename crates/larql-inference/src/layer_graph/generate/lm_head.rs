@@ -26,7 +26,16 @@ pub fn lm_head_topk(
     backend: &dyn ComputeBackend,
 ) -> Vec<(u32, f32)> {
     let hits = index.lm_head_knn_backend(query, top_k, backend);
-    if !hits.is_empty() {
+    // Workaround for the prefill→decode boundary: on the first decode
+    // step, the Metal `q4k_matvec` / `f16_gemv` for lm_head occasionally
+    // returns an all-zeros score vector even though the query is healthy
+    // (verified rms ≈ 4, max_abs ≈ 60). The underlying cause appears to
+    // be a GPU command-buffer ordering edge case after the first
+    // `decode_token_with_moe` call. Falling back to the CPU/backend
+    // gemv path produces correct scores immediately.
+    let all_zero = !hits.is_empty()
+        && hits.iter().all(|(_, s)| *s == 0.0 || s.is_nan());
+    if !hits.is_empty() && !all_zero {
         return hits;
     }
     backend_lm_head_topk(weights, query, top_k, backend)

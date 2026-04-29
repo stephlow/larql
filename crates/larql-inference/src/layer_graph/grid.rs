@@ -17,6 +17,8 @@ use larql_compute::prelude::*;
 use larql_models::ModelWeights;
 use larql_vindex::VectorIndex;
 
+use std::collections::HashSet;
+
 use crate::ffn::moe_remote::{InflightMoe, MoeRouterWeights, RemoteMoeError, ShardStream};
 use crate::ffn::RemoteMoeBackend;
 use crate::forward::{apply_norm, embed_tokens_pub};
@@ -24,6 +26,173 @@ use crate::layer_graph::generate::detok::Detokenizer;
 use crate::layer_graph::generate::eos::EosConfig;
 use crate::layer_graph::generate::lm_head_topk as lm_topk;
 use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+
+/// IDs of tokens that should never be picked during text generation.
+///
+/// Built from the tokenizer's `added_tokens` table (everything marked
+/// `special: true`) minus any IDs in the EOS set — those are kept so the
+/// EOS check in [`EosConfig`] can fire when the model wants to halt.
+///
+/// Without this filter, Q4_K quantisation noise occasionally lifts a special
+/// token's logit above the intended next-word logit. On Gemma 4 26B-A4B,
+/// `<mask>` (id 4) and the channel/turn markers leak into the answer at
+/// random positions, producing fragments like "The<mask>capital of France".
+fn build_special_suppress_set(
+    tokenizer: &tokenizers::Tokenizer,
+    eos: &EosConfig,
+) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    // 1. Anything the tokenizer config explicitly marks as a special added
+    //    token (`<bos>`, `<mask>`, `<|tool>`, channel/turn markers, etc.).
+    for (&id, added) in tokenizer.get_added_tokens_decoder().iter() {
+        if added.special && !eos.eos_token_ids.contains(&id) {
+            out.insert(id);
+        }
+    }
+    // 2. Vocab-resident structural tokens that aren't flagged `special` but
+    //    should never appear in a natural-language answer:
+    //      - `<unusedN>` placeholders reserved for future training,
+    //      - `[multimodal]` and similar bracketed markers,
+    //      - HTML/markdown tags (`<table>`, `<h1>`, `<strong>`, …),
+    //
+    //    Without this widening, Q4_K quantisation noise on Gemma 4 26B-A4B
+    //    occasionally outranks the intended next-word logit with one of
+    //    these markers, producing fragments like "The<mask>capital..." or
+    //    "The<unused25>...". Suppressing pulls the next-best legitimate
+    //    word continuation forward, and the cascade effect through the KV
+    //    cache cleans up later positions too (we observed `<0xC2>` →
+    //    "랑" sequences disappear once position 1 picks a real word).
+    let vocab = tokenizer.get_vocab(true);
+    let mut structural_count = 0;
+    for (tok, &id) in vocab.iter() {
+        if eos.eos_token_ids.contains(&id) || out.contains(&id) {
+            continue;
+        }
+        if is_structural_marker(tok) {
+            out.insert(id);
+            structural_count += 1;
+        }
+    }
+    if std::env::var("LARQL_DEBUG_TOKEN_IDS").is_ok() {
+        eprintln!(
+            "[suppress] {} ids ({} from added_tokens.special, {} from structural-marker scan)",
+            out.len(),
+            out.len() - structural_count,
+            structural_count,
+        );
+        // Dump a sample so we can see what got captured.
+        let mut sorted: Vec<u32> = out.iter().copied().collect();
+        sorted.sort_unstable();
+        let sample: Vec<String> = sorted
+            .iter()
+            .take(20)
+            .map(|id| {
+                let raw = tokenizer.id_to_token(*id).unwrap_or_default();
+                format!("{id}={raw:?}")
+            })
+            .collect();
+        eprintln!("[suppress] first 20: {}", sample.join(", "));
+        // Also explicitly probe id 31 (`<unused25>`) and id 5 (`[multimodal]`).
+        for &probe in &[5u32, 31, 4, 168, 184] {
+            let raw = tokenizer.id_to_token(probe).unwrap_or_default();
+            let in_set = out.contains(&probe);
+            let in_vocab = vocab.contains_key(&raw);
+            eprintln!("[suppress] probe id={probe} raw={raw:?} in_set={in_set} in_vocab={in_vocab}");
+        }
+    }
+    out
+}
+
+/// Returns `true` for vocab strings that look like structural markup or
+/// reserved placeholders rather than natural-language tokens. Conservative:
+/// only matches strings of the form `<...>`, `</...>`, or `[...]` with
+/// non-whitespace bodies. Whitespace tokens (`\n`, `▁`-prefixed,
+/// `▁▁▁...`) are intentionally NOT matched — those are legitimate parts
+/// of normal text.
+fn is_structural_marker(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    let trimmed = tok.trim();
+    if trimmed.len() < 2 {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    let bracketed = (first == b'<' && last == b'>') || (first == b'[' && last == b']');
+    if !bracketed {
+        return false;
+    }
+    // Body must be non-empty and contain no whitespace (markers are tight
+    // tokens; a token like `<some real text>` from natural language would
+    // contain a space and shouldn't be suppressed).
+    let body = &trimmed[1..trimmed.len() - 1];
+    !body.is_empty() && !body.chars().any(char::is_whitespace)
+}
+
+/// Pick the top-1 vocabulary id from logits, skipping any id in `suppress`.
+///
+/// Falls back to the raw argmax when every top candidate is suppressed
+/// (degenerate case — should never happen unless `suppress` covers most of
+/// the vocab).
+///
+/// Set `LARQL_DEBUG_TOPK=1` to log the top-5 logit candidates per step;
+/// useful when the chosen token is wrong and you want to see whether the
+/// right answer was even in the running.
+fn pick_next_filtered(
+    index: &VectorIndex,
+    weights: &ModelWeights,
+    h: &ndarray::Array1<f32>,
+    backend: &dyn ComputeBackend,
+    suppress: &HashSet<u32>,
+    tokenizer: &tokenizers::Tokenizer,
+) -> u32 {
+    let debug_topk = std::env::var("LARQL_DEBUG_TOPK").is_ok();
+    if suppress.is_empty() && !debug_topk {
+        return lm_topk(index, weights, h, 1, backend)
+            .into_iter()
+            .next()
+            .map(|(id, _)| id)
+            .unwrap_or(0);
+    }
+    // Pull a wider top-K so that when the model's logits put many
+    // structural markers at the top (which Q4_K-quantised Gemma 4 26B-A4B
+    // does at the first answer position), we still find a real word.
+    let candidates = lm_topk(index, weights, h, 256, backend);
+    if debug_topk {
+        let summary: Vec<String> = candidates
+            .iter()
+            .take(8)
+            .map(|(id, score)| {
+                let raw = tokenizer.id_to_token(*id).unwrap_or_default();
+                let mark = if suppress.contains(id) { "✗" } else { " " };
+                format!("{mark}id={id:6} {score:+.4e} {raw:?}")
+            })
+            .collect();
+        let max_abs = candidates
+            .iter()
+            .fold(0.0f32, |a, &(_, s)| a.max(s.abs()));
+        let nan_count = candidates.iter().filter(|(_, s)| s.is_nan()).count();
+        let zero_count = candidates.iter().filter(|(_, s)| *s == 0.0).count();
+        let suppressed_in_top16 = candidates
+            .iter()
+            .take(16)
+            .filter(|(id, _)| suppress.contains(id))
+            .count();
+        eprintln!(
+            "    top8: {}\n    (max|score|={max_abs:.6e}  zeros={zero_count}/{}  nans={nan_count}  suppressed_top16={suppressed_in_top16}/16)",
+            summary.join("  |  "),
+            candidates.len()
+        );
+    }
+    candidates
+        .iter()
+        .find(|(id, _)| !suppress.contains(id))
+        .or_else(|| candidates.first())
+        .map(|(id, _)| *id)
+        .unwrap_or(0)
+}
 
 // ── Bottleneck diagnostic ────────────────────────────────────────────────────
 //
@@ -319,6 +488,11 @@ pub fn generate_with_remote_moe(
     let mut detok = Detokenizer::new(tokenizer);
     detok.seed(&prompt_ids);
 
+    // Special-token suppression set: prevents Q4_K-noise-induced picks of
+    // `<mask>`, `<|tool>`, `<|channel>`, etc. EOS tokens stay unmasked so
+    // the EOS check can still fire when the model legitimately wants to halt.
+    let suppress = build_special_suppress_set(tokenizer, eos);
+
     for (prefill_idx, &tok_id) in prompt_ids.iter().enumerate() {
         let tok_embed = embed_tokens_pub(weights, &[tok_id]);
         let x_tok: Vec<f32> = tok_embed.as_slice().unwrap_or(&[]).to_vec();
@@ -364,14 +538,15 @@ pub fn generate_with_remote_moe(
         .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
     let h_norm0 = apply_norm(weights, &prefill_h_arr, arch.final_norm_key(), norm_offset);
     let last0 = h_norm0.row(0).to_owned();
-    let first_id = lm_topk(index, weights, &last0, 1, backend)
-        .into_iter()
-        .next()
-        .map(|(id, _)| id)
-        .unwrap_or(0);
+    let first_id = pick_next_filtered(index, weights, &last0, backend, &suppress, tokenizer);
 
     let first_tok = detok.push(first_id);
     let first_is_eos = eos.is_eos_with_tokenizer(first_id, &first_tok, tokenizer);
+    let debug_ids = std::env::var("LARQL_DEBUG_TOKEN_IDS").is_ok();
+    if debug_ids {
+        let raw = tokenizer.id_to_token(first_id).unwrap_or_default();
+        eprintln!("[tok 0] id={first_id:6} raw={raw:?} delta={first_tok:?}");
+    }
     tokens.push(first_tok);
     current_ids.push(first_id);
     if first_is_eos || tokens.len() >= max_tokens {
@@ -516,11 +691,21 @@ pub fn generate_with_remote_moe(
             .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
         let h_normed = apply_norm(weights, &h_arr, arch.final_norm_key(), norm_offset);
         let last_hidden = h_normed.row(0).to_owned();
-        let next_id = lm_topk(index, weights, &last_hidden, 1, backend)
-            .into_iter()
-            .next()
-            .map(|(id, _)| id)
-            .unwrap_or(0);
+        if std::env::var("LARQL_DEBUG_TOKEN_IDS").is_ok() {
+            let raw_rms = (last_hidden_vec.iter().map(|v| v * v).sum::<f32>()
+                / last_hidden_vec.len() as f32)
+                .sqrt();
+            let normed_rms = (last_hidden.iter().map(|v| v * v).sum::<f32>()
+                / last_hidden.len() as f32)
+                .sqrt();
+            let max_abs = last_hidden
+                .iter()
+                .fold(0.0f32, |a, &b| a.max(b.abs()));
+            eprintln!(
+                "  [step {step}] h_pre_norm_rms={raw_rms:.5} h_normed_rms={normed_rms:.5} max_abs={max_abs:.5}"
+            );
+        }
+        let next_id = pick_next_filtered(index, weights, &last_hidden, backend, &suppress, tokenizer);
 
         let token_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         decode_ms.push(token_wall_ms);
@@ -536,6 +721,10 @@ pub fn generate_with_remote_moe(
         }
         let tok_str = detok.push(next_id);
         let is_eos = eos.is_eos_with_tokenizer(next_id, &tok_str, tokenizer);
+        if debug_ids {
+            let raw = tokenizer.id_to_token(next_id).unwrap_or_default();
+            eprintln!("[tok {}] id={next_id:6} raw={raw:?} delta={tok_str:?}", step + 1);
+        }
         tokens.push(tok_str);
         current_ids.push(next_id);
         if is_eos {
@@ -669,11 +858,11 @@ pub fn generate_with_remote_moe_batch(
     let mut decode_ms = Vec::new();
     let mut detok = Detokenizer::new(tokenizer);
     detok.seed(&prompt_ids);
+    let suppress = build_special_suppress_set(tokenizer, eos);
     let pfa = ndarray::Array2::from_shape_vec((1, hidden), last_hidden_vec.clone())
         .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
     let pfn = apply_norm(weights, &pfa, arch.final_norm_key(), norm_offset);
-    let first_id = lm_topk(index, weights, &pfn.row(0).to_owned(), 1, backend)
-        .into_iter().next().map(|(id, _)| id).unwrap_or(0);
+    let first_id = pick_next_filtered(index, weights, &pfn.row(0).to_owned(), backend, &suppress, tokenizer);
     let first_tok = detok.push(first_id);
     let first_eos = eos.is_eos_with_tokenizer(first_id, &first_tok, tokenizer);
     tokens.push(first_tok);
@@ -727,8 +916,7 @@ pub fn generate_with_remote_moe_batch(
         let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_out.clone())
             .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
         let h_normed = apply_norm(weights, &h_arr, arch.final_norm_key(), norm_offset);
-        let next_tok_id = lm_topk(index, weights, &h_normed.row(0).to_owned(), 1, backend)
-            .into_iter().next().map(|(id, _)| id).unwrap_or(0);
+        let next_tok_id = pick_next_filtered(index, weights, &h_normed.row(0).to_owned(), backend, &suppress, tokenizer);
 
         decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         let tok_str = detok.push(next_tok_id);
