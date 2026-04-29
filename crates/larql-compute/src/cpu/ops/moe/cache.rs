@@ -27,7 +27,7 @@
 //! of the format tag, so a single key works for all formats.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// LRU cache entry: dequantised expert weights.
 pub(super) type ExpertF32 = Arc<Vec<f32>>;
@@ -58,6 +58,12 @@ fn cache_key(bytes: &[u8]) -> Key {
 
 struct Inner {
     map: std::collections::HashMap<Key, ExpertF32>,
+    /// Insertion order — used for FIFO eviction when `map.len() > cap`.
+    /// Hits do NOT touch this (eviction is now FIFO, not LRU): preserving
+    /// recency would force every read to take a write lock, which destroys
+    /// the parallel-hit pattern that motivates the `RwLock` switch.
+    /// For workloads sized so the working set fits in `cap`, no eviction
+    /// happens and the policy difference is moot.
     order: VecDeque<Key>,
     cap: usize,
 }
@@ -71,16 +77,11 @@ impl Inner {
         }
     }
 
-    fn get(&mut self, key: Key) -> Option<ExpertF32> {
-        let v = self.map.get(&key)?.clone();
-        // LRU touch: move to back without reordering the map. Linear in the
-        // VecDeque; for cap=64 this is a handful of pointer moves per lookup
-        // and stays well below the BLAS cost we're amortising.
-        if let Some(pos) = self.order.iter().position(|k| *k == key) {
-            self.order.remove(pos);
-            self.order.push_back(key);
-        }
-        Some(v)
+    /// Read-only lookup — no map mutation, no order update.  Suitable to
+    /// run under a shared `RwLock` read guard so concurrent rayon threads
+    /// hitting different (or the same) keys don't serialize.
+    fn get(&self, key: Key) -> Option<ExpertF32> {
+        self.map.get(&key).cloned()
     }
 
     fn insert(&mut self, key: Key, val: ExpertF32) {
@@ -103,14 +104,14 @@ impl Inner {
     }
 }
 
-fn cell() -> &'static Mutex<Inner> {
-    static CELL: OnceLock<Mutex<Inner>> = OnceLock::new();
+fn cell() -> &'static RwLock<Inner> {
+    static CELL: OnceLock<RwLock<Inner>> = OnceLock::new();
     CELL.get_or_init(|| {
         let cap = std::env::var("LARQL_MOE_CACHE_ENTRIES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(64);
-        Mutex::new(Inner::new(cap))
+        RwLock::new(Inner::new(cap))
     })
 }
 
@@ -118,20 +119,23 @@ fn cell() -> &'static Mutex<Inner> {
 /// miss. `expected_floats` is required for block formats (Q4_K) where the
 /// output length is not derivable from the input length without padding info;
 /// it's ignored for raw BF16. On hit, no allocation happens.
+///
+/// Concurrency: the hot path (cache hit) takes a *read* lock so any number of
+/// rayon threads can clone their Arcs in parallel.  Misses take a brief write
+/// lock only at insert time; the dequant itself runs lock-free.
 pub(super) fn cached_dequant(
     bytes: &[u8],
     format: crate::QuantFormat,
     expected_floats: usize,
 ) -> ExpertF32 {
     let key = cache_key(bytes);
-    // Fast path: read-only hit under the mutex. Cache key is just the byte
-    // slice identity — same bytes always dequant to the same output.
-    if let Ok(mut inner) = cell().lock() {
+    // Fast path: shared read lock — concurrent hits don't contend.
+    if let Ok(inner) = cell().read() {
         if let Some(hit) = inner.get(key) {
             return hit;
         }
     }
-    // Miss: dequantise OUTSIDE the lock, then insert.
+    // Miss: dequantise OUTSIDE any lock, then take the write lock to insert.
     let decoded = match format {
         crate::QuantFormat::BF16 => super::math::bf16_to_f32(bytes),
         crate::QuantFormat::Q4_K => {
@@ -148,7 +152,7 @@ pub(super) fn cached_dequant(
         }
     };
     let arc = Arc::new(decoded);
-    if let Ok(mut inner) = cell().lock() {
+    if let Ok(mut inner) = cell().write() {
         inner.insert(key, arc.clone());
     }
     arc
@@ -228,5 +232,50 @@ mod cache_format_tests {
         let bytes = vec![0u8; 144];
         let out = cached_dequant(&bytes, QuantFormat::Q4_K, 200);
         assert!(out.is_empty(), "expected_floats not a 256 multiple → empty");
+    }
+
+    /// Parallel cache hits don't deadlock or corrupt — exercises the
+    /// `RwLock` read-side under contention.  Many threads request the same
+    /// few keys; the cache must stably return the same `Arc` content for
+    /// each key without serializing readers (the perf claim isn't
+    /// asserted here, but the absence of deadlock and content-identity
+    /// regression is).
+    #[test]
+    fn parallel_hits_do_not_deadlock_or_corrupt() {
+        // Pre-warm: a few small BF16 entries.
+        let entries: Vec<Vec<u8>> = (0..4)
+            .map(|i| {
+                let v = (i + 1) as f32;
+                let bits = v.to_bits();
+                let hi = (bits >> 16) as u16;
+                hi.to_le_bytes().repeat(4) // 4 BF16 values per entry
+            })
+            .collect();
+        for e in &entries {
+            let _ = cached_dequant(e, QuantFormat::BF16, 4);
+        }
+
+        // 16 threads × 1000 lookups each, all on the same 4 keys.
+        // Each thread checks the returned Vec matches the known constant.
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for tid in 0..16 {
+                let entries = &entries;
+                handles.push(s.spawn(move || {
+                    for i in 0..1000 {
+                        let idx = (tid + i) & 3; // 0..=3
+                        let out = cached_dequant(&entries[idx], QuantFormat::BF16, 4);
+                        let expected = (idx + 1) as f32;
+                        assert!(
+                            out.iter().all(|v| (v - expected).abs() < 1e-3),
+                            "thread {tid}/iter {i}: got {out:?}, expected {expected}"
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("thread panicked");
+            }
+        });
     }
 }

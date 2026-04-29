@@ -187,33 +187,52 @@ impl MetalBackend {
         let n_tgs_down = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
 
         if layer.is_gated() {
-            let n_tgs_per_mat = (inter as u64).div_ceil(q4k_gu::ROWS_PER_TG);
-            // f16-accumulator gate+up: kernel-isolated 1.79× faster
-            // than f32 (measured 2026-04-28, see
-            // `tests/test_kernel_q4k_ffn_gate_up_f16acc.rs`). End-to-end
-            // greedy-decode parity validated on a 10-prompt corpus —
-            // all outputs bit-identical to f32.
+            // Variant selection. Production **default is 8sg** as of
+            // 2026-04-28 — see below.
             //
-            // **End-to-end perf win does NOT reproduce reliably.**
-            // Initial measurement showed +23% on a thermally-loaded GPU,
-            // but on a quiet system f32 and f16 run at parity (within
-            // 1%). The kernel was already bandwidth-bound at 274 GB/s
-            // (74% of LPDDR5X peak); freeing ALU cycles only helps when
-            // ALU is the bottleneck, which it isn't here. The 1.79×
-            // kernel speedup gets absorbed into pipeline stalls
-            // elsewhere or thermal headroom that the surrounding
-            // kernels reclaim.
+            //   - **Default (8sg)**: 8 simdgroups per TG (256 threads,
+            //     8 rows/TG). Bit-identical output to the older 4sg
+            //     kernel (same math, only TG geometry changed). End-to-end
+            //     +2.1% throughput on quiet GPU (12.96 → 12.69 ms/tok,
+            //     5-iter median), no regression on long prompts, full
+            //     greedy-decode parity validated on a 5-prompt corpus.
+            //     First positive end-to-end perf result this session.
             //
-            // Kept as opt-in via `LARQL_F16_ACC=1` for future
-            // experiments (e.g. on different hardware where the ALU
-            // pressure profile differs, or for prompts where thermal
-            // headroom matters). Default stays f32.
+            //   - `LARQL_GATE_UP_8SG=0`: opt-OUT to the older 4sg kernel
+            //     (production until 2026-04-28). Emergency escape hatch.
+            //
+            //   - `LARQL_F16_ACC=1`: f16 inner accumulator. Kernel-isolated
+            //     1.79× but end-to-end at parity on quiet GPU. Kept as
+            //     opt-in for future hardware/fusion scenarios.
+            use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
+            let use_4sg = matches!(
+                std::env::var("LARQL_GATE_UP_8SG").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            );
             let use_f16 = std::env::var("LARQL_F16_ACC").is_ok();
-            let pipeline = if use_f16 {
-                &self.q4k_ffn_gate_up_f16acc_pipeline.state
+            let (pipeline, rows_per_tg, threads_per_tg) = if use_4sg && use_f16 {
+                (
+                    &self.q4k_ffn_gate_up_f16acc_pipeline.state,
+                    q4k_gu::ROWS_PER_TG,
+                    q4k_gu::THREADS_PER_TG,
+                )
+            } else if use_4sg {
+                (
+                    &self.q4k_ffn_gate_up_pipeline.state,
+                    q4k_gu::ROWS_PER_TG,
+                    q4k_gu::THREADS_PER_TG,
+                )
             } else {
-                &self.q4k_ffn_gate_up_pipeline.state
+                // Default (8sg) — and f16 is incompatible-untested with
+                // 8sg dispatch, so 8sg wins if both flags conflict.
+                let _ = use_f16;
+                (
+                    &self.q4k_ffn_gate_up_8sg_pipeline.state,
+                    q4k_gu_8sg::ROWS_PER_TG,
+                    q4k_gu_8sg::THREADS_PER_TG,
+                )
             };
+            let n_tgs_per_mat = (inter as u64).div_ceil(rows_per_tg);
             enc.set_compute_pipeline_state(pipeline);
             enc.set_buffer(0, Some(bufs.gate_w), 0);
             enc.set_buffer(1, Some(bufs.up_w), 0);
@@ -224,7 +243,7 @@ impl MetalBackend {
             enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(n_tgs_per_mat * 2, 1, 1),
-                MTLSize::new(q4k_gu::THREADS_PER_TG, 1, 1),
+                MTLSize::new(threads_per_tg, 1, 1),
             );
 
             // Fast path: down is Q4_K → fused activation+down kernel

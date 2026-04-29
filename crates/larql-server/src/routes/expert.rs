@@ -71,6 +71,443 @@ pub struct BatchExpertResponse {
 
 // ── Core computation ──────────────────────────────────────────────────────────
 
+/// CPU expert dispatch with pre_norm hoisted out of the per-expert loop and
+/// allocation-free per-expert compute via `ExpertScratch`.  Replaces the old
+/// `expert_ids.par_iter().filter_map(|&eid| run_expert(...)).collect()` pattern
+/// where every expert call:
+///   1. re-applied `pre_experts_norm` to the same residual (K× wasted work),
+///   2. re-allocated three Vec<f32> per matmul (3 × K × num_layers per token).
+///
+/// New flow:
+///   - apply `pre_experts_norm` once per frame, store h_norm
+///   - rayon par_iter over K experts; each rayon worker reuses a thread-local
+///     `ExpertScratch` for matmul outputs and activation
+///   - weighted sum of partials into the result
+///
+/// Returns the same `Vec<f32>` (length = hidden) as the old code path —
+/// callers see no behavioural change, only fewer allocations and no
+/// redundant rms_norm work.
+pub fn run_experts_cpu_batch(
+    state: &AppState,
+    layer: usize,
+    h_post_attn: &[f32],
+    expert_ids: &[usize],
+    expert_weights: &[f32],
+) -> Result<Vec<f32>, ServerError> {
+    use larql_compute::cpu::ops::moe::{
+        pre_experts_norm, run_single_expert_into, ExpertScratch,
+    };
+    use std::time::Instant;
+    let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+    let t_start = Instant::now();
+
+    let model = state.model_or_err(None)?;
+    let weights = model
+        .get_or_load_weights()
+        .map_err(ServerError::InferenceUnavailable)?;
+    let arch = &*weights.arch;
+    let hidden = h_post_attn.len();
+    if hidden == 0 || expert_ids.is_empty() {
+        return Ok(vec![0.0f32; hidden]);
+    }
+    let inter = arch.moe_intermediate_size();
+    let activation = larql_inference::activation_from_arch(arch);
+    let inter_padded = if let Some(per_layer) = weights.has_per_layer_ffn().then_some(()) {
+        let _ = per_layer;
+        let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+        inter.div_ceil(block) * block
+    } else {
+        inter
+    };
+    let t_arch = t_start.elapsed();
+
+    // Hoist pre_experts_norm: same input residual for all K experts; rms_norm
+    // is invariant of the expert id, so doing it once per frame saves K-1
+    // redundant passes per layer.
+    let t_norm_start = Instant::now();
+    let pre_norm_slice: &[f32] = arch
+        .moe_pre_experts_norm_key(layer)
+        .and_then(|key| weights.vectors.get(&key))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let h_norm = pre_experts_norm(
+        h_post_attn,
+        pre_norm_slice,
+        arch.norm_weight_offset(),
+        arch.norm_eps(),
+    );
+    let t_norm = t_norm_start.elapsed();
+
+    // Per-rayon-thread scratch.  16 cores on M3 Max → up to 16 instances live
+    // for the lifetime of the worker thread; replaces the old code's 3 fresh
+    // Vec<f32> heap allocations per expert call.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Option<ExpertScratch>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    let format = if weights.has_per_layer_ffn() {
+        larql_inference::QuantFormat::Q4_K
+    } else {
+        larql_inference::QuantFormat::BF16
+    };
+
+    use rayon::prelude::*;
+    let partials: Vec<(Vec<f32>, f32)> = expert_ids
+        .par_iter()
+        .zip(expert_weights.par_iter())
+        .filter(|(_, &w)| w != 0.0)
+        .filter_map(|(&eid, &w)| {
+            // Resolve the expert's bytes (per-layer Q4_K mmap or legacy
+            // packed BF16).  Mirrors run_expert's logic but inlined so we
+            // can drive the scratch-based fast path here.
+            let (gu_bytes, dn_bytes) = if weights.has_per_layer_ffn() {
+                weights.get_layer_entry_bytes(layer, eid)?
+            } else {
+                let gu_key = arch.packed_experts_gate_up_key(layer)?;
+                let dn_key = arch.packed_experts_down_key(layer)?;
+                let gu_all = weights.get_packed_bytes(&gu_key)?;
+                let dn_all = weights.get_packed_bytes(&dn_key)?;
+                let gu_stride = 2 * inter * hidden * 2; // BF16 = 2 bytes
+                let dn_stride = hidden * inter * 2;
+                let gu_start = eid * gu_stride;
+                let dn_start = eid * dn_stride;
+                if gu_start + gu_stride > gu_all.len()
+                    || dn_start + dn_stride > dn_all.len()
+                {
+                    return None;
+                }
+                (
+                    &gu_all[gu_start..gu_start + gu_stride],
+                    &dn_all[dn_start..dn_start + dn_stride],
+                )
+            };
+
+            let out = SCRATCH.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                let scratch =
+                    borrow.get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
+                // Resize-on-shape-change: a single server might host multiple
+                // models with different shapes (rare, but cheap to handle).
+                if scratch.gate_out.len() != inter
+                    || scratch.act.len() != inter_padded
+                    || scratch.out.len() != hidden
+                {
+                    *scratch = ExpertScratch::new(hidden, inter, inter_padded);
+                }
+                let h2 = run_single_expert_into(
+                    scratch, &h_norm, gu_bytes, dn_bytes, inter, format, activation,
+                );
+                h2.to_vec() // last unavoidable allocation per expert call
+            });
+            Some((out, w))
+        })
+        .collect();
+
+    let t_par = t_norm_start.elapsed() - t_norm;
+    let t_sum_start = Instant::now();
+    let mut out = vec![0.0f32; hidden];
+    for (expert_out, weight) in &partials {
+        for (acc, &v) in out.iter_mut().zip(expert_out.iter()) {
+            *acc += weight * v;
+        }
+    }
+    let t_sum = t_sum_start.elapsed();
+    if timing_enabled {
+        let n_active = partials.len();
+        eprintln!(
+            "[run_experts_cpu] layer={layer} K={n_active} arch={:.2}ms norm={:.2}ms \
+             par_iter={:.2}ms sum={:.2}ms total={:.2}ms",
+            t_arch.as_secs_f32() * 1000.0,
+            t_norm.as_secs_f32() * 1000.0,
+            t_par.as_secs_f32() * 1000.0,
+            t_sum.as_secs_f32() * 1000.0,
+            t_start.elapsed().as_secs_f32() * 1000.0,
+        );
+    }
+    Ok(out)
+}
+
+/// Eager warmup of the per-(layer, expert) HNSW unit cache for **walk** /
+/// interpretability KNN queries.  Iterates every `(layer, expert)` this
+/// shard owns and pre-builds an HNSW index over that expert's gate slice
+/// (`moe_intermediate_size` vectors per unit, vs `num_experts ×
+/// moe_intermediate_size` for the layer-level index).
+///
+/// Independent of the Metal expert cache: this is for the gate-KNN code
+/// path (`gate_knn_expert`), not the MoE forward pass.  Skipped when
+/// `LARQL_NO_WARMUP=1`.  Requires `--hnsw` to actually be useful at query
+/// time, but the cache is populated regardless so flipping the toggle on
+/// later doesn't pay a build burst.
+///
+/// Returns `(units_built, num_layers, experts_per_shard)` so the caller
+/// can log a one-line summary.  All builds happen in parallel via rayon.
+pub fn warmup_hnsw_unit_cache(
+    model: &crate::state::LoadedModel,
+) -> Result<(usize, usize, usize), String> {
+    if std::env::var("LARQL_NO_WARMUP").is_ok() {
+        return Ok((0, 0, 0));
+    }
+    let weights = model.get_or_load_weights()?;
+    let arch = &*weights.arch;
+    if !arch.is_hybrid_moe() {
+        return Ok((0, 0, 0));
+    }
+    let num_layers = model.config.num_layers;
+    let num_experts = arch.num_experts();
+    let moe_inter = arch.moe_intermediate_size();
+    if num_layers == 0 || moe_inter == 0 {
+        return Ok((0, 0, 0));
+    }
+    // Resolve the (layer, expert_id) ownership set for this shard.
+    // Priority: `--units` manifest (`unit_filter`) → `--experts START-END`
+    // (`expert_filter`, layer-uniform) → all experts on every layer.
+    let owned_units: Vec<(usize, usize)> = if let Some(units) = model.unit_filter.as_ref() {
+        let mut v: Vec<(usize, usize)> = units.iter().copied().collect();
+        v.sort_unstable();
+        v
+    } else {
+        let (start, end_excl) = model.expert_filter.unwrap_or((0, num_experts));
+        (0..num_layers)
+            .flat_map(|l| (start..end_excl).map(move |e| (l, e)))
+            .collect()
+    };
+    let n_experts_owned = if let Some(units) = model.unit_filter.as_ref() {
+        units.iter().map(|(_, e)| *e).collect::<std::collections::HashSet<_>>().len()
+    } else {
+        let (start, end_excl) = model.expert_filter.unwrap_or((0, num_experts));
+        end_excl.saturating_sub(start)
+    };
+
+    // Build the (layer, feat_start, feat_end) triples for every owned unit.
+    // feat_start_for_expert_e = e * moe_intermediate_size — same layout the
+    // gate_knn_expert callers use.
+    let mut units: Vec<(usize, usize, usize)> = Vec::with_capacity(owned_units.len());
+    for (layer, eid) in owned_units {
+        let fs = eid * moe_inter;
+        let fe = (eid + 1) * moe_inter;
+        units.push((layer, fs, fe));
+    }
+
+    // We need a `&VectorIndex` to call `warmup_hnsw_units`.  The patched
+    // overlay's `blocking_read` exposes that synchronously — fine here
+    // because this runs inside a `spawn_blocking` job during startup.
+    let patched = model.patched.blocking_read();
+    let n_built = patched.base().warmup_hnsw_units(&units);
+    drop(patched);
+    Ok((n_built, num_layers, n_experts_owned))
+}
+
+/// Eager warmup of the Metal expert buffer cache.
+///
+/// Iterates every `(layer, expert_id)` owned by this shard and calls
+/// `cached_buffer_for_bytes` on the expert's gate_up + down mmap regions,
+/// populating `BufferCache` so that subsequent RPC calls hit instantly
+/// instead of paying the first-touch ~10–28ms Metal-buffer allocation.
+///
+/// Returns the number of (gate_up, down) buffer pairs staged.
+///
+/// Skipped when `LARQL_NO_WARMUP=1` (useful in low-RSS dev setups; warmup
+/// allocates ~10MB × experts_owned × num_layers of Metal-resident memory).
+#[cfg(feature = "metal-experts")]
+pub fn warmup_metal_expert_cache(model: &crate::state::LoadedModel) -> Result<usize, String> {
+    use larql_compute::MetalBackend;
+
+    if std::env::var("LARQL_NO_WARMUP").is_ok() {
+        return Ok(0);
+    }
+
+    let weights = model.get_or_load_weights()?;
+    let arch = &*weights.arch;
+    if !arch.is_hybrid_moe() || !weights.has_per_layer_ffn() {
+        return Ok(0);
+    }
+
+    let backend_slot = model.metal_backend.get_or_init(MetalBackend::new);
+    let Some(backend) = backend_slot.as_ref() else {
+        return Ok(0);
+    };
+
+    let num_layers = model.config.num_layers;
+    let num_experts = arch.num_experts();
+
+    // Same ownership-resolution pattern as warmup_hnsw_unit_cache:
+    // unit_filter > expert_filter > all.  See that function for rationale.
+    let owned_units: Vec<(usize, usize)> = if let Some(units) = model.unit_filter.as_ref() {
+        let mut v: Vec<(usize, usize)> = units.iter().copied().collect();
+        v.sort_unstable();
+        v
+    } else {
+        let (start, end_excl) = model.expert_filter.unwrap_or((0, num_experts));
+        (0..num_layers)
+            .flat_map(|l| (start..end_excl).map(move |e| (l, e)))
+            .collect()
+    };
+
+    let mut staged = 0usize;
+    for (layer, eid) in owned_units {
+        if let Some((gu, dn)) = weights.get_layer_entry_bytes(layer, eid) {
+            // Each call returns a cached Buffer; first call pays the
+            // mmap → Metal allocation/copy, subsequent calls are O(1)
+            // hash lookups.  We discard the returned Buffer here — the
+            // cache holds it for the server's lifetime.
+            let _ = backend.cached_buffer_for_bytes(gu);
+            let _ = backend.cached_buffer_for_bytes(dn);
+            staged += 1;
+        }
+    }
+    Ok(staged)
+}
+
+/// Run a layer's pre-selected experts on the Metal GPU and return the weighted
+/// sum of their outputs.  Returns `Ok(None)` when Metal is unavailable, the
+/// model is not hybrid-MoE, or per-layer Q4_K weights are missing — caller
+/// should fall back to the per-expert CPU path.
+///
+/// `h_post_attn` is the residual the streaming RPC carries (pre-norm not yet
+/// applied).  `expert_ids` and `expert_weights` are already client-routed (no
+/// router run on the server).  Returns the weighted sum WITHOUT post-experts
+/// norm; the client applies post-norm once after summing across shards.
+#[cfg(feature = "metal-experts")]
+pub fn run_experts_metal_batch(
+    state: &AppState,
+    layer: usize,
+    h_post_attn: &[f32],
+    expert_ids: &[usize],
+    expert_weights: &[f32],
+) -> Result<Option<Vec<f32>>, ServerError> {
+    use larql_compute::{MetalBackend, MoeScratch};
+    use std::time::Instant;
+    let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+    // Runtime escape hatch: when LARQL_DISABLE_METAL_EXPERTS=1 the streaming
+    // handler falls through to the per-expert rayon CPU path even on a build
+    // that linked the Metal backend.  Useful when client and server share a
+    // single GPU (loopback dev box) — running the experts on CPU avoids
+    // contention with the client's attention + dense FFN GPU work.
+    if std::env::var("LARQL_DISABLE_METAL_EXPERTS").is_ok() {
+        return Ok(None);
+    }
+    let t_start = Instant::now();
+
+    let model = state.model_or_err(None)?;
+    let weights = model
+        .get_or_load_weights()
+        .map_err(ServerError::InferenceUnavailable)?;
+    let arch = &*weights.arch;
+    let t_state = t_start.elapsed();
+
+    if !arch.is_hybrid_moe() || !weights.has_per_layer_ffn() {
+        return Ok(None);
+    }
+
+    // Lazy-init the Metal backend.  `MetalBackend::new()` returns None when
+    // Metal is unavailable on this build/host (e.g. cross-compile, no GPU).
+    let backend_slot = model.metal_backend.get_or_init(MetalBackend::new);
+    let Some(backend) = backend_slot.as_ref() else {
+        return Ok(None);
+    };
+
+    let hidden = model.config.hidden_size;
+    if h_post_attn.len() != hidden {
+        return Err(ServerError::BadRequest(format!(
+            "residual length {} != hidden_size {hidden}",
+            h_post_attn.len()
+        )));
+    }
+    let inter = arch.moe_intermediate_size();
+    let top_k = arch.num_experts_per_token();
+
+    let t_pre = Instant::now();
+    // Apply pre_experts_norm on CPU (cheap; matches the per-expert CPU path's
+    // behaviour in `run_single_expert_with_norm`).
+    //   out[i] = h[i] / sqrt(mean(h²) + eps) * (norm[i] + norm_offset)
+    let h_norm: Vec<f32> = if let Some(norm_key) = arch.moe_pre_experts_norm_key(layer) {
+        if let Some(pre_norm) = weights.vectors.get(&norm_key) {
+            let eps = arch.norm_eps();
+            let norm_offset = arch.norm_weight_offset();
+            let pre_norm = pre_norm.as_slice();
+            let rms = (h_post_attn.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
+            h_post_attn
+                .iter()
+                .zip(pre_norm.iter())
+                .map(|(x, w)| x / rms * (w + norm_offset))
+                .collect()
+        } else {
+            h_post_attn.to_vec()
+        }
+    } else {
+        h_post_attn.to_vec()
+    };
+    let t_norm = t_pre.elapsed();
+
+    let t_scratch_start = Instant::now();
+    // Look up (or create + cache) the MoE scratch for this layer's shape.
+    let scratch_key = (top_k, hidden, inter);
+    let scratch: Arc<MoeScratch> = {
+        let mut cache = model.moe_scratches.lock().expect("moe_scratches poisoned");
+        cache
+            .entry(scratch_key)
+            .or_insert_with(|| Arc::new(MoeScratch::new_public(backend, top_k, hidden, inter)))
+            .clone()
+    };
+    let t_scratch = t_scratch_start.elapsed();
+
+    // get_expert_bytes maps expert_id → (gate_up_bytes, down_bytes) mmap slices.
+    let get_expert_bytes = |eid: usize| -> Option<(&[u8], &[u8])> {
+        weights.get_layer_entry_bytes(layer, eid)
+    };
+
+    // Pre-stage per-expert weights as cache-backed Metal buffers.  First
+    // call for each (layer, expert_id) pays a memcpy (when bytes aren't
+    // page-aligned for zero-copy aliasing); subsequent calls hit the
+    // BufferCache and return instantly.  By the time the model is warm
+    // (a handful of decode tokens), every owned expert has been staged.
+    let t_buf_start = Instant::now();
+    let mut expert_bufs: Vec<(larql_compute::MetalBuffer, larql_compute::MetalBuffer)> =
+        Vec::with_capacity(expert_ids.len());
+    let mut filtered_weights: Vec<f32> = Vec::with_capacity(expert_ids.len());
+    for (i, &eid) in expert_ids.iter().enumerate() {
+        if let Some((gu, dn)) = weights.get_layer_entry_bytes(layer, eid) {
+            expert_bufs.push((
+                backend.cached_buffer_for_bytes(gu),
+                backend.cached_buffer_for_bytes(dn),
+            ));
+            filtered_weights.push(expert_weights[i]);
+        }
+    }
+    let t_bufs = t_buf_start.elapsed();
+
+    let t_gpu_start = Instant::now();
+    let result = backend.run_experts_prestaged_metal(
+        &h_norm,
+        &expert_bufs,
+        &filtered_weights,
+        &scratch,
+    );
+    let t_gpu = t_gpu_start.elapsed();
+    // Suppress the unused-closure warning for the legacy code path —
+    // `get_expert_bytes` was used by `run_experts_preselected_metal` before
+    // we switched to the prestaged path, kept here as a fallback for
+    // experts where the mmap lookup itself failed (we just skipped them).
+    let _ = get_expert_bytes;
+
+    if timing_enabled {
+        eprintln!(
+            "[expert_metal_batch] layer={layer} experts={} state={:.2}ms norm={:.2}ms \
+             scratch={:.2}ms bufs={:.2}ms gpu={:.2}ms total={:.2}ms",
+            expert_ids.len(),
+            t_state.as_secs_f32() * 1000.0,
+            t_norm.as_secs_f32() * 1000.0,
+            t_scratch.as_secs_f32() * 1000.0,
+            t_bufs.as_secs_f32() * 1000.0,
+            t_gpu.as_secs_f32() * 1000.0,
+            t_start.elapsed().as_secs_f32() * 1000.0,
+        );
+    }
+
+    Ok(Some(result))
+}
+
 pub fn run_expert(
     state: &AppState,
     layer: usize,
@@ -79,11 +516,20 @@ pub fn run_expert(
 ) -> Result<Vec<f32>, ServerError> {
     let model = state.model_or_err(None)?;
 
-    // Ownership check: reject if this shard doesn't own this expert.
-    // `expert_filter` uses the half-open `[start, end_exclusive)` convention
-    // returned by `parse_layer_range`, so the upper bound is exclusive.
-    // Display the inclusive bound in the error message to match the CLI flag.
-    if let Some((start, end_excl)) = model.expert_filter {
+    // Ownership check.  When `unit_filter` is set (`--units` JSON manifest),
+    // the per-(layer, expert) ownership set takes precedence over the
+    // layer-uniform `expert_filter` range.  The two flags are mutually
+    // exclusive at the CLI parse layer, but check both in priority order
+    // so misconfiguration fails loudly at request time rather than silently
+    // accepting a request the shard doesn't own.
+    if let Some(units) = model.unit_filter.as_ref() {
+        if !units.contains(&(layer, expert_id)) {
+            return Err(ServerError::BadRequest(format!(
+                "(layer={layer}, expert={expert_id}) not owned by this shard \
+                 (--units manifest defines its ownership set)"
+            )));
+        }
+    } else if let Some((start, end_excl)) = model.expert_filter {
         if expert_id < start || expert_id >= end_excl {
             let end_inclusive = end_excl.saturating_sub(1);
             return Err(ServerError::BadRequest(format!(

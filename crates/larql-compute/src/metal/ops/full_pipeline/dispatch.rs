@@ -403,68 +403,37 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
-        // ── 5. O projection.
-        //
-        // Two paths:
-        //   - **Q4_K + seq_len > 1**: ONE `q4k_matmul` dispatch for all
-        //     positions. Amortises Q4_K dequant across seq_len × COLS_PER_TG=4.
-        //     ~3.8× faster than stacked matvec at production prefill shapes
-        //     (measured: 4.99 ms → 1.31 ms at N=2560, K=8192, M=18; see
-        //     `tests/test_kernel_q4k_matmul_perf.rs`).
-        //   - **Otherwise** (decode seq=1, or non-Q4_K formats): per-position
-        //     matvec loop, one shared encoder. The encoder coalescing was
-        //     itself a small win (~5% on long prompts) and stays as the
-        //     fallback path for non-batched dispatches.
-        //
-        // Buffer layout note: the matmul writes `out[m × N + row]` =
-        // `[seq_len, hidden]` row-major. The matvec writes
-        // `o_outs[l]` at `pos × hidden × 4` byte offsets — same layout.
-        // Downstream stages (post-attn residual + pre-FFN norm) consume
-        // `o_outs[l]` as `[seq_len, hidden]` row-major regardless.
+        // ── 5. O projection. Per position, coalesced into a single
+        // encoder so we pay one encoder-create + end_encoding for the
+        // whole stage. (Tried wiring `q4k_matmul` here for seq_len>1
+        // prefill — kernel-isolated 3.8× speedup did NOT translate
+        // end-to-end. Within-noise on short prompts, ~10% regression
+        // on long prompts. Same root cause as the f16 acc and FFN
+        // gate+up tries: the kernel was already bandwidth-near-peak
+        // and the matmul's [seq_len × q_dim] X working set thrashes
+        // L1 on long prompts. Reverted 2026-04-28; matmul kernel
+        // remains shipped with parity tests but isn't worth wiring
+        // into production decode/prefill.)
         {
-            let use_matmul = seq_len > 1
-                && layers[l].wo.format == crate::QuantFormat::Q4_K
-                && q4k_matmul_pipeline.is_some();
             let enc = cmd.new_compute_command_encoder();
-            if use_matmul {
-                let matmul_kh = q4k_matmul_pipeline.unwrap();
-                use crate::metal::shaders::q4k_matmul as q4k_mm;
-                let n = hidden as u32;
-                let k = layer_q_dim as u32;
-                let m = seq_len as u32;
-                let row_tgs = (hidden as u64).div_ceil(q4k_mm::ROWS_PER_TG);
-                let col_tgs = (seq_len as u64).div_ceil(q4k_mm::COLS_PER_TG);
-                enc.set_compute_pipeline_state(&matmul_kh.state);
-                enc.set_buffer(0, Some(&wo_bufs[l]), 0);
-                enc.set_buffer(1, Some(&attn_outs[l]), 0);
-                enc.set_buffer(2, Some(&o_outs[l]), 0);
-                enc.set_bytes(3, 4, &n as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(5, 4, &m as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(
-                    metal::MTLSize::new(col_tgs, row_tgs, 1),
-                    metal::MTLSize::new(q4k_mm::THREADS_PER_TG, 1, 1),
+            for pos in 0..seq_len {
+                crate::metal::stages::o_proj::encode(
+                    enc,
+                    &qm_pipes,
+                    q8_quant_pipeline,
+                    layers[l].wo.format,
+                    &wo_bufs[l],
+                    &attn_outs[l],
+                    q_off(pos),
+                    &q8_bufs[l],
+                    q8_off(pos),
+                    &q8s_bufs[l],
+                    q8s_off(pos),
+                    &o_outs[l],
+                    h_off(pos),
+                    layer_q_dim,
+                    hidden,
                 );
-            } else {
-                for pos in 0..seq_len {
-                    crate::metal::stages::o_proj::encode(
-                        enc,
-                        &qm_pipes,
-                        q8_quant_pipeline,
-                        layers[l].wo.format,
-                        &wo_bufs[l],
-                        &attn_outs[l],
-                        q_off(pos),
-                        &q8_bufs[l],
-                        q8_off(pos),
-                        &q8s_bufs[l],
-                        q8s_off(pos),
-                        &o_outs[l],
-                        h_off(pos),
-                        layer_q_dim,
-                        hidden,
-                    );
-                }
             }
             enc.end_encoding();
         }

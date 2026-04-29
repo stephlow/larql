@@ -405,6 +405,60 @@ impl DecodeBackend for MetalBackend {
         ))
     }
 
+    fn decode_token_with_moe_split(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        moe_fire_fn: &mut dyn FnMut(usize, &[f32]),
+        moe_collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        let num_layers = layers.len();
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        if cache_guard.is_none() {
+            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+        }
+        let kv = cache_guard.as_mut().unwrap();
+        while kv.layers.len() < num_layers {
+            let l = &layers[kv.layers.len()];
+            kv.layers.push(ops::kv_cache::LayerKVCache::new(
+                &self.bufs,
+                4096,
+                l.num_kv_heads,
+                l.head_dim,
+            ));
+        }
+        // Wrap fire so its return value is ignored — the decode-loop closure
+        // already discards moe_fn's output when split mode is active.
+        let mut fire_wrapper = |layer: usize, h: &[f32]| -> Vec<f32> {
+            moe_fire_fn(layer, h);
+            Vec::new()
+        };
+        Some(MetalBackend::decode_token_with_moe_split_fn(
+            self,
+            kv,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            Some(&mut fire_wrapper),
+            Some(moe_collect_fn),
+        ))
+    }
+
     fn decode_token_split_profile(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],

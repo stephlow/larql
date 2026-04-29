@@ -117,6 +117,23 @@ impl VectorIndex {
         feat_end: usize,
         top_k: usize,
     ) -> Vec<(usize, f32)> {
+        // HNSW-on-unit fast path: when the master toggle is on, search the
+        // per-(layer, expert) HNSW (lazily built on first hit).  At ~704
+        // vectors per Gemma-4-26B-A4B expert this is sub-µs vs ~50µs brute.
+        // Falls through to the brute paths below if the index can't be
+        // built (empty slice, no gate data) or if the toggle is off.
+        if self
+            .gate
+            .hnsw_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(hits) =
+                self.gate_knn_expert_hnsw(layer, residual, feat_start, feat_end, top_k)
+            {
+                return hits;
+            }
+        }
+
         // If promoted to heap, use heap path
         if let Some(Some(ref matrix)) = self.gate.gate_vectors.get(layer) {
             let end = feat_end.min(matrix.shape()[0]);
@@ -533,6 +550,92 @@ impl VectorIndex {
         Some(super::hnsw::HnswLayer::build(&view, 8, 32))
     }
 
+    /// Build an HNSW for a single `(layer, expert_id)` unit — i.e. the gate
+    /// vectors for one expert's intermediate slice.  Index covers vectors
+    /// `feat_start..feat_end` in the layer's global feature space; entries
+    /// returned from the HNSW search are still in the local (0-based) range
+    /// and the caller offsets them back to global indices.
+    ///
+    /// Returns `None` when the layer has no gate data or the slice is empty.
+    fn build_hnsw_unit_at(
+        &self,
+        layer: usize,
+        feat_start: usize,
+        feat_end: usize,
+    ) -> Option<super::hnsw::HnswLayer> {
+        let (data, num_features) = self.gate_matrix_f32(layer)?;
+        let end = feat_end.min(num_features);
+        if feat_start >= end {
+            return None;
+        }
+        let view =
+            ArrayView2::from_shape((num_features, self.hidden_size), &data).ok()?;
+        let slice = view.slice(ndarray::s![feat_start..end, ..]);
+        // Smaller `m` and `ef_construction` for the per-expert case — at
+        // ~704 vectors the layer-level (8, 32) is overkill; (6, 16) builds
+        // ~3× faster with comparable recall on this size class.
+        Some(super::hnsw::HnswLayer::build(&slice, 6, 16))
+    }
+
+    /// Get-or-build the per-(layer, expert) HNSW unit, race-safely.
+    ///
+    /// Lock pattern mirrors `get_or_build_hnsw`: brief check under the
+    /// mutex, build outside the lock, install only if no other thread
+    /// raced ahead.
+    fn get_or_build_hnsw_unit(
+        &self,
+        layer: usize,
+        feat_start: usize,
+        feat_end: usize,
+    ) -> bool {
+        let key = (layer, feat_start);
+        {
+            let cache = self.gate.hnsw_unit_cache.lock().unwrap();
+            if cache.contains_key(&key) {
+                return true;
+            }
+        }
+        let Some(hnsw) = self.build_hnsw_unit_at(layer, feat_start, feat_end) else {
+            return false;
+        };
+        let mut cache = self.gate.hnsw_unit_cache.lock().unwrap();
+        cache.entry(key).or_insert(hnsw);
+        true
+    }
+
+    /// Eager-build per-(layer, expert) HNSW units in parallel.  Equivalent of
+    /// [`Self::warmup_hnsw_all_layers`] for the fine-grained shard layout —
+    /// caller passes `(layer, feat_start, feat_end)` triples for every unit
+    /// the shard owns.  Returns the number of units actually built (skipping
+    /// already-cached entries and empty slices).
+    pub fn warmup_hnsw_units(&self, units: &[(usize, usize, usize)]) -> usize {
+        use rayon::prelude::*;
+        // Snapshot which units still need building under the lock.
+        let to_build: Vec<(usize, usize, usize)> = {
+            let cache = self.gate.hnsw_unit_cache.lock().unwrap();
+            units
+                .iter()
+                .filter(|(l, fs, _)| !cache.contains_key(&(*l, *fs)))
+                .copied()
+                .collect()
+        };
+        if to_build.is_empty() {
+            return 0;
+        }
+        let built: Vec<((usize, usize), super::hnsw::HnswLayer)> = to_build
+            .par_iter()
+            .filter_map(|&(l, fs, fe)| {
+                self.build_hnsw_unit_at(l, fs, fe).map(|h| ((l, fs), h))
+            })
+            .collect();
+        let n = built.len();
+        let mut cache = self.gate.hnsw_unit_cache.lock().unwrap();
+        for (key, hnsw) in built {
+            cache.entry(key).or_insert(hnsw);
+        }
+        n
+    }
+
     /// Atomically install `hnsw` at `layer` if no other thread already
     /// did. A concurrent racer's index is dropped — the loss is one
     /// duplicated build, not a corrupted cache.
@@ -666,6 +769,62 @@ impl VectorIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.truncate(top_k);
+        Some(candidates)
+    }
+
+    /// Per-(layer, expert) HNSW search.  Returns `None` when the unit index
+    /// can't be built (empty slice, no gate data) or when gate matrix decode
+    /// fails — caller falls back to the brute paths in `gate_knn_expert`.
+    ///
+    /// Same `|dot|` ranking semantics as `gate_knn_hnsw` (oversample 4×, then
+    /// re-rank by absolute value).  Indices in the returned vector are in
+    /// **global** feature space — `feat_start` is added back so the caller
+    /// can use them interchangeably with the brute path's output.
+    fn gate_knn_expert_hnsw(
+        &self,
+        layer: usize,
+        residual: &Array1<f32>,
+        feat_start: usize,
+        feat_end: usize,
+        top_k: usize,
+    ) -> Option<Vec<(usize, f32)>> {
+        if !self.get_or_build_hnsw_unit(layer, feat_start, feat_end) {
+            return None;
+        }
+        let ef = self
+            .gate
+            .hnsw_ef_search
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let hnsw_k = top_k.saturating_mul(4).max(top_k);
+
+        // Need a view onto the expert's slice for re-ranking.  Cheapest path
+        // is the f32-mmap zero-copy slice; otherwise fall back to a
+        // gate_matrix_f32 clone and slice into it.
+        let (data, num_features) = self.gate_matrix_f32(layer)?;
+        let view = ArrayView2::from_shape((num_features, self.hidden_size), &data).ok()?;
+        let end = feat_end.min(num_features);
+        if feat_start >= end {
+            return None;
+        }
+        let slice = view.slice(ndarray::s![feat_start..end, ..]);
+
+        let cache = self.gate.hnsw_unit_cache.lock().unwrap();
+        let hnsw = cache.get(&(layer, feat_start))?;
+        let mut candidates = hnsw.search(&slice, residual, hnsw_k, ef);
+        drop(cache);
+
+        // Re-rank by |dot| to match brute-force semantics.
+        candidates.sort_unstable_by(|a, b| {
+            b.1.abs()
+                .partial_cmp(&a.1.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(top_k);
+        // HNSW returned indices in slice-local space (0..end-feat_start).
+        // Offset to global feature indices.
+        for hit in &mut candidates {
+            hit.0 += feat_start;
+        }
         Some(candidates)
     }
 
@@ -813,6 +972,118 @@ where
 mod tests {
     use super::top_k_by_abs;
     use ndarray::Array1;
+
+    // ── Per-(layer, expert) HNSW unit tests ──────────────────────────────
+    //
+    // Construct a small synthetic VectorIndex with gate vectors laid out
+    // as [features, hidden]. We split features into two "experts":
+    // expert 0 holds features [0, 4), expert 1 holds [4, 8).  Test that
+    // gate_knn_expert respects the expert range, and that the HNSW-enabled
+    // path returns the same top hit as brute-force on a designed input.
+    //
+    // The HNSW path uses random projection + approximate graph search so
+    // the EXACT top-K can differ from brute. We pick test inputs where the
+    // top hit is far from the runners-up, so even approximate search lands
+    // it correctly. This catches index-mapping bugs (slice→global offset),
+    // empty-slice handling, and the HNSW toggle dispatch — without
+    // promising graph-search recall guarantees the tests can't enforce.
+
+    use crate::index::VectorIndex;
+    use ndarray::Array2;
+    use std::sync::atomic::Ordering;
+
+    /// Build a 2-layer VectorIndex with 8 features × 4 hidden where
+    /// `feature_i = e_(i mod 4)` (one-hot among the 4 hidden dims).  A
+    /// query equal to `e_j` then dot-products to 1.0 exactly with
+    /// features `j, j+4` and 0.0 with the others — predictable top-K.
+    fn synth_index() -> VectorIndex {
+        let num_layers = 2;
+        let hidden = 4;
+        let mut gate0 = Array2::<f32>::zeros((8, hidden));
+        for f in 0..8 {
+            gate0[[f, f % 4]] = 1.0;
+        }
+        let gate1 = gate0.clone();
+        let gate = vec![Some(gate0), Some(gate1)];
+        let down = vec![None, None];
+        VectorIndex::new(gate, down, num_layers, hidden)
+    }
+
+    #[test]
+    fn gate_knn_expert_brute_force_respects_range() {
+        let v = synth_index();
+        // Query e_2 → matches feature 2 (in expert 0) and feature 6 (in
+        // expert 1) at score 1.0.  Restricting to expert 0 (feat 0..4)
+        // should return feature 2 only at full score; feature 6 must NOT
+        // appear.
+        let q = Array1::from_vec(vec![0.0, 0.0, 1.0, 0.0]);
+        let hits = v.gate_knn_expert(0, &q, 0, 4, 2);
+        assert_eq!(hits[0].0, 2, "top hit must be feature 2");
+        assert!((hits[0].1 - 1.0).abs() < 1e-5);
+        for (idx, _) in &hits {
+            assert!(*idx < 4, "feature {idx} leaked from expert 1");
+        }
+    }
+
+    #[test]
+    fn gate_knn_expert_hnsw_top_hit_matches_brute() {
+        let v = synth_index();
+        v.gate.hnsw_enabled.store(true, Ordering::Relaxed);
+        // Same query as above; HNSW must agree on the top hit (the only
+        // feature with perfect score 1.0 inside the expert-0 range).
+        let q = Array1::from_vec(vec![0.0, 0.0, 1.0, 0.0]);
+        let hits = v.gate_knn_expert(0, &q, 0, 4, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 2);
+        assert!((hits[0].1 - 1.0).abs() < 1e-5);
+        // Cache should now hold the unit index.
+        let cache = v.gate.hnsw_unit_cache.lock().unwrap();
+        assert!(cache.contains_key(&(0, 0)),
+            "hnsw_unit_cache must contain (layer=0, feat_start=0)");
+    }
+
+    #[test]
+    fn gate_knn_expert_hnsw_offsets_to_global_indices() {
+        let v = synth_index();
+        v.gate.hnsw_enabled.store(true, Ordering::Relaxed);
+        // Search expert 1 (features 4..8); query e_2 hits feature 6.
+        // The HNSW unit indexes 0..4 internally; we must offset back to
+        // global feature 6, not 2.
+        let q = Array1::from_vec(vec![0.0, 0.0, 1.0, 0.0]);
+        let hits = v.gate_knn_expert(0, &q, 4, 8, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 6, "expected global feature 6, got {}", hits[0].0);
+    }
+
+    #[test]
+    fn warmup_hnsw_units_builds_requested_set() {
+        let v = synth_index();
+        let units = vec![(0, 0, 4), (0, 4, 8), (1, 0, 4), (1, 4, 8)];
+        let n = v.warmup_hnsw_units(&units);
+        assert_eq!(n, 4);
+        let cache = v.gate.hnsw_unit_cache.lock().unwrap();
+        for &(l, fs, _) in &units {
+            assert!(cache.contains_key(&(l, fs)),
+                "missing unit ({l}, {fs}) after warmup");
+        }
+        // Idempotent: second call should build nothing new.
+        drop(cache);
+        let n2 = v.warmup_hnsw_units(&units);
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn gate_knn_expert_hnsw_falls_back_when_slice_empty() {
+        let v = synth_index();
+        v.gate.hnsw_enabled.store(true, Ordering::Relaxed);
+        // feat_start == feat_end → empty range → must return empty without
+        // panicking on the HNSW path or installing a bogus cache entry.
+        let q = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
+        let hits = v.gate_knn_expert(0, &q, 4, 4, 1);
+        assert!(hits.is_empty());
+        let cache = v.gate.hnsw_unit_cache.lock().unwrap();
+        assert!(!cache.contains_key(&(0, 4)));
+    }
 
     #[test]
     fn top_k_by_abs_basic_ordering() {

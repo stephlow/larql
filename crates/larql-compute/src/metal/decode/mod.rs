@@ -3,6 +3,7 @@ use super::*;
 mod diag;
 mod encode_ffn;
 mod encode_qkv;
+pub mod gpu_timing;
 mod moe_combine;
 pub mod profile;
 
@@ -58,6 +59,14 @@ impl MetalBackend {
     /// every MoE layer.  Signature: `moe_fn(layer_idx, h_post_attn) -> Vec<f32>`.
     /// The returned vec must have length == `hidden`.  Pass `None` for the
     /// normal local-expert path.
+    ///
+    /// When `moe_collect_fn` is also `Some` the per-layer pipeline switches to
+    /// the split-encoder layout: attention is committed and waited, `moe_fn`
+    /// is invoked as a non-blocking *fire* (return value discarded), dense
+    /// FFN + post-FFN residual are encoded on a fresh command buffer and
+    /// committed without waiting, then `moe_collect_fn(layer)` is called to
+    /// retrieve the expert output — letting the remote round trip overlap
+    /// with the dense-FFN GPU work.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn decode_token_with_moe_fn(
         &self,
@@ -74,6 +83,39 @@ impl MetalBackend {
         _rope_base: f32,
         mut moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
     ) -> Vec<f32> {
+        // Backwards-compat wrapper: forward to the split-aware impl with no
+        // collect callback.
+        self.decode_token_with_moe_split_fn(
+            kv_cache, layers, x, hidden, inter, q_dim, kv_dim,
+            _num_q_heads, _num_kv_heads, _head_dim, _rope_base,
+            moe_fn.as_deref_mut().map(|f| f as &mut dyn FnMut(usize, &[f32]) -> Vec<f32>),
+            None,
+        )
+    }
+
+    /// Split fire / collect variant of `decode_token_with_moe_fn`.  See the
+    /// trait method `DecodeBackend::decode_token_with_moe_split` for the
+    /// motivating use case (within-layer GPU/MoE overlap).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn decode_token_with_moe_split_fn(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[crate::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        mut moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
+        mut moe_collect_fn: Option<&mut dyn FnMut(usize) -> Vec<f32>>,
+    ) -> Vec<f32> {
+        let _gpu_time_token_start = std::time::Instant::now();
+        let mut gpu_time = gpu_timing::TokenGpuTime::default();
+
         let num_layers = layers.len();
         let hidden_val = hidden as u32;
         // Inner dim of down_proj is the intermediate size. Q4_K/Q6_K
@@ -210,6 +252,12 @@ impl MetalBackend {
 
         // Owned cmd+enc so they can be re-created mid-loop for MoE CPU interleave.
         let has_moe = layers.iter().any(|l| l.moe.is_some());
+        // Split mode: when a fire+collect callback pair is present, defer
+        // FFN encoding for MoE layers until *after* the remote MoE call has
+        // been fired, so dense FFN runs on the GPU in parallel with the
+        // network round trip.  Falls back to single-encoder per layer when
+        // `moe_collect_fn` is `None` (existing local-MoE / unary HTTP path).
+        let split_mode = moe_fn.is_some() && moe_collect_fn.is_some();
         let mut cmd = self.queue.new_command_buffer().to_owned();
         let mut enc = cmd.new_compute_command_encoder().to_owned();
         let mut encoder_ended = false;
@@ -572,58 +620,93 @@ impl MetalBackend {
                 );
             }
 
-            // ── Step 6: FFN (format-aware Q4_KF / Q4_K / Q4_0) ──
-            // Implementation lives in `encode_ffn.rs` so this hot
-            // function stays scannable. Behaviour is byte-identical
-            // to the previous inline form — see that file's comment.
-            self.encode_ffn_step(
-                &enc,
-                layer,
-                encode_ffn::FfnBufs {
-                    gate_w: &gate_bufs[l],
-                    up_w: &up_bufs[l],
-                    down_w: &down_bufs[l],
-                    ffn_norm_out: &ffn_norm_out,
-                    ffn_q8: &ffn_q8,
-                    ffn_q8s: &ffn_q8s,
-                    gate_out_scratch: &gate_out_scratch,
-                    up_out: &up_out,
-                    act_buf: &act_buf,
-                    down_out: &down_out,
-                },
-                encode_ffn::FfnDims {
-                    hidden,
-                    inter,
-                    inter_padded,
-                },
-                ffn_uses_q4k,
-            );
+            // ── Steps 6-7: FFN + post-FFN residual ──
+            //
+            // Skip when in split mode AND this layer has MoE — they will be
+            // re-encoded on a fresh command buffer inside the MoE block so
+            // they can run in parallel with the remote MoE round trip.  For
+            // non-MoE layers (or non-split mode) we encode them inline as
+            // before.
+            let defer_ffn_for_split = split_mode && layer.moe.is_some();
 
-            // ── Step 7: Post-FFN residual ──
-            if has_post_norms {
-                if let Some(post_ffn) = layer.post_ffn_norm {
-                    let post_ffn_buf = self.bufs.get_f32(post_ffn);
-                    let normed_ffn = &normed_scratch;
-                    use crate::metal::ops::full_pipeline::encode_rms_norm;
-                    encode_rms_norm(
-                        &enc,
-                        &self.rms_norm_pipeline,
-                        &down_out,
-                        &post_ffn_buf,
-                        normed_ffn,
+            // Stage-timing boundary: when LARQL_DECODE_STAGE_TIMING=1 (and we
+            // are NOT already splitting for MoE), close the encoder here so
+            // attention CB time can be recorded separately from FFN CB time.
+            // Adds ~1 commit/wait per layer (~0.5ms × 30 = ~15ms inflation
+            // on Gemma 4) — measurement-only mode, off by default.
+            let stage_timing_split = !defer_ffn_for_split
+                && std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
+            if stage_timing_split {
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::Attention);
+                cmd = self.queue.new_command_buffer().to_owned();
+                enc = cmd.new_compute_command_encoder().to_owned();
+                encoder_ended = false;
+            }
+
+            if !defer_ffn_for_split {
+                // Step 6: FFN (format-aware Q4_KF / Q4_K / Q4_0)
+                self.encode_ffn_step(
+                    &enc,
+                    layer,
+                    encode_ffn::FfnBufs {
+                        gate_w: &gate_bufs[l],
+                        up_w: &up_bufs[l],
+                        down_w: &down_bufs[l],
+                        ffn_norm_out: &ffn_norm_out,
+                        ffn_q8: &ffn_q8,
+                        ffn_q8s: &ffn_q8s,
+                        gate_out_scratch: &gate_out_scratch,
+                        up_out: &up_out,
+                        act_buf: &act_buf,
+                        down_out: &down_out,
+                    },
+                    encode_ffn::FfnDims {
                         hidden,
-                        eps,
-                        norm_offset,
-                    );
-                    use crate::metal::ops::full_pipeline::encode_residual_add;
-                    encode_residual_add(
-                        &enc,
-                        &self.residual_add_pipeline,
-                        &h_post_attn,
-                        normed_ffn,
-                        new_h,
-                        hidden,
-                    );
+                        inter,
+                        inter_padded,
+                    },
+                    ffn_uses_q4k,
+                );
+
+                // Step 7: Post-FFN residual
+                if has_post_norms {
+                    if let Some(post_ffn) = layer.post_ffn_norm {
+                        let post_ffn_buf = self.bufs.get_f32(post_ffn);
+                        let normed_ffn = &normed_scratch;
+                        use crate::metal::ops::full_pipeline::encode_rms_norm;
+                        encode_rms_norm(
+                            &enc,
+                            &self.rms_norm_pipeline,
+                            &down_out,
+                            &post_ffn_buf,
+                            normed_ffn,
+                            hidden,
+                            eps,
+                            norm_offset,
+                        );
+                        use crate::metal::ops::full_pipeline::encode_residual_add;
+                        encode_residual_add(
+                            &enc,
+                            &self.residual_add_pipeline,
+                            &h_post_attn,
+                            normed_ffn,
+                            new_h,
+                            hidden,
+                        );
+                    } else {
+                        use crate::metal::ops::full_pipeline::encode_residual_add;
+                        encode_residual_add(
+                            &enc,
+                            &self.residual_add_pipeline,
+                            &h_post_attn,
+                            &down_out,
+                            new_h,
+                            hidden,
+                        );
+                    }
                 } else {
                     use crate::metal::ops::full_pipeline::encode_residual_add;
                     encode_residual_add(
@@ -635,16 +718,6 @@ impl MetalBackend {
                         hidden,
                     );
                 }
-            } else {
-                use crate::metal::ops::full_pipeline::encode_residual_add;
-                encode_residual_add(
-                    &enc,
-                    &self.residual_add_pipeline,
-                    &h_post_attn,
-                    &down_out,
-                    new_h,
-                    hidden,
-                );
             }
 
             h_buf = new_h;
@@ -660,6 +733,19 @@ impl MetalBackend {
                     enc.end_encoding();
                     cmd.commit();
                     cmd.wait_until_completed();
+                    // In split mode the cb we just waited contains ONLY attention
+                    // (steps 1-5).  In non-split mode it normally contains
+                    // attention + dense FFN; but when stage_timing_split was
+                    // active, attention was already committed at its own
+                    // boundary so this cb contains only FFN + post-residual.
+                    let attn_cb_stage = if defer_ffn_for_split {
+                        gpu_timing::DecodeStage::Attention
+                    } else if stage_timing_split {
+                        gpu_timing::DecodeStage::DenseFfn
+                    } else {
+                        gpu_timing::DecodeStage::Other
+                    };
+                    gpu_time.record_stage(&cmd, attn_cb_stage);
                     encoder_ended = true;
 
                     // MoE and dense FFN run on the SAME input (h_post_attn, the
@@ -667,7 +753,104 @@ impl MetalBackend {
                     // Read MoE input from h_post_attn, accumulate MoE output into new_h.
                     let attn_ptr = h_post_attn.contents() as *const f32;
                     let attn_slice = unsafe { std::slice::from_raw_parts(attn_ptr, hidden) };
-                    let moe_out = if let Some(ref mut f) = moe_fn {
+                    let moe_out = if defer_ffn_for_split {
+                        // Split path: fire MoE NOW (h_post_attn is ready), then
+                        // encode dense FFN + post-FFN residual on a fresh cb so
+                        // GPU runs them while the network round trip is in
+                        // flight, then collect.
+                        let fire = moe_fn.as_deref_mut().expect("split_mode implies moe_fn");
+                        fire(l, attn_slice);
+
+                        // Fresh command buffer for the dense FFN pass.
+                        cmd = self.queue.new_command_buffer().to_owned();
+                        let ffn_enc = cmd.new_compute_command_encoder();
+
+                        // Step 6: FFN encode on the new cb.
+                        self.encode_ffn_step(
+                            ffn_enc,
+                            layer,
+                            encode_ffn::FfnBufs {
+                                gate_w: &gate_bufs[l],
+                                up_w: &up_bufs[l],
+                                down_w: &down_bufs[l],
+                                ffn_norm_out: &ffn_norm_out,
+                                ffn_q8: &ffn_q8,
+                                ffn_q8s: &ffn_q8s,
+                                gate_out_scratch: &gate_out_scratch,
+                                up_out: &up_out,
+                                act_buf: &act_buf,
+                                down_out: &down_out,
+                            },
+                            encode_ffn::FfnDims {
+                                hidden,
+                                inter,
+                                inter_padded,
+                            },
+                            ffn_uses_q4k,
+                        );
+
+                        // Step 7: Post-FFN residual on the new cb.
+                        if has_post_norms {
+                            if let Some(post_ffn) = layer.post_ffn_norm {
+                                let post_ffn_buf = self.bufs.get_f32(post_ffn);
+                                let normed_ffn = &normed_scratch;
+                                use crate::metal::ops::full_pipeline::encode_rms_norm;
+                                encode_rms_norm(
+                                    ffn_enc,
+                                    &self.rms_norm_pipeline,
+                                    &down_out,
+                                    &post_ffn_buf,
+                                    normed_ffn,
+                                    hidden,
+                                    eps,
+                                    norm_offset,
+                                );
+                                use crate::metal::ops::full_pipeline::encode_residual_add;
+                                encode_residual_add(
+                                    ffn_enc,
+                                    &self.residual_add_pipeline,
+                                    &h_post_attn,
+                                    normed_ffn,
+                                    new_h,
+                                    hidden,
+                                );
+                            } else {
+                                use crate::metal::ops::full_pipeline::encode_residual_add;
+                                encode_residual_add(
+                                    ffn_enc,
+                                    &self.residual_add_pipeline,
+                                    &h_post_attn,
+                                    &down_out,
+                                    new_h,
+                                    hidden,
+                                );
+                            }
+                        } else {
+                            use crate::metal::ops::full_pipeline::encode_residual_add;
+                            encode_residual_add(
+                                ffn_enc,
+                                &self.residual_add_pipeline,
+                                &h_post_attn,
+                                &down_out,
+                                new_h,
+                                hidden,
+                            );
+                        }
+                        ffn_enc.end_encoding();
+                        cmd.commit(); // GPU runs FFN async — no wait yet
+
+                        // Collect MoE — blocks on the network round trip.
+                        // GPU is doing dense FFN in parallel during this wait.
+                        let collect = moe_collect_fn
+                            .as_deref_mut()
+                            .expect("split_mode implies moe_collect_fn");
+                        let result = collect(l);
+                        // Wait for the FFN cb (likely already done if MoE was
+                        // the longer leg).
+                        cmd.wait_until_completed();
+                        gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::DenseFfn);
+                        result
+                    } else if let Some(ref mut f) = moe_fn {
                         f(l, attn_slice)
                     } else {
                         crate::cpu::ops::moe::cpu_moe_forward(
@@ -847,9 +1030,19 @@ impl MetalBackend {
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            gpu_time.record(&cmd);
         }
 
-        super::buffers::read_buffer_f32(h_buf, hidden)
+        let result = super::buffers::read_buffer_f32(h_buf, hidden);
+
+        // Print GPU vs CPU split when LARQL_GPU_TIMING=1. Wall covers the
+        // entire decode_token_with_moe_fn call including buffer reads;
+        // gpu is the sum of MTLCommandBuffer.gpuStartTime/gpuEndTime
+        // windows. Delta is CPU encoding + readback overhead.
+        let wall_ms = _gpu_time_token_start.elapsed().as_secs_f64() * 1000.0;
+        gpu_time.print_if_enabled(wall_ms);
+
+        result
     }
 
     /// Local-expert path — delegates to `decode_token_with_moe_fn` with no hook.

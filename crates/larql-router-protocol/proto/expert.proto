@@ -75,4 +75,9 @@ message ExpertLayerOutput {
   // h2 = post_experts_norm(weighted_sum(expert_k_outputs)).
   // f32 LE bytes, length = hidden_size × 4.
   bytes h2 = 2;
+  // Server-side compute time for this frame, in milliseconds.
+  // Set when LARQL_MOE_TIMING=1 on the server; lets the client decompose
+  // its collect_ms into network_ms (= collect_ms − compute_ms) vs
+  // server_compute_ms.  Zero / unset means no server timing was recorded.
+  float compute_ms = 3;
 }

@@ -511,6 +511,11 @@ mod tests {
             probe_labels: labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             expert_filter: None,
+            unit_filter: None,
+            #[cfg(feature = "metal-experts")]
+            metal_backend: std::sync::OnceLock::new(),
+            #[cfg(feature = "metal-experts")]
+            moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

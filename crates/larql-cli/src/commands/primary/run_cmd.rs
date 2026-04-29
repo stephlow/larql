@@ -164,6 +164,37 @@ pub struct RunArgs {
     /// parallel to the owning shard(s) via `POST /v1/expert/batch`.
     #[arg(long, value_name = "SHARDS")]
     pub moe_shards: Option<String>,
+
+    /// Path to a JSON manifest for fine-grained per-(layer, expert) shard
+    /// ownership.  Format:
+    ///
+    /// ```json
+    /// { "shards": [
+    ///     { "url": "grpc://hostA:9081",
+    ///       "layer_experts": {"0": [[0,31]], "1": [[0,15]]} },
+    ///     { "url": "grpc://hostB:9082",
+    ///       "layer_experts": {"0": [[32,63]], "1": [[16,31]]} }
+    ///   ] }
+    /// ```
+    ///
+    /// Each shard owns an explicit `(layer, expert_id)` set instead of a
+    /// layer-uniform expert range — pairs naturally with the server's
+    /// `--units PATH` flag.  Mutually exclusive with `--moe-shards`.
+    #[arg(long, value_name = "PATH")]
+    pub moe_units_manifest: Option<std::path::PathBuf>,
+
+    /// MoE dispatch strategy when `--moe-shards` is set.
+    ///
+    ///   streaming  (default) — one gRPC stream per shard, 30 sequential
+    ///              round-trips per decode token.  Exact: each layer's expert
+    ///              input uses the correct h_post_attn.
+    ///
+    ///   batch      — two Metal passes per token + ONE batch gRPC call per
+    ///              shard.  Approximate: pass-1 h_post_attn lacks prior
+    ///              layers' expert contributions, but error is small.
+    ///              Faster on servers with many CPU cores.
+    #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
+    pub moe_dispatch: String,
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -180,11 +211,27 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         return experts::run(&vindex_path, &args);
     }
 
-    if let Some(ref shards_str) = args.moe_shards {
+    if args.moe_shards.is_some() && args.moe_units_manifest.is_some() {
+        return Err(
+            "--moe-shards and --moe-units-manifest are mutually exclusive — \
+             use --moe-shards for layer-uniform expert ranges, \
+             --moe-units-manifest for per-(layer, expert) ownership"
+                .into(),
+        );
+    }
+    if args.moe_shards.is_some() || args.moe_units_manifest.is_some() {
         let prompt = args.prompt.as_deref().ok_or(
-            "--moe-shards requires a prompt argument (chat mode not yet supported)",
+            "--moe-shards / --moe-units-manifest requires a prompt argument \
+             (chat mode not yet supported)",
         )?;
-        return run_with_moe_shards(&vindex_path, prompt, shards_str, args.max_tokens);
+        return run_with_moe_shards(
+            &vindex_path,
+            prompt,
+            args.moe_shards.as_deref(),
+            args.moe_units_manifest.as_deref(),
+            args.max_tokens,
+            &args.moe_dispatch,
+        );
     }
 
     if let Some(prompt) = args.prompt.as_deref() {
@@ -281,33 +328,57 @@ fn build_walk_args(
 fn run_with_moe_shards(
     vindex_path: &std::path::Path,
     prompt: &str,
-    shards_str: &str,
+    shards_str: Option<&str>,
+    units_manifest: Option<&std::path::Path>,
     max_tokens: usize,
+    dispatch: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use larql_inference::ffn::moe_remote::{RemoteMoeBackend, ShardConfig};
-    use larql_inference::generate_with_remote_moe;
+    use larql_inference::ffn::moe_remote::{
+        parse_unit_manifest, RemoteMoeBackend, ShardConfig,
+    };
+    use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
 
-    // Parse "START-END=URL,START-END=URL,..." into Vec<ShardConfig>.
-    let mut configs: Vec<ShardConfig> = Vec::new();
-    for segment in shards_str.split(',') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
+    // Pick ownership mode: legacy `--moe-shards` (layer-uniform ranges) or
+    // `--moe-units-manifest` (fine-grained per-(layer, expert) sets).  The
+    // mutually-exclusive guard at the caller means at most one is set here.
+    let configs: Vec<ShardConfig> = if let Some(path) = units_manifest {
+        let cfgs = parse_unit_manifest(path)
+            .map_err(|e| format!("--moe-units-manifest: {e}"))?;
+        if cfgs.is_empty() {
+            return Err("--moe-units-manifest: manifest contains no shards".into());
         }
-        let mut parts = segment.splitn(2, '=');
-        let range_str = parts
-            .next()
-            .ok_or_else(|| format!("malformed shard segment: {segment:?}"))?;
-        let url = parts
-            .next()
-            .ok_or_else(|| format!("missing URL in shard segment: {segment:?}"))?;
-        let (start, end_incl) = ShardConfig::parse_range(range_str)
-            .ok_or_else(|| format!("bad expert range {range_str:?} in --moe-shards"))?;
-        configs.push(ShardConfig::new(start, end_incl, url));
-    }
-    if configs.is_empty() {
-        return Err("--moe-shards: no valid shard segments found".into());
-    }
+        eprintln!(
+            "Loaded {} shard(s) from unit manifest at {}",
+            cfgs.len(),
+            path.display()
+        );
+        cfgs
+    } else if let Some(s) = shards_str {
+        // Parse "START-END=URL,START-END=URL,..." into Vec<ShardConfig>.
+        let mut cfgs: Vec<ShardConfig> = Vec::new();
+        for segment in s.split(',') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let mut parts = segment.splitn(2, '=');
+            let range_str = parts
+                .next()
+                .ok_or_else(|| format!("malformed shard segment: {segment:?}"))?;
+            let url = parts
+                .next()
+                .ok_or_else(|| format!("missing URL in shard segment: {segment:?}"))?;
+            let (start, end_incl) = ShardConfig::parse_range(range_str)
+                .ok_or_else(|| format!("bad expert range {range_str:?} in --moe-shards"))?;
+            cfgs.push(ShardConfig::new(start, end_incl, url));
+        }
+        if cfgs.is_empty() {
+            return Err("--moe-shards: no valid shard segments found".into());
+        }
+        cfgs
+    } else {
+        return Err("internal error: run_with_moe_shards called with neither flag".into());
+    };
 
     eprintln!("Connecting to {} MoE shard(s)…", configs.len());
     let remote = RemoteMoeBackend::connect(configs)
@@ -332,21 +403,72 @@ fn run_with_moe_shards(
     // Metal: attention + dense FFN on GPU; MoE experts dispatched to shards.
     let backend = larql_compute::default_backend();
 
-    let wrapped = larql_inference::wrap_chat_prompt(vindex_path, None, prompt);
+    // Prompt-shape options for diagnostic:
+    //   default  → wrap_chat_prompt with the model's chat_template.jinja
+    //   LARQL_RAW_PROMPT=1   → raw user string with <bos> prepended
+    //   LARQL_THINKING=1     → enable_thinking=true (skips empty thought block)
+    //   LARQL_SYSTEM=<text>  → prepend a system message before the user turn
+    //                          (Gemma 4 26B-A4B-it relies on one to avoid the
+    //                          "answer from the text" reading-comprehension
+    //                          fallback)
+    let raw_prompt = std::env::var("LARQL_RAW_PROMPT").is_ok();
+    let enable_thinking = std::env::var("LARQL_THINKING").is_ok();
+    let system_prompt = std::env::var("LARQL_SYSTEM").ok();
+    let wrapped_prompt = if raw_prompt {
+        // Base-model style: just <bos>prompt.  Tokenizer adds <bos> when its
+        // config says so; encode_prompt handles the prefix.
+        prompt.to_string()
+    } else if enable_thinking || system_prompt.is_some() {
+        // System prompt and/or enable_thinking flag → render the model's
+        // chat_template.jinja with the augmented context.  Uses the same
+        // pycompat-enabled minijinja env that wrap_chat_prompt uses, so
+        // template features like `message.get(...)` work.
+        let template_path = vindex_path.join("chat_template.jinja");
+        let template_str = std::fs::read_to_string(&template_path)
+            .map_err(|e| format!("read chat_template.jinja: {e}"))?;
+        let cfg = serde_json::Value::Object(Default::default());
+        let mut messages: Vec<(String, String)> = Vec::new();
+        if let Some(sys) = system_prompt.as_deref() {
+            messages.push(("system".to_string(), sys.to_string()));
+        }
+        messages.push(("user".to_string(), prompt.to_string()));
+        larql_inference::chat::render_chat_template_multi(
+            &template_str,
+            &cfg,
+            &messages,
+            enable_thinking,
+        )
+        .map_err(|e| format!("render chat template: {e}"))?
+    } else {
+        let wrap = larql_inference::wrap_chat_prompt(vindex_path, None, prompt);
+        eprintln!(
+            "[chat] applied={} note={} prompt_len={}",
+            wrap.applied, wrap.note, wrap.prompt.len()
+        );
+        wrap.prompt
+    };
+    if std::env::var("LARQL_DUMP_PROMPT").is_ok() {
+        eprintln!(
+            "[chat] mode={} ---PROMPT START---\n{}\n[chat] ---PROMPT END---",
+            if raw_prompt { "raw" } else if enable_thinking { "thinking" } else { "default" },
+            wrapped_prompt
+        );
+    }
     let prompt_ids =
-        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped.prompt)
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
             .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
+    eprintln!("[chat] tokenised to {} ids", prompt_ids.len());
 
-    let result = generate_with_remote_moe(
-        &weights,
-        &tokenizer,
-        prompt_ids,
-        max_tokens,
-        &index,
-        &remote,
-        &*backend,
-    )
-    .map_err(|e| format!("grid generate failed: {e}"))?;
+    let result = if dispatch == "batch" {
+        generate_with_remote_moe_batch(
+            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend,
+        )
+    } else {
+        generate_with_remote_moe(
+            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend,
+        )
+    }
+    .map_err(|e| format!("grid generate failed ({dispatch}): {e}"))?;
 
     for tok in &result.tokens {
         print!("{tok}");

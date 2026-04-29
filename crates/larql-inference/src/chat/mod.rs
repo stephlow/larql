@@ -23,6 +23,11 @@ pub(crate) mod fallback;
 pub(crate) mod render;
 pub(crate) mod source;
 
+/// Re-export of the multi-message renderer for diagnostic CLI flags
+/// (`--system`, `--thinking`) and external callers that need richer
+/// chat shapes than the single-turn `wrap_prompt_raw` exposes.
+pub use render::render_chat_template_multi;
+
 use std::path::Path;
 
 use serde_json::Value;

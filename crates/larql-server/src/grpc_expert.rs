@@ -1,26 +1,15 @@
-//! gRPC `ExpertService` implementation.
-//!
-//! Exposes two RPCs:
-//!
-//! `ExpertBatch` — unary, processes a flat list of (layer, expert_id, residual) items.
-//! Good for correctness testing and small batches.
-//!
-//! `ExpertStream` — bidirectional streaming, one frame per MoE layer per decode step.
-//! Client sends `ExpertLayerInput` for each layer as it becomes available; server
-//! streams back `ExpertLayerOutput` after computing the weighted expert sum.
-//! ONE stream per shard per token eliminates the per-call connection overhead of
-//! 30 unary calls — measured improvement: ~360ms overhead → ~18ms.
+//! gRPC `ExpertService` — unary batch + bidirectional streaming.
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::Stream;
+use futures::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    ExpertBatchRequest, ExpertBatchResponse, ExpertBatchResult, ExpertLayerInput,
-    ExpertLayerOutput, ExpertService,
+    ExpertBatchItem, ExpertBatchRequest, ExpertBatchResponse, ExpertBatchResult,
+    ExpertLayerInput, ExpertLayerOutput, ExpertService,
 };
 
 use crate::state::AppState;
@@ -28,6 +17,37 @@ use crate::state::AppState;
 pub struct ExpertGrpcService {
     pub state: Arc<AppState>,
 }
+
+/// Process one batch item: decode residual bytes, dispatch to the per-expert
+/// runner, and pack the f32 output back as little-endian bytes.  Pulled out so
+/// `expert_batch` can switch between `par_iter` (small N) and `iter()` (large
+/// N) without duplicating the per-item logic.
+fn process_batch_item(
+    state: &Arc<AppState>,
+    item: &ExpertBatchItem,
+) -> Result<ExpertBatchResult, Status> {
+    let layer = item.layer as usize;
+    let expert_id = item.expert_id as usize;
+    if item.residual.len() % 4 != 0 {
+        return Err(Status::invalid_argument("residual not 4-byte aligned"));
+    }
+    let residual: Vec<f32> = item
+        .residual
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let output = crate::routes::expert::run_expert(state, layer, expert_id, &residual)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    Ok(ExpertBatchResult {
+        layer: item.layer,
+        expert_id: item.expert_id,
+        output: output.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    })
+}
+
+type StreamOutput = Pin<
+    Box<dyn futures::Stream<Item = Result<ExpertLayerOutput, Status>> + Send + 'static>,
+>;
 
 #[tonic::async_trait]
 impl ExpertService for ExpertGrpcService {
@@ -41,60 +61,71 @@ impl ExpertService for ExpertGrpcService {
         let start = Instant::now();
         let req = request.into_inner();
         let state = Arc::clone(&self.state);
+        let n_items = req.items.len();
 
-        let futs: Vec<_> = req.items
-            .into_iter()
-            .map(|item| {
-                let s = Arc::clone(&state);
-                tokio::task::spawn_blocking(move || {
-                    let layer = item.layer as usize;
-                    let expert_id = item.expert_id as usize;
-                    if item.residual.len() % 4 != 0 {
-                        return Err(Status::invalid_argument("residual not 4-byte aligned"));
-                    }
-                    let residual: Vec<f32> = item.residual.chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect();
-                    let output = crate::routes::expert::run_expert(&s, layer, expert_id, &residual)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    Ok(ExpertBatchResult {
-                        layer: item.layer,
-                        expert_id: item.expert_id,
-                        output: output.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                    })
-                })
-            })
-            .collect();
-
-        let results: Vec<ExpertBatchResult> = {
-            let mut v = Vec::new();
-            for task in futures::future::join_all(futs).await {
-                v.push(task.map_err(|e| Status::internal(e.to_string()))?
-                    .map_err(|e| e)?);
+        // Compute strategy: each `run_expert` already drives BLAS sgemv
+        // (Accelerate on macOS / OpenBLAS on Linux), which is internally
+        // multi-threaded.  Wrapping that in an outer `par_iter` over many
+        // items creates thread oversubscription — the diagnostic measured
+        // batch (120 items in `par_iter`) at ~400ms vs streaming (4 items in
+        // `par_iter` × 30 sequential layer calls) at ~220ms.
+        //
+        // The right shape is one rayon task per CHUNK, with each chunk
+        // processed serially inside.  That gives the outer level exactly
+        // `min(n, n_cores)` work-stealing tasks (≤ core count, no
+        // oversubscription) while letting BLAS use whatever threading it
+        // wants on each call.  `LARQL_MOE_BATCH_MODE` lets the operator
+        // override the auto-pick: `par`, `serial`, or `chunked` (default).
+        let items = req.items;
+        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let mode_override = std::env::var("LARQL_MOE_BATCH_MODE").ok();
+        let n_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        let mode = mode_override.as_deref().unwrap_or(if n_items <= n_cores {
+            "par"
+        } else {
+            "chunked"
+        });
+        let results: Vec<ExpertBatchResult> = tokio::task::block_in_place(|| {
+            use rayon::prelude::*;
+            let t0 = Instant::now();
+            let res = match mode {
+                "par" => items.par_iter()
+                    .map(|item| process_batch_item(&state, item))
+                    .collect::<Result<Vec<_>, Status>>(),
+                "serial" => items.iter()
+                    .map(|item| process_batch_item(&state, item))
+                    .collect::<Result<Vec<_>, Status>>(),
+                _ => {
+                    // chunked: ceil(n / n_cores) items per chunk, processed
+                    // serially within each rayon task.
+                    let chunk_size = n_items.div_ceil(n_cores).max(1);
+                    items.par_chunks(chunk_size)
+                        .map(|chunk| -> Result<Vec<_>, Status> {
+                            chunk.iter()
+                                .map(|item| process_batch_item(&state, item))
+                                .collect()
+                        })
+                        .collect::<Result<Vec<Vec<_>>, Status>>()
+                        .map(|chunks| chunks.into_iter().flatten().collect())
+                }
+            };
+            if timing_enabled {
+                eprintln!("[expert_batch grpc] n={n_items} mode={mode} cores={n_cores} \
+                    elapsed={:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0);
             }
-            v
-        };
+            res
+        })?;
 
         let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
-        Ok(Response::new(ExpertBatchResponse {
-            results,
-            latency_ms,
-        }))
+        Ok(Response::new(ExpertBatchResponse { results, latency_ms }))
     }
 
     // ── Bidirectional streaming ──────────────────────────────────────────────
-    //
-    // Each incoming ExpertLayerInput carries:
-    //   layer, expert_ids[], expert_weights[], residual (h_post_attn), post_experts_norm
-    //
-    // For each message, the server:
-    //   1. Runs each selected expert: run_single_expert_with_norm(residual, ...)
-    //   2. Weighted sum: h2 = sum(w_k * expert_k_output)
-    //   3. Post-experts norm: h2 = rms_norm(h2, post_experts_norm)
-    //   4. Streams back ExpertLayerOutput { layer, h2 }
 
-    type ExpertStreamStream =
-        Pin<Box<dyn Stream<Item = Result<ExpertLayerOutput, Status>> + Send + 'static>>;
+    type ExpertStreamStream = StreamOutput;
 
     async fn expert_stream(
         &self,
@@ -104,81 +135,100 @@ impl ExpertService for ExpertGrpcService {
         let state = Arc::clone(&self.state);
         let mut in_stream = request.into_inner();
 
-        let out_stream = async_stream::try_stream! {
-            while let Some(msg) = {
-                use futures::StreamExt;
-                in_stream.next().await
-            } {
+        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let out = async_stream::try_stream! {
+            while let Some(msg) = in_stream.next().await {
                 let input = msg?;
                 let layer = input.layer as usize;
-
-                // Decode bytes on the async thread, then do blocking expert compute.
                 if input.residual.len() % 4 != 0 {
                     Err(Status::invalid_argument("residual not 4-byte aligned"))?;
                 }
-                let residual: Vec<f32> = input
-                    .residual
-                    .chunks_exact(4)
+                let residual: Vec<f32> = input.residual.chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                     .collect();
-
-                let post_norm: Vec<f32> = if input.post_experts_norm.is_empty() {
-                    vec![]
-                } else {
-                    input.post_experts_norm
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect()
-                };
+                let post_norm: Vec<f32> = input.post_experts_norm.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
                 let norm_offset = input.norm_offset;
                 let eps = input.eps;
-
                 let expert_ids: Vec<usize> =
                     input.expert_ids.iter().map(|&e| e as usize).collect();
                 let expert_weights: Vec<f32> = input.expert_weights.clone();
-
                 let state2 = Arc::clone(&state);
-
-                // Spawn each expert as a separate non-blocking tokio task.
-                // The stream handler stays async throughout — it awaits all
-                // expert futures concurrently via join_all rather than
-                // blocking on any of them.  4 experts run on 4 separate
-                // blocking-pool threads, truly in parallel.
-                let futs: Vec<_> = expert_ids
-                    .iter()
-                    .zip(expert_weights.iter())
-                    .filter(|(_, &w)| w != 0.0)
-                    .map(|(&eid, &w)| {
-                        let s = Arc::clone(&state2);
-                        let r = residual.clone();
-                        tokio::task::spawn_blocking(move || {
-                            crate::routes::expert::run_expert(&s, layer, eid, &r)
-                                .map(|out| (out, w))
-                                .map_err(|e| Status::internal(e.to_string()))
-                        })
-                    })
-                    .collect();
-
                 let hidden = residual.len();
-                let mut out = vec![0.0f32; hidden];
-                for task in futures::future::join_all(futs).await {
-                    let (expert_out, weight) = task
-                        .map_err(|e| Status::internal(e.to_string()))?
-                        .map_err(|e| e)?;
-                    for (acc, &v) in out.iter_mut().zip(expert_out.iter()) {
-                        *acc += weight * v;
-                    }
-                }
-                let h2 = out;
+                let n_experts_active = expert_ids.len();
 
-                let h2_bytes: Vec<u8> = h2.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let t_compute = Instant::now();
+                // Path selection: when `metal-experts` feature is on AND a
+                // Metal backend is available, dispatch the layer's selected
+                // experts to GPU as one MoE call (q4k_ffn_gate_up + GELU +
+                // K × q4k_matvec).  Falls through to the per-expert rayon
+                // CPU path otherwise — preserves identical wire output.
+                let mut path_used = "cpu";
+                #[cfg(feature = "metal-experts")]
+                let metal_h2 = tokio::task::block_in_place(|| -> Result<Option<Vec<f32>>, Status> {
+                    crate::routes::expert::run_experts_metal_batch(
+                        &state2, layer, &residual, &expert_ids, &expert_weights,
+                    )
+                    .map_err(|e| Status::internal(e.to_string()))
+                })?;
+                #[cfg(not(feature = "metal-experts"))]
+                let metal_h2: Option<Vec<f32>> = None;
+
+                let h2 = if let Some(h2_metal) = metal_h2 {
+                    path_used = "metal";
+                    h2_metal
+                } else if std::env::var("LARQL_USE_LEGACY_CPU").is_ok() {
+                    // Legacy reference path — per-expert run_expert with
+                    // its own pre_norm pass.  Kept as a correctness oracle
+                    // while we debug whether the pooled `run_experts_cpu_batch`
+                    // produces identical output.
+                    path_used = "cpu-legacy";
+                    tokio::task::block_in_place(|| -> Result<Vec<f32>, Status> {
+                        use rayon::prelude::*;
+                        let partial: Vec<(Vec<f32>, f32)> = expert_ids
+                            .par_iter()
+                            .zip(expert_weights.par_iter())
+                            .filter(|(_, &w)| w != 0.0)
+                            .filter_map(|(&eid, &w)| {
+                                crate::routes::expert::run_expert(&state2, layer, eid, &residual)
+                                    .ok()
+                                    .map(|out| (out, w))
+                            })
+                            .collect();
+                        let mut out = vec![0.0f32; hidden];
+                        for (expert_out, weight) in partial {
+                            for (acc, &v) in out.iter_mut().zip(expert_out.iter()) {
+                                *acc += weight * v;
+                            }
+                        }
+                        Ok(out)
+                    })?
+                } else {
+                    path_used = "cpu";
+                    tokio::task::block_in_place(|| -> Result<Vec<f32>, Status> {
+                        crate::routes::expert::run_experts_cpu_batch(
+                            &state2, layer, &residual, &expert_ids, &expert_weights,
+                        )
+                        .map_err(|e| Status::internal(e.to_string()))
+                    })?
+                };
+                let compute_ms = t_compute.elapsed().as_secs_f32() * 1000.0;
+                if timing_enabled {
+                    eprintln!(
+                        "[expert_stream] layer={layer} experts={n_experts_active} \
+                         path={path_used} compute={compute_ms:.2}ms"
+                    );
+                }
+
                 yield ExpertLayerOutput {
                     layer: input.layer,
-                    h2: h2_bytes,
+                    h2: h2.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    compute_ms,
                 };
             }
         };
 
-        Ok(Response::new(Box::pin(out_stream)))
+        Ok(Response::new(Box::pin(out)))
     }
 }

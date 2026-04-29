@@ -72,7 +72,17 @@ pub fn encode_gated(
     q8_stride_bytes: u64,    // Q8 input bytes per pos
     q8s_stride_bytes: u64,   // Q8 scales bytes per pos
 ) {
-    // Gate+up per position.
+    // Gate+up per position. (Tried wiring `q4k_matmul` here for
+    // seq_len>1 prefill — kernel-isolated 1.79× speedup did NOT
+    // translate end-to-end. Long-prompt prefill regressed 10%
+    // (~2933 → ~3268 ms on a 340-token prompt). Same failure mode as
+    // the f16 acc try: kernel was already bandwidth-bound, and on
+    // long prompts the matmul's [seq_len × hidden] X working set no
+    // longer fits in GPU L1, defeating the cache locality the
+    // matvec loop had. Reverted 2026-04-28. The matmul kernel ships
+    // with its parity tests and remains usable via the q4k_matmul
+    // method on `MetalBackend` but is not worth wiring into the
+    // production prefill path on this hardware.)
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;
         let inter_off = pos as u64 * inter_stride_bytes;

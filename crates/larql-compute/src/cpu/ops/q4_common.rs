@@ -475,6 +475,132 @@ pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Direct Q4_K matrix-vector product: `out = W · x` where `W` is the raw
+/// Q4_K byte stream (`rows × cols` weights, 144 bytes per 256 elements).
+///
+/// Decodes nibbles + per-sub-block scales/mins on the fly while
+/// accumulating the dot product — avoids the f32 dequant cache that
+/// quadruples the bandwidth bill.  At Gemma 4 26B-A4B sizes
+/// (`hidden=2816`, `inter=704`, ~7.9 MB f32 per row otherwise) this drops
+/// per-matmul bandwidth pressure from ~8 MB → ~2 MB and should land ~3–4×
+/// faster than `dequantize_q4_k` + BLAS sgemv on a same-sized f32 view.
+///
+/// Math (matches `dequantize_q4_k`'s `out = sc * q - mn` per-element form):
+///
+/// ```text
+/// for each super-block sb of 256 elements (8 sub-blocks of 32 each):
+///   for each sub-block subblk in [0..8):
+///     sc = d    * scales[subblk]
+///     mn = dmin * mins[subblk]
+///     dot = Σ  q_l · x[base + l]    (l in 0..32)
+///     sumx = Σ x[base + l]          (precomputed once across all rows)
+///     acc += sc * dot − mn * sumx
+/// out[r] = acc
+/// ```
+///
+/// `sumx` precomputation: x is shared across rows, so its per-sub-block
+/// sum is row-invariant.  Computing it once outside the row loop saves
+/// `rows × 8 · n_blocks` redundant sums.
+///
+/// Returns silently on shape mismatch (debug-asserted) and on Q4_K layout
+/// errors (input too short, or `cols` not a multiple of 256).
+///
+/// Caller layout: `w.len() == rows * (cols / 256) * 144` bytes.
+pub fn q4k_matvec_into(out: &mut [f32], x: &[f32], w: &[u8], rows: usize, cols: usize) {
+    debug_assert_eq!(out.len(), rows);
+    debug_assert_eq!(x.len(), cols);
+    if rows == 0 || cols == 0 {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    const BLOCK_BYTES: usize = 144;
+    const ELEMS_PER_BLOCK: usize = 256;
+    if !cols.is_multiple_of(ELEMS_PER_BLOCK) {
+        // Caller pads; falling back to zero output makes the failure visible
+        // without panicking (the existing dequant path returns Vec::new()).
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * BLOCK_BYTES;
+    if w.len() < rows * row_bytes {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+
+    // Precompute per-sub-block sum_x (one f32 per 32-element chunk of x).
+    // 2-byte stride per (sb, subblk) pair lets us index by `sb * 8 + subblk`.
+    let n_subblocks = n_blocks * 8;
+    let mut sum_x: Vec<f32> = Vec::with_capacity(n_subblocks);
+    for sub in 0..n_subblocks {
+        let chunk = &x[sub * 32..(sub + 1) * 32];
+        let mut s = 0.0f32;
+        for &v in chunk {
+            s += v;
+        }
+        sum_x.push(s);
+    }
+
+    for r in 0..rows {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+        for sb in 0..n_blocks {
+            let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let p = &block[4..16];
+            let mut scales = [0u8; 8];
+            let mut mins = [0u8; 8];
+            for j in 0..4 {
+                scales[j] = p[j] & 0x3F;
+                mins[j] = p[j + 4] & 0x3F;
+                scales[j + 4] = (p[j + 8] & 0x0F) | ((p[j] >> 6) << 4);
+                mins[j + 4] = (p[j + 8] >> 4) | ((p[j + 4] >> 6) << 4);
+            }
+            let quants = &block[16..144];
+            let x_sb_base = sb * ELEMS_PER_BLOCK;
+
+            for g in 0..4 {
+                // Two paired sub-blocks (low + high nibble) share one 32-byte
+                // quant chunk.  Hot inner: 32 nibble decodes × FMA each side.
+                let sb_lo = 2 * g;
+                let sb_hi = 2 * g + 1;
+                let sc_lo = d * scales[sb_lo] as f32;
+                let sc_hi = d * scales[sb_hi] as f32;
+                let mn_lo = dmin * mins[sb_lo] as f32;
+                let mn_hi = dmin * mins[sb_hi] as f32;
+                let chunk = &quants[g * 32..(g + 1) * 32];
+                let x_lo_base = x_sb_base + sb_lo * 32;
+                let x_hi_base = x_sb_base + sb_hi * 32;
+                let sumy_lo = sum_x[sb * 8 + sb_lo];
+                let sumy_hi = sum_x[sb * 8 + sb_hi];
+
+                let mut dot_lo = 0.0f32;
+                let mut dot_hi = 0.0f32;
+                let x_lo = &x[x_lo_base..x_lo_base + 32];
+                let x_hi = &x[x_hi_base..x_hi_base + 32];
+                for l in 0..32 {
+                    let byte = chunk[l];
+                    let q_lo = (byte & 0x0F) as f32;
+                    let q_hi = ((byte >> 4) & 0x0F) as f32;
+                    dot_lo += q_lo * x_lo[l];
+                    dot_hi += q_hi * x_hi[l];
+                }
+
+                acc += sc_lo * dot_lo - mn_lo * sumy_lo;
+                acc += sc_hi * dot_hi - mn_hi * sumy_hi;
+            }
+        }
+        out[r] = acc;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +679,104 @@ mod tests {
             max_err < 2.0,
             "Q4 round-trip max error {max_err} exceeds 2.0"
         );
+    }
+
+    /// `q4k_matvec_into` must produce numerically identical output to
+    /// the reference `dequantize_q4_k(...) → matmul_vec(...)` path.  Same
+    /// f32 weights, same arithmetic — just decoded streaming.  We use a
+    /// designed Q4_K-quantised input where the round-trip error is
+    /// already inside the quantizer, so the matvec output should match
+    /// within float-rounding noise (1e-3 on small magnitudes).
+    #[test]
+    fn q4k_matvec_matches_dequant_then_matmul() {
+        // 4 rows × 256 cols (one super-block per row).
+        let rows = 4;
+        let cols = 256;
+        let n_elem = rows * cols;
+
+        // Designed weights: gradient ramp so the per-sub-block scale/min
+        // varies, exercises every code path in q4k_matvec_into.
+        let weights: Vec<f32> = (0..n_elem)
+            .map(|i| ((i as f32 / n_elem as f32) - 0.5) * 1.0)
+            .collect();
+        let q4k = quantize_q4_k(&weights);
+        assert_eq!(q4k.len(), rows * 144);
+
+        // Reference: dequantize → row-major sgemv (manual, so this test
+        // doesn't reach into the moe::math BLAS path).
+        let dequant = dequantize_q4_k(&q4k, n_elem);
+        assert_eq!(dequant.len(), n_elem);
+
+        let x: Vec<f32> = (0..cols).map(|j| (j as f32 * 0.01).sin()).collect();
+        let mut reference = vec![0.0f32; rows];
+        for r in 0..rows {
+            let mut acc = 0.0f32;
+            for c in 0..cols {
+                acc += dequant[r * cols + c] * x[c];
+            }
+            reference[r] = acc;
+        }
+
+        let mut got = vec![0.0f32; rows];
+        q4k_matvec_into(&mut got, &x, &q4k, rows, cols);
+
+        let max_diff: f32 = reference
+            .iter()
+            .zip(got.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        // Both paths use the same nibble + scale arithmetic — differ only
+        // in summation order.  f32 fp accumulation reorders are bounded
+        // by ~ulp(max_intermediate); for 256-element sums of ~1.0 magnitudes
+        // that's well under 1e-3.
+        assert!(
+            max_diff < 1e-3,
+            "q4k_matvec_into diverges from dequant→matmul reference: \
+             max_diff={max_diff}, reference={reference:?}, got={got:?}"
+        );
+    }
+
+    /// Multi-block path: cols = 2 × 256 forces the per-row inner loop to
+    /// iterate `n_blocks > 1`.  Catches off-by-one in row-stride arithmetic
+    /// (`row_bytes = n_blocks * 144`) that the single-block test wouldn't
+    /// notice.
+    #[test]
+    fn q4k_matvec_multi_block_matches_dequant() {
+        let rows = 3;
+        let cols = 512; // 2 super-blocks per row
+        let n_elem = rows * cols;
+        let weights: Vec<f32> = (0..n_elem).map(|i| (i as f32 * 0.003).cos()).collect();
+        let q4k = quantize_q4_k(&weights);
+        assert_eq!(q4k.len(), rows * 2 * 144);
+
+        let dequant = dequantize_q4_k(&q4k, n_elem);
+        let x: Vec<f32> = (0..cols).map(|j| ((j as f32) * 0.013).sin() * 0.7).collect();
+        let mut reference = vec![0.0f32; rows];
+        for r in 0..rows {
+            for c in 0..cols {
+                reference[r] += dequant[r * cols + c] * x[c];
+            }
+        }
+        let mut got = vec![0.0f32; rows];
+        q4k_matvec_into(&mut got, &x, &q4k, rows, cols);
+        let max_diff: f32 = reference
+            .iter()
+            .zip(got.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(max_diff < 5e-3, "multi-block diverged: max_diff={max_diff}");
+    }
+
+    /// Defensive: caller passes a malformed `cols` (not multiple of 256).
+    /// We zero the output rather than reading past the buffer, mirroring
+    /// `dequantize_q4_k`'s `Vec::new()` shape-error contract.
+    #[test]
+    fn q4k_matvec_rejects_non_multiple_of_256() {
+        let mut out = vec![1.0f32; 4]; // pre-fill to detect zeroing
+        let x = vec![0.5f32; 100];
+        let w = vec![0u8; 4 * 144];
+        q4k_matvec_into(&mut out, &x, &w, 4, 100);
+        assert_eq!(out, vec![0.0f32; 4]);
     }
 
     #[test]

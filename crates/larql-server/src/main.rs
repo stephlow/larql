@@ -143,8 +143,24 @@ struct Cli {
     /// Only load and serve experts in this range (inclusive, e.g. "0-31").
     /// Requests for out-of-range expert IDs are rejected with HTTP 400.
     /// Used to shard the expert bank across multiple servers.
+    /// Layer-uniform: same expert range applies to every layer.
     #[arg(long)]
     experts: Option<String>,
+
+    /// Path to a JSON manifest specifying per-(layer, expert) ownership for
+    /// fine-grained shards.  Format:
+    /// ```json
+    /// { "layer_experts": { "0": [[0,31]], "1": [[0,15],[64,79]], ... } }
+    /// ```
+    /// Each value is a list of inclusive `[start, end]` expert-id ranges.
+    /// Layers absent from the map own no experts on this shard.
+    ///
+    /// When set, overrides `--experts` and switches `run_expert` ownership
+    /// checks to per-(layer, expert) lookups.  Designed for the architecture
+    /// where each shard hosts a tight set of (layer, expert) units rather
+    /// than a contiguous expert range across all layers.
+    #[arg(long, value_name = "PATH")]
+    units: Option<std::path::PathBuf>,
 
     /// Enable CORS for browser access.
     #[arg(long)]
@@ -226,6 +242,31 @@ async fn main() -> Result<(), BoxError> {
 
     let layer_range = cli.layers.as_deref().map(parse_layer_range).transpose()?;
     let expert_filter = cli.experts.as_deref().map(parse_layer_range).transpose()?;
+    // --units PATH (per-(layer, expert) ownership manifest) takes precedence
+    // over --experts START-END; the two are mutually exclusive at parse time
+    // so the operator gets a clear error rather than silently picking one.
+    if cli.units.is_some() && cli.experts.is_some() {
+        return Err(
+            "--units and --experts are mutually exclusive — \
+             use --experts for layer-uniform ranges, --units for fine-grained ownership"
+                .into(),
+        );
+    }
+    let unit_filter = cli
+        .units
+        .as_deref()
+        .map(larql_server::bootstrap::parse_unit_manifest)
+        .transpose()?
+        .map(Arc::new);
+    if let Some(ref u) = unit_filter {
+        info!(
+            "  Units (--units): {} ({}, {}) pairs across {} layers",
+            u.len(),
+            "layer",
+            "expert",
+            u.iter().map(|(l, _)| *l).collect::<std::collections::HashSet<_>>().len(),
+        );
+    }
     let load_opts = LoadVindexOptions {
         no_infer: cli.no_infer,
         ffn_only: cli.ffn_only,
@@ -241,6 +282,7 @@ async fn main() -> Result<(), BoxError> {
         warmup_hnsw: cli.warmup_hnsw,
         release_mmap_after_request: cli.release_mmap_after_request,
         expert_filter,
+        unit_filter,
     };
 
     if let Some(ref dir) = cli.dir {
@@ -250,7 +292,10 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            match load_single_vindex(&p.to_string_lossy(), load_opts) {
+            // `LoadVindexOptions` is `Clone` (was `Copy` until `unit_filter`
+            // added an `Arc<HashSet<...>>` field) — clone per iteration so
+            // the loop owns each call's argument.
+            match load_single_vindex(&p.to_string_lossy(), load_opts.clone()) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
@@ -337,6 +382,81 @@ async fn main() -> Result<(), BoxError> {
                 r.prefetch_ms,
                 r.total_ms,
             );
+        }
+    }
+
+    // Per-(layer, expert) HNSW unit warmup.  Each shard pre-builds an
+    // HNSW index over each owned expert's gate slice (~704 vectors per
+    // unit on Gemma 4 26B-A4B, vs ~90k for the layer-level index).
+    // Used by walk / interp KNN queries (`gate_knn_expert`); not on the
+    // MoE forward path.  Skipped when `LARQL_NO_WARMUP=1`.
+    for m in &state.models {
+        if m.expert_filter.is_none() && !cli.warmup_walk_ffn {
+            // No shard filter and operator didn't ask for walk-ffn warmup
+            // → skip the cost; whoever queries first will lazy-build.
+            continue;
+        }
+        let model = Arc::clone(m);
+        let model_id = model.id.clone();
+        let t0 = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::routes::expert::warmup_hnsw_unit_cache(&model)
+        })
+        .await;
+        match result {
+            Ok(Ok((built, n_layers, n_owned))) if built > 0 => {
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                info!(
+                    "  Warmup hnsw-units[{model_id}]: built {built} units \
+                     ({n_layers} layers × {n_owned} experts/shard) in {elapsed_ms:.0}ms"
+                );
+            }
+            Ok(Ok(_)) => {} // No units built (non-MoE / opted-out / nothing owned).
+            Ok(Err(e)) => {
+                tracing::warn!("Warmup hnsw-units[{model_id}] failed: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("Warmup hnsw-units[{model_id}] join failed: {e}");
+            }
+        }
+    }
+
+    // Metal expert cache warmup (cfg=metal-experts only).  For shard
+    // servers, eagerly populate the BufferCache for every expert this
+    // shard owns so the first decode token sees the steady-state ~20
+    // tok/s instead of the cold-call 4–8 tok/s ramp.  Skipped when
+    // LARQL_NO_WARMUP=1 is set.
+    #[cfg(feature = "metal-experts")]
+    for m in &state.models {
+        // Only run for shard servers (have an expert_filter).  Models
+        // without --experts are running the whole MoE locally and use a
+        // different code path.
+        if m.expert_filter.is_none() {
+            continue;
+        }
+        let model = Arc::clone(m);
+        let model_id = model.id.clone();
+        let t0 = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::routes::expert::warmup_metal_expert_cache(&model)
+        })
+        .await;
+        match result {
+            Ok(Ok(staged)) => {
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if staged > 0 {
+                    info!(
+                        "  Warmup metal-experts[{model_id}]: staged {staged} \
+                         (gate_up, down) buffer pairs in {elapsed_ms:.0}ms"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Warmup metal-experts[{model_id}] failed: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("Warmup metal-experts[{model_id}] join failed: {e}");
+            }
         }
     }
 

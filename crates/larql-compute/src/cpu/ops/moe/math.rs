@@ -81,6 +81,40 @@ pub(super) fn matmul_vec(x: &[f32], w: &[f32], out_rows: usize, in_cols: usize) 
     w_view.dot(&x_view).to_vec()
 }
 
+/// Same as `matmul_vec` but writes into a caller-provided output buffer
+/// instead of allocating.  Reuse a per-call scratch (`gate_scratch`,
+/// `up_scratch`, `out_scratch` in `run_single_expert`) to avoid 360+ heap
+/// allocations per token per shard at Gemma 4 26B-A4B sizes.
+///
+/// `out` must have length exactly `out_rows`; existing contents are
+/// overwritten.  Panics in debug builds on size mismatch (matches
+/// `matmul_vec`'s assertion semantics).
+pub(super) fn matmul_vec_into(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    out_rows: usize,
+    in_cols: usize,
+) {
+    debug_assert_eq!(w.len(), out_rows * in_cols);
+    debug_assert_eq!(x.len(), in_cols);
+    debug_assert_eq!(out.len(), out_rows);
+    if out_rows == 0 || in_cols == 0 {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let w_view = ndarray::ArrayView2::from_shape((out_rows, in_cols), w)
+        .expect("matmul_vec_into: weight shape mismatch");
+    let x_view = ndarray::ArrayView1::from(x);
+    // `assign_to` writes the gemv result into `out` without allocating an
+    // intermediate Array1 — the same code path as `Array2.dot(&Array1)` but
+    // landing in caller memory.
+    let dst = ndarray::ArrayViewMut1::from(out);
+    w_view.dot(&x_view).assign_to(dst);
+}
+
 /// Softmax in-place.
 pub(super) fn softmax(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);

@@ -12,6 +12,12 @@ use super::TiledKernel;
 /// and `rows_per_tg`/`threads_per_tg` for `dispatch_thread_groups`.
 /// Geometry travels with the pipeline; bumping a shader = swap the
 /// type parameter at the [`from_kernel`](Self::from_kernel) call site.
+///
+/// `Clone` is cheap — `ComputePipelineState` is a wrapper around a
+/// ref-counted Objective-C object, and the geometry constants are
+/// plain `u64`. Cloning is only used for runtime kernel selection
+/// (e.g., `LARQL_Q6K_8SG=0` opt-out to the 4sg variant).
+#[derive(Clone)]
 pub struct KernelHandle {
     /// The underlying pipeline state. Use this for
     /// `enc.set_compute_pipeline_state(&handle.state)`.

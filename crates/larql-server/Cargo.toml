@@ -19,6 +19,11 @@ larql-vindex = { path = "../larql-vindex" }
 larql-inference = { path = "../larql-inference" }
 larql-models = { path = "../larql-models" }
 larql-router-protocol = { path = "../larql-router-protocol" }
+# Optional Metal backend for shard-side GPU experts (macOS).  When the
+# `metal-experts` feature is enabled, the server uses
+# `MetalBackend::run_experts_preselected_metal` to dispatch each layer's
+# selected experts on the GPU instead of running them per-expert on CPU.
+larql-compute = { path = "../larql-compute" }
 
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
@@ -40,8 +45,11 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-[dev-dependencies]
-larql-compute = { path = "../larql-compute" }
+[features]
+default = []
+# Enable Metal-backed GPU expert kernels on the shard server.  Forwards to
+# `larql-compute`'s `metal` feature.  macOS-only.
+metal-experts = ["larql-compute/metal"]
 
 [build-dependencies]
 tonic-build = "0.13"

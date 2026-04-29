@@ -34,7 +34,7 @@ pub fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
     Ok((start, end + 1))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct LoadVindexOptions {
     pub no_infer: bool,
     pub ffn_only: bool,
@@ -46,6 +46,55 @@ pub struct LoadVindexOptions {
     pub warmup_hnsw: bool,
     pub release_mmap_after_request: bool,
     pub expert_filter: Option<(usize, usize)>,
+    /// Fine-grained per-(layer, expert) ownership.  When `Some`, takes
+    /// precedence over `expert_filter` for `run_expert`'s ownership check
+    /// and for the HNSW / Metal warmup loops.  Loaded from `--units` JSON.
+    pub unit_filter: Option<Arc<std::collections::HashSet<(usize, usize)>>>,
+}
+
+/// JSON layout for the `--units` manifest.  Each value is a list of inclusive
+/// `[start, end]` expert-id ranges, keyed by layer index (as a string for
+/// JSON-object compatibility).
+#[derive(serde::Deserialize)]
+pub struct UnitManifest {
+    pub layer_experts: std::collections::BTreeMap<String, Vec<[usize; 2]>>,
+}
+
+impl UnitManifest {
+    /// Expand the per-layer range list into the flat `(layer, expert_id)`
+    /// set used by ownership checks.  Reports the first malformed entry in
+    /// the error path so the operator can fix it without grepping.
+    pub fn into_unit_set(
+        self,
+    ) -> Result<std::collections::HashSet<(usize, usize)>, BoxError> {
+        let mut units = std::collections::HashSet::new();
+        for (layer_str, ranges) in self.layer_experts {
+            let layer: usize = layer_str.parse().map_err(|_| -> BoxError {
+                format!("--units: layer key '{layer_str}' is not a valid usize").into()
+            })?;
+            for [start, end] in ranges {
+                if end < start {
+                    return Err(format!(
+                        "--units: layer {layer}: end ({end}) must be >= start ({start})"
+                    )
+                    .into());
+                }
+                for eid in start..=end {
+                    units.insert((layer, eid));
+                }
+            }
+        }
+        Ok(units)
+    }
+}
+
+/// Parse `--units PATH` into the canonical `(layer, expert_id)` ownership set.
+pub fn parse_unit_manifest(path: &Path) -> Result<std::collections::HashSet<(usize, usize)>, BoxError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| -> BoxError { format!("--units: read {}: {e}", path.display()).into() })?;
+    let manifest: UnitManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| -> BoxError { format!("--units: parse {}: {e}", path.display()).into() })?;
+    manifest.into_unit_set()
 }
 
 pub fn load_single_vindex(
@@ -220,6 +269,11 @@ pub fn load_single_vindex(
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         expert_filter: opts.expert_filter,
+        unit_filter: opts.unit_filter.clone(),
+        #[cfg(feature = "metal-experts")]
+        metal_backend: std::sync::OnceLock::new(),
+        #[cfg(feature = "metal-experts")]
+        moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -263,6 +317,77 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── Unit-manifest parser ─────────────────────────────────────────────
+    //
+    // The JSON shape the operator hands the server must round-trip through
+    // `parse_unit_manifest` into a deterministic ownership set.  Tests
+    // cover: well-formed multi-range manifest, bad layer key, reversed
+    // range, missing file.  The data shape is exercised end-to-end here so
+    // ownership-check and warmup loops can rely on it without having to
+    // re-validate.
+
+    fn write_units_file(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("units.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_unit_manifest_round_trips_per_layer_ranges() {
+        let dir = unique_temp_dir("units-ok");
+        let path = write_units_file(
+            &dir,
+            r#"{"layer_experts": {"0": [[0,2]], "3": [[5,7],[10,10]]}}"#,
+        );
+        let units = parse_unit_manifest(&path).unwrap();
+        // Layer 0: experts 0..=2 → (0,0), (0,1), (0,2)
+        // Layer 3: experts 5..=7 + 10 → (3,5), (3,6), (3,7), (3,10)
+        let expected: std::collections::HashSet<(usize, usize)> = [
+            (0, 0), (0, 1), (0, 2),
+            (3, 5), (3, 6), (3, 7), (3, 10),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(units, expected);
+    }
+
+    #[test]
+    fn parse_unit_manifest_rejects_non_numeric_layer_key() {
+        let dir = unique_temp_dir("units-bad-layer");
+        let path = write_units_file(&dir, r#"{"layer_experts": {"oops": [[0,2]]}}"#);
+        let err = parse_unit_manifest(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("layer key 'oops'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_unit_manifest_rejects_reversed_range() {
+        let dir = unique_temp_dir("units-bad-range");
+        let path = write_units_file(&dir, r#"{"layer_experts": {"0": [[5,2]]}}"#);
+        let err = parse_unit_manifest(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("end (2) must be >= start (5)"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_unit_manifest_missing_file_reports_path() {
+        let bogus = PathBuf::from("/nonexistent/larql-units-not-here.json");
+        let err = parse_unit_manifest(&bogus).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read"), "msg should mention read failure: {msg}");
+        assert!(msg.contains(bogus.to_str().unwrap()), "msg should name path: {msg}");
+    }
+
+    #[test]
+    fn parse_unit_manifest_accepts_empty_object() {
+        // Operator may want to test the wiring without owning any units —
+        // empty manifest should yield an empty set, not error.
+        let dir = unique_temp_dir("units-empty");
+        let path = write_units_file(&dir, r#"{"layer_experts": {}}"#);
+        let units = parse_unit_manifest(&path).unwrap();
+        assert!(units.is_empty());
     }
 
     #[test]
@@ -325,8 +450,9 @@ mod tests {
             warmup_hnsw: true,
             release_mmap_after_request: true,
             expert_filter: Some((3, 4)),
+            unit_filter: None,
         };
-        let copied = opts;
+        let copied = opts.clone();
         assert!(copied.no_infer);
         assert_eq!(copied.layer_range, Some((0, 2)));
         assert_eq!(copied.expert_filter, Some((3, 4)));

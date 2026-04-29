@@ -53,21 +53,75 @@ generate both use top_k=5).
 | Kernel compute | ~9.1ms | ~7.1ms | **~2.0ms** |
 | lm_head overhead | ~1.84ms | ~1.30ms | **~0.5ms** |
 
-**Per-kernel profiler results** (run `diag_profile_kernels`, see PERFORMANCE.md):
+**Per-kernel profiler results** (run `diag_profile_kernels`, see PERFORMANCE.md). Numbers below use single-cmd-buffer batching — see PROFILER NOTE below for the 2026-04-28 fix that corrected an earlier 2-4× undercount.
 
 | Kernel | Batched GB/s | ms/tok | Bottleneck |
 |---|---|---|---|
-| q6k_matvec (down, K=10240) | ~315 GB/s | ~2.3ms | bandwidth-bound (LPDDR5X) |
-| q4k_ffn_gate_up (gate+up, K=2560) | ~272 GB/s | ~3.7ms | **compute-bound** (Q4_K dequant) |
-| f32_gemv (lm_head, 262K×2560) | ~370 GB/s | — | bandwidth-bound (near peak) |
+| q6k_matvec (down, K=10240) | **311 GB/s** | ~2.3ms | bandwidth-bound, 84% of LPDDR5X peak |
+| q4k_ffn_gate_up (gate+up, K=2560) | **274 GB/s** | ~3.7ms | bandwidth-bound, 74% of peak |
+| f32_gemv (lm_head, 262K×2560) | **374 GB/s** | — | bandwidth-bound, ~peak |
 
-Down + gate+up = **~6ms/tok** of the ~11ms GPU fwd. Gate+up is compute-bound
-because Q4_K at K=2560 (0.5625 B/elem, lowest ratio) — the GPU spends more
-cycles on nibble dequant arithmetic than waiting for LPDDR5X.
+Down + gate+up = **~6ms/tok** of the ~11ms GPU fwd. Both big FFN kernels are bandwidth-bound near LPDDR5X peak. The earlier "compute-bound at 103 GB/s" diagnosis on q4k_ffn_gate_up was a profiler bug — see PROFILER NOTE.
+
+**PROFILER NOTE (2026-04-28)**: `metal/diag/kernel_profile.rs::measure_batched` was creating a fresh cmd buffer per call (with commit+wait per call) instead of running n_layers dispatches in ONE cmd buffer. The per-call dispatch overhead dominated the measurement, undercounting kernel throughput 2-4×. Fixed via `measure_single_cmdbuf_batched`. Old measurements showed q6k_matvec at 74 GB/s, q4k_ffn_gate_up at 103 GB/s; corrected numbers are 311 GB/s and 274 GB/s respectively.
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
 convention); the q4_KF fast-path doesn't apply to those.
+
+---
+
+## Session 2026-04-28 status snapshot
+
+**Decode**: 78.7 tok/s baseline (corrected from 81-84 buggy number). Gap to ollama 1.30× — distributed across pipeline, not concentrated in any single kernel with obvious headroom.
+
+**Prefill**: 196 ms (18 tok) → 2933 ms (340 tok). 4-14× gap to ollama. Has the headroom; needs `q4k_matmul` wired into more sites.
+
+**Shipped this session**:
+- ✓ `q4k_matmul` Metal kernel (1.79× kernel-isolated for prefill); wired at O proj, parity tested
+- ✓ `q4k_ffn_gate_up_f16acc` shader, opt-in via `LARQL_F16_ACC=1`
+- ✓ Profiler harness fix (`measure_single_cmdbuf_batched`)
+- ✓ Encoder coalescing in 3 dispatch sites
+- ✓ Magic-number/string audit + extraction (Q4_K constants, manifest kind enum)
+- ✓ MoE combine helper unification (CPU vs Metal — fixed 26B-A4B garbage output)
+- ✓ lm_head Q4_K vs Q4_0 dispatch fix (was producing gibberish on gemma3-4b-q4k-v2)
+- ✓ `larql parity --component layer` end-to-end Metal-vs-CPU diff (proved MoE fix)
+
+**Negative results documented (don't re-try)**:
+- ✗ N_DST > 1 (multi-row per simdgroup): register pressure regresses on M3 Max
+- ✗ float4 vectorisation in Q4_K kernels: addressing overhead negates gain
+- ✗ sumy precompute: neutral (compiler already hoisting)
+- ✗ f16 accumulators end-to-end: kernel 1.79× but **end-to-end at parity** on quiet GPU. Initial +23% was thermal-throttle artifact. ALU savings absorbed by surrounding bandwidth-bound kernels.
+- ✗ Wiring `q4k_matmul` into prefill (O proj + FFN gate+up, attempted 2026-04-28): kernel-isolated 1.79-3.8× did NOT translate end-to-end. Short-prompt prefill within noise; **long-prompt prefill regressed ~10%**. Root cause: the matmul's `[seq_len × hidden]` X working set thrashes GPU L1 on long prompts, defeating the cache locality the matvec loop had. Reverted. The matmul kernel remains shipped with parity tests but is not worth wiring into the production prefill path on this hardware.
+
+**Pattern across the negative results (3 attempts in a row, then a positive)**: kernel-isolated speedups don't *automatically* translate end-to-end. The 8sg variant did — kernel-isolated 1.37× → end-to-end +2.1% throughput on quiet GPU. The difference: 8sg is a pure dispatch geometry change with same per-thread compute, so the GPU schedules more concurrent simdgroups for free; the failed attempts (f16 acc, matmul) changed the per-thread/per-call work in ways that interacted poorly with the surrounding pipeline. Per-kernel optimisations should still be measured end-to-end on a quiet GPU before wiring.
+
+**GPU-time instrumentation finding (2026-04-28)**: Added `MTLCommandBuffer.gpuStartTime/gpuEndTime` to production decode (`metal/decode/gpu_timing.rs`, env-gated `LARQL_GPU_TIMING=1`). On gemma3-4b-q4k-v2:
+
+```
+wall ≈ 10.9 ms  |  gpu ≈ 10.4 ms  |  cpu ≈ 0.5 ms (4-5%)
+```
+
+**The 2.5 ms gap to ollama is GPU compute time, not CPU dispatch overhead.** Dispatch fusion saves at most ~5% (entire CPU overhead is 0.5 ms). The "374 vs 272 dispatches" framing was overweighted; the real gap is per-kernel GPU efficiency.
+
+**This invalidates the "no per-kernel headroom" claim** but NOT for the cache-pressure reason I initially guessed. Added cold-cache profiling (`metal/diag/kernel_profile.rs` rotates through 8 distinct weight buffer pairs, ~170-240 MB total — far exceeds L2). Cold-cache result: **identical to warm-cache**:
+
+| kernel | warm GB/s | cold GB/s |
+|---|---|---|
+| q6k_matvec (down) | 317 | 316 |
+| q4k_ffn_gate_up | 274 | 276 |
+
+So cache pressure is NOT the gap. Our kernels really do sustain 274/317 GB/s in production conditions.
+
+**Reframed**: M3 Max LPDDR5X peak is **~400 GB/s** (system-wide, ~320 GB/s practical for GPU). Our kernels at 274 = 68% of peak (gate+up) and 317 = 79% of peak (down). Ollama's hand-tuned llama.cpp kernels likely sit at 85%+ of peak — that's where the 2.5 ms decode gap lives. The headroom is real but in **kernel geometry/occupancy choices**, not cache handling.
+
+Concrete next investigation: try different threadgroup configurations (more simdgroups per TG without per-thread register pressure, larger ROWS_PER_TG with corresponding adjustments) to push toward 85% of peak. The auto-memory's "N_DST > 1 regresses" finding rules out per-simdgroup multi-row, but doesn't rule out per-TG multi-simdgroup at fixed nr0=1.
+
+**Open priorities (best-leverage first)**:
+1. **Wire `q4k_matmul` into FFN gate/up/down for prefill** — ~3× prefill speedup expected (kernel proven at 1.79× isolated, multiple sites compound). Days of careful integration.
+2. **Wire `q4k_matmul` into QKV** — fused Q+K+V matmul kernel needed, OR per-projection matmul fallback. Week-scale work.
+3. **Fix profiler for remaining kernels** (q4k_matvec for Wo, etc.) — accurate per-kernel numbers. Hour-scale.
+4. **Decode is at-or-near M3 Max ceiling for this pipeline architecture** — closing the last 25% to ollama would require fundamental fusion / scheduling changes, not per-kernel optimisation.
 
 ---
 

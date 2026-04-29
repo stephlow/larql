@@ -47,28 +47,24 @@ pub fn cpu_moe_forward(
         return vec![0.0f32; hidden];
     }
 
-    // 1. Pre-experts norm — input for the expert matmuls.
-    //
-    //    The router norm composes ON TOP of this — verified by `larql parity
-    //    --component moe-block`: raw-h routing and h_norm routing pick
-    //    different top-K experts on the 26B-A4B vindex (e.g. layer 0:
-    //    [55,101,126,12,52,114,84,79] vs [101,52,126,55,12,34,68,79], 2 of 8
-    //    differ). Metal's `gpu_moe_dispatch` calls `cpu_moe_route(&h_norm,
-    //    ...)` and produces correct generation ("Paris."); CPU paths that
-    //    route on raw h produce garbage. Aligning to Metal here.
+    // 1. Pre-experts norm — input for the expert matmuls only.
+    //    Per HF Gemma4TextDecoderLayer.forward (modeling_gemma4.py:1380-1382):
+    //      hidden_states_flat = residual.reshape(...)              # raw post-attn residual
+    //      _, top_k_weights, top_k_index = self.router(hidden_states_flat)
+    //      hidden_states_2 = self.pre_feedforward_layernorm_2(hidden_states_flat)
+    //    Experts get pre_experts_norm(raw_h); router gets raw_h directly.
     let h_norm = rms_norm(h, moe.pre_experts_norm, eps, norm_offset);
 
-    // 2. Router input norm. Resolution order:
+    // 2. Router input norm — applied to RAW h (not h_norm). Resolution order:
     //      1. learned router_norm weight (architectures that ship one),
     //      2. parameter-free RMSNorm (HF Gemma 4 — `Gemma4RMSNorm(with_scale=False)`),
-    //      3. fallback: just use the pre-experts-norm output directly.
-    //    All three apply on top of h_norm so the routing matches Metal.
+    //      3. fallback: pass raw h through.
     let router_in_normed: Vec<f32> = if !moe.router_norm.is_empty() {
-        rms_norm(&h_norm, moe.router_norm, eps, norm_offset)
+        rms_norm(h, moe.router_norm, eps, norm_offset)
     } else if moe.router_norm_parameter_free {
-        rms_norm_no_weight(&h_norm, eps)
+        rms_norm_no_weight(h, eps)
     } else {
-        h_norm.clone()
+        h.to_vec()
     };
 
     // 3. Router scale (learned per-hidden-dim vector) + optional scalar

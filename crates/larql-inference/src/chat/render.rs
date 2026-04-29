@@ -30,6 +30,40 @@ pub(crate) fn render_chat_template(
     tmpl.render(ctx)
 }
 
+/// Render `template_str` against an arbitrary multi-message conversation
+/// plus optional `enable_thinking` flag.  Used by the CLI's diagnostic
+/// `--system` / thinking flags so callers can inject a system prompt or
+/// flip the thinking-channel default without forking the env setup
+/// (which the bare `wrap_prompt_raw` API doesn't expose — it hard-codes
+/// a single user turn).
+///
+/// `messages` is a list of `(role, content)` pairs; roles are passed
+/// through to the template verbatim ("system", "user", "assistant",
+/// "model" — pick what your model's template recognises).
+pub fn render_chat_template_multi(
+    template_str: &str,
+    cfg: &Value,
+    messages: &[(String, String)],
+    enable_thinking: bool,
+) -> Result<String, String> {
+    let env = build_env(template_str).map_err(|e| e.to_string())?;
+    let tmpl = env.get_template("chat").map_err(|e| e.to_string())?;
+    let bos_token = cfg_string_field(cfg, "bos_token").unwrap_or_default();
+    let eos_token = cfg_string_field(cfg, "eos_token").unwrap_or_default();
+    let msgs: Vec<minijinja::Value> = messages
+        .iter()
+        .map(|(role, content)| context! { role => role.clone(), content => content.clone() })
+        .collect();
+    let ctx = context! {
+        messages => msgs,
+        add_generation_prompt => true,
+        enable_thinking => enable_thinking,
+        bos_token => bos_token,
+        eos_token => eos_token,
+    };
+    tmpl.render(ctx).map_err(|e| e.to_string())
+}
+
 /// Assemble the minijinja environment with all HF-compat shims attached.
 /// Factored out so tests can poke at individual shims in isolation.
 fn build_env(template_str: &str) -> Result<Environment<'static>, minijinja::Error> {

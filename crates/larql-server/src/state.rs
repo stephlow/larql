@@ -60,7 +60,29 @@ pub struct LoadedModel {
     /// Expert ID range this server owns (from `--experts START-END`).
     /// `None` = serve all experts. Used by the expert endpoint to reject
     /// requests for experts this shard doesn't hold.
+    /// Layer-uniform: same range applies to every layer.
     pub expert_filter: Option<(usize, usize)>,
+    /// Fine-grained per-(layer, expert) ownership (from `--units PATH`).
+    /// When `Some`, takes precedence over `expert_filter` — `run_expert`
+    /// rejects any (layer, expert_id) not in this set.  Designed for the
+    /// architecture where each shard hosts a tight set of (layer, expert)
+    /// units rather than a contiguous expert range.
+    pub unit_filter: Option<Arc<std::collections::HashSet<(usize, usize)>>>,
+
+    /// Lazy-initialised Metal backend for GPU expert dispatch.
+    /// `Some(Some(backend))` = initialised, available; `Some(None)` =
+    /// initialised, Metal not available; `None` = not yet initialised.
+    /// Only present under `--features metal-experts`.
+    #[cfg(feature = "metal-experts")]
+    pub metal_backend: std::sync::OnceLock<Option<larql_compute::MetalBackend>>,
+    /// Cached MoE scratch per `(top_k, hidden, inter)` shape — one entry
+    /// per architecture in practice.  Behind a Mutex so the streaming
+    /// handler can take a `&Arc<MoeScratch>` without holding the lock
+    /// across the GPU dispatch.
+    #[cfg(feature = "metal-experts")]
+    pub moe_scratches: std::sync::Mutex<
+        std::collections::HashMap<(usize, usize, usize), Arc<larql_compute::MoeScratch>>,
+    >,
 }
 
 impl LoadedModel {
@@ -316,6 +338,11 @@ mod loaded_model_tests {
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             expert_filter: None,
+            unit_filter: None,
+            #[cfg(feature = "metal-experts")]
+            metal_backend: std::sync::OnceLock::new(),
+            #[cfg(feature = "metal-experts")]
+            moe_scratches: std::sync::Mutex::new(HashMap::new()),
         }
     }
 

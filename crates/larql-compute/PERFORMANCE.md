@@ -11,17 +11,30 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 > ~75% of output rows unwritten. The 81–84 was real wall-clock
 > throughput on broken (wrong-output) code. **78.7 tok/s is the correct
 > baseline for valid output.** Reverting 077884b would re-introduce the
-> bug; future gains here come from optimising the Q4_K kernel itself
-> (it's already at 8 rows/TG, ALU-limited at ~272 GB/s on K=2560).
+> bug.
+
+> **Profiler note (2026-04-28)**: an earlier per-kernel diagnosis claimed
+> q4k_ffn_gate_up was "ALU-limited at 103 GB/s, compute-bound on Q4_K
+> dequant". That was a profiler bug — `measure_batched` was creating a
+> fresh cmd buffer per kernel call (with commit+wait per call) instead
+> of running `n_layers` dispatches in one cmd buffer, so per-call
+> dispatch overhead dominated the measurement. Fixed via
+> `measure_single_cmdbuf_batched`. Corrected numbers: q4k_ffn_gate_up at
+> **274 GB/s = 74% of LPDDR5X peak (bandwidth-bound)**, not 103 GB/s
+> compute-bound. Both big FFN kernels are at bandwidth saturation; the
+> 1.30× decode gap to ollama is distributed across the pipeline, not
+> concentrated in any single kernel.
 
 ---
 
 ## Current state (2026-04-28)
 
 ```
-larql-metal  gemma3-4b-q4k-v2     78.7 tok/s   12.7ms/tok  (100-token run, 8 warmup)
+larql-metal  gemma3-4b-q4k-v2     80.3 tok/s   12.45ms/tok (gate+up 8sg + q4k_matvec 8sg, 2026-04-28)
+larql-metal  gemma3-4b-q4k-v2     76.3 tok/s   13.11ms/tok (q4k_matvec 4sg, gate+up 8sg)
+larql-metal  gemma3-4b-q4k-v2     78.9 tok/s   12.67ms/tok (gate+up 8sg, q4k_matvec 4sg)
 Ollama       gemma3:4b            94–98 tok/s   ~10.5ms/tok
-Gap          ~1.27×               ~2.2ms/tok
+Gap          ~1.18×               ~1.95ms/tok
 
 larql-metal  gemma4-26B-A4B         5.1 tok/s  ~194ms/tok  (Phase 1 GPU dispatch; Phase 2 open)
 SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok  (attention + dense FFN only)
@@ -39,13 +52,36 @@ Per-stage (Gemma 3 4B, 100-token run, 8 warmup):
 
 | Change | Model | Effect | Notes |
 |---|---|---|---|
+| **lm_head Q4_K vs Q4_0 dispatch fix** | Gemma 3 4B v2 | correctness — output was gibberish | Writer produced Q4_K, reader dispatched Q4_0 (same byte rate so file size matched). Now dispatches q4k_matvec. |
+| **MoE combine helper unification** (CPU + Metal share `outer_combine.rs`) | Gemma 4 26B-A4B | **correctness — was multilingual gibberish** | 4 silent divergences between CPU/Metal MoE combine logic (f32/f64 RMS, identity-scale-on-missing-norm, etc.) collapsed into one helper. Verified via `larql parity --component layer`: 30/30 layers cos=1.0. |
 | **Q4_K dispatch correctness fix** (commit 077884b) | Gemma 3 4B | **−5 tok/s** (84 → 79) | Q4_K was routed through Q4_KF kernel, leaving 75% of output rows unwritten; 81-84 was on broken code, 79 is correct baseline |
 | **`q6k_matvec` ROWS_PER_TG=4 correctness fix** | Gemma 3 4B | **78.7 tok/s, GPU fwd 10.8ms** | Silent bug: rows 1282-2559 were zeros; fixed to ROWS_PER_TG=4 everywhere |
+| **Profiler harness fix** (`measure_single_cmdbuf_batched`) | profiling tool | corrects per-kernel GB/s by 2-4× | Old harness ran each kernel call in its own cmd buffer; per-call dispatch overhead dominated the measurement. Fixed numbers: q6k_matvec 311 GB/s (was 74), q4k_ffn_gate_up 274 GB/s (was 103). |
+| **`q4k_matmul` Metal kernel** + parity tests | prefill | kernel 1.79× isolated; **end-to-end no win** | Wiring into O proj + FFN gate+up was attempted and reverted 2026-04-28: short-prompt prefill within noise, long-prompt prefill regressed ~10%. Same failure mode as f16 acc — kernel was bandwidth-near-peak and matmul's [seq_len × hidden] X working set thrashes L1 on long prompts. Kernel remains available via `MetalBackend::q4k_matmul` for callers that want it; not in production decode/prefill path. |
+| **Encoder coalescing** in 3 dispatch sites (O proj, QKV f32, QKV Q8) | prefill | <5% on long prompts | Below noise on short prompts. Real win is the matmul kernel above; coalescing was the cheap risk-free first move. |
+| **`q4k_ffn_gate_up_f16acc` shader** (opt-in, `LARQL_F16_ACC=1`) | Gemma 3 4B | kernel 1.79× isolated; **end-to-end at parity** | Numerical parity perfect (10-prompt greedy bit-identical), but kernel was already bandwidth-bound — freed ALU cycles get absorbed by surrounding kernels. Initial +23% measurement was thermal-throttle artifact. Kept as opt-in. |
+| **`q4k_ffn_gate_up_8sg` shader** (now default; opt-out `LARQL_GATE_UP_8SG=0`) | Gemma 3 4B | **+2.1% end-to-end** (77.2 → 78.9 tok/s) | 8 simdgroups per TG (256 threads, 8 rows/TG) instead of 4/128/4. Same per-thread register footprint (`nr0=1`). Bit-identical output. First positive end-to-end perf this session. |
+| **`q6k_matvec_8sg` shader** (opt-in only, `LARQL_Q6K_8SG=1`) | Gemma 3 4B | kernel **1.96× isolated**, end-to-end **at parity** | Q6_K was already at 84% of LPDDR5X peak — too little headroom for 8sg to recover; larger TGs cause schedule contention with 8sg gate+up. Kept opt-in. |
+| **`q4k_matvec_8sg` shader** (now default; opt-out `LARQL_Q4K_MATVEC_8SG=0`) | Gemma 3 4B | **+5.2% end-to-end** (76.3 → 80.3 tok/s) | Profiler showed q4k_matvec at 220 GB/s = 55% of LPDDR5X peak (most under-utilised matvec). 8sg gives biggest single-shader win this session — touches Wo + QKV fallback + other call sites, gains compound. Bit-equal parity ✓. |
+| **Pattern observation (2026-04-28)**: 8sg geometry helps proportionally to bandwidth headroom: 55% util (q4k_matvec) → +5.2%; 68% util (gate+up) → +2.1%; 84% util (q6k_matvec) → 0% (regressed). When considering 8sg for a new kernel, profile its production-batched GB/s first — only worth it if utilisation is below ~75% of LPDDR5X peak. | | | |
 | `f32_gemv_topk1` GPU argmax | any | 0 in bench (KNN fires first) | Saves 0.33ms for top_k=1 non-KNN callers |
-| Q4_K float4 dual-sub-block | Gemma 3 4B | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |
+| Q4_K float4 dual-sub-block | Gemma 3 4B | **REGRESSED** (reverted) | K=2560 — added addressing overhead |
 | Batched MoE prefill | Gemma 4 26B A4B | **+35% tok/s, −31% prefill** | 130 → 26 GPU commits for 5-token prompt |
 | Q4_K `sumy` precompute | Gemma 3 4B | neutral (within noise) | Compiler already hoisting; FMA chain unchanged |
 | Per-layer Q4K format + GPU expert dispatch | Gemma 4 26B A4B | **+75% overall (2.9 → 5.1 tok/s)** | Expert FFNs on GPU; see §26B A4B below |
+
+### Per-kernel batched throughput (corrected 2026-04-28)
+
+`diag_profile_kernels`, M3 Max, gemma3-4b-q4k-v2:
+
+| Kernel | Batched ms/call | GB/s | Per-token (×34) | Bottleneck |
+|---|---|---|---|---|
+| q4k_ffn_gate_up (gate+up, K=2560) | 0.108 ms | **274 GB/s** | 3.7 ms | bandwidth-bound, 74% of LPDDR5X peak |
+| q6k_matvec (down, K=10240) | 0.069 ms | **311 GB/s** | 2.3 ms | bandwidth-bound, 84% of peak |
+| f32_gemv (lm_head, 262K×2560) | — | **374 GB/s** | 1.93 ms | at LPDDR5X peak |
+| Wo + QKV + attention + 4× RMS norms | mixed | mixed | ~5.9 ms | mixed, presumed near-peak |
+
+**No headroom in any single kernel.** The 1.30× decode gap to ollama is distributed across dispatch overhead + sustained-clock effects + the cumulative inefficiency of running fewer-fused kernels than llama.cpp.
 
 ---
 

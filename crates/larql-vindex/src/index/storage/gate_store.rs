@@ -55,6 +55,13 @@ pub struct GateStore {
     pub gate_q4_slices: Vec<GateQ4Slice>,
     /// HNSW per-layer index, lazily built on first query when enabled.
     pub hnsw_cache: Mutex<Vec<Option<super::super::hnsw::HnswLayer>>>,
+    /// Fine-grained HNSW indexed by `(layer, expert_id)` over each expert's
+    /// gate-vector slice (704 vectors per expert on Gemma 4 26B-A4B vs 90k
+    /// per-layer in `hnsw_cache`).  Lazily populated by `gate_knn_expert`
+    /// when HNSW is enabled.  Used for the per-unit shard architecture
+    /// where each shard hosts only its own (layer, expert) units and a
+    /// query's KNN search space is bounded by one expert's slice.
+    pub hnsw_unit_cache: Mutex<std::collections::HashMap<(usize, usize), super::super::hnsw::HnswLayer>>,
     /// HNSW master toggle.
     pub hnsw_enabled: std::sync::atomic::AtomicBool,
     /// HNSW beam width.
@@ -76,6 +83,7 @@ impl GateStore {
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
             hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
+            hnsw_unit_cache: Mutex::new(std::collections::HashMap::new()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
             hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
         }
@@ -103,6 +111,7 @@ impl Clone for GateStore {
             gate_q4_mmap: self.gate_q4_mmap.clone(),
             gate_q4_slices: self.gate_q4_slices.clone(),
             hnsw_cache: Mutex::new((0..nl).map(|_| None).collect()),
+            hnsw_unit_cache: Mutex::new(std::collections::HashMap::new()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(
                 self.hnsw_enabled.load(Ordering::Relaxed),
             ),

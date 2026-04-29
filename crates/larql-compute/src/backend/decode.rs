@@ -122,6 +122,44 @@ pub trait DecodeBackend {
         )
     }
 
+    /// Split fire / collect variant of `decode_token_with_moe`.  At each MoE
+    /// layer the implementation calls `moe_fire_fn(layer, h_post_attn)` once
+    /// `h_post_attn` is computed, encodes dense FFN + post-FFN residual on a
+    /// fresh command buffer, commits without waiting, then calls
+    /// `moe_collect_fn(layer)` to retrieve the expert weighted-sum vector
+    /// while the GPU runs the dense FFN in parallel.
+    ///
+    /// Default impl combines the two callbacks into a single synchronous
+    /// closure and forwards to `decode_token_with_moe` — backends that don't
+    /// support encoder splitting see no behaviour change.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_with_moe_split(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        moe_fire_fn: &mut dyn FnMut(usize, &[f32]),
+        moe_collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        // Default: synthesise a single synchronous moe_fn from the pair.
+        let mut combined = |layer: usize, h: &[f32]| -> Vec<f32> {
+            moe_fire_fn(layer, h);
+            moe_collect_fn(layer)
+        };
+        self.decode_token_with_moe(
+            layers, x, hidden, inter, q_dim, kv_dim,
+            num_q_heads, num_kv_heads, head_dim, rope_base,
+            &mut combined,
+        )
+    }
+
     /// Like `decode_token` but splits each layer into attn / gate+up /
     /// down command buffers and times each. Returns `(result, attn_ms,
     /// gate_up_ms, down_ms)`. Default delegates to `decode_token` with

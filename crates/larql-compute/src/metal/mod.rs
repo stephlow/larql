@@ -30,6 +30,7 @@ mod direct_ops;
 pub mod f32_ops;
 pub mod kernel; // KernelHandle: pipeline + dispatch geometry, bundled
 mod moe_dispatch;
+pub use moe_dispatch::MoeScratch;
 pub mod ops; // modular: ops/mod.rs → one file per operation
 mod pipeline;
 mod prefill;
@@ -88,7 +89,18 @@ pub struct MetalBackend {
     pub rms_norm_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
     pub q8_qkv_proj_pipeline: KernelHandle,
+    /// Production-active Q4_K matvec pipeline. Holds 8sg by default
+    /// (2026-04-28; profiler showed 55% of LPDDR5X peak with 4sg).
+    /// All dispatch sites use this transparently. Tests reach the
+    /// explicit variants via `q4k_matvec_4sg_pipeline` /
+    /// `q4k_matvec_8sg_pipeline`.
     pub q4k_matvec_pipeline: KernelHandle,
+    /// Always-4sg Q4_K matvec (production until 2026-04-28). Kept as
+    /// the explicit fallback / opt-out via `LARQL_Q4K_MATVEC_8SG=0`.
+    pub q4k_matvec_4sg_pipeline: KernelHandle,
+    /// Always-8sg Q4_K matvec (256 threads/TG, 8 rows/TG). Bit-identical
+    /// output to 4sg. Default-on for `q4k_matvec_pipeline`.
+    pub q4k_matvec_8sg_pipeline: KernelHandle,
     /// Q4_K matmul (gemm) — `[N, K] × [M, K] → [M, N]`. Used by prefill
     /// and seq>1 dispatch when amortising dequant across positions is
     /// worth the per-thread accumulator footprint. Decode (M=1) still
@@ -101,6 +113,14 @@ pub struct MetalBackend {
     /// even on bandwidth-bound kernels. See
     /// `shaders/q4k_ffn_gate_up_f16acc.rs`.
     pub q4k_ffn_gate_up_f16acc_pipeline: KernelHandle,
+    /// Experimental Q4_K gate+up with 8 simdgroups per TG (256 threads,
+    /// 8 rows/TG) instead of the production 4 simdgroups (128 threads,
+    /// 4 rows/TG). Same per-thread register footprint (nr0=1) so no
+    /// register pressure regression; doubled threads per TG should
+    /// improve within-TG latency hiding. Off by default; opt-in via
+    /// `LARQL_GATE_UP_8SG=1` while perf is being measured. See
+    /// `shaders/q4k_ffn_gate_up_8sg.rs`.
+    pub q4k_ffn_gate_up_8sg_pipeline: KernelHandle,
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
     pub q4k_geglu_silu_down_pipeline: KernelHandle,
     pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
@@ -109,7 +129,19 @@ pub struct MetalBackend {
     /// is Q4_K gate/up + Q6_K down). Mirrors the Q4_K twins above.
     pub q6k_geglu_silu_down_pipeline: KernelHandle,
     pub q6k_geglu_gelu_tanh_down_pipeline: KernelHandle,
+    /// Production-active Q6_K matvec pipeline. Holds 8sg by default,
+    /// 4sg when `LARQL_Q6K_8SG=0` is set at startup. All dispatch
+    /// sites use this transparently; tests reach the explicit
+    /// variants via `q6k_matvec_4sg_pipeline` / `q6k_matvec_8sg_pipeline`.
     pub q6k_matvec_pipeline: KernelHandle,
+    /// Always-4sg Q6_K matvec (production until 2026-04-28). Kept as
+    /// the explicit fallback / opt-out via `LARQL_Q6K_8SG=0`.
+    pub q6k_matvec_4sg_pipeline: KernelHandle,
+    /// Always-8sg Q6_K matvec (256 threads/TG, 8 rows/TG). Bit-identical
+    /// output to 4sg (same math, only TG dispatch geometry changed).
+    /// Default-on for `q6k_matvec_pipeline` as of 2026-04-28. See
+    /// `shaders/q6k_matvec_8sg.rs`.
+    pub q6k_matvec_8sg_pipeline: KernelHandle,
     pub rope_at_pos_pipeline: ComputePipelineState,
     pub rope_at_pos_batched_pipeline: ComputePipelineState,
     pub q4k_qkv_proj_pipeline: KernelHandle,
@@ -219,12 +251,49 @@ impl MetalBackend {
             get_shader_pipeline::<shaders::residual_inject::ResidualAddKernel>(&device, &library)?;
 
         // Q4_K + Q6_K matvec (KernelHandle).
-        let q4k_matvec_pipeline =
+        // Q4_K matvec: production default is 8sg (256 threads/TG, 8
+        // rows/TG) as of 2026-04-28 — production-batched profiler
+        // showed q4k_matvec at 220 GB/s = 55% of LPDDR5X peak, the
+        // most-under-utilised matvec by far. 8sg gives access to the
+        // remaining bandwidth slack the same way it did for gate+up.
+        // Set `LARQL_Q4K_MATVEC_8SG=0` at startup to opt out.
+        let q4k_matvec_4sg_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_matvec::Kernel>(&device, &library)?;
+        let q4k_matvec_8sg_pipeline =
+            KernelHandle::from_kernel::<shaders::q4k_matvec_8sg::Kernel>(&device, &library)?;
+        let q4k_matvec_use_4sg = matches!(
+            std::env::var("LARQL_Q4K_MATVEC_8SG").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        );
+        let q4k_matvec_pipeline = if q4k_matvec_use_4sg {
+            q4k_matvec_4sg_pipeline.clone()
+        } else {
+            q4k_matvec_8sg_pipeline.clone()
+        };
         let q4k_matmul_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_matmul::Kernel>(&device, &library)?;
-        let q6k_matvec_pipeline =
+        // Q6_K matvec: production default is the 4-simdgroup variant.
+        // Tried 8sg (256 threads/TG, 8 rows/TG, kernel-isolated 1.96×
+        // speedup) on 2026-04-28 — end-to-end was at parity, slightly
+        // worse on quiet GPU (77.6 → 77.1 tok/s, 0.08 ms/tok). q6k was
+        // already at 84% of LPDDR5X peak (vs gate+up's 68%), so the
+        // ALU/scheduling slack the 8sg variant exposes is too small
+        // to recover end-to-end. Both pipelines are kept — tests use
+        // them explicitly, opt-IN via `LARQL_Q6K_8SG=1` for callers
+        // who want to retry on different hardware.
+        let q6k_matvec_4sg_pipeline =
             KernelHandle::from_kernel::<shaders::q6k_matvec::Kernel>(&device, &library)?;
+        let q6k_matvec_8sg_pipeline =
+            KernelHandle::from_kernel::<shaders::q6k_matvec_8sg::Kernel>(&device, &library)?;
+        let q6k_use_8sg = matches!(
+            std::env::var("LARQL_Q6K_8SG").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        );
+        let q6k_matvec_pipeline = if q6k_use_8sg {
+            q6k_matvec_8sg_pipeline.clone()
+        } else {
+            q6k_matvec_4sg_pipeline.clone()
+        };
 
         // Fused Q4_K / Q4_KF FFN gate+up (KernelHandle).
         let q4k_ffn_gate_up_pipeline =
@@ -232,6 +301,8 @@ impl MetalBackend {
         let q4k_ffn_gate_up_f16acc_pipeline = KernelHandle::from_kernel::<
             shaders::q4k_ffn_gate_up_f16acc::Kernel,
         >(&device, &library)?;
+        let q4k_ffn_gate_up_8sg_pipeline =
+            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_8sg::Kernel>(&device, &library)?;
         let q4kf_ffn_gate_up_pipeline =
             KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(&device, &library)?;
         // Fused activation+down (KernelHandle).
@@ -348,15 +419,20 @@ impl MetalBackend {
             residual_add_pipeline,
             q8_qkv_proj_pipeline,
             q4k_matvec_pipeline,
+            q4k_matvec_4sg_pipeline,
+            q4k_matvec_8sg_pipeline,
             q4k_matmul_pipeline,
             q4k_ffn_gate_up_pipeline,
             q4k_ffn_gate_up_f16acc_pipeline,
+            q4k_ffn_gate_up_8sg_pipeline,
             q4kf_ffn_gate_up_pipeline,
             q4k_geglu_silu_down_pipeline,
             q4k_geglu_gelu_tanh_down_pipeline,
             q6k_geglu_silu_down_pipeline,
             q6k_geglu_gelu_tanh_down_pipeline,
             q6k_matvec_pipeline,
+            q6k_matvec_4sg_pipeline,
+            q6k_matvec_8sg_pipeline,
             rope_at_pos_pipeline,
             rope_at_pos_batched_pipeline,
             q4k_qkv_proj_pipeline,

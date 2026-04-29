@@ -282,6 +282,8 @@ impl From<ChatArgs> for run_cmd::RunArgs {
             ops: Vec::new(),
             constrained: false,
             moe_shards: None,
+            moe_units_manifest: None,
+            moe_dispatch: "streaming".into(),
         }
     }
 }

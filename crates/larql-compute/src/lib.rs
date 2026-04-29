@@ -95,7 +95,13 @@ pub use cpu::ops::vector::{cosine, dot, norm};
 pub use cpu::CpuBackend;
 
 #[cfg(feature = "metal")]
-pub use metal::MetalBackend;
+pub use metal::{MetalBackend, MoeScratch};
+
+/// Re-export of the metal-rs `Buffer` type so downstream crates (e.g.
+/// `larql-server`) can hold cached `(gate_up, down)` Metal buffer pairs
+/// without taking a direct dependency on the `metal` crate.
+#[cfg(feature = "metal")]
+pub use ::metal::Buffer as MetalBuffer;
 
 /// Create the best available backend.
 ///
