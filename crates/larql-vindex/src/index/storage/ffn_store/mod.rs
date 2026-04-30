@@ -536,8 +536,7 @@ impl VectorIndex {
         }
 
         let floats_per_matrix = intermediate * self.hidden_size;
-        let q4_bytes_per_matrix = floats_per_matrix
-            / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
+        let q4_bytes_per_matrix = floats_per_matrix / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
             * larql_models::quant::ggml::Q4_0_BLOCK_BYTES;
         let q4_bytes_per_layer = q4_bytes_per_matrix * 3;
 
@@ -668,8 +667,7 @@ impl VectorIndex {
         for layer in 0..self.num_layers {
             let num_features = self.num_features(layer);
             let floats = num_features * self.hidden_size;
-            let q4_bytes = floats
-                / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
+            let q4_bytes = floats / larql_models::quant::ggml::Q4_0_BLOCK_ELEMS
                 * larql_models::quant::ggml::Q4_0_BLOCK_BYTES;
             slices.push(crate::index::types::GateQ4Slice {
                 byte_offset: offset,

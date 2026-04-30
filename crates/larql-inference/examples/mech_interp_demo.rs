@@ -145,7 +145,11 @@ fn main() {
 
     // ── 5. Steering ─────────────────────────────────────────────────────────
     println!("\n[5] add α·v at the middle layer");
-    let v = Array1::from_vec((0..weights.hidden_size).map(|i| (i as f32) * 0.001).collect());
+    let v = Array1::from_vec(
+        (0..weights.hidden_size)
+            .map(|i| (i as f32) * 0.001)
+            .collect(),
+    );
     let mut steer = SteerHook::new().add(target_layer, v, 0.5);
     let steered = trace_forward_full_hooked(
         &weights,
@@ -174,10 +178,10 @@ fn main() {
     let patch_layer = 0;
     println!("\n[6] activation patching donor → recipient");
     let recipient: Vec<u32> = vec![5, 6, 7, 8];
-    let recipient_baseline =
-        trace_forward(&weights, &recipient, &[last_layer], false, 0).residuals[0]
-            .1
-            .clone();
+    let recipient_baseline = trace_forward(&weights, &recipient, &[last_layer], false, 0).residuals
+        [0]
+    .1
+    .clone();
     let donor = capture_donor_state(&weights, &prompt, &[(patch_layer, recipient.len() - 1)]);
     println!(
         "  donor recorded {} coord(s) at (layer={patch_layer}, pos={})",

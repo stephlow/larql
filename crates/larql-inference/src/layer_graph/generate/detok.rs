@@ -162,7 +162,7 @@ mod tests {
         let a = detok.push(1); // "the"
         let b = detok.push(2); // "capital"
         let c = detok.push(3); // "of"
-        // WordLevel + Whitespace decode joins with single spaces.
+                               // WordLevel + Whitespace decode joins with single spaces.
         assert_eq!(a, "the");
         assert!(b.contains("capital"));
         assert!(c.contains("of"));
@@ -176,7 +176,7 @@ mod tests {
         detok.seed(&[1, 2, 3]); // "the capital of"
         assert!(detok.cumulative().starts_with("the capital of"));
         let next = detok.push(4); // "france"
-        // First emit after seeding must contain only the new token's surface.
+                                  // First emit after seeding must contain only the new token's surface.
         assert!(!next.contains("the"));
         assert!(next.contains("france"));
     }

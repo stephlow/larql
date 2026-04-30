@@ -175,7 +175,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.decode_tok_s(),
         result.avg_decode_ms()
     );
-    println!("Wall time:      {wall:.2}s (prefill {:.0}ms)", result.prefill_ms);
+    println!(
+        "Wall time:      {wall:.2}s (prefill {:.0}ms)",
+        result.prefill_ms
+    );
 
     Ok(())
 }

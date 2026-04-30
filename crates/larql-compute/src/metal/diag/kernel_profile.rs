@@ -91,6 +91,7 @@ fn measure_isolated(warmup: usize, iters: usize, f: &mut impl FnMut()) -> (f64, 
 ///
 /// Kept for callers who genuinely want per-call cmd-buffer overhead in
 /// the measurement (rare).
+#[allow(dead_code)]
 fn measure_batched(warmup: usize, iters: usize, n_layers: usize, f: &mut impl FnMut()) -> f64 {
     let mut times = Vec::with_capacity(iters);
     for i in 0..warmup + iters {

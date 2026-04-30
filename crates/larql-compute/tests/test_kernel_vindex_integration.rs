@@ -519,6 +519,7 @@ fn stage_quant_matvec_routes_format_to_correct_shader() {
         q4k_matvec_fallback: &q4k_mv,
         q6k_matvec: &q6k_mv,
         q4_matvec: &q4_matvec,
+        q4k_matmul: None,
     };
 
     let w_f32: Vec<f32> = (0..rows * hidden)

@@ -60,10 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_be = default_backend();
 
     // Use the same Gemma 4 chat template the rest of the crate uses.
-    let prompt = format!(
-        "<start_of_turn>user\n{user}\n<end_of_turn>\n<start_of_turn>model\n"
-    );
-    let encoding = tokenizer.encode(prompt.as_str(), true).map_err(|e| format!("{e}"))?;
+    let prompt = format!("<start_of_turn>user\n{user}\n<end_of_turn>\n<start_of_turn>model\n");
+    let encoding = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| format!("{e}"))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     let cache = {
         let weights = model.weights();

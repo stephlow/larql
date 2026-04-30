@@ -76,9 +76,9 @@ pub struct LoadedModel {
     #[cfg(feature = "metal-experts")]
     pub metal_backend: std::sync::OnceLock<Option<larql_compute::MetalBackend>>,
     /// Cached MoE scratch per `(top_k, hidden, inter)` shape — one entry
-    /// per architecture in practice.  Behind a Mutex so the streaming
-    /// handler can take a `&Arc<MoeScratch>` without holding the lock
-    /// across the GPU dispatch.
+    /// per architecture in practice.  `MoeScratch` contains mutable Metal
+    /// staging buffers, so Metal expert dispatch holds this mutex while
+    /// using a scratch entry.
     #[cfg(feature = "metal-experts")]
     pub moe_scratches: std::sync::Mutex<
         std::collections::HashMap<(usize, usize, usize), Arc<larql_compute::MoeScratch>>,

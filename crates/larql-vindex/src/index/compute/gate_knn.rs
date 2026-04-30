@@ -568,8 +568,7 @@ impl VectorIndex {
         if feat_start >= end {
             return None;
         }
-        let view =
-            ArrayView2::from_shape((num_features, self.hidden_size), &data).ok()?;
+        let view = ArrayView2::from_shape((num_features, self.hidden_size), &data).ok()?;
         let slice = view.slice(ndarray::s![feat_start..end, ..]);
         // Smaller `m` and `ef_construction` for the per-expert case — at
         // ~704 vectors the layer-level (8, 32) is overkill; (6, 16) builds
@@ -582,12 +581,7 @@ impl VectorIndex {
     /// Lock pattern mirrors `get_or_build_hnsw`: brief check under the
     /// mutex, build outside the lock, install only if no other thread
     /// raced ahead.
-    fn get_or_build_hnsw_unit(
-        &self,
-        layer: usize,
-        feat_start: usize,
-        feat_end: usize,
-    ) -> bool {
+    fn get_or_build_hnsw_unit(&self, layer: usize, feat_start: usize, feat_end: usize) -> bool {
         let key = (layer, feat_start);
         {
             let cache = self.gate.hnsw_unit_cache.lock().unwrap();
@@ -624,9 +618,7 @@ impl VectorIndex {
         }
         let built: Vec<((usize, usize), super::hnsw::HnswLayer)> = to_build
             .par_iter()
-            .filter_map(|&(l, fs, fe)| {
-                self.build_hnsw_unit_at(l, fs, fe).map(|h| ((l, fs), h))
-            })
+            .filter_map(|&(l, fs, fe)| self.build_hnsw_unit_at(l, fs, fe).map(|h| ((l, fs), h)))
             .collect();
         let n = built.len();
         let mut cache = self.gate.hnsw_unit_cache.lock().unwrap();
@@ -1038,8 +1030,10 @@ mod tests {
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
         // Cache should now hold the unit index.
         let cache = v.gate.hnsw_unit_cache.lock().unwrap();
-        assert!(cache.contains_key(&(0, 0)),
-            "hnsw_unit_cache must contain (layer=0, feat_start=0)");
+        assert!(
+            cache.contains_key(&(0, 0)),
+            "hnsw_unit_cache must contain (layer=0, feat_start=0)"
+        );
     }
 
     #[test]
@@ -1063,8 +1057,10 @@ mod tests {
         assert_eq!(n, 4);
         let cache = v.gate.hnsw_unit_cache.lock().unwrap();
         for &(l, fs, _) in &units {
-            assert!(cache.contains_key(&(l, fs)),
-                "missing unit ({l}, {fs}) after warmup");
+            assert!(
+                cache.contains_key(&(l, fs)),
+                "missing unit ({l}, {fs}) after warmup"
+            );
         }
         // Idempotent: second call should build nothing new.
         drop(cache);

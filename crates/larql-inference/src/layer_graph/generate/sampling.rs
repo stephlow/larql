@@ -85,9 +85,7 @@ impl SamplingConfig {
 
     /// True iff this config does plain argmax (no RNG needed).
     pub fn is_greedy(&self) -> bool {
-        self.temperature <= TEMPERATURE_GREEDY_EPS
-            && self.top_k.is_none()
-            && self.top_p.is_none()
+        self.temperature <= TEMPERATURE_GREEDY_EPS && self.top_k.is_none() && self.top_p.is_none()
     }
 }
 
@@ -176,7 +174,13 @@ fn apply_filters(logits: &[f32], cfg: SamplingConfig) -> Vec<f32> {
     };
     let mut scaled: Vec<f32> = logits
         .iter()
-        .map(|&l| if l.is_finite() { l / temp } else { f32::NEG_INFINITY })
+        .map(|&l| {
+            if l.is_finite() {
+                l / temp
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
         .collect();
 
     if let Some(k) = cfg.top_k {
@@ -331,11 +335,7 @@ mod tests {
 
     #[test]
     fn top_k_one_is_greedy_under_temperature() {
-        let mut s = Sampler::new(
-            SamplingConfig::temperature(2.0)
-                .with_top_k(1)
-                .with_seed(42),
-        );
+        let mut s = Sampler::new(SamplingConfig::temperature(2.0).with_top_k(1).with_seed(42));
         for _ in 0..16 {
             assert_eq!(s.sample(&logits_3()), Some(1));
         }
@@ -375,11 +375,7 @@ mod tests {
     #[test]
     fn top_k_truncates_choices() {
         // top_k=2 over [3.0, 5.0, 1.0] keeps {0, 1}; index 2 should never sample.
-        let mut s = Sampler::new(
-            SamplingConfig::temperature(1.0)
-                .with_top_k(2)
-                .with_seed(99),
-        );
+        let mut s = Sampler::new(SamplingConfig::temperature(1.0).with_top_k(2).with_seed(99));
         for _ in 0..200 {
             let id = s.sample(&logits_3()).unwrap();
             assert!(id == 0 || id == 1, "top_k=2 leaked id={id}");

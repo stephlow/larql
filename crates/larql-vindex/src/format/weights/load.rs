@@ -339,8 +339,7 @@ pub fn load_model_weights_with_opts(
             }
             let bytes = std::fs::read(&lm_q4_path)?;
             let num_floats = config.vocab_size * config.hidden_size;
-            let padded_floats = num_floats
-                .div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+            let padded_floats = num_floats.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
                 * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
             if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, padded_floats) {
                 if floats.len() >= num_floats {
@@ -602,8 +601,7 @@ pub fn load_model_weights_q4k_shard(
                 let cols = entry.shape[1];
                 let n = rows * cols;
                 let floats: Option<Vec<f32>> = if entry.kind == kind::TENSOR_Q4K {
-                    let padded = n
-                        .div_ceil(larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
+                    let padded = n.div_ceil(larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
                         * larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
                     larql_models::quant::ggml::dequantize_q4_k(raw_bytes, padded).ok()
                 } else {

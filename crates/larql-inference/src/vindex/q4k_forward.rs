@@ -226,15 +226,15 @@ fn build_moe_router_weights<'a>(
     };
     Some(crate::ffn::MoeRouterWeights {
         router_proj,
-        router_scale:            sl(arch.moe_router_scale_key(layer)),
+        router_scale: sl(arch.moe_router_scale_key(layer)),
         router_per_expert_scale: sl(arch.moe_router_per_expert_scale_key(layer)),
-        router_norm:             sl(arch.moe_router_norm_key(layer)),
+        router_norm: sl(arch.moe_router_norm_key(layer)),
         router_norm_parameter_free: arch.moe_router_norm_parameter_free(),
         router_input_scalar: arch.moe_router_input_scalar().unwrap_or(1.0),
-        pre_experts_norm:  sl(arch.moe_pre_experts_norm_key(layer)),
+        pre_experts_norm: sl(arch.moe_pre_experts_norm_key(layer)),
         post_experts_norm: sl(arch.moe_post_experts_norm_key(layer)),
         num_experts: arch.num_experts(),
-        top_k:       arch.num_experts_per_token(),
+        top_k: arch.num_experts_per_token(),
     })
 }
 
@@ -312,9 +312,7 @@ fn run_moe_layer_cpu(
         if let Some(router) = build_moe_router_weights(weights, arch, layer) {
             match remote.forward_moe_seq(layer, &h_post_attn, &router, norm_offset, eps) {
                 Ok(out) => h2 = out,
-                Err(e) => eprintln!(
-                    "[run_moe_layer_cpu] remote dispatch error L{layer}: {e}"
-                ),
+                Err(e) => eprintln!("[run_moe_layer_cpu] remote dispatch error L{layer}: {e}"),
             }
         }
         // If router weights unavailable, h2 stays zero (dense-only degradation).

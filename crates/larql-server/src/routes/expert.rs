@@ -94,9 +94,7 @@ pub fn run_experts_cpu_batch(
     expert_ids: &[usize],
     expert_weights: &[f32],
 ) -> Result<Vec<f32>, ServerError> {
-    use larql_compute::cpu::ops::moe::{
-        pre_experts_norm, run_single_expert_into, ExpertScratch,
-    };
+    use larql_compute::cpu::ops::moe::{pre_experts_norm, run_single_expert_into, ExpertScratch};
     use std::time::Instant;
     let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
     let t_start = Instant::now();
@@ -172,9 +170,7 @@ pub fn run_experts_cpu_batch(
                 let dn_stride = hidden * inter * 2;
                 let gu_start = eid * gu_stride;
                 let dn_start = eid * dn_stride;
-                if gu_start + gu_stride > gu_all.len()
-                    || dn_start + dn_stride > dn_all.len()
-                {
+                if gu_start + gu_stride > gu_all.len() || dn_start + dn_stride > dn_all.len() {
                     return None;
                 }
                 (
@@ -273,7 +269,11 @@ pub fn warmup_hnsw_unit_cache(
             .collect()
     };
     let n_experts_owned = if let Some(units) = model.unit_filter.as_ref() {
-        units.iter().map(|(_, e)| *e).collect::<std::collections::HashSet<_>>().len()
+        units
+            .iter()
+            .map(|(_, e)| *e)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     } else {
         let (start, end_excl) = model.expert_filter.unwrap_or((0, num_experts));
         end_excl.saturating_sub(start)
@@ -449,22 +449,9 @@ pub fn run_experts_metal_batch(
     };
     let t_norm = t_pre.elapsed();
 
-    let t_scratch_start = Instant::now();
-    // Look up (or create + cache) the MoE scratch for this layer's shape.
-    let scratch_key = (top_k, hidden, inter);
-    let scratch: Arc<MoeScratch> = {
-        let mut cache = model.moe_scratches.lock().expect("moe_scratches poisoned");
-        cache
-            .entry(scratch_key)
-            .or_insert_with(|| Arc::new(MoeScratch::new_public(backend, top_k, hidden, inter)))
-            .clone()
-    };
-    let t_scratch = t_scratch_start.elapsed();
-
     // get_expert_bytes maps expert_id → (gate_up_bytes, down_bytes) mmap slices.
-    let get_expert_bytes = |eid: usize| -> Option<(&[u8], &[u8])> {
-        weights.get_layer_entry_bytes(layer, eid)
-    };
+    let get_expert_bytes =
+        |eid: usize| -> Option<(&[u8], &[u8])> { weights.get_layer_entry_bytes(layer, eid) };
 
     // Pre-stage per-expert weights as cache-backed Metal buffers.  First
     // call for each (layer, expert_id) pays a memcpy (when bytes aren't
@@ -486,6 +473,21 @@ pub fn run_experts_metal_batch(
     }
     let t_bufs = t_buf_start.elapsed();
 
+    // Look up (or create + cache) the MoE scratch for this layer's shape.
+    //
+    // MoeScratch owns mutable Metal staging/output buffers. Keep the cache lock
+    // held across the dispatch so concurrent RPCs cannot overwrite each other's
+    // scratch contents. This path is opt-in while the Metal expert accuracy bug
+    // is being debugged; replace with a scratch pool if parallel GPU expert
+    // dispatch becomes a production requirement.
+    let t_scratch_start = Instant::now();
+    let scratch_key = (top_k, hidden, inter);
+    let mut scratch_cache = model.moe_scratches.lock().expect("moe_scratches poisoned");
+    let scratch = scratch_cache
+        .entry(scratch_key)
+        .or_insert_with(|| Arc::new(MoeScratch::new_public(backend, top_k, hidden, inter)));
+    let t_scratch = t_scratch_start.elapsed();
+
     let t_gpu_start = Instant::now();
     // 2026-04-30: switched from `run_experts_prestaged_metal` (per-expert
     // pre-cached buffers, per-expert dispatch) back to
@@ -503,7 +505,7 @@ pub fn run_experts_metal_batch(
         &h_norm,
         expert_ids,
         expert_weights,
-        &scratch,
+        scratch.as_ref(),
         get_expert_bytes,
     );
     let t_gpu = t_gpu_start.elapsed();
@@ -520,10 +522,8 @@ pub fn run_experts_metal_batch(
                     .iter()
                     .zip(cpu_out.iter())
                     .fold(0.0f32, |acc, (m, c)| acc.max((m - c).abs()));
-                let metal_norm =
-                    (result.iter().map(|v| v * v).sum::<f32>() / hidden as f32).sqrt();
-                let cpu_norm =
-                    (cpu_out.iter().map(|v| v * v).sum::<f32>() / hidden as f32).sqrt();
+                let metal_norm = (result.iter().map(|v| v * v).sum::<f32>() / hidden as f32).sqrt();
+                let cpu_norm = (cpu_out.iter().map(|v| v * v).sum::<f32>() / hidden as f32).sqrt();
                 let cos = {
                     let dot: f32 = result.iter().zip(cpu_out.iter()).map(|(a, b)| a * b).sum();
                     let na: f32 = result.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -623,11 +623,13 @@ pub fn run_expert(
     // slice by stride. Either way we feed `run_single_expert*` exactly one
     // expert's bytes — no monolith arithmetic in the compute path.
     let (gate_up_bytes, down_bytes, format) = if weights.has_per_layer_ffn() {
-        let (gu, dn) = weights.get_layer_entry_bytes(layer, expert_id).ok_or_else(|| {
-            ServerError::Internal(format!(
-                "per-layer entry missing for layer {layer} expert {expert_id}"
-            ))
-        })?;
+        let (gu, dn) = weights
+            .get_layer_entry_bytes(layer, expert_id)
+            .ok_or_else(|| {
+                ServerError::Internal(format!(
+                    "per-layer entry missing for layer {layer} expert {expert_id}"
+                ))
+            })?;
         (gu, dn, larql_inference::QuantFormat::Q4_K)
     } else {
         let gate_up_key = arch.packed_experts_gate_up_key(layer).ok_or_else(|| {
@@ -781,8 +783,7 @@ pub async fn handle_expert_batch(
         Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
-                serde_json::to_vec(&resp)
-                    .map_err(|e| ServerError::Internal(e.to_string()))?,
+                serde_json::to_vec(&resp).map_err(|e| ServerError::Internal(e.to_string()))?,
             ))
             .map_err(|e| ServerError::Internal(e.to_string()))?
     };

@@ -154,10 +154,10 @@ pub use layer_graph::{
     PipelinedLayerGraph,
     Sampler,
     SamplingConfig,
-    TurnRenderer,
     // Analysis/validation
     TemplatePattern,
     TemplateUniverse,
+    TurnRenderer,
     WalkLayerGraph,
 };
 pub use model::{load_model_dir, resolve_model_path, ModelWeights};

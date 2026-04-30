@@ -64,7 +64,11 @@ pub struct GemmaRenderer;
 impl TurnRenderer for GemmaRenderer {
     fn render(&self, role: &str, text: &str) -> String {
         // Gemma uses "model" rather than "assistant" inside the tag.
-        let role = if role == roles::ASSISTANT { "model" } else { role };
+        let role = if role == roles::ASSISTANT {
+            "model"
+        } else {
+            role
+        };
         format!("<start_of_turn>{role}\n{text}<end_of_turn>\n")
     }
     fn assistant_open(&self) -> String {
@@ -89,9 +93,7 @@ pub struct Llama3Renderer;
 
 impl TurnRenderer for Llama3Renderer {
     fn render(&self, role: &str, text: &str) -> String {
-        format!(
-            "<|start_header_id|>{role}<|end_header_id|>\n\n{text}<|eot_id|>"
-        )
+        format!("<|start_header_id|>{role}<|end_header_id|>\n\n{text}<|eot_id|>")
     }
     fn assistant_open(&self) -> String {
         "<|start_header_id|>assistant<|end_header_id|>\n\n".to_string()
@@ -318,7 +320,9 @@ mod tests {
     #[test]
     fn chatml_renderer_uses_role_verbatim() {
         let r = ChatMLRenderer;
-        assert!(r.render("assistant", "hi").contains("<|im_start|>assistant"));
+        assert!(r
+            .render("assistant", "hi")
+            .contains("<|im_start|>assistant"));
         assert!(r.render("user", "hi").contains("<|im_end|>"));
     }
 

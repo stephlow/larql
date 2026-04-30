@@ -21,12 +21,12 @@ engine.
 - LLM extraction utilities are provider-agnostic through `ModelProvider`,
   `TemplateRegistry`, `chain_tokens`, and BFS extraction.
 - Baseline verification: `cargo test -p larql-core` passes.
-- Current coverage: 89.49% line coverage with default features; 92.15% line
+- Current coverage: 77.92% line coverage with default features; 79.84% line
   coverage with `--no-default-features --features msgpack`.
 - Current release benchmark snapshot is recorded in `README.md` from
   `cargo run --release -p larql-core --example bench_graph`.
-- P1 has started: deterministic accessor ordering and exact edge lookup are
-  shipped.
+- P1 core API polish has shipped: deterministic accessor ordering, explicit
+  mutation results, and richer exact/multiedge lookup helpers are available.
 
 ---
 
@@ -50,8 +50,8 @@ regressions now covered by tests.
 | Item | Area | Detail |
 |---|---|---|
 | Deterministic ordered accessors | `core::graph`, `algo::components` | Done. `list_entities`, `list_relations`, `nodes`, search tie-breaks, and connected component ordering are deterministic. |
-| Fallible graph mutation API | `core::graph` | `add_edge` silently drops duplicate triples. Add `try_add_edge` or `insert_edge` returning `Inserted`, `Duplicate`, or `Replaced`, while keeping `add_edge` as the convenient legacy path. |
-| Explicit multiedge lookup | `core::graph` | Partially done. Exact triple lookup is available through `get_edge(subject, relation, object) -> Option<&Edge>`. Still open: richer subject/object relation iterators. |
+| Fallible graph mutation API | `core::graph` | Done. `try_add_edge` reports `Inserted`/`Duplicate` without replacement, `insert_edge` upserts by exact triple and can return `Replaced`, and `add_edge` remains the legacy duplicate-skipping path. |
+| Explicit multiedge lookup | `core::graph` | Done. Exact triple lookup is available through `get_edge(subject, relation, object) -> Option<&Edge>`, pair lookup through `edges_between(subject, object)`, and relation discovery through `outgoing_relations`/`incoming_relations`. |
 | Configurable keyword tokenizer | `core::graph` | Search lowercases and splits on whitespace/hyphen only. Add a small tokenizer abstraction or normalization options for punctuation, relation aliases, and case/diacritic handling. |
 | Error types per subsystem | `core::graph`, `io`, `engine` | `GraphError::Deserialize(String)` is too broad. Split parse, format, unsupported-version, corrupt-offset, and IO context enough for CLI/server diagnostics. |
 

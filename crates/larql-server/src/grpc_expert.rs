@@ -8,8 +8,8 @@ use futures::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    ExpertBatchItem, ExpertBatchRequest, ExpertBatchResponse, ExpertBatchResult,
-    ExpertLayerInput, ExpertLayerOutput, ExpertService,
+    ExpertBatchItem, ExpertBatchRequest, ExpertBatchResponse, ExpertBatchResult, ExpertLayerInput,
+    ExpertLayerOutput, ExpertService,
 };
 
 use crate::state::AppState;
@@ -45,9 +45,8 @@ fn process_batch_item(
     })
 }
 
-type StreamOutput = Pin<
-    Box<dyn futures::Stream<Item = Result<ExpertLayerOutput, Status>> + Send + 'static>,
->;
+type StreamOutput =
+    Pin<Box<dyn futures::Stream<Item = Result<ExpertLayerOutput, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl ExpertService for ExpertGrpcService {
@@ -82,28 +81,31 @@ impl ExpertService for ExpertGrpcService {
         let n_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
-        let mode = mode_override.as_deref().unwrap_or(if n_items <= n_cores {
-            "par"
-        } else {
-            "chunked"
-        });
+        let mode =
+            mode_override
+                .as_deref()
+                .unwrap_or(if n_items <= n_cores { "par" } else { "chunked" });
         let results: Vec<ExpertBatchResult> = tokio::task::block_in_place(|| {
             use rayon::prelude::*;
             let t0 = Instant::now();
             let res = match mode {
-                "par" => items.par_iter()
+                "par" => items
+                    .par_iter()
                     .map(|item| process_batch_item(&state, item))
                     .collect::<Result<Vec<_>, Status>>(),
-                "serial" => items.iter()
+                "serial" => items
+                    .iter()
                     .map(|item| process_batch_item(&state, item))
                     .collect::<Result<Vec<_>, Status>>(),
                 _ => {
                     // chunked: ceil(n / n_cores) items per chunk, processed
                     // serially within each rayon task.
                     let chunk_size = n_items.div_ceil(n_cores).max(1);
-                    items.par_chunks(chunk_size)
+                    items
+                        .par_chunks(chunk_size)
                         .map(|chunk| -> Result<Vec<_>, Status> {
-                            chunk.iter()
+                            chunk
+                                .iter()
                                 .map(|item| process_batch_item(&state, item))
                                 .collect()
                         })
@@ -112,15 +114,20 @@ impl ExpertService for ExpertGrpcService {
                 }
             };
             if timing_enabled {
-                eprintln!("[expert_batch grpc] n={n_items} mode={mode} cores={n_cores} \
+                eprintln!(
+                    "[expert_batch grpc] n={n_items} mode={mode} cores={n_cores} \
                     elapsed={:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0);
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
             res
         })?;
 
         let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
-        Ok(Response::new(ExpertBatchResponse { results, latency_ms }))
+        Ok(Response::new(ExpertBatchResponse {
+            results,
+            latency_ms,
+        }))
     }
 
     // ── Bidirectional streaming ──────────────────────────────────────────────

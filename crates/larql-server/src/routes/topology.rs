@@ -34,7 +34,9 @@ pub struct TopologyResponse {
 pub async fn handle_topology(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<TopologyResponse>, StatusCode> {
-    let model = state.model_or_err(None).map_err(|_| StatusCode::NOT_FOUND)?;
+    let model = state
+        .model_or_err(None)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
 
     // 404 if this server was not launched with --experts (no shard filter set).
     let (start, end_excl) = model.expert_filter.ok_or(StatusCode::NOT_FOUND)?;

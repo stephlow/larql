@@ -185,7 +185,11 @@ fn validate_strides(dir: &std::path::Path) -> Result<String, Box<dyn std::error:
             let length = entry["length"].as_u64().unwrap_or(0) as usize;
             let shape: Vec<usize> = entry["shape"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
                 .unwrap_or_default();
             let qfmt = match larql_vindex::quant::registry::lookup(fmt) {
                 Some(q) => q,
@@ -209,13 +213,14 @@ fn validate_strides(dir: &std::path::Path) -> Result<String, Box<dyn std::error:
     if total_bad == 0 {
         Ok(format!("✓ {total_clean} entries match canonical stride"))
     } else {
-        let mut msg = format!(
-            "✗ {total_bad} entries mismatched, {total_clean} clean — vindex is STALE"
-        );
+        let mut msg =
+            format!("✗ {total_bad} entries mismatched, {total_clean} clean — vindex is STALE");
         for ex in &bad_examples {
             msg.push_str(&format!("\n      {ex}"));
         }
-        msg.push_str("\n      Likely cause: legacy 148-byte block_q4_K layout. Rebuild the vindex.");
+        msg.push_str(
+            "\n      Likely cause: legacy 148-byte block_q4_K layout. Rebuild the vindex.",
+        );
         Ok(msg)
     }
 }
@@ -247,10 +252,7 @@ fn resolve_lm_head_path(
         PathDecision {
             label: "f16 gemv (tied embed)",
             will_fire: f16_ready,
-            note: format!(
-                "lm_head_f16 mmap = {}  → ~3-5 ms",
-                index.has_lm_head_f16()
-            ),
+            note: format!("lm_head_f16 mmap = {}  → ~3-5 ms", index.has_lm_head_f16()),
         },
         PathDecision {
             label: "f32 KNN (lm_head.bin)",
@@ -284,9 +286,8 @@ fn probe_run(
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)?;
 
     let prompt = "The capital of France is";
-    let token_ids: Vec<u32> =
-        larql_inference::encode_prompt(&tokenizer, &*weights.arch, prompt)
-            .map_err(|e| format!("{e}"))?;
+    let token_ids: Vec<u32> = larql_inference::encode_prompt(&tokenizer, &*weights.arch, prompt)
+        .map_err(|e| format!("{e}"))?;
 
     let backend = default_backend();
     let num_layers = weights.num_layers;

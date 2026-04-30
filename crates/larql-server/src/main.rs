@@ -246,11 +246,9 @@ async fn main() -> Result<(), BoxError> {
     // over --experts START-END; the two are mutually exclusive at parse time
     // so the operator gets a clear error rather than silently picking one.
     if cli.units.is_some() && cli.experts.is_some() {
-        return Err(
-            "--units and --experts are mutually exclusive — \
+        return Err("--units and --experts are mutually exclusive — \
              use --experts for layer-uniform ranges, --units for fine-grained ownership"
-                .into(),
-        );
+            .into());
     }
     let unit_filter = cli
         .units
@@ -264,7 +262,10 @@ async fn main() -> Result<(), BoxError> {
             u.len(),
             "layer",
             "expert",
-            u.iter().map(|(l, _)| *l).collect::<std::collections::HashSet<_>>().len(),
+            u.iter()
+                .map(|(l, _)| *l)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
         );
     }
     let load_opts = LoadVindexOptions {
@@ -504,10 +505,16 @@ async fn main() -> Result<(), BoxError> {
         let grpc_state = Arc::clone(&state);
         info!("gRPC: listening on {}", grpc_addr);
         tokio::spawn(async move {
-            let vindex_svc = grpc::VindexGrpcService { state: Arc::clone(&grpc_state) };
-            let expert_svc = grpc_expert::ExpertGrpcService { state: Arc::clone(&grpc_state) };
+            let vindex_svc = grpc::VindexGrpcService {
+                state: Arc::clone(&grpc_state),
+            };
+            let expert_svc = grpc_expert::ExpertGrpcService {
+                state: Arc::clone(&grpc_state),
+            };
             if let Err(e) = tonic::transport::Server::builder()
-                .add_service(grpc::proto::vindex_service_server::VindexServiceServer::new(vindex_svc))
+                .add_service(
+                    grpc::proto::vindex_service_server::VindexServiceServer::new(vindex_svc),
+                )
                 .add_service(larql_router_protocol::ExpertServiceServer::new(expert_svc))
                 .serve(grpc_addr)
                 .await

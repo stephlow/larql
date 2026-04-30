@@ -9,11 +9,9 @@
 
 extern crate blas_src;
 
-use larql_compute::prelude::*;
-
 #[path = "common/mod.rs"]
 mod common;
-use common::{get_metal, max_diff};
+use common::max_diff;
 
 // ── rms_norm with offset ──
 

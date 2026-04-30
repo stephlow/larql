@@ -37,10 +37,7 @@ use crate::layer_graph::pipeline_layer::build_pipeline_layers;
 /// token's logit above the intended next-word logit. On Gemma 4 26B-A4B,
 /// `<mask>` (id 4) and the channel/turn markers leak into the answer at
 /// random positions, producing fragments like "The<mask>capital of France".
-fn build_special_suppress_set(
-    tokenizer: &tokenizers::Tokenizer,
-    eos: &EosConfig,
-) -> HashSet<u32> {
+fn build_special_suppress_set(tokenizer: &tokenizers::Tokenizer, eos: &EosConfig) -> HashSet<u32> {
     let mut out = HashSet::new();
     // 1. Anything the tokenizer config explicitly marks as a special added
     //    token (`<bos>`, `<mask>`, `<|tool>`, channel/turn markers, etc.).
@@ -97,7 +94,9 @@ fn build_special_suppress_set(
             let raw = tokenizer.id_to_token(probe).unwrap_or_default();
             let in_set = out.contains(&probe);
             let in_vocab = vocab.contains_key(&raw);
-            eprintln!("[suppress] probe id={probe} raw={raw:?} in_set={in_set} in_vocab={in_vocab}");
+            eprintln!(
+                "[suppress] probe id={probe} raw={raw:?} in_set={in_set} in_vocab={in_vocab}"
+            );
         }
     }
     out
@@ -170,9 +169,7 @@ fn pick_next_filtered(
                 format!("{mark}id={id:6} {score:+.4e} {raw:?}")
             })
             .collect();
-        let max_abs = candidates
-            .iter()
-            .fold(0.0f32, |a, &(_, s)| a.max(s.abs()));
+        let max_abs = candidates.iter().fold(0.0f32, |a, &(_, s)| a.max(s.abs()));
         let nan_count = candidates.iter().filter(|(_, s)| s.is_nan()).count();
         let zero_count = candidates.iter().filter(|(_, s)| *s == 0.0).count();
         let suppressed_in_top16 = candidates
@@ -271,7 +268,9 @@ fn print_run_summary(label: &str, per_token: &[Vec<LayerTiming>]) {
     let avg_server = tot_server / n_tokens as f32;
     let avg_net = (avg_collect - avg_server).max(0.0);
 
-    eprintln!("[moe-timing] {label} SUMMARY ({n_tokens} tokens, {layers_per_tok} MoE layers/token)");
+    eprintln!(
+        "[moe-timing] {label} SUMMARY ({n_tokens} tokens, {layers_per_tok} MoE layers/token)"
+    );
     eprintln!(
         "[moe-timing]   per-token avg: moe_total={avg_total:.1}ms \
          (route+fire={avg_route:.1}ms collect={avg_collect:.1}ms \
@@ -329,8 +328,7 @@ fn moe_call_timed(
         remote.forward_moe_stream_fire(layer, h_post_attn, router, streams, norm_offset, eps)?;
     let route_fire_ms = t_fire.elapsed().as_secs_f32() * 1000.0;
     let t_collect = std::time::Instant::now();
-    let (h2, per_shard) =
-        remote.forward_moe_stream_collect_with_timing(streams, inflight)?;
+    let (h2, per_shard) = remote.forward_moe_stream_collect_with_timing(streams, inflight)?;
     let collect_ms = t_collect.elapsed().as_secs_f32() * 1000.0;
     let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
     timing.push(LayerTiming {
@@ -370,12 +368,12 @@ fn build_router<'a>(
         .unwrap_or(arch_top_k);
     Some(MoeRouterWeights {
         router_proj,
-        router_scale:            sl(arch.moe_router_scale_key(layer)),
+        router_scale: sl(arch.moe_router_scale_key(layer)),
         router_per_expert_scale: sl(arch.moe_router_per_expert_scale_key(layer)),
-        router_norm:             sl(arch.moe_router_norm_key(layer)),
+        router_norm: sl(arch.moe_router_norm_key(layer)),
         router_norm_parameter_free: arch.moe_router_norm_parameter_free(),
         router_input_scalar: arch.moe_router_input_scalar().unwrap_or(1.0),
-        pre_experts_norm:  sl(arch.moe_pre_experts_norm_key(layer)),
+        pre_experts_norm: sl(arch.moe_pre_experts_norm_key(layer)),
         post_experts_norm: sl(arch.moe_post_experts_norm_key(layer)),
         num_experts: arch.num_experts(),
         top_k,
@@ -454,12 +452,11 @@ pub fn generate_with_remote_moe(
     //
     // For HTTP shards, `open_streams` returns an empty vec and we fall back to
     // `forward_moe` (per-layer HTTP calls, as before).
-    let mut streams: Vec<crate::ffn::moe_remote::ShardStream> =
-        if remote.has_grpc_shards() {
-            remote.open_streams().unwrap_or_default()
-        } else {
-            vec![]
-        };
+    let mut streams: Vec<crate::ffn::moe_remote::ShardStream> = if remote.has_grpc_shards() {
+        remote.open_streams().unwrap_or_default()
+    } else {
+        vec![]
+    };
 
     // ── Prefill ───────────────────────────────────────────────────────────────
     //
@@ -500,26 +497,55 @@ pub fn generate_with_remote_moe(
         let mut step_error: Option<RemoteMoeError> = None;
         let mut tok_timings: Vec<LayerTiming> = Vec::new();
         let mut moe_fn = |layer: usize, h_post_attn: &[f32]| -> Vec<f32> {
-            if skip_moe { return vec![0.0f32; hidden]; }
-            if step_error.is_some() { return vec![0.0f32; hidden]; }
+            if skip_moe {
+                return vec![0.0f32; hidden];
+            }
+            if step_error.is_some() {
+                return vec![0.0f32; hidden];
+            }
             let router = match build_router(weights, arch, layer) {
                 Some(r) => r,
                 None => return vec![0.0f32; hidden],
             };
-            let timing_slot = if timing_enabled { Some(&mut tok_timings) } else { None };
+            let timing_slot = if timing_enabled {
+                Some(&mut tok_timings)
+            } else {
+                None
+            };
             match moe_call_timed(
-                remote, layer, h_post_attn, &router, &mut streams, norm_offset, eps, timing_slot,
+                remote,
+                layer,
+                h_post_attn,
+                &router,
+                &mut streams,
+                norm_offset,
+                eps,
+                timing_slot,
             ) {
                 Ok(out) => out,
-                Err(e) => { step_error = Some(e); vec![0.0f32; hidden] }
+                Err(e) => {
+                    step_error = Some(e);
+                    vec![0.0f32; hidden]
+                }
             }
         };
 
         let h = backend.decode_token_with_moe(
-            &layers, &x_tok, hidden, intermediate, q_dim, kv_dim,
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope, &mut moe_fn,
+            &layers,
+            &x_tok,
+            hidden,
+            intermediate,
+            q_dim,
+            kv_dim,
+            weights.num_q_heads,
+            weights.num_kv_heads,
+            weights.head_dim,
+            rope,
+            &mut moe_fn,
         );
-        if let Some(err) = step_error { return Err(err); }
+        if let Some(err) = step_error {
+            return Err(err);
+        }
         last_hidden_vec = h.ok_or_else(|| {
             RemoteMoeError::BadResponse("decode_token_with_moe returned None during prefill".into())
         })?;
@@ -579,18 +605,36 @@ pub fn generate_with_remote_moe(
         let split_enabled = std::env::var("LARQL_MOE_SPLIT").is_ok();
         let result = if streams.is_empty() || !split_enabled {
             let mut moe_fn = |layer: usize, h_post_attn: &[f32]| -> Vec<f32> {
-                if skip_moe { return vec![0.0f32; hidden]; }
-                if step_error.is_some() { return vec![0.0f32; hidden]; }
+                if skip_moe {
+                    return vec![0.0f32; hidden];
+                }
+                if step_error.is_some() {
+                    return vec![0.0f32; hidden];
+                }
                 let router = match build_router(weights, arch, layer) {
                     Some(r) => r,
                     None => return vec![0.0f32; hidden],
                 };
-                let timing_slot = if timing_enabled { Some(&mut tok_timings) } else { None };
+                let timing_slot = if timing_enabled {
+                    Some(&mut tok_timings)
+                } else {
+                    None
+                };
                 match moe_call_timed(
-                    remote, layer, h_post_attn, &router, &mut streams, norm_offset, eps, timing_slot,
+                    remote,
+                    layer,
+                    h_post_attn,
+                    &router,
+                    &mut streams,
+                    norm_offset,
+                    eps,
+                    timing_slot,
                 ) {
                     Ok(out) => out,
-                    Err(e) => { step_error = Some(e); vec![0.0f32; hidden] }
+                    Err(e) => {
+                        step_error = Some(e);
+                        vec![0.0f32; hidden]
+                    }
                 }
             };
             backend.decode_token_with_moe(
@@ -617,23 +661,40 @@ pub fn generate_with_remote_moe(
             let tok_timings_cell: RefCell<Vec<LayerTiming>> = RefCell::new(Vec::new());
 
             let mut fire_fn = |layer: usize, h_post_attn: &[f32]| {
-                if skip_moe { return; }
-                if step_err_cell.borrow().is_some() { return; }
+                if skip_moe {
+                    return;
+                }
+                if step_err_cell.borrow().is_some() {
+                    return;
+                }
                 let router = match build_router(weights, arch, layer) {
                     Some(r) => r,
                     None => return,
                 };
                 let t_start = std::time::Instant::now();
                 match remote.forward_moe_stream_fire(
-                    layer, h_post_attn, &router, &streams, norm_offset, eps,
+                    layer,
+                    h_post_attn,
+                    &router,
+                    &streams,
+                    norm_offset,
+                    eps,
                 ) {
-                    Ok(inf) => { *inflight.borrow_mut() = Some((inf, t_start)); }
-                    Err(e) => { *step_err_cell.borrow_mut() = Some(e); }
+                    Ok(inf) => {
+                        *inflight.borrow_mut() = Some((inf, t_start));
+                    }
+                    Err(e) => {
+                        *step_err_cell.borrow_mut() = Some(e);
+                    }
                 }
             };
             let mut collect_fn = |layer: usize| -> Vec<f32> {
-                if skip_moe { return vec![0.0f32; hidden]; }
-                if step_err_cell.borrow().is_some() { return vec![0.0f32; hidden]; }
+                if skip_moe {
+                    return vec![0.0f32; hidden];
+                }
+                if step_err_cell.borrow().is_some() {
+                    return vec![0.0f32; hidden];
+                }
                 let Some((inf, t_start)) = inflight.borrow_mut().take() else {
                     return vec![0.0f32; hidden];
                 };
@@ -695,17 +756,15 @@ pub fn generate_with_remote_moe(
             let raw_rms = (last_hidden_vec.iter().map(|v| v * v).sum::<f32>()
                 / last_hidden_vec.len() as f32)
                 .sqrt();
-            let normed_rms = (last_hidden.iter().map(|v| v * v).sum::<f32>()
-                / last_hidden.len() as f32)
-                .sqrt();
-            let max_abs = last_hidden
-                .iter()
-                .fold(0.0f32, |a, &b| a.max(b.abs()));
+            let normed_rms =
+                (last_hidden.iter().map(|v| v * v).sum::<f32>() / last_hidden.len() as f32).sqrt();
+            let max_abs = last_hidden.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
             eprintln!(
                 "  [step {step}] h_pre_norm_rms={raw_rms:.5} h_normed_rms={normed_rms:.5} max_abs={max_abs:.5}"
             );
         }
-        let next_id = pick_next_filtered(index, weights, &last_hidden, backend, &suppress, tokenizer);
+        let next_id =
+            pick_next_filtered(index, weights, &last_hidden, backend, &suppress, tokenizer);
 
         let token_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         decode_ms.push(token_wall_ms);
@@ -723,7 +782,10 @@ pub fn generate_with_remote_moe(
         let is_eos = eos.is_eos_with_tokenizer(next_id, &tok_str, tokenizer);
         if debug_ids {
             let raw = tokenizer.id_to_token(next_id).unwrap_or_default();
-            eprintln!("[tok {}] id={next_id:6} raw={raw:?} delta={tok_str:?}", step + 1);
+            eprintln!(
+                "[tok {}] id={next_id:6} raw={raw:?} delta={tok_str:?}",
+                step + 1
+            );
         }
         tokens.push(tok_str);
         current_ids.push(next_id);
@@ -793,7 +855,12 @@ pub fn generate_with_remote_moe_batch(
         larql_compute::QuantFormat::Q4_0
     };
     let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
-        weights, index, 0..num_layers, q4_ffn, q4_ffn_per_matrix, ffn_format,
+        weights,
+        index,
+        0..num_layers,
+        q4_ffn,
+        q4_ffn_per_matrix,
+        ffn_format,
     );
 
     let q_dim = weights.num_q_heads * weights.head_dim;
@@ -819,12 +886,23 @@ pub fn generate_with_remote_moe_batch(
         let mut step_error: Option<RemoteMoeError> = None;
         let mut h_capture: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
         let mut moe_fn_pass1 = |layer: usize, h: &[f32]| -> Vec<f32> {
-            if h_capture.len() == layer { h_capture.push(h.to_vec()); }
+            if h_capture.len() == layer {
+                h_capture.push(h.to_vec());
+            }
             vec![0.0f32; hidden]
         };
         let h = backend.decode_token_with_moe(
-            &layers, &x_tok, hidden, intermediate, q_dim, kv_dim,
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope, &mut moe_fn_pass1,
+            &layers,
+            &x_tok,
+            hidden,
+            intermediate,
+            q_dim,
+            kv_dim,
+            weights.num_q_heads,
+            weights.num_kv_heads,
+            weights.head_dim,
+            rope,
+            &mut moe_fn_pass1,
         );
         // Dispatch captured layers
         let routers: Vec<_> = (0..h_capture.len())
@@ -833,21 +911,36 @@ pub fn generate_with_remote_moe_batch(
         let h2_per_layer = if skip_moe || h_capture.is_empty() {
             vec![vec![0.0f32; hidden]; num_layers]
         } else {
-            remote.forward_moe_predispatch(&h_capture, &routers, norm_offset, eps)
+            remote
+                .forward_moe_predispatch(&h_capture, &routers, norm_offset, eps)
                 .unwrap_or_else(|_| vec![vec![0.0f32; hidden]; num_layers])
         };
         // Pass 2: apply h2
         let mut li2 = 0usize;
         let mut moe_fn_pass2 = |layer: usize, _h: &[f32]| -> Vec<f32> {
             li2 = layer;
-            if layer < h2_per_layer.len() { h2_per_layer[layer].clone() }
-            else { vec![0.0f32; hidden] }
+            if layer < h2_per_layer.len() {
+                h2_per_layer[layer].clone()
+            } else {
+                vec![0.0f32; hidden]
+            }
         };
         let h2 = backend.decode_token_with_moe(
-            &layers, &x_tok, hidden, intermediate, q_dim, kv_dim,
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope, &mut moe_fn_pass2,
+            &layers,
+            &x_tok,
+            hidden,
+            intermediate,
+            q_dim,
+            kv_dim,
+            weights.num_q_heads,
+            weights.num_kv_heads,
+            weights.head_dim,
+            rope,
+            &mut moe_fn_pass2,
         );
-        if let Some(e) = step_error { return Err(e); }
+        if let Some(e) = step_error {
+            return Err(e);
+        }
         last_hidden_vec = h2.or(h).ok_or_else(|| {
             RemoteMoeError::BadResponse("decode returned None during prefill".into())
         })?;
@@ -862,13 +955,23 @@ pub fn generate_with_remote_moe_batch(
     let pfa = ndarray::Array2::from_shape_vec((1, hidden), last_hidden_vec.clone())
         .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
     let pfn = apply_norm(weights, &pfa, arch.final_norm_key(), norm_offset);
-    let first_id = pick_next_filtered(index, weights, &pfn.row(0).to_owned(), backend, &suppress, tokenizer);
+    let first_id = pick_next_filtered(
+        index,
+        weights,
+        &pfn.row(0).to_owned(),
+        backend,
+        &suppress,
+        tokenizer,
+    );
     let first_tok = detok.push(first_id);
     let first_eos = eos.is_eos_with_tokenizer(first_id, &first_tok, tokenizer);
     tokens.push(first_tok);
     current_ids.push(first_id);
     if first_eos || tokens.len() >= max_tokens {
-        return Ok(GridGenerateResult { tokens, decode_ms: vec![0.0] });
+        return Ok(GridGenerateResult {
+            tokens,
+            decode_ms: vec![0.0],
+        });
     }
 
     // Decode loop — two Metal passes per token + ONE batch dispatch.
@@ -881,12 +984,23 @@ pub fn generate_with_remote_moe_batch(
         // ── Pass 1: SKIP_MOE, capture h_post_attn at every MoE layer ───────
         let mut h_capture: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
         let mut moe_pass1 = |layer: usize, h: &[f32]| -> Vec<f32> {
-            if skip_moe || h_capture.len() == layer { h_capture.push(h.to_vec()); }
+            if skip_moe || h_capture.len() == layer {
+                h_capture.push(h.to_vec());
+            }
             vec![0.0f32; hidden]
         };
         backend.decode_token_with_moe(
-            &layers, &x_tok, hidden, intermediate, q_dim, kv_dim,
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope, &mut moe_pass1,
+            &layers,
+            &x_tok,
+            hidden,
+            intermediate,
+            q_dim,
+            kv_dim,
+            weights.num_q_heads,
+            weights.num_kv_heads,
+            weights.head_dim,
+            rope,
+            &mut moe_pass1,
         );
 
         // ── Batch dispatch: ONE call per shard, all 30 layers ───────────────
@@ -904,26 +1018,49 @@ pub fn generate_with_remote_moe_batch(
 
         // ── Pass 2: apply pre-computed h2 ───────────────────────────────────
         let mut moe_pass2 = |layer: usize, _h: &[f32]| -> Vec<f32> {
-            if layer < h2_per_layer.len() { h2_per_layer[layer].clone() }
-            else { vec![0.0f32; hidden] }
+            if layer < h2_per_layer.len() {
+                h2_per_layer[layer].clone()
+            } else {
+                vec![0.0f32; hidden]
+            }
         };
-        let h_out = backend.decode_token_with_moe(
-            &layers, &x_tok, hidden, intermediate, q_dim, kv_dim,
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope, &mut moe_pass2,
-        ).ok_or_else(|| RemoteMoeError::BadResponse("pass2 returned None".into()))?;
+        let h_out = backend
+            .decode_token_with_moe(
+                &layers,
+                &x_tok,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
+                &mut moe_pass2,
+            )
+            .ok_or_else(|| RemoteMoeError::BadResponse("pass2 returned None".into()))?;
 
         // Pick next token.
         let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_out.clone())
             .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
         let h_normed = apply_norm(weights, &h_arr, arch.final_norm_key(), norm_offset);
-        let next_tok_id = pick_next_filtered(index, weights, &h_normed.row(0).to_owned(), backend, &suppress, tokenizer);
+        let next_tok_id = pick_next_filtered(
+            index,
+            weights,
+            &h_normed.row(0).to_owned(),
+            backend,
+            &suppress,
+            tokenizer,
+        );
 
         decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         let tok_str = detok.push(next_tok_id);
         let is_eos = eos.is_eos_with_tokenizer(next_tok_id, &tok_str, tokenizer);
         tokens.push(tok_str);
         current_ids.push(next_tok_id);
-        if is_eos { break; }
+        if is_eos {
+            break;
+        }
     }
 
     Ok(GridGenerateResult { tokens, decode_ms })

@@ -33,8 +33,7 @@ pub fn lm_head_topk(
     // be a GPU command-buffer ordering edge case after the first
     // `decode_token_with_moe` call. Falling back to the CPU/backend
     // gemv path produces correct scores immediately.
-    let all_zero = !hits.is_empty()
-        && hits.iter().all(|(_, s)| *s == 0.0 || s.is_nan());
+    let all_zero = !hits.is_empty() && hits.iter().all(|(_, s)| *s == 0.0 || s.is_nan());
     if !hits.is_empty() && !all_zero {
         return hits;
     }

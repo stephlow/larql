@@ -61,7 +61,8 @@ pub struct GateStore {
     /// when HNSW is enabled.  Used for the per-unit shard architecture
     /// where each shard hosts only its own (layer, expert) units and a
     /// query's KNN search space is bounded by one expert's slice.
-    pub hnsw_unit_cache: Mutex<std::collections::HashMap<(usize, usize), super::super::hnsw::HnswLayer>>,
+    pub hnsw_unit_cache:
+        Mutex<std::collections::HashMap<(usize, usize), super::super::hnsw::HnswLayer>>,
     /// HNSW master toggle.
     pub hnsw_enabled: std::sync::atomic::AtomicBool,
     /// HNSW beam width.

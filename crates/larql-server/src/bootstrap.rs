@@ -64,9 +64,7 @@ impl UnitManifest {
     /// Expand the per-layer range list into the flat `(layer, expert_id)`
     /// set used by ownership checks.  Reports the first malformed entry in
     /// the error path so the operator can fix it without grepping.
-    pub fn into_unit_set(
-        self,
-    ) -> Result<std::collections::HashSet<(usize, usize)>, BoxError> {
+    pub fn into_unit_set(self) -> Result<std::collections::HashSet<(usize, usize)>, BoxError> {
         let mut units = std::collections::HashSet::new();
         for (layer_str, ranges) in self.layer_experts {
             let layer: usize = layer_str.parse().map_err(|_| -> BoxError {
@@ -89,7 +87,9 @@ impl UnitManifest {
 }
 
 /// Parse `--units PATH` into the canonical `(layer, expert_id)` ownership set.
-pub fn parse_unit_manifest(path: &Path) -> Result<std::collections::HashSet<(usize, usize)>, BoxError> {
+pub fn parse_unit_manifest(
+    path: &Path,
+) -> Result<std::collections::HashSet<(usize, usize)>, BoxError> {
     let bytes = std::fs::read(path)
         .map_err(|e| -> BoxError { format!("--units: read {}: {e}", path.display()).into() })?;
     let manifest: UnitManifest = serde_json::from_slice(&bytes)
@@ -344,12 +344,10 @@ mod tests {
         let units = parse_unit_manifest(&path).unwrap();
         // Layer 0: experts 0..=2 → (0,0), (0,1), (0,2)
         // Layer 3: experts 5..=7 + 10 → (3,5), (3,6), (3,7), (3,10)
-        let expected: std::collections::HashSet<(usize, usize)> = [
-            (0, 0), (0, 1), (0, 2),
-            (3, 5), (3, 6), (3, 7), (3, 10),
-        ]
-        .into_iter()
-        .collect();
+        let expected: std::collections::HashSet<(usize, usize)> =
+            [(0, 0), (0, 1), (0, 2), (3, 5), (3, 6), (3, 7), (3, 10)]
+                .into_iter()
+                .collect();
         assert_eq!(units, expected);
     }
 
@@ -376,8 +374,14 @@ mod tests {
         let bogus = PathBuf::from("/nonexistent/larql-units-not-here.json");
         let err = parse_unit_manifest(&bogus).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("read"), "msg should mention read failure: {msg}");
-        assert!(msg.contains(bogus.to_str().unwrap()), "msg should name path: {msg}");
+        assert!(
+            msg.contains("read"),
+            "msg should mention read failure: {msg}"
+        );
+        assert!(
+            msg.contains(bogus.to_str().unwrap()),
+            "msg should name path: {msg}"
+        );
     }
 
     #[test]

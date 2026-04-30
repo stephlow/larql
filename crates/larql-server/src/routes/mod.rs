@@ -13,9 +13,9 @@ pub mod relations;
 pub mod select;
 pub mod stats;
 pub mod stream;
+pub mod topology;
 pub mod walk;
 pub mod walk_ffn;
-pub mod topology;
 pub mod warmup;
 
 use std::sync::Arc;
@@ -89,8 +89,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(EXPERT_TOPOLOGY, get(topology::handle_topology))
         .route(
             EXPERT_BATCH,
-            post(expert::handle_expert_batch)
-                .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
+            post(expert::handle_expert_batch).layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
         )
         .route(EXPERT, post(expert::handle_expert))
         .route(EXPLAIN_INFER, post(explain::handle_explain))

@@ -23,8 +23,7 @@ pub mod write_q4k;
 
 pub use load::{
     find_tokenizer_path, load_model_weights, load_model_weights_q4k, load_model_weights_q4k_shard,
-    load_model_weights_with_opts,
-    LoadWeightsOptions,
+    load_model_weights_with_opts, LoadWeightsOptions,
 };
 pub use manifest::Q4kManifestEntry;
 pub use write_f32::{

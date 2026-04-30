@@ -467,6 +467,9 @@ impl MetalBackend {
             let copy_len = dn_bytes.len().min(down_expert_bytes);
             unsafe {
                 std::ptr::copy_nonoverlapping(dn_bytes.as_ptr(), dn_dst, copy_len);
+                if copy_len < down_expert_bytes {
+                    std::ptr::write_bytes(dn_dst.add(copy_len), 0, down_expert_bytes - copy_len);
+                }
             }
 
             valid_weights.push(expert_weights[k]);
@@ -655,6 +658,9 @@ impl MetalBackend {
             let copy_len = dn_bytes.len().min(down_expert_bytes);
             unsafe {
                 std::ptr::copy_nonoverlapping(dn_bytes.as_ptr(), dn_dst, copy_len);
+                if copy_len < down_expert_bytes {
+                    std::ptr::write_bytes(dn_dst.add(copy_len), 0, down_expert_bytes - copy_len);
+                }
             }
 
             valid_weights.push(expert_weights[k]);

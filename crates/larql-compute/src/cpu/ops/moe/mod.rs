@@ -499,8 +499,6 @@ mod tests {
         let hidden = 4;
         let inter = 2;
         let num_experts = 4;
-        let top_k = 1;
-
         // Build per-expert tables. Each expert's bytes are tagged by a
         // distinct first-byte signature so we can detect mis-indexing.
         let gu_stride = 2 * inter * hidden * 2;

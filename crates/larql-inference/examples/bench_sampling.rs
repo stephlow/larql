@@ -46,7 +46,9 @@ fn bench_sampling(label: &str, vocab: usize, cfg: SamplingConfig) {
 fn bench_topk_path(label: &str, k: usize, cfg: SamplingConfig) {
     // Sparse path: vindex KNN already truncated to k hits.
     let mut rng = StdRng::seed_from_u64(11);
-    let hits: Vec<(u32, f32)> = (0..k).map(|i| (i as u32, rng.gen_range(-10.0..10.0))).collect();
+    let hits: Vec<(u32, f32)> = (0..k)
+        .map(|i| (i as u32, rng.gen_range(-10.0..10.0)))
+        .collect();
     let mut sampler = Sampler::new(cfg);
     for _ in 0..WARMUP {
         let _ = sampler.sample_from_topk(&hits);

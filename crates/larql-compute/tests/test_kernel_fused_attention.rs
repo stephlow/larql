@@ -10,17 +10,17 @@
 
 extern crate blas_src;
 
-use larql_compute::prelude::*;
-
 #[path = "common/mod.rs"]
 mod common;
-use common::{get_metal, max_diff};
+use common::max_diff;
 
 // ── fused_attention correctness (3 tokens, 2 heads, verified against CPU) ──
 
 #[test]
 fn fused_attention_matches_cpu_reference() {
-    let device = metal::Device::system_default().unwrap();
+    let Some(device) = metal::Device::system_default() else {
+        return;
+    };
     let src = larql_compute::metal::shaders::all_shaders();
     let lib = device
         .new_library_with_source(&src, &metal::CompileOptions::new())
@@ -203,7 +203,9 @@ fn fused_attention_matches_cpu_reference() {
 /// catches it within seconds, no Gemma 4 vindex required.
 #[test]
 fn fused_attention_head_dim_512() {
-    let device = metal::Device::system_default().unwrap();
+    let Some(device) = metal::Device::system_default() else {
+        return;
+    };
     let src = larql_compute::metal::shaders::all_shaders();
     let lib = device
         .new_library_with_source(&src, &metal::CompileOptions::new())

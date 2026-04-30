@@ -44,6 +44,49 @@ fn test_duplicate_skipped() {
 }
 
 #[test]
+fn test_try_add_edge_reports_duplicate() {
+    let mut g = Graph::new();
+    assert_eq!(
+        g.try_add_edge(Edge::new("France", "capital-of", "Paris").with_confidence(0.89)),
+        EdgeInsertResult::Inserted
+    );
+    assert_eq!(
+        g.try_add_edge(Edge::new("France", "capital-of", "Paris").with_confidence(0.50)),
+        EdgeInsertResult::Duplicate
+    );
+
+    assert_eq!(g.edge_count(), 1);
+    assert!((g.edges()[0].confidence - 0.89).abs() < f64::EPSILON);
+}
+
+#[test]
+fn test_insert_edge_replaces_changed_payload() {
+    let mut g = Graph::new();
+    let original = Edge::new("France", "capital-of", "Paris")
+        .with_confidence(0.89)
+        .with_source(SourceType::Parametric);
+
+    assert_eq!(g.insert_edge(original.clone()), EdgeInsertResult::Inserted);
+    assert_eq!(g.insert_edge(original), EdgeInsertResult::Duplicate);
+    assert_eq!(
+        g.insert_edge(
+            Edge::new("France", "capital-of", "Paris")
+                .with_confidence(0.95)
+                .with_source(SourceType::Wikidata),
+        ),
+        EdgeInsertResult::Replaced
+    );
+
+    let edge = g.get_edge("France", "capital-of", "Paris").unwrap();
+    assert_eq!(g.edge_count(), 1);
+    assert!((edge.confidence - 0.95).abs() < f64::EPSILON);
+    assert_eq!(edge.source, SourceType::Wikidata);
+    assert!(g.exists("France", "capital-of", "Paris"));
+    assert_eq!(g.select("France", Some("capital-of")).len(), 1);
+    assert_eq!(g.select_reverse("Paris", Some("capital-of")).len(), 1);
+}
+
+#[test]
 fn test_same_subject_relation_different_object() {
     let mut g = Graph::new();
     g.add_edge(Edge::new("France", "language-of", "French"));
@@ -186,6 +229,28 @@ fn test_get_edge_exact_triple() {
     assert!((edge.confidence - 0.89).abs() < 0.001);
     assert!(g.get_edge("France", "capital-of", "Berlin").is_none());
     assert!(g.get_edge("France", "currency", "Paris").is_none());
+}
+
+#[test]
+fn test_multiedge_lookup_helpers() {
+    let mut g = Graph::new();
+    g.add_edge(Edge::new("A", "friend-of", "B"));
+    g.add_edge(Edge::new("A", "works-with", "B"));
+    g.add_edge(Edge::new("A", "friend-of", "C"));
+    g.add_edge(Edge::new("C", "located-near", "B"));
+
+    let between = g.edges_between("A", "B");
+    let relations: Vec<_> = between.iter().map(|e| e.relation.as_str()).collect();
+    assert_eq!(relations, vec!["friend-of", "works-with"]);
+
+    assert_eq!(g.outgoing_relations("A"), vec!["friend-of", "works-with"]);
+    assert_eq!(
+        g.incoming_relations("B"),
+        vec!["friend-of", "located-near", "works-with"]
+    );
+    assert!(g.edges_between("B", "A").is_empty());
+    assert!(g.outgoing_relations("missing").is_empty());
+    assert!(g.incoming_relations("missing").is_empty());
 }
 
 #[test]

@@ -287,7 +287,10 @@ impl Shard {
                     url: grpc_endpoint,
                     cause: e.to_string(),
                 })?;
-            ShardTransport::Grpc(std::sync::Arc::new(GrpcState { runtime: rt, client }))
+            ShardTransport::Grpc(std::sync::Arc::new(GrpcState {
+                runtime: rt,
+                client,
+            }))
         } else {
             let http = reqwest::blocking::Client::builder()
                 .timeout(config.timeout)
@@ -355,8 +358,9 @@ impl Shard {
                 let mut client = grpc.client.clone();
 
                 // Work channel: Metal thread → async task (non-blocking send)
-                let (work_tx, mut work_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<larql_router_protocol::ExpertLayerInput>();
+                let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel::<
+                    larql_router_protocol::ExpertLayerInput,
+                >();
 
                 // Result channel: async task → Metal thread (condvar recv).
                 // The f32 carries `compute_ms` from the server (0.0 when the
@@ -369,8 +373,9 @@ impl Shard {
                 // This is the ONLY block_on — one-time stream setup, not per-layer.
                 rt.block_on(async {
                     // Channel for feeding the gRPC request stream.
-                    let (grpc_input_tx, mut grpc_input_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<larql_router_protocol::ExpertLayerInput>();
+                    let (grpc_input_tx, mut grpc_input_rx) = tokio::sync::mpsc::unbounded_channel::<
+                        larql_router_protocol::ExpertLayerInput,
+                    >();
 
                     let req_stream = async_stream::stream! {
                         while let Some(msg) = grpc_input_rx.recv().await { yield msg; }
@@ -389,14 +394,17 @@ impl Shard {
                         use futures::StreamExt;
                         while let Some(input) = work_rx.recv().await {
                             // Forward input to gRPC stream.
-                            if grpc_input_tx.send(input).is_err() { break; }
+                            if grpc_input_tx.send(input).is_err() {
+                                break;
+                            }
                             // Await server response (pure async, no block_on).
                             let result = match grpc_output.next().await {
                                 Some(Ok(out)) => {
                                     if out.h2.len() % 4 != 0 {
                                         Err(RemoteMoeError::BadResponse("h2 unaligned".into()))
                                     } else {
-                                        let h2: Vec<f32> = out.h2
+                                        let h2: Vec<f32> = out
+                                            .h2
                                             .chunks_exact(4)
                                             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                                             .collect();
@@ -410,14 +418,20 @@ impl Shard {
                                 None => Err(RemoteMoeError::BadResponse("stream ended".into())),
                             };
                             // Wake the Metal thread via condvar (much cheaper than block_on).
-                            if result_tx.send(result).is_err() { break; }
+                            if result_tx.send(result).is_err() {
+                                break;
+                            }
                         }
                     });
 
                     Ok::<(), RemoteMoeError>(())
                 })?;
 
-                Ok(ShardStream { work_tx, result_rx, _runtime: rt })
+                Ok(ShardStream {
+                    work_tx,
+                    result_rx,
+                    _runtime: rt,
+                })
             }
             ShardTransport::Http(_) => Err(RemoteMoeError::Client(
                 "open_stream requires grpc:// shards".into(),
@@ -441,11 +455,7 @@ impl Shard {
                     .map(|r| larql_router_protocol::ExpertBatchItem {
                         layer: r.layer as u32,
                         expert_id: r.expert_id as u32,
-                        residual: r
-                            .residual
-                            .iter()
-                            .flat_map(|v| v.to_le_bytes())
-                            .collect(),
+                        residual: r.residual.iter().flat_map(|v| v.to_le_bytes()).collect(),
                     })
                     .collect();
 
@@ -453,7 +463,8 @@ impl Shard {
                 // Block on the async gRPC call from this sync context.
                 let mut client = grpc.client.clone();
                 let t_call = std::time::Instant::now();
-                let resp = grpc.runtime
+                let resp = grpc
+                    .runtime
                     .block_on(client.expert_batch(tonic::Request::new(grpc_req)))
                     .map_err(|e| RemoteMoeError::ServerError {
                         status: e.code() as u16,
@@ -461,8 +472,11 @@ impl Shard {
                     })?
                     .into_inner();
 
-                eprintln!("[call_batch/grpc] n={} block_on={:.1}ms", requests.len(),
-                    t_call.elapsed().as_secs_f64()*1000.0);
+                eprintln!(
+                    "[call_batch/grpc] n={} block_on={:.1}ms",
+                    requests.len(),
+                    t_call.elapsed().as_secs_f64() * 1000.0
+                );
                 // Decode proto results back to ExpertResultItem.
                 resp.results
                     .into_iter()
@@ -570,7 +584,11 @@ pub fn decode_expert_response(bytes: &[u8]) -> Option<Vec<ExpertResultItem>> {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         pos += hidden * 4;
-        results.push(ExpertResultItem { layer, expert_id, output });
+        results.push(ExpertResultItem {
+            layer,
+            expert_id,
+            output,
+        });
     }
     Some(results)
 }
@@ -597,7 +615,11 @@ pub fn decode_expert_request(bytes: &[u8]) -> Option<Vec<ExpertCallItem>> {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         pos += hidden * 4;
-        items.push(ExpertCallItem { layer, expert_id, residual });
+        items.push(ExpertCallItem {
+            layer,
+            expert_id,
+            residual,
+        });
     }
     Some(items)
 }
@@ -1090,10 +1112,7 @@ impl RemoteMoeBackend {
     ///   ```
     pub fn open_streams(&self) -> Result<Vec<ShardStream>, RemoteMoeError> {
         let shards = self.shards.read().unwrap();
-        shards
-            .iter()
-            .map(|shard| shard.open_stream())
-            .collect()
+        shards.iter().map(|shard| shard.open_stream()).collect()
     }
 
     /// Run one MoE layer via the already-open per-shard streams.
@@ -1290,12 +1309,10 @@ impl RemoteMoeBackend {
         let shards = self.shards.read().unwrap();
         let num_shards = shards.len();
         // shard_items[si] = Vec<(layer, expert_id, residual_bytes, weight)>
-        let mut shard_items: Vec<Vec<(usize, usize, Vec<u8>, f32)>> =
-            vec![Vec::new(); num_shards];
+        let mut shard_items: Vec<Vec<(usize, usize, Vec<u8>, f32)>> = vec![Vec::new(); num_shards];
 
         for (l, (h, router)) in h_per_layer.iter().zip(routers.iter()).enumerate() {
-            let residual_bytes: Vec<u8> =
-                h.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let residual_bytes: Vec<u8> = h.iter().flat_map(|v| v.to_le_bytes()).collect();
             let (_, expert_indices, expert_weights) = router.route(h, norm_offset, eps);
             for (&eid, &w) in expert_indices.iter().zip(expert_weights.iter()) {
                 let si = shards
@@ -1310,41 +1327,42 @@ impl RemoteMoeBackend {
 
         // 2. Fire ONE call per shard in parallel (rayon), collect raw outputs.
         //    Each item: (layer, expert_id, h2_contribution).
-        let shard_results: Vec<Result<Vec<(usize, usize, Vec<f32>)>, RemoteMoeError>> =
-            shard_items
-                .par_iter()
-                .map(|items| {
-                    if items.is_empty() {
-                        return Ok(vec![]);
-                    }
-                    let calls: Vec<ExpertCallItem> = items
-                        .iter()
-                        .map(|(layer, eid, res, _w)| ExpertCallItem {
-                            layer: *layer,
-                            expert_id: *eid,
-                            residual: res
-                                .chunks_exact(4)
-                                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                                .collect(),
-                        })
-                        .collect();
-                    let shards_g = self.shards.read().unwrap();
-                    // `items` is a per-shard bucket built above; every entry
-                    // here belongs to the same shard, so picking shard from
-                    // the first item's (layer, expert_id) is correct.
-                    let (first_layer, first_eid) = (items[0].0, items[0].1);
-                    let si = shards_g
-                        .iter()
-                        .position(|s| s.owns_unit(first_layer, first_eid))
-                        .ok_or(RemoteMoeError::NoShard { expert_id: first_eid })?;
-                    let raw = shards_g[si].call_batch(&calls)?;
-                    Ok(items
-                        .iter()
-                        .zip(raw.iter())
-                        .map(|((layer, eid, _, _), r)| (*layer, *eid, r.output.clone()))
-                        .collect())
-                })
-                .collect();
+        let shard_results: Vec<Result<Vec<(usize, usize, Vec<f32>)>, RemoteMoeError>> = shard_items
+            .par_iter()
+            .map(|items| {
+                if items.is_empty() {
+                    return Ok(vec![]);
+                }
+                let calls: Vec<ExpertCallItem> = items
+                    .iter()
+                    .map(|(layer, eid, res, _w)| ExpertCallItem {
+                        layer: *layer,
+                        expert_id: *eid,
+                        residual: res
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                            .collect(),
+                    })
+                    .collect();
+                let shards_g = self.shards.read().unwrap();
+                // `items` is a per-shard bucket built above; every entry
+                // here belongs to the same shard, so picking shard from
+                // the first item's (layer, expert_id) is correct.
+                let (first_layer, first_eid) = (items[0].0, items[0].1);
+                let si = shards_g
+                    .iter()
+                    .position(|s| s.owns_unit(first_layer, first_eid))
+                    .ok_or(RemoteMoeError::NoShard {
+                        expert_id: first_eid,
+                    })?;
+                let raw = shards_g[si].call_batch(&calls)?;
+                Ok(items
+                    .iter()
+                    .zip(raw.iter())
+                    .map(|((layer, eid, _, _), r)| (*layer, *eid, r.output.clone()))
+                    .collect())
+            })
+            .collect();
         let t_dispatch = t0.elapsed().as_secs_f64() * 1000.0;
 
         // 3. Accumulate weighted outputs per layer.
@@ -1363,9 +1381,13 @@ impl RemoteMoeBackend {
         }
 
         let t_accum = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[predispatch] route={:.1}ms dispatch={:.1}ms accum={:.1}ms  items/shard={:?}",
-            t_route, t_dispatch - t_route, t_accum - t_dispatch,
-            shard_items.iter().map(|v| v.len()).collect::<Vec<_>>());
+        eprintln!(
+            "[predispatch] route={:.1}ms dispatch={:.1}ms accum={:.1}ms  items/shard={:?}",
+            t_route,
+            t_dispatch - t_route,
+            t_accum - t_dispatch,
+            shard_items.iter().map(|v| v.len()).collect::<Vec<_>>()
+        );
 
         // Apply post-experts norm per layer.
         for (l, h2) in h2_per_layer.iter_mut().enumerate() {
@@ -1450,7 +1472,9 @@ impl ShardStream {
     pub fn collect_with_timing(&self) -> Result<(Vec<f32>, f32), RemoteMoeError> {
         self.result_rx
             .recv()
-            .unwrap_or(Err(RemoteMoeError::BadResponse("shard result channel closed".into())))
+            .unwrap_or(Err(RemoteMoeError::BadResponse(
+                "shard result channel closed".into(),
+            )))
     }
 
     /// Convenience: fire then collect.
@@ -1573,7 +1597,7 @@ mod tests {
             assert!(a_units.contains(&(l, e)), "shard A missing ({l},{e})");
         }
         assert_eq!(a.start, 0); // min expert id across set
-        assert_eq!(a.end, 7);   // max expert id across set
+        assert_eq!(a.end, 7); // max expert id across set
 
         // Shard B: 7 pairs (note the singleton range [15,15]).
         let b_units = configs[1].unit_set.as_ref().unwrap();
@@ -1607,8 +1631,14 @@ mod tests {
         let bogus = std::path::PathBuf::from("/nonexistent/larql-units-x.json");
         let err = parse_unit_manifest(&bogus).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("read"), "msg should mention read failure: {msg}");
-        assert!(msg.contains(bogus.to_str().unwrap()), "msg should name path: {msg}");
+        assert!(
+            msg.contains("read"),
+            "msg should mention read failure: {msg}"
+        );
+        assert!(
+            msg.contains(bogus.to_str().unwrap()),
+            "msg should name path: {msg}"
+        );
     }
 
     #[test]

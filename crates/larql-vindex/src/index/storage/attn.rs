@@ -271,7 +271,8 @@ mod tests {
         ]);
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
-        idx.load_attn_q4k(tmp.path()).expect("clean stride must load");
+        idx.load_attn_q4k(tmp.path())
+            .expect("clean stride must load");
     }
 
     /// Regression: an attn_weights_q4k.bin written with the legacy
@@ -334,9 +335,7 @@ mod tests {
     /// silent-drift class of bug.
     #[test]
     fn load_attn_q4k_validates_q6k_v_projection() {
-        use larql_models::quant::ggml::{
-            K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
-        };
+        use larql_models::quant::ggml::{K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES};
         let q4k_len = 1024 * (2560 / K_QUANT_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES; // K proj: 1024 × 1440
         let q6k_len = 1024 * (2560 / K_QUANT_BLOCK_ELEMS) * Q6_K_BLOCK_BYTES; // V proj: 1024 × 2100
         let total = q4k_len + q6k_len;

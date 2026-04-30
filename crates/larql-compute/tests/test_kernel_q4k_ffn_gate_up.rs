@@ -150,6 +150,14 @@ fn q4k_ffn_gate_up_gemma3_4b() {
 }
 
 #[test]
+fn q4k_ffn_gate_up_gemma4_26b_a4b_moe_shape() {
+    // Gemma 4 26B-A4B MoE expert shape: hidden=2816, inter=704.
+    // Pins the primitive suspected by the Metal MoE dispatch bug before
+    // exercising the larger multi-expert dispatch chain.
+    assert_q4k_ffn_gate_up_matches_per_matrix("gemma4-26b-a4b moe", 704, 2816);
+}
+
+#[test]
 fn q4k_ffn_gate_up_max_k_boundary_4096() {
     // Right at the shader's Q4K_GU_MAX_K=4096 shared-memory cap. Should
     // pass — the threadgroup tile fits exactly. Anything past this is

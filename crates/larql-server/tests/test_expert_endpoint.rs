@@ -656,8 +656,7 @@ async fn expert_filter_rejects_at_upper_bound() {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use larql_server::{
-        cache::DescribeCache, routes::single_model_router, session::SessionManager,
-        state::AppState,
+        cache::DescribeCache, routes::single_model_router, session::SessionManager, state::AppState,
     };
     use std::sync::atomic::AtomicU64;
     use tower::ServiceExt as _;
@@ -680,11 +679,7 @@ async fn expert_filter_rejects_at_upper_bound() {
     });
     let app = single_model_router(state);
 
-    async fn call(
-        app: axum::Router,
-        h: &[f32],
-        id: usize,
-    ) -> (StatusCode, String) {
+    async fn call(app: axum::Router, h: &[f32], id: usize) -> (StatusCode, String) {
         let body_str = serde_json::json!({ "residual": h }).to_string();
         let resp = app
             .oneshot(

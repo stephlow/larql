@@ -650,7 +650,10 @@ mod tests {
 
         let mut index = VectorIndex::empty(1, 0);
         index.load_lm_head_q4(tmp.path()).unwrap();
-        assert_eq!(index.vocab_size, 0, "no inference possible without hidden_size");
+        assert_eq!(
+            index.vocab_size, 0,
+            "no inference possible without hidden_size"
+        );
     }
 
     /// Regression test for the gemma3-4b-v2 garbage-output bug (2026-04-27):
@@ -708,7 +711,11 @@ mod tests {
 
         // f32 reference: dot product of `query` against every row of `lm_head`.
         let ref_scores: Vec<f32> = (0..vocab)
-            .map(|v| (0..hidden).map(|h| lm_head[v * hidden + h] * query[h]).sum())
+            .map(|v| {
+                (0..hidden)
+                    .map(|h| lm_head[v * hidden + h] * query[h])
+                    .sum()
+            })
             .collect();
         let ref_top1 = ref_scores
             .iter()

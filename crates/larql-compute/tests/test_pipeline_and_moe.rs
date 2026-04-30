@@ -39,8 +39,26 @@ fn bf16_fill(len: usize, val: f32) -> Vec<u8> {
     v
 }
 
+fn bf16_expert_tables<'a>(
+    gate_up: &'a [u8],
+    down: &'a [u8],
+    num_experts: usize,
+    inter: usize,
+    hidden: usize,
+) -> (Vec<&'a [u8]>, Vec<&'a [u8]>) {
+    let gu_stride = 2 * inter * hidden * 2;
+    let dn_stride = hidden * inter * 2;
+    let experts_gate_up = (0..num_experts)
+        .map(|e| &gate_up[e * gu_stride..(e + 1) * gu_stride])
+        .collect();
+    let experts_down = (0..num_experts)
+        .map(|e| &down[e * dn_stride..(e + 1) * dn_stride])
+        .collect();
+    (experts_gate_up, experts_down)
+}
+
 fn make_moe_weights<'a>(
-    _hidden: usize,
+    hidden: usize,
     inter: usize,
     num_experts: usize,
     top_k: usize,
@@ -50,9 +68,11 @@ fn make_moe_weights<'a>(
     router_norm: &'a [f32],
     router_norm_parameter_free: bool,
 ) -> MoeLayerWeights<'a> {
+    let (experts_gate_up, experts_down) =
+        bf16_expert_tables(gate_up, down, num_experts, inter, hidden);
     MoeLayerWeights {
-        experts_gate_up: gate_up,
-        experts_down: down,
+        experts_gate_up,
+        experts_down,
         router_proj: router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -146,11 +166,13 @@ fn moe_per_expert_scale_applied() {
         .map(|i| if i < hidden { 1.0 } else { 0.0 })
         .collect();
     let h = vec![1.0f32; hidden];
+    let (experts_gate_up, experts_down) =
+        bf16_expert_tables(&gate_up, &down, num_experts, inter, hidden);
 
     // Without per-expert scale
     let moe_no_scale = MoeLayerWeights {
-        experts_gate_up: &gate_up,
-        experts_down: &down,
+        experts_gate_up: experts_gate_up.clone(),
+        experts_down: experts_down.clone(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -171,8 +193,8 @@ fn moe_per_expert_scale_applied() {
     // With per-expert scale = [2.0, 1.0, 1.0, 1.0] (expert 0 gets 2× weight)
     let per_expert_scale = vec![2.0f32, 1.0, 1.0, 1.0];
     let moe_scaled = MoeLayerWeights {
-        experts_gate_up: &gate_up,
-        experts_down: &down,
+        experts_gate_up,
+        experts_down,
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &per_expert_scale,
@@ -219,10 +241,12 @@ fn moe_router_scale_vector_applied() {
         .collect();
     let router_scale = vec![1.0f32; hidden]; // scale each hidden dim by 1 (neutral)
     let h = vec![1.0f32; hidden];
+    let (experts_gate_up, experts_down) =
+        bf16_expert_tables(&gate_up, &down, num_experts, inter, hidden);
 
     let moe = MoeLayerWeights {
-        experts_gate_up: &gate_up,
-        experts_down: &down,
+        experts_gate_up,
+        experts_down,
         router_proj: &router,
         router_scale: &router_scale, // non-empty → enters the scale branch
         router_per_expert_scale: &[],
@@ -256,11 +280,13 @@ fn moe_router_input_scalar_nonunit() {
         .map(|i| if i < hidden { 1.0 } else { 0.0 })
         .collect();
     let h = vec![1.0f32; hidden];
+    let (experts_gate_up, experts_down) =
+        bf16_expert_tables(&gate_up, &down, num_experts, inter, hidden);
 
     // scalar = 0.5 → router input scaled down before projection
     let moe_scalar = MoeLayerWeights {
-        experts_gate_up: &gate_up,
-        experts_down: &down,
+        experts_gate_up,
+        experts_down,
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -284,8 +310,8 @@ fn moe_router_input_scalar_nonunit() {
 fn moe_empty_router_proj_returns_zeros() {
     let hidden = 8;
     let moe = MoeLayerWeights {
-        experts_gate_up: &[],
-        experts_down: &[],
+        experts_gate_up: Vec::new(),
+        experts_down: Vec::new(),
         router_proj: &[], // empty → early return
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -315,8 +341,8 @@ fn moe_zero_num_experts_returns_zeros() {
     // Exercises the num_experts == 0 early-return in forward.rs line 41.
     let hidden = 8;
     let moe = MoeLayerWeights {
-        experts_gate_up: &[],
-        experts_down: &[],
+        experts_gate_up: Vec::new(),
+        experts_down: Vec::new(),
         router_proj: &[1.0f32], // non-empty so we don't hit that guard
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -350,10 +376,12 @@ fn moe_gelu_tanh_activation_in_forward() {
     let router: Vec<f32> = (0..num_experts * hidden)
         .map(|i| if i < hidden { 1.0 } else { 0.0 })
         .collect();
+    let (experts_gate_up, experts_down) =
+        bf16_expert_tables(&gate_up, &down, num_experts, inter, hidden);
 
     let moe = MoeLayerWeights {
-        experts_gate_up: &gate_up,
-        experts_down: &down,
+        experts_gate_up,
+        experts_down,
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -457,8 +485,8 @@ mod moe_prefill_integration {
         // num_experts=0 → cpu_moe_forward returns zeros immediately.
         // Sufficient to exercise the callback path without real expert weights.
         MoeLayerWeights {
-            experts_gate_up: &[],
-            experts_down: &[],
+            experts_gate_up: Vec::new(),
+            experts_down: Vec::new(),
             router_proj: &[],
             router_scale: &[],
             router_per_expert_scale: &[],

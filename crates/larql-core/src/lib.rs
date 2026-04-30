@@ -6,7 +6,7 @@ pub mod io;
 // Re-export the essential types at crate root.
 pub use core::edge::Edge;
 pub use core::enums::{MergeStrategy, SourceType};
-pub use core::graph::Graph;
+pub use core::graph::{EdgeInsertResult, Graph};
 pub use core::schema::Schema;
 
 pub use engine::bfs::{extract_bfs, BfsCallbacks, BfsConfig, BfsResult};

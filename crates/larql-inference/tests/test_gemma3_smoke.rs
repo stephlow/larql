@@ -46,9 +46,9 @@ fn first_token_matches_expected_surface() {
     let strict = std::env::var(ENV_CI_INTEGRATION).is_ok();
     let vindex_path = match std::env::var(ENV_VINDEX_PATH) {
         Ok(p) => p,
-        Err(_) if strict => panic!(
-            "{ENV_CI_INTEGRATION}=1 set but {ENV_VINDEX_PATH} not — cannot run smoke test"
-        ),
+        Err(_) if strict => {
+            panic!("{ENV_CI_INTEGRATION}=1 set but {ENV_VINDEX_PATH} not — cannot run smoke test")
+        }
         Err(_) => return,
     };
     let prompt = std::env::var(ENV_PROMPT).unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
@@ -58,8 +58,8 @@ fn first_token_matches_expected_surface() {
     let path = std::path::Path::new(&vindex_path);
     let index = open_inference_vindex(path).expect("failed to open vindex for inference");
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut weights = larql_vindex::load_model_weights_q4k(path, &mut cb)
-        .expect("failed to load weights");
+    let mut weights =
+        larql_vindex::load_model_weights_q4k(path, &mut cb).expect("failed to load weights");
     let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer load");
 
     let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &prompt)

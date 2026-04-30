@@ -61,7 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = open_inference_vindex(&vindex_path)?;
 
     let gpu_be = default_backend();
-    let encoding = tokenizer.encode(prompt.as_str(), true).map_err(|e| format!("{e}"))?;
+    let encoding = tokenizer
+        .encode(prompt.as_str(), true)
+        .map_err(|e| format!("{e}"))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
     let cache = {

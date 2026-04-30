@@ -154,9 +154,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: bench_expert_server <vindex_path> [--ffn-only] [--two-shard]");
         eprintln!("  Example:");
-        eprintln!(
-            "    cargo run --release -p larql-server --example bench_expert_server -- \\"
-        );
+        eprintln!("    cargo run --release -p larql-server --example bench_expert_server -- \\");
         eprintln!("      output/gemma4-26b-a4b-q4k.vindex");
         std::process::exit(1);
     }
@@ -167,8 +165,14 @@ fn main() {
     println!("LARQL Expert Server Benchmark");
     println!("══════════════════════════════");
     println!("Vindex:    {}", vindex_path.display());
-    println!("Mode:      {}", if ffn_only { "--ffn-only" } else { "full" });
-    println!("Shards:    {}", if two_shard { "2 (in-process)" } else { "1" });
+    println!(
+        "Mode:      {}",
+        if ffn_only { "--ffn-only" } else { "full" }
+    );
+    println!(
+        "Shards:    {}",
+        if two_shard { "2 (in-process)" } else { "1" }
+    );
     println!();
 
     let started = Instant::now();
@@ -193,9 +197,8 @@ fn main() {
     };
 
     let path_str = args[1].clone();
-    let (model_a, load_a_ms) = time_ms(|| {
-        load_single_vindex(&path_str, opts_a).expect("load vindex")
-    });
+    let (model_a, load_a_ms) =
+        time_ms(|| load_single_vindex(&path_str, opts_a).expect("load vindex"));
     let after_load_a = checkpoint("after vindex load (shard A)", started, baseline);
     println!("  Shard A load: {:.0} ms", load_a_ms);
 
@@ -411,7 +414,8 @@ fn main() {
 
     let url_a = runtime.block_on(spawn_server(model_a));
     println!();
-    println!("Shard A:  {url_a}  experts={}",
+    println!(
+        "Shard A:  {url_a}  experts={}",
         if two_shard {
             format!("0..{}", mid - 1)
         } else {

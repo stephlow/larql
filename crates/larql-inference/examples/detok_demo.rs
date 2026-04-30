@@ -98,8 +98,5 @@ fn main() {
         print!("{}", detok.push(*id));
     }
     println!("\"");
-    println!(
-        "  full cumulative:  \"{}\"",
-        detok.cumulative()
-    );
+    println!("  full cumulative:  \"{}\"", detok.cumulative());
 }

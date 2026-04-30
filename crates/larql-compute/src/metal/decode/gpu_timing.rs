@@ -28,6 +28,7 @@ use objc::{msg_send, sel, sel_impl};
 /// Subtract for the GPU-side wall window. Caller MUST have already
 /// called `wait_until_completed` on the buffer; values for an
 /// in-flight buffer are undefined.
+#[allow(unexpected_cfgs)]
 pub fn gpu_window_seconds(cmd: &CommandBufferRef) -> (f64, f64) {
     unsafe {
         let start: f64 = msg_send![cmd, GPUStartTime];
@@ -50,6 +51,7 @@ pub enum DecodeStage {
     /// Dense FFN: post-attn residual+norm → gate, up, GELU, down → post-FFN residual.
     DenseFfn,
     /// Final norm + lm_head (only if recorded; many decode paths run it on CPU).
+    #[allow(dead_code)]
     Final,
     /// Anything else / unlabeled.
     Other,
