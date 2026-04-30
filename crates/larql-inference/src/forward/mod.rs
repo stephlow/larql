@@ -54,7 +54,7 @@ pub use infer_patched::{
     InferPatchedResult, KnnOverride, KNN_COSINE_THRESHOLD,
 };
 pub use kv_generate::{
-    generate_cached, generate_cached_backend, generate_cached_constrained,
+    generate_cached, generate_cached_backend, generate_cached_constrained, generate_cached_hooked,
     generate_cached_with_window,
 };
 pub use layer::{

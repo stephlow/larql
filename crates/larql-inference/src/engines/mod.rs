@@ -11,7 +11,12 @@
 pub mod accuracy;
 pub mod kv_engines;
 pub mod profiler;
-#[cfg(test)]
+/// Synthetic-weight fixtures (`make_test_weights`, `make_test_vindex`,
+/// `make_test_tokenizer`, `TestFixtures`). Used by unit tests, integration
+/// tests, and the `mech_interp_demo` example so they don't need a vindex
+/// on disk. Released as part of the public API because mech-interp tooling
+/// downstream of this crate (chuk-mcp-lazarus and similar) wants the same
+/// fixtures for self-contained regression tests.
 pub mod test_utils;
 
 // Convenience re-exports so existing `engines::markov_residual::*` paths keep working.

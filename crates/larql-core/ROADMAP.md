@@ -26,15 +26,16 @@ engine.
 
 ## P0 - Correctness and robustness
 
-These are review findings that should be fixed before growing the crate surface.
+Status: shipped. Keep this section as a record of the hardening pass and the
+regressions now covered by tests.
 
-| Item | Area | Detail |
+| Item | Area | Status |
 |---|---|---|
-| Store exact path edges in shortest path | `algo::shortest_path` | `prev` currently records only the previous node. Path reconstruction then picks the first `prev -> current` edge, so multiedges with different relations or confidences can return a path that does not match the computed cost. Store the chosen edge or edge index alongside the predecessor. |
-| Harden packed binary decoding | `io::packed` | `from_packed_bytes` trusts header offsets, record counts, string indexes, and slice ranges. Malformed `.larql.pak` input should return `GraphError::Deserialize`, not panic. Add checked arithmetic, range validation, string index validation, and corrupt-file tests. |
-| Replace ad hoc CSV parsing/writing | `io::csv` | The current `splitn(5, ',')` parser and raw comma writer corrupt quoted fields, commas, and newlines. Use the `csv` crate or rename/document this as a simple debug format. Preserve confidence/source roundtrips. |
-| Diff all edge attributes | `algo::diff` | Docs mention metadata changes, but implementation only compares confidence. Include `source`, `metadata`, and `injection`, or narrow the docs and type names to confidence-only diffing. |
-| Clarify traversal edge semantics | `algo::traversal` | BFS/DFS push outgoing edges even when `max_depth` prevents visiting the target node. Decide whether `TraversalResult.edges` means observed outgoing edges or actually traversed edges, then align implementation and tests. |
+| Store exact path edges in shortest path | `algo::shortest_path` | Done. Dijkstra/A* predecessor state now stores the selected edge, so multiedge paths and costs agree. |
+| Harden packed binary decoding | `io::packed` | Done. Decoder validates flags, offsets, record bounds, string indexes, checked arithmetic, and metadata ranges. |
+| Replace ad hoc CSV parsing/writing | `io::csv` | Done. CSV supports quoted commas, escaped quotes, CRLF/LF records, and multiline quoted fields. |
+| Diff all edge attributes | `algo::diff` | Done. Same-triple changes now include confidence, source, metadata, and injection. |
+| Clarify traversal edge semantics | `algo::traversal` | Done. `TraversalResult.edges` means edges actually traversed to newly discovered nodes. |
 
 ---
 
@@ -87,17 +88,16 @@ These are review findings that should be fixed before growing the crate surface.
 
 ---
 
-## Test gaps to add with the P0 fixes
+## P0 regression coverage
 
 - Shortest path with two `A -> B` edges where the cheaper edge is not the first
-  inserted edge; assert returned path edge and cost agree.
+  inserted edge; returned path edge and cost must agree.
 - Packed files with invalid `string_table_offset`, truncated edge records,
-  out-of-range string indexes, overflowing `num_edges * EDGE_RECORD_SIZE`, and
-  invalid metadata ranges.
+  out-of-range string indexes, unsupported flags, and invalid metadata ranges.
 - CSV roundtrip with commas, quotes, and newlines in subject/object fields.
 - Diff where confidence is unchanged but `source`, `metadata`, or `injection`
   changes.
-- BFS/DFS with `max_depth = 0` confirming the chosen `edges` semantics.
+- BFS/DFS with `max_depth = 0`, confirming no traversed edges are returned.
 
 ---
 

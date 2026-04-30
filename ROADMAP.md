@@ -65,14 +65,14 @@ lands the rest is mostly Python wrappers.
 
 | # | Item | Crate | Status |
 |---|------|-------|--------|
-| M1 | `LayerHook` trait + CPU plumbing (read + write) | larql-inference | in progress |
-| M2 | `RecordHook`, `ZeroAblateHook`, `SteerHook` built on M1 | larql-inference | not started |
-| M3 | Activation patching (cross-prompt residual swap) | larql-inference | not started |
-| M4 | Full logit lens — `logit_lens_topk(layer, k)`, `track_token(layer, id)` | larql-inference | not started |
-| M5 | `KvCache::{get_layer, set_layer, clone_at_position}` | larql-inference | not started |
-| M6 | Hooks on Metal `generate` path (per-layer opt-in fall-off) | larql-inference + larql-compute | blocked on M1 |
-| M7 | Expose `W_E` / `W_U` + `project_through_unembed` helper | larql-inference | not started |
-| M8 | pyo3 `PyLayerHook` (Python callable → `&mut dyn LayerHook`) | larql-python | blocked on M1 |
+| M1 | `LayerHook` trait + CPU plumbing (read + write) | larql-inference | shipped |
+| M2 | `RecordHook`, `ZeroAblateHook`, `SteerHook`, `CompositeHook` | larql-inference | shipped |
+| M3 | Activation patching (cross-prompt residual swap) | larql-inference | shipped |
+| M4 | Full logit lens — `logit_lens_topk`, `track_token`, `track_race` | larql-inference | shipped |
+| M5 | `KvCache::{get_layer, set_layer, clear_layer, clone_layer_from, clone_layer_position_range}` | larql-inference | shipped |
+| M6 | Hooks during multi-token generation (`generate_cached_hooked` on CPU; Metal `generate` stays fast by design) | larql-inference | shipped |
+| M7 | `W_E` / `W_U` + `embedding_neighbors` + `project_through_unembed` | larql-inference | shipped |
+| M8 | pyo3 `PyWalkModel` mech-interp methods (capture / ablate / steer / patch / lens / generate_with_hooks) | larql-python | shipped |
 
 Detail in `larql-inference/ROADMAP.md` § Mechanistic hooks (lazarus parity).
 

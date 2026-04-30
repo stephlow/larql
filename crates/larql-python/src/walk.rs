@@ -15,8 +15,9 @@ use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::{
     capture_donor_state, embedding_neighbors as li_embedding_neighbors,
     embedding_row as li_embedding_row, embedding_row_scaled as li_embedding_row_scaled,
-    logit_lens_topk, patch_and_trace, project_through_unembed as li_project_through_unembed,
-    trace_forward_full_hooked, track_race as li_track_race, track_token as li_track_token,
+    generate_cached_hooked, logit_lens_topk, patch_and_trace,
+    project_through_unembed as li_project_through_unembed, trace_forward_full_hooked,
+    track_race as li_track_race, track_token as li_track_token,
     unembedding_row as li_unembedding_row, RecordHook, SteerHook, ZeroAblateHook,
 };
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
@@ -818,6 +819,63 @@ impl PyWalkModel {
         token_id: u32,
     ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
         Ok(li_unembedding_row(&self.weights, token_id).map(|r| r.into_pyarray(py)))
+    }
+
+    /// Multi-token generation with a `LayerHook` active on **every layer
+    /// of every step** (prefill + each decode step). Mirrors lazarus's
+    /// `steer_and_generate` and `ablate_and_generate` workflows.
+    ///
+    /// Pass an `ablate_layers` list to zero the post-layer residual at
+    /// those layers, and/or a `steers` list of `(layer, vector, alpha)`
+    /// triples to add `alpha * v` to the last-token row at those layers.
+    /// Both apply on every step. Returns the generated string and the
+    /// raw token ids.
+    ///
+    /// **Backend note**: this routes to the CPU KV-cache path. The
+    /// Metal-fast `predict` is hook-free by design (kernel pipeline is
+    /// fused). For mech-interp use cases hooks-on-CPU is the right
+    /// trade.
+    #[pyo3(signature = (prompt, max_new_tokens, ablate_layers=None, steers=None))]
+    fn generate_with_hooks(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        ablate_layers: Option<Vec<usize>>,
+        steers: Option<Vec<(usize, PyReadonlyArray1<f32>, f32)>>,
+    ) -> PyResult<(String, Vec<u32>)> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+
+        // Build the active hook(s). When both ablate + steer are present,
+        // wrap them in a CompositeHook; otherwise pass the single hook
+        // directly so we don't pay for the extra dispatch.
+        let mut ablate = ZeroAblateHook::for_layers(ablate_layers.unwrap_or_default());
+        let mut steer = SteerHook::new();
+        if let Some(steers) = steers {
+            for (layer, vec, alpha) in steers {
+                let arr = Array1::from_vec(vec.as_slice()?.to_vec());
+                steer = steer.add(layer, arr, alpha);
+            }
+        }
+
+        let mut composite = larql_inference::forward::CompositeHook::new(vec![
+            &mut ablate as &mut dyn larql_inference::forward::LayerHook,
+            &mut steer as &mut dyn larql_inference::forward::LayerHook,
+        ]);
+
+        let mut generated_text = String::new();
+        let ids = generate_cached_hooked(
+            &self.weights,
+            &self.tokenizer,
+            &walk_ffn,
+            &token_ids,
+            max_new_tokens,
+            None,
+            None,
+            &mut composite,
+            |_id, text| generated_text.push_str(text),
+        );
+        Ok((generated_text, ids))
     }
 
     fn __repr__(&self) -> String {

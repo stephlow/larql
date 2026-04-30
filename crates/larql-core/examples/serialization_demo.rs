@@ -1,4 +1,4 @@
-//! Serialization demo — JSON vs MessagePack, format detection, bytes API.
+//! Serialization demo — JSON vs MessagePack, packed binary, CSV, format detection, bytes API.
 //!
 //! Run: cargo run --release -p larql-core --example serialization_demo
 
@@ -65,6 +65,25 @@ fn main() {
     println!("Roundtrip JSON:    {} edges", from_json.edge_count());
     println!("Roundtrip MsgPack: {} edges", from_msgpack.edge_count());
     println!("Roundtrip Packed:  {} edges", from_packed.edge_count());
+
+    // ── CSV with quoted fields ──
+    let mut csv_graph = Graph::new();
+    csv_graph.add_edge(Edge::new(
+        "Washington, D.C.",
+        "nickname",
+        "The \"District\"",
+    ));
+    csv_graph.add_edge(Edge::new("Line\nBreak", "rel", "Value, with comma"));
+
+    let tmp_csv = std::env::temp_dir().join("demo.larql.csv");
+    save_csv(&csv_graph, &tmp_csv).unwrap();
+    let csv_roundtrip = load_csv(&tmp_csv).unwrap();
+    println!(
+        "Roundtrip CSV:     {} edges, quoted fields preserved={}",
+        csv_roundtrip.edge_count(),
+        csv_roundtrip.exists("Washington, D.C.", "nickname", "The \"District\"")
+    );
+    std::fs::remove_file(&tmp_csv).ok();
 
     // ── File format detection ──
     println!("\nFormat detection:");

@@ -91,16 +91,38 @@ Lazarus `prefill_inject` and `kv_inject_test` need to lift K/V from one cache
 into another. Add `get_layer(layer) -> (&[f32], &[f32])`,
 `set_layer(layer, k, v)`, `clone_at_position(other, layer, pos_range)`.
 
-### M6 — Metal generate path
-**Status**: Blocked on M1
-**File**: `layer_graph/generate/gpu.rs`, plus shaders in `larql-compute/src/metal/`
+### M6 — Hooks during multi-token generation
+**Status**: Shipped
+**File**: `forward/kv_generate.rs::generate_cached_hooked`,
+`crates/larql-python/src/walk.rs::generate_with_hooks`
 
-The kernel-fusion design assumes nobody reads intermediates. Strategy: when
-the caller registers a hook for layer L, that layer falls off the fast path
-(CPU readback, run `LayerHook` callbacks, push back to GPU buffers). Layers
-without registered hooks keep the current fused dispatch. The cost model is
-explicit: hooks are free until used; per-layer cost is one
-`MTLBuffer.contents()` round-trip on the layers you ask about.
+Final design: **hooks-on-CPU, Metal-stays-fast**. Lazarus-style mech interp
+during multi-token generation goes through `generate_cached_hooked` on the
+CPU KV-cache path; the Metal-fast `layer_graph::generate::gpu::generate*`
+remains hook-free.
+
+Why not propagate hooks into the Metal path: the Metal `decode_token` and
+`prefill_q4` calls are end-to-end fused kernels that handle every layer in
+one dispatch. Threading hooks in would require either CPU readback per
+layer (kills the fusion benefit) or a parallel kernel surface that splits
+on layer boundaries (kills the fast path even when no hook is registered).
+Mech-interp tools care about correctness over throughput, so paying the
+CPU-path cost when hooks are active is the right trade.
+
+Interface mirrors `trace_forward_full_hooked` — same `LayerHook` trait;
+`on_pre_layer`, `on_post_attention(&mut)`, `on_post_layer(&mut)` fire on
+every layer of every step (prefill + each decode step).
+`on_attention_weights` and `on_ffn_activation` do **not** fire on this
+path — the production decode kernels don't capture those intermediates.
+Use `trace_forward_full_hooked` for a single forward pass when you need
+them.
+
+Tests: `forward::kv_generate::tests` — noop matches baseline; record fires
+on prefill + every decode step; α=5 steer changes generated tokens vs
+baseline. Demo: `examples/mech_interp_demo.rs` § [7] shows
+`baseline_ids = [12, 30, 10, 29]` vs `steered_ids = [4, 4, 4, 4]`.
+
+### M7 — `W_E` / `W_U` + `project_through_unembed`
 
 ### M7 — `W_E` / `W_U` + `project_through_unembed`
 **Status**: Not started

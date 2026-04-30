@@ -528,6 +528,65 @@ store.residual(42)  # zero-copy from mmap
 
 See [docs/residual-trace.md](docs/residual-trace.md) for the full writeup.
 
+## Mechanistic interpretability surface
+
+LARQL exposes a programmatic forward-hook system for capture, ablation,
+steering, activation patching, logit lens, and KV-cache surgery — the
+primitives lazarus-style MCP servers (e.g. `chuk-mcp-lazarus`) build on
+top of. All of it works on real models and on synthetic weights, with
+zero overhead when no hook is registered.
+
+```rust
+use larql_inference::forward::{
+    RecordHook, SteerHook, ZeroAblateHook, trace_forward_full_hooked,
+    capture_donor_state, patch_and_trace, logit_lens_topk, embedding_neighbors,
+};
+
+// 1. Capture residuals at chosen layers (read-only).
+let mut record = RecordHook::for_layers([12, 18, 24]);
+trace_forward_full_hooked(&weights, &tokens, &[12, 18, 24],
+    /*activations=*/ false, 0, /*attention=*/ false, &ffn, &mut record);
+let residual_at_18 = record.post_layer.get(&18).unwrap();
+
+// 2. Logit lens at any layer — top-k, single-token tracking, full race.
+let top_k     = logit_lens_topk(&weights, residual_at_18.row(0).as_slice().unwrap(), 5);
+let neighbors = embedding_neighbors(&weights, &query_vec, 10);
+
+// 3. Ablate or steer mid-forward.
+let mut ablate = ZeroAblateHook::for_layers([14usize]);
+let mut steer  = SteerHook::new().add(20, steer_vec, 0.5);
+
+// 4. Activation patching — donor → recipient at chosen (layer, position) coords.
+let donor   = capture_donor_state(&weights, &donor_tokens, &[(10, 4)]);
+let patched = patch_and_trace(&weights, &recipient_tokens, &donor, &[28]);
+```
+
+From Python via `larql._native.WalkModel`:
+`capture_residuals`, `forward_with_capture`, `forward_ablate`,
+`forward_steer`, `patch_activations`, `logit_lens`, `track_token_at`,
+`track_race`, `embedding_neighbors`, `project_through_unembed`,
+`embedding_for`, `unembedding_for`, `generate_with_hooks`. Returned
+tensors are numpy arrays.
+
+**Backend split.** Hooks during single-forward (`trace_forward_full_hooked`,
+all the capture/ablate/steer/patch primitives above) are zero-cost when
+no hook is registered and run on the existing CPU forward path. Hooks
+during **multi-token generation** (`generate_cached_hooked` /
+`WalkModel.generate_with_hooks`) also use the CPU KV-cache path — the
+Metal-fast `predict` is hook-free by design (kernels are fused; threading
+hooks through would split the fast path even when unused). Mech-interp
+tools want correctness over throughput, so the CPU-when-hooks-active
+trade is the right one.
+
+End-to-end walkthrough on synthetic weights (no vindex required):
+
+```bash
+cargo run --release -p larql-inference --example mech_interp_demo
+```
+
+The full surface is documented in `crates/larql-inference/ROADMAP.md` §
+"P0: Mechanistic hooks (lazarus parity)".
+
 ## Documentation
 
 | Doc | Description |
@@ -567,6 +626,7 @@ cargo test -p larql-vindex               # vindex storage + patch tests (104 tes
 
 # Inference engine examples
 cargo run --release -p larql-inference --example attention_demo    # fused attention demo
+cargo run --release -p larql-inference --example mech_interp_demo  # capture / lens / ablate / steer / patch (synthetic — no vindex)
 cargo run --release -p larql-inference --example bench_attention   # attention benchmarks
 cargo run --release -p larql-inference --example backend_demo --features metal   # backend demo
 cargo run --release -p larql-inference --example bench_backend --features metal  # backend benchmarks

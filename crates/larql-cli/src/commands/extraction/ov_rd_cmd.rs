@@ -193,17 +193,40 @@ struct ZeroStratumReport {
     prompts: usize,
     mean_kl: f64,
     max_kl: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ZeroPromptReport {
+    id: String,
+    stratum: String,
+    kl: f64,
+    delta_cross_entropy_bits: f64,
+    baseline_top1: u32,
+    ablated_top1: u32,
+    top1_agree: bool,
+    baseline_top1_in_ablated_top5: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct ZeroHeadReport {
     layer: usize,
     head: usize,
+    ablation_kind: String,
+    patch_location: String,
+    preserved_components: Vec<String>,
+    bounded_vocab_size: Option<usize>,
     prompts: usize,
     mean_kl: f64,
     p95_kl: f64,
     max_kl: f64,
+    mean_delta_cross_entropy_bits: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
     strata: Vec<ZeroStratumReport>,
+    worst_examples: Vec<ZeroPromptReport>,
+    per_prompt: Vec<ZeroPromptReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,50 +240,83 @@ struct ZeroAblationReport {
 
 #[derive(Debug)]
 struct ZeroHeadAccumulator {
-    values: Vec<f64>,
-    by_stratum: HashMap<String, Vec<f64>>,
+    prompts: Vec<ZeroPromptReport>,
+    by_stratum: HashMap<String, Vec<ZeroPromptReport>>,
 }
 
 impl ZeroHeadAccumulator {
     fn new() -> Self {
         Self {
-            values: Vec::new(),
+            prompts: Vec::new(),
             by_stratum: HashMap::new(),
         }
     }
 
-    fn add(&mut self, stratum: &str, kl: f64) {
-        self.values.push(kl);
-        self.by_stratum
-            .entry(stratum.to_string())
-            .or_default()
-            .push(kl);
+    fn add(&mut self, prompt: ZeroPromptReport) {
+        let stratum = prompt.stratum.clone();
+        self.prompts.push(prompt.clone());
+        self.by_stratum.entry(stratum).or_default().push(prompt);
     }
 
     fn finish(self, head: HeadId) -> ZeroHeadReport {
-        let prompts = self.values.len();
-        let mean_kl = mean(&self.values);
-        let p95_kl = percentile(self.values.clone(), 0.95);
-        let max_kl = self.values.iter().copied().fold(0.0, f64::max);
+        let prompts_len = self.prompts.len();
+        let kl_values: Vec<f64> = self.prompts.iter().map(|p| p.kl).collect();
+        let mean_kl = mean(&kl_values);
+        let p95_kl = percentile(kl_values.clone(), 0.95);
+        let max_kl = kl_values.iter().copied().fold(0.0, f64::max);
+        let mean_delta_cross_entropy_bits = mean(
+            &self
+                .prompts
+                .iter()
+                .map(|p| p.delta_cross_entropy_bits)
+                .collect::<Vec<_>>(),
+        );
+        let top1_agreement = bool_rate(self.prompts.iter().map(|p| p.top1_agree));
+        let top5_contains_baseline_top1 =
+            bool_rate(self.prompts.iter().map(|p| p.baseline_top1_in_ablated_top5));
+        let mut worst_examples = self.prompts.clone();
+        worst_examples.sort_by(|a, b| b.kl.partial_cmp(&a.kl).unwrap_or(std::cmp::Ordering::Equal));
+        worst_examples.truncate(10);
+
         let mut strata: Vec<_> = self
             .by_stratum
             .into_iter()
-            .map(|(stratum, values)| ZeroStratumReport {
-                stratum,
-                prompts: values.len(),
-                mean_kl: mean(&values),
-                max_kl: values.iter().copied().fold(0.0, f64::max),
+            .map(|(stratum, prompts)| {
+                let values: Vec<f64> = prompts.iter().map(|p| p.kl).collect();
+                ZeroStratumReport {
+                    stratum,
+                    prompts: prompts.len(),
+                    mean_kl: mean(&values),
+                    max_kl: values.iter().copied().fold(0.0, f64::max),
+                    top1_agreement: bool_rate(prompts.iter().map(|p| p.top1_agree)),
+                    top5_contains_baseline_top1: bool_rate(
+                        prompts.iter().map(|p| p.baseline_top1_in_ablated_top5),
+                    ),
+                }
             })
             .collect();
         strata.sort_by(|a, b| a.stratum.cmp(&b.stratum));
         ZeroHeadReport {
             layer: head.layer,
             head: head.head,
-            prompts,
+            ablation_kind: "zero_pre_wo".to_string(),
+            patch_location: "before_W_O".to_string(),
+            preserved_components: vec![
+                "FFN".to_string(),
+                "PLE".to_string(),
+                "layer_scalar".to_string(),
+            ],
+            bounded_vocab_size: None,
+            prompts: prompts_len,
             mean_kl,
             p95_kl,
             max_kl,
+            mean_delta_cross_entropy_bits,
+            top1_agreement,
+            top5_contains_baseline_top1,
             strata,
+            worst_examples,
+            per_prompt: self.prompts,
         }
     }
 }
@@ -447,6 +503,7 @@ fn run_zero_ablate(args: ZeroAblateArgs) -> Result<(), Box<dyn std::error::Error
             larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
+        let baseline_top1 = argmax(&baseline_logits);
 
         for (idx, head) in selected_heads.iter().copied().enumerate() {
             let ablated_hidden =
@@ -454,7 +511,18 @@ fn run_zero_ablate(args: ZeroAblateArgs) -> Result<(), Box<dyn std::error::Error
             let ablated_logits = final_logits(&weights, &ablated_hidden);
             let ablated_logp = log_softmax(&ablated_logits);
             let kl = kl_logp(&baseline_logp, &ablated_logp);
-            accumulators[idx].add(stratum, kl);
+            let ablated_top1 = argmax(&ablated_logits);
+            let ablated_top5 = top_k_indices(&ablated_logits, 5);
+            accumulators[idx].add(ZeroPromptReport {
+                id: label.to_string(),
+                stratum: stratum.to_string(),
+                kl,
+                delta_cross_entropy_bits: kl / std::f64::consts::LN_2,
+                baseline_top1,
+                ablated_top1,
+                top1_agree: baseline_top1 == ablated_top1,
+                baseline_top1_in_ablated_top5: ablated_top5.contains(&baseline_top1),
+            });
         }
     }
 
@@ -667,11 +735,47 @@ fn kl_logp(p_logp: &[f64], q_logp: &[f64]) -> f64 {
         .sum()
 }
 
+fn argmax(values: &[f32]) -> u32 {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx as u32)
+        .unwrap_or(0)
+}
+
+fn top_k_indices(values: &[f32], k: usize) -> Vec<u32> {
+    let mut pairs: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();
+    let take = k.min(pairs.len());
+    pairs.select_nth_unstable_by(take.saturating_sub(1), |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    pairs.truncate(take);
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.into_iter().map(|(idx, _)| idx as u32).collect()
+}
+
 fn mean(values: &[f64]) -> f64 {
     if values.is_empty() {
         0.0
     } else {
         values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn bool_rate(values: impl Iterator<Item = bool>) -> f64 {
+    let mut total = 0usize;
+    let mut hits = 0usize;
+    for value in values {
+        total += 1;
+        if value {
+            hits += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 / total as f64
     }
 }
 

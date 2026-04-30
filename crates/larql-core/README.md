@@ -58,6 +58,12 @@ save_json(&graph, "knowledge.larql.json").unwrap();
 | Diff | `diff()` | O(E) |
 | Subgraph | `graph.subgraph()` | O(E within depth) |
 
+Shortest path stores the exact edge chosen during Dijkstra/A*, so returned paths
+and costs stay consistent for multiedges with different relations or weights.
+`TraversalResult.edges` contains edges actually traversed to newly discovered
+nodes. `diff()` reports same-triple changes to confidence, source, metadata,
+and injection.
+
 ## LLM Integration
 
 | Component | Purpose |
@@ -80,6 +86,10 @@ save_json(&graph, "knowledge.larql.json").unwrap();
 | Checkpoint | (append-only) | (crash-safe log) | - | - |
 
 Packed binary uses string interning — repeated relation names stored once.
+Packed decoding validates header offsets, record bounds, string indexes, and
+metadata ranges before reading. CSV import/export supports quoted commas,
+quotes, CRLF/LF newlines, and multiline fields for the five graph columns:
+`subject,relation,object,confidence,source`.
 
 ## Crate Structure
 
@@ -103,7 +113,7 @@ larql-core/src/
 │   └── diff.rs             Graph diffing (added, removed, changed)
 ├── engine/
 │   ├── provider.rs         ModelProvider trait, PredictionResult
-│   ├─�� http_provider.rs    OpenAI-compatible HTTP provider (feature-gated)
+│   ├── http_provider.rs    OpenAI-compatible HTTP provider (feature-gated)
 │   ├── mock_provider.rs    Mock provider for testing
 │   ├── bfs.rs              BFS knowledge extraction from LLM
 │   ├── chain.rs            Multi-token chaining
@@ -112,15 +122,18 @@ larql-core/src/
     ├── format.rs           Format enum, auto-detection from extension
     ├── json.rs             JSON serialization (Python-compatible)
     ├── msgpack.rs          MessagePack (feature-gated)
-    ├── packed.rs           String-interned binary format
-    ├── csv.rs              Simple CSV import/export
+    ├── packed.rs           String-interned binary format with corrupt-input checks
+    ├── csv.rs              CSV import/export with quoted-field support
     └── checkpoint.rs       Append-only crash-safe log
 ```
 
 ## Testing
 
 ```bash
-cargo test -p larql-core                                  # 167 tests
+cargo test -p larql-core                                  # 176 tests
+cargo test -p larql-core --no-default-features --features msgpack
+cargo clippy -p larql-core --tests -- -D warnings
+cargo llvm-cov -p larql-core --summary-only
 cargo run --release -p larql-core --example bench_graph   # Benchmark
 cargo run -p larql-core --example graph_demo              # Feature showcase
 cargo run -p larql-core --example algorithm_demo          # Algorithm examples
@@ -143,22 +156,35 @@ cargo run -p larql-core --example algorithm_demo          # Algorithm examples
 | filter (100K, confidence) | 56ms |
 | Packed binary serialize (100K) | 22ms |
 
-### Test Coverage (167 tests)
+### Test Coverage (176 tests)
 
 - Graph: construction, queries, walk, search, subgraph, stats, dedupe
 - Edge: builder pattern, equality, hashing, compact serialization
 - Schema: type rules, inference, JSON roundtrip
-- Algorithms: shortest path, PageRank, BFS/DFS, merge, diff, filter
+- Algorithms: shortest path, multiedge reconstruction, PageRank, BFS/DFS, merge, diff, filter
 - Components: enumeration, connectivity, disconnected graphs, edge cases
 - Walk: highest-confidence selection, multi-path, all-paths, limits
 - Remove edge: index rebuild correctness
 - Search: empty query, no match, case insensitive
-- Serialization: JSON/MsgPack/Packed roundtrips, metadata preservation
+- Serialization: JSON/MsgPack/Packed roundtrips, metadata preservation, corrupt packed input
+- CSV: quoted commas, escaped quotes, multiline fields, confidence/source roundtrips
+- Diff: confidence, source, metadata, and injection changes
 - BFS extraction: mock provider, depth, multi-seed, max_entities
 - Token chaining: multi-token, stop tokens, probability threshold
 - Templates: registry, JSON load/save
 - Checkpoint: append, replay, persistence
 - Python compatibility: format interop
+
+Recent `cargo llvm-cov` summary:
+
+| Command | Line coverage | Region coverage |
+|---------|---------------|-----------------|
+| `cargo llvm-cov -p larql-core --summary-only` | 89.49% | 90.39% |
+| `cargo llvm-cov -p larql-core --no-default-features --features msgpack --summary-only` | 92.15% | 92.20% |
+
+Default coverage includes the optional HTTP provider. The non-HTTP profile is a
+better signal for the core graph/serialization surface until `HttpProvider` has
+a local mock-server test.
 
 ## Design Principles
 

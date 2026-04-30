@@ -1,3 +1,45 @@
+//! larql-inference — full transformer forward pass + mechanistic-interp surface.
+//!
+//! Two roles:
+//!
+//! - **Inference**: prefill, decode, sampling, KV engines, Metal GPU path,
+//!   chat templates. `predict`, `generate`, `predict_with_temperature`.
+//! - **Mechanistic interp**: programmatic hooks at every layer boundary,
+//!   logit lens, embedding-neighbor lookups, activation patching, KV-cache
+//!   surgery. The primitives lazarus-style MCP servers build on.
+//!
+//! ## Mechanistic interp surface
+//!
+//! Five callbacks fire inside [`forward::trace_forward_full_hooked`]; two of
+//! them take `&mut Array2<f32>` so a hook can mutate the residual in place:
+//!
+//! ```text
+//! pre_layer  →  attention  →  on_post_attention(&mut h)  →  FFN  →  on_post_layer(&mut h)
+//!                                  ^                              ^
+//!                                  └─ patching, pre-FFN steer ────┘
+//! ```
+//!
+//! Built-in hooks live in [`forward::hooks`]:
+//! [`RecordHook`](forward::RecordHook) (capture),
+//! [`ZeroAblateHook`](forward::ZeroAblateHook) (zero-out),
+//! [`SteerHook`](forward::SteerHook) (`x + α·v`),
+//! [`CompositeHook`](forward::CompositeHook) (compose multiple). Implement
+//! [`forward::LayerHook`] for custom transforms.
+//!
+//! Sibling primitives:
+//!
+//! - [`forward::lens`] — full logit lens, `track_token`, `track_race`.
+//! - [`forward::vocab_proj`] — `W_E` / `W_U` access, `embedding_neighbors`,
+//!   raw `project_through_unembed` (DLA without final norm).
+//! - [`forward::patching`] — donor/recipient activation patching built on
+//!   the hook surface.
+//! - [`attention::KvCache`] — `get_layer` / `set_layer` /
+//!   `clone_layer_position_range` for KV-cache surgery (e.g. lazarus's
+//!   `prefill_inject` and `kv_inject_test`).
+//!
+//! See `examples/mech_interp_demo.rs` for an end-to-end walkthrough on
+//! synthetic weights (no vindex required).
+
 extern crate blas_src;
 
 pub mod attention;
