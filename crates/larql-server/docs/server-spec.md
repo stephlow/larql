@@ -457,16 +457,23 @@ DELETE /v1/patches/drug-interactions@2.1.0
 
 #### GET /v1/models
 
-List loaded models (multi-model server).
+List loaded models. Response conforms to the
+[OpenAI Models API](https://platform.openai.com/docs/api-reference/models/list)
+shape, which means existing `openai` SDKs work unmodified. Larql-specific
+fields (`path`, `features`, `loaded`) are present as additional members —
+OpenAI clients ignore them.
 
 ```json
 {
-  "models": [
+  "object": "list",
+  "data": [
     {
       "id": "gemma-3-4b-it",
+      "object": "model",
+      "created": 1746094800,
+      "owned_by": "larql",
       "path": "/v1/gemma-3-4b-it",
       "features": 348160,
-      "probe_confirmed": 1967,
       "loaded": true
     }
   ]

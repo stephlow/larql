@@ -15,6 +15,7 @@ pub mod sgemm_transb;
 // implementing `metal::kernel::TiledKernel` so the binding site reads
 // it by *path*, not by hand-typed string.
 pub mod activation;
+pub mod attn_fused;
 pub mod causal_attention;
 pub mod f16_gemv;
 pub mod f32_gemv;
@@ -92,6 +93,7 @@ pub fn all_shaders() -> String {
     src.push_str(causal_attention::SHADER);
     src.push_str(kv_attention::SHADER);
     src.push_str(kv_append_attend_fused::SHADER);
+    src.push_str(attn_fused::SHADER);
     src.push_str(rope::SHADER);
     src.push_str(fused_attention::SHADER);
     src.push_str(fused_ops::SHADER);

@@ -365,22 +365,88 @@ impl MetalBackend {
             // The qk_norm_offset is 0.0 on Gemma 4 and 1.0 on Gemma 2/3.
             // Passed as `offset` to the shader so `offset + weight[d]` does
             // the right thing for both families.
+            //
             // ── Steps 1.5 + 2: QK-norm + RoPE ──
             //
-            // When `LARQL_FUSED_QK_NORM_ROPE=1` AND the layer has
-            // QK-norm weights (Gemma 3/4), use the single fused
-            // `qk_norm_rope_fused` kernel — saves 1 dispatch per
-            // layer × 34 = ~34/tok. Falls back to the consecutive
-            // `qk_norm_qk` + `rope_at_pos_batched_qk` chain for
-            // archs without QK-norm or when the env flag is unset.
-            // qk_norm+RoPE fusion — proven win 2026-05-01 (~0.10 ms/tok GPU).
-            // Default-on; opt out via `LARQL_FUSED_QK_NORM_ROPE=0`.
+            // **`LARQL_FUSED_ATTN`** is **opt-in** (default off). When set,
+            // routes qk_norm_rope + kv_append + kv_attend through the
+            // single `attn_fused` kernel. Tested 2026-05-02 — regresses
+            // 74→64 tok/s on Gemma 3 4B Q4_K-v2 because the merger
+            // **serializes work that was parallel**: the standalone
+            // `qk_norm_rope_fused` runs 12 TGs (num_q + num_kv) in
+            // parallel; the merged kernel must collapse to 8 TGs
+            // (one per Q head) and each TG redundantly does its
+            // kv_head's K work. The dispatch saving (~30 µs) is
+            // dwarfed by the parallelism loss (~1.45 ms). Lesson:
+            // dispatch fusions only win when they don't reduce TG
+            // parallelism. Kernel kept registered for the next attempt
+            // (e.g. multi-TG-per-head schemes that preserve parallelism).
+            //
+            // `LARQL_FUSED_QK_NORM_ROPE=1` (default-on) keeps the
+            // proven-win two-stage kernel chain.
+            let use_fused_attn = matches!(
+                std::env::var("LARQL_FUSED_ATTN").as_deref(),
+                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            );
             let use_fused_qkn_rope = !matches!(
                 std::env::var("LARQL_FUSED_QK_NORM_ROPE").as_deref(),
                 Ok("0") | Ok("false") | Ok("off") | Ok("no")
             );
             let pos = kv_cache.layers[l].current_len as u32;
-            if use_fused_qkn_rope && layer.q_norm_weight.is_some() && layer.k_norm_weight.is_some()
+            // Path 1: full attention fusion. Skips both qk_norm_rope dispatch
+            // AND kv_append_attend_fused dispatch — handles them in attn_fused.
+            let did_fused_attn = use_fused_attn
+                && layer.q_norm_weight.is_some()
+                && layer.k_norm_weight.is_some()
+                && !layer.has_v_norm;
+            if did_fused_attn {
+                let cache = &kv_cache.layers[l];
+                let q_w = layer.q_norm_weight.unwrap();
+                let k_w = layer.k_norm_weight.unwrap();
+                let q_w_buf = self.bufs.get_f32(q_w);
+                let k_w_buf = self.bufs.get_f32(k_w);
+                let t_val = (cache.current_len + 1) as u32;
+                let hd_val = layer_head_dim as u32;
+                let nq_val = layer_num_q_heads as u32;
+                let nkv_val = cache.num_kv_heads as u32;
+                let qk_off = layer.qk_norm_offset;
+                let eps = layer.eps;
+                let rdim = layer_rotary_dim as u32;
+                let mut tg_w: u64 = 1;
+                while tg_w < layer_head_dim as u64 && tg_w < 256 {
+                    tg_w <<= 1;
+                }
+                enc.set_compute_pipeline_state(&self.attn_fused_pipeline);
+                enc.set_buffer(0, Some(&q_out), 0);
+                enc.set_buffer(1, Some(&k_out), 0);
+                enc.set_buffer(2, Some(&v_out), 0);
+                enc.set_buffer(3, Some(&cache.k_cache), 0);
+                enc.set_buffer(4, Some(&cache.v_cache), 0);
+                enc.set_buffer(5, Some(&attn_out_buf), 0);
+                enc.set_buffer(6, Some(&q_w_buf), 0);
+                enc.set_buffer(7, Some(&k_w_buf), 0);
+                enc.set_bytes(8, 4, &t_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(9, 4, &hd_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(10, 4, &nq_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(11, 4, &nkv_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(13, 4, &window_size as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(14, 4, &eps as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(15, 4, &qk_off as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(
+                    16,
+                    4,
+                    &layer_rope_base as *const f32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(17, 4, &rdim as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(layer_num_q_heads as u64, 1, 1),
+                    MTLSize::new(tg_w, 1, 1),
+                );
+                kv_cache.layers[l].current_len += 1;
+            } else if use_fused_qkn_rope
+                && layer.q_norm_weight.is_some()
+                && layer.k_norm_weight.is_some()
             {
                 let q_w = layer.q_norm_weight.unwrap();
                 let k_w = layer.k_norm_weight.unwrap();
@@ -499,17 +565,19 @@ impl MetalBackend {
             // within a single encoder in submission order. Verified by tests.
 
             let attn_out = &attn_out_buf;
-            // Fused KV-append + KV-attention. Each Q-head TG writes its
-            // kv_head's new K/V row at position pos = current_len, then
-            // proceeds with attention on T = current_len + 1. Eliminates
-            // the separate kv_cache_append dispatch
-            // (~1 dispatch/layer × 34 ≈ 0.24 ms/tok). Default-on; opt
-            // out via `LARQL_FUSED_KV_APPEND_ATTEND=0` for diagnostics.
+            // KV-append + KV-attend. Skipped entirely when `did_fused_attn`
+            // is true (the unified `attn_fused` kernel above already
+            // wrote both cache rows + the attention output and bumped
+            // current_len). Otherwise fall through to the prior
+            // kv_append_attend_fused single-dispatch fusion or, for
+            // diagnostics, the unfused two-dispatch chain.
             let use_fused_kv_aa = !matches!(
                 std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
                 Ok("0") | Ok("false") | Ok("off") | Ok("no")
             );
-            if use_fused_kv_aa {
+            if did_fused_attn {
+                // Already done — attn_fused wrote attn_out + bumped current_len.
+            } else if use_fused_kv_aa {
                 let cache = &kv_cache.layers[l];
                 let t_val = (cache.current_len + 1) as u32;
                 let hd = cache.head_dim as u32;
@@ -551,7 +619,9 @@ impl MetalBackend {
                     window_size,
                 );
             }
-            kv_cache.layers[l].current_len += 1;
+            if !did_fused_attn {
+                kv_cache.layers[l].current_len += 1;
+            }
 
             // Scratch buffers pre-allocated above — reused each layer.
             let new_h = if l % 2 == 0 { &h_a } else { &h_b };

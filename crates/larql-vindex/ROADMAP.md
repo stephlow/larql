@@ -1,23 +1,33 @@
 # Roadmap — larql-vindex
 
-## Current state (as of 2026-04-25)
+## Current state (as of 2026-05-01)
 
-- **457 tests passing** on `larql-vindex` (306 unit + 151 integration);
-  211 on `larql-models`. Workspace builds clean. 0 clippy warnings
-  under `--lib --all-targets`. Coverage: **61 % lines / 57 % functions**
-  (cargo-llvm-cov; new W2 files at 95–100 %).
+- **493 tests passing** on `larql-vindex`. Workspace builds clean.
+  No new clippy warnings; `cargo fmt --check` clean.
 - **Folder layout decomposed**:
   - `index/{storage,compute,mutate}/` — substores, KNN dispatch, mutation
+  - `index/compute/gate_knn/{mod,dispatch,scores_batch,hnsw_lifecycle}.rs`
+    (round-4 split)
+  - `index/storage/ffn_store/{mod,down,up,interleaved,interleaved_q4,interleaved_q4k,gate_q4,fp4,q4k_cache}.rs`
+    (round-4 split)
+  - `index/storage/lm_head/{mod,loaders,knn}.rs` (round-4 split)
+  - `extract/build/{mod,down_meta,index_json,resume}.rs` (round-4 split)
   - `format/{huggingface,weights,filenames,fp4_codec,…}/`
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
   - `config/{index,quantization,model,compliance,dtype}.rs` — was the
     624-line `types.rs` monolith
-  - No `.rs` file > 750 lines (down from 1366 monolith)
+  - No non-test `.rs` file > 600 lines (down from 1366 monolith).
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
-  one table entry plus codec functions; ~3-file edit.
+  one table entry plus codec functions; ~3-file edit. Block sizes flow
+  through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS` (round-4 M4).
+  `LEGACY_BLOCK_Q4_K_STRIDE` names the 148-byte historical bug shape
+  (round-4 M5).
 - **Filename literals centralised** in `format::filenames` (252+
   occurrences → one constant module). Round-2 added 8 missed
-  constants (LM_HEAD_BIN + FP4 family + attn_q4/q8 manifests).
+  constants (LM_HEAD_BIN + FP4 family + attn_q4/q8 manifests). Round-4
+  M1 closed the last gap (`UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN`).
+- **`DEFAULT_C_SCORE`** lifted on `index::types` so the patch overlay
+  fallback and the vindexfile builder share one default (round-4 M3).
 - **`VectorIndex` god struct decomposed** into four typed substores
   (`GateStore`, `FfnStore`, `ProjectionStore`, `MetadataStore`). Adding
   a new field is one edit in the relevant store.
@@ -231,115 +241,10 @@ all 34 layers; layer-level resume would skip 30
 truncation to the last clean layer boundary, which is more delicate
 than the phase flag.
 
-### Round-4 cleanup audit (2026-05-01) — magic strings, magic numbers, modularity
+### Round-4 cleanup audit (2026-05-01) — ✅ shipped 2026-05-01
 
-**Status**: Findings landed 2026-05-01; nothing shipped yet. Tracks
-the same cadence as the round-1/2/3 cleanups (see Completed). Each
-sub-item is independently shippable; M1 is the highest-value pick
-because it matches the audit pattern that already ran once.
-
-#### M1. Two filenames bypass `format::filenames` ⚠ active
-**Impact**: Same class of bug `format::filenames` was created to
-prevent — a typo silently triggers a fallback codepath
-(file "doesn't exist") and bugs go undiagnosed.
-**Effort**: 30 min
-**Sites**: `up_weights.bin` / `down_weights.bin` literals in
-- `quant/convert_q4k.rs:174-175,239-240`
-- `format/checksums.rs:38-39`
-- `format/weights/write_f32.rs:365,369,387,401,416,431,445`
-- `format/huggingface/mod.rs:40-41`
-
-Add `UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN` to `format/filenames.rs`
-and route the literals through them. Round-2 added 8 missed constants
-the same way; this completes the sweep.
-
-#### M2. `"Q4_K"` / `"Q6_K"` tag strings duplicated outside the registry — ❌ invalid (2026-05-01)
-**Status**: Won't fix — finding withdrawn after re-review.
-
-All 6 `attn.rs` sites flagged are inside the `#[cfg(test)]` block at
-`index/storage/attn.rs:232`, and the `registry.rs` literals are
-either the canonical declarations (`tag: "Q4_K"`) or contract
-assertions on the on-disk wire format (`lookup("Q4_K")` in tests).
-Routing them through `QuantBlockFormat::Q4K.format_tag()` would
-weaken the tests — a registry rename would no longer be caught,
-because both sides of the comparison would shift together.
-The literals are correctly localised; nothing to centralise.
-
-#### M3. Default `c_score` / confidence fallback scattered
-**Impact**: A future tune of the default would have to touch four
-independent sites; today they can drift apart silently.
-**Effort**: 15 min
-**Sites**: `0.95` / `0.9` literals at
-- `describe.rs:80`
-- `vindexfile/mod.rs:122`
-- `patch/overlay.rs:499`
-- `patch/overlay_apply.rs:71` (the `confidence.unwrap_or(0.9)` left
-  in place during the lossy-patch fix on 2026-05-01)
-
-Lift to a single `DEFAULT_C_SCORE` constant.
-
-#### M4. K-quant block size 256 hardcoded locally
-**Impact**: `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS = 256`
-already exists and is referenced once at `format/load.rs:336`. Five
-other sites duplicate the literal.
-**Effort**: 30 min
-**Sites**:
-- `quant/registry.rs:109,117` (`block_elements: 256`)
-- `config/quantization.rs:114`
-- `format/weights/write_q4k/mod.rs:49,74` (`pad_to_256` /
-  `pad_rows_to_256` — the 256 is in the function name)
-
-Either route through `K_QUANT_BLOCK_ELEMS` or define a local
-re-export. The pad helpers should generalise to `pad_to(_, n)` and
-take the constant.
-
-#### M5. `144` / `148` Q4_K block-byte stride documented as anonymous numbers
-**Impact**: The 148-byte legacy stride is the historical bug shape;
-`registry.rs:228-231` documents the comparison with a comment but
-both numbers are anonymous. A `LEGACY_BLOCK_Q4_K_STRIDE = 148`
-constant would make the test self-documenting.
-**Effort**: 15 min
-
-#### M6. `index/compute/gate_knn.rs` is the largest non-test file
-**Impact**: 962 non-test lines, ~25 methods on a single
-`impl VectorIndex` block, mixing four concerns. Hurts navigability
-and grep-ability.
-**Effort**: Medium (half-day)
-**Status**: Not started — split along these axes:
-- `gate_knn/dispatch.rs` — `gate_knn`, `gate_knn_expert`,
-  `gate_knn_adaptive`, `gate_knn_q4`, `walk`
-- `gate_knn/hnsw_lifecycle.rs` — `enable_hnsw` / `disable_hnsw` /
-  `build_hnsw_*` / `warmup_hnsw_*` / `install_hnsw_layer` /
-  `get_or_build_hnsw*`
-- `gate_knn/scores_batch.rs` — `gate_scores_batch*`,
-  `gate_scores_2d_*`
-
-Sibling pattern matches what `index/storage/ffn_store/` already does
-(`fp4.rs`, `q4k_cache.rs` declared at the bottom of `mod.rs`).
-
-#### M7. `index/storage/ffn_store/mod.rs` is 740 non-test lines
-**Impact**: ~30 methods covering load + accessors for `down_features`,
-`up_features`, and three interleaved variants (f32 / Q4_0 / Q4_K).
-Same shape as M6 but with the sibling pattern already half-done
-(`fp4.rs`, `q4k_cache.rs` already split out).
-**Effort**: Medium (half-day)
-**Status**: Not started — finish the split: `down.rs`, `up.rs`,
-`interleaved.rs`, `interleaved_q4.rs`, `interleaved_q4k.rs`. `mod.rs`
-keeps the `FfnStore` struct, the manifest helper, and the new
-`ffn_layer_byte_offset` shared helper added 2026-05-01.
-
-#### M8. `extract/build.rs` 808 non-test lines after partial extraction
-**Impact**: `build_helpers.rs` / `streaming.rs` / `build_from_vectors.rs`
-already split out (round-1 cleanup); the `BuildContext` 6-stage
-pipeline could finish the job (one file per stage).
-**Effort**: Medium
-**Status**: Second-pass cleanup — not urgent.
-
-#### M9. `index/storage/lm_head.rs` 521 non-test / 482 test lines
-**Impact**: Less urgent than M6/M7 because half the file is test
-code, which would naturally co-locate with each split file.
-**Effort**: Small
-**Status**: Lowest priority of the modularity items.
+All M1-M9 items closed. See **Completed → 2026-05-01 round-4 cleanup**
+below for the per-item outcomes.
 
 ## P2: Forward-looking
 
@@ -415,6 +320,30 @@ Add new layers / features to an existing vindex without full rebuild.
 ---
 
 ## Completed
+
+### 2026-05-01 — round-4 cleanup (magic strings, magic numbers, modularity)
+
+Closes the M1-M9 audit landed earlier in the day. Same cadence as
+round-1/2/3. **493 tests passing**, **0 new clippy warnings**, **fmt
+clean**.
+
+| Item | Outcome |
+|------|---------|
+| **M1**. `up_weights.bin` / `down_weights.bin` literals | Added `UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN` constants, routed 17+ literal sites in `quant/convert_q4k.rs`, `format/checksums.rs`, `format/weights/write_f32.rs`, `format/huggingface/mod.rs`, `extract/build/mod.rs` tests, `HF_UPLOAD_FILES` + uniqueness test extended |
+| **M2**. `"Q4_K"` / `"Q6_K"` tag literals | ❌ Withdrawn — re-review found all 6 `attn.rs` sites are inside `#[cfg(test)]` exercising the on-disk wire contract; routing through `format_tag()` would weaken the tests (rename would no longer be caught). Literals correctly localised |
+| **M3**. Default `c_score` / confidence fallback | `DEFAULT_C_SCORE = 0.9` lifted to `index::types`; routed `vindexfile/mod.rs:122` and `patch/overlay_apply.rs:73`. Test-fixture sites kept literal |
+| **M4**. K-quant block size 256 hardcoded | Routed `quant/registry.rs` + `config/quantization.rs` through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS`; renamed `pad_to_256` / `pad_rows_to_256` → `pad_to_block` / `pad_rows_to_block` (function bodies already used the constant; renames removed it from the API surface) |
+| **M5**. `148`-byte legacy Q4_K stride anonymous | `LEGACY_BLOCK_Q4_K_STRIDE` constant added next to `QUANT_FORMATS`; `registry.rs` and `attn.rs` rejection tests now reference it instead of `* 148` |
+| **M6**. `gate_knn.rs` 962 non-test lines, ~25 methods | Split into `gate_knn/{mod,dispatch,scores_batch,hnsw_lifecycle}.rs` (4 files, largest 380). `top_k_by_abs` free fn + `top_k_from_scores` impl shim live in `mod.rs` so all submodules share them |
+| **M7**. `ffn_store/mod.rs` 740 non-test lines | Split into `ffn_store/{mod,down,up,interleaved,interleaved_q4,interleaved_q4k,gate_q4}.rs` (existing `fp4.rs` + `q4k_cache.rs` siblings preserved). `mod.rs` keeps `FfnStore` struct, `DownFeaturesQ4kEntry`, `Clone`/`empty` impls, and the `ffn_layer_byte_offset` shared helper. Largest sibling 248 |
+| **M8**. `extract/build.rs` 1115 → 4 files | Split into `build/{mod,down_meta,index_json,resume}.rs`. `BuildContext` + small stages (gate_vectors, embeddings, clustering, tokenizer) + `build_vindex` + tests stay in `mod.rs`; the 3 large concerns moved to siblings. Largest sibling 579 (mostly test fixture code) |
+| **M9**. `lm_head.rs` 1003 → 3 files | Split into `lm_head/{mod,loaders,knn}.rs`. `top_k_sorted` made `pub(super)` so the test module in `mod.rs` can keep its existing `VectorIndex::top_k_sorted` calls. Constants + `read_lm_head_manifest_kind` helper + tests stay in `mod.rs` |
+
+Aggregate file-size impact: 4 monolith files totalling 4,075 lines →
+20 sibling files, no non-test file over 600 lines. The
+`ffn_layer_byte_offset` prefix-sum helper added in the upstream P1
+fix on the same day stays as the single source of truth for layer →
+byte translation across the variant accessors.
 
 ### 2026-04-25 — round-3 polish
 

@@ -92,6 +92,15 @@ pub struct MetalBackend {
     /// Default-on; opt out via `LARQL_FUSED_KV_APPEND_ATTEND=0`. See
     /// `shaders/kv_append_attend_fused.rs`.
     pub kv_append_attend_fused_pipeline: ComputePipelineState,
+    /// Fused **QK-norm + RoPE + KV-cache append + attention** —
+    /// collapses three dispatches (qk_norm_rope_fused +
+    /// kv_append_attend_fused, plus the implicit kv_append phase) into
+    /// one. Each Q-head TG normalises+ropes its Q (kept in TG memory),
+    /// normalises+ropes+writes its kv_head's K row to cache, streams V
+    /// to cache, then attends. Saves 1 dispatch/layer × 34 ≈ 0.2 ms/tok.
+    /// Default-on; opt out via `LARQL_FUSED_ATTN=0`. See
+    /// `shaders/attn_fused.rs`.
+    pub attn_fused_pipeline: ComputePipelineState,
     pub q8_matvec_pipeline: KernelHandle,
     pub rms_norm_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
@@ -487,6 +496,8 @@ impl MetalBackend {
             get_shader_pipeline::<shaders::kv_attention::AppendKernel>(&device, &library)?;
         let kv_append_attend_fused_pipeline =
             get_shader_pipeline::<shaders::kv_append_attend_fused::Kernel>(&device, &library)?;
+        let attn_fused_pipeline =
+            get_shader_pipeline::<shaders::attn_fused::Kernel>(&device, &library)?;
 
         Some(Self {
             queue,
@@ -501,6 +512,7 @@ impl MetalBackend {
             kv_attend_pipeline,
             kv_append_pipeline,
             kv_append_attend_fused_pipeline,
+            attn_fused_pipeline,
             q8_matvec_pipeline,
             rms_norm_pipeline,
             residual_add_pipeline,

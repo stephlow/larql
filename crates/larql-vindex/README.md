@@ -119,6 +119,14 @@ weights are resident at a time. The rest stays on disk until touched.
 
 ## Crate Structure
 
+> **Note**: tree below reflects the layout after the 2026-05-01 round-4
+> cleanup (M6/M7/M8/M9 splits — see `ROADMAP.md` Completed). The
+> `index/compute/gate_knn/`, `index/storage/ffn_store/`,
+> `index/storage/lm_head/`, and `extract/build/` directories are
+> sibling-file modules: each child file holds an `impl VectorIndex`
+> (or `impl BuildContext`) block focused on one concern, and `mod.rs`
+> declares them and owns shared helpers.
+
 ```
 larql-vindex/src/
 ├── lib.rs                      Crate root + re-exports
@@ -127,46 +135,89 @@ larql-vindex/src/
 ├── mmap_util.rs                madvise-optimized mmap helper
 │
 ├── config/                     Configuration types
-│   ├── types.rs                VindexConfig, ExtractLevel, LayerBands, MoeConfig
+│   ├── index.rs                VindexConfig, VindexLayerInfo, ExtractLevel,
+│   │                           LayerBands, source/checksums
+│   ├── quantization.rs         QuantFormat, Fp4Config, Precision, Projections
+│   ├── model.rs                VindexModelConfig, MoeConfig
+│   ├── compliance.rs           ComplianceGate
 │   └── dtype.rs                StorageDtype (f32/f16), encode/decode/write_floats
 │
 ├── index/                      In-memory KNN engine (zero-copy mmap)
-│   ├── types.rs                FeatureMeta, GateIndex trait, WalkHit, WalkTrace
-│   ├── core.rs                 VectorIndex struct + Clone + constructors (new, new_mmap)
-│   ├── loaders.rs              load_gates, load_down_meta (NDJSON readers)
-│   ├── gate.rs                 Gate KNN dispatch (brute-force, batched, HNSW, Q4)
-│   ├── gate_trait.rs           impl GateIndex for VectorIndex
-│   ├── accessors.rs            feature_meta, gate_vector(s), warmup, total_*
-│   ├── walk.rs                 Feature-major down/up vectors, interleaved, Q4
-│   ├── attn.rs                 Attention weight loaders (Q8, Q4_K, Q4)
-│   ├── lm_head.rs              LM-head loaders + KNN (f32 + Q4)
-│   ├── hnsw.rs                 HNSW graph index (random projection, exact rescoring)
-│   ├── mutate.rs               set/delete features, save to disk
-│   ├── router.rs               MoE expert router
-│   └── residency.rs            Adaptive layer pinning (memory budget → performance)
+│   ├── types.rs                FeatureMeta, DEFAULT_C_SCORE, GateIndex trait,
+│   │                           WalkHit, WalkTrace, StorageBucket
+│   ├── core.rs                 VectorIndex struct + Clone + constructors
+│   ├── compute/                KNN dispatch + HNSW + GPU paths
+│   │   ├── gate_knn/
+│   │   │   ├── mod.rs          top_k_by_abs free fn + top_k_from_scores impl shim + tests
+│   │   │   ├── dispatch.rs     gate_knn, gate_knn_expert, gate_knn_batch,
+│   │   │   │                   gate_knn_adaptive, gate_knn_q4, walk, gate_walk
+│   │   │   ├── scores_batch.rs gate_scores_batch + GPU/BLAS fast paths
+│   │   │   └── hnsw_lifecycle.rs build/install/warmup + HNSW-backed knn variants
+│   │   ├── hnsw.rs             HNSW graph index (random projection + exact rescoring)
+│   │   ├── q4k_dispatch.rs     Compute-side Q4_K codec dispatch (matmul + row decode)
+│   │   └── router.rs           MoE expert router
+│   ├── mutate/                 set_down_vector, set_up_vector, save_*
+│   └── storage/                Substores composed into VectorIndex
+│       ├── gate_store.rs       GateStore (mmap + heap gate vectors + warmed cache)
+│       ├── gate_accessors.rs   feature_meta, gate_vector, num_features, warmup
+│       ├── ffn_store/
+│       │   ├── mod.rs          FfnStore struct + Clone + ffn_layer_byte_offset
+│       │   ├── down.rs         down_features.bin (feature-major f32)
+│       │   ├── up.rs           up_features.bin (feature-major f32) + has_full_mmap_ffn
+│       │   ├── interleaved.rs  interleaved.bin (f32 [gate|up|down])
+│       │   ├── interleaved_q4.rs   interleaved_q4.bin (Q4_0)
+│       │   ├── interleaved_q4k.rs  interleaved_q4k.bin + manifests +
+│       │   │                       down_features_q4k.bin (Q4_K/Q6_K)
+│       │   ├── gate_q4.rs      Q4_0 gate-vector mmap (KNN side-channel)
+│       │   ├── fp4.rs          FP4 / FP8 FFN storage (exp 26)
+│       │   └── q4k_cache.rs    Bounded LRU dequant cache (q4k_ffn_cache)
+│       ├── lm_head/
+│       │   ├── mod.rs          Q4 byte-rate constants + manifest helper + tests
+│       │   ├── loaders.rs      load_lm_head_q4, synthesize_lm_head_q4,
+│       │   │                   set_lm_head_f16_mmap, load_lm_head
+│       │   └── knn.rs          lm_head_knn_backend (Q4/f16/f32) + skip_q4k variant +
+│       │                       top_k_sorted reduce + lm_head_knn (f32 fallback)
+│       ├── attn.rs             Attention weight loaders (Q8, Q4_K, Q4)
+│       ├── projection_store.rs ProjectionStore (lm_head, embed)
+│       ├── metadata_store.rs   MetadataStore (down_meta + overrides)
+│       ├── fp4_store.rs        Fp4Storage runtime store (exp 26)
+│       └── residency.rs        Adaptive layer pinning (memory → performance)
 │
 ├── format/                     Vindex file I/O
 │   ├── load.rs                 load_vindex, load_embeddings, load_tokenizer
 │   ├── down_meta.rs            Binary down_meta read/write
+│   ├── filenames.rs            Single source of truth for *.bin / *.json names —
+│   │                           UP_WEIGHTS_BIN / DOWN_WEIGHTS_BIN added 2026-05-01
 │   ├── weights/
 │   │   ├── mod.rs              Re-exports
-│   │   ├── write.rs            write_model_weights, WeightSource, StreamingWeights
+│   │   ├── write_f32.rs        write_model_weights (f32/f16), WeightEntry/Source
+│   │   ├── write_q4k/          Q4_K / Q6_K streaming writer + feature-major down
+│   │   ├── write_layers.rs     Per-layer FFN file writer (§5.12)
+│   │   ├── manifest.rs         Q4kManifestEntry + format_tag
 │   │   └── load.rs             load_model_weights, find_tokenizer_path
 │   ├── checksums.rs            SHA256 computation + verification
-│   ├── huggingface.rs          HuggingFace Hub download/publish
+│   ├── fp4_codec.rs            FP4 / FP8 codec (extraction-side)
+│   ├── huggingface/            HuggingFace Hub download/publish
 │   └── quant/mod.rs            Re-exports from larql_models::quant
 │
 ├── extract/                    Build pipeline (model → vindex)
-│   ├── build.rs                build_vindex coordinator + BuildContext + 6 stages
+│   ├── build/
+│   │   ├── mod.rs              BuildContext struct + small stages + build_vindex + tests
+│   │   ├── down_meta.rs        Stage 3: per-feature top-k + cluster collection
+│   │   ├── index_json.rs       Stage 6: config + provenance + checksums
+│   │   └── resume.rs           build_vindex_resume (alt entry point)
 │   ├── build_helpers.rs        chrono_now, build_whole_word_vocab,
 │   │                           compute_gate_top_tokens, compute_offset_direction,
 │   │                           run_clustering_pipeline, ClusterData
 │   ├── streaming.rs            Streaming extraction (mmap, no full model load)
+│   ├── stage_labels.rs         15 labels for IndexBuildCallbacks (compile-time pinned)
 │   ├── callbacks.rs            IndexBuildCallbacks trait
+│   ├── checkpoint.rs           Phase-level resume checkpoint
 │   └── build_from_vectors.rs   Build from pre-extracted NDJSON
 │
 ├── patch/                      Patch system
-│   ├── format.rs               VindexPatch, PatchOp, PatchDownMeta + base64
+│   ├── format.rs               VindexPatch, PatchOp (Insert/Update with optional
+│   │                           gate/up/down vectors), PatchDownMeta + base64
 │   ├── overlay.rs              PatchedVindex (queries, mutators, walk, bake_down)
 │   ├── overlay_apply.rs        apply_patch, remove_patch, rebuild_overrides
 │   ├── overlay_gate_trait.rs   impl GateIndex for PatchedVindex
@@ -175,21 +226,25 @@ larql-vindex/src/
 │   └── refine.rs               Gate refine pass (Gram-Schmidt orthogonalisation
 │                               of patched gates + optional decoy residuals)
 │
-├── storage/                    Storage engine + L2 MEMIT cycles
+├── engine/                     Storage engine + L2 MEMIT cycles
 │   ├── engine.rs               StorageEngine (PatchedVindex + epoch + memit_store)
 │   ├── epoch.rs                Monotonic mutation counter
 │   ├── status.rs               CompactStatus snapshot
-│   └── memit_store.rs          MemitStore + MemitFact + memit_solve +
-│                               MemitSolveResult (vanilla closed-form, BLAS-batched)
+│   └── memit_store.rs          MemitStore + MemitFact + memit_solve
+│
+├── quant/                      Quant codec registry + format scanning
+│   ├── registry.rs             QUANT_FORMATS table + lookup() — adding a K-quant
+│   │                           is one entry. LEGACY_BLOCK_Q4_K_STRIDE = 148
+│   │                           (round-4 M5)
+│   ├── convert.rs              f32/f16 → Q4_K conversion (post-extract path)
+│   ├── convert_q4k.rs          Whole-vindex f32 → Q4_K conversion + auxfile linking
+│   └── scan.rs                 FP4 compliance scanner (exp 26 Q1 outcomes)
 │
 ├── clustering/                 Relation discovery
 │   ├── kmeans.rs               k-means clustering (BLAS via larql-compute)
 │   ├── labeling.rs             Pattern detection, TF-IDF labels
 │   ├── categories.rs           Entity category word lists
-│   ├── pair_matching/
-│   │   ├── mod.rs              Re-exports
-│   │   ├── database.rs         RelationDatabase + Wikidata/WordNet loaders
-│   │   └── labeling.rs         label_clusters_from_pairs / _from_outputs
+│   ├── pair_matching/          RelationDatabase + Wikidata/WordNet loaders
 │   └── probe.rs                Probe label loading
 │
 └── vindexfile/                 Declarative model builds

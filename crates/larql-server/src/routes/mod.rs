@@ -8,6 +8,7 @@ pub mod health;
 pub mod infer;
 pub mod insert;
 pub mod models;
+pub mod openai_embeddings;
 pub mod patches;
 pub mod relations;
 pub mod select;
@@ -57,6 +58,7 @@ const EMBED_TOKEN: &str = "/v1/embed/{token_id}";
 const LOGITS: &str = "/v1/logits";
 const TOKEN_ENCODE: &str = "/v1/token/encode";
 const TOKEN_DECODE: &str = "/v1/token/decode";
+const OPENAI_EMBEDDINGS: &str = "/v1/embeddings";
 
 const M_DESCRIBE: &str = "/v1/{model_id}/describe";
 const M_WALK: &str = "/v1/{model_id}/walk";
@@ -116,6 +118,10 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(LOGITS, post(embed::handle_logits))
         .route(TOKEN_ENCODE, get(embed::handle_token_encode))
         .route(TOKEN_DECODE, get(embed::handle_token_decode))
+        .route(
+            OPENAI_EMBEDDINGS,
+            post(openai_embeddings::handle_embeddings),
+        )
         .with_state(state)
 }
 
@@ -141,5 +147,10 @@ pub fn multi_model_router(state: Arc<AppState>) -> Router {
         .route(M_LOGITS, post(embed::handle_logits_multi))
         .route(M_TOKEN_ENCODE, get(embed::handle_token_encode_multi))
         .route(M_TOKEN_DECODE, get(embed::handle_token_decode_multi))
+        // OpenAI-compat embeddings (multi-model: client passes `model` in body).
+        .route(
+            OPENAI_EMBEDDINGS,
+            post(openai_embeddings::handle_embeddings),
+        )
         .with_state(state)
 }

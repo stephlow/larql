@@ -58,11 +58,17 @@ async fn http_models_single_lists_one_model() {
     let resp = get(app, "/v1/models").await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
-    let models = body["models"].as_array().unwrap();
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0]["id"], "gemma");
-    assert!(models[0]["features"].as_u64().is_some());
-    assert_eq!(models[0]["loaded"], true);
+    // OpenAI-compat shape: {object: "list", data: [...]}
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["id"], "gemma");
+    assert_eq!(data[0]["object"], "model");
+    assert_eq!(data[0]["owned_by"], "larql");
+    assert!(data[0]["created"].is_u64());
+    // larql-specific extras still present.
+    assert!(data[0]["features"].as_u64().is_some());
+    assert_eq!(data[0]["loaded"], true);
 }
 
 #[tokio::test]
@@ -70,7 +76,7 @@ async fn http_models_single_path_is_v1() {
     let app = single_model_router(state(vec![model("m")]));
     let resp = get(app, "/v1/models").await;
     let body = body_json(resp.into_body()).await;
-    assert_eq!(body["models"][0]["path"], "/v1");
+    assert_eq!(body["data"][0]["path"], "/v1");
 }
 
 #[tokio::test]
@@ -78,10 +84,10 @@ async fn http_models_multi_path_includes_model_id() {
     let app = multi_model_router(state(vec![model("a"), model("b")]));
     let resp = get(app, "/v1/models").await;
     let body = body_json(resp.into_body()).await;
-    let models = body["models"].as_array().unwrap();
-    assert_eq!(models.len(), 2);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
     // Multi-model paths are /v1/{id}
-    let paths: Vec<&str> = models.iter().map(|m| m["path"].as_str().unwrap()).collect();
+    let paths: Vec<&str> = data.iter().map(|m| m["path"].as_str().unwrap()).collect();
     assert!(paths.contains(&"/v1/a"));
     assert!(paths.contains(&"/v1/b"));
 }
@@ -162,7 +168,8 @@ async fn http_multi_models_lists_both() {
     let app = multi_model_router(state(vec![model("a"), model("b")]));
     let resp = get(app, "/v1/models").await;
     let body = body_json(resp.into_body()).await;
-    assert_eq!(body["models"].as_array().unwrap().len(), 2);
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]

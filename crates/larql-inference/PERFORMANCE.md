@@ -2,24 +2,48 @@
 
 Machine: M3 Max, macOS. Gemma 3 4B (34 layers, hidden=2560, vocab=262K).
 
-## Real-vindex headline (2026-04-27)
+## Real-vindex headline (2026-05-02)
 
-`larql bench output/gemma3-4b-q4k-v2.vindex --tokens 100 --warmup 8`:
+`larql bench output/gemma3-4b-q4k-v2.vindex --tokens 30 --warmup 8`:
 
 ```
 Backend       prefill    ms/tok    tok/s    steps
-larql-metal   65 ms     13.4 ms    74.6      99
-Ollama        ~10 ms/tok = 98–103 tok/s (reference, same model)
+larql-metal   ~67 ms    13.5–13.9   72–75     29
+Ollama        ~10 ms/tok = 96–104 tok/s (reference, same model)
 ```
 
-Per-stage breakdown of one decode step:
+Per-stage breakdown of one decode step (with all five fusions default-on):
 
 | Stage | ms/tok | % | What runs |
 |---|---:|---:|---|
-| GPU forward | 11.8 | 86% | `dispatch_full_pipeline` per-token Metal compute (Q4_K matvecs, fused QKV proj, GQA attention, FFN, norms) |
-| LM head    |  1.9 | 14% | Q4 matvec on `lm_head_q4.bin` + GPU argmax reduction (256K vocab) |
-| Embed / final norm / detok / sample / EOS |  0.05 | <1% | All the per-step CPU work outside the Metal compute path |
-| **Total** | **13.7** | **100%** | **= 73 tok/s** |
+| GPU forward | 11.5–12.0 | 79% | `dispatch_full_pipeline` per-token Metal compute (Q4_K matvecs, fused QKV proj + input_norm, fused QK_norm + RoPE, fused KV append + attend, fused post_attn norm + residual + store, fused gate + up, fused GEGLU + down, fused post_ffn norm + residual_add) |
+| LM head    | 2.9–3.0 | 20% | Q4 matvec on `lm_head_q4.bin` + GPU argmax reduction (256K vocab) — stride-32 reduction tree (lm_head v5) |
+| Embed / final norm / detok / sample / EOS |  0.05 | <1% | Per-step CPU work outside the Metal compute path |
+| **Total** | **13.5–14.0** | **100%** | **= 72–75 tok/s** |
+
+### Shipped Metal dispatch fusions (2026-05-01 → 2026-05-02)
+
+Five default-on fusions; `LARQL_FUSED_*=0` opt-out flags wired for diagnostics.
+Cumulative GPU forward saving ~0.99 ms vs. unfused baseline (10.45 ms → 9.46 ms
+isolated kernel time; end-to-end 71.5 → 72–75 tok/s).
+
+| Fusion | Δ GPU | Mechanic |
+|---|---:|---|
+| `qk_norm_rope_fused` | -0.10 ms | One TG/head does RMS-norm + RoPE in one pass; replaces qk_norm_qk + rope_at_pos_batched_qk |
+| `residual_norm_store` (always-on) | -0.38 ms | Single 1-TG kernel writes both `ffn_norm_out` and `h_post_attn` |
+| `post_attn_residual_norm_store_pipeline` | -0.43 ms | Triple-fused post_attn norm + residual + h_post_attn store + ffn_norm; replaces a 3-dispatch chain on the `has_post_norms` path |
+| `post_ffn_norm_residual_add_pipeline` | -0.78 ms | 1-TG kernel: RMS over down_out + residual sum into `new_h` (next-layer input) in one pass |
+| `kv_append_attend_fused_pipeline` | -0.99 ms | Per-Q-head TG cooperatively writes new K/V row at pos, `mem_device` barrier, then standard attention |
+
+### Failed fusion attempt — `attn_fused` (kept opt-in)
+
+Merging `qk_norm_rope_fused` (12 TGs) + `kv_append_attend_fused` (8 TGs) into one
+kernel regressed 74 → 64 tok/s (-1.45 ms). Diagnosis: collapsing to 8 TGs lost
+parallelism that 12 TGs had given the standalone kernel; dispatch-overhead saving
+(~30 µs) was dwarfed by the parallelism cost. Kernel registered as opt-in
+`LARQL_FUSED_ATTN=1` for any future multi-TG-per-head retry that preserves
+parallelism. **Lesson**: dispatch fusions only win when they don't reduce TG
+count for an already parallelism-bound stage. See `crates/larql-inference/ROADMAP.md`.
 
 ### Headline-vs-reality reading guide
 
@@ -27,9 +51,9 @@ The number you measure depends on **how the run is timed**:
 
 | Run shape | tok/s | Why |
 |---|---:|---|
-| `larql bench --warmup 8 --tokens 100` (steady-state) | **74.6** | Drops the 54-ms cold token, averages over enough steps for variance to wash out. **Use this for any speed comparison.** |
-| Short bench (`--max-tokens 20`, no warmup) | 67 | Cold token 1 (54 ms) dragged into the average; the per-token decode after warmup is still ~12 ms (= 80 tok/s) but the average reports 14.8. |
-| Compute `PERFORMANCE.md` 78.7 tok/s claim | 78.7 | Snapshot from the q6k_matvec correctness fix. Current state regressed ~1 ms/tok in the GPU phase. |
+| `larql bench --warmup 8 --tokens 30` (steady-state, post-fusion) | **72–75** | Drops the 54-ms cold token, averages over enough steps for variance to wash out. **Use this for any speed comparison.** Variance is ~3 tok/s between cold/warm GPU; multi-run average is the honest number. |
+| Short bench (`--max-tokens 20`, no warmup) | ~67 | Cold token 1 (54 ms) dragged into the average; the per-token decode after warmup is still ~13 ms (= 75 tok/s) but the average reports higher. |
+| Compute `PERFORMANCE.md` 78.7 tok/s claim | 78.7 | Pre-correctness-fix snapshot, on the buggy Q4_K → Q4_KF dispatch path. **Not a real reference** — see `project_metal_decode_81_was_buggy` memory. |
 
 ## LM head path matters
 
@@ -79,23 +103,27 @@ predict_honest("The capital of France is"):
 | Ollama (34L) | 10.3ms | 98 | |
 | **vs Ollama (synthetic)** | **0.83x** | — | **17% faster** |
 
-### Real vindex (larql bench, gemma3-4b-q4k-v2.vindex, 2026-04-19)
+### Real vindex (larql bench, gemma3-4b-q4k-v2.vindex, 2026-05-02)
 
-Prompt: "The capital of France is" (5 tokens), 50 tok, 3 warmup.
+Prompt: "The capital of France is" (5 tokens), 30 tok, 8 warmup, all
+five Metal dispatch fusions default-on.
 
 | Engine | prefill | ms/tok | tok/s | Notes |
 |--------|---------|--------|-------|-------|
-| **LARQL Metal** | **67.7ms** | **15.6ms** | **64.1** | |
-| Ollama gemma3:4b | ~15ms | ~10ms | ~100 | |
-| **vs Ollama (real)** | — | 1.56x slower | — | GPU forward 86% of decode |
+| **LARQL Metal** | **~67ms** | **13.5–13.9ms** | **72–75** | Five default-on fusions; lm_head v5 stride-32 reduction tree |
+| Ollama gemma3:4b | ~15ms | ~10ms | ~96–104 | |
+| **vs Ollama (real)** | — | ~1.40x slower | — | GPU fwd 79% of decode; lm_head 20% |
 
-Per-stage: embed 0.002ms · GPU fwd 14.1ms · final_norm 0.007ms · lm_head 2.0ms · detok 0.008ms
+Per-stage: embed 0.002ms · GPU fwd 11.5–12.0ms · final_norm 0.006ms · lm_head 2.9–3.0ms · detok 0.04ms
 
 Progress:
 - 2026-04-07: 28.0ms / 36 tok/s (34L synthetic) = 2.84x Ollama
 - 2026-04-08: 18.3ms / 55 tok/s (34L synthetic) = 1.79x Ollama
 - 2026-04-09: 8.5ms / 117 tok/s (34L synthetic) = 0.83x Ollama (synthetic ceiling)
 - 2026-04-19: 15.6ms / 64 tok/s (34L real vindex) — lm_head Q4 synthesis, KV cache fix
+- 2026-05-01: 13.6ms / 73 tok/s (34L real vindex) — 4 dispatch fusions default-on (qk_norm+rope, residual_norm_store, post_attn_norm, post_ffn_norm)
+- 2026-05-01: 13.4ms / 74 tok/s — 5th fusion default-on (kv_append + kv_attend)
+- 2026-05-02: 13.5–13.9ms / 72–75 tok/s — `attn_fused` merger attempt regressed and was reverted to opt-in; lm_head v5 stride-32 holds. Path-to-80 lever search documented in ROADMAP G-3
 
 ## Layer Graph Strategies
 

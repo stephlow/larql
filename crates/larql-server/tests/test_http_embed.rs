@@ -285,3 +285,95 @@ async fn http_token_encode_missing_text_returns_400() {
     let resp = get(app, "/v1/token/encode").await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ══════════════════════════════════════════════════════════════
+// POST /v1/embeddings — OpenAI-compatible embeddings (N0.4)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn http_openai_embeddings_string_input_returns_200_with_pooled_vector() {
+    // Uses the functional tokenizer so "France" tokenises cleanly.
+    let app = single_model_router(state(vec![model_functional("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": "France"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "gemma");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["object"], "embedding");
+    assert_eq!(data[0]["index"], 0);
+    let embedding = data[0]["embedding"].as_array().unwrap();
+    assert_eq!(embedding.len(), 4); // hidden_size=4 in synthetic model
+    assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(
+        body["usage"]["prompt_tokens"],
+        body["usage"]["total_tokens"]
+    );
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_string_array_returns_indexed_data() {
+    let app = single_model_router(state(vec![model_functional("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": ["France", "Germany", "capital"]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    for (i, entry) in data.iter().enumerate() {
+        assert_eq!(entry["index"], i);
+        assert_eq!(entry["object"], "embedding");
+        let v = entry["embedding"].as_array().unwrap();
+        assert_eq!(v.len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_pretokenised_single_works() {
+    let app = single_model_router(state(vec![model("test")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": [0u32, 1u32, 2u32]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_base64_format_returns_400() {
+    let app = single_model_router(state(vec![model("test")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": "hi", "encoding_format": "base64"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_empty_input_returns_400() {
+    let app = single_model_router(state(vec![model("test")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": []}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

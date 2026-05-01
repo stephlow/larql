@@ -1,6 +1,6 @@
 # Roadmap — larql-inference
 
-## Current: ~95 tok/s (Metal Q4K) | Ollama: ~101 tok/s | 4 KV engines
+## Current: 72–75 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-02) | Ollama: ~96–104 tok/s | 4 KV engines
 
 ## ✅ Metal lm_head — stride-32 Q4_K matvec, f16 GEMV fallback (correctness + perf fix, 2026-05-01)
 
@@ -493,13 +493,37 @@ re-route. Kernel and pipeline kept registered as dead code; env var
 `LARQL_FUSED_Q6K_DOWN` is a no-op until the underlying bug is
 diagnosed. See `shaders/q6k_geglu_gelu_tanh_down_cached.rs`.
 
-**Remaining gap to 80 tok/s** (~3 more fusions of similar mechanic
-needed):
+**Remaining gap to 80 tok/s** (revised after `attn_fused` failure
+2026-05-02): the simple "fuse adjacent dispatches" lever has likely
+played out. Current per-layer chain has 9 dispatches; the cheap
+ones (1-TG kernels) are already merged into adjacent multi-phase
+kernels (post_attn_residual_norm_store, post_ffn_norm_residual_add).
+The remaining 7 dispatches are all multi-TG matvecs or per-head
+attention work where merging two of them would cost more in
+parallelism than it saves in dispatch overhead — see `attn_fused`
+post-mortem below.
 
-**Realistic savings**: ~140 dispatches/tok × ~7 µs avg = **~1 ms/tok**
-end-to-end → projects to **77-80 tok/s**. Smaller than the original
-3.5 ms gap but the only one of G-1..G-3' the corrected diagnosis
-actually supports.
+**Realistic next options** (in decreasing confidence):
+1. **Multi-TG-per-head attention** (split `kv_append_attend_fused`
+   across the T dimension so each head uses 4-8 TGs instead of 1).
+   Adds parallelism rather than fusing it away. Would let attention
+   compete fairly with the matvec stages for SM occupancy. Same
+   shape as the early flash-attention work (G-3 deprecated entry).
+2. **Q4_K matvec ALU/cache audit** — Xcode GPU frame capture on
+   `q4k_ffn_gate_up_8sg` and `q4k_q6k_qkv_proj` (G-5 still open).
+   If L2 hit rate or occupancy is the bottleneck, kernel-level
+   wins are still on the table. Three earlier kernel-isolated
+   attempts came out null but they were optimising in the dark
+   (no profiler data); a real frame capture would tell us whether
+   the Q4_K matvecs are bandwidth-, cache-, or occupancy-bound.
+3. **lm_head reduction** — currently 3 ms (~25% of decode). Q4
+   matvec on vocab=262208 × hidden=2560. Hard, but a meaningful
+   target if 1+2 don't deliver.
+
+The "1 ms/tok via 3 more dispatch fusions" projection is **withdrawn**
+after the attn_fused result — the parallelism cost on Apple Silicon
+makes any further per-attention-stage merger a regression at the
+current TG counts.
 
 **Current per-layer dispatch count** (~9-10 dispatches × 34 layers):
 1. fused input_norm + QKV proj (1)
@@ -517,6 +541,24 @@ actually supports.
 - ~~Fuse `QK_norm` + `RoPE`~~ — shipped 2026-05-01, saves 1 dispatch/layer.
 - ~~Fuse `KV append` + `KV attend`~~ — shipped 2026-05-01, saves 1
   dispatch/layer × 34 = 34/tok, measured -0.21 ms.
+- ❌ **Merge qk_norm_rope + kv_append_attend into one `attn_fused`
+  kernel** (attempted 2026-05-02). Built `attn_fused.rs` with a single
+  per-Q-head TG doing all of (norm Q+K, rope Q+K, write K/V cache,
+  attend). Regressed 74.4 → 63.8 tok/s (-1.45 ms GPU). Even after
+  re-using the `(cos, sin)` per rotary pair across Q and K (avoids
+  duplicate transcendentals), still slower than the two-dispatch
+  pair. **Diagnosis**: the standalone `qk_norm_rope_fused` runs
+  `num_q + num_kv = 12` TGs in parallel; the merger collapses to
+  `num_q = 8` TGs (one per Q head) with each redundantly doing its
+  kv_head's K work. The dispatch saving (~30 µs) is dwarfed by the
+  parallelism loss (~1.45 ms). Kernel kept registered as opt-in
+  (`LARQL_FUSED_ATTN=1`) for diagnostic A/B and for a future
+  multi-TG-per-head retry that preserves parallelism. **Lesson**:
+  dispatch fusions only win when they don't reduce TG count for an
+  already parallelism-bound stage. The earlier wins (QK_norm+RoPE,
+  KV-append+attend, post_attn_residual_norm_store, post_ffn_norm)
+  were either already-1-TG kernels (parallelism-free fusions) or
+  preserved TG count.
 - Fold `V_norm` (Gemma 4 only) into `qk_norm_rope_fused` so all three
   per-head normalisations are one dispatch. Saves 1 dispatch/layer
   × 34 = 34/tok on Gemma 4 only.

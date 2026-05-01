@@ -610,23 +610,22 @@ tells us whether the in-room engineering translates to a deployable grid.
   fly.io setup probably wants per-shard token rotation (out of scope for
   Phase 1).
 
-### F0. CPU MoE correctness — server path correct, local path TBD
+### F0. CPU MoE correctness — RESOLVED ✅
 
-**Status**: Server-side resolved 2026-04-30 (gRPC grid + layer-batch
-HTTP path generates correct "Paris" / coherent poem output on
-`output/gemma4-26b-a4b-q4k.vindex`). Local in-process `larql run`
-without `--moe-shards` not re-validated this session — the kernel work
-in `larql-inference/ROADMAP.md → M-CPU-1..6` likely fixed the
-underlying issue (NEON SDOT direct-Q4K + scratch reuse + correct
-hybrid-combine ordering all share the same code path the local CPU
-inference uses), but a smoke-test run is the cheapest way to confirm.
+**Status**: Closed 2026-05-01.
 
-The remaining open item: 2026-04-27 historical analysis below describes
-the bug as it existed THEN; most of the suspects have since been
-addressed by the per-expert refactor + the M-CPU work. Re-running
-`larql run output/gemma4-26b-a4b-q4k.vindex "The capital of France is"`
-(no `--moe-shards`) and checking the output is "Paris" would close this
-out.
+Smoke-test `larql run output/gemma4-26b-a4b-q4k.vindex "The capital of
+France is" --max-tokens 5` (no `--moe-shards`, no `--metal`) returns
+**"Paris."** End-to-end CPU path on the per-layer Q4_K hybrid-MoE
+vindex now produces the correct answer; the M-CPU kernel work
+(NEON SDOT direct-Q4K + scratch reuse + correct hybrid-combine
+ordering, see `larql-inference/ROADMAP.md → M-CPU-1..6`) shared the
+code path with the server-side fix that landed 2026-04-30, so the
+local route inherited the correctness for free.
+
+The historical analysis below is preserved as forensics for future
+CPU-vs-Metal divergence debugging — the diff-and-localise pattern
+generalised better than the specific bug.
 
 **Historical context (2026-04-27, pre-M-CPU work):**
 

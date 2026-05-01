@@ -135,7 +135,10 @@ pub struct TokenDecodeQuery {
 ///
 /// Uses the f16-at-rest store (with L1 cache) when available; falls back to
 /// the eagerly-decoded f32 `model.embeddings` matrix otherwise.
-fn embed_tokens(model: &LoadedModel, token_ids: &[u32]) -> Result<Array2<f32>, ServerError> {
+pub(crate) fn embed_tokens(
+    model: &LoadedModel,
+    token_ids: &[u32],
+) -> Result<Array2<f32>, ServerError> {
     let hidden = model.config.hidden_size;
     let mut h = Array2::<f32>::zeros((token_ids.len(), hidden));
 

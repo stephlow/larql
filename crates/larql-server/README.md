@@ -834,8 +834,25 @@ Always accessible (exempt from API key auth).
 
 #### GET /v1/models
 
+OpenAI-compatible shape (works with the `openai` Python/JS SDK as-is).
+Larql-specific fields (`path`, `features`, `loaded`) are present as
+extras — OpenAI clients ignore them.
+
 ```json
-{"models": [{"id": "gemma-3-4b-it", "path": "/v1", "features": 348160, "loaded": true}]}
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gemma-3-4b-it",
+      "object": "model",
+      "created": 1746094800,
+      "owned_by": "larql",
+      "path": "/v1",
+      "features": 348160,
+      "loaded": true
+    }
+  ]
+}
 ```
 
 ## Authentication

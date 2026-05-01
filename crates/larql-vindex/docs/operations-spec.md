@@ -555,50 +555,34 @@ pub trait IndexLoadCallbacks {
 
 ## 5. Crate Structure
 
-```
-larql-vindex/
-├── Cargo.toml
-└── src/
-    ├── lib.rs                      Crate root + re-exports
-    ├── error.rs                    VindexError (including InsufficientExtractLevel)
-    ├── describe.rs                 DescribeEdge, LabelSource
-    │
-    ├── config/                     Configuration types
-    │   ├── types.rs                VindexConfig, ExtractLevel, LayerBands, MoeConfig
-    │   └── dtype.rs                StorageDtype (f32/f16), conversion utilities
-    │
-    ├── index/                      In-memory KNN engine
-    │   ├── core.rs                 VectorIndex, FeatureMeta, gate_knn, walk
-    │   └── mutate.rs               set/delete features, find_free_feature, save to disk
-    │
-    ├── format/                     Vindex file I/O
-    │   ├── load.rs                 load_vindex, load_embeddings, load_tokenizer
-    │   ├── down_meta.rs            Binary down_meta read/write
-    │   ├── weights.rs              Split weight files (attn, up, down, norms, lm_head)
-    │   ├── checksums.rs            SHA256 computation + verification
-    │   ├── huggingface.rs          HuggingFace Hub download/publish
-    │   └── quant/mod.rs            Re-exports from larql_models::quant
-    │
-    ├── extract/                    Build pipeline (model → vindex)
-    │   ├── build.rs                build_vindex (full extraction + clustering)
-    │   ├── streaming.rs            Streaming extraction (mmap, no full model load)
-    │   ├── callbacks.rs            IndexBuildCallbacks trait
-    │   └── build_from_vectors.rs   Build from pre-extracted NDJSON
-    │
-    ├── patch/                      Patch system
-    │   └── core.rs                 VindexPatch, PatchOp, PatchedVindex, base64 gate encoding
-    │
-    ├── clustering/                 Relation discovery
-    │   ├── kmeans.rs               k-means clustering
-    │   ├── labeling.rs             Pattern detection, TF-IDF labels
-    │   ├── categories.rs           Entity category word lists
-    │   ├── pair_matching.rs        Wikidata/WordNet output matching
-    │   └── probe.rs                Probe label loading
-    │
-    └── vindexfile/                 Declarative model builds
-        ├── mod.rs                  Build executor (FROM → PATCH → INSERT → bake_down)
-        └── parser.rs               Vindexfile parser
-```
+The full annotated source tree lives in [`crates/larql-vindex/README.md`](../README.md#crate-structure)
+under the **Crate Structure** section. It's the single source of
+truth — keeping two trees in two places is exactly the kind of
+drift the round-1/2/4 audits found.
+
+Highlights of the layout consumers usually need to know:
+
+- **`index/`** — `VectorIndex` + the substores it composes. Sibling
+  modules under `index/compute/gate_knn/`, `index/storage/ffn_store/`,
+  and `index/storage/lm_head/` each carry one impl-block fragment for
+  one concern (KNN dispatch, HNSW lifecycle, per-format FFN accessors,
+  lm_head loaders/KNN). All public methods stay reachable through the
+  same `VectorIndex` API.
+- **`extract/build/`** — `BuildContext` 6-stage pipeline:
+  `mod.rs` orchestrates + holds the small stages, with `down_meta.rs`,
+  `index_json.rs`, and `resume.rs` as siblings.
+- **`format/filenames.rs`** — single source of truth for every
+  `.bin` / `.json` filename. A typo at any reader/writer site is now
+  a compile error.
+- **`format/weights/manifest.rs` + `quant/registry.rs`** — typed
+  Q4_K manifest entries and the format registry (`QUANT_FORMATS` +
+  `lookup`). Adding a K-quant is one entry plus codec functions.
+- **`engine/`** (formerly `storage/`) — `StorageEngine` +
+  epoch + MEMIT cycles.
+- **`patch/`** — `VindexPatch` / `PatchOp` / `PatchedVindex`
+  overlay. `Insert` / `Update` carry optional `gate_vector_b64` /
+  `up_vector_b64` / `down_vector_b64` so a `.vlp` round-trips losslessly
+  through `apply_patch` → `COMPILE INTO VINDEX`.
 
 **Dependencies:** `larql-models` (ModelWeights, architectures, quant, loading), `ndarray` (BLAS), `serde`/`serde_json`, `tokenizers`, `thiserror`
 
