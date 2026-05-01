@@ -6,8 +6,9 @@ use larql_inference::attention::run_attention_block_with_pre_o;
 use larql_inference::attention::SharedKV;
 use larql_inference::forward::ple::precompute_per_layer_inputs;
 use larql_inference::forward::{
-    embed_tokens_pub, run_layer_with_ffn, run_layer_with_replaced_pre_o_head,
-    run_layer_with_subtracted_pre_o_heads, run_layer_with_zeroed_pre_o_heads,
+    dot_proj, embed_tokens_pub, run_layer_with_ffn, run_layer_with_replaced_head_residual_delta,
+    run_layer_with_replaced_pre_o_head, run_layer_with_subtracted_pre_o_heads,
+    run_layer_with_zeroed_pre_o_heads,
 };
 use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
 use larql_vindex::{
@@ -36,6 +37,15 @@ enum OvRdCommand {
 
     /// Sanity checks for pre-W_O replacement and W_O block equivalence.
     SanityCheck(SanityCheckArgs),
+
+    /// Oracle RD plumbing check: W_O-coordinate roundtrip with no truncation.
+    OracleRoundtrip(OracleRoundtripArgs),
+
+    /// Oracle RD: unquantized low-rank sweep in W_O-visible coordinates.
+    OracleLowrank(OracleLowrankArgs),
+
+    /// Oracle RD: oracle-addressed product quantization in PCA coordinates.
+    OraclePq(OraclePqArgs),
 }
 
 #[derive(Args)]
@@ -63,6 +73,14 @@ struct CaptureArgs {
     /// Limit token positions per prompt for smoke runs.
     #[arg(long)]
     max_positions: Option<usize>,
+
+    /// Also compute W_O-visible residual-contribution statistics.
+    ///
+    /// This is slower than raw pre-W_O capture because it projects each head
+    /// through its W_O block, but it gives the ranking the downstream residual
+    /// actually sees.
+    #[arg(long)]
+    wo_visible: bool,
 }
 
 #[derive(Args)]
@@ -117,6 +135,16 @@ struct StaticReplaceArgs {
     /// Limit prompts for bounded gate runs.
     #[arg(long)]
     max_prompts: Option<usize>,
+
+    /// Evaluate only prompts where prompt_index % eval_mod == eval_offset.
+    /// The remaining prompts are used to fit static means. Omit for in-sample
+    /// fit/eval on the same prompt set.
+    #[arg(long)]
+    eval_mod: Option<usize>,
+
+    /// Held-out modulo offset used with --eval-mod.
+    #[arg(long, default_value_t = 0)]
+    eval_offset: usize,
 }
 
 #[derive(Args)]
@@ -142,7 +170,118 @@ struct SanityCheckArgs {
     max_prompts: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Args)]
+struct OracleRoundtripArgs {
+    /// Self-contained Q4K vindex directory.
+    #[arg(long)]
+    index: PathBuf,
+
+    /// JSONL prompt file. Each line must include at least {"prompt": "..."}.
+    #[arg(long)]
+    prompts: PathBuf,
+
+    /// Output directory.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Explicit heads as layer:head comma list, e.g. 0:4,0:6.
+    #[arg(long)]
+    heads: String,
+
+    /// Relative singular value cutoff for retained W_O-visible directions.
+    #[arg(long, default_value_t = 1e-6)]
+    sigma_rel_cutoff: f64,
+
+    /// Limit prompts for bounded sanity runs.
+    #[arg(long)]
+    max_prompts: Option<usize>,
+}
+
+#[derive(Args)]
+struct OracleLowrankArgs {
+    /// Self-contained Q4K vindex directory.
+    #[arg(long)]
+    index: PathBuf,
+
+    /// JSONL prompt file. Each line must include at least {"prompt": "..."}.
+    #[arg(long)]
+    prompts: PathBuf,
+
+    /// Output directory.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Explicit heads as layer:head comma list, e.g. 0:4,0:6.
+    #[arg(long)]
+    heads: String,
+
+    /// Comma-separated K values for the low-rank sweep.
+    #[arg(long, default_value = "1,2,4,8,16,32")]
+    ks: String,
+
+    /// Relative singular value cutoff for retained W_O-visible directions.
+    #[arg(long, default_value_t = 1e-6)]
+    sigma_rel_cutoff: f64,
+
+    /// Limit prompts for bounded sanity runs.
+    #[arg(long)]
+    max_prompts: Option<usize>,
+}
+
+#[derive(Args)]
+struct OraclePqArgs {
+    /// Self-contained Q4K vindex directory.
+    #[arg(long)]
+    index: PathBuf,
+
+    /// JSONL prompt file. Each line must include at least {"prompt": "..."}.
+    #[arg(long)]
+    prompts: PathBuf,
+
+    /// Output directory.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Explicit heads as layer:head comma list, e.g. 0:6.
+    #[arg(long)]
+    heads: String,
+
+    /// Comma-separated PQ configs as K:groups:bits, e.g. 128:16:4,192:24:4.
+    #[arg(long)]
+    configs: String,
+
+    /// Relative singular value cutoff for retained W_O-visible directions.
+    #[arg(long, default_value_t = 1e-6)]
+    sigma_rel_cutoff: f64,
+
+    /// Lloyd iterations per product-codebook group.
+    #[arg(long, default_value_t = 25)]
+    pq_iters: usize,
+
+    /// Also materialize residual-space additive tables and compare Mode D injection.
+    #[arg(long)]
+    mode_d_check: bool,
+
+    /// Limit prompts for bounded oracle runs.
+    #[arg(long)]
+    max_prompts: Option<usize>,
+
+    /// Keep at most N prompts per stratum after loading. Useful for balanced
+    /// held-out smoke runs from a larger ordered corpus.
+    #[arg(long)]
+    max_per_stratum: Option<usize>,
+
+    /// Evaluate only prompts where prompt_index % eval_mod == eval_offset.
+    /// The remaining prompts are used to fit static means, PCA, and PQ.
+    #[arg(long)]
+    eval_mod: Option<usize>,
+
+    /// Held-out modulo offset used with --eval-mod.
+    #[arg(long, default_value_t = 0)]
+    eval_offset: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PromptRecord {
     id: Option<String>,
     stratum: Option<String>,
@@ -323,6 +462,8 @@ struct HeadReport {
     head: usize,
     head_dim: usize,
     stats: FinishedHeadStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wo_visible_stats: Option<FinishedHeadStats>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -332,6 +473,8 @@ struct CaptureReport {
     prompts_seen: usize,
     layers: Vec<usize>,
     max_positions: Option<usize>,
+    #[serde(default)]
+    wo_visible: bool,
     heads: Vec<HeadReport>,
 }
 
@@ -429,6 +572,11 @@ struct StaticReplacementReport {
     index: String,
     prompt_file: String,
     prompts_seen: usize,
+    train_prompts_seen: usize,
+    eval_prompts_seen: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_mod: Option<usize>,
+    eval_offset: usize,
     selected_heads: Vec<HeadId>,
     heads: Vec<StaticHeadReport>,
 }
@@ -450,6 +598,9 @@ struct SanityHeadReport {
     noop_mean_kl: f64,
     noop_max_kl: f64,
     noop_max_abs_logit_diff: f64,
+    residual_delta_noop_mean_kl: f64,
+    residual_delta_noop_max_kl: f64,
+    residual_delta_noop_max_abs_logit_diff: f64,
     zero_subtract_mean_kl: f64,
     zero_subtract_max_kl: f64,
     zero_subtract_max_abs_logit_diff: f64,
@@ -462,8 +613,462 @@ struct SanityPromptReport {
     stratum: String,
     noop_kl: f64,
     noop_max_abs_logit_diff: f64,
+    residual_delta_noop_kl: f64,
+    residual_delta_noop_max_abs_logit_diff: f64,
     zero_subtract_kl: f64,
     zero_subtract_max_abs_logit_diff: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleRoundtripReport {
+    index: String,
+    prompt_file: String,
+    prompts_seen: usize,
+    sigma_rel_cutoff: f64,
+    selected_heads: Vec<HeadId>,
+    heads: Vec<OracleRoundtripHeadReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleRoundtripHeadReport {
+    layer: usize,
+    head: usize,
+    head_dim: usize,
+    rank_retained: usize,
+    sigma_max: f64,
+    sigma_min_retained: f64,
+    sigma_rel_cutoff: f64,
+    prompts: usize,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    max_abs_logit_diff: f64,
+    mean_pre_wo_l2: f64,
+    max_pre_wo_l2: f64,
+    mean_wo_visible_l2: f64,
+    max_wo_visible_l2: f64,
+    per_prompt: Vec<OracleRoundtripPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OracleRoundtripPromptReport {
+    id: String,
+    stratum: String,
+    kl: f64,
+    max_abs_logit_diff: f64,
+    pre_wo_l2: f64,
+    wo_visible_l2: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleLowrankReport {
+    index: String,
+    prompt_file: String,
+    prompts_seen: usize,
+    static_base: String,
+    ks: Vec<usize>,
+    sigma_rel_cutoff: f64,
+    selected_heads: Vec<HeadId>,
+    heads: Vec<OracleLowrankHeadReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleLowrankHeadReport {
+    layer: usize,
+    head: usize,
+    head_dim: usize,
+    rank_retained: usize,
+    empirical_rank: usize,
+    sigma_max: f64,
+    sigma_min_retained: f64,
+    static_train_samples: u64,
+    points: Vec<OracleLowrankPointReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleLowrankPointReport {
+    k: usize,
+    prompts: usize,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    mean_delta_cross_entropy_bits: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+    mean_baseline_top1_prob: f64,
+    mean_lowrank_prob_of_baseline_top1: f64,
+    mean_baseline_top1_margin: f64,
+    mean_pre_wo_l2: f64,
+    mean_wo_visible_l2: f64,
+    per_prompt: Vec<OracleLowrankPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OracleLowrankPromptReport {
+    id: String,
+    stratum: String,
+    kl: f64,
+    delta_cross_entropy_bits: f64,
+    baseline_top1: u32,
+    lowrank_top1: u32,
+    top1_agree: bool,
+    baseline_top1_in_lowrank_top5: bool,
+    baseline_top1_prob: f64,
+    baseline_top2: u32,
+    baseline_top2_prob: f64,
+    baseline_top1_margin: f64,
+    lowrank_top1_prob: f64,
+    lowrank_prob_of_baseline_top1: f64,
+    lowrank_top1_margin: f64,
+    pre_wo_l2: f64,
+    wo_visible_l2: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+struct PqConfig {
+    k: usize,
+    groups: usize,
+    bits_per_group: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OraclePqReport {
+    index: String,
+    prompt_file: String,
+    prompts_seen: usize,
+    train_prompts_seen: usize,
+    eval_prompts_seen: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_per_stratum: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_mod: Option<usize>,
+    eval_offset: usize,
+    static_base: String,
+    configs: Vec<PqConfig>,
+    sigma_rel_cutoff: f64,
+    pq_iters: usize,
+    mode_d_check: bool,
+    selected_heads: Vec<HeadId>,
+    heads: Vec<OraclePqHeadReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct OraclePqHeadReport {
+    layer: usize,
+    head: usize,
+    head_dim: usize,
+    rank_retained: usize,
+    empirical_rank: usize,
+    sigma_max: f64,
+    sigma_min_retained: f64,
+    static_train_samples: u64,
+    points: Vec<OraclePqPointReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct OraclePqPointReport {
+    k: usize,
+    groups: usize,
+    bits_per_group: usize,
+    oracle_address_bits: usize,
+    coefficient_codebook_bytes_f32: usize,
+    mode_d_residual_table_bytes_bf16: usize,
+    prompts: usize,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    mean_delta_cross_entropy_bits: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+    mean_baseline_top1_prob: f64,
+    mean_pq_prob_of_baseline_top1: f64,
+    mean_baseline_top1_margin: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_mean_kl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_p95_kl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_max_kl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_top1_agreement: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_top5_contains_baseline_top1: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coeff_mode_d_max_abs_logit_diff: Option<f64>,
+    mean_pre_wo_l2: f64,
+    mean_wo_visible_l2: f64,
+    per_prompt: Vec<OraclePqPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OraclePqPromptReport {
+    id: String,
+    stratum: String,
+    kl: f64,
+    delta_cross_entropy_bits: f64,
+    baseline_top1: u32,
+    pq_top1: u32,
+    top1_agree: bool,
+    baseline_top1_in_pq_top5: bool,
+    baseline_top1_prob: f64,
+    baseline_top2: u32,
+    baseline_top2_prob: f64,
+    baseline_top1_margin: f64,
+    pq_top1_prob: f64,
+    pq_prob_of_baseline_top1: f64,
+    pq_top1_margin: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_kl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_top1: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_d_top1_agree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_top1_in_mode_d_top5: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coeff_mode_d_max_abs_logit_diff: Option<f64>,
+    pre_wo_l2: f64,
+    wo_visible_l2: f64,
+}
+
+#[derive(Debug)]
+struct OraclePqPointAccumulator {
+    prompts: Vec<OraclePqPromptReport>,
+}
+
+impl OraclePqPointAccumulator {
+    fn new() -> Self {
+        Self {
+            prompts: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, prompt: OraclePqPromptReport) {
+        self.prompts.push(prompt);
+    }
+
+    fn finish(self, config: PqConfig, hidden_dim: usize) -> OraclePqPointReport {
+        let kls: Vec<f64> = self.prompts.iter().map(|p| p.kl).collect();
+        let levels = 1usize << config.bits_per_group;
+        let mode_d_kls = self
+            .prompts
+            .iter()
+            .filter_map(|p| p.mode_d_kl)
+            .collect::<Vec<_>>();
+        let coeff_mode_d_diffs = self
+            .prompts
+            .iter()
+            .filter_map(|p| p.coeff_mode_d_max_abs_logit_diff)
+            .collect::<Vec<_>>();
+        OraclePqPointReport {
+            k: config.k,
+            groups: config.groups,
+            bits_per_group: config.bits_per_group,
+            oracle_address_bits: config.groups * config.bits_per_group,
+            coefficient_codebook_bytes_f32: config.groups
+                * levels
+                * (config.k / config.groups)
+                * std::mem::size_of::<f32>(),
+            mode_d_residual_table_bytes_bf16: config.groups * levels * hidden_dim * 2,
+            prompts: self.prompts.len(),
+            mean_kl: mean(&kls),
+            p95_kl: percentile(kls.clone(), 0.95),
+            max_kl: kls.iter().copied().fold(0.0, f64::max),
+            mean_delta_cross_entropy_bits: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.delta_cross_entropy_bits)
+                    .collect::<Vec<_>>(),
+            ),
+            top1_agreement: bool_rate(self.prompts.iter().map(|p| p.top1_agree)),
+            top5_contains_baseline_top1: bool_rate(
+                self.prompts.iter().map(|p| p.baseline_top1_in_pq_top5),
+            ),
+            mean_baseline_top1_prob: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_prob)
+                    .collect::<Vec<_>>(),
+            ),
+            mean_pq_prob_of_baseline_top1: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.pq_prob_of_baseline_top1)
+                    .collect::<Vec<_>>(),
+            ),
+            mean_baseline_top1_margin: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_margin)
+                    .collect::<Vec<_>>(),
+            ),
+            mode_d_mean_kl: if mode_d_kls.is_empty() {
+                None
+            } else {
+                Some(mean(&mode_d_kls))
+            },
+            mode_d_p95_kl: if mode_d_kls.is_empty() {
+                None
+            } else {
+                Some(percentile(mode_d_kls.clone(), 0.95))
+            },
+            mode_d_max_kl: if mode_d_kls.is_empty() {
+                None
+            } else {
+                Some(mode_d_kls.iter().copied().fold(0.0, f64::max))
+            },
+            mode_d_top1_agreement: if mode_d_kls.is_empty() {
+                None
+            } else {
+                Some(bool_rate(
+                    self.prompts.iter().filter_map(|p| p.mode_d_top1_agree),
+                ))
+            },
+            mode_d_top5_contains_baseline_top1: if mode_d_kls.is_empty() {
+                None
+            } else {
+                Some(bool_rate(
+                    self.prompts
+                        .iter()
+                        .filter_map(|p| p.baseline_top1_in_mode_d_top5),
+                ))
+            },
+            coeff_mode_d_max_abs_logit_diff: if coeff_mode_d_diffs.is_empty() {
+                None
+            } else {
+                Some(coeff_mode_d_diffs.iter().copied().fold(0.0, f64::max))
+            },
+            mean_pre_wo_l2: mean(&self.prompts.iter().map(|p| p.pre_wo_l2).collect::<Vec<_>>()),
+            mean_wo_visible_l2: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.wo_visible_l2)
+                    .collect::<Vec<_>>(),
+            ),
+            per_prompt: self.prompts,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OracleLowrankPointAccumulator {
+    prompts: Vec<OracleLowrankPromptReport>,
+}
+
+impl OracleLowrankPointAccumulator {
+    fn new() -> Self {
+        Self {
+            prompts: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, prompt: OracleLowrankPromptReport) {
+        self.prompts.push(prompt);
+    }
+
+    fn finish(self, k: usize) -> OracleLowrankPointReport {
+        let kls: Vec<f64> = self.prompts.iter().map(|p| p.kl).collect();
+        let mean_delta_cross_entropy_bits = mean(
+            &self
+                .prompts
+                .iter()
+                .map(|p| p.delta_cross_entropy_bits)
+                .collect::<Vec<_>>(),
+        );
+        OracleLowrankPointReport {
+            k,
+            prompts: self.prompts.len(),
+            mean_kl: mean(&kls),
+            p95_kl: percentile(kls.clone(), 0.95),
+            max_kl: kls.iter().copied().fold(0.0, f64::max),
+            mean_delta_cross_entropy_bits,
+            top1_agreement: bool_rate(self.prompts.iter().map(|p| p.top1_agree)),
+            top5_contains_baseline_top1: bool_rate(
+                self.prompts.iter().map(|p| p.baseline_top1_in_lowrank_top5),
+            ),
+            mean_baseline_top1_prob: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_prob)
+                    .collect::<Vec<_>>(),
+            ),
+            mean_lowrank_prob_of_baseline_top1: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.lowrank_prob_of_baseline_top1)
+                    .collect::<Vec<_>>(),
+            ),
+            mean_baseline_top1_margin: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_margin)
+                    .collect::<Vec<_>>(),
+            ),
+            mean_pre_wo_l2: mean(&self.prompts.iter().map(|p| p.pre_wo_l2).collect::<Vec<_>>()),
+            mean_wo_visible_l2: mean(
+                &self
+                    .prompts
+                    .iter()
+                    .map(|p| p.wo_visible_l2)
+                    .collect::<Vec<_>>(),
+            ),
+            per_prompt: self.prompts,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OracleRoundtripAccumulator {
+    prompts: Vec<OracleRoundtripPromptReport>,
+}
+
+impl OracleRoundtripAccumulator {
+    fn new() -> Self {
+        Self {
+            prompts: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, prompt: OracleRoundtripPromptReport) {
+        self.prompts.push(prompt);
+    }
+
+    fn finish(self, head: HeadId, basis: &WoRoundtripBasis) -> OracleRoundtripHeadReport {
+        let kls: Vec<f64> = self.prompts.iter().map(|p| p.kl).collect();
+        let pre_l2: Vec<f64> = self.prompts.iter().map(|p| p.pre_wo_l2).collect();
+        let visible_l2: Vec<f64> = self.prompts.iter().map(|p| p.wo_visible_l2).collect();
+        OracleRoundtripHeadReport {
+            layer: head.layer,
+            head: head.head,
+            head_dim: basis.head_dim,
+            rank_retained: basis.rank_retained(),
+            sigma_max: basis.sigma_max,
+            sigma_min_retained: basis.sigma_min_retained,
+            sigma_rel_cutoff: basis.sigma_rel_cutoff,
+            prompts: self.prompts.len(),
+            mean_kl: mean(&kls),
+            p95_kl: percentile(kls.clone(), 0.95),
+            max_kl: kls.iter().copied().fold(0.0, f64::max),
+            max_abs_logit_diff: self
+                .prompts
+                .iter()
+                .map(|p| p.max_abs_logit_diff)
+                .fold(0.0, f64::max),
+            mean_pre_wo_l2: mean(&pre_l2),
+            max_pre_wo_l2: pre_l2.iter().copied().fold(0.0, f64::max),
+            mean_wo_visible_l2: mean(&visible_l2),
+            max_wo_visible_l2: visible_l2.iter().copied().fold(0.0, f64::max),
+            per_prompt: self.prompts,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -484,6 +1089,11 @@ impl SanityHeadAccumulator {
 
     fn finish(self, head: HeadId) -> SanityHeadReport {
         let noop_kls: Vec<f64> = self.prompts.iter().map(|p| p.noop_kl).collect();
+        let residual_delta_noop_kls: Vec<f64> = self
+            .prompts
+            .iter()
+            .map(|p| p.residual_delta_noop_kl)
+            .collect();
         let zero_subtract_kls: Vec<f64> = self.prompts.iter().map(|p| p.zero_subtract_kl).collect();
         SanityHeadReport {
             layer: head.layer,
@@ -495,6 +1105,13 @@ impl SanityHeadAccumulator {
                 .prompts
                 .iter()
                 .map(|p| p.noop_max_abs_logit_diff)
+                .fold(0.0, f64::max),
+            residual_delta_noop_mean_kl: mean(&residual_delta_noop_kls),
+            residual_delta_noop_max_kl: residual_delta_noop_kls.iter().copied().fold(0.0, f64::max),
+            residual_delta_noop_max_abs_logit_diff: self
+                .prompts
+                .iter()
+                .map(|p| p.residual_delta_noop_max_abs_logit_diff)
                 .fold(0.0, f64::max),
             zero_subtract_mean_kl: mean(&zero_subtract_kls),
             zero_subtract_max_kl: zero_subtract_kls.iter().copied().fold(0.0, f64::max),
@@ -696,6 +1313,9 @@ pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
         OvRdCommand::ZeroAblate(zero) => run_zero_ablate(zero),
         OvRdCommand::StaticReplace(static_replace) => run_static_replace(static_replace),
         OvRdCommand::SanityCheck(sanity) => run_sanity_check(sanity),
+        OvRdCommand::OracleRoundtrip(roundtrip) => run_oracle_roundtrip(roundtrip),
+        OvRdCommand::OracleLowrank(lowrank) => run_oracle_lowrank(lowrank),
+        OvRdCommand::OraclePq(pq) => run_oracle_pq(pq),
     }
 }
 
@@ -738,6 +1358,20 @@ fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .collect();
+    let mut wo_visible_stats: Vec<Vec<Option<RunningHeadStats>>> = (0..weights.num_layers)
+        .map(|layer| {
+            let heads = weights.arch.num_q_heads_for_layer(layer);
+            (0..heads)
+                .map(|_| {
+                    if args.wo_visible {
+                        Some(RunningHeadStats::new(weights.hidden_size))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .collect();
 
     for (prompt_idx, record) in prompts.iter().enumerate() {
         let label = record
@@ -768,6 +1402,20 @@ fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
                     weights.arch.head_dim_for_layer(layer),
                     args.max_positions,
                 );
+                if args.wo_visible {
+                    let w_o = weights
+                        .tensors
+                        .get(&weights.arch.attn_o_key(layer))
+                        .ok_or_else(|| format!("missing W_O tensor at layer {layer}"))?;
+                    add_pre_o_wo_visible_stats(
+                        &mut wo_visible_stats[layer],
+                        &pre_o,
+                        w_o,
+                        weights.arch.num_q_heads_for_layer(layer),
+                        weights.arch.head_dim_for_layer(layer),
+                        args.max_positions,
+                    );
+                }
             }
 
             {
@@ -798,6 +1446,9 @@ fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
                 head,
                 head_dim,
                 stats: stat.finish(),
+                wo_visible_stats: wo_visible_stats[layer][head]
+                    .as_ref()
+                    .map(RunningHeadStats::finish),
             });
         }
     }
@@ -808,6 +1459,7 @@ fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
         prompts_seen: prompts.len(),
         layers,
         max_positions: args.max_positions,
+        wo_visible: args.wo_visible,
         heads,
     };
 
@@ -950,9 +1602,46 @@ fn run_static_replace(args: StaticReplaceArgs) -> Result<(), Box<dyn std::error:
     let prompts = load_prompts(&args.prompts, args.max_prompts)?;
     eprintln!("Selected heads: {:?}", selected_heads);
     eprintln!("Prompts: {}", prompts.len());
+    let (fit_prompts, eval_prompts): (Vec<PromptRecord>, Vec<PromptRecord>) =
+        if let Some(eval_mod) = args.eval_mod {
+            if eval_mod == 0 {
+                return Err("--eval-mod must be greater than zero".into());
+            }
+            if args.eval_offset >= eval_mod {
+                return Err("--eval-offset must be smaller than --eval-mod".into());
+            }
+            let mut fit = Vec::new();
+            let mut eval = Vec::new();
+            for (idx, prompt) in prompts.iter().cloned().enumerate() {
+                if idx % eval_mod == args.eval_offset {
+                    eval.push(prompt);
+                } else {
+                    fit.push(prompt);
+                }
+            }
+            if fit.is_empty() || eval.is_empty() {
+                return Err("held-out split produced an empty fit or eval set".into());
+            }
+            eprintln!(
+                "Held-out split: fit_prompts={}, eval_prompts={} (idx % {} == {})",
+                fit.len(),
+                eval.len(),
+                eval_mod,
+                args.eval_offset
+            );
+            (fit, eval)
+        } else {
+            (prompts.clone(), prompts.clone())
+        };
 
     eprintln!("Pass 1/2: fitting static pre-W_O means");
-    let means = fit_static_means(&mut weights, &index, &tokenizer, &prompts, &selected_heads)?;
+    let means = fit_static_means(
+        &mut weights,
+        &index,
+        &tokenizer,
+        &fit_prompts,
+        &selected_heads,
+    )?;
 
     eprintln!("Pass 2/2: evaluating static replacements");
     let mut accumulators: HashMap<(HeadId, &'static str), StaticModeAccumulator> = HashMap::new();
@@ -962,13 +1651,13 @@ fn run_static_replace(args: StaticReplaceArgs) -> Result<(), Box<dyn std::error:
         }
     }
 
-    for (prompt_idx, record) in prompts.iter().enumerate() {
+    for (prompt_idx, record) in eval_prompts.iter().enumerate() {
         let label = record
             .id
             .as_deref()
             .or(record.stratum.as_deref())
             .unwrap_or("prompt");
-        eprintln!("  [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+        eprintln!("  [{}/{}] {}", prompt_idx + 1, eval_prompts.len(), label);
 
         let token_ids = encode_prompt(&tokenizer, &*weights.arch, &record.prompt)?;
         if token_ids.is_empty() {
@@ -980,7 +1669,6 @@ fn run_static_replace(args: StaticReplaceArgs) -> Result<(), Box<dyn std::error:
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
-
         for head in &selected_heads {
             let head_means = means.get(head).ok_or_else(|| {
                 format!("missing fitted means for L{} H{}", head.layer, head.head)
@@ -1039,6 +1727,10 @@ fn run_static_replace(args: StaticReplaceArgs) -> Result<(), Box<dyn std::error:
         index: args.index.display().to_string(),
         prompt_file: args.prompts.display().to_string(),
         prompts_seen: prompts.len(),
+        train_prompts_seen: fit_prompts.len(),
+        eval_prompts_seen: eval_prompts.len(),
+        eval_mod: args.eval_mod,
+        eval_offset: args.eval_offset,
         selected_heads,
         heads: head_reports,
     };
@@ -1112,6 +1804,15 @@ fn run_sanity_check(args: SanityCheckArgs) -> Result<(), Box<dyn std::error::Err
             let noop_logits = final_logits(&weights, &noop_hidden);
             let noop_logp = log_softmax(&noop_logits);
 
+            let residual_delta_noop_hidden = forward_q4k_noop_replace_head_residual_delta(
+                &mut weights,
+                &token_ids,
+                &index,
+                head,
+            )?;
+            let residual_delta_noop_logits = final_logits(&weights, &residual_delta_noop_hidden);
+            let residual_delta_noop_logp = log_softmax(&residual_delta_noop_logits);
+
             let zero_hidden = forward_q4k_zero_pre_o_head(&mut weights, &token_ids, &index, head)?;
             let zero_logits = final_logits(&weights, &zero_hidden);
             let zero_logp = log_softmax(&zero_logits);
@@ -1126,6 +1827,11 @@ fn run_sanity_check(args: SanityCheckArgs) -> Result<(), Box<dyn std::error::Err
                 stratum: stratum.to_string(),
                 noop_kl: kl_logp(&baseline_logp, &noop_logp),
                 noop_max_abs_logit_diff: max_abs_diff(&baseline_logits, &noop_logits),
+                residual_delta_noop_kl: kl_logp(&baseline_logp, &residual_delta_noop_logp),
+                residual_delta_noop_max_abs_logit_diff: max_abs_diff(
+                    &baseline_logits,
+                    &residual_delta_noop_logits,
+                ),
                 zero_subtract_kl: kl_logp(&zero_logp, &subtract_logp),
                 zero_subtract_max_abs_logit_diff: max_abs_diff(&zero_logits, &subtract_logits),
             });
@@ -1147,6 +1853,642 @@ fn run_sanity_check(args: SanityCheckArgs) -> Result<(), Box<dyn std::error::Err
     };
 
     let out_path = args.out.join("sanity_check.json");
+    let file = std::fs::File::create(&out_path)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    eprintln!("Wrote {}", out_path.display());
+
+    Ok(())
+}
+
+fn run_oracle_roundtrip(args: OracleRoundtripArgs) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&args.out)?;
+
+    eprintln!("Loading vindex: {}", args.index.display());
+    let start = Instant::now();
+    let mut cb = SilentLoadCallbacks;
+    let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
+    index.load_attn_q4k(&args.index)?;
+    index.load_interleaved_q4k(&args.index)?;
+    let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
+    let tokenizer = load_vindex_tokenizer(&args.index)?;
+    if weights.arch.is_hybrid_moe() {
+        return Err("ov-rd oracle-roundtrip currently supports dense FFN vindexes only".into());
+    }
+    eprintln!(
+        "  {} layers, hidden_size={}, q_heads={}, head_dim={} ({:.1}s)",
+        weights.num_layers,
+        weights.hidden_size,
+        weights.num_q_heads,
+        weights.head_dim,
+        start.elapsed().as_secs_f64()
+    );
+
+    let selected_heads = parse_head_spec(&args.heads)?;
+    if selected_heads.is_empty() {
+        return Err("no heads selected for oracle roundtrip".into());
+    }
+    let prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    eprintln!("Selected heads: {:?}", selected_heads);
+    eprintln!("Prompts: {}", prompts.len());
+
+    eprintln!("Building W_O-visible roundtrip bases");
+    let bases =
+        build_roundtrip_bases(&mut weights, &index, &selected_heads, args.sigma_rel_cutoff)?;
+    for head in &selected_heads {
+        let basis = bases
+            .get(head)
+            .ok_or_else(|| format!("missing basis for L{} H{}", head.layer, head.head))?;
+        eprintln!(
+            "  L{}H{} rank={} sigma_max={:.6} sigma_min_retained={:.6}",
+            head.layer,
+            head.head,
+            basis.rank_retained(),
+            basis.sigma_max,
+            basis.sigma_min_retained
+        );
+    }
+
+    let mut accumulators: Vec<OracleRoundtripAccumulator> = selected_heads
+        .iter()
+        .map(|_| OracleRoundtripAccumulator::new())
+        .collect();
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+
+        let token_ids = encode_prompt(&tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+
+        let baseline_hidden =
+            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+        let baseline_logits = final_logits(&weights, &baseline_hidden);
+        let baseline_logp = log_softmax(&baseline_logits);
+
+        for (idx, head) in selected_heads.iter().copied().enumerate() {
+            let basis = bases
+                .get(&head)
+                .ok_or_else(|| format!("missing basis for L{} H{}", head.layer, head.head))?;
+            let (roundtrip_hidden, metrics) =
+                forward_q4k_oracle_roundtrip_head(&mut weights, &token_ids, &index, head, basis)?;
+            let roundtrip_logits = final_logits(&weights, &roundtrip_hidden);
+            let roundtrip_logp = log_softmax(&roundtrip_logits);
+            accumulators[idx].add(OracleRoundtripPromptReport {
+                id: label.to_string(),
+                stratum: stratum.to_string(),
+                kl: kl_logp(&baseline_logp, &roundtrip_logp),
+                max_abs_logit_diff: max_abs_diff(&baseline_logits, &roundtrip_logits),
+                pre_wo_l2: metrics.pre_wo_l2,
+                wo_visible_l2: metrics.wo_visible_l2,
+            });
+        }
+    }
+
+    let heads = selected_heads
+        .iter()
+        .copied()
+        .zip(accumulators)
+        .map(|(head, acc)| {
+            let basis = bases
+                .get(&head)
+                .expect("basis existed during oracle roundtrip");
+            acc.finish(head, basis)
+        })
+        .collect();
+    let report = OracleRoundtripReport {
+        index: args.index.display().to_string(),
+        prompt_file: args.prompts.display().to_string(),
+        prompts_seen: prompts.len(),
+        sigma_rel_cutoff: args.sigma_rel_cutoff,
+        selected_heads,
+        heads,
+    };
+
+    let out_path = args.out.join("oracle_roundtrip.json");
+    let file = std::fs::File::create(&out_path)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    eprintln!("Wrote {}", out_path.display());
+
+    Ok(())
+}
+
+fn run_oracle_lowrank(args: OracleLowrankArgs) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&args.out)?;
+
+    eprintln!("Loading vindex: {}", args.index.display());
+    let start = Instant::now();
+    let mut cb = SilentLoadCallbacks;
+    let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
+    index.load_attn_q4k(&args.index)?;
+    index.load_interleaved_q4k(&args.index)?;
+    let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
+    let tokenizer = load_vindex_tokenizer(&args.index)?;
+    if weights.arch.is_hybrid_moe() {
+        return Err("ov-rd oracle-lowrank currently supports dense FFN vindexes only".into());
+    }
+    eprintln!(
+        "  {} layers, hidden_size={}, q_heads={}, head_dim={} ({:.1}s)",
+        weights.num_layers,
+        weights.hidden_size,
+        weights.num_q_heads,
+        weights.head_dim,
+        start.elapsed().as_secs_f64()
+    );
+
+    let selected_heads = parse_head_spec(&args.heads)?;
+    if selected_heads.is_empty() {
+        return Err("no heads selected for oracle lowrank".into());
+    }
+    let mut ks = parse_usize_list(&args.ks)?;
+    ks.sort_unstable();
+    ks.dedup();
+    if ks.is_empty() {
+        return Err("no K values selected for oracle lowrank".into());
+    }
+    let prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    eprintln!("Selected heads: {:?}", selected_heads);
+    eprintln!("K sweep: {:?}", ks);
+    eprintln!("Prompts: {}", prompts.len());
+
+    eprintln!("Fitting position-mean static bases");
+    let means = fit_static_means(&mut weights, &index, &tokenizer, &prompts, &selected_heads)?;
+
+    eprintln!("Building W_O-visible bases");
+    let bases =
+        build_roundtrip_bases(&mut weights, &index, &selected_heads, args.sigma_rel_cutoff)?;
+    for head in &selected_heads {
+        let basis = bases
+            .get(head)
+            .ok_or_else(|| format!("missing basis for L{} H{}", head.layer, head.head))?;
+        eprintln!(
+            "  L{}H{} rank={} sigma_max={:.6} sigma_min_retained={:.6}",
+            head.layer,
+            head.head,
+            basis.rank_retained(),
+            basis.sigma_max,
+            basis.sigma_min_retained
+        );
+    }
+
+    eprintln!("Fitting empirical z-space PCA bases");
+    let pca_bases = fit_z_pca_bases(
+        &mut weights,
+        &index,
+        &tokenizer,
+        &prompts,
+        &selected_heads,
+        &bases,
+        &means,
+    )?;
+
+    let mut accumulators: HashMap<(HeadId, usize), OracleLowrankPointAccumulator> = HashMap::new();
+    for head in &selected_heads {
+        for &k in &ks {
+            accumulators.insert((*head, k), OracleLowrankPointAccumulator::new());
+        }
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+
+        let token_ids = encode_prompt(&tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+
+        let baseline_hidden =
+            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+        let baseline_logits = final_logits(&weights, &baseline_hidden);
+        let baseline_logp = log_softmax(&baseline_logits);
+        let baseline_top1 = argmax(&baseline_logits);
+        let baseline_top2 = top_k_indices(&baseline_logits, 2);
+        let baseline_top2_token = baseline_top2.get(1).copied().unwrap_or(baseline_top1);
+        let baseline_top1_prob = token_prob(&baseline_logp, baseline_top1);
+        let baseline_top2_prob = token_prob(&baseline_logp, baseline_top2_token);
+        let baseline_top1_margin = baseline_top1_prob - baseline_top2_prob;
+
+        for head in &selected_heads {
+            let basis = bases.get(head).ok_or_else(|| {
+                format!(
+                    "missing basis for oracle lowrank L{} H{}",
+                    head.layer, head.head
+                )
+            })?;
+            let head_means = means.get(head).ok_or_else(|| {
+                format!(
+                    "missing position means for oracle lowrank L{} H{}",
+                    head.layer, head.head
+                )
+            })?;
+            let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                format!(
+                    "missing empirical PCA basis for oracle lowrank L{} H{}",
+                    head.layer, head.head
+                )
+            })?;
+            for &k in &ks {
+                let (lowrank_hidden, metrics) = forward_q4k_oracle_lowrank_head(
+                    &mut weights,
+                    &token_ids,
+                    &index,
+                    *head,
+                    basis,
+                    pca_basis,
+                    head_means,
+                    k,
+                )?;
+                let lowrank_logits = final_logits(&weights, &lowrank_hidden);
+                let lowrank_logp = log_softmax(&lowrank_logits);
+                let kl = kl_logp(&baseline_logp, &lowrank_logp);
+                let lowrank_top1 = argmax(&lowrank_logits);
+                let lowrank_top5 = top_k_indices(&lowrank_logits, 5);
+                let lowrank_top2 = top_k_indices(&lowrank_logits, 2);
+                let lowrank_top2_token = lowrank_top2.get(1).copied().unwrap_or(lowrank_top1);
+                let lowrank_top1_prob = token_prob(&lowrank_logp, lowrank_top1);
+                let lowrank_top2_prob = token_prob(&lowrank_logp, lowrank_top2_token);
+                let lowrank_top1_margin = lowrank_top1_prob - lowrank_top2_prob;
+                let lowrank_prob_of_baseline_top1 = token_prob(&lowrank_logp, baseline_top1);
+                accumulators
+                    .get_mut(&(*head, k))
+                    .expect("oracle lowrank accumulator missing")
+                    .add(OracleLowrankPromptReport {
+                        id: label.to_string(),
+                        stratum: stratum.to_string(),
+                        kl,
+                        delta_cross_entropy_bits: kl / std::f64::consts::LN_2,
+                        baseline_top1,
+                        lowrank_top1,
+                        top1_agree: baseline_top1 == lowrank_top1,
+                        baseline_top1_in_lowrank_top5: lowrank_top5.contains(&baseline_top1),
+                        baseline_top1_prob,
+                        baseline_top2: baseline_top2_token,
+                        baseline_top2_prob,
+                        baseline_top1_margin,
+                        lowrank_top1_prob,
+                        lowrank_prob_of_baseline_top1,
+                        lowrank_top1_margin,
+                        pre_wo_l2: metrics.pre_wo_l2,
+                        wo_visible_l2: metrics.wo_visible_l2,
+                    });
+            }
+        }
+    }
+
+    let mut head_reports = Vec::new();
+    for head in &selected_heads {
+        let basis = bases
+            .get(head)
+            .ok_or_else(|| format!("missing basis for L{} H{}", head.layer, head.head))?;
+        let pca_basis = pca_bases
+            .get(head)
+            .ok_or_else(|| format!("missing PCA basis for L{} H{}", head.layer, head.head))?;
+        let mut points = Vec::new();
+        for &k in &ks {
+            let acc = accumulators
+                .remove(&(*head, k))
+                .expect("oracle lowrank accumulator missing at finish");
+            points.push(acc.finish(k));
+        }
+        let static_train_samples = means.get(head).map(|m| m.count).unwrap_or(0);
+        head_reports.push(OracleLowrankHeadReport {
+            layer: head.layer,
+            head: head.head,
+            head_dim: basis.head_dim,
+            rank_retained: basis.rank_retained(),
+            empirical_rank: pca_basis.rank(),
+            sigma_max: basis.sigma_max,
+            sigma_min_retained: basis.sigma_min_retained,
+            static_train_samples,
+            points,
+        });
+    }
+
+    let report = OracleLowrankReport {
+        index: args.index.display().to_string(),
+        prompt_file: args.prompts.display().to_string(),
+        prompts_seen: prompts.len(),
+        static_base: "position_mean".to_string(),
+        ks,
+        sigma_rel_cutoff: args.sigma_rel_cutoff,
+        selected_heads,
+        heads: head_reports,
+    };
+
+    let out_path = args.out.join("oracle_lowrank.json");
+    let file = std::fs::File::create(&out_path)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    eprintln!("Wrote {}", out_path.display());
+
+    Ok(())
+}
+
+fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&args.out)?;
+
+    eprintln!("Loading vindex: {}", args.index.display());
+    let start = Instant::now();
+    let mut cb = SilentLoadCallbacks;
+    let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
+    index.load_attn_q4k(&args.index)?;
+    index.load_interleaved_q4k(&args.index)?;
+    let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
+    let tokenizer = load_vindex_tokenizer(&args.index)?;
+    if weights.arch.is_hybrid_moe() {
+        return Err("ov-rd oracle-pq currently supports dense FFN vindexes only".into());
+    }
+    eprintln!(
+        "  {} layers, hidden_size={}, q_heads={}, head_dim={} ({:.1}s)",
+        weights.num_layers,
+        weights.hidden_size,
+        weights.num_q_heads,
+        weights.head_dim,
+        start.elapsed().as_secs_f64()
+    );
+
+    let selected_heads = parse_head_spec(&args.heads)?;
+    if selected_heads.is_empty() {
+        return Err("no heads selected for oracle PQ".into());
+    }
+    let configs = parse_pq_configs(&args.configs)?;
+    if configs.is_empty() {
+        return Err("no PQ configs selected".into());
+    }
+    let mut prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    if let Some(max_per_stratum) = args.max_per_stratum {
+        prompts = limit_prompts_per_stratum(prompts, max_per_stratum);
+    }
+    eprintln!("Selected heads: {:?}", selected_heads);
+    eprintln!("PQ configs: {:?}", configs);
+    eprintln!("Prompts: {}", prompts.len());
+    let (fit_prompts, eval_prompts): (Vec<PromptRecord>, Vec<PromptRecord>) =
+        if let Some(eval_mod) = args.eval_mod {
+            split_prompt_records(&prompts, eval_mod, args.eval_offset)?
+        } else {
+            (prompts.clone(), prompts.clone())
+        };
+    eprintln!(
+        "Oracle PQ split: fit_prompts={}, eval_prompts={}",
+        fit_prompts.len(),
+        eval_prompts.len()
+    );
+
+    eprintln!("Fitting position-mean static bases");
+    let means = fit_static_means(
+        &mut weights,
+        &index,
+        &tokenizer,
+        &fit_prompts,
+        &selected_heads,
+    )?;
+
+    eprintln!("Building W_O-visible bases");
+    let bases =
+        build_roundtrip_bases(&mut weights, &index, &selected_heads, args.sigma_rel_cutoff)?;
+
+    eprintln!("Fitting empirical z-space PCA bases");
+    let pca_bases = fit_z_pca_bases(
+        &mut weights,
+        &index,
+        &tokenizer,
+        &fit_prompts,
+        &selected_heads,
+        &bases,
+        &means,
+    )?;
+
+    eprintln!("Fitting product quantizers");
+    let codebooks = fit_pq_codebooks(
+        &mut weights,
+        &index,
+        &tokenizer,
+        &fit_prompts,
+        &selected_heads,
+        &bases,
+        &means,
+        &pca_bases,
+        &configs,
+        args.pq_iters,
+    )?;
+    let mode_d_tables = if args.mode_d_check {
+        eprintln!("Materializing Mode D residual-space tables");
+        materialize_mode_d_tables(
+            &mut weights,
+            &index,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+        )?
+    } else {
+        HashMap::new()
+    };
+
+    let mut accumulators: HashMap<(HeadId, PqConfig), OraclePqPointAccumulator> = HashMap::new();
+    for head in &selected_heads {
+        for &config in &configs {
+            accumulators.insert((*head, config), OraclePqPointAccumulator::new());
+        }
+    }
+
+    for (prompt_idx, record) in eval_prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  [{}/{}] {}", prompt_idx + 1, eval_prompts.len(), label);
+
+        let token_ids = encode_prompt(&tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+
+        let baseline_hidden =
+            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+        let baseline_logits = final_logits(&weights, &baseline_hidden);
+        let baseline_logp = log_softmax(&baseline_logits);
+        let baseline_top1 = argmax(&baseline_logits);
+        let baseline_top2 = top_k_indices(&baseline_logits, 2);
+        let baseline_top2_token = baseline_top2.get(1).copied().unwrap_or(baseline_top1);
+        let baseline_top1_prob = token_prob(&baseline_logp, baseline_top1);
+        let baseline_top2_prob = token_prob(&baseline_logp, baseline_top2_token);
+        let baseline_top1_margin = baseline_top1_prob - baseline_top2_prob;
+
+        for head in &selected_heads {
+            let basis = bases.get(head).ok_or_else(|| {
+                format!("missing basis for oracle PQ L{} H{}", head.layer, head.head)
+            })?;
+            let head_means = means.get(head).ok_or_else(|| {
+                format!(
+                    "missing position means for oracle PQ L{} H{}",
+                    head.layer, head.head
+                )
+            })?;
+            let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                format!(
+                    "missing empirical PCA basis for oracle PQ L{} H{}",
+                    head.layer, head.head
+                )
+            })?;
+            for &config in &configs {
+                let codebook = codebooks.get(&(*head, config)).ok_or_else(|| {
+                    format!("missing PQ codebook for L{} H{}", head.layer, head.head)
+                })?;
+                let (pq_hidden, metrics) = forward_q4k_oracle_pq_head(
+                    &mut weights,
+                    &token_ids,
+                    &index,
+                    *head,
+                    basis,
+                    pca_basis,
+                    head_means,
+                    codebook,
+                )?;
+                let pq_logits = final_logits(&weights, &pq_hidden);
+                let pq_logp = log_softmax(&pq_logits);
+                let kl = kl_logp(&baseline_logp, &pq_logp);
+                let pq_top1 = argmax(&pq_logits);
+                let pq_top5 = top_k_indices(&pq_logits, 5);
+                let pq_top2 = top_k_indices(&pq_logits, 2);
+                let pq_top2_token = pq_top2.get(1).copied().unwrap_or(pq_top1);
+                let pq_top1_prob = token_prob(&pq_logp, pq_top1);
+                let pq_top2_prob = token_prob(&pq_logp, pq_top2_token);
+                let pq_top1_margin = pq_top1_prob - pq_top2_prob;
+                let pq_prob_of_baseline_top1 = token_prob(&pq_logp, baseline_top1);
+
+                let (
+                    mode_d_kl,
+                    mode_d_top1,
+                    mode_d_top1_agree,
+                    baseline_top1_in_mode_d_top5,
+                    coeff_mode_d_max_abs_logit_diff,
+                ) = if args.mode_d_check {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let mode_d_hidden = forward_q4k_oracle_pq_mode_d_head(
+                        &mut weights,
+                        &token_ids,
+                        &index,
+                        *head,
+                        basis,
+                        pca_basis,
+                        head_means,
+                        codebook,
+                        mode_d_table,
+                    )?;
+                    let mode_d_logits = final_logits(&weights, &mode_d_hidden);
+                    let mode_d_logp = log_softmax(&mode_d_logits);
+                    let mode_d_top1 = argmax(&mode_d_logits);
+                    let mode_d_top5 = top_k_indices(&mode_d_logits, 5);
+                    (
+                        Some(kl_logp(&baseline_logp, &mode_d_logp)),
+                        Some(mode_d_top1),
+                        Some(baseline_top1 == mode_d_top1),
+                        Some(mode_d_top5.contains(&baseline_top1)),
+                        Some(max_abs_diff(&pq_logits, &mode_d_logits)),
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
+
+                accumulators
+                    .get_mut(&(*head, config))
+                    .expect("oracle PQ accumulator missing")
+                    .add(OraclePqPromptReport {
+                        id: label.to_string(),
+                        stratum: stratum.to_string(),
+                        kl,
+                        delta_cross_entropy_bits: kl / std::f64::consts::LN_2,
+                        baseline_top1,
+                        pq_top1,
+                        top1_agree: baseline_top1 == pq_top1,
+                        baseline_top1_in_pq_top5: pq_top5.contains(&baseline_top1),
+                        baseline_top1_prob,
+                        baseline_top2: baseline_top2_token,
+                        baseline_top2_prob,
+                        baseline_top1_margin,
+                        pq_top1_prob,
+                        pq_prob_of_baseline_top1,
+                        pq_top1_margin,
+                        mode_d_kl,
+                        mode_d_top1,
+                        mode_d_top1_agree,
+                        baseline_top1_in_mode_d_top5,
+                        coeff_mode_d_max_abs_logit_diff,
+                        pre_wo_l2: metrics.pre_wo_l2,
+                        wo_visible_l2: metrics.wo_visible_l2,
+                    });
+            }
+        }
+    }
+
+    let mut head_reports = Vec::new();
+    for head in &selected_heads {
+        let basis = bases
+            .get(head)
+            .ok_or_else(|| format!("missing basis for L{} H{}", head.layer, head.head))?;
+        let pca_basis = pca_bases
+            .get(head)
+            .ok_or_else(|| format!("missing PCA basis for L{} H{}", head.layer, head.head))?;
+        let static_train_samples = means.get(head).map(|m| m.count).unwrap_or(0);
+        let mut points = Vec::new();
+        for &config in &configs {
+            let acc = accumulators
+                .remove(&(*head, config))
+                .expect("oracle PQ accumulator missing at finish");
+            points.push(acc.finish(config, weights.hidden_size));
+        }
+        head_reports.push(OraclePqHeadReport {
+            layer: head.layer,
+            head: head.head,
+            head_dim: basis.head_dim,
+            rank_retained: basis.rank_retained(),
+            empirical_rank: pca_basis.rank(),
+            sigma_max: basis.sigma_max,
+            sigma_min_retained: basis.sigma_min_retained,
+            static_train_samples,
+            points,
+        });
+    }
+
+    let report = OraclePqReport {
+        index: args.index.display().to_string(),
+        prompt_file: args.prompts.display().to_string(),
+        prompts_seen: prompts.len(),
+        train_prompts_seen: fit_prompts.len(),
+        eval_prompts_seen: eval_prompts.len(),
+        max_per_stratum: args.max_per_stratum,
+        eval_mod: args.eval_mod,
+        eval_offset: args.eval_offset,
+        static_base: "position_mean".to_string(),
+        configs,
+        sigma_rel_cutoff: args.sigma_rel_cutoff,
+        pq_iters: args.pq_iters,
+        mode_d_check: args.mode_d_check,
+        selected_heads,
+        heads: head_reports,
+    };
+
+    let out_path = args.out.join("oracle_pq.json");
     let file = std::fs::File::create(&out_path)?;
     serde_json::to_writer_pretty(file, &report)?;
     eprintln!("Wrote {}", out_path.display());
@@ -1176,6 +2518,34 @@ fn add_pre_o_stats(
     }
 }
 
+fn add_pre_o_wo_visible_stats(
+    stats: &mut [Option<RunningHeadStats>],
+    pre_o: &Array2<f32>,
+    w_o: &ndarray::ArrayBase<impl ndarray::Data<Elem = f32>, ndarray::Ix2>,
+    num_heads: usize,
+    head_dim: usize,
+    max_positions: Option<usize>,
+) {
+    let positions = max_positions
+        .map(|n| n.min(pre_o.nrows()))
+        .unwrap_or_else(|| pre_o.nrows());
+    for head in 0..num_heads {
+        let Some(head_stats) = stats.get_mut(head).and_then(Option::as_mut) else {
+            continue;
+        };
+        let start = head * head_dim;
+        let end = start + head_dim;
+        let head_out = pre_o.slice(s![0..positions, start..end]);
+        let w_o_head = w_o.slice(s![.., start..end]);
+        let contribution = dot_proj(&head_out, &w_o_head);
+        for row in contribution.rows() {
+            if let Some(values) = row.as_slice() {
+                head_stats.add(values);
+            }
+        }
+    }
+}
+
 fn load_prompts(
     path: &PathBuf,
     max_prompts: Option<usize>,
@@ -1193,6 +2563,59 @@ fn load_prompts(
         }
     }
     Ok(prompts)
+}
+
+fn limit_prompts_per_stratum(
+    prompts: Vec<PromptRecord>,
+    max_per_stratum: usize,
+) -> Vec<PromptRecord> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut selected = Vec::new();
+    for prompt in prompts {
+        let key = prompt
+            .stratum
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let count = counts.entry(key).or_default();
+        if *count < max_per_stratum {
+            *count += 1;
+            selected.push(prompt);
+        }
+    }
+    selected
+}
+
+fn split_prompt_records(
+    prompts: &[PromptRecord],
+    eval_mod: usize,
+    eval_offset: usize,
+) -> Result<(Vec<PromptRecord>, Vec<PromptRecord>), Box<dyn std::error::Error>> {
+    if eval_mod == 0 {
+        return Err("--eval-mod must be greater than zero".into());
+    }
+    if eval_offset >= eval_mod {
+        return Err("--eval-offset must be smaller than --eval-mod".into());
+    }
+    let mut fit = Vec::new();
+    let mut eval = Vec::new();
+    for (idx, prompt) in prompts.iter().cloned().enumerate() {
+        if idx % eval_mod == eval_offset {
+            eval.push(prompt);
+        } else {
+            fit.push(prompt);
+        }
+    }
+    if fit.is_empty() || eval.is_empty() {
+        return Err("held-out split produced an empty fit or eval set".into());
+    }
+    eprintln!(
+        "Held-out split: fit_prompts={}, eval_prompts={} (idx % {} == {})",
+        fit.len(),
+        eval.len(),
+        eval_mod,
+        eval_offset
+    );
+    Ok((fit, eval))
 }
 
 fn select_zero_ablation_heads(
@@ -1245,6 +2668,50 @@ fn parse_head_spec(spec: &str) -> Result<Vec<HeadId>, Box<dyn std::error::Error>
         });
     }
     Ok(heads)
+}
+
+fn parse_usize_list(spec: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let mut values = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        values.push(part.parse()?);
+    }
+    Ok(values)
+}
+
+fn parse_pq_configs(spec: &str) -> Result<Vec<PqConfig>, Box<dyn std::error::Error>> {
+    let mut configs = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let fields = part.split(':').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(format!("invalid PQ config '{part}', expected K:groups:bits").into());
+        }
+        let config = PqConfig {
+            k: fields[0].parse()?,
+            groups: fields[1].parse()?,
+            bits_per_group: fields[2].parse()?,
+        };
+        if config.k == 0 || config.groups == 0 || config.bits_per_group == 0 {
+            return Err(format!("invalid zero value in PQ config '{part}'").into());
+        }
+        if config.k % config.groups != 0 {
+            return Err(format!("PQ config '{part}' requires K divisible by groups").into());
+        }
+        if config.bits_per_group > 12 {
+            return Err(format!("PQ config '{part}' has too many bits/group for smoke run").into());
+        }
+        configs.push(config);
+    }
+    configs.sort_by_key(|c| (c.k, c.groups, c.bits_per_group));
+    configs.dedup();
+    Ok(configs)
 }
 
 fn forward_q4k_zero_pre_o_head(
@@ -1431,6 +2898,1273 @@ fn forward_q4k_subtract_pre_o_head(
             return Err(format!(
                 "forward failed at layer {layer} during subtract check L{} H{}",
                 head.layer, head.head
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(h)
+}
+
+fn forward_q4k_noop_replace_head_residual_delta(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                let start = head.head * head_dim;
+                let end = start + head_dim;
+                let head_out = pre_o.slice(s![.., start..end]);
+                let w_o = weights
+                    .tensors
+                    .get(&weights.arch.attn_o_key(layer))
+                    .ok_or_else(|| format!("missing W_O tensor at layer {layer}"))?;
+                let w_o_head = w_o.slice(s![.., start..end]);
+                let replacement_delta = dot_proj(&head_out, &w_o_head);
+                run_layer_with_replaced_head_residual_delta(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    &replacement_delta,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} during residual-delta no-op L{} H{}",
+                head.layer, head.head
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(h)
+}
+
+#[derive(Debug)]
+struct WoRoundtripBasis {
+    head_dim: usize,
+    gram: Vec<Vec<f64>>,
+    vectors: Vec<Vec<f64>>,
+    sigmas: Vec<f64>,
+    sigma_max: f64,
+    sigma_min_retained: f64,
+    sigma_rel_cutoff: f64,
+}
+
+impl WoRoundtripBasis {
+    fn rank_retained(&self) -> usize {
+        self.vectors.len()
+    }
+
+    fn project(&self, y: &[f32]) -> Vec<f32> {
+        self.project_with_rank(y, self.vectors.len())
+    }
+
+    fn project_with_rank(&self, y: &[f32], k: usize) -> Vec<f32> {
+        let mut out = vec![0.0f64; self.head_dim];
+        for v in self.vectors.iter().take(k.min(self.vectors.len())) {
+            let coeff = v
+                .iter()
+                .zip(y.iter())
+                .map(|(&vi, &yi)| vi * yi as f64)
+                .sum::<f64>();
+            for (dst, &vi) in out.iter_mut().zip(v.iter()) {
+                *dst += coeff * vi;
+            }
+        }
+        out.into_iter().map(|value| value as f32).collect()
+    }
+
+    fn residual_to_z(&self, residual: &[f32]) -> Vec<f64> {
+        self.vectors
+            .iter()
+            .zip(self.sigmas.iter())
+            .map(|(v, &sigma)| {
+                sigma
+                    * v.iter()
+                        .zip(residual.iter())
+                        .map(|(&vi, &ri)| vi * ri as f64)
+                        .sum::<f64>()
+            })
+            .collect()
+    }
+
+    fn z_to_residual(&self, z: &[f64]) -> Vec<f32> {
+        let mut residual = vec![0.0f64; self.head_dim];
+        for ((v, &sigma), &zi) in self.vectors.iter().zip(self.sigmas.iter()).zip(z.iter()) {
+            if sigma == 0.0 {
+                continue;
+            }
+            let coeff = zi / sigma;
+            for (dst, &vi) in residual.iter_mut().zip(v.iter()) {
+                *dst += coeff * vi;
+            }
+        }
+        residual.into_iter().map(|value| value as f32).collect()
+    }
+
+    fn visible_sq_norm(&self, delta: &[f64]) -> f64 {
+        let mut total = 0.0;
+        for i in 0..self.head_dim {
+            let mut row = 0.0;
+            for j in 0..self.head_dim {
+                row += self.gram[i][j] * delta[j];
+            }
+            total += delta[i] * row;
+        }
+        total.max(0.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RoundtripPatchMetrics {
+    pre_wo_l2: f64,
+    wo_visible_l2: f64,
+}
+
+fn build_roundtrip_bases(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    heads: &[HeadId],
+    sigma_rel_cutoff: f64,
+) -> Result<HashMap<HeadId, WoRoundtripBasis>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut bases = HashMap::new();
+    for (layer, layer_heads) in heads_by_layer {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let w_o = weights
+            .tensors
+            .get(&weights.arch.attn_o_key(layer))
+            .ok_or_else(|| format!("missing W_O tensor at layer {layer}"))?;
+        let head_dim = weights.arch.head_dim_for_layer(layer);
+        for head in layer_heads {
+            let start = head.head * head_dim;
+            let end = start + head_dim;
+            let w_o_head = w_o.slice(s![.., start..end]);
+            let basis = build_wo_roundtrip_basis(&w_o_head, sigma_rel_cutoff)?;
+            bases.insert(head, basis);
+        }
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(bases)
+}
+
+fn build_wo_roundtrip_basis(
+    w_o_head: &ndarray::ArrayBase<impl ndarray::Data<Elem = f32>, ndarray::Ix2>,
+    sigma_rel_cutoff: f64,
+) -> Result<WoRoundtripBasis, Box<dyn std::error::Error>> {
+    let hidden = w_o_head.nrows();
+    let head_dim = w_o_head.ncols();
+    let mut gram = vec![vec![0.0f64; head_dim]; head_dim];
+    for row in 0..hidden {
+        for i in 0..head_dim {
+            let wi = w_o_head[[row, i]] as f64;
+            for j in i..head_dim {
+                gram[i][j] += wi * w_o_head[[row, j]] as f64;
+            }
+        }
+    }
+    for i in 0..head_dim {
+        for j in 0..i {
+            gram[i][j] = gram[j][i];
+        }
+    }
+
+    let (eigenvalues, eigenvectors) = jacobi_symmetric_eigen(&gram, 100, 1e-10);
+    let mut pairs: Vec<(f64, Vec<f64>)> = eigenvalues.into_iter().zip(eigenvectors).collect();
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let sigma_max = pairs
+        .first()
+        .map(|(value, _)| value.max(0.0).sqrt())
+        .unwrap_or(0.0);
+    let cutoff = sigma_max * sigma_rel_cutoff;
+    let mut vectors = Vec::new();
+    let mut sigmas = Vec::new();
+    let mut sigma_min_retained = 0.0;
+    for (value, vector) in pairs {
+        let sigma = value.max(0.0).sqrt();
+        if sigma > cutoff {
+            sigma_min_retained = if sigma_min_retained == 0.0 {
+                sigma
+            } else {
+                sigma_min_retained.min(sigma)
+            };
+            sigmas.push(sigma);
+            vectors.push(vector);
+        }
+    }
+    if vectors.is_empty() && sigma_max > 0.0 {
+        return Err("W_O roundtrip retained zero singular directions".into());
+    }
+
+    Ok(WoRoundtripBasis {
+        head_dim,
+        gram,
+        vectors,
+        sigmas,
+        sigma_max,
+        sigma_min_retained,
+        sigma_rel_cutoff,
+    })
+}
+
+fn jacobi_symmetric_eigen(
+    input: &[Vec<f64>],
+    max_sweeps: usize,
+    tolerance: f64,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let n = input.len();
+    let mut a = input.to_vec();
+    let mut v = vec![vec![0.0f64; n]; n];
+    for i in 0..n {
+        v[i][i] = 1.0;
+    }
+
+    for _ in 0..max_sweeps {
+        let mut max_value = 0.0;
+        let mut p = 0;
+        let mut q = 1.min(n.saturating_sub(1));
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let value = a[i][j].abs();
+                if value > max_value {
+                    max_value = value;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if max_value < tolerance || n < 2 {
+            break;
+        }
+
+        let app = a[p][p];
+        let aqq = a[q][q];
+        let apq = a[p][q];
+        if apq == 0.0 {
+            continue;
+        }
+        let tau = (aqq - app) / (2.0 * apq);
+        let t = if tau >= 0.0 {
+            1.0 / (tau + (1.0 + tau * tau).sqrt())
+        } else {
+            -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+        };
+        let c = 1.0 / (1.0 + t * t).sqrt();
+        let s = t * c;
+
+        for k in 0..n {
+            if k != p && k != q {
+                let akp = a[k][p];
+                let akq = a[k][q];
+                let new_kp = c * akp - s * akq;
+                let new_kq = s * akp + c * akq;
+                a[k][p] = new_kp;
+                a[p][k] = new_kp;
+                a[k][q] = new_kq;
+                a[q][k] = new_kq;
+            }
+        }
+        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        a[p][q] = 0.0;
+        a[q][p] = 0.0;
+
+        for row in &mut v {
+            let vip = row[p];
+            let viq = row[q];
+            row[p] = c * vip - s * viq;
+            row[q] = s * vip + c * viq;
+        }
+    }
+
+    let eigenvalues = (0..n).map(|i| a[i][i]).collect::<Vec<_>>();
+    let eigenvectors = (0..n)
+        .map(|col| (0..n).map(|row| v[row][col]).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    (eigenvalues, eigenvectors)
+}
+
+#[derive(Debug)]
+struct ZPcaBasis {
+    vectors: Vec<Vec<f64>>,
+}
+
+impl ZPcaBasis {
+    fn rank(&self) -> usize {
+        self.vectors.len()
+    }
+
+    fn coordinates_with_rank(&self, z: &[f64], k: usize) -> Vec<f64> {
+        self.vectors
+            .iter()
+            .take(k.min(self.vectors.len()))
+            .map(|v| v.iter().zip(z.iter()).map(|(&vi, &zi)| vi * zi).sum())
+            .collect()
+    }
+
+    fn reconstruct_from_coordinates(&self, coords: &[f64]) -> Vec<f64> {
+        let dim = self.vectors.first().map(|v| v.len()).unwrap_or(0);
+        let mut out = vec![0.0; dim];
+        for (coord, v) in coords.iter().zip(self.vectors.iter()) {
+            for (dst, &vi) in out.iter_mut().zip(v.iter()) {
+                *dst += coord * vi;
+            }
+        }
+        out
+    }
+
+    fn project_with_rank(&self, z: &[f64], k: usize) -> Vec<f64> {
+        let coords = self.coordinates_with_rank(z, k);
+        self.reconstruct_from_coordinates(&coords)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PqCodebook {
+    config: PqConfig,
+    centroids: Vec<Vec<Vec<f64>>>,
+}
+
+impl PqCodebook {
+    fn quantize(&self, coords: &[f64]) -> Vec<f64> {
+        let indices = self.quantize_indices(coords);
+        self.quantize_from_indices(&indices)
+    }
+
+    fn quantize_indices(&self, coords: &[f64]) -> Vec<usize> {
+        let group_dim = self.config.k / self.config.groups;
+        (0..self.config.groups)
+            .map(|group| {
+                let start = group * group_dim;
+                let end = start + group_dim;
+                nearest_centroid_index(&coords[start..end], &self.centroids[group])
+            })
+            .collect()
+    }
+
+    fn quantize_from_indices(&self, indices: &[usize]) -> Vec<f64> {
+        let group_dim = self.config.k / self.config.groups;
+        let mut out = vec![0.0; self.config.k];
+        for (group, &index) in indices.iter().take(self.config.groups).enumerate() {
+            let start = group * group_dim;
+            let end = start + group_dim;
+            let centroid = &self.centroids[group][index];
+            out[start..end].copy_from_slice(centroid);
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ModeDTable {
+    static_delta_by_position: Vec<Vec<f32>>,
+    static_global_delta: Vec<f32>,
+    group_tables: Vec<Vec<Vec<f32>>>,
+}
+
+impl ModeDTable {
+    fn delta_for_position_codes(&self, position: usize, codes: &[usize]) -> Vec<f32> {
+        let mut out = self
+            .static_delta_by_position
+            .get(position)
+            .unwrap_or(&self.static_global_delta)
+            .clone();
+        for (group, &code) in codes.iter().enumerate() {
+            let table = &self.group_tables[group][code];
+            for (dst, &value) in out.iter_mut().zip(table.iter()) {
+                *dst += value;
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug)]
+struct ZPcaAccumulator {
+    count: u64,
+    sum: Vec<f64>,
+    sum_outer: Vec<Vec<f64>>,
+}
+
+impl ZPcaAccumulator {
+    fn new(dim: usize) -> Self {
+        Self {
+            count: 0,
+            sum: vec![0.0; dim],
+            sum_outer: vec![vec![0.0; dim]; dim],
+        }
+    }
+
+    fn add(&mut self, z: &[f64]) {
+        self.count += 1;
+        for (dst, &value) in self.sum.iter_mut().zip(z.iter()) {
+            *dst += value;
+        }
+        for i in 0..z.len() {
+            for j in i..z.len() {
+                self.sum_outer[i][j] += z[i] * z[j];
+            }
+        }
+    }
+
+    fn finish(mut self) -> ZPcaBasis {
+        let dim = self.sum.len();
+        if self.count == 0 {
+            return ZPcaBasis {
+                vectors: Vec::new(),
+            };
+        }
+        for i in 0..dim {
+            for j in 0..i {
+                self.sum_outer[i][j] = self.sum_outer[j][i];
+            }
+        }
+        let n = self.count as f64;
+        let mut covariance = self.sum_outer;
+        for i in 0..dim {
+            for j in 0..dim {
+                covariance[i][j] = covariance[i][j] / n - (self.sum[i] / n) * (self.sum[j] / n);
+            }
+        }
+        let (eigenvalues, eigenvectors) = jacobi_symmetric_eigen(&covariance, 100, 1e-8);
+        let mut pairs: Vec<(f64, Vec<f64>)> = eigenvalues.into_iter().zip(eigenvectors).collect();
+        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        ZPcaBasis {
+            vectors: pairs
+                .into_iter()
+                .filter(|(value, _)| *value > 0.0)
+                .map(|(_, vector)| vector)
+                .collect(),
+        }
+    }
+}
+
+fn fit_z_pca_bases(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+) -> Result<HashMap<HeadId, ZPcaBasis>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut accumulators: HashMap<HeadId, ZPcaAccumulator> = HashMap::new();
+    for head in heads {
+        let basis = bases
+            .get(head)
+            .ok_or_else(|| format!("missing W_O basis for L{} H{}", head.layer, head.head))?;
+        accumulators.insert(*head, ZPcaAccumulator::new(basis.rank_retained()));
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  pca-fit [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).expect("basis pre-created for PCA fit");
+                    let head_means = means.get(head).expect("means pre-created for PCA fit");
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let acc = accumulators.get_mut(head).expect("PCA accumulator missing");
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row
+                            .as_slice()
+                            .ok_or("pre-W_O head row was not contiguous during PCA fit")?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        acc.add(&z);
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    Ok(accumulators
+        .into_iter()
+        .map(|(head, acc)| (head, acc.finish()))
+        .collect())
+}
+
+fn fit_pq_codebooks(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    configs: &[PqConfig],
+    iterations: usize,
+) -> Result<HashMap<(HeadId, PqConfig), PqCodebook>, Box<dyn std::error::Error>> {
+    let max_k = configs.iter().map(|c| c.k).max().unwrap_or(0);
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut samples: HashMap<HeadId, Vec<Vec<f64>>> = HashMap::new();
+    for head in heads {
+        samples.insert(*head, Vec::new());
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  pq-fit [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).expect("basis pre-created for PQ fit");
+                    let head_means = means.get(head).expect("means pre-created for PQ fit");
+                    let pca_basis = pca_bases.get(head).expect("PCA pre-created for PQ fit");
+                    if pca_basis.rank() < max_k {
+                        return Err(format!(
+                            "PCA rank {} is below requested K {} for L{}H{}",
+                            pca_basis.rank(),
+                            max_k,
+                            head.layer,
+                            head.head
+                        )
+                        .into());
+                    }
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let head_samples = samples.get_mut(head).expect("PQ samples missing");
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row
+                            .as_slice()
+                            .ok_or("pre-W_O head row was not contiguous during PQ fit")?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        head_samples.push(pca_basis.coordinates_with_rank(&z, max_k));
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    let mut codebooks = HashMap::new();
+    for head in heads {
+        let head_samples = samples
+            .get(head)
+            .ok_or_else(|| format!("missing PQ samples for L{}H{}", head.layer, head.head))?;
+        for &config in configs {
+            let levels = 1usize << config.bits_per_group;
+            let group_dim = config.k / config.groups;
+            let mut centroids = Vec::with_capacity(config.groups);
+            for group in 0..config.groups {
+                let start = group * group_dim;
+                let group_samples = head_samples
+                    .iter()
+                    .map(|sample| sample[start..start + group_dim].to_vec())
+                    .collect::<Vec<_>>();
+                centroids.push(kmeans_centroids(&group_samples, levels, iterations));
+            }
+            codebooks.insert((*head, config), PqCodebook { config, centroids });
+        }
+    }
+
+    Ok(codebooks)
+}
+
+fn kmeans_centroids(samples: &[Vec<f64>], k: usize, iterations: usize) -> Vec<Vec<f64>> {
+    if samples.is_empty() {
+        return vec![Vec::new(); k];
+    }
+    let dim = samples[0].len();
+    let mut centroids = (0..k)
+        .map(|idx| samples[(idx * samples.len()) / k].clone())
+        .collect::<Vec<_>>();
+    let mut assignments = vec![0usize; samples.len()];
+    for _ in 0..iterations {
+        let mut changed = false;
+        for (sample_idx, sample) in samples.iter().enumerate() {
+            let nearest = nearest_centroid_index(sample, &centroids);
+            if assignments[sample_idx] != nearest {
+                assignments[sample_idx] = nearest;
+                changed = true;
+            }
+        }
+        let mut sums = vec![vec![0.0; dim]; k];
+        let mut counts = vec![0usize; k];
+        for (sample, &cluster) in samples.iter().zip(assignments.iter()) {
+            counts[cluster] += 1;
+            for (dst, &value) in sums[cluster].iter_mut().zip(sample.iter()) {
+                *dst += value;
+            }
+        }
+        for cluster in 0..k {
+            if counts[cluster] == 0 {
+                continue;
+            }
+            let inv = 1.0 / counts[cluster] as f64;
+            for value in &mut sums[cluster] {
+                *value *= inv;
+            }
+            centroids[cluster] = sums[cluster].clone();
+        }
+        if !changed {
+            break;
+        }
+    }
+    centroids
+}
+
+fn nearest_centroid_index(sample: &[f64], centroids: &[Vec<f64>]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_dist = f64::INFINITY;
+    for (idx, centroid) in centroids.iter().enumerate() {
+        let dist = sample
+            .iter()
+            .zip(centroid.iter())
+            .map(|(&a, &b)| {
+                let d = a - b;
+                d * d
+            })
+            .sum::<f64>();
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+fn materialize_mode_d_tables(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+) -> Result<HashMap<(HeadId, PqConfig), ModeDTable>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut tables = HashMap::new();
+    for (layer, layer_heads) in heads_by_layer {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let w_o = weights
+            .tensors
+            .get(&weights.arch.attn_o_key(layer))
+            .ok_or_else(|| format!("missing W_O tensor at layer {layer}"))?;
+        let head_dim = weights.arch.head_dim_for_layer(layer);
+        for head in layer_heads {
+            let start = head.head * head_dim;
+            let end = start + head_dim;
+            let w_o_head = w_o.slice(s![.., start..end]);
+            let head_means = means
+                .get(&head)
+                .ok_or_else(|| format!("missing means for L{}H{}", head.layer, head.head))?;
+            let static_global_delta = project_head_vector_to_hidden(&w_o_head, &head_means.global);
+            let static_delta_by_position = head_means
+                .positions
+                .iter()
+                .map(|mean| project_head_vector_to_hidden(&w_o_head, mean))
+                .collect::<Vec<_>>();
+            let basis = bases
+                .get(&head)
+                .ok_or_else(|| format!("missing W_O basis for L{}H{}", head.layer, head.head))?;
+            let pca_basis = pca_bases
+                .get(&head)
+                .ok_or_else(|| format!("missing PCA basis for L{}H{}", head.layer, head.head))?;
+
+            for ((codebook_head, config), codebook) in codebooks.iter() {
+                if *codebook_head != head {
+                    continue;
+                }
+                let group_dim = config.k / config.groups;
+                let mut group_tables = Vec::with_capacity(config.groups);
+                for group in 0..config.groups {
+                    let mut table = Vec::with_capacity(codebook.centroids[group].len());
+                    for centroid in &codebook.centroids[group] {
+                        let mut coords = vec![0.0; config.k];
+                        let start_coord = group * group_dim;
+                        coords[start_coord..start_coord + group_dim].copy_from_slice(centroid);
+                        let z_part = pca_basis.reconstruct_from_coordinates(&coords);
+                        let residual_part = basis.z_to_residual(&z_part);
+                        table.push(project_head_vector_to_hidden(&w_o_head, &residual_part));
+                    }
+                    group_tables.push(table);
+                }
+                tables.insert(
+                    (head, *config),
+                    ModeDTable {
+                        static_delta_by_position: static_delta_by_position.clone(),
+                        static_global_delta: static_global_delta.clone(),
+                        group_tables,
+                    },
+                );
+            }
+        }
+        remove_layer_tensors(weights, inserted);
+    }
+    Ok(tables)
+}
+
+fn project_head_vector_to_hidden(
+    w_o_head: &ndarray::ArrayBase<impl ndarray::Data<Elem = f32>, ndarray::Ix2>,
+    values: &[f32],
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; w_o_head.nrows()];
+    for row in 0..w_o_head.nrows() {
+        let mut sum = 0.0f32;
+        for col in 0..w_o_head.ncols() {
+            sum += values[col] * w_o_head[[row, col]];
+        }
+        out[row] = sum;
+    }
+    out
+}
+
+fn forward_q4k_oracle_roundtrip_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    basis: &WoRoundtripBasis,
+) -> Result<(Array2<f32>, RoundtripPatchMetrics), Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+    let mut metrics = None;
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                let start = head.head * head_dim;
+                let end = start + head_dim;
+                let mut replacement = Vec::with_capacity(pre_o.nrows() * head_dim);
+                let mut pre_sq = 0.0;
+                let mut visible_sq = 0.0;
+                let mut count = 0usize;
+                for pos in 0..pre_o.nrows() {
+                    let row = pre_o.slice(s![pos, start..end]);
+                    let values = row
+                        .as_slice()
+                        .ok_or("pre-W_O head row was not contiguous during roundtrip")?;
+                    let projected = basis.project(values);
+                    for (&original, &recon) in values.iter().zip(projected.iter()) {
+                        let delta = original as f64 - recon as f64;
+                        pre_sq += delta * delta;
+                    }
+                    let delta = values
+                        .iter()
+                        .zip(projected.iter())
+                        .map(|(&original, &recon)| original as f64 - recon as f64)
+                        .collect::<Vec<_>>();
+                    visible_sq += basis.visible_sq_norm(&delta);
+                    count += 1;
+                    replacement.extend_from_slice(&projected);
+                }
+                metrics = Some(RoundtripPatchMetrics {
+                    pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
+                    wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
+                });
+                let replacement = Array2::from_shape_vec((pre_o.nrows(), head_dim), replacement)?;
+                run_layer_with_replaced_pre_o_head(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    &replacement,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} during oracle roundtrip L{} H{}",
+                head.layer, head.head
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok((
+        h,
+        metrics.ok_or("oracle roundtrip did not visit target layer")?,
+    ))
+}
+
+fn forward_q4k_oracle_lowrank_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    basis: &WoRoundtripBasis,
+    pca_basis: &ZPcaBasis,
+    means: &StaticHeadMeans,
+    k: usize,
+) -> Result<(Array2<f32>, RoundtripPatchMetrics), Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+    let mut metrics = None;
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                let start = head.head * head_dim;
+                let end = start + head_dim;
+                let mut replacement = Vec::with_capacity(pre_o.nrows() * head_dim);
+                let mut pre_sq = 0.0;
+                let mut visible_sq = 0.0;
+                let mut count = 0usize;
+                for pos in 0..pre_o.nrows() {
+                    let row = pre_o.slice(s![pos, start..end]);
+                    let values = row
+                        .as_slice()
+                        .ok_or("pre-W_O head row was not contiguous during lowrank")?;
+                    let base = means.positions.get(pos).unwrap_or(&means.global);
+                    let residual = values
+                        .iter()
+                        .zip(base.iter())
+                        .map(|(&yi, &bi)| yi - bi)
+                        .collect::<Vec<_>>();
+                    let z = basis.residual_to_z(&residual);
+                    let z_projected = pca_basis.project_with_rank(&z, k);
+                    let residual_projected = basis.z_to_residual(&z_projected);
+                    let projected = residual_projected
+                        .into_iter()
+                        .zip(base.iter())
+                        .map(|(ri, &bi)| ri + bi)
+                        .collect::<Vec<_>>();
+                    for (&original, &recon) in values.iter().zip(projected.iter()) {
+                        let delta = original as f64 - recon as f64;
+                        pre_sq += delta * delta;
+                    }
+                    let delta = values
+                        .iter()
+                        .zip(projected.iter())
+                        .map(|(&original, &recon)| original as f64 - recon as f64)
+                        .collect::<Vec<_>>();
+                    visible_sq += basis.visible_sq_norm(&delta);
+                    count += 1;
+                    replacement.extend_from_slice(&projected);
+                }
+                metrics = Some(RoundtripPatchMetrics {
+                    pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
+                    wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
+                });
+                let replacement = Array2::from_shape_vec((pre_o.nrows(), head_dim), replacement)?;
+                run_layer_with_replaced_pre_o_head(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    &replacement,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} during oracle lowrank L{} H{} K={}",
+                head.layer, head.head, k
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok((
+        h,
+        metrics.ok_or("oracle lowrank did not visit target layer")?,
+    ))
+}
+
+fn forward_q4k_oracle_pq_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    basis: &WoRoundtripBasis,
+    pca_basis: &ZPcaBasis,
+    means: &StaticHeadMeans,
+    codebook: &PqCodebook,
+) -> Result<(Array2<f32>, RoundtripPatchMetrics), Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+    let mut metrics = None;
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                let start = head.head * head_dim;
+                let end = start + head_dim;
+                let mut replacement = Vec::with_capacity(pre_o.nrows() * head_dim);
+                let mut pre_sq = 0.0;
+                let mut visible_sq = 0.0;
+                let mut count = 0usize;
+                for pos in 0..pre_o.nrows() {
+                    let row = pre_o.slice(s![pos, start..end]);
+                    let values = row
+                        .as_slice()
+                        .ok_or("pre-W_O head row was not contiguous during PQ")?;
+                    let base = means.positions.get(pos).unwrap_or(&means.global);
+                    let residual = values
+                        .iter()
+                        .zip(base.iter())
+                        .map(|(&yi, &bi)| yi - bi)
+                        .collect::<Vec<_>>();
+                    let z = basis.residual_to_z(&residual);
+                    let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
+                    let quantized_coords = codebook.quantize(&coords);
+                    let z_projected = pca_basis.reconstruct_from_coordinates(&quantized_coords);
+                    let residual_projected = basis.z_to_residual(&z_projected);
+                    let projected = residual_projected
+                        .into_iter()
+                        .zip(base.iter())
+                        .map(|(ri, &bi)| ri + bi)
+                        .collect::<Vec<_>>();
+                    for (&original, &recon) in values.iter().zip(projected.iter()) {
+                        let delta = original as f64 - recon as f64;
+                        pre_sq += delta * delta;
+                    }
+                    let delta = values
+                        .iter()
+                        .zip(projected.iter())
+                        .map(|(&original, &recon)| original as f64 - recon as f64)
+                        .collect::<Vec<_>>();
+                    visible_sq += basis.visible_sq_norm(&delta);
+                    count += 1;
+                    replacement.extend_from_slice(&projected);
+                }
+                metrics = Some(RoundtripPatchMetrics {
+                    pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
+                    wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
+                });
+                let replacement = Array2::from_shape_vec((pre_o.nrows(), head_dim), replacement)?;
+                run_layer_with_replaced_pre_o_head(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    &replacement,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} during oracle PQ L{} H{} K={} groups={} bits={}",
+                head.layer,
+                head.head,
+                codebook.config.k,
+                codebook.config.groups,
+                codebook.config.bits_per_group
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok((h, metrics.ok_or("oracle PQ did not visit target layer")?))
+}
+
+fn forward_q4k_oracle_pq_mode_d_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    basis: &WoRoundtripBasis,
+    pca_basis: &ZPcaBasis,
+    means: &StaticHeadMeans,
+    codebook: &PqCodebook,
+    mode_d_table: &ModeDTable,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                let start = head.head * head_dim;
+                let end = start + head_dim;
+                let mut replacement_delta = Vec::with_capacity(pre_o.nrows() * weights.hidden_size);
+                for pos in 0..pre_o.nrows() {
+                    let row = pre_o.slice(s![pos, start..end]);
+                    let values = row
+                        .as_slice()
+                        .ok_or("pre-W_O head row was not contiguous during Mode D PQ")?;
+                    let base = means.positions.get(pos).unwrap_or(&means.global);
+                    let residual = values
+                        .iter()
+                        .zip(base.iter())
+                        .map(|(&yi, &bi)| yi - bi)
+                        .collect::<Vec<_>>();
+                    let z = basis.residual_to_z(&residual);
+                    let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
+                    let codes = codebook.quantize_indices(&coords);
+                    let delta = mode_d_table.delta_for_position_codes(pos, &codes);
+                    replacement_delta.extend_from_slice(&delta);
+                }
+                let replacement_delta = Array2::from_shape_vec(
+                    (pre_o.nrows(), weights.hidden_size),
+                    replacement_delta,
+                )?;
+                run_layer_with_replaced_head_residual_delta(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    &replacement_delta,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} during Mode D oracle PQ L{} H{} K={} groups={} bits={}",
+                head.layer,
+                head.head,
+                codebook.config.k,
+                codebook.config.groups,
+                codebook.config.bits_per_group
             )
             .into());
         }
@@ -1646,6 +4380,12 @@ fn kl_logp(p_logp: &[f64], q_logp: &[f64]) -> f64 {
             p * (lp - lq)
         })
         .sum()
+}
+
+fn token_prob(logp: &[f64], token_id: u32) -> f64 {
+    logp.get(token_id as usize)
+        .map(|value| value.exp())
+        .unwrap_or(0.0)
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {

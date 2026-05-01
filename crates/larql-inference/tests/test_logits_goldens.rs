@@ -89,15 +89,49 @@ const GOLDENS: &[Golden] = &[
     // synthesised Q4_0 path (`backend.q4_matvec` against `lm_head_q4_synth`).
     // Pre-2026-04-25 the Metal dispatcher imported the wrong shader's
     // geometry constants and silently dropped 75 % of vocab rows; CPU
-    // and Metal goldens diverged because of that bug. Post-fix the two
-    // backends agree to within Q4 round-trip noise and the goldens
-    // collapse to one set per arch.
+    // and Metal goldens diverged because of that bug.
+    //
+    // 2026-05-01: Metal lm_head now routes through the **stride-32
+    // Q4_K matvec** path (`shaders/q4k_matvec_stride32.rs`) by default
+    // (`lm_head_topk` `prefer_cpu` branch in
+    // `layer_graph/generate/lm_head.rs` calls
+    // `index.lm_head_knn_backend_skip_q4k(..., backend)`, which tries
+    // `backend.q4k_matvec_stride32` first, then f16 GEMV, then f32
+    // BLAS). Reason: the production `q4k_matvec` 32-lane simdgroup
+    // reduction with `lane & 1u` block split drifts ~1e-3 vs CPU's
+    // sequential accumulator — enough to flip top-1 on close-call
+    // tokens (e.g. " Capital" vs " capital" at decode step 1 on
+    // Gemma 3 4B — see `arch_golden_gemma3_4b_gpu`). The stride-32
+    // variant uses the same Q4_K bytes but lane `k` accumulates
+    // stride-32 elements followed by `simd_sum` — a reduction tree
+    // bit-equivalent to `f16_gemv`'s, converging on CPU rankings up
+    // to ~ULP noise (top-1 logit within ~1e-7 relative).
+    //
+    // The Metal pins below match CPU pins at top-5 set+order; top-1
+    // logits differ by ~1e-3 (round-off, well inside `LOGIT_TOLERANCE`).
+    // Opt back into the production Q4_K Metal path with
+    // `LARQL_METAL_LM_HEAD=1` (faster ~1ms but flips top-1 on close
+    // calls); opt out of stride-32 to f16 GEMV with
+    // `LARQL_LM_HEAD_STRIDE32=0` (correct rank-1 but ~1ms slower).
+    //
+    // The non-gemma3 Metal pins below (gemma4-31b dense, gemma4-31b
+    // Q6_K down, llama2-7b, mistral-7b) still reflect older fix
+    // attempts and have NOT been re-captured for the stride-32 path.
+    // If you run this suite with those vindexes present, expect them
+    // to need refreshing — set `LARQL_LOGITS_GOLDENS_PRINT=1` and
+    // copy-paste from stdout.
     Golden {
         arch_name: "gemma3-4b-it",
         vindex_name: "gemma3-4b-q4k-v2",
         backend: "metal",
-        top5_token_ids: [256240, 250251, 256331, 114202, 254403],
-        top1_logit: 3693.570801,
+        // Metal stride-32 Q4_K matvec (`q4k_matvec_stride32` shader):
+        // same top-5 set + order as CPU, top-1 logit within ~7e-4 abs
+        // (~2e-7 relative). The stride-32 reduction tree closely
+        // mirrors `f16_gemv`'s and converges on CPU's f32 BLAS result
+        // up to round-off — much tighter than the original v3/v4
+        // (Metal f32/f16 GEMV) paths.
+        top5_token_ids: [256240, 250251, 256331, 249309, 212287],
+        top1_logit: 3693.571045,
     },
     Golden {
         arch_name: "gemma3-4b-it",
@@ -110,8 +144,8 @@ const GOLDENS: &[Golden] = &[
         arch_name: "gemma4-31b-it (dense)",
         vindex_name: "gemma4-31b-q4k",
         backend: "metal",
-        top5_token_ids: [181225, 129376, 231659, 85000, 258017],
-        top1_logit: 1.355004,
+        top5_token_ids: [236780, 236772, 236798, 236799, 236773],
+        top1_logit: 2.366634,
     },
     Golden {
         arch_name: "gemma4-31b-it (dense)",
@@ -124,8 +158,8 @@ const GOLDENS: &[Golden] = &[
         arch_name: "llama2-7b-hf (base)",
         vindex_name: "llama2-7b-q4k",
         backend: "metal",
-        top5_token_ids: [697, 3681, 385, 451, 297],
-        top1_logit: 27.334770,
+        top5_token_ids: [263, 278, 697, 3681, 884],
+        top1_logit: 29.988192,
     },
     Golden {
         arch_name: "llama2-7b-hf (base)",
@@ -158,8 +192,10 @@ const GOLDENS: &[Golden] = &[
         arch_name: "gemma3-4b-it (Q4_K down)",
         vindex_name: "gemma3-4b-q4k-downq4k",
         backend: "metal",
-        top5_token_ids: [250251, 256240, 256331, 120545, 123779],
-        top1_logit: 14667.831055,
+        // Metal stride-32 Q4_K matvec: bit-equivalent top-5 set + order
+        // to CPU, top-1 logit within ~7e-3 abs (~5e-7 relative).
+        top5_token_ids: [250251, 256240, 253044, 212287, 250492],
+        top1_logit: 14667.830078,
     },
     Golden {
         arch_name: "gemma3-4b-it (Q4_K down)",
@@ -175,8 +211,8 @@ const GOLDENS: &[Golden] = &[
         arch_name: "gemma4-31b-it (Q6_K down)",
         vindex_name: "gemma4-31b-q4k-q6kdown",
         backend: "metal",
-        top5_token_ids: [497, 236762, 514, 237051, 236945],
-        top1_logit: 1.064088,
+        top5_token_ids: [497, 524, 236762, 514, 237051],
+        top1_logit: 1.064089,
     },
     Golden {
         arch_name: "gemma4-31b-it (Q6_K down)",

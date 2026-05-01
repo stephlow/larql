@@ -71,9 +71,7 @@ fn q4k_matmul_faster_than_stacked_matvec_on_prefill_shape() {
     let matmul_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
     let speedup = stacked_ms / matmul_ms;
-    eprintln!(
-        "q4k_matmul perf vs stacked matvec (N={num_rows}, K={hidden}, M={seq_len}):"
-    );
+    eprintln!("q4k_matmul perf vs stacked matvec (N={num_rows}, K={hidden}, M={seq_len}):");
     eprintln!("  stacked matvec: {stacked_ms:.2} ms / call");
     eprintln!("  q4k_matmul:     {matmul_ms:.2} ms / call");
     eprintln!("  speedup:        {speedup:.2}×");

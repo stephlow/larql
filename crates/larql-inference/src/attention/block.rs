@@ -44,6 +44,7 @@ pub fn run_attention_block_with_kv_out(
         None,
         None,
         None,
+        None,
     )?;
     Some((h_post, attn_proj, attn_w, k, v))
 }
@@ -66,6 +67,7 @@ pub fn run_attention_block_shared(
         None,
         None,
         None,
+        None,
     )?;
     Some((h_post, attn_proj, attn_w))
 }
@@ -79,7 +81,7 @@ pub fn run_attention_block_with_pre_o(
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
     let (h_post, _, _, _, _, pre_o) =
-        run_attention_block_core(weights, h, layer, false, None, None, None, None)?;
+        run_attention_block_core(weights, h, layer, false, None, None, None, None, None)?;
     Some((h_post, pre_o))
 }
 
@@ -94,8 +96,17 @@ pub fn run_attention_block_zero_pre_o_heads(
     heads: &[usize],
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (h_post, _, _, k_rope, v_final, _) =
-        run_attention_block_core(weights, h, layer, false, shared_kv, Some(heads), None, None)?;
+    let (h_post, _, _, k_rope, v_final, _) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        false,
+        shared_kv,
+        Some(heads),
+        None,
+        None,
+        None,
+    )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
     } else {
@@ -124,6 +135,7 @@ pub fn run_attention_block_replace_pre_o_head(
         None,
         Some((head, replacement)),
         None,
+        None,
     )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
@@ -145,8 +157,51 @@ pub fn run_attention_block_subtract_pre_o_heads(
     heads: &[usize],
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (h_post, _, _, k_rope, v_final, _) =
-        run_attention_block_core(weights, h, layer, false, shared_kv, None, None, Some(heads))?;
+    let (h_post, _, _, k_rope, v_final, _) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        false,
+        shared_kv,
+        None,
+        None,
+        Some(heads),
+        None,
+    )?;
+    let kv_out = if shared_kv.is_none() {
+        Some((k_rope, v_final))
+    } else {
+        None
+    };
+    Some((h_post, kv_out))
+}
+
+/// Run attention while replacing one query-head residual-space contribution
+/// after W_O projection and before the attention residual path.
+///
+/// `replacement_delta` must have shape `[seq_len, hidden_size]` and represents
+/// the residual-space contribution that should replace `W_O^head y_head`.
+/// This is the Mode D validation surface: runtime lookup/add tables can bypass
+/// W_O entirely while the rest of the layer remains unchanged.
+pub fn run_attention_block_replace_head_residual_delta(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    head: usize,
+    replacement_delta: &Array2<f32>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post, _, _, k_rope, v_final, _) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        false,
+        shared_kv,
+        None,
+        None,
+        None,
+        Some((head, replacement_delta)),
+    )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
     } else {
@@ -167,6 +222,7 @@ fn run_attention_block_core(
     zero_pre_o_heads: Option<&[usize]>,
     replace_pre_o_head: Option<(usize, &Array2<f32>)>,
     subtract_pre_o_heads: Option<&[usize]>,
+    replace_head_residual_delta: Option<(usize, &Array2<f32>)>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -362,6 +418,21 @@ fn run_attention_block_core(
             let contribution = dot_proj(&head_out, &w_o_head);
             attn_projected -= &contribution;
         }
+    }
+    if let Some((head, replacement_delta)) = replace_head_residual_delta {
+        if head >= num_q
+            || replacement_delta.nrows() != seq_len
+            || replacement_delta.ncols() != weights.hidden_size
+        {
+            return None;
+        }
+        let start = head * head_dim;
+        let end = start + head_dim;
+        let head_out = attn_out.slice(s![.., start..end]);
+        let w_o_head = w_o.slice(s![.., start..end]);
+        let original_contribution = dot_proj(&head_out, &w_o_head);
+        attn_projected -= &original_contribution;
+        attn_projected += replacement_delta;
     }
     if let Some(bias) = arch
         .attn_o_bias_key(layer)

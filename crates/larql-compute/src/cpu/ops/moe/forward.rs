@@ -16,7 +16,9 @@
 use crate::MoeLayerWeights;
 
 use super::cache::cached_dequant;
+use super::expert::{run_single_expert_q4k_q8k_into, ExpertScratch};
 use super::math::{gelu_tanh, matmul_vec, rms_norm, rms_norm_no_weight, silu, softmax, top_k};
+use crate::cpu::ops::q4k_q8k_dot::quantize_x_to_q8k;
 
 /// Run the MoE expert block for one token.
 ///
@@ -29,6 +31,15 @@ pub fn cpu_moe_forward(
     norm_offset: f32,
     eps: f32,
 ) -> Vec<f32> {
+    // Per-stage timing for bottleneck diagnosis.  Enable with
+    // `LARQL_MOE_FWD_TIMING=1`.  Cached in TLS to avoid syscalls
+    // per call on the hot path.
+    thread_local! {
+        static FWD_TIMING: bool = std::env::var("LARQL_MOE_FWD_TIMING").is_ok();
+    }
+    let timing = FWD_TIMING.with(|t| *t);
+    let t_start = std::time::Instant::now();
+
     let hidden = h.len();
     let num_experts = moe.num_experts;
     let top_k_val = moe.top_k;
@@ -149,7 +160,6 @@ pub fn cpu_moe_forward(
     //
     //    gate_up layout: [num_experts, 2*inter, hidden]  (gate rows first, then up rows)
     //    down layout:    [num_experts, hidden, inter]
-    use rayon::prelude::*;
     let activation = moe.activation;
     let format = moe.expert_data_format;
     // Storage layout per Gemma 4 26B-A4B (and the per-layer Q4_K writer):
@@ -171,60 +181,145 @@ pub fn cpu_moe_forward(
         }
         _ => inter,
     };
-    let per_expert: Vec<(f32, Vec<f32>)> = expert_indices
-        .par_iter()
-        .zip(expert_weights.par_iter())
-        .filter_map(|(&ei, &weight)| {
-            if weight == 0.0 {
-                return None;
-            }
-            // Per-expert byte slices come straight from the mmap-backed
-            // tables; cached_dequant LRU-keys on the byte pointer so a
-            // re-selected expert skips both allocation and decode.
-            let gate_up_bytes = *moe.experts_gate_up.get(ei)?;
-            let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
-            if gate_up_w.is_empty() {
-                return None;
-            }
-            let gate_w = &gate_up_w[..inter * hidden];
-            let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
 
-            let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
-            let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
+    let t_pre_par = t_start.elapsed();
 
-            // Gated activation: ACT(gate) * up.  Gemma 4 uses GELU-tanh; Mixtral uses SiLU.
-            // Build the inner activation at `inter_padded` so the down matmul
-            // (which expects `inter_padded` columns under Q4_K) sees zero in
-            // the padding region.
-            let mut hidden_state: Vec<f32> = vec![0.0f32; inter_padded];
-            for j in 0..inter {
-                let g = gate_out[j];
-                let u = up_out[j];
-                hidden_state[j] = match activation {
-                    crate::Activation::GeluTanh => gelu_tanh(g) * u,
-                    _ => silu(g) * u,
-                };
-            }
+    // Q4_K direct-from-mmap path: quantise h_norm to Q8_K once per layer
+    // (shared across all K active experts) and use the SDOT-based integer
+    // matvec.  Bypasses the f32 dequant cache entirely — at Gemma 4 26B-A4B
+    // sizes the f32 cache is 5.7 GB walked per token and DRAM-bandwidth
+    // bound; direct-Q4K is ~1.4 GB.  Set `LARQL_DISABLE_Q4K_DIRECT=1` to
+    // fall back to the BLAS-on-cached-f32 path for kernel-debug A/B runs.
+    let q4k_direct = matches!(format, crate::QuantFormat::Q4_K)
+        && hidden.is_multiple_of(256)
+        && std::env::var("LARQL_DISABLE_Q4K_DIRECT").is_err();
+    let t_q8k_quant_start = std::time::Instant::now();
+    let h_norm_q8k = q4k_direct.then(|| quantize_x_to_q8k(&h_norm));
+    let t_q8k_quant = t_q8k_quant_start.elapsed();
+    let t_par_start = std::time::Instant::now();
 
-            let down_bytes = *moe.experts_down.get(ei)?;
-            let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
-            if down_w.is_empty() {
-                return None;
-            }
-            let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter_padded);
-            Some((weight, expert_contribution))
-        })
-        .collect();
-
-    let mut expert_out = vec![0.0f32; hidden];
-    for (weight, contribution) in &per_expert {
-        for (acc, &val) in expert_out.iter_mut().zip(contribution.iter()) {
-            *acc += val * *weight;
-        }
+    // Per-rayon-thread scratch buffers (gate_out / up_out / act / act_q8k /
+    // out).  Allocated lazily on first hit, reused across all subsequent
+    // expert calls on the same worker.  Replaces the prior pattern of
+    // `vec![0; ...]` allocs per expert call (5 distinct heap allocs per
+    // call × K=8 × 30 layers = 1200 allocs/token, with occasional 150 µs
+    // spikes from the allocator's slow path that drag par_iter wall up).
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Option<ExpertScratch>> =
+            const { std::cell::RefCell::new(None) };
     }
 
+    use rayon::prelude::*;
+    let expert_out = expert_indices
+        .par_iter()
+        .zip(expert_weights.par_iter())
+        .filter(|(_, &w)| w != 0.0)
+        .fold(
+            || vec![0.0f32; hidden],
+            |mut acc, (&ei, &w)| {
+                let Some(&gate_up_bytes) = moe.experts_gate_up.get(ei) else {
+                    return acc;
+                };
+                let Some(&down_bytes) = moe.experts_down.get(ei) else {
+                    return acc;
+                };
+
+                SCRATCH.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let scratch = borrow
+                        .get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
+                    if scratch.gate_out.len() != inter
+                        || scratch.act.len() != inter_padded
+                        || scratch.out.len() != hidden
+                    {
+                        *scratch = ExpertScratch::new(hidden, inter, inter_padded);
+                    }
+
+                    if let Some(q8k) = h_norm_q8k.as_ref() {
+                        // Q4_K direct path — single source of truth in
+                        // `expert::run_single_expert_q4k_q8k_into`.  Reuses
+                        // the scratch's act_q8k buffer too.
+                        let h2 = run_single_expert_q4k_q8k_into(
+                            scratch,
+                            q8k,
+                            gate_up_bytes,
+                            down_bytes,
+                            inter,
+                            activation,
+                        );
+                        for (a, &v) in acc.iter_mut().zip(h2.iter()) {
+                            *a += w * v;
+                        }
+                        return;
+                    }
+
+                    // Fallback: BF16 / F32 / Q4_K-with-disable — original
+                    // f32 cache path.  Inlined here to avoid pulling the
+                    // per-call rms_norm / format dispatch from the legacy
+                    // `run_single_expert_into` that doesn't share scratch.
+                    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
+                    if gate_up_w.is_empty() {
+                        return;
+                    }
+                    let gate_w = &gate_up_w[..inter * hidden];
+                    let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
+
+                    let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
+                    let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
+
+                    for j in 0..inter {
+                        let g = gate_out[j];
+                        let u = up_out[j];
+                        scratch.act[j] = match activation {
+                            crate::Activation::GeluTanh => gelu_tanh(g) * u,
+                            _ => silu(g) * u,
+                        };
+                    }
+
+                    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
+                    if down_w.is_empty() {
+                        return;
+                    }
+                    let expert_contribution =
+                        matmul_vec(&scratch.act, &down_w, hidden, inter_padded);
+                    for (a, &v) in acc.iter_mut().zip(expert_contribution.iter()) {
+                        *a += w * v;
+                    }
+                });
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f32; hidden],
+            |mut a, b| {
+                for (x, &y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            },
+        );
+
+    let t_par = t_par_start.elapsed();
+    let t_sum = std::time::Duration::ZERO;
+
     // 10. Post-experts norm (HF `post_feedforward_layernorm_2`)
+    let t_post_start = std::time::Instant::now();
     let result = rms_norm(&expert_out, moe.post_experts_norm, eps, norm_offset);
+    let t_post = t_post_start.elapsed();
+
+    if timing {
+        eprintln!(
+            "[cpu_moe_forward] K={} pre_par={:.0}us q8k_quant={:.0}us \
+             par_iter={:.0}us sum={:.0}us post_norm={:.0}us total={:.0}us",
+            expert_indices.len(),
+            t_pre_par.as_secs_f64() * 1e6,
+            t_q8k_quant.as_secs_f64() * 1e6,
+            t_par.as_secs_f64() * 1e6,
+            t_sum.as_secs_f64() * 1e6,
+            t_post.as_secs_f64() * 1e6,
+            t_start.elapsed().as_secs_f64() * 1e6,
+        );
+    }
 
     if std::env::var("MOE_DEBUG").is_ok() {
         let pre_rms =

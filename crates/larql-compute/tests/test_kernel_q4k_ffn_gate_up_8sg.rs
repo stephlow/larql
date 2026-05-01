@@ -129,18 +129,10 @@ fn q4k_ffn_gate_up_8sg_matches_4sg_bit_equal() {
     assert_eq!(u4.len(), u8.len(), "up output length");
     // Bit-equal: math is identical, only the TG dispatch geometry changed.
     for (i, (a, b)) in g4.iter().zip(&g8).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "gate row {i}: 4sg={a} != 8sg={b}"
-        );
+        assert_eq!(a.to_bits(), b.to_bits(), "gate row {i}: 4sg={a} != 8sg={b}");
     }
     for (i, (a, b)) in u4.iter().zip(&u8).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "up row {i}: 4sg={a} != 8sg={b}"
-        );
+        assert_eq!(a.to_bits(), b.to_bits(), "up row {i}: 4sg={a} != 8sg={b}");
     }
 }
 

@@ -594,16 +594,22 @@ pub fn generate_with_remote_moe(
         let mut tok_timings: Vec<LayerTiming> = Vec::new();
 
         // Two paths:
-        //   - LARQL_MOE_SPLIT=1 + streams (gRPC) → split fire/collect so dense
-        //     FFN overlaps with the remote round trip.  Only beneficial when
-        //     the shard servers are on **separate physical GPUs** from the
-        //     client; on a single-GPU dev box client + server contend for the
-        //     device and overlap regresses (measured: 20 → 4 tok/s on M3 Max
-        //     with one local shard).  Off by default.
-        //   - otherwise → existing unary HTTP / synchronous moe_fn (used for
-        //     both HTTP shards and the loopback gRPC dev case).
-        let split_enabled = std::env::var("LARQL_MOE_SPLIT").is_ok();
-        let result = if streams.is_empty() || !split_enabled {
+        //   - streams (gRPC) → split fire/collect so dense FFN overlaps with
+        //     the remote MoE round trip.  Reliably ~10% faster on M3 Max
+        //     loopback in steady state (re-measured 2026-05-01: 19.5 vs
+        //     17.7 tok/s on Gemma 4 26B-A4B with one local gRPC shard,
+        //     stable across alternating cooled runs).  The historical
+        //     "20 → 4 tok/s catastrophic regression" warning predates the
+        //     Metal MoE accuracy fix and the predispatch refactor; under
+        //     thermal pressure both paths regress similarly, but
+        //     stable-state SPLIT wins.  Set `LARQL_MOE_NO_SPLIT=1` to
+        //     force the unary path (e.g., to debug a regression on a new
+        //     hardware / driver combo).
+        //   - otherwise → existing unary HTTP / synchronous moe_fn (used
+        //     for HTTP shards which don't open gRPC streams, plus the
+        //     opt-out path above).
+        let split_disabled = std::env::var("LARQL_MOE_NO_SPLIT").is_ok();
+        let result = if streams.is_empty() || split_disabled {
             let mut moe_fn = |layer: usize, h_post_attn: &[f32]| -> Vec<f32> {
                 if skip_moe {
                     return vec![0.0f32; hidden];

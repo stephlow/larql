@@ -45,6 +45,8 @@ const PATCH_BY_NAME: &str = "/v1/patches/{name}";
 const WALK_FFN: &str = "/v1/walk-ffn";
 const EXPERT_TOPOLOGY: &str = "/v1/expert/topology";
 const EXPERT_BATCH: &str = "/v1/expert/batch";
+const EXPERTS_LAYER_BATCH: &str = "/v1/experts/layer-batch";
+const EXPERTS_LAYER_BATCH_F16: &str = "/v1/experts/layer-batch-f16";
 const EXPERT: &str = "/v1/expert/{layer}/{expert_id}";
 const EXPLAIN_INFER: &str = "/v1/explain-infer";
 const INSERT: &str = "/v1/insert";
@@ -90,6 +92,16 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(
             EXPERT_BATCH,
             post(expert::handle_expert_batch).layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
+        )
+        .route(
+            EXPERTS_LAYER_BATCH,
+            post(expert::handle_experts_layer_batch)
+                .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
+        )
+        .route(
+            EXPERTS_LAYER_BATCH_F16,
+            post(expert::handle_experts_layer_batch_f16)
+                .layer(DefaultBodyLimit::max(EXPERT_BATCH_BODY_LIMIT)),
         )
         .route(EXPERT, post(expert::handle_expert))
         .route(EXPLAIN_INFER, post(explain::handle_explain))

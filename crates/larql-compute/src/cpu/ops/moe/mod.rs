@@ -16,9 +16,10 @@ mod expert;
 mod forward;
 mod math;
 
+pub use crate::cpu::ops::q4k_q8k_dot::{quantize_x_to_q8k, Q8KActivation};
 pub use expert::{
-    pre_experts_norm, run_single_expert, run_single_expert_into,
-    run_single_expert_with_norm, ExpertScratch,
+    pre_experts_norm, quantize_h_norm_for_q4k, run_single_expert, run_single_expert_into,
+    run_single_expert_q4k_q8k_into, run_single_expert_with_norm, ExpertScratch,
 };
 pub use forward::cpu_moe_forward;
 

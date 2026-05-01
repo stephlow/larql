@@ -452,6 +452,50 @@ impl MetalBackend {
         ))
     }
 
+    /// Q4_K stride-32 matvec → full f32 scores. Same Q4_K input format
+    /// as `q4k_matvec`, but uses the shader at
+    /// `shaders::q4k_matvec_stride32` whose 32-lane reduction matches
+    /// `f16_gemv`'s tree (lane k accumulates stride-32 elements then
+    /// `simd_sum`). Required for the LM head when the production
+    /// `q4k_matvec`'s block-aware lane split drifts enough vs CPU to
+    /// flip top-1 on close-call tokens.
+    pub fn q4k_matvec_stride32(
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        if hidden == 0 || !hidden.is_multiple_of(256) {
+            return None;
+        }
+        let kh = &self.q4k_matvec_stride32_pipeline;
+        let buf_w = self.bufs.get_bytes(q4k_data);
+        let buf_x = self.bufs.transient_from_f32(x);
+        let buf_out = self.bufs.output((num_rows * 4) as u64);
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let num_tgs = (num_rows as u64).div_ceil(kh.rows_per_tg);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&kh.state);
+        enc.set_buffer(0, Some(&buf_w), 0);
+        enc.set_buffer(1, Some(&buf_x), 0);
+        enc.set_buffer(2, Some(&buf_out), 0);
+        enc.set_bytes(3, 4, &n as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(num_tgs, 1, 1),
+            metal::MTLSize::new(kh.threads_per_tg, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        Some(crate::metal::buffers::read_buffer_f32(&buf_out, num_rows))
+    }
+
     /// Shared dispatch body for f16-weight gemv (behind both trait
     /// variants: threshold-gated `f16_gemv` and direct `f16_gemv_force`).
     fn encode_f16_gemv(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {

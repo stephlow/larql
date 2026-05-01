@@ -205,6 +205,14 @@ struct Cli {
     #[arg(long)]
     tls_key: Option<PathBuf>,
 
+    /// Bind a Unix domain socket alongside the TCP listener for same-host
+    /// MoE shard clients.  Skips the kernel TCP stack and saves ~50 µs/call
+    /// on loopback.  Path is created at startup; pre-existing socket files
+    /// are unlinked.  Clients reach the shard via a `unix:///path/to/sock`
+    /// URL in `--moe-shards`.
+    #[arg(long, value_name = "PATH")]
+    uds_path: Option<PathBuf>,
+
     /// Join one or more router grids (comma-separated gRPC addresses).
     /// Example: "http://router-a:50052,http://router-b:50052"
     /// Each router gets an independent announce stream — stateless fan-out.
@@ -581,8 +589,51 @@ async fn main() -> Result<(), BoxError> {
             .serve(app.into_make_service())
             .await?;
     } else {
+        // Optional Unix domain socket alongside TCP (for same-host MoE
+        // shard clients).  Saves ~50 µs/call on loopback by skipping the
+        // kernel TCP stack.  Runs as a background task; if it fails we
+        // log and continue with TCP only — TCP is the primary process
+        // lifecycle anchor.
+        if let Some(uds_path) = cli.uds_path.clone() {
+            // Unlink any leftover socket from a prior unclean shutdown.
+            let _ = std::fs::remove_file(&uds_path);
+            match tokio::net::UnixListener::bind(&uds_path) {
+                Ok(uds_listener) => {
+                    info!("Listening: unix://{}", uds_path.display());
+                    let uds_app = app.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(uds_listener, uds_app).await {
+                            tracing::error!(
+                                "UDS listener crashed: {e:#}; same-host MoE shard \
+                                 clients will need to fall back to TCP"
+                            );
+                        }
+                    });
+                }
+                Err(e) => warn!(
+                    "failed to bind UDS at {}: {e:#}; serving TCP only",
+                    uds_path.display()
+                ),
+            }
+        }
+
         info!("Listening: http://{}", addr);
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        // `set_nodelay(true)` on every accepted connection — disables
+        // Nagle's algorithm so the response tail-packet isn't held
+        // waiting for ACK coalescence.  The MoE layer-batch path
+        // round-trips ~12 KB request + ~11 KB response per layer × 30
+        // layers/token; without TCP_NODELAY the last partial packet
+        // can be held by the kernel for 40 ms (Linux delayed-ACK timer)
+        // or 200 ms (BSD).  axum 0.8's `ListenerExt::tap_io` is the
+        // canonical hook.
+        use axum::serve::ListenerExt;
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await?
+            .tap_io(|stream| {
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!("failed to set TCP_NODELAY on accepted connection: {e:#}");
+                }
+            });
         axum::serve(listener, app).await?;
     }
 

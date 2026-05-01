@@ -190,6 +190,25 @@ pub trait QuantMatVec {
         None
     }
 
+    /// Q4_K matvec with stride-32 lane access pattern. Same Q4_K input
+    /// format as [`q4k_matvec`](Self::q4k_matvec) but the per-row
+    /// reduction tree mirrors `f16_gemv` — lane `k` accumulates the
+    /// dot product over elements `i % 32 == k`, then `simd_sum` across
+    /// 32 lanes. Designed for the LM head when the production
+    /// `q4k_matvec`'s block-aware lane split drifts enough vs CPU to
+    /// flip top-1 on close-call tokens. Backends without a stable-
+    /// reduction Q4_K path return `None` and the caller falls back to
+    /// `f16_gemv` / `q4k_matvec` / `f32_gemv` chain.
+    fn q4k_matvec_stride32(
+        &self,
+        _q4k_data: &[u8],
+        _x: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Q4_K matmul: `C[m, n] = sum_k W[n, k] * X[m, k]`.
     ///
     /// `W` is `[num_rows, hidden]` Q4_K, `X` is `[seq_len, hidden]` f32,

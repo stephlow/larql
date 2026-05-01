@@ -27,8 +27,10 @@ use crate::error::ServerError;
 use crate::state::AppState;
 use larql_inference;
 use larql_inference::ffn::moe_remote::{
-    decode_expert_request, encode_expert_response, ExpertCallItem, ExpertResultItem,
-    EXPERT_BINARY_CONTENT_TYPE,
+    decode_expert_request, decode_layer_batch_request, decode_layer_batch_request_f16,
+    encode_expert_response, encode_layer_batch_response, encode_layer_batch_response_f16,
+    ExpertCallItem, ExpertResultItem, EXPERT_BINARY_CONTENT_TYPE, LAYER_BATCH_CONTENT_TYPE,
+    LAYER_BATCH_F16_CONTENT_TYPE,
 };
 
 // ── Request / response types ──────────────────────────────────────────────────
@@ -94,7 +96,10 @@ pub fn run_experts_cpu_batch(
     expert_ids: &[usize],
     expert_weights: &[f32],
 ) -> Result<Vec<f32>, ServerError> {
-    use larql_compute::cpu::ops::moe::{pre_experts_norm, run_single_expert_into, ExpertScratch};
+    use larql_compute::cpu::ops::moe::{
+        pre_experts_norm, quantize_h_norm_for_q4k, run_single_expert_into,
+        run_single_expert_q4k_q8k_into, ExpertScratch,
+    };
     use std::time::Instant;
     let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
     let t_start = Instant::now();
@@ -148,6 +153,21 @@ pub fn run_experts_cpu_batch(
         larql_inference::QuantFormat::Q4_K
     } else {
         larql_inference::QuantFormat::BF16
+    };
+
+    // For Q4_K weights, quantise h_norm to Q8_K once per layer (shared
+    // across all K active experts).  Enables the SDOT-based direct-Q4K
+    // matvec kernel — bypasses the f32 dequant cache entirely.  Default-on
+    // when format is Q4_K and the activation length is divisible by 256
+    // (always true for production hidden sizes); set
+    // `LARQL_DISABLE_Q4K_DIRECT=1` to fall back to the BLAS-on-cached-f32
+    // path (e.g. for kernel-debug A/B comparison).
+    let q4k_direct = matches!(format, larql_inference::QuantFormat::Q4_K)
+        && std::env::var("LARQL_DISABLE_Q4K_DIRECT").is_err();
+    let h_norm_q8k = if q4k_direct {
+        quantize_h_norm_for_q4k(&h_norm)
+    } else {
+        None
     };
 
     // Resolve (gate_up, down) bytes for one expert.  Pulled out of the
@@ -204,9 +224,15 @@ pub fn run_experts_cpu_batch(
                     {
                         *scratch = ExpertScratch::new(hidden, inter, inter_padded);
                     }
-                    let h2 = run_single_expert_into(
-                        scratch, &h_norm, gu_bytes, dn_bytes, inter, format, activation,
-                    );
+                    let h2 = if let Some(q8k) = h_norm_q8k.as_ref() {
+                        run_single_expert_q4k_q8k_into(
+                            scratch, q8k, gu_bytes, dn_bytes, inter, activation,
+                        )
+                    } else {
+                        run_single_expert_into(
+                            scratch, &h_norm, gu_bytes, dn_bytes, inter, format, activation,
+                        )
+                    };
                     for (a, &v) in acc.iter_mut().zip(h2.iter()) {
                         *a += w * v;
                     }
@@ -805,4 +831,150 @@ pub async fn handle_expert_batch(
     };
 
     Ok(response)
+}
+
+/// `POST /v1/experts/layer-batch` — single residual + K (expert_id, weight)
+/// pairs for one layer.  Server applies pre_experts_norm once, quantises
+/// h_norm to Q8_K once, fans out the K expert kernels with the shared
+/// activation via `run_experts_cpu_batch`, returns the router-weighted sum.
+///
+/// Wire format documented in `larql_inference::ffn::moe_remote` next to
+/// `LAYER_BATCH_CONTENT_TYPE`.  Replaces the K-residual-copies pattern of
+/// `/v1/expert/batch` for the common-case forward_moe call where every
+/// expert in the layer's top-K shares the same residual.
+pub async fn handle_experts_layer_batch(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Response, ServerError> {
+    state.bump_requests();
+    // Per-stage timing for HTTP-overhead diagnosis.  Enable with
+    // `LARQL_HTTP_TIMING=1`.  Cached in TLS to avoid syscalls per call.
+    thread_local! {
+        static HTTP_TIMING: bool = std::env::var("LARQL_HTTP_TIMING").is_ok();
+    }
+    let timing = HTTP_TIMING.with(|t| *t);
+    let t_start = std::time::Instant::now();
+
+    let (layer, residual, expert_ids_u32, expert_weights) = decode_layer_batch_request(&body)
+        .ok_or_else(|| ServerError::BadRequest("layer-batch request truncated".into()))?;
+    let t_decode = if timing {
+        Some(t_start.elapsed())
+    } else {
+        None
+    };
+
+    // Convert expert_ids u32 → usize for the existing run_experts_cpu_batch
+    // signature.  Cheap; expert_ids is small (K=8 typical).
+    let expert_ids: Vec<usize> = expert_ids_u32.iter().map(|&e| e as usize).collect();
+
+    let t_spawn_in = std::time::Instant::now();
+    // `spawn_blocking` (vs `block_in_place`): we want the compute on the
+    // dedicated blocking thread pool so tokio's worker threads stay free
+    // for the hot HTTP path.  Tried block_in_place (2026-05-01): saved
+    // the ~25 µs transition server-side but made sweep ~0.3 ms slower
+    // because tokio kept spawning replacement OS workers when every
+    // request blocked the worker.  spawn_blocking's pool reuses threads
+    // and works better for the hot-path-blocks-every-call pattern.
+    let (weighted_sum, t_spawn_internal) = tokio::task::spawn_blocking(move || {
+        let t_in = std::time::Instant::now();
+        let r = run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights);
+        let t_internal = t_in.elapsed();
+        (r, t_internal)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let weighted_sum = weighted_sum?;
+    let t_total_compute = t_spawn_in.elapsed();
+    let t_spawn_overhead = t_total_compute.saturating_sub(t_spawn_internal);
+
+    let t_encode_in = std::time::Instant::now();
+    let latency_ms = (t_start.elapsed().as_secs_f64() * 1000.0) as f32;
+    let body = encode_layer_batch_response(&weighted_sum, latency_ms);
+    let t_encode = t_encode_in.elapsed();
+
+    let resp = Response::builder()
+        .header(header::CONTENT_TYPE, LAYER_BATCH_CONTENT_TYPE)
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+
+    if timing {
+        eprintln!(
+            "[handle_layer_batch] layer={layer} K={} decode={:.0}us \
+             spawn_overhead={:.0}us compute={:.0}us encode={:.0}us total={:.0}us",
+            expert_ids_u32.len(),
+            t_decode.unwrap().as_secs_f64() * 1e6,
+            t_spawn_overhead.as_secs_f64() * 1e6,
+            t_spawn_internal.as_secs_f64() * 1e6,
+            t_encode.as_secs_f64() * 1e6,
+            t_start.elapsed().as_secs_f64() * 1e6,
+        );
+    }
+
+    Ok(resp)
+}
+
+/// `POST /v1/experts/layer-batch-f16` — same semantics as the f32 layer-batch
+/// endpoint but residual + response use IEEE-754 binary16.  Halves the wire
+/// bytes (~5.5 KB residual + 5.5 KB response vs 11+11 KB f32).  f16 quant
+/// noise on activations is well below the Q8_K activation quant the SDOT
+/// kernel already applies, so end-to-end accuracy is unchanged.
+pub async fn handle_experts_layer_batch_f16(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Response, ServerError> {
+    state.bump_requests();
+    thread_local! {
+        static HTTP_TIMING: bool = std::env::var("LARQL_HTTP_TIMING").is_ok();
+    }
+    let timing = HTTP_TIMING.with(|t| *t);
+    let t_start = std::time::Instant::now();
+
+    let (layer, residual, expert_ids_u32, expert_weights) =
+        decode_layer_batch_request_f16(&body)
+            .ok_or_else(|| ServerError::BadRequest("layer-batch-f16 request truncated".into()))?;
+    let t_decode = if timing {
+        Some(t_start.elapsed())
+    } else {
+        None
+    };
+
+    let expert_ids: Vec<usize> = expert_ids_u32.iter().map(|&e| e as usize).collect();
+
+    let t_spawn_in = std::time::Instant::now();
+    let (weighted_sum, t_spawn_internal) = tokio::task::spawn_blocking(move || {
+        let t_in = std::time::Instant::now();
+        let r = run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights);
+        let t_internal = t_in.elapsed();
+        (r, t_internal)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let weighted_sum = weighted_sum?;
+    let t_total_compute = t_spawn_in.elapsed();
+    let t_spawn_overhead = t_total_compute.saturating_sub(t_spawn_internal);
+
+    let t_encode_in = std::time::Instant::now();
+    let latency_ms = (t_start.elapsed().as_secs_f64() * 1000.0) as f32;
+    let body = encode_layer_batch_response_f16(&weighted_sum, latency_ms);
+    let t_encode = t_encode_in.elapsed();
+
+    let resp = Response::builder()
+        .header(header::CONTENT_TYPE, LAYER_BATCH_F16_CONTENT_TYPE)
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+
+    if timing {
+        eprintln!(
+            "[handle_layer_batch_f16] layer={layer} K={} decode={:.0}us \
+             spawn_overhead={:.0}us compute={:.0}us encode={:.0}us total={:.0}us",
+            expert_ids_u32.len(),
+            t_decode.unwrap().as_secs_f64() * 1e6,
+            t_spawn_overhead.as_secs_f64() * 1e6,
+            t_spawn_internal.as_secs_f64() * 1e6,
+            t_encode.as_secs_f64() * 1e6,
+            t_start.elapsed().as_secs_f64() * 1e6,
+        );
+    }
+
+    Ok(resp)
 }

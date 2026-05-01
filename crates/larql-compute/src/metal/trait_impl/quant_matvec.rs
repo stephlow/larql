@@ -131,6 +131,16 @@ impl QuantMatVec for MetalBackend {
         Some(self.q4_matvec_pair_batch_direct(gate_q4, up_q4, x_matrix, seq_len, num_rows, hidden))
     }
 
+    fn q4k_matvec_stride32(
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        MetalBackend::q4k_matvec_stride32(self, q4k_data, x, num_rows, hidden)
+    }
+
     fn q4k_matvec(
         &self,
         q4k_data: &[u8],

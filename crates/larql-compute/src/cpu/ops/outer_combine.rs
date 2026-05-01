@@ -100,13 +100,7 @@ mod tests {
         let eps = 1e-6f32;
         let offset = 0.0f32;
 
-        let got = outer_post_norm_residual(
-            &h_post_attn,
-            &h1_plus_h2,
-            Some(&outer_w),
-            offset,
-            eps,
-        );
+        let got = outer_post_norm_residual(&h_post_attn, &h1_plus_h2, Some(&outer_w), offset, eps);
 
         // Reference implementation: literal Metal apply_outer_norm.
         let n = h1_plus_h2.len() as f32;
@@ -137,8 +131,7 @@ mod tests {
         let h_post_attn = vec![1.0f32, 2.0, 3.0];
         let h1_plus_h2 = vec![0.1f32, 0.2, 0.3];
 
-        let got =
-            outer_post_norm_residual(&h_post_attn, &h1_plus_h2, None, 0.0, 1e-6);
+        let got = outer_post_norm_residual(&h_post_attn, &h1_plus_h2, None, 0.0, 1e-6);
         assert_eq!(got, vec![1.1, 2.2, 3.3]);
     }
 
@@ -151,13 +144,7 @@ mod tests {
         let outer_w = vec![0.0f32; 4]; // all-zero learned weight
         let offset = 1.0f32;
 
-        let got = outer_post_norm_residual(
-            &h_post_attn,
-            &h1_plus_h2,
-            Some(&outer_w),
-            offset,
-            1e-6,
-        );
+        let got = outer_post_norm_residual(&h_post_attn, &h1_plus_h2, Some(&outer_w), offset, 1e-6);
         // After norm: x/rms = 1.0 (rms ≈ 1), times (0 + 1) = 1, plus
         // h_post_attn (0). So all 1.0 within eps tolerance.
         for v in &got {

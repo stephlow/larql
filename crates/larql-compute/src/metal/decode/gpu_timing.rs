@@ -126,10 +126,14 @@ impl TokenGpuTime {
             eprintln!(
                 "[gpu-timing/stage] attn={:.2}ms ({:.0}%)  dense_ffn={:.2}ms ({:.0}%)  \
                  final={:.2}ms ({:.0}%)  other={:.2}ms ({:.0}%)",
-                self.attn_ms, pct(self.attn_ms),
-                self.dense_ffn_ms, pct(self.dense_ffn_ms),
-                self.final_ms, pct(self.final_ms),
-                self.other_ms, pct(self.other_ms),
+                self.attn_ms,
+                pct(self.attn_ms),
+                self.dense_ffn_ms,
+                pct(self.dense_ffn_ms),
+                self.final_ms,
+                pct(self.final_ms),
+                self.other_ms,
+                pct(self.other_ms),
             );
         }
     }

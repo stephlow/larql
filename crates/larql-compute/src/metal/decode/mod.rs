@@ -86,9 +86,20 @@ impl MetalBackend {
         // Backwards-compat wrapper: forward to the split-aware impl with no
         // collect callback.
         self.decode_token_with_moe_split_fn(
-            kv_cache, layers, x, hidden, inter, q_dim, kv_dim,
-            _num_q_heads, _num_kv_heads, _head_dim, _rope_base,
-            moe_fn.as_deref_mut().map(|f| f as &mut dyn FnMut(usize, &[f32]) -> Vec<f32>),
+            kv_cache,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            _num_q_heads,
+            _num_kv_heads,
+            _head_dim,
+            _rope_base,
+            moe_fn
+                .as_deref_mut()
+                .map(|f| f as &mut dyn FnMut(usize, &[f32]) -> Vec<f32>),
             None,
         )
     }
@@ -634,8 +645,8 @@ impl MetalBackend {
             // attention CB time can be recorded separately from FFN CB time.
             // Adds ~1 commit/wait per layer (~0.5ms × 30 = ~15ms inflation
             // on Gemma 4) — measurement-only mode, off by default.
-            let stage_timing_split = !defer_ffn_for_split
-                && std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
+            let stage_timing_split =
+                !defer_ffn_for_split && std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
             if stage_timing_split {
                 enc.end_encoding();
                 cmd.commit();

@@ -2,6 +2,7 @@
 
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
+use larql_compute::CpuBackend;
 
 /// Top-K logits lookup that transparently handles models with tied
 /// input/output embeddings (Gemma 2/3/4) whose vindex has no dedicated
@@ -25,6 +26,53 @@ pub fn lm_head_topk(
     top_k: usize,
     backend: &dyn ComputeBackend,
 ) -> Vec<(u32, f32)> {
+    // Metal q4k_matvec on the lm_head produces sub-percent logit drift
+    // vs CPU q4k_matvec. Each row of the 262K-vocab × 2560-hidden matvec
+    // is reduced across a 32-lane simdgroup with a 2-way inter-superblock
+    // split (`q4k_matvec.rs::ix = lane & 1u`); CPU runs the same dot
+    // product as a sequential per-element accumulator. Both paths use
+    // f32 throughout but the reduction trees differ, and that's enough
+    // to flip top-1 on close-call tokens. End-to-end symptom on Gemma 3
+    // 4B: prompt "The capital of France is" continues with " Capital"
+    // (capital C, no answer) on Metal vs " capital ... **Paris**" on
+    // CPU; per-layer hidden parity holds at cos≥0.99995 across all 34
+    // layers (`test_decode_consistency_gemma3_4b_2steps`), so the drift
+    // is fully concentrated in the lm_head matvec.
+    //
+    // Default-route the lm_head through `CpuBackend` whenever the
+    // active compute backend isn't already CPU; opt back into Metal
+    // with `LARQL_METAL_LM_HEAD=1` (~1ms/tok faster but token-flip risk
+    // on close-ranking pairs). Same correctness-over-speed pattern
+    // shipped for the Metal MoE expert path.
+    let prefer_cpu = std::env::var("LARQL_METAL_LM_HEAD").is_err();
+    let is_metal_backend = backend.as_any().type_id() != std::any::TypeId::of::<CpuBackend>();
+    if prefer_cpu && is_metal_backend {
+        // Route to `lm_head_knn_backend_skip_q4k` — the same dispatch
+        // chain as `lm_head_knn_backend` but starting at the f16 GEMV
+        // path (path 2) instead of the Q4_K matvec path (path 1).
+        //
+        // Why: Metal's `q4k_matvec` 32-lane simdgroup reduction drifts
+        // ~1e-3 vs CPU's sequential accumulator (different reduction
+        // tree, same f32 precision). On the 262K × 2560 lm_head matvec
+        // that's enough to flip top-1 on close-call tokens (e.g.
+        // " Capital" vs " capital" at decode step 1 of Gemma 3 4B).
+        // Metal's `f16_gemv` shader uses a tighter reduction tree and
+        // keeps top-1 stable end-to-end. Reads 1.3 GB of f16 weights
+        // per token vs 2.6 GB for f32 — roughly 2× faster than the
+        // f32 BLAS path on `weights.lm_head`.
+        //
+        // For models where the f16 mmap isn't populated (no tied embed
+        // / no f16 lm_head), this falls through to `lm_head_knn` (f32
+        // BLAS). The Q4_K Metal path stays opt-in via
+        // `LARQL_METAL_LM_HEAD=1` for runs where the speed margin
+        // matters more than top-1 stability.
+        let hits = index.lm_head_knn_backend_skip_q4k(query, top_k, backend);
+        let all_zero = !hits.is_empty() && hits.iter().all(|(_, s)| *s == 0.0 || s.is_nan());
+        if !hits.is_empty() && !all_zero {
+            return hits;
+        }
+        return backend_lm_head_topk(weights, query, top_k, backend);
+    }
     let hits = index.lm_head_knn_backend(query, top_k, backend);
     // Workaround for the prefill→decode boundary: on the first decode
     // step, the Metal `q4k_matvec` / `f16_gemv` for lm_head occasionally

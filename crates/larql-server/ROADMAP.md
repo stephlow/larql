@@ -70,6 +70,81 @@ sweep, and 16.6 GB steady RSS — i.e. the change cut latency 2.5× and RSS 1.7�
 
 ## P0: Active
 
+### F-FLY. Remote multi-shard deployment on fly.io
+
+**Status**: Not started — next session.
+
+**Goal**: validate the HTTP CPU-path optimisations from the 2026-05-01 session
+on a real network (LAN-class RTT ≥ 100 µs), not just M3 Max loopback. Most
+of what we shipped is designed to win on real links but is invisible on
+loopback (TCP_NODELAY, f16 wire). This is the apples-to-apples test that
+tells us whether the in-room engineering translates to a deployable grid.
+
+**Setup target (~2 hosts, then 4-8 if Phase 1 looks good)**:
+
+- 1× client host (Mac dev box or fly.io VM): runs `larql run --moe-shards`
+  with attention + dense FFN compute. Holds the 2 GB attention/router/dense
+  weight set.
+- N× shard hosts (fly.io VMs, ~16 GB RAM each): each runs
+  `larql-server --experts START-END --grpc-port 9081 --uds-path ...`
+  on a slice of the expert table. 26B-A4B has 128 experts × 30 layers;
+  e.g., 4 shards × 32 experts × 30 layers ≈ 4 GB Q4_K + 2 GB working set
+  per shard.
+- Network: same fly.io region (intra-DC ~0.5 ms RTT) for Phase 1; a second
+  region (cross-region ~30-100 ms RTT) for Phase 2 to stress the streaming
+  overlap.
+
+**What we expect to learn from this**:
+
+1. Whether the **f16 wire** opt-in actually wins on real links (estimate:
+   +3-5% on 1 Gbps, more on slower). On loopback it was within noise; we
+   need real RTT to see the wire-bytes saving translate.
+2. Whether **gRPC SPLIT default** (now on by default for gRPC) holds its
+   ~12% steady-state win when the network leg is bigger than the dense
+   FFN GPU leg (instead of comparable). The overlap math says the win
+   grows when RTT > dense_FFN_time.
+3. End-to-end tok/s ceiling on a real grid — we currently know loopback
+   is ~19.7 tok/s; a multi-host grid should be slower per-token but
+   throughput-scalable (more shards per host = more concurrent expert work).
+4. Whether **predispatch (`batch` dispatch mode)** actually breaks
+   generation on every multi-host setup or just on M3 Max loopback. We
+   saw garbage output on loopback; might be a different story with real
+   network timing.
+
+**Prerequisites already in place** (from this session):
+
+- gRPC streaming default-on for gRPC shards (~12% loopback gain,
+  expected to grow on RTT-heavier links)
+- TCP_NODELAY on accepted connections (defensive against tail-packet
+  stalls on real LAN)
+- f16 wire as opt-in (`LARQL_MOE_WIRE_F16=1`)
+- Unix domain sockets (`--uds-path`, `unix:///path` URL) for same-host
+  shard collocation
+- `LARQL_HTTP_TIMING=1` per-call instrumentation (encode / send_total /
+  recv_body / decode breakdown)
+- `LARQL_MOE_TIMING=1` per-token MoE summary (route / collect / server
+  compute / network estimate)
+- 9.6× CPU MoE speedup on the shard side (bench: 30-layer sweep
+  221 → 22.9 ms; production: 2.3 → ~19.7 tok/s end-to-end on M3 Max
+  loopback)
+
+**fly.io specifics worth pinning down before deploy**:
+
+- VM size for shards: 26B-A4B vindex is ~16 GB on disk; needs ~10 GB
+  RSS at warmup. `performance-cpu-2x` (~7 GB RAM) won't fit a full
+  shard; need `performance-cpu-4x` (~14 GB) at minimum, or shard the
+  vindex finer.
+- Vindex distribution: cheapest is to ship the full 16 GB to each shard
+  and let `--experts START-END` cap working set; alternative is per-shard
+  vindex slicing (`larql slice` exists but needs a per-shard variant).
+- Persistent volume vs in-memory: with `--warmup-walk-ffn` the boot
+  cost is ~6-7 s; if VMs reboot per deploy, that adds up. Consider
+  fly.io persistent volumes for the vindex.
+- Health check: `/v1/health` is already there.
+- Authentication: the existing `--api-key` flag works but a multi-tenant
+  fly.io setup probably wants per-shard token rotation (out of scope for
+  Phase 1).
+
 ### F0. CPU MoE correctness — unfinished, blocks the remote-MoE story
 
 **Status**: Open — bug found 2026-04-27, not yet root-caused.

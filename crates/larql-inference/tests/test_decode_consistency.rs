@@ -105,6 +105,125 @@ fn strict_mode() -> bool {
     )
 }
 
+/// Drive Metal through one prefill + N decode tokens, capture the per-layer
+/// output of the **last** decode step against a CPU reference of the same
+/// final sequence length, compare. `n_steps == 1` is the original single-
+/// step variant; `n_steps >= 2` exercises the prefill→decode→decode KV-
+/// cache hand-off (the path single-step parity does not cover).
+fn check_n_steps(case: &ConsistencyCase, n_steps: usize) -> Result<(), String> {
+    if n_steps == 0 {
+        return Err("n_steps must be >= 1".to_string());
+    }
+    let Some(vindex_path) = find_vindex(case.vindex_name) else {
+        if strict_mode() {
+            return Err(format!(
+                "[{}] vindex `{}` not found (LARQL_ARCH_STRICT=1)",
+                case.name, case.vindex_name
+            ));
+        }
+        eprintln!(
+            "[{}] skip: vindex `{}` not found",
+            case.name, case.vindex_name
+        );
+        return Ok(());
+    };
+
+    let mut cb = SilentLoadCallbacks;
+    let cfg = load_vindex_config(&vindex_path).map_err(|e| format!("load_vindex_config: {e}"))?;
+    if cfg.quant != QuantFormat::Q4K {
+        return Err(format!("expected Q4K vindex, got {:?}", cfg.quant));
+    }
+    let tokenizer =
+        load_vindex_tokenizer(&vindex_path).map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
+    let mut q4_index =
+        VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
+    q4_index
+        .load_attn_q4k(&vindex_path)
+        .map_err(|e| format!("load_attn_q4k: {e}"))?;
+    q4_index
+        .load_interleaved_q4k(&vindex_path)
+        .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
+    let _ = q4_index.load_lm_head_q4(&vindex_path);
+
+    let mut w_metal = load_model_weights_q4k(&vindex_path, &mut cb)
+        .map_err(|e| format!("load weights (metal): {e}"))?;
+    let mut w_cpu = load_model_weights_q4k(&vindex_path, &mut cb)
+        .map_err(|e| format!("load weights (cpu): {e}"))?;
+
+    let prompt = "The capital of France is";
+    let wrap = wrap_chat_prompt(&vindex_path, Some(cfg.model.as_str()), prompt);
+    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrap.prompt)
+        .map_err(|e| format!("encode_prompt: {e}"))?;
+
+    let metal_backend =
+        larql_compute::metal::MetalBackend::new().ok_or("Metal backend unavailable")?;
+
+    // Drive Metal `generate(n_steps)` once to capture the deterministic
+    // greedy token chain. Re-encode prompt + that chain to recover
+    // canonical ids — keeps the parity check anchored to ids the
+    // tokenizer actually round-trips.
+    let cached = larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
+    let metal_num_layers = w_metal.num_layers;
+    let r = larql_inference::layer_graph::generate(
+        &mut w_metal,
+        &tokenizer,
+        &prompt_ids,
+        n_steps,
+        &q4_index,
+        &metal_backend,
+        &cached,
+        0..metal_num_layers,
+    );
+    if r.tokens.len() < n_steps {
+        return Err(format!(
+            "[{}] generate produced only {} of {} tokens",
+            case.name,
+            r.tokens.len(),
+            n_steps
+        ));
+    }
+    let mut chain_text = String::new();
+    for (t, _) in r.tokens.iter().take(n_steps) {
+        chain_text.push_str(t);
+    }
+    let appended_prompt = format!("{}{}", wrap.prompt, chain_text);
+    let appended_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &appended_prompt)
+        .map_err(|e| format!("encode_prompt: {e}"))?;
+    if appended_ids.len() != prompt_ids.len() + n_steps {
+        eprintln!(
+            "[{}] note: tokeniser merged generated tokens at boundary \
+             (expected len {} got {}); skipping {n_steps}-step parity",
+            case.name,
+            prompt_ids.len() + n_steps,
+            appended_ids.len(),
+        );
+        return Ok(());
+    }
+    let new_ids: Vec<u32> = appended_ids[prompt_ids.len()..].to_vec();
+
+    let metal_decode = ResidualCapture::metal_decode_steps(
+        &mut w_metal,
+        &prompt_ids,
+        &new_ids,
+        &q4_index,
+        &metal_backend,
+    )?;
+    let cpu_ref_full = ResidualCapture::cpu_prefill(&mut w_cpu, &appended_ids, &q4_index)?;
+    let cpu_ref = cpu_ref_full.project_to_last_position();
+
+    let report = compare_captures(&cpu_ref, &metal_decode, ParityThreshold::tight());
+    report
+        .assert_clean()
+        .map_err(|e| format!("[{}] {n_steps}-step decode: {e}", case.name))?;
+    eprintln!(
+        "[{}] decode-consistency OK across {} layers ({n_steps} step{})",
+        case.name,
+        cpu_ref.num_layers(),
+        if n_steps == 1 { "" } else { "s" },
+    );
+    Ok(())
+}
+
 /// Drive Metal through one prefill + one decode token, capture both
 /// the decode's per-layer output and a CPU reference at sequence
 /// length N+1, compare. Single-step variant — the multi-step test
@@ -221,6 +340,11 @@ fn check_one_step(case: &ConsistencyCase) -> Result<(), String> {
 #[test]
 fn decode_consistency_gemma3_4b() {
     check_one_step(&CASES[0]).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn decode_consistency_gemma3_4b_2steps() {
+    check_n_steps(&CASES[0], 2).unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]

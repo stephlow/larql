@@ -130,7 +130,17 @@ pub fn encode(
                     MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
                 );
             } else {
-                dispatch_kh(enc, pipes.q4k_matvec_fallback, w_buf, f32_in, f32_in_off, out_buf, out_off, n, k);
+                dispatch_kh(
+                    enc,
+                    pipes.q4k_matvec_fallback,
+                    w_buf,
+                    f32_in,
+                    f32_in_off,
+                    out_buf,
+                    out_off,
+                    n,
+                    k,
+                );
             }
         }
         crate::QuantFormat::Q4_K => {
@@ -140,12 +150,25 @@ pub fn encode(
             // and gets the threadgroup geometry wrong (4 rows / 64 threads),
             // leaving ~75% of output rows unwritten.
             if std::env::var("LARQL_DBG_QM").is_ok() {
-                eprintln!("[quant_matvec] Q4_K path — kh.rows_per_tg={} kh.threads_per_tg={} n={} k={}",
+                eprintln!(
+                    "[quant_matvec] Q4_K path — kh.rows_per_tg={} kh.threads_per_tg={} n={} k={}",
                     pipes.q4k_matvec_fallback.rows_per_tg,
                     pipes.q4k_matvec_fallback.threads_per_tg,
-                    n, k);
+                    n,
+                    k
+                );
             }
-            dispatch_kh(enc, pipes.q4k_matvec_fallback, w_buf, f32_in, f32_in_off, out_buf, out_off, n, k);
+            dispatch_kh(
+                enc,
+                pipes.q4k_matvec_fallback,
+                w_buf,
+                f32_in,
+                f32_in_off,
+                out_buf,
+                out_off,
+                n,
+                k,
+            );
         }
         crate::QuantFormat::Q6_K => {
             let kh = pipes.q6k_matvec;

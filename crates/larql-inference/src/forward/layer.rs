@@ -270,6 +270,36 @@ pub fn run_layer_with_subtracted_pre_o_heads(
     Some((h_out, kv_out))
 }
 
+/// Run a single transformer layer while replacing one attention head's
+/// residual-space contribution after W_O projection.
+///
+/// This is the Mode D validation path: a precomputed lookup/add table can
+/// provide `replacement_delta` directly in residual space, bypassing W_O while
+/// preserving FFN, PLE, and layer scalar behavior.
+pub fn run_layer_with_replaced_head_residual_delta(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn FfnBackend,
+    head: usize,
+    replacement_delta: &Array2<f32>,
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post_attn, kv_out) = crate::attention::run_attention_block_replace_head_residual_delta(
+        weights,
+        h,
+        layer,
+        head,
+        replacement_delta,
+        shared_kv,
+    )?;
+    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(weights, &mut h_out, layer);
+    Some((h_out, kv_out))
+}
+
 /// Run a single transformer layer, optionally capturing attention weights.
 ///
 /// Backwards-compatible wrapper: behaves identically to the pre-hook version

@@ -226,6 +226,141 @@ impl ResidualCapture {
         })
     }
 
+    /// Metal `prefill(prefix_ids)` followed by a sequential chain of
+    /// `decode_token(id)` calls for each id in `new_ids`. Captures the
+    /// per-layer hidden state of the **last** decode step. Pair with
+    /// `cpu_prefill(prefix_ids ++ new_ids)` projected to last position
+    /// to verify that the KV cache state written during step k stays
+    /// correct for the read at step k+1 — that's not validated by
+    /// `metal_decode` (single step) which only sees the initial KV
+    /// state from prefill.
+    pub fn metal_decode_steps(
+        weights: &mut ModelWeights,
+        prefix_ids: &[u32],
+        new_ids: &[u32],
+        index: &VectorIndex,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Result<Self, String> {
+        if new_ids.is_empty() {
+            return Err("metal_decode_steps requires at least one new_id".to_string());
+        }
+        let hidden = weights.hidden_size;
+        let num_layers = weights.num_layers;
+        let arch = &*weights.arch;
+
+        backend.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
+            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
+            .collect();
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+
+        let gate_index: &dyn GateIndex = index;
+        let (q4_ffn, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
+            (Some(m), true)
+        } else {
+            (gate_index.interleaved_q4_mmap_ref(), false)
+        };
+        let q4_ffn_mmap = q4_ffn.ok_or("no Q4 FFN mmap available for decode capture")?;
+        let intermediate = gate_index.num_features(0);
+        let q4_ffn_per_matrix = if ffn_is_q4k {
+            (intermediate * hidden).div_ceil(256) * 144
+        } else {
+            intermediate * hidden / 32 * 18
+        };
+        let ffn_format = if ffn_is_q4k {
+            larql_compute::QuantFormat::Q4_K
+        } else {
+            larql_compute::QuantFormat::Q4_0
+        };
+        let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
+            weights,
+            index,
+            0..num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
+        );
+
+        let q_dim = weights.num_q_heads * weights.head_dim;
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        let rope = arch.rope_base_for_layer(0) as f32;
+        let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
+        let qk_norm_val = arch.attn_q_norm_key(0).is_some();
+
+        let h_embed = crate::forward::embed_tokens_pub(weights, prefix_ids);
+        let prefill_x: Vec<f32> = h_embed.as_slice().unwrap().to_vec();
+        backend
+            .prefill_q4(
+                &layers,
+                &prefill_x,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                prefix_ids.len(),
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
+                qk_norm_val,
+                softcap,
+            )
+            .ok_or("Metal prefill_q4 returned None")?;
+
+        // Decode all but the last id without the dump hook (cheaper —
+        // we only need per-layer state of the final step). Then decode
+        // the last id with the dump hook active.
+        for &id in &new_ids[..new_ids.len() - 1] {
+            let dec_embed = crate::forward::embed_tokens_pub(weights, &[id]);
+            let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
+            let _ = backend.decode_token(
+                &layers,
+                &dec_x,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
+            );
+        }
+
+        let last_id = *new_ids.last().unwrap();
+        let dec_embed = crate::forward::embed_tokens_pub(weights, &[last_id]);
+        let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
+        let dir = run_with_dump_dir("LARQL_DECODE_DUMP_LAYERS", || {
+            let _ = backend.decode_token(
+                &layers,
+                &dec_x,
+                hidden,
+                intermediate,
+                q_dim,
+                kv_dim,
+                weights.num_q_heads,
+                weights.num_kv_heads,
+                weights.head_dim,
+                rope,
+            );
+        })?;
+
+        let layer_dumps = (0..num_layers)
+            .map(|l| {
+                let path = dir.path().join(format!("decode_layer_{l:02}.f32"));
+                read_f32_vec(&path).ok_or_else(|| {
+                    format!("decode dump missing for layer {l} at {}", path.display())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            layers: layer_dumps,
+            hidden_size: hidden,
+            seq_len: 1,
+        })
+    }
+
     /// Metal full prefill via `prefill_q4`. Drives the per-layer dump
     /// hook (`LARQL_METAL_DUMP_LAYERS=<dir>`) at `metal_layer_NN_h_out.f32`
     /// per layer.

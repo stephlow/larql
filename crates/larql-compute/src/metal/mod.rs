@@ -101,6 +101,14 @@ pub struct MetalBackend {
     /// Always-8sg Q4_K matvec (256 threads/TG, 8 rows/TG). Bit-identical
     /// output to 4sg. Default-on for `q4k_matvec_pipeline`.
     pub q4k_matvec_8sg_pipeline: KernelHandle,
+    /// Stride-32 Q4_K matvec — same Q4_K input format as `q4k_matvec`
+    /// but each lane accumulates the contribution of every element
+    /// `i where i % 32 == lane`, mirroring `f16_gemv`'s reduction tree.
+    /// Use this for the LM head when the regular `q4k_matvec`'s
+    /// block-aware lane split (`ix = lane & 1u`) drifts enough vs CPU
+    /// to flip top-1 on close-call tokens. See
+    /// `shaders/q4k_matvec_stride32.rs` for the rationale.
+    pub q4k_matvec_stride32_pipeline: KernelHandle,
     /// Q4_K matmul (gemm) — `[N, K] × [M, K] → [M, N]`. Used by prefill
     /// and seq>1 dispatch when amortising dequant across positions is
     /// worth the per-thread accumulator footprint. Decode (M=1) still
@@ -121,6 +129,25 @@ pub struct MetalBackend {
     /// `LARQL_GATE_UP_8SG=1` while perf is being measured. See
     /// `shaders/q4k_ffn_gate_up_8sg.rs`.
     pub q4k_ffn_gate_up_8sg_pipeline: KernelHandle,
+    /// Cooperative-scale-load Q4_K gate+up — same Q4_K input as
+    /// `q4k_ffn_gate_up_pipeline`, but the per-super-block dequant
+    /// header (`d`/`dmin`/8 sub-block scales/mins) is decoded once
+    /// per simdgroup per super-block and broadcast via
+    /// `simd_broadcast`/`simd_shuffle`, eliminating 32× redundant
+    /// ALU on the production critical path. Aimed at the
+    /// 187 GB/s = 47%-of-peak ALU bottleneck flagged in
+    /// `metal/diag/kernel_profile.rs`. Opt-in via
+    /// `LARQL_GATE_UP_COOP=1` while perf is being measured. See
+    /// `shaders/q4k_ffn_gate_up_coop.rs`.
+    pub q4k_ffn_gate_up_coop_pipeline: KernelHandle,
+    /// NR0=2 multi-row + shared-X-vector Q4_K gate+up — same Q4_K
+    /// input as `q4k_ffn_gate_up_pipeline`, but each simdgroup handles
+    /// 2 output rows in parallel with `xl[16]` loaded once and reused
+    /// across both. Mirrors llama.cpp's `N_R0_Q4_K = 2` shape. Aimed
+    /// at the X-cache-traffic bottleneck diagnosed by step-by-step
+    /// vs-ollama comparison (2026-05-01). Opt-in via
+    /// `LARQL_GATE_UP_NR2=1`. See `shaders/q4k_ffn_gate_up_nr2.rs`.
+    pub q4k_ffn_gate_up_nr2_pipeline: KernelHandle,
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
     pub q4k_geglu_silu_down_pipeline: KernelHandle,
     pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
@@ -261,6 +288,8 @@ impl MetalBackend {
             KernelHandle::from_kernel::<shaders::q4k_matvec::Kernel>(&device, &library)?;
         let q4k_matvec_8sg_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_matvec_8sg::Kernel>(&device, &library)?;
+        let q4k_matvec_stride32_pipeline =
+            KernelHandle::from_kernel::<shaders::q4k_matvec_stride32::Kernel>(&device, &library)?;
         let q4k_matvec_use_4sg = matches!(
             std::env::var("LARQL_Q4K_MATVEC_8SG").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
@@ -303,6 +332,10 @@ impl MetalBackend {
         >(&device, &library)?;
         let q4k_ffn_gate_up_8sg_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_8sg::Kernel>(&device, &library)?;
+        let q4k_ffn_gate_up_coop_pipeline =
+            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_coop::Kernel>(&device, &library)?;
+        let q4k_ffn_gate_up_nr2_pipeline =
+            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_nr2::Kernel>(&device, &library)?;
         let q4kf_ffn_gate_up_pipeline =
             KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(&device, &library)?;
         // Fused activation+down (KernelHandle).
@@ -421,10 +454,13 @@ impl MetalBackend {
             q4k_matvec_pipeline,
             q4k_matvec_4sg_pipeline,
             q4k_matvec_8sg_pipeline,
+            q4k_matvec_stride32_pipeline,
             q4k_matmul_pipeline,
             q4k_ffn_gate_up_pipeline,
             q4k_ffn_gate_up_f16acc_pipeline,
             q4k_ffn_gate_up_8sg_pipeline,
+            q4k_ffn_gate_up_coop_pipeline,
+            q4k_ffn_gate_up_nr2_pipeline,
             q4kf_ffn_gate_up_pipeline,
             q4k_geglu_silu_down_pipeline,
             q4k_geglu_gelu_tanh_down_pipeline,

@@ -259,6 +259,25 @@ struct GrpcState {
 enum ShardTransport {
     Http(reqwest::blocking::Client),
     Grpc(std::sync::Arc<GrpcState>),
+    /// Unix domain socket transport for same-host shards.  Holds one
+    /// persistent stream per shard behind a `Mutex` (per-shard calls
+    /// are sequential within a `forward_moe`, and across `forward_moe`
+    /// calls in chat mode).  Manual HTTP/1.1 framing keeps the wire
+    /// protocol identical to the TCP `Http` variant — server-side it's
+    /// the same axum router on a `UnixListener`.
+    ///
+    /// Saves ~50 µs/call on loopback by skipping the kernel TCP stack
+    /// (no Nagle, no delayed ACK, no socket buffer copies through the
+    /// network stack).  Most of the saving is on the response path
+    /// (server flushes complete writes immediately).
+    Uds(UdsState),
+}
+
+struct UdsState {
+    /// Filesystem path of the socket.  Used in error messages.
+    path: std::path::PathBuf,
+    /// Persistent stream behind a mutex.  Reconnect lazily on disconnect.
+    stream: std::sync::Mutex<Option<std::os::unix::net::UnixStream>>,
 }
 
 struct Shard {
@@ -268,9 +287,36 @@ struct Shard {
 
 impl Shard {
     fn connect(config: ShardConfig) -> Result<Self, RemoteMoeError> {
-        // `grpc://` URL → tonic gRPC over HTTP/2 persistent channel.
-        // `http://` URL → reqwest blocking HTTP/1.1 (legacy path).
-        let transport = if config.url.starts_with("grpc://") {
+        // URL scheme dispatch:
+        //   `grpc://host:port` → tonic gRPC over HTTP/2 persistent channel.
+        //   `unix:///path/to/sock` → manual HTTP/1.1 over a Unix domain
+        //     socket (same-host fast path; ~50 µs/call faster than TCP
+        //     loopback).
+        //   `http://host:port` → reqwest blocking HTTP/1.1 (default).
+        let transport = if let Some(uds_path) = config
+            .url
+            .strip_prefix("unix://")
+            .or_else(|| config.url.strip_prefix("unix:"))
+        {
+            // Strip the leading `///` of `unix:///abs/path` (the third `/`
+            // is part of the path).  `unix:relative/path` also accepted.
+            let path = std::path::PathBuf::from(uds_path);
+            // Open + health check.
+            let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
+                RemoteMoeError::Unreachable {
+                    url: format!("unix://{}", path.display()),
+                    cause: e.to_string(),
+                }
+            })?;
+            // Apply the configured timeout to read/write so a stuck shard
+            // doesn't wedge the client forever.
+            let _ = stream.set_read_timeout(Some(config.timeout));
+            let _ = stream.set_write_timeout(Some(config.timeout));
+            ShardTransport::Uds(UdsState {
+                path,
+                stream: std::sync::Mutex::new(Some(stream)),
+            })
+        } else if config.url.starts_with("grpc://") {
             let grpc_endpoint = config.url.replacen("grpc://", "http://", 1);
             let rt = std::sync::Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
@@ -433,7 +479,7 @@ impl Shard {
                     _runtime: rt,
                 })
             }
-            ShardTransport::Http(_) => Err(RemoteMoeError::Client(
+            ShardTransport::Http(_) | ShardTransport::Uds(_) => Err(RemoteMoeError::Client(
                 "open_stream requires grpc:// shards".into(),
             )),
         }
@@ -528,8 +574,410 @@ impl Shard {
                 decode_expert_response(&bytes)
                     .ok_or_else(|| RemoteMoeError::BadResponse("binary response truncated".into()))
             }
+            ShardTransport::Uds(uds) => {
+                // Same wire body as the HTTP path; UDS framing is identical
+                // to TCP HTTP/1.1 — only the transport differs.
+                let body = encode_expert_request(requests);
+                let resp_bytes =
+                    uds_call(uds, "/v1/expert/batch", EXPERT_BINARY_CONTENT_TYPE, &body)?;
+                decode_expert_response(&resp_bytes).ok_or_else(|| {
+                    RemoteMoeError::BadResponse("UDS expert/batch response truncated".into())
+                })
+            }
         }
     }
+
+    /// Send a layer-batch request: ONE residual + K (expert_id, weight) pairs.
+    /// Returns the router-weighted sum across the K experts owned by this
+    /// shard.  Eliminates the K-1 redundant residual copies on the wire and
+    /// the K-1 redundant `pre_experts_norm` + Q8_K quantisations on the
+    /// server (the server applies them once and shares across the K experts).
+    ///
+    /// HTTP-only for now (gRPC variant TODO).  Falls back to `call_batch` if
+    /// the shard transport is gRPC.
+    fn call_layer_batch(
+        &self,
+        layer: usize,
+        residual: &[f32],
+        expert_ids: &[u32],
+        expert_weights: &[f32],
+    ) -> Result<Vec<f32>, RemoteMoeError> {
+        match &self.transport {
+            ShardTransport::Grpc(_) => {
+                // TODO: gRPC variant.  For now, encode-and-fall-back to
+                // call_batch with K identical residuals.
+                let items: Vec<ExpertCallItem> = expert_ids
+                    .iter()
+                    .map(|&eid| ExpertCallItem {
+                        layer,
+                        expert_id: eid as usize,
+                        residual: residual.to_vec(),
+                    })
+                    .collect();
+                let results = self.call_batch(&items)?;
+                // Apply weights and sum on the client (mirrors the server's
+                // run_experts_cpu_batch behaviour for the http path).
+                let hidden = residual.len();
+                let mut out = vec![0.0f32; hidden];
+                for (i, item) in results.iter().enumerate() {
+                    let w = expert_weights[i];
+                    for (a, &v) in out.iter_mut().zip(item.output.iter()) {
+                        *a += w * v;
+                    }
+                }
+                Ok(out)
+            }
+            ShardTransport::Http(client) => {
+                // Per-stage client-side timing (`LARQL_HTTP_TIMING=1`).
+                thread_local! {
+                    static HTTP_TIMING: bool =
+                        std::env::var("LARQL_HTTP_TIMING").is_ok();
+                }
+                let timing = HTTP_TIMING.with(|t| *t);
+
+                // Wire format selection.  Default f32 (loopback / same-host
+                // grids — TCP buffer/copy costs dominate, f16 conversion
+                // CPU cost cancels the wire-bytes saving).  Set
+                // `LARQL_MOE_WIRE_F16=1` for LAN deployments where the
+                // 5 KB/call wire saving matters more than the 9 µs/call
+                // f32↔f16 conversion CPU.  Bench (M3 Max loopback,
+                // 2026-05-01): f16 was 0.5-1% slower (within noise) on
+                // 100-token poem; expected to invert on >100 µs RTT links.
+                thread_local! {
+                    static USE_F16_WIRE: bool =
+                        std::env::var("LARQL_MOE_WIRE_F16").is_ok();
+                }
+                let use_f16 = USE_F16_WIRE.with(|v| *v);
+
+                let url = if use_f16 {
+                    format!("{}/v1/experts/layer-batch-f16", self.config.url)
+                } else {
+                    format!("{}/v1/experts/layer-batch", self.config.url)
+                };
+                let ct = if use_f16 {
+                    LAYER_BATCH_F16_CONTENT_TYPE
+                } else {
+                    LAYER_BATCH_CONTENT_TYPE
+                };
+
+                let t_encode_in = std::time::Instant::now();
+                let body = if use_f16 {
+                    encode_layer_batch_request_f16(layer, residual, expert_ids, expert_weights)
+                } else {
+                    encode_layer_batch_request(layer, residual, expert_ids, expert_weights)
+                };
+                let t_encode = t_encode_in.elapsed();
+
+                let t_send_in = std::time::Instant::now();
+                let resp = client
+                    .post(&url)
+                    .header("Content-Type", ct)
+                    .header("Accept", ct)
+                    .body(body)
+                    .send()
+                    .map_err(|e| RemoteMoeError::Unreachable {
+                        url: url.clone(),
+                        cause: e.to_string(),
+                    })?;
+                let t_send = t_send_in.elapsed();
+
+                if !resp.status().is_success() {
+                    return Err(RemoteMoeError::ServerError {
+                        status: resp.status().as_u16(),
+                        body: resp.text().unwrap_or_default(),
+                    });
+                }
+
+                let t_recv_in = std::time::Instant::now();
+                let bytes = resp
+                    .bytes()
+                    .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                let t_recv = t_recv_in.elapsed();
+
+                let t_decode_in = std::time::Instant::now();
+                let out = if use_f16 {
+                    decode_layer_batch_response_f16(&bytes)
+                } else {
+                    decode_layer_batch_response(&bytes)
+                }
+                .ok_or_else(|| {
+                    RemoteMoeError::BadResponse("layer-batch response truncated".into())
+                });
+                let t_decode = t_decode_in.elapsed();
+
+                if timing {
+                    eprintln!(
+                        "[shard.call_layer_batch] layer={layer} K={} wire={} \
+                         encode={:.0}us send_total={:.0}us recv_body={:.0}us decode={:.0}us",
+                        expert_ids.len(),
+                        if use_f16 { "f16" } else { "f32" },
+                        t_encode.as_secs_f64() * 1e6,
+                        t_send.as_secs_f64() * 1e6,
+                        t_recv.as_secs_f64() * 1e6,
+                        t_decode.as_secs_f64() * 1e6,
+                    );
+                }
+
+                out
+            }
+            ShardTransport::Uds(uds) => {
+                // Manual HTTP/1.1 over UnixStream — same wire format as
+                // the TCP `Http` variant, just no TCP stack.  The server
+                // is the same axum router on a `UnixListener`; from the
+                // handler's perspective it can't tell.
+                thread_local! {
+                    static HTTP_TIMING: bool =
+                        std::env::var("LARQL_HTTP_TIMING").is_ok();
+                    static USE_F16_WIRE: bool =
+                        std::env::var("LARQL_MOE_WIRE_F16").is_ok();
+                }
+                let timing = HTTP_TIMING.with(|t| *t);
+                let use_f16 = USE_F16_WIRE.with(|v| *v);
+
+                let path = if use_f16 {
+                    "/v1/experts/layer-batch-f16"
+                } else {
+                    "/v1/experts/layer-batch"
+                };
+                let ct = if use_f16 {
+                    LAYER_BATCH_F16_CONTENT_TYPE
+                } else {
+                    LAYER_BATCH_CONTENT_TYPE
+                };
+
+                let t_encode_in = std::time::Instant::now();
+                let body = if use_f16 {
+                    encode_layer_batch_request_f16(layer, residual, expert_ids, expert_weights)
+                } else {
+                    encode_layer_batch_request(layer, residual, expert_ids, expert_weights)
+                };
+                let t_encode = t_encode_in.elapsed();
+
+                let t_send_in = std::time::Instant::now();
+                let resp_bytes = uds_call(uds, path, ct, &body)?;
+                let t_send = t_send_in.elapsed();
+
+                let t_decode_in = std::time::Instant::now();
+                let out = if use_f16 {
+                    decode_layer_batch_response_f16(&resp_bytes)
+                } else {
+                    decode_layer_batch_response(&resp_bytes)
+                }
+                .ok_or_else(|| {
+                    RemoteMoeError::BadResponse("layer-batch response truncated (uds)".into())
+                });
+                let t_decode = t_decode_in.elapsed();
+
+                if timing {
+                    eprintln!(
+                        "[shard.call_layer_batch] layer={layer} K={} wire={} \
+                         transport=uds encode={:.0}us send_total={:.0}us decode={:.0}us",
+                        expert_ids.len(),
+                        if use_f16 { "f16" } else { "f32" },
+                        t_encode.as_secs_f64() * 1e6,
+                        t_send.as_secs_f64() * 1e6,
+                        t_decode.as_secs_f64() * 1e6,
+                    );
+                }
+                out
+            }
+        }
+    }
+}
+
+// ── UDS HTTP/1.1 helpers ──────────────────────────────────────────────────────
+//
+// Hand-rolled because reqwest doesn't natively expose UDS, and pulling in
+// hyperlocal + hyper for one request type would be heavier than the wire
+// protocol itself.  We control both ends so framing is fixed:
+//
+//   POST <path> HTTP/1.1\r\n
+//   Host: localhost\r\n
+//   Content-Type: <ct>\r\n
+//   Content-Length: <N>\r\n
+//   Connection: keep-alive\r\n
+//   \r\n
+//   <body bytes>
+//
+// Response:
+//   HTTP/1.1 200 OK\r\n
+//   Content-Type: <ct>\r\n
+//   Content-Length: <M>\r\n
+//   ...other headers...
+//   \r\n
+//   <body bytes>
+//
+// Connections are persistent and reused across calls (the server's axum
+// hyper accept loop honours keep-alive by default).
+
+/// Send a single POST + read the response body via the persistent UDS
+/// stream.  Reconnects on broken-pipe / read errors.
+fn uds_call(
+    uds: &UdsState,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, RemoteMoeError> {
+    use std::io::{Read, Write};
+
+    let mut guard = uds
+        .stream
+        .lock()
+        .map_err(|_| RemoteMoeError::Client("UDS stream mutex poisoned".into()))?;
+
+    // Try once; on transport error, reconnect and retry once.
+    for attempt in 0..2 {
+        // Establish the stream lazily / after disconnect.
+        if guard.is_none() {
+            let s = std::os::unix::net::UnixStream::connect(&uds.path).map_err(|e| {
+                RemoteMoeError::Unreachable {
+                    url: format!("unix://{}", uds.path.display()),
+                    cause: e.to_string(),
+                }
+            })?;
+            *guard = Some(s);
+        }
+        let stream = guard.as_mut().expect("just populated");
+
+        // Build request header in a small Vec so the kernel sees one syscall
+        // for the header (write_vectored could split header/body but for
+        // small headers the difference is negligible; the bench result is
+        // dominated by the body bytes).
+        let mut req = Vec::with_capacity(160 + body.len());
+        req.extend_from_slice(b"POST ");
+        req.extend_from_slice(path.as_bytes());
+        req.extend_from_slice(b" HTTP/1.1\r\n");
+        req.extend_from_slice(b"Host: localhost\r\n");
+        req.extend_from_slice(b"Content-Type: ");
+        req.extend_from_slice(content_type.as_bytes());
+        req.extend_from_slice(b"\r\n");
+        req.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        req.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+        req.extend_from_slice(body);
+
+        // Send request.
+        if let Err(e) = stream.write_all(&req) {
+            if attempt == 0 {
+                *guard = None; // force reconnect
+                continue;
+            }
+            return Err(RemoteMoeError::Unreachable {
+                url: format!("unix://{}", uds.path.display()),
+                cause: format!("write: {e}"),
+            });
+        }
+
+        // Read response: parse headers, find Content-Length, then read N bytes.
+        let mut buf = Vec::with_capacity(8 * 1024);
+        let mut tmp = [0u8; 4096];
+        let body_start;
+        let content_length;
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => {
+                    // Server closed; reconnect on next attempt.
+                    if attempt == 0 {
+                        *guard = None;
+                    }
+                    return Err(RemoteMoeError::BadResponse(
+                        "UDS server closed connection mid-response".into(),
+                    ));
+                }
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) => {
+                    if attempt == 0 {
+                        *guard = None;
+                    }
+                    return Err(RemoteMoeError::BadResponse(format!("UDS read: {e}")));
+                }
+            }
+            // Look for end-of-headers (\r\n\r\n).
+            if let Some(idx) = find_header_end(&buf) {
+                body_start = idx + 4;
+                content_length = parse_content_length(&buf[..idx])?;
+                break;
+            }
+            if buf.len() > 64 * 1024 {
+                return Err(RemoteMoeError::BadResponse(
+                    "UDS response headers exceed 64 KB — refusing to read further".into(),
+                ));
+            }
+        }
+
+        // Check status line — first 12 bytes are "HTTP/1.1 XXX".
+        if buf.len() < 12 || &buf[..9] != b"HTTP/1.1 " {
+            return Err(RemoteMoeError::BadResponse(
+                "UDS response missing HTTP/1.1 status line".into(),
+            ));
+        }
+        let status = std::str::from_utf8(&buf[9..12])
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&status) {
+            // Read body for the error message but cap to keep memory bounded.
+            let body_end = (body_start + content_length).min(buf.len());
+            let body_slice = &buf[body_start..body_end];
+            return Err(RemoteMoeError::ServerError {
+                status,
+                body: String::from_utf8_lossy(body_slice).into_owned(),
+            });
+        }
+
+        // Read remaining body bytes.
+        let already_have = buf.len() - body_start;
+        if already_have < content_length {
+            let mut body_buf = vec![0u8; content_length - already_have];
+            if let Err(e) = stream.read_exact(&mut body_buf) {
+                return Err(RemoteMoeError::BadResponse(format!("UDS body read: {e}")));
+            }
+            buf.extend_from_slice(&body_buf);
+        }
+
+        return Ok(buf[body_start..body_start + content_length].to_vec());
+    }
+    Err(RemoteMoeError::Client("UDS retry exhausted".into()))
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    for i in 0..=buf.len() - 4 {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn parse_content_length(headers: &[u8]) -> Result<usize, RemoteMoeError> {
+    // Headers look like:
+    //   HTTP/1.1 200 OK\r\nContent-Type: ...\r\nContent-Length: 11264\r\n
+    // Search case-insensitively for "content-length:".
+    let lower = headers
+        .iter()
+        .map(|&b| b.to_ascii_lowercase())
+        .collect::<Vec<u8>>();
+    let needle = b"content-length:";
+    let pos = lower
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .ok_or_else(|| {
+            RemoteMoeError::BadResponse("UDS response missing Content-Length header".into())
+        })?;
+    let mut start = pos + needle.len();
+    while start < headers.len() && (headers[start] == b' ' || headers[start] == b'\t') {
+        start += 1;
+    }
+    let mut end = start;
+    while end < headers.len() && headers[end].is_ascii_digit() {
+        end += 1;
+    }
+    let s = std::str::from_utf8(&headers[start..end])
+        .map_err(|_| RemoteMoeError::BadResponse("UDS Content-Length value not UTF-8".into()))?;
+    s.parse::<usize>()
+        .map_err(|_| RemoteMoeError::BadResponse(format!("UDS Content-Length not a number: {s:?}")))
 }
 
 // ── Binary wire format ────────────────────────────────────────────────────────
@@ -543,6 +991,293 @@ impl Shard {
 // for typical 2816-float payloads and avoids serde_json float formatting.
 
 pub const EXPERT_BINARY_CONTENT_TYPE: &str = "application/x-larql-expert";
+
+/// Content type for the `/v1/experts/layer-batch` endpoint — the layer-batched
+/// MoE wire format that ships one residual + K (expert_id, weight) pairs and
+/// receives back ONE weighted-sum vector.  Eliminates the K-1 redundant
+/// residual copies on the wire (~78 KB per call at Gemma 4 26B-A4B sizes)
+/// and the K-1 redundant `pre_experts_norm` + Q8_K quantisations on the
+/// server (~10-20 µs per layer of CPU work).
+pub const LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-layer";
+
+/// f16 variant of the layer-batch wire format.  Halves the per-call wire
+/// bytes (residual + weighted-sum response): 11 KB → 5.5 KB at hidden=2816.
+/// Quantisation is `f32 → IEEE-754 half`, ~3 decimal digits of precision —
+/// well within MoE activation noise (Q8_K already adds ~0.4% per-element
+/// quant error on the activation in the SDOT path; f16 wire adds another
+/// ~0.05% which is negligible).  Mathematically identical when both sides
+/// dequantise to f32 before compute.
+pub const LAYER_BATCH_F16_CONTENT_TYPE: &str = "application/x-larql-experts-layer-f16";
+
+// ── Layer-batch wire format ───────────────────────────────────────────────────
+//
+// Content-Type: application/x-larql-experts-layer
+//
+// Request:  [layer u32][hidden u32][K u32]
+//           + hidden × f32  (residual, sent ONCE)
+//           + K × [expert_id u32, weight f32]
+//
+// Response: [hidden u32][latency_ms f32]
+//           + hidden × f32  (router-weighted sum across the K experts)
+//
+// Server-side fast path: the response is the result of
+// `run_experts_cpu_batch(layer, residual, expert_ids, expert_weights)` — the
+// server applies pre_experts_norm once, quantises h_norm to Q8_K once, and
+// fans out the K expert kernels with the shared activation.
+
+/// Encode a layer-batch request.
+pub fn encode_layer_batch_request(
+    layer: usize,
+    residual: &[f32],
+    expert_ids: &[u32],
+    expert_weights: &[f32],
+) -> Vec<u8> {
+    let hidden = residual.len();
+    let k = expert_ids.len();
+    debug_assert_eq!(k, expert_weights.len());
+    let mut buf = Vec::with_capacity(12 + hidden * 4 + k * 8);
+    buf.extend_from_slice(&(layer as u32).to_le_bytes());
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    buf.extend_from_slice(&(k as u32).to_le_bytes());
+    for &v in residual {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for (i, &eid) in expert_ids.iter().enumerate() {
+        buf.extend_from_slice(&eid.to_le_bytes());
+        buf.extend_from_slice(&expert_weights[i].to_le_bytes());
+    }
+    buf
+}
+
+/// Decode a layer-batch request from raw bytes.  Returns
+/// `(layer, residual, expert_ids, expert_weights)` or `None` on truncation.
+pub fn decode_layer_batch_request(bytes: &[u8]) -> Option<(usize, Vec<f32>, Vec<u32>, Vec<f32>)> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let layer = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let k = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let want = 12 + hidden * 4 + k * 8;
+    if bytes.len() < want {
+        return None;
+    }
+    let mut pos = 12usize;
+    let residual: Vec<f32> = bytes[pos..pos + hidden * 4]
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    pos += hidden * 4;
+    let mut expert_ids = Vec::with_capacity(k);
+    let mut expert_weights = Vec::with_capacity(k);
+    for _ in 0..k {
+        let eid = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?);
+        let w = f32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?);
+        expert_ids.push(eid);
+        expert_weights.push(w);
+        pos += 8;
+    }
+    Some((layer, residual, expert_ids, expert_weights))
+}
+
+/// Encode a layer-batch response (one weighted-sum vector).
+pub fn encode_layer_batch_response(weighted_sum: &[f32], latency_ms: f32) -> Vec<u8> {
+    let hidden = weighted_sum.len();
+    let mut buf = Vec::with_capacity(8 + hidden * 4);
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    buf.extend_from_slice(&latency_ms.to_le_bytes());
+    for &v in weighted_sum {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+/// Decode a layer-batch response.  Returns the weighted-sum vector or `None`
+/// on truncation.  Discards the latency_ms field (informational only).
+pub fn decode_layer_batch_response(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let hidden = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    if bytes.len() < 8 + hidden * 4 {
+        return None;
+    }
+    Some(
+        bytes[8..8 + hidden * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect(),
+    )
+}
+
+// ── f16 wire helpers ──────────────────────────────────────────────────────────
+// IEEE-754 binary16 conversion.  Round-to-nearest-even for finite values;
+// saturates on overflow; preserves NaN.  Same behaviour as the `half` crate
+// but kept inline here so the wire layer doesn't take a new dep.
+
+#[inline(always)]
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        // Inf or NaN.
+        if mant == 0 {
+            return sign | 0x7C00;
+        }
+        return sign | 0x7C00 | ((mant >> 13) as u16) | 0x0001; // canonical NaN
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 0x1F {
+        // Overflow → ±Inf.
+        return sign | 0x7C00;
+    }
+    if new_exp <= 0 {
+        // Subnormal or zero.
+        if new_exp < -10 {
+            return sign;
+        }
+        let mant_full = mant | 0x80_0000; // implicit leading 1
+        let shift = (14 - new_exp) as u32;
+        let new_mant = (mant_full >> shift) as u16;
+        // Round-to-nearest-even on the dropped bit.
+        let round_bit = (mant_full >> (shift - 1)) & 1;
+        let sticky = mant_full & ((1u32 << (shift - 1)) - 1);
+        let mut out = new_mant;
+        if round_bit != 0 && (sticky != 0 || (new_mant & 1) != 0) {
+            out += 1;
+        }
+        return sign | out;
+    }
+    // Normal.
+    let new_mant = (mant >> 13) as u16;
+    let round_bit = (mant >> 12) & 1;
+    let sticky = mant & 0xFFF;
+    let mut combined = ((new_exp as u16) << 10) | new_mant;
+    if round_bit != 0 && (sticky != 0 || (new_mant & 1) != 0) {
+        combined += 1; // may carry into exponent — that's fine, IEEE-correct
+    }
+    sign | combined
+}
+
+#[inline(always)]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    // Mirrors `larql_compute::cpu::ops::q4_common::f16_to_f32` (kept inline
+    // so the wire layer stays dependency-free).  Bit-exact for all 65536
+    // f16 inputs vs the powi reference.
+    let bits = bits as u32;
+    let sign = (bits & 0x8000) << 16;
+    let exp = (bits >> 10) & 0x1F;
+    let mant = bits & 0x3FF;
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        let lz = (mant as u16).leading_zeros() - 6;
+        let new_mant = (mant << (lz + 14)) & 0x7F_FFFF;
+        let new_exp = (127u32 - 14 - lz) << 23;
+        return f32::from_bits(sign | new_exp | new_mant);
+    }
+    if exp == 31 {
+        return f32::from_bits(sign | 0x7F80_0000 | (mant << 13));
+    }
+    let new_exp = (exp + (127 - 15)) << 23;
+    f32::from_bits(sign | new_exp | (mant << 13))
+}
+
+/// Encode a layer-batch request with f16 residual.  Same shape as the f32
+/// version but residual bytes are 2 per element (vs 4).  Header layout
+/// `[layer u32][hidden u32][K u32]` is unchanged so the server can size
+/// the read slice correctly.
+pub fn encode_layer_batch_request_f16(
+    layer: usize,
+    residual: &[f32],
+    expert_ids: &[u32],
+    expert_weights: &[f32],
+) -> Vec<u8> {
+    let hidden = residual.len();
+    let k = expert_ids.len();
+    debug_assert_eq!(k, expert_weights.len());
+    let mut buf = Vec::with_capacity(12 + hidden * 2 + k * 8);
+    buf.extend_from_slice(&(layer as u32).to_le_bytes());
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    buf.extend_from_slice(&(k as u32).to_le_bytes());
+    for &v in residual {
+        buf.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+    }
+    for (i, &eid) in expert_ids.iter().enumerate() {
+        buf.extend_from_slice(&eid.to_le_bytes());
+        // Weights stay f32 — only K of them, and they're routing
+        // probabilities (small dynamic range, but full f32 precision keeps
+        // the renormalised sum exactly 1.0).
+        buf.extend_from_slice(&expert_weights[i].to_le_bytes());
+    }
+    buf
+}
+
+/// Decode an f16 layer-batch request.  Reconstructs `residual` to f32 on
+/// the server before passing into `run_experts_cpu_batch`.
+pub fn decode_layer_batch_request_f16(
+    bytes: &[u8],
+) -> Option<(usize, Vec<f32>, Vec<u32>, Vec<f32>)> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let layer = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let k = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let want = 12 + hidden * 2 + k * 8;
+    if bytes.len() < want {
+        return None;
+    }
+    let mut pos = 12usize;
+    let residual: Vec<f32> = bytes[pos..pos + hidden * 2]
+        .chunks_exact(2)
+        .map(|b| f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+    pos += hidden * 2;
+    let mut expert_ids = Vec::with_capacity(k);
+    let mut expert_weights = Vec::with_capacity(k);
+    for _ in 0..k {
+        let eid = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?);
+        let w = f32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?);
+        expert_ids.push(eid);
+        expert_weights.push(w);
+        pos += 8;
+    }
+    Some((layer, residual, expert_ids, expert_weights))
+}
+
+/// Encode the f16 layer-batch response (weighted-sum vector packed as f16).
+pub fn encode_layer_batch_response_f16(weighted_sum: &[f32], latency_ms: f32) -> Vec<u8> {
+    let hidden = weighted_sum.len();
+    let mut buf = Vec::with_capacity(8 + hidden * 2);
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    buf.extend_from_slice(&latency_ms.to_le_bytes());
+    for &v in weighted_sum {
+        buf.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+    }
+    buf
+}
+
+/// Decode the f16 layer-batch response back to f32 for client-side
+/// accumulation.
+pub fn decode_layer_batch_response_f16(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let hidden = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    if bytes.len() < 8 + hidden * 2 {
+        return None;
+    }
+    Some(
+        bytes[8..8 + hidden * 2]
+            .chunks_exact(2)
+            .map(|b| f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+    )
+}
 
 /// Encode a batch of expert requests as binary.
 pub fn encode_expert_request(items: &[ExpertCallItem]) -> Vec<u8> {
@@ -910,60 +1645,51 @@ impl RemoteMoeBackend {
         // 1. Route locally.
         let (_h_norm, expert_indices, expert_weights) = router.route(h, norm_offset, eps);
 
-        // 2. Build per-shard call lists.
+        // 2. Build per-shard (expert_id, weight) lists.  The new
+        //    layer-batch wire format ships ONE residual per shard plus K
+        //    (expert_id, weight) pairs — saves the K-1 redundant residual
+        //    copies that the legacy `call_batch` path forced.
         let shards = self.shards.read().unwrap();
-        let mut shard_calls: Vec<(usize, Vec<ExpertCallItem>)> =
-            (0..shards.len()).map(|i| (i, Vec::new())).collect();
+        let mut shard_calls: Vec<(usize, Vec<u32>, Vec<f32>)> = (0..shards.len())
+            .map(|i| (i, Vec::new(), Vec::new()))
+            .collect();
 
-        for (&expert_id, _) in expert_indices.iter().zip(expert_weights.iter()) {
+        for (&expert_id, &weight) in expert_indices.iter().zip(expert_weights.iter()) {
             let shard_idx = shards
                 .iter()
                 .position(|s| s.owns_unit(layer, expert_id))
                 .ok_or(RemoteMoeError::NoShard { expert_id })?;
-            shard_calls[shard_idx].1.push(ExpertCallItem {
-                layer,
-                expert_id,
-                residual: h.to_vec(),
-            });
+            shard_calls[shard_idx].1.push(expert_id as u32);
+            shard_calls[shard_idx].2.push(weight);
         }
 
-        // 3. Parallel dispatch — one batch call per shard that has work.
-        let non_empty: Vec<(usize, &Vec<ExpertCallItem>)> = shard_calls
+        // 3. Parallel dispatch — one layer-batch call per shard that has
+        //    work.  Each shard returns its own router-weighted partial sum;
+        //    the client just sums shard partials (no per-expert weighting
+        //    needed because the server already applied the weights).
+        let non_empty: Vec<(usize, &Vec<u32>, &Vec<f32>)> = shard_calls
             .iter()
-            .filter(|(_, items)| !items.is_empty())
-            .map(|(si, items)| (*si, items))
+            .filter(|(_, ids, _)| !ids.is_empty())
+            .map(|(si, ids, ws)| (*si, ids, ws))
             .collect();
 
-        let results_per_shard: Vec<Result<Vec<ExpertResultItem>, RemoteMoeError>> = non_empty
+        let results_per_shard: Vec<Result<Vec<f32>, RemoteMoeError>> = non_empty
             .par_iter()
-            .map(|(si, items)| shards[*si].call_batch(items))
+            .map(|(si, ids, ws)| shards[*si].call_layer_batch(layer, h, ids, ws))
             .collect();
 
-        // 4. Accumulate weighted outputs.
-        let expert_weight_map: std::collections::HashMap<usize, f32> = expert_indices
-            .iter()
-            .copied()
-            .zip(expert_weights.iter().copied())
-            .collect();
-
+        // 4. Sum shard partials into the layer's combined expert output.
         let mut out = vec![0.0f32; hidden];
         for result in results_per_shard {
-            for item in result? {
-                if item.output.len() != hidden {
-                    return Err(RemoteMoeError::BadResponse(format!(
-                        "expert {}/{} returned {} floats, expected {hidden}",
-                        item.layer,
-                        item.expert_id,
-                        item.output.len()
-                    )));
-                }
-                let weight = expert_weight_map
-                    .get(&item.expert_id)
-                    .copied()
-                    .unwrap_or(0.0);
-                for (acc, &val) in out.iter_mut().zip(item.output.iter()) {
-                    *acc += weight * val;
-                }
+            let shard_out = result?;
+            if shard_out.len() != hidden {
+                return Err(RemoteMoeError::BadResponse(format!(
+                    "shard returned {} floats, expected {hidden}",
+                    shard_out.len()
+                )));
+            }
+            for (acc, &v) in out.iter_mut().zip(shard_out.iter()) {
+                *acc += v;
             }
         }
 
@@ -1492,6 +2218,121 @@ impl ShardStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// f32→f16→f32 round-trip should preserve normal-range residual values
+    /// to within ~3 decimal digits.  Spot-check the boundary cases too.
+    #[test]
+    fn f16_round_trip_preserves_residual_values() {
+        let test_cases: &[f32] = &[
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            100.0,
+            -100.0,
+            0.001,
+            -0.001,
+            65504.0, // f16 max
+            -65504.0,
+            1e-4, // small but representable
+            std::f32::consts::PI,
+            std::f32::consts::E,
+        ];
+        for &v in test_cases {
+            let bits = f32_to_f16_bits(v);
+            let back = f16_bits_to_f32(bits);
+            // f16 has 11-bit mantissa precision → ~3 decimal digits.
+            // Tolerate 0.1% relative error or 1e-3 absolute, whichever is larger.
+            let tol = (v.abs() * 1e-3).max(1e-3);
+            assert!(
+                (v - back).abs() <= tol,
+                "f16 round-trip drift for v={v}: back={back} bits={bits:#06x}"
+            );
+        }
+    }
+
+    /// Out-of-range f32 inputs should saturate to ±Inf, not produce garbage.
+    #[test]
+    fn f16_saturates_overflow() {
+        let big = 1e10_f32;
+        let bits = f32_to_f16_bits(big);
+        let back = f16_bits_to_f32(bits);
+        assert!(
+            back.is_infinite() && back > 0.0,
+            "expected +Inf, got {back}"
+        );
+
+        let bits_neg = f32_to_f16_bits(-1e10_f32);
+        let back_neg = f16_bits_to_f32(bits_neg);
+        assert!(
+            back_neg.is_infinite() && back_neg < 0.0,
+            "expected -Inf, got {back_neg}"
+        );
+    }
+
+    /// Subnormal inputs round to zero or near-zero correctly.
+    #[test]
+    fn f16_handles_subnormals() {
+        // f16 smallest subnormal ≈ 6e-8; below that → 0.
+        let tiny = 1e-9_f32;
+        let bits = f32_to_f16_bits(tiny);
+        let back = f16_bits_to_f32(bits);
+        assert!(back.abs() < 1e-7, "expected ~0 for tiny={tiny}, got {back}");
+    }
+
+    /// Encode-then-decode round-trip for the layer-batch f16 wire.
+    #[test]
+    fn f16_layer_batch_request_round_trip() {
+        let layer = 15usize;
+        let residual: Vec<f32> = (0..256).map(|i| (i as f32 * 0.01).sin() * 5.0).collect();
+        let expert_ids: Vec<u32> = vec![3, 17, 42, 88];
+        let expert_weights: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
+
+        let bytes = encode_layer_batch_request_f16(layer, &residual, &expert_ids, &expert_weights);
+        // Header (12) + residual (256 × 2) + K × 8 = 12 + 512 + 32 = 556
+        assert_eq!(bytes.len(), 12 + 256 * 2 + 4 * 8);
+
+        let (l2, r2, ids2, ws2) =
+            decode_layer_batch_request_f16(&bytes).expect("decode should succeed");
+        assert_eq!(l2, layer);
+        assert_eq!(ids2, expert_ids);
+        assert_eq!(ws2, expert_weights); // weights are f32 → exact
+        assert_eq!(r2.len(), residual.len());
+        for (a, b) in residual.iter().zip(r2.iter()) {
+            let tol = (a.abs() * 1e-3).max(1e-3);
+            assert!(
+                (a - b).abs() <= tol,
+                "residual drift after round-trip: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Encode-then-decode round-trip for the layer-batch f16 response.
+    #[test]
+    fn f16_layer_batch_response_round_trip() {
+        let weighted_sum: Vec<f32> = (0..512).map(|i| (i as f32 * 0.013).cos() * 2.5).collect();
+        let bytes = encode_layer_batch_response_f16(&weighted_sum, 1.234);
+        assert_eq!(bytes.len(), 8 + 512 * 2);
+        let back = decode_layer_batch_response_f16(&bytes).expect("decode should succeed");
+        assert_eq!(back.len(), weighted_sum.len());
+        for (a, b) in weighted_sum.iter().zip(back.iter()) {
+            let tol = (a.abs() * 1e-3).max(1e-3);
+            assert!(
+                (a - b).abs() <= tol,
+                "weighted_sum drift after round-trip: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Truncated f16 buffers should fail safely (None), not panic.
+    #[test]
+    fn f16_layer_batch_handles_truncation() {
+        assert!(decode_layer_batch_request_f16(&[]).is_none());
+        assert!(decode_layer_batch_request_f16(&[0u8; 11]).is_none());
+        assert!(decode_layer_batch_response_f16(&[0u8; 7]).is_none());
+    }
 
     #[test]
     fn parse_range_valid() {

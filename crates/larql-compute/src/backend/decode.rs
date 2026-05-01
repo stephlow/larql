@@ -154,8 +154,16 @@ pub trait DecodeBackend {
             moe_collect_fn(layer)
         };
         self.decode_token_with_moe(
-            layers, x, hidden, inter, q_dim, kv_dim,
-            num_q_heads, num_kv_heads, head_dim, rope_base,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
             &mut combined,
         )
     }

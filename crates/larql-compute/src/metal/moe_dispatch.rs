@@ -294,8 +294,8 @@ impl MetalBackend {
         let gate_half_bytes = (inter * row_bytes) as u64;
         let n_rows = inter as u32;
         let k_cols = hidden as u32;
-        let tgs_per_mat = (inter as u64)
-            .div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        let tgs_per_mat =
+            (inter as u64).div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
 
         for (e, (gate_up_buf, _)) in expert_bufs.iter().enumerate().take(valid_count) {
             enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);

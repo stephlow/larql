@@ -181,10 +181,7 @@ fn q4k_ffn_gate_up_f16acc_matches_f32_within_tolerance() {
         "gate drift {max_g_diff} exceeds 0.5 — f16 accumulator is leaking precision \
          beyond the documented budget (sqrt(160) × 5e-4 × output_mag ≈ 6e-2)"
     );
-    assert!(
-        max_u_diff < 0.5,
-        "up drift {max_u_diff} exceeds 0.5"
-    );
+    assert!(max_u_diff < 0.5, "up drift {max_u_diff} exceeds 0.5");
 }
 
 #[test]

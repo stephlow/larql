@@ -205,12 +205,47 @@ impl MetalBackend {
             //     1.79× but end-to-end at parity on quiet GPU. Kept as
             //     opt-in for future hardware/fusion scenarios.
             use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
+            use crate::metal::shaders::q4k_ffn_gate_up_coop as q4k_gu_coop;
+            use crate::metal::shaders::q4k_ffn_gate_up_nr2 as q4k_gu_nr2;
+            // `LARQL_GATE_UP_NR2=1`: NR0=2 multi-row + shared-X variant.
+            // Mirrors llama.cpp's `N_R0_Q4_K = 2` shape — each simdgroup
+            // handles 2 output rows with `xl[16]` loaded once and
+            // reused. Targets the X-cache-traffic bottleneck (187 GB/s
+            // = 47% peak on production). Opt-in while perf is being
+            // measured; wins if A/B vs default (8sg) shows tok/s
+            // improvement without breaking arch_golden parity.
+            let use_nr2 = matches!(
+                std::env::var("LARQL_GATE_UP_NR2").as_deref(),
+                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            );
+            // `LARQL_GATE_UP_COOP=1`: cooperative scale-loading variant.
+            // Tried 2026-05-01 — null end-to-end (kernel-isolated ALU
+            // diagnosis was misleading). Kept opt-in.
+            let use_coop = matches!(
+                std::env::var("LARQL_GATE_UP_COOP").as_deref(),
+                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            );
             let use_4sg = matches!(
                 std::env::var("LARQL_GATE_UP_8SG").as_deref(),
                 Ok("0") | Ok("false") | Ok("off") | Ok("no")
             );
             let use_f16 = std::env::var("LARQL_F16_ACC").is_ok();
-            let (pipeline, rows_per_tg, threads_per_tg) = if use_4sg && use_f16 {
+            let (pipeline, rows_per_tg, threads_per_tg) = if use_nr2 {
+                // NR0=2 wins over coop / 4sg / 8sg — newest under test.
+                (
+                    &self.q4k_ffn_gate_up_nr2_pipeline.state,
+                    q4k_gu_nr2::ROWS_PER_TG,
+                    q4k_gu_nr2::THREADS_PER_TG,
+                )
+            } else if use_coop {
+                // Cooperative wins over the other flags — it's the
+                // newest variant under measurement.
+                (
+                    &self.q4k_ffn_gate_up_coop_pipeline.state,
+                    q4k_gu_coop::ROWS_PER_TG,
+                    q4k_gu_coop::THREADS_PER_TG,
+                )
+            } else if use_4sg && use_f16 {
                 (
                     &self.q4k_ffn_gate_up_f16acc_pipeline.state,
                     q4k_gu::ROWS_PER_TG,

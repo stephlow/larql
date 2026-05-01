@@ -285,6 +285,109 @@ impl VectorIndex {
         self.lm_head_knn(query, top_k)
     }
 
+    /// Same as `lm_head_knn_backend` but skips the **production**
+    /// `q4k_matvec` path (path 1 of the canonical chain) and tries
+    /// stable-reduction alternatives in this order:
+    ///
+    ///   1. Stride-32 Q4_K matvec (`backend.q4k_matvec_stride32`) on
+    ///      the same Q4_K bytes — same bandwidth as production
+    ///      `q4k_matvec`, but with `f16_gemv`'s reduction tree.
+    ///   2. f16 GEMV on `embeddings.bin` mmap (tied-embed only) —
+    ///      bigger read (1.3 GB vs 330 MB Q4_K) but always stable.
+    ///   3. f32 BLAS fallback (`lm_head_knn`).
+    ///
+    /// Why: Metal's production `q4k_matvec` 32-lane simdgroup reduction
+    /// (`shaders/q4k_matvec.rs::ix = lane & 1u`) drifts ~1e-3 vs CPU's
+    /// sequential dot product. On a 262K-vocab × 2560-hidden matvec
+    /// that's enough to flip top-1 on close-call tokens (e.g.
+    /// " Capital" vs " capital" at decode step 1 of Gemma 3 4B — see
+    /// `arch_golden_gemma3_4b_gpu`). The stride-32 variant
+    /// (`shaders/q4k_matvec_stride32.rs`) keeps the Q4_K bandwidth win
+    /// while matching `f16_gemv`'s stable reduction.
+    ///
+    /// `lm_head_topk` in `larql-inference::layer_graph::generate::lm_head`
+    /// routes here when the active backend is non-CPU (default;
+    /// override with `LARQL_METAL_LM_HEAD=1` to re-enable the production
+    /// `q4k_matvec` path).
+    pub fn lm_head_knn_backend_skip_q4k(
+        &self,
+        query: &ndarray::Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Vec<(u32, f32)> {
+        // 1. Stride-32 Q4_K matvec on the same Q4_K bytes as the
+        //    production path — preserves the bandwidth advantage,
+        //    fixes the rank-1 drift. Falls through if the backend
+        //    doesn't implement the stable variant (default impl
+        //    returns None). `LARQL_LM_HEAD_STRIDE32=0` disables this
+        //    path so callers can A/B against the f16 fallback without
+        //    a rebuild.
+        let stride32_enabled = !matches!(
+            std::env::var("LARQL_LM_HEAD_STRIDE32").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        );
+        if stride32_enabled && backend.has_q4() {
+            let q4_bytes: Option<&[u8]> = self
+                .projections
+                .lm_head_q4_mmap
+                .as_ref()
+                .map(|m| m.as_ref() as &[u8])
+                .or_else(|| {
+                    self.projections
+                        .lm_head_q4_synth
+                        .as_ref()
+                        .map(|v| v.as_slice())
+                });
+            if let Some(q4_data) = q4_bytes {
+                let vocab = self.vocab_size;
+                let hidden = self.hidden_size;
+                if vocab > 0 {
+                    if let Some(x) = query.as_slice() {
+                        if let Some(scores_vec) =
+                            backend.q4k_matvec_stride32(q4_data, x, vocab, hidden)
+                        {
+                            return Self::top_k_sorted(scores_vec, top_k);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. f16 GEMV on tied-embed `embeddings.bin` — stable reduction,
+        //    but ~2× the bandwidth of Q4_K.
+        if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
+            let vocab = self.vocab_size;
+            let hidden = self.hidden_size;
+            if vocab > 0 {
+                let expected = vocab * hidden * 2;
+                if f16_mmap.len() >= expected {
+                    if let Some(x) = query.as_slice() {
+                        if top_k == 1 {
+                            if let Some((idx, score)) =
+                                backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
+                            {
+                                return vec![(idx, score)];
+                            }
+                        } else if let Some(hits) =
+                            backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
+                        {
+                            if !hits.is_empty() {
+                                return hits;
+                            }
+                        }
+                        if let Some(scores_vec) =
+                            backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
+                        {
+                            return Self::top_k_sorted(scores_vec, top_k);
+                        }
+                    }
+                }
+            }
+        }
+        // 3. f32 BLAS fallback.
+        self.lm_head_knn(query, top_k)
+    }
+
     /// Sort `scores` by descending value and keep the top `top_k`. Shared
     /// by the Q4 / f16 / f32 paths above.
     ///

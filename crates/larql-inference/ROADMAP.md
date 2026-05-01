@@ -2,6 +2,369 @@
 
 ## Current: ~95 tok/s (Metal Q4K) | Ollama: ~101 tok/s | 4 KV engines
 
+## ✅ Metal lm_head — stride-32 Q4_K matvec, f16 GEMV fallback (correctness + perf fix, 2026-05-01)
+
+Gemma 3 4B Metal end-to-end was producing the wrong continuation
+("The Capital of France is:  **") on `"The capital of France is"`
+while CPU produced the correct "**Paris**" answer. Bisected:
+
+- Per-layer hidden parity holds (`test_decode_consistency_gemma3_4b`
+  and the new 2-step variant pass at cos ≥ 0.99995 across all 34
+  layers, 1 and 2 decode steps) — KV cache writes/reads and per-layer
+  Metal kernels are correct.
+- The single-token logits goldens for Metal pinned a top-5 set whose
+  positions 4-5 differed from CPU at the prefill boundary, even though
+  top-1 matched (`top1_logit Δ ≈ 5e-4`).
+- A/B with `LARQL_LM_HEAD_FORCE_CPU=1` confirmed Metal generated
+  "Paris" once the lm_head bypassed the Q4_K matvec path, isolating
+  the drift to that specific kernel.
+
+Root cause: `shaders/q4k_matvec.rs` 32-lane simdgroup parallel
+reduction with a 2-way inter-superblock split (`ix = lane & 1u`)
+accumulates partial sums in a different order than the f32 reference.
+Same f32 precision at every step; the difference is reduction-tree
+associativity. On a 262K × 2560 lm_head matvec this surfaces as
+~1e-3 relative drift on top-1 logits, enough to flip rank-1 on
+close-call tokens (e.g. " Capital" vs " capital" at decode step 1
+of Gemma 3 4B).
+
+**Fix**: `lm_head_topk` (`layer_graph/generate/lm_head.rs`) routes
+through the new `lm_head_knn_backend_skip_q4k` method on `VectorIndex`
+when the active backend is non-CPU. That dispatch chain replaces the
+production `q4k_matvec` first-path with a 3-step ladder:
+
+  1. **Stride-32 Q4_K matvec** (`backend.q4k_matvec_stride32`,
+     `shaders/q4k_matvec_stride32.rs` — new) — same Q4_K bytes as
+     production, same bandwidth (330 MB/tok read), but lane `k`
+     accumulates the dot-product over elements `i % 32 == k` and the
+     final reduction is `simd_sum` across 32 lanes — bit-equivalent
+     reduction tree to `f16_gemv`. Recovers rank-1 stability without
+     paying the f16 fallback's 4× bandwidth penalty.
+  2. **f16 GEMV on `embeddings.bin` mmap** (tied-embed only, ~2×
+     bandwidth of Q4_K) — fallback when the stride-32 kernel isn't
+     dispatchable.
+  3. f32 BLAS fallback (`lm_head_knn`).
+
+Opt out of stride-32 with `LARQL_LM_HEAD_STRIDE32=0`; opt back into
+the production Q4_K path with `LARQL_METAL_LM_HEAD=1`.
+
+Five attempts on the way to this:
+- v1: route through `CpuBackend` via `index.lm_head_knn_backend` —
+  picks the **scalar** Q4_K reference (`cpu/ops/q4k_matvec.rs::dispatch`,
+  unvectorised), ~510 ms/tok → **1.9 tok/s** end-to-end.
+- v2: route through `CpuBackend` via `backend_lm_head_topk` (CPU BLAS
+  on f32 `weights.lm_head`), ~30 ms/tok → **23.6 tok/s**.
+- v3: route through Metal `backend.f32_gemv` on f32 `weights.lm_head`,
+  ~8 ms/tok → **52.2 tok/s** sustained.
+- v4: Metal `f16_gemv` on the embed `f16_mmap`, ~4 ms/tok →
+  **66.8 tok/s** sustained.
+- **v5 (shipped)**: Metal stride-32 `q4k_matvec` on Q4_K mmap, ~3
+  ms/tok → **71.5 tok/s** sustained.
+
+**Validation**:
+- `arch_gemma3_4b_gpu` now generates `"The capital of France is **Paris**."` (was `"The Capital of France is:  **"`).
+- All 4 `gemma3` logits goldens pass for both backends; pinned values are now equal post-fix (per-backend split kept for future drift detection).
+- 2-step decode parity (`decode_consistency_gemma3_4b_2steps` — new) confirms KV-cache write/read across decode steps is independently correct.
+
+**Bench (Gemma 3 4B, M3 Max, `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b -n 50 --warmup 5`, sustained / cold-GPU)**:
+
+| Path | Decode tok/s | lm_head ms/tok | GPU fwd ms/tok | vs ollama |
+|---|---|---|---|---|
+| Pre-fix (Metal Q4_K matvec, **wrong output**) | ~78 (historic) | ~1 | ~12 | 1.34× slower |
+| v1: CPU `index.lm_head_knn_backend` (scalar Q4_K) | **1.9** | 509.3 | 18.6 | 55× slower |
+| v2: CPU `backend_lm_head_topk` (BLAS f32) | 23.6 | 30.4 | 12.6 | 4.4× slower |
+| v3: Metal `backend.f32_gemv` on f32 lm_head | 52.2 | 8.0 | 12.0 | 2.0× slower |
+| v4: Metal `f16_gemv` on embed f16_mmap | 66.8 | 3.8 | 11.8 | 1.57× slower |
+| **v5 (shipped)**: Metal stride-32 `q4k_matvec` | **71.5** | 3.0 | 11.7 | **1.44× slower** |
+| ollama gemma3:4b | 102.8 | — | — | 1.00× |
+
+(Watch for thermal noise: back-to-back benches on a hot GPU drop
+sustained tok/s by 25-30%; cool-GPU numbers above match the historic
+~78 baseline structure when adjusting for the 3 ms lm_head cost.)
+
+lm_head is now ~21% of decode (down from 96.5% in v1, 25.5% in v4).
+The stride-32 kernel approaches Q4_K's bandwidth floor (330 MB/tok ÷
+~400 GB/s ≈ 0.8 ms theoretical; we're at 3 ms ≈ 28% of peak). The
+remaining 1.44× gap to ollama (and the ~6 tok/s gap to the historic
+~78 baseline) lives entirely in **GPU forward** (75% of decode @
+11.7 ms), which is a separate roadmap item — `q4k_matvec` 8sg /
+Q4_K matmul for prefill / kernel fusion / encoder coalescing.
+
+**Files**:
+- `crates/larql-compute/src/metal/shaders/q4k_matvec_stride32.rs` — new shader, f16_gemv-style stride-32 reduction
+- `crates/larql-compute/src/metal/shaders/mod.rs` — register the new module + push to merged source
+- `crates/larql-compute/src/metal/mod.rs` — `q4k_matvec_stride32_pipeline` field + KernelHandle init
+- `crates/larql-compute/src/metal/trait_impl/matmul.rs` — `MetalBackend::q4k_matvec_stride32` inherent method
+- `crates/larql-compute/src/metal/trait_impl/quant_matvec.rs` — `QuantMatVec::q4k_matvec_stride32` trait wire-up
+- `crates/larql-compute/src/backend/quant_matvec.rs` — trait method declaration (default returns `None`)
+- `crates/larql-inference/src/layer_graph/generate/lm_head.rs` — `lm_head_topk` `prefer_cpu` branch routes to `index.lm_head_knn_backend_skip_q4k(..., backend)`
+- `crates/larql-vindex/src/index/storage/lm_head.rs` — new `lm_head_knn_backend_skip_q4k` method (path 1 = stride-32 Q4_K, path 2 = f16 GEMV, path 3 = f32 BLAS); `LARQL_LM_HEAD_STRIDE32=0` opt-out
+- `crates/larql-inference/src/residual_diff/capture.rs` — `metal_decode_steps` helper for multi-step parity
+- `crates/larql-inference/tests/test_decode_consistency.rs` — `decode_consistency_gemma3_4b_2steps` test
+- `crates/larql-inference/tests/test_logits_goldens.rs` — Metal pins re-captured for v5 stride-32 path
+
+---
+
+## Open: GPU-forward kernel utilization — closing the 4.4 ms gap to ollama
+
+**Status**: Open as of 2026-05-01. Diagnosed via
+`cargo run -p larql-compute --release --features metal --example diag_profile_kernels`
+plus per-step `LARQL_PROFILE_DECODE=1` profiling on Gemma 3 4B; ollama's
+fine-grained timings via `/api/generate` (`total_duration`,
+`prompt_eval_duration`, `eval_duration`).
+
+**Where the gap lives** (steady-state, peak/cold step):
+
+| Stage | larql peak | ollama | gap | recoverable? |
+|---|---|---|---|---|
+| GPU forward | 11.6 ms/tok | ~7-8 ms | **+4 ms** | yes — see kernel breakdown |
+| lm_head | 3.0 ms/tok | ~1.5-2 | +1.5 ms | mostly tight (~28% of Q4_K bandwidth floor) |
+| total/tok | **14.7 ms** | 9.6 ms | +5 ms | most via GPU fwd |
+| tok/s | 68 | 104 | 1.53× | |
+
+(Sustained tok/s drops further on hot GPU — thermal throttling doubles
+GPU fwd time over ~16 decode steps. Ollama is presumably less affected
+because their faster decode finishes the same wallclock budget with less
+GPU on-time.)
+
+**Per-kernel utilization** (decode, Gemma 3 4B, M3 Max LPDDR5X ~400 GB/s peak):
+
+| Kernel | Bandwidth | % of peak | ms/tok | Headroom (at 80% peak) |
+|---|---|---|---|---|
+| q6k_matvec (FFN down, K=10240) | 321 GB/s | 80% | 2.3 | ~0 (already tight) |
+| q4k_ffn_gate_up (gate+up, K=2560) | 187 GB/s | **47%** | 5.4 | **-2.2 ms** |
+| q4k_matvec (Wo, K=8192) | 184 GB/s | **46%** | 2.2 | **-0.9 ms** |
+| q4k_qkv_proj (Q+K+V fused, K=2560) | 114 GB/s | **28%** | 7.1 | **-4.3 ms** |
+| **Total recoverable in GPU fwd** | | | | **~7 ms/tok** |
+
+If we hit 80% peak across the three under-utilized kernels: GPU fwd
+drops 11.7 ms → ~5 ms, total decode 14 ms → ~8 ms, **125+ tok/s
+end-to-end** (ahead of ollama). Realistic target with kernel rewrites:
+**80-90 tok/s** as a first milestone (matches the historic memory's
+"~78 baseline" pre-correctness-fix).
+
+**Why under-utilized**: per `metal/diag/kernel_profile.rs` annotations,
+`q4k_ffn_gate_up` is "COMPUTE-BOUND (K=2560 dequant dominates)". The
+Q4_K dequant inline in the shader (decode super-block scale, sub-block
+scale via 6-bit unpack, nibble extract, FMA) eats ALU cycles that block
+memory issue. Each lane redundantly decodes the per-super-block
+`d`/`dmin` and per-sub-block `sc`/`mn`, so the simdgroup spends 32× the
+necessary dequant work and the per-row FMA chain stalls waiting for
+operands. Llama.cpp's equivalent kernel co-operates one lane per
+simdgroup to load scales into threadgroup memory, then broadcasts to
+all 32 lanes for a tight FMA loop — eliminates the redundancy.
+
+The same pattern applies to `q4k_qkv_proj` (also K=2560) and `q4k_matvec`
+on Wo (K=8192). The three are the largest per-token GPU costs; closing
+their utilization is the highest-leverage GPU-fwd work item.
+
+**Optimization paths in priority order** (each independent and stackable):
+
+### G-1 — Cooperative scale-loading in `q4k_ffn_gate_up`
+
+**Status**: ❌ Tried 2026-05-01, no end-to-end win. Kernel kept opt-in
+(`LARQL_GATE_UP_COOP=1` → `q4k_ffn_gate_up_coop_pipeline`,
+`shaders/q4k_ffn_gate_up_coop.rs`) for future hardware / fusion
+scenarios.
+
+**What was tried**: shipped a new `q4k_ffn_gate_up_coop` shader that
+keeps the production lane partitioning (`ix = lane & 1u`,
+`j = (lane >> 1) >> 1`) but does the per-super-block dequant
+cooperatively:
+- Lanes 0..7 of each simdgroup each compute one sub-block's
+  `(scale = d * sc, mmin = dmin * mn)`.
+- Writes go to threadgroup memory (256 B / TG, well under hardware
+  limit).
+- `threadgroup_barrier(mem_threadgroup)` flushes; all 32 lanes read
+  their owned `j`'s `(scale, mmin)`.
+- Each writer also re-decodes `d`/`dmin` itself (8× redundant vs
+  production's 32×) — using `simd_broadcast` for `d`/`dmin` produced
+  wrong output (close-call top-1 flips), likely from the broadcast
+  reordering the inner FMA chain enough to drift past the rank-1 gap.
+
+**Result**: bench A/B (3 runs each, cold + warm GPU):
+- Coop:     72.1 / 61.8 / 71.8 tok/s, GPU fwd 12.1 / 14.1 / 12.1 ms
+- Baseline: 63.2 / 73.0 / 62.2 tok/s, GPU fwd 13.9 / 11.8 / 13.8 ms
+
+Within thermal noise. **No end-to-end win**.
+
+**Why the diagnosis was misleading**: `metal/diag/kernel_profile.rs`
+flagged `q4k_ffn_gate_up` as "COMPUTE-BOUND (K=2560 dequant
+dominates)" based on isolated-kernel GB/s measurement. In practice the
+production kernel's per-lane redundant dequant ALU **runs concurrently
+with the per-row weight loads**, filling memory-stall bubbles for free.
+Removing the redundant ALU saves cycles in isolation but doesn't
+increase memory throughput — the actual bottleneck. Same lesson as the
+2026-04-28 `LARQL_F16_ACC=1` kernel-isolated 1.79× → end-to-end parity
+finding. Kernel-isolated profiler GB/s alone is not predictive of
+end-to-end wins on Apple Silicon GPUs; the right metric is full
+end-to-end tok/s on a quiet GPU.
+
+**Implications for G-2 and G-3** (same cooperative pattern proposed
+for `q4k_qkv_proj` and `q4k_matvec`-Wo): expect the same null result,
+since both kernels share the same per-lane dequant pattern with the
+same memory/ALU overlap. Not worth shipping G-2/G-3 as written;
+de-prioritise.
+
+**What's actually on the critical path** (revised): the GB/s
+under-utilization isn't ALU-driven, it's **memory access pattern /
+occupancy**. Possible causes:
+
+- Per-row weight loads are scattered enough that prefetchers don't
+  saturate the LPDDR5X channels.
+- Threadgroup count too low to hide memory latency across TGs.
+- Per-row register footprint blocks higher concurrent-TG counts.
+
+These need a different toolset (Xcode GPU frame capture / Metal
+profiler) to localise — kernel-isolated GB/s alone isn't enough.
+
+---
+
+### G-2 — NR0=2 + shared-X-vector port from llama.cpp (HIGH PRIORITY)
+
+**Status**: Open. Replaces the de-prioritised cooperative-dequant idea
+as the highest-leverage GPU-fwd item. Diagnosed as the actual bottleneck
+in step-by-step diff against ollama (2026-05-01).
+
+**Diagnosis**: Side-by-side bench against `ollama gemma3:4b` on
+`"The capital of France is"`, num_predict=20:
+
+| | larql | ollama | Δ |
+|---|---|---|---|
+| Decode tok/s | 71.7 | 96.0 | **+3.53 ms/tok gap** |
+| GPU fwd | 12.5 ms | est. 7-8 ms | ~5 ms gap |
+
+llama.cpp's Q4_K matvec
+(`ggml/src/ggml-metal/ggml-metal-impl.h::N_R0_Q4_K`) processes **2
+output rows per simdgroup** (`NR0=2`) with the X-vector loaded once
+into per-lane registers and reused across both rows. Ours processes
+1 row per simdgroup; the same 2560-element X-vector is reloaded per
+row from cache. With our 8sg / 8-rows-per-TG geometry, that's ~2× the
+X-cache traffic of llama.cpp's 2sg / 4-rows-per-TG, which matches our
+measured 47% / 28% peak utilization on `q4k_ffn_gate_up` /
+`q4k_qkv_proj` (the two biggest decode costs).
+
+**Approach** (mirrors llama.cpp `kernel_mul_mv_q4_K_f32`):
+
+1. Each simdgroup handles 2 output rows (`NR0 = 2`).
+2. X-vector slice loaded once into `xl[16]` per lane.
+3. For each of 2 rows: separate `sumf[2]` accumulator running the
+   per-element FMA against the same `xl[16]`.
+4. Two `simd_sum` calls at the end, two row-writes.
+
+**Caveats** to watch:
+- Auto-memory note from 2026-04-19: "N_DST=2 caused ~10% regression,
+  N_DST=4 caused 24× regression (register spilling)". That earlier
+  attempt likely **didn't share the X-vector** across rows — it just
+  doubled the per-thread register footprint. The win in llama.cpp
+  comes from the **shared X load**, not from naively doubling NR0.
+- Verify register count via Xcode's Metal compiler diagnostic
+  (`MTLLibrary.functionInfo.maxThreadsPerThreadgroup`) before shipping.
+- Inner FMA chain becomes 2 chained FMAs per (lane, element) — same
+  total work, but compiler must keep both `sumf[0]` and `sumf[1]` in
+  registers without spilling.
+
+**Validation**:
+- Kernel-level parity test against current `q4k_ffn_gate_up` on
+  synthetic data (cos ≥ 0.9999 — same Q4_K math, just multi-row dispatch).
+- `arch_golden_gemma3_4b_gpu` continues to emit "**Paris**".
+- `decode_consistency_gemma3_4b_2steps` continues to pass.
+
+**Expected**: 187 GB/s → ~280 GB/s on `q4k_ffn_gate_up` → 5.4 → 3.5 ms/tok
+across 34 layers → **+10-15 tok/s end-to-end** on Gemma 3 4B.
+Apply the same pattern to `q4k_qkv_proj` (114 → 200 GB/s → +20 tok/s).
+Stretch goal: **~95-100 tok/s, ollama parity**.
+
+### G-3 — Flash-attention-style fused attention kernel (HIGH PRIORITY)
+
+**Status**: Open. Larger lift than G-2 but orthogonal — attacks
+**dispatch overhead** (~1.0 ms/tok savings) rather than per-kernel
+utilization.
+
+**Current decode dispatch chain per layer**: ~11 dispatches × 34
+layers = ~374 dispatches/tok × ~5 µs each = **1.87 ms/tok overhead**.
+Llama.cpp's flash-attention path collapses RoPE + QK_norm + KV_append +
+KV_attend + O_proj fragments into 1-2 dispatches → ~6-7 per layer ×
+34 = ~200/tok ≈ 1.0 ms overhead. **~0.85 ms/tok recoverable**.
+
+**Approach** (mirrors llama.cpp `kernel_flash_attn_ext_*`):
+
+1. Single fused kernel takes Q, K, V (already projected and RoPE-rotated),
+   and the KV cache. Computes `softmax(QK^T / √d) · V` in one pass.
+2. Tile over Q heads × KV blocks; each TG handles one Q head's softmax
+   row, accumulating against the V tile in registers.
+3. Online softmax (re-normalising incrementally) — avoids the
+   per-position Q output allocation our current `kv_attend` materializes.
+
+**File**: `crates/larql-compute/src/metal/shaders/fused_attention.rs`
+already exists as a stub — flesh out using llama.cpp's
+`kernel_flash_attn_ext_q4_K_f32` as the template (templated over Q
+quant type, K head_dim, V head_dim).
+
+**Validation**:
+- Per-kernel parity test against current per-stage chain on synthetic
+  Q/K/V/cache (cos ≥ 0.9999).
+- `arch_golden_gemma3_4b_gpu`, `decode_consistency_gemma3_4b{,_2steps}`
+  continue to pass.
+- Wider sweep across Gemma 4 31B dense / 26B-A4B (different head
+  geometries — global vs sliding-window layers, different head_dim).
+
+**Expected**: -0.85 ms/tok dispatch overhead → **+5-8 tok/s end-to-end**
+on Gemma 3 4B.
+
+**Sequencing**: G-2 first (smaller, more bounded), G-3 second
+(builds on G-2's NR0 understanding plus the existing
+`fused_attention.rs` stub). Both together project to **95-105 tok/s
+on Gemma 3 4B** (full ollama parity).
+
+### G-5 — Memory access pattern audit (highest priority after G-1's null)
+
+**Status**: Open. Should run before any further kernel rewrites.
+
+**Approach**: Use Xcode's GPU frame capture / Metal Profiler on a
+single decode token, focused on `q4k_ffn_gate_up` and `q4k_qkv_proj`.
+Look at:
+- L2 cache hit rate per dispatch (low = scattered access; high = the
+  diagnosis is wrong about memory being the bottleneck).
+- Concurrent threadgroup count vs theoretical (low = register
+  pressure or threadgroup-mem capping occupancy).
+- Memory access stall events on the FMA chain.
+
+The output should distinguish (a) scattered access pattern hurting
+prefetch, (b) low occupancy hiding latency poorly, (c) actually
+ALU-bound but the existing in-kernel ALU isn't the redundant dequant.
+
+Without this, optimization is guess-and-check. Kernel-isolated GB/s
+on `metal/diag/kernel_profile.rs` doesn't predict end-to-end wins on
+Apple Silicon (G-1 and the prior `LARQL_F16_ACC=1` attempt both
+demonstrated this).
+
+### G-4 — Flash-attention-style fused attention kernel
+
+**Status**: Open. Larger lift, separate from G-1..G-3 / G-5. Promoted
+toward the top of the list because it eliminates dispatch overhead
+(orthogonal to per-kernel utilization), so it should win regardless
+of what G-5 finds about the matmul kernels.
+
+Per-token attention currently dispatches as:
+- `q4k_qkv_proj` (Q + K + V projection)
+- `qk_norm` (Gemma 3/4)
+- `rope_at_pos`
+- `kv_append`
+- `kv_attend` (the actual `softmax(QK^T)V`)
+- `q4k_matvec` (O projection)
+
+Six dispatches per layer × 34 layers = 204 dispatches per token, each
+costing ~5-8 µs scheduling overhead = 1-1.6 ms/tok in pure dispatch
+time. A flash-attention-style fused kernel (`fused_attention.rs` is a
+stub) would collapse RoPE+QK norm+append+attend into one or two
+dispatches, saving ~0.5-1 ms/tok dispatch overhead plus the per-stage
+buffer round-trips.
+
+**Expected**: +5-10 tok/s end-to-end after G-1..G-3 are in place.
+
+---
+
 ## Status
 
 The four KV-cache engines shipped in `engines/kv_engines/` all reach ~93-95 tok/s
@@ -269,20 +632,48 @@ single-shard 26B-A4B bench). Long-term answer is M-CPU-4 (kill the cache
 entirely via direct Q4_K matvec); cap=256 is the right default until then.
 
 ### M-CPU-4 — NEON-vectorised Q4_K matvec (load-bearing item)
-**Status**: Not started — landed in `larql-compute/ROADMAP.md` as a parallel item  
-**File**: `crates/larql-compute/src/cpu/ops/q4_common.rs::q4k_matvec_into`  
-**Why this is the structural fix**: M-CPU-1/2/3 cut the per-call floor 1.8×
-(3.52 → 1.94 ms) but the multi-layer sweep barely moved (221 → 205 ms, -7%).
-Diagnostic: warm matmul on cached f32 should be 1.94 × 30 = 58 ms, but actual
-sweep is 205 ms. The 147 ms gap is **DRAM bandwidth pressure** — 240 cached
-experts × 24 MB f32 = **5.7 GB walked per token**, dwarfing L3. Direct Q4_K
-matvec reads ~12 MB Q4_K bytes per expert (4× smaller, straight from mmap),
-eliminating the f32 cache entirely. Mirror llama.cpp `ggml_vec_dot_q4_K_q8_K`:
-quantise activation to Q8_K once per expert call, then NEON dot-product (`vdotq_s32`
-on Apple Silicon, AVX2 `_mm256_maddubs_epi16` on x86) against the 144-byte
-Q4_K super-blocks. Once shipped, flip `LARQL_Q4K_DIRECT` default ON and shrink
-or kill the cache. Expected: pulls CPU MoE within 2-4× of the BW floor (~25-50
-tok/s on grid loopback).
+**Status**: ✅ Done 2026-05-01 — measured **8.6× sweep speedup**  
+**File**: `crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs` (new module);
+wired in `expert.rs::run_single_expert`, `expert.rs::run_single_expert_q4k_q8k_into`,
+`forward.rs::cpu_moe_forward`, `routes/expert.rs::run_experts_cpu_batch`.  
+New isolated module mirrors llama.cpp's `ggml_vec_dot_q4_K_q8_K`:
+
+- `quantize_x_to_q8k(x)` → per-256-element absmax + i8 + per-32-subblock i16 sums.
+- `q4k_q8k_matvec_scalar` — scalar reference, integer dot math.
+- `q4k_q8k_matvec_neon` — aarch64 SDOT inner loop (16 i8 × i8 → 4 i32 lanes
+  per instruction). Implemented via stable `core::arch::asm!` because
+  `core::arch::aarch64::vdotq_s32` is still unstable on Rust 1.91 (gated
+  behind `stdarch_neon_dotprod`, rust-lang/rust#117224).
+
+Test rig: Q8_K quantiser round-trip; scalar Q4_K×Q8_K vs cached-f32 path
+within Q8 quant noise; multi-block matvec parity; **NEON vs scalar bit-exact**
+(`to_bits()` equality on non-trivial sin/cos input); zero-dim and short-buffer
+edge cases. 7 new tests, all passing.
+
+The Q4_K direct path is on by default for Q4_K weights; `LARQL_DISABLE_Q4K_DIRECT=1`
+falls back to the BLAS-on-cached-f32 path for kernel-debug A/B comparison.
+
+Bench measurements (Gemma 4 26B-A4B, M3 Max, single-shard loopback):
+
+| Metric | Baseline (cap=64) | M-CPU-1/2/3 (cap=256) | + M-CPU-4 (NEON Q4_K) | Total Δ |
+|---|---|---|---|---|
+| `forward_moe` warm 1-layer HTTP RTT | 2.53 ms | 2.43 ms | **0.95 ms** | **2.7×** |
+| `cpu_moe_forward` warm floor | 3.52 ms | 1.94 ms | **0.39 ms** | **9.0×** |
+| `cpu_moe_forward` p99 | 11.62 ms | 2.42 ms | **0.50 ms** | **23×** |
+| **30-layer sweep** | **221 ms** | 205 ms | **25.6 ms (0.85 ms/layer)** | **8.6×** |
+| Steady RSS | 11.4 GB | 13.6 GB | **10.5 GB** | -8% |
+
+The sweep at 25.6 ms projects to ~25-30 tok/s end-to-end on the gRPC grid
+(vs 2.3 tok/s baseline = ~10-13× end-to-end). RSS dropped below baseline
+because the f32 dequant cache is largely inert in the new path —
+direct-Q4K reads straight from mmap.
+
+Follow-ups (if further perf needed): (1) shrink `LARQL_MOE_CACHE_ENTRIES`
+default back to 64 or 32 once the BF16 fallback path is removed (cache only
+serves legacy BF16 vindexes now); (2) reuse per-rayon-thread scratch for the
+`gate_out` / `up_out` / `act_q8k` heap allocs in `cpu_moe_forward`'s
+direct-Q4K branch (currently per-call); (3) wire AVX2 dot-product equivalent
+for x86 hosts (`_mm256_maddubs_epi16`).
 
 ### M-CPU-5 — bench harness + per-fix tok/s attribution
 **Status**: ✅ Done 2026-05-01  
@@ -305,6 +696,76 @@ cap, indicating a code drift between then and now that should be bisected
 separately. The point of the bench: it falsifies "more cache = more tok/s"
 as the path to target, and confirms M-CPU-4 (NEON direct-Q4K, no f32 cache)
 as the only structural answer.
+
+### M-CPU-6 — Bottleneck-driven follow-ups (post-NEON profiling round)
+**Status**: ✅ Done 2026-05-01  
+**Files**: `q4k_q8k_dot.rs`, `cpu/ops/q4_common.rs::f16_to_f32`,
+`moe/expert.rs`, `moe/forward.rs`, server `routes/expert.rs` +
+`larql-inference/ffn/moe_remote.rs`.
+
+After M-CPU-1..4 landed, samply (`/usr/bin/sample bench_expert_server 30`)
+identified the next bottlenecks:
+
+1. **f16-to-f32 was calling `__powisf2`**.  `2.0f32.powi(exp - 15)` lowered
+   to a libcall; ~11 M decodes/token at 26B-A4B sizes routed through the
+   software powi.  Replaced with pure-integer bit-manipulation
+   (`f16_to_f32`).  Bit-exact for all 65,536 inputs (test:
+   `f16_to_f32_bit_exact_for_all_inputs`).  Removed the bl from the
+   kernel — but wall-clock barely moved, which DIAGNOSED the kernel as
+   already DRAM-bandwidth bound (the powi work was hidden in memory
+   stalls).
+
+2. **Reusable Q8_K activation buffer (`act_q8k`) in `ExpertScratch`**.
+   The per-expert activation Q8_K quantisation was allocating a fresh
+   `Q8KActivation` per call; ~5% of calls hit a 150 µs allocator slow
+   path that dragged par_iter wall up.  Added `act_q8k` field +
+   `quantize_x_to_q8k_into` API + `Q8KActivation::with_capacity`.
+   `forward_moe` p99 dropped 23% (1.38 → 1.06 ms).
+
+3. **`cpu_moe_forward` refactored to use thread-local `ExpertScratch` via
+   rayon `fold/reduce`**.  Eliminates the per-expert
+   `Vec<f32>` allocs in the in-process MoE path AND deduplicates the
+   kernel logic (now goes through `run_single_expert_q4k_q8k_into`
+   instead of an inlined copy).
+
+4. **`run_single_expert` (HTTP single-expert entry) now uses thread-local
+   scratch on the Q4_K path**.  K=8 calls per layer no longer
+   re-allocate gate_out / up_out / act / act_q8k; only the final
+   returned `Vec<f32>` is allocated.
+
+5. **New `/v1/experts/layer-batch` endpoint + wire format**.  Ships ONE
+   residual + K (expert_id, weight) pairs per call (vs K identical
+   residuals on the legacy `/v1/expert/batch` path).  Server applies
+   `pre_experts_norm` once + Q8_K quantises h_norm once + fans out the
+   K experts via `run_experts_cpu_batch`.  `RemoteMoeBackend::forward_moe`
+   updated to use the new endpoint.  Saved K-1 redundant pre-norm + Q8K
+   quantisations and ~2.6 MB/token of redundant residual on the wire.
+
+6. **Tried fused gate+up matvec**.  Implemented `q4k_q8k_gate_up_into`
+   with NEON SDOTs interleaved across both matrices.  Bit-exact parity
+   test against back-to-back single-matvec calls (`q8k_gate_up_fused_matches_separate_matvecs`).
+   Bench: ~4% slower on the 30-layer sweep.  M3 Max OoO engine
+   already extracts ILP from the back-to-back independent matvec calls;
+   manual interleaving adds register pressure and hurts the L1 prefetcher
+   pattern.  Reverted the wiring; kept the function for future
+   architectures where the trade may flip.
+
+End-state bench (Gemma 4 26B-A4B, M3 Max, single-shard loopback):
+
+| Metric | Baseline (cap=64) | M-CPU-1..4 | + M-CPU-6 (post-profile fixes) | Total Δ |
+|---|---|---|---|---|
+| `forward_moe` warm 1-layer HTTP RTT | 2.53 ms | 0.95 ms | **0.83 ms** | **3.0×** |
+| `cpu_moe_forward` warm floor | 3.52 ms | 0.39 ms | **0.38 ms** | **9.3×** |
+| **30-layer sweep** | **221 ms** | 25.6 ms | **24.2 ms (0.81 ms/layer)** | **9.1×** |
+| Steady RSS | 11.4 GB | 10.5 GB | 10.5 GB | -8% |
+
+Sweep at 24.2 ms projects to **~25-30 tok/s end-to-end on the gRPC grid**
+(vs 2.3 tok/s baseline = ~10-13× end-to-end).  Path is now firmly
+DRAM-bandwidth bound (~32 GB/s aggregate vs ~50-100 GB/s practical M3
+Max CPU peak); further wins require structural changes (multi-row
+matvec sharing super-block reads across output rows, prefetch
+instructions ahead of SDOT loads, or simply waiting on the Metal MoE
+expert kernel fix to land for an additional ~3.7× via GPU dispatch).
 
 ---
 

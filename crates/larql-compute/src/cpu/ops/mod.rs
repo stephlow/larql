@@ -13,6 +13,7 @@ pub mod q4_common;
 pub mod q4_matvec;
 pub mod q4_vecmat;
 pub mod q4k_matvec;
+pub mod q4k_q8k_dot;
 pub mod q6k_matvec;
 pub mod q8_matvec;
 pub mod vector;
