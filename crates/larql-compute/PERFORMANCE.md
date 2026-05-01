@@ -27,26 +27,45 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 
 ---
 
-## Current state (2026-04-28)
+## Current state (2026-05-02)
 
 ```
-larql-metal  gemma3-4b-q4k-v2     80.3 tok/s   12.45ms/tok (gate+up 8sg + q4k_matvec 8sg, 2026-04-28)
-larql-metal  gemma3-4b-q4k-v2     76.3 tok/s   13.11ms/tok (q4k_matvec 4sg, gate+up 8sg)
-larql-metal  gemma3-4b-q4k-v2     78.9 tok/s   12.67ms/tok (gate+up 8sg, q4k_matvec 4sg)
-Ollama       gemma3:4b            94–98 tok/s   ~10.5ms/tok
-Gap          ~1.18×               ~1.95ms/tok
+larql-metal  gemma3-4b-q4k-v2     72–75 tok/s   13.5–13.9 ms/tok  (5 dispatch fusions default-on, lm_head v5 stride-32)
+Ollama       gemma3:4b            96–104 tok/s  ~10 ms/tok
+Gap          ~1.30–1.45×          ~3 ms/tok
 
-larql-metal  gemma4-26B-A4B         5.1 tok/s  ~194ms/tok  (Phase 1 GPU dispatch; Phase 2 open)
-SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok  (attention + dense FFN only)
+larql-metal  gemma4-26B-A4B         5.1 tok/s  ~194ms/tok   (Phase 1 GPU dispatch; Phase 2 open)
+SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok   (attention + dense FFN only)
 ```
 
-Per-stage (Gemma 3 4B, 100-token run, 8 warmup):
+Per-stage (Gemma 3 4B, 30-token run, 8 warmup, 2026-05-02):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | ~10.8ms | 83% |
-| lm_head | ~2.2ms | 17% |
-| embed + norm + detok | ~0.01ms | ~0% |
+| GPU fwd | ~11.5–12.0 ms | 79% |
+| lm_head | ~2.9–3.0 ms | 20% |
+| embed + norm + detok | ~0.05 ms | <1% |
+
+The lm_head jumped from ~2.2 ms to ~3.0 ms when the **lm_head v5 stride-32
+correctness fix** landed (2026-05-01) — the new reduction tree matches the
+CPU ranking exactly (model now emits "Paris" not gibberish), at a measured
+~0.7 ms cost vs. the prior incorrect kernel.
+
+The 78.7 / 80.3 tok/s headlines below are preserved for context but
+predate both (a) the v5 lm_head correctness fix and (b) the 2026-05
+dispatch-fusion wave. The honest current number is 72–75 tok/s with
+correct output.
+
+**Recent changes (2026-05-01 → 2026-05-02):**
+
+| Change | Model | Effect | Notes |
+|---|---|---|---|
+| **lm_head v5 stride-32 Q4_K matvec** | Gemma 3 4B v2 | **correctness — model now emits "Paris"** | Each lane accumulates over `i % 32 == lane` elements (mirrors `f16_gemv` reduction tree). Same Q4_K bytes, same bandwidth, but reduction tree matches CPU rankings. End-to-end argmax flips to the correct token. ~0.7 ms slower than the prior (incorrect) kernel; held as the production lm_head path. See `shaders/q4k_matvec_stride32.rs`. |
+| **`qk_norm_rope_fused` shader** (default-on; opt-out `LARQL_FUSED_QK_NORM_ROPE=0`) | Gemma 3 4B | -0.10 ms GPU | One TG/head: RMS-norm + RoPE in one kernel. Replaces qk_norm_qk + rope_at_pos_batched_qk. |
+| **`kv_append_attend_fused` shader** (default-on; opt-out `LARQL_FUSED_KV_APPEND_ATTEND=0`) | Gemma 3 4B | -0.21 ms GPU | Per-Q-head TG cooperatively writes new K/V row at pos, then standard attention. Absorbs the kv_cache_append dispatch. |
+| **`post_attn_residual_norm_store` shader** (default-on; opt-out `LARQL_FUSED_POST_ATTN_NORM=0`) | Gemma 3 4B | cumulative -0.43 ms GPU | Triple fusion on the `has_post_norms` path: post-attn RMS + residual + ffn-norm RMS + h_post_attn store, two sequential RMS reductions in one 1-TG kernel. |
+| **`post_ffn_norm_residual_add` shader** (default-on; opt-out `LARQL_FUSED_POST_FFN_NORM=0`) | Gemma 3 4B | cumulative -0.78 ms GPU | 1-TG fused RMS over `down_out` + per-element norm + residual sum into next-layer input. Bit-equivalent to the unfused chain. |
+| **`attn_fused` shader** (opt-in only, `LARQL_FUSED_ATTN=1`) | Gemma 3 4B | **REGRESSED** -1.45 ms GPU | Tried merging `qk_norm_rope_fused` + `kv_append_attend_fused` into one kernel (per-Q-head TG normalises+ropes Q+K, writes cache, attends). Standalone qk_norm_rope ran 12 TGs in parallel; the merger collapses to 8 TGs. Dispatch saving (~30 µs) dwarfed by parallelism loss. Kept registered for a future multi-TG-per-head retry. **Lesson saved**: dispatch fusions only win when they don't reduce TG count for an already parallelism-bound stage. |
 
 **Recent changes (2026-04-26 → 2026-04-28):**
 

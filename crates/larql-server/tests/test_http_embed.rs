@@ -377,3 +377,68 @@ async fn http_openai_embeddings_empty_input_returns_400() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ══════════════════════════════════════════════════════════════
+// POST /v1/completions — OpenAI-compatible completions (N0.2)
+//
+// These tests exercise request validation (the parts that don't
+// require a real model + weights). End-to-end generation is exercised
+// via the `larql run` CLI smoke test against a real vindex.
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn http_openai_completions_stream_true_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"prompt": "hi", "stream": true, "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_completions_n_gt_1_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"prompt": "hi", "n": 2, "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_completions_infer_disabled_returns_503() {
+    // model() builds with infer_disabled=true.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"prompt": "hi", "max_tokens": 1}),
+    )
+    .await;
+    // ServerError::InferenceUnavailable maps to 503.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_completions_missing_prompt_returns_422() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"max_tokens": 1}),
+    )
+    .await;
+    // Missing required `prompt` field — serde returns 422 via axum's
+    // Json extractor.
+    assert!(
+        resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+            || resp.status() == StatusCode::BAD_REQUEST,
+        "got {}",
+        resp.status()
+    );
+}

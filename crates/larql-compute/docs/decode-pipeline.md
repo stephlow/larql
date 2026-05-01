@@ -8,20 +8,25 @@ How `decode_token` processes one token through all layers with KV cache.
 Input: x[hidden] (embedded token)
 Output: h[hidden] (final hidden state for logit projection)
 
-Per layer (~11 dispatches, all in a SINGLE Metal encoder):
-  1. Fused norm + QKV projection (q4k_q6k_qkv_proj_normed — 1 dispatch)
-     OR: rms_norm (1) + q4k_q6k_qkv_proj (1) = 2 dispatches
-  2. Fused QK-norm Q+K (qk_norm_qk — 1 dispatch, was 2)
-  3. Fused RoPE Q+K (rope_at_pos_batched_qk — 1 dispatch, was 2)
-  4. Batched V-norm (optional, Gemma 4)
-  5. KV cache append + attend (SIMD reductions)
-  6. O projection (q4k_matvec)
-  7. Fused residual+norm (residual_norm_store — 1 dispatch, writes both
-     ffn_norm_out and h_post_attn; was 2 dispatches)
-  8. FFN gate+up fused (q4k_ffn_gate_up — 1 dispatch)
-  9. GEGLU activation
- 10. FFN down (q6k_matvec)
- 11. Post-FFN residual add
+Per layer (Gemma 3 4B, post-2026-05-02 — 9 dispatches with 5 fusions
+default-on; all in a SINGLE Metal encoder):
+  1. Fused input_norm + QKV projection
+       (q4k_q6k_qkv_proj_normed — 1 dispatch)
+       OR: rms_norm (1) + q4k_q6k_qkv_proj (1) = 2 dispatches
+  2. Fused QK-norm + RoPE
+       (qk_norm_rope_fused — 1 dispatch; was qk_norm_qk + rope = 2)
+  3. Batched V-norm (Gemma 4 only — Gemma 3 skips)
+  4. Fused KV append + KV attend
+       (kv_append_attend_fused — 1 dispatch; was 2)
+  5. O projection (q4k_matvec / q4kf_proj)
+  6. Fused post-attn norm + residual + ffn-norm + h_post_attn store
+       (post_attn_residual_norm_store — 1 dispatch; was 3 on the
+       has_post_norms path, was 2 on the residual_norm_store path)
+  7. Fused FFN gate + up (q4k_ffn_gate_up_8sg — 1 dispatch)
+  8. Fused GEGLU + down (q4k_geglu_gelu_tanh_down — 1 dispatch when
+     down format is Q4_K; falls back to GEGLU + matvec when not)
+  9. Fused post-FFN norm + residual_add
+       (post_ffn_norm_residual_add — 1 dispatch; was 2)
 ```
 
 All layers run in a **single Metal command buffer with a single global encoder**.
@@ -30,7 +35,9 @@ dispatches within an encoder so no explicit barriers are needed.
 
 ## Dispatch fusion history
 
-Starting from ~14 dispatches/layer (476/token), 5 fusions land in 2026-04-25:
+Starting from ~14 dispatches/layer (~476/token):
+
+**2026-04-25 wave** (4 fusions, ~136 dispatches/token saved):
 
 | Fusion | Dispatches saved | Technique |
 |---|---|---|
@@ -39,26 +46,39 @@ Starting from ~14 dispatches/layer (476/token), 5 fusions land in 2026-04-25:
 | `residual_norm_store` | 34/token | Writes normed + raw sum simultaneously |
 | `q4k_q6k_qkv_proj_normed` | 34/token | Norm computed inline in QKV TGs |
 
-Current: **~374 dispatches/token** (~1.9ms overhead at 5µs/dispatch).
-Ollama estimate: ~272 dispatches (~1.4ms).
+**2026-05-01 / 2026-05-02 wave** (5 fusions, ~136 dispatches/token saved):
+
+| Fusion | Dispatches saved | Technique |
+|---|---|---|
+| `qk_norm_rope_fused` | 34/token | One TG/head: RMS-norm + RoPE in one pass; supersedes the qk_norm_qk + rope chain |
+| `kv_append_attend_fused` | 34/token | Per-Q-head TG cooperatively writes new K/V row at pos, then attends; absorbs the kv_cache_append dispatch |
+| `post_attn_residual_norm_store` | ~68/token | Triple fusion on the `has_post_norms` path: post-attn RMS + residual + ffn-norm + store |
+| `post_ffn_norm_residual_add` | 34/token | Single 1-TG kernel: RMS over down_out + per-element norm + residual sum into next-layer input |
+| (`attn_fused` — opt-in only) | — | Attempted further merge of qk_norm_rope + kv_append_attend; regressed -1.45 ms (parallelism loss). Kept registered as `LARQL_FUSED_ATTN=1`. |
+
+Current: ~306 dispatches/token (9 dispatches/layer × 34 layers).
+At measured ~6 µs/saved-dispatch this is ~1.84 ms of dispatch overhead;
+the remainder of the ~11.5 ms GPU forward is genuine compute.
+
+Each 2026-05 fusion has an `LARQL_FUSED_*=0` opt-out for diagnostic A/B.
 
 ## Dual-Path Architecture
 
 `decode_token` auto-detects the weight format from `FullPipelineLayer.wq.format`.
 
-### Q4_K + Q6_K Path (production — Gemma 3 / 4 Ollama extracts)
+### Q4_K + Q6_K Path (production — Gemma 3 / 4 Ollama extracts, 2026-05-02)
 
 ```
 h_buf [f32]
   → q4k_q6k_qkv_proj_normed (RMS norm inline + fused Q4_K Q/K + Q6_K V)
-  → qk_norm_qk (fused Q+K norm)
-  → rope_at_pos_batched_qk (fused Q+K RoPE)
-  → v_norm_batched (optional, Gemma 4)
-  → kv_cache_append + kv_attention
-  → q4k_matvec (O projection)
-  → residual_norm_store → ffn_norm_out [f32] + h_post_attn [f32]
-  → q4k_ffn_gate_up → geglu_gelu_tanh → q6k_matvec (down)
-  → residual_add → h_buf [f32]
+  → qk_norm_rope_fused (Q+K norm + RoPE in one kernel)
+  → v_norm_batched (Gemma 4 only)
+  → kv_append_attend_fused (writes new K/V row + attends in one kernel)
+  → q4k_matvec / q4kf_proj (O projection)
+  → post_attn_residual_norm_store
+        → ffn_norm_out [f32] + h_post_attn [f32]
+  → q4k_ffn_gate_up_8sg (fused gate+up) → q4k_geglu_gelu_tanh_down (fused GEGLU+down)
+  → post_ffn_norm_residual_add → h_buf [f32] (next-layer input)
 ```
 
 ### Q4_KF Path (fastest for Q4_KF vindexes)
@@ -140,16 +160,23 @@ placement at the end of `Gemma4TextDecoderLayer.forward`.
 copies one layer's K/V scratch immediately after each per-layer commit,
 so the cache is current before the MoE callback reads `h_post_attn`.
 
-## Performance (M3 Max, 2026-04-26)
+## Performance (M3 Max, 2026-05-02)
 
-### Gemma 3 4B (dense, 34 layers)
+### Gemma 3 4B (dense, 34 layers, all five 2026-05 fusions default-on)
 
 | Path | GPU fwd | tok/s | vs Ollama |
 |---|---|---|---|
-| **Q4_K+Q6_K decode (34L)** | **11.1ms** | **75–79** | **1.24–1.30×** |
-| Ollama gemma3:4b | ~8.5ms | 97–103 | 1.0× |
+| **Q4_K+Q6_K decode (34L)** | **11.5–12.0ms** | **72–75** | **1.30–1.45×** slower |
+| Ollama gemma3:4b | ~10ms | 96–104 | 1.0× |
 
-Per-stage: GPU fwd 83%, lm_head 17%.
+Per-stage: GPU fwd 79%, lm_head 20%.
+
+The 2026-05 wave landed -0.99 ms cumulative GPU savings vs. unfused baseline
+(10.45 → 9.46 ms isolated kernel time). End-to-end gain is smaller than the
+isolated saving (cold/warm GPU thermal variance dominates at this scale on
+M3 Max). The further `attn_fused` merger was attempted and regressed —
+parallelism loss is the reason it's kept opt-in. Path-to-80 lever search is
+documented in `crates/larql-inference/ROADMAP.md` (G-3, G-5 still open).
 
 ### Gemma 4 26B A4B (hybrid MoE, 26 layers, batched prefill)
 

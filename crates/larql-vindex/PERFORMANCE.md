@@ -122,19 +122,27 @@ Notes:
 
 `cargo bench -p larql-vindex --features metal --bench cpu_vs_gpu`
 
-## End-to-end decode (2026-04-25, real Q4K Gemma 3 4B)
+## End-to-end decode (2026-05-02, real Q4K Gemma 3 4B)
 
-`larql bench /path/to/gemma3-4b-q4k-streaming.vindex --tokens 30
---warmup 3 --backends metal -v`
+`larql bench output/gemma3-4b-q4k-v2.vindex --tokens 30 --warmup 8 --backends metal`
+with all five 2026-05 dispatch fusions default-on (qk_norm_rope,
+kv_append_attend, post_attn_residual_norm_store, post_ffn_norm_residual_add)
+plus the lm_head v5 stride-32 correctness fix:
 
 | Backend | tok/s | ms/tok | GPU fwd | lm_head | Peak footprint |
 |---------|-------|--------|---------|---------|----------------|
-| metal   | **68.7** | 14.56 | 13.60 ms (86.7%) | 2.08 ms (13.3%) | 6.59 GB |
+| metal   | **72–75** | 13.5–13.9 | 11.5–12.0 ms (79%) | 2.9–3.0 ms (20%) | 6.59 GB |
 | cpu     |   0.4 | 2787 | 2777 ms | — | 3.70 GB |
 
-68.7 tok/s on Metal Q4K is up from 51.9 in the 2026-04-19 PERFORMANCE
-section. GPU forward is still 86.7 % of decode → the kernel-compute
-work in the `gpu_forward_gap` memo is still the next-biggest lever.
+The 72–75 tok/s reading is the **honest** number — it incorporates the
+lm_head v5 correctness fix (the model now emits "Paris" rather than
+gibberish; the fix added ~0.7 ms to lm_head). Pre-fix benches showing
+78–80 tok/s ran on incorrect output and are not comparable. Cumulative
+2026-05 fusion saving: -0.99 ms GPU forward vs. unfused baseline.
+
+GPU forward is now 79% of decode (down from 86.7% pre-lm_head-fix);
+kernel-compute work and the lm_head matvec are roughly equal levers.
+Path-to-80 documented in `crates/larql-inference/ROADMAP.md` G-3.
 
 ## mmap residency (live decode pid, vmmap)
 
