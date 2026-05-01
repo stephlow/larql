@@ -17,13 +17,21 @@ opt-in. See `Completed` section below for the full per-change list.
   server loader options are grouped, embed errors use the standard JSON
   error envelope, and server-local clippy allows were reduced.
 - Test coverage: **74.2% line / 81.2% function** at the 2026-04-26
-  baseline (478 tests). 2026-05-01: 494 tests across lib + 14 integration
-  files, all green; coverage delta tracked in Phase 6.
+  baseline (478 tests). 2026-05-01 (post Q1 cleanup): **131 lib tests +
+  37 integration files (~580 tests total), all green**.
+- Q1 code-quality cleanup (2026-05-01) shipped 9 of 10 items: 1044-LOC
+  `routes/expert.rs` split into 7 focused files; 656-LOC `main.rs` reduced
+  to 26 LOC with `bootstrap::serve(cli)` as the orchestration point; new
+  `env_flags.rs` (single source of truth for `LARQL_*` knobs) and `wire.rs`
+  (shared content-type detection); body-size / JSON-content-type / Cli
+  default literals all lifted to typed consts. Q1.10 (stream.rs WebSocket
+  state machine) deferred until N0.1 SSE infrastructure lands. See
+  Completed → "2026-05-01 (continued) — Q1 code-quality cleanup".
 - Server-local clippy was clean at the 2026-04-26 baseline with
-  `cargo clippy -p larql-server --tests --no-deps -- -D warnings`.
+  `cargo clippy -p larql-server --tests --no-deps -- -D warnings`,
+  re-verified clean post-Q1 on 2026-05-01.
   The dependency-checking form still stops in `larql-vindex`; that is
-  tracked outside this server-only pass. 2026-05-01 status to be
-  verified in Phase 6.
+  tracked outside this server-only pass.
 - Examples and synthetic benchmarks checked on 2026-04-26 and re-verified
   2026-05-01: `server_demo`, `embed_demo`, `server_bench --release`,
   `bench_expert_server` (live MoE bench) all pass. `bench_embed_server`
@@ -769,195 +777,13 @@ split.
 
 ## P1: Active
 
-### Q1. Code-quality review (2026-05-01) — modularity + magic literals
+### Q1.10 Reduce `routes/stream.rs::handle_stream_infer` (327 LOC) — deferred
 
-Audit findings from the larql-server review session. None of these are
-correctness bugs; they're structural debt that's accumulated as the
-crate grew from browse-only HTTP server to a multi-protocol grid +
-remote-MoE backend. Listed in priority order — the first three would
-materially improve readability, the rest are polish.
-
-#### Q1.1 Split `routes/expert.rs` (1049 LOC, 6 distinct concerns)
-
-The file now mixes legacy single-expert dispatch, legacy batch,
-new layer-batch (f32 + f16), Metal expert dispatch, CPU expert
-dispatch, two warmup helpers, and a test mod. Each piece has its
-own well-defined surface. Proposed split (preserves all public
-APIs):
-
-```
-routes/expert/
-├── mod.rs            — pub re-exports + handler routing constants
-├── single.rs         — run_expert + handle_expert (POST /v1/expert/{layer}/{id})
-├── batch_legacy.rs   — handle_expert_batch (POST /v1/expert/batch — pre-2026-05-01 wire)
-├── layer_batch.rs    — handle_experts_layer_batch{,_f16} + decode helpers
-├── cpu.rs            — run_experts_cpu_batch (CPU rayon dispatch)
-├── metal.rs          — run_experts_metal_batch (#[cfg(feature = "metal-experts")])
-└── warmup.rs         — warmup_hnsw_unit_cache + warmup_metal_expert_cache
-```
-
-Effort: ~2 hours. No new tests required; existing
-`tests/test_expert_endpoint.rs` covers the public surface.
-
-#### Q1.2 Centralise env-var flags into `src/env_flags.rs`
-
-8 distinct `LARQL_*` env vars are read at scattered call sites
-(17 raw `std::env::var(...)` references). Several do thread-local
-caching individually; the pattern is duplicated. Proposed:
-
-```rust
-// src/env_flags.rs
-pub mod env {
-    pub const MOE_TIMING: &str = "LARQL_MOE_TIMING";        // 6 callsites
-    pub const HTTP_TIMING: &str = "LARQL_HTTP_TIMING";       // 2 callsites
-    pub const NO_WARMUP: &str = "LARQL_NO_WARMUP";           // 2 callsites
-    pub const USE_LEGACY_CPU: &str = "LARQL_USE_LEGACY_CPU"; // 1
-    pub const USE_METAL_EXPERTS: &str = "LARQL_USE_METAL_EXPERTS";
-    pub const DISABLE_METAL_EXPERTS: &str = "LARQL_DISABLE_METAL_EXPERTS";
-    pub const DISABLE_Q4K_DIRECT: &str = "LARQL_DISABLE_Q4K_DIRECT";
-    pub const METAL_VS_CPU_DEBUG: &str = "LARQL_METAL_VS_CPU_DEBUG";
-    pub const MOE_BATCH_MODE: &str = "LARQL_MOE_BATCH_MODE";
-}
-
-/// Cached at first read; re-reads on each call would syscall.  Used
-/// from the hot per-call paths in routes/expert.rs and grpc_expert.rs.
-pub fn moe_timing_enabled() -> bool { /* TLS-cached `is_ok` */ }
-pub fn http_timing_enabled() -> bool { /* ... */ }
-// ... one accessor per flag
-```
-
-Pairs with **README.md → "Environment variables"** which is the
-documentation surface for these. The env_flags module becomes the
-single source of truth referenced by both code and README.
-
-Effort: ~1 hour. Mostly find-and-replace.
-
-#### Q1.3 Reduce `routes/walk_ffn.rs::handle_walk_ffn` (397 LOC)
-
-The handler is split into 6-7 small helpers (`validate_owned`,
-`run_full_output`, `run_features_only`, etc.) — that work landed in
-the 2026-04-26 review. But the handler body still does:
-content-type detection, body deserialise (JSON or binary),
-delegation, response encode (JSON or binary), error envelope. The
-binary/JSON content-type bifurcation is the same pattern in
-`routes/expert.rs::handle_expert_batch` (already extracted helpers
-there) and could be a shared utility:
-
-```rust
-// src/wire.rs
-pub enum WireFormat { Binary, Json }
-impl WireFormat { pub fn from_content_type(headers: &HeaderMap) -> Self { ... } }
-```
-
-Effort: ~1.5 hours. Reduces walk_ffn handler to ~150 LOC, expert
-handlers benefit similarly.
-
-#### Q1.4 Body-size limit constants
-
-Three places literal `64 * 1024 * 1024`:
-- `routes/mod.rs:30` `EXPERT_BATCH_BODY_LIMIT` ✓ (already const)
-- `routes/embed.rs:216` (embed) and `routes/walk_ffn.rs:503` —
-  bare literals
-- `routes/embed.rs:315` has `256 * 1024 * 1024` for logits
-  (different class — wider residual dim)
-
-Proposed: lift to `src/http.rs`:
-
-```rust
-pub const REQUEST_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-pub const REQUEST_BODY_LIMIT_LARGE_BYTES: usize = 256 * 1024 * 1024;
-```
-
-Effort: ~10 min.
-
-#### Q1.5 `"application/json"` literal — use `mime` const or `http.rs` const
-
-Three sites still embed the bare string (`routes/expert.rs:825`,
-`routes/walk_ffn.rs:559`, `routes/embed.rs:543`). axum re-exports
-`mime::APPLICATION_JSON` via `axum::http::header`. Either use that
-or add `JSON_CONTENT_TYPE` to `http.rs` for consistency with
-`BINARY_FFN_CONTENT_TYPE`.
-
-Effort: ~10 min.
-
-#### Q1.6 Default-value constants in `main.rs` Cli struct
-
-CLI default values are inline string literals
-(`#[arg(long, default_value = "8080")]`). Lift to consts at the top
-of `main.rs`:
-
-```rust
-const DEFAULT_PORT: u16 = 8080;
-const DEFAULT_MAX_CONCURRENT: usize = 100;
-const DEFAULT_HNSW_EF_SEARCH: usize = 200;
-const DEFAULT_SESSION_TTL_SECS: u64 = 3600;  // also used by SessionManager::new
-const DEFAULT_DESCRIBE_CACHE_TTL_SECS: u64 = 0;
-```
-
-`#[arg(long, default_value_t = DEFAULT_PORT)]` with the `_t` form
-takes a typed value. Both are searchable; the typed const is also
-referenceable from elsewhere (e.g., the `SessionManager::new(3600)`
-in main.rs:346 currently re-encodes the same `3600`).
-
-Effort: ~30 min.
-
-#### Q1.7 `announce.rs` reconnect / heartbeat magic durations
-
-```rust
-let mut backoff = Duration::from_secs(1);                // initial
-backoff = (backoff * 2).min(Duration::from_secs(60));    // cap
-let mut interval = tokio::time::interval(Duration::from_secs(10));  // heartbeat
-```
-
-Lift to module consts:
-```rust
-const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-```
-
-Effort: ~5 min. Pure naming.
-
-#### Q1.8 Reduce `main.rs::main` (405 LOC)
-
-The entry point does: argv parsing, multi-vs-single mode detection,
-vindex loading (per model), warmup, app construction, listener
-setup (TCP + UDS + TLS), grid announce kick-off, then `await`s the
-listener. Most of this orchestration belongs in
-`bootstrap.rs` (which already has `load_single_vindex`,
-`discover_vindexes`, `parse_layer_range`). Proposed extraction:
-
-```
-src/bootstrap.rs::serve(cli: Cli) -> Result<(), BoxError>
-```
-
-`main.rs::main` shrinks to ~30 lines (parse Cli, init tracing,
-call `bootstrap::serve(cli).await`). Makes the binary entry point
-trivial and the orchestration testable from `bootstrap`'s existing
-unit-test harness.
-
-Effort: ~2 hours. Moderate care needed to avoid breaking the
-warmup ordering + grid-join lifecycle.
-
-#### Q1.9 Reduce `routes/embed.rs::handle_embed_single_inner` (301 LOC)
-
-Same shape as walk_ffn: handler does content-type dispatch + body
-parse + delegate + response encode. Same fix — share the
-content-type detection helper from Q1.3.
-
-Effort: rolls into Q1.3.
-
-#### Q1.10 Reduce `routes/stream.rs::handle_stream_infer` (327 LOC)
-
-WebSocket-based streaming infer is a substantial state machine.
-Less of a "modularity" issue than a "this is inherently complex"
-issue. Worth a once-over for sub-state extraction (separate `enum
-ClientMessage`, separate token-emit loop) but lower priority than
-the routes/expert.rs split.
-
-Effort: ~3 hours. Defer until N0.1 (OpenAI Chat Completions SSE)
-forces a similar shape — the two could share streaming
-infrastructure.
+The remaining open code-quality item from the 2026-05-01 audit. The other
+nine (Q1.1–Q1.9) shipped — see "Completed → 2026-05-01 (continued) — Q1
+code-quality cleanup". Q1.10 is deferred until N0.1 (OpenAI Chat
+Completions SSE) forces a similar streaming state-machine shape; the
+two should share infrastructure. Effort estimate: ~3 hours when picked up.
 
 ---
 
@@ -1242,6 +1068,50 @@ the SDK is a thin wrapper over the OpenAI client.
 ---
 
 ## Completed
+
+### 2026-05-01 (continued) — Q1 code-quality cleanup (9 of 10 items)
+
+The Q1 audit catalogue from earlier the same day, executed in a follow-on
+session. All public APIs preserved; existing test surface unchanged.
+Q1.10 (stream.rs WebSocket state machine) deferred until N0.1 (OpenAI
+Chat Completions SSE) forces a similar shape.
+
+| Item | Outcome |
+|---|---|
+| **Q1.1** Split `routes/expert.rs` (1044 LOC, 6 concerns) | New `routes/expert/{mod,single,batch_legacy,layer_batch,cpu,metal,warmup}.rs` directory. mod.rs (90 LOC) re-exports the historical public surface (`run_expert`, `run_experts_cpu_batch`, `run_experts_metal_batch`, `warmup_*`, `handle_*`); each sibling file is ~100-225 LOC with one clear concern. `metal.rs` is `#[cfg(feature = "metal-experts")]`-gated so non-Metal builds compile clean. |
+| **Q1.2** Centralise env-var flags into `src/env_flags.rs` | New module with one `pub const` per `LARQL_*` name + cached presence accessors backed by `std::sync::OnceLock` (process-wide, not TLS — env vars don't change at runtime). Replaced 12 raw `std::env::var(...)` call sites in `routes/expert/*` and `grpc_expert.rs`; removed two ad-hoc `thread_local! { static HTTP_TIMING ... }` blocks. README env-var table now references the same names that show up in `env_flags::*`. |
+| **Q1.3 + Q1.9** Shared `wire::has_content_type` | New `src/wire.rs` with `has_content_type(headers, expected) -> bool` (uses `contains` so parameterised types like `application/json; charset=utf-8` match). Replaced 4 inline header-detection patterns in `routes/walk_ffn.rs`, `routes/embed.rs` (×2), `routes/expert/batch_legacy.rs`. 4 unit tests cover exact-match, parameterised, mismatch, and missing-header cases. |
+| **Q1.4** Body-size limit constants | `REQUEST_BODY_LIMIT_BYTES = 64 MB` and `REQUEST_BODY_LIMIT_LARGE_BYTES = 256 MB` in `src/http.rs`. Replaced 3 bare literals; `EXPERT_BATCH_BODY_LIMIT` in `routes/mod.rs` now references the same const. |
+| **Q1.5** `JSON_CONTENT_TYPE` const | Added to `src/http.rs` next to `BINARY_FFN_CONTENT_TYPE`. Replaced 3 bare `"application/json"` literals across walk_ffn / embed / expert. |
+| **Q1.6** Typed `DEFAULT_*` consts | `DEFAULT_PORT`, `DEFAULT_HOST`, `DEFAULT_HNSW_EF_SEARCH`, `DEFAULT_MAX_CONCURRENT`, `DEFAULT_DESCRIBE_CACHE_TTL_SECS`, `DEFAULT_LOG_LEVEL`, `DEFAULT_SESSION_TTL_SECS`, etc. Moved into `bootstrap.rs` (alongside the new `Cli` struct from Q1.8); `clap` now uses `default_value_t = ...`. `SessionManager::new` references the same `DEFAULT_SESSION_TTL_SECS` instead of re-encoding `3600`. |
+| **Q1.7** `announce.rs` reconnect/heartbeat consts | `RECONNECT_INITIAL_BACKOFF` / `RECONNECT_MAX_BACKOFF` / `HEARTBEAT_INTERVAL` lifted to module consts; the previous `Duration::from_secs(1) / 60 / 10` magic numbers are gone. |
+| **Q1.8** Reduce `main.rs::main` (656 LOC → 26 LOC) | Moved `Cli` struct + `pub async fn serve(cli: Cli)` into `bootstrap.rs`. `main.rs` is now: parse Cli, install tracing, call `bootstrap::serve(cli).await`. Boot orchestration (vindex loading, warmups, listener+TLS+UDS, gRPC, grid announce) is callable from anywhere that wants to drive the server without going through `clap::Parser::parse_from`. |
+| **Q1.10** stream.rs reduction | **Deferred** — see P1: Active. Bundling with N0.1 SSE infrastructure when that lands. |
+| Tests | 126 → **131 lib tests** (4 new for `wire::has_content_type`, 1 for `env_flags::names_are_larql_prefixed_and_unique`); 37 integration tests unchanged; ~580 tests across lib + integration, 0 failures. |
+| Clippy | `cargo clippy -p larql-server --tests --no-deps -- -D warnings` clean. |
+| `cargo fmt -p larql-server -- --check` | Clean. |
+
+LOC delta (per-file):
+
+| File | Before | After |
+|---|---|---|
+| `main.rs` | 656 | **26** |
+| `bootstrap.rs` | 464 | 1073 (Cli + serve moved in) |
+| `routes/expert.rs` | 1044 | (deleted) |
+| `routes/expert/mod.rs` | — | 90 |
+| `routes/expert/single.rs` | — | 155 |
+| `routes/expert/batch_legacy.rs` | — | 105 |
+| `routes/expert/layer_batch.rs` | — | 226 |
+| `routes/expert/cpu.rs` | — | 195 |
+| `routes/expert/metal.rs` | — | 204 |
+| `routes/expert/warmup.rs` | — | 140 |
+| `env_flags.rs` (new) | — | 122 |
+| `wire.rs` (new) | — | 64 |
+
+The bulk of the `bootstrap.rs` size growth is the Cli struct (~200 LOC of
+clap doc-comments + `#[arg]` attributes) and the `serve` function body
+that used to live in `main`. The orchestration is unchanged; only its
+location moved.
 
 ### 2026-05-01 — HTTP CPU-path optimisations + UDS transport + layer-batch wire
 

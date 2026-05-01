@@ -23,7 +23,7 @@ use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 use crate::error::VindexError;
 use crate::format::weights::Q4kManifestEntry;
 
-use super::{pad_rows_to_256, QuantBlockFormat};
+use super::{pad_rows_to_block, QuantBlockFormat};
 
 /// In-flight state for the W2 feature-major down emission. Lives only
 /// while the FFN write loop is running; collapsed into the manifest
@@ -68,7 +68,7 @@ impl FeatureMajorDownState {
             }
         }
         let (fm_padded, fm_padded_cols) =
-            pad_rows_to_256(&transposed, cols_padded_intermediate, rows_hidden);
+            pad_rows_to_block(&transposed, cols_padded_intermediate, rows_hidden);
         let bytes = match format {
             QuantBlockFormat::Q6K => quantize_q6_k(&fm_padded),
             QuantBlockFormat::Q4K => quantize_q4_k(&fm_padded),

@@ -35,8 +35,8 @@ pub fn compute_checksums(dir: &Path) -> Result<HashMap<String, String>, VindexEr
         DOWN_META_BIN,
         "down_meta.jsonl",
         ATTN_WEIGHTS_BIN,
-        "up_weights.bin",
-        "down_weights.bin",
+        UP_WEIGHTS_BIN,
+        DOWN_WEIGHTS_BIN,
         NORMS_BIN,
         LM_HEAD_BIN,
     ];

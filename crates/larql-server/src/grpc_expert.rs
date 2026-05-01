@@ -12,6 +12,7 @@ use larql_router_protocol::{
     ExpertLayerOutput, ExpertService,
 };
 
+use crate::env_flags;
 use crate::state::AppState;
 
 pub struct ExpertGrpcService {
@@ -76,8 +77,8 @@ impl ExpertService for ExpertGrpcService {
         // wants on each call.  `LARQL_MOE_BATCH_MODE` lets the operator
         // override the auto-pick: `par`, `serial`, or `chunked` (default).
         let items = req.items;
-        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
-        let mode_override = std::env::var("LARQL_MOE_BATCH_MODE").ok();
+        let timing_enabled = env_flags::moe_timing_enabled();
+        let mode_override = env_flags::moe_batch_mode();
         let n_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
@@ -142,7 +143,7 @@ impl ExpertService for ExpertGrpcService {
         let state = Arc::clone(&self.state);
         let mut in_stream = request.into_inner();
 
-        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let timing_enabled = env_flags::moe_timing_enabled();
         let out = async_stream::try_stream! {
             while let Some(msg) = in_stream.next().await {
                 let input = msg?;
@@ -187,7 +188,7 @@ impl ExpertService for ExpertGrpcService {
                 let h2 = if let Some(h2_metal) = metal_h2 {
                     path_used = "metal";
                     h2_metal
-                } else if std::env::var("LARQL_USE_LEGACY_CPU").is_ok() {
+                } else if env_flags::use_legacy_cpu() {
                     // Legacy reference path — per-expert run_expert with
                     // its own pre_norm pass.  Kept as a correctness oracle
                     // while we debug whether the pooled `run_experts_cpu_batch`

@@ -3,6 +3,14 @@
 use larql_models::TopKEntry;
 use ndarray::{Array1, Array2};
 
+/// Default `c_score` for a `FeatureMeta` synthesised without an explicit
+/// confidence — used by the patch loader when an `Insert` op omits
+/// `confidence`, and by the vindexfile builder when a fact is inserted
+/// from a `.vindexfile` directive without a probed score. Lifted to a
+/// constant so a future tune of the default touches one site instead of
+/// drifting independently across the two callers.
+pub const DEFAULT_C_SCORE: f32 = 0.9;
+
 /// Metadata for a single FFN feature (from extraction).
 #[derive(Clone)]
 pub struct FeatureMeta {
@@ -555,10 +563,7 @@ pub trait GateIndex: Send + Sync {
     fn primary_storage_bucket(&self) -> StorageBucket {
         if self.has_fp4_storage() {
             StorageBucket::Fp4
-        } else if self.has_interleaved()
-            || self.has_full_mmap_ffn()
-            || self.has_down_features()
-        {
+        } else if self.has_interleaved() || self.has_full_mmap_ffn() || self.has_down_features() {
             // Native f32 mmap available; ffn_row_* dispatch prefers it
             // over Q4K, so sparse on a mixed (f32 + Q4K) vindex walks
             // f32 features and lands in the Exact bucket.

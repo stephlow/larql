@@ -106,16 +106,16 @@ impl QuantFormatInfo {
 pub static QUANT_FORMATS: &[QuantFormatInfo] = &[
     QuantFormatInfo {
         tag: "Q4_K",
-        block_elements: 256,
-        bytes_per_block: 144,
+        block_elements: ggml::K_QUANT_BLOCK_ELEMS,
+        bytes_per_block: ggml::Q4_K_BLOCK_BYTES,
         dequantize: ggml::dequantize_q4_k,
         row_dot: Some(ggml::q4k_row_dot),
         row_scaled_add: Some(ggml::q4k_row_scaled_add),
     },
     QuantFormatInfo {
         tag: "Q6_K",
-        block_elements: 256,
-        bytes_per_block: 210,
+        block_elements: ggml::K_QUANT_BLOCK_ELEMS,
+        bytes_per_block: ggml::Q6_K_BLOCK_BYTES,
         dequantize: ggml::dequantize_q6_k,
         row_dot: Some(ggml::q6k_row_dot),
         row_scaled_add: Some(ggml::q6k_row_scaled_add),
@@ -129,6 +129,16 @@ pub static QUANT_FORMATS: &[QuantFormatInfo] = &[
 pub fn lookup(tag: &str) -> Option<&'static QuantFormatInfo> {
     QUANT_FORMATS.iter().find(|f| f.tag == tag)
 }
+
+/// Legacy `block_q4_K` stride emitted by the buggy 8-Apr extractor.
+/// The current GGUF kernel decodes 144-byte blocks
+/// (`ggml::Q4_K_BLOCK_BYTES`); files written with this 148-byte stride
+/// silently drift 4 bytes per superblock and produce all-NaN GPU
+/// prefill. Used by the `attn_weights_q4k.bin` and registry length
+/// validators to give a precise rebuild-the-vindex error instead of
+/// silent garbage. Lifted from anonymous `148` literals in the
+/// rejection tests so the comparison is self-documenting.
+pub const LEGACY_BLOCK_Q4_K_STRIDE: usize = 148;
 
 #[cfg(test)]
 mod tests {
@@ -223,12 +233,13 @@ mod tests {
         // all-NaN. `expected_bytes` for the 144-byte stride must NOT
         // equal the legacy length, so the loader's `expected != length`
         // check fires.
+        use larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         let q4k = lookup("Q4_K").unwrap();
-        let legacy_length = 2048 * (2560 / 256) * 148; // 3,031,040
+        let legacy_length = 2048 * (2560 / K_QUANT_BLOCK_ELEMS) * LEGACY_BLOCK_Q4_K_STRIDE;
         let current_expected = q4k.expected_bytes(&[2048, 2560]).unwrap();
         assert_ne!(
             current_expected, legacy_length,
-            "144-byte expected ({current_expected}) must differ from legacy 148-byte stride ({legacy_length}) — \
+            "current expected ({current_expected}) must differ from legacy stride ({legacy_length}) — \
              otherwise the loader can't tell stale vindexes from current ones"
         );
         assert_eq!(current_expected, 2_949_120);

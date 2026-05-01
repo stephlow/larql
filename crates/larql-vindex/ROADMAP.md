@@ -253,14 +253,17 @@ Add `UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN` to `format/filenames.rs`
 and route the literals through them. Round-2 added 8 missed constants
 the same way; this completes the sweep.
 
-#### M2. `"Q4_K"` / `"Q6_K"` tag strings duplicated outside the registry
-**Impact**: A typo in `attn.rs` would mismatch
-`quant::registry::lookup` without a compile error.
-**Effort**: 15 min
-**Sites**: `index/storage/attn.rs:267,291,322,347,354,376` builds
-`serde_json::json!` manifests with raw `"Q4_K"` / `"Q6_K"` strings.
-`QuantBlockFormat::format_tag()` already returns these — switch
-the manifest construction to call it.
+#### M2. `"Q4_K"` / `"Q6_K"` tag strings duplicated outside the registry — ❌ invalid (2026-05-01)
+**Status**: Won't fix — finding withdrawn after re-review.
+
+All 6 `attn.rs` sites flagged are inside the `#[cfg(test)]` block at
+`index/storage/attn.rs:232`, and the `registry.rs` literals are
+either the canonical declarations (`tag: "Q4_K"`) or contract
+assertions on the on-disk wire format (`lookup("Q4_K")` in tests).
+Routing them through `QuantBlockFormat::Q4K.format_tag()` would
+weaken the tests — a registry rename would no longer be caught,
+because both sides of the comparison would shift together.
+The literals are correctly localised; nothing to centralise.
 
 #### M3. Default `c_score` / confidence fallback scattered
 **Impact**: A future tune of the default would have to touch four

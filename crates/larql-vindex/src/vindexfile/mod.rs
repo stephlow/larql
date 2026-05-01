@@ -119,7 +119,7 @@ pub fn build_from_vindexfile(
                 let meta = crate::index::FeatureMeta {
                     top_token: target.clone(),
                     top_token_id: 0,
-                    c_score: 0.9,
+                    c_score: crate::index::types::DEFAULT_C_SCORE,
                     top_k: vec![],
                 };
                 patched.insert_feature(layer, feature, vec![], meta);

@@ -22,9 +22,11 @@ pub mod fused_attention;
 pub mod fused_ops;
 pub mod geglu;
 pub mod graph_walk_knn;
+pub mod kv_append_attend_fused;
 pub mod kv_attention;
 pub mod layer_norm;
 pub mod post_attn_residual_norm_store;
+pub mod post_ffn_norm_residual_add;
 pub mod q4_f32_matvec;
 pub mod q4_matvec_v4;
 pub mod q4_sparse_matvec;
@@ -89,6 +91,7 @@ pub fn all_shaders() -> String {
     // Attention
     src.push_str(causal_attention::SHADER);
     src.push_str(kv_attention::SHADER);
+    src.push_str(kv_append_attend_fused::SHADER);
     src.push_str(rope::SHADER);
     src.push_str(fused_attention::SHADER);
     src.push_str(fused_ops::SHADER);
@@ -123,6 +126,7 @@ pub fn all_shaders() -> String {
     src.push_str(qk_norm::SHADER);
     src.push_str(qk_norm_rope_fused::SHADER);
     src.push_str(post_attn_residual_norm_store::SHADER);
+    src.push_str(post_ffn_norm_residual_add::SHADER);
     // TurboQuant (KV cache compression)
     src.push_str(turboquant_encode::SHADER);
     src.push_str(turboquant_decode::SHADER);

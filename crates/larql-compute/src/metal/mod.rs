@@ -85,6 +85,13 @@ pub struct MetalBackend {
     q8_quant_pipeline: ComputePipelineState,
     pub kv_attend_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
+    /// Fused KV-append + KV-attention. Each Q-head TG cooperatively
+    /// writes its kv_head's new K/V row to cache at position `pos`,
+    /// then proceeds with attention over T = pos + 1. Eliminates the
+    /// `kv_cache_append` dispatch (~1 dispatch/layer × 34 ≈ 0.24 ms/tok).
+    /// Default-on; opt out via `LARQL_FUSED_KV_APPEND_ATTEND=0`. See
+    /// `shaders/kv_append_attend_fused.rs`.
+    pub kv_append_attend_fused_pipeline: ComputePipelineState,
     pub q8_matvec_pipeline: KernelHandle,
     pub rms_norm_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
@@ -217,6 +224,14 @@ pub struct MetalBackend {
     /// Opt-in via `LARQL_FUSED_POST_ATTN_NORM=1`.
     /// See `shaders/post_attn_residual_norm_store.rs`.
     pub post_attn_residual_norm_store_pipeline: ComputePipelineState,
+    /// Fused post-FFN norm + residual_add. Replaces the consecutive
+    /// `rms_norm(down_out)` + `residual_add(h_post_attn, normed_ffn)`
+    /// dispatches at the end of each layer in the
+    /// `has_post_norms + post_ffn_norm` decode path. Saves
+    /// 1 dispatch / layer × 34 ≈ 0.24 ms/tok.
+    /// Opt-in via `LARQL_FUSED_POST_FFN_NORM=1`.
+    /// See `shaders/post_ffn_norm_residual_add.rs`.
+    pub post_ffn_norm_residual_add_pipeline: ComputePipelineState,
     pub rope_at_pos_batched_qk_pipeline: ComputePipelineState,
     // Scale vector (per-layer scalar, Gemma 4)
     pub scale_vector_pipeline: ComputePipelineState,
@@ -454,6 +469,8 @@ impl MetalBackend {
         let post_attn_residual_norm_store_pipeline = get_shader_pipeline::<
             shaders::post_attn_residual_norm_store::Kernel,
         >(&device, &library)?;
+        let post_ffn_norm_residual_add_pipeline =
+            get_shader_pipeline::<shaders::post_ffn_norm_residual_add::Kernel>(&device, &library)?;
         let qk_norm_qk_pipeline =
             get_shader_pipeline::<shaders::qk_norm::QkKernel>(&device, &library)?;
         let rope_at_pos_batched_qk_pipeline =
@@ -468,6 +485,8 @@ impl MetalBackend {
             get_shader_pipeline::<shaders::kv_attention::AttendKernel>(&device, &library)?;
         let kv_append_pipeline =
             get_shader_pipeline::<shaders::kv_attention::AppendKernel>(&device, &library)?;
+        let kv_append_attend_fused_pipeline =
+            get_shader_pipeline::<shaders::kv_append_attend_fused::Kernel>(&device, &library)?;
 
         Some(Self {
             queue,
@@ -481,6 +500,7 @@ impl MetalBackend {
             q8_quant_pipeline,
             kv_attend_pipeline,
             kv_append_pipeline,
+            kv_append_attend_fused_pipeline,
             q8_matvec_pipeline,
             rms_norm_pipeline,
             residual_add_pipeline,
@@ -522,6 +542,7 @@ impl MetalBackend {
             qk_norm_qk_pipeline,
             qk_norm_rope_fused_pipeline,
             post_attn_residual_norm_store_pipeline,
+            post_ffn_norm_residual_add_pipeline,
             rope_at_pos_batched_qk_pipeline,
             scale_vector_pipeline,
             kv_cache: std::sync::Mutex::new(None),

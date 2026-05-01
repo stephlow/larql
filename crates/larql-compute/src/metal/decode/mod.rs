@@ -373,7 +373,12 @@ impl MetalBackend {
             // layer × 34 = ~34/tok. Falls back to the consecutive
             // `qk_norm_qk` + `rope_at_pos_batched_qk` chain for
             // archs without QK-norm or when the env flag is unset.
-            let use_fused_qkn_rope = std::env::var("LARQL_FUSED_QK_NORM_ROPE").is_ok();
+            // qk_norm+RoPE fusion — proven win 2026-05-01 (~0.10 ms/tok GPU).
+            // Default-on; opt out via `LARQL_FUSED_QK_NORM_ROPE=0`.
+            let use_fused_qkn_rope = !matches!(
+                std::env::var("LARQL_FUSED_QK_NORM_ROPE").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            );
             let pos = kv_cache.layers[l].current_len as u32;
             if use_fused_qkn_rope && layer.q_norm_weight.is_some() && layer.k_norm_weight.is_some()
             {
@@ -494,23 +499,58 @@ impl MetalBackend {
             // within a single encoder in submission order. Verified by tests.
 
             let attn_out = &attn_out_buf;
-            ops::kv_cache::encode_kv_append(
-                &enc,
-                &kv_cache.layers[l],
-                &self.kv_append_pipeline,
-                &k_out,
-                &v_out,
+            // Fused KV-append + KV-attention. Each Q-head TG writes its
+            // kv_head's new K/V row at position pos = current_len, then
+            // proceeds with attention on T = current_len + 1. Eliminates
+            // the separate kv_cache_append dispatch
+            // (~1 dispatch/layer × 34 ≈ 0.24 ms/tok). Default-on; opt
+            // out via `LARQL_FUSED_KV_APPEND_ATTEND=0` for diagnostics.
+            let use_fused_kv_aa = !matches!(
+                std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
             );
-            ops::kv_cache::encode_kv_attend(
-                &enc,
-                &kv_cache.layers[l],
-                &self.kv_attend_pipeline,
-                &q_out,
-                attn_out,
-                layer_num_q_heads,
-                scale,
-                window_size,
-            );
+            if use_fused_kv_aa {
+                let cache = &kv_cache.layers[l];
+                let t_val = (cache.current_len + 1) as u32;
+                let hd = cache.head_dim as u32;
+                let num_q_val = layer_num_q_heads as u32;
+                let num_kv = cache.num_kv_heads as u32;
+                enc.set_compute_pipeline_state(&self.kv_append_attend_fused_pipeline);
+                enc.set_buffer(0, Some(&q_out), 0);
+                enc.set_buffer(1, Some(&cache.k_cache), 0);
+                enc.set_buffer(2, Some(&cache.v_cache), 0);
+                enc.set_buffer(3, Some(attn_out), 0);
+                enc.set_bytes(4, 4, &t_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hd as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &num_q_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &num_kv as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(9, 4, &window_size as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(10, Some(&k_out), 0);
+                enc.set_buffer(11, Some(&v_out), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(layer_num_q_heads as u64, 1, 1),
+                    MTLSize::new(256.min(layer_head_dim as u64), 1, 1),
+                );
+            } else {
+                ops::kv_cache::encode_kv_append(
+                    &enc,
+                    &kv_cache.layers[l],
+                    &self.kv_append_pipeline,
+                    &k_out,
+                    &v_out,
+                );
+                ops::kv_cache::encode_kv_attend(
+                    &enc,
+                    &kv_cache.layers[l],
+                    &self.kv_attend_pipeline,
+                    &q_out,
+                    attn_out,
+                    layer_num_q_heads,
+                    scale,
+                    window_size,
+                );
+            }
             kv_cache.layers[l].current_len += 1;
 
             // Scratch buffers pre-allocated above — reused each layer.
@@ -588,7 +628,13 @@ impl MetalBackend {
                 } else {
                     post_attn_norm_bufs[l].clone()
                 };
-                let use_fused_post_attn = std::env::var("LARQL_FUSED_POST_ATTN_NORM").is_ok();
+                // Triple-fused post_attn_norm+residual+ffn_norm+store kernel —
+                // proven win 2026-05-01. Default-on; opt out via
+                // `LARQL_FUSED_POST_ATTN_NORM=0` if needed for diagnostics.
+                let use_fused_post_attn = !matches!(
+                    std::env::var("LARQL_FUSED_POST_ATTN_NORM").as_deref(),
+                    Ok("0") | Ok("false") | Ok("off") | Ok("no")
+                );
                 if use_fused_post_attn && ffn_uses_q4k {
                     // Triple-fused: post_attn_norm + residual_norm + h_post_attn
                     // store in ONE dispatch. Replaces (rms_norm +
@@ -765,27 +811,64 @@ impl MetalBackend {
                 if has_post_norms {
                     if let Some(post_ffn) = layer.post_ffn_norm {
                         let post_ffn_buf = self.bufs.get_f32(post_ffn);
-                        let normed_ffn = &normed_scratch;
-                        use crate::metal::ops::full_pipeline::encode_rms_norm;
-                        encode_rms_norm(
-                            &enc,
-                            &self.rms_norm_pipeline,
-                            &down_out,
-                            &post_ffn_buf,
-                            normed_ffn,
-                            hidden,
-                            eps,
-                            norm_offset,
+                        // Post-FFN norm+residual_add fusion — proven win
+                        // 2026-05-01. Default-on; opt out via
+                        // `LARQL_FUSED_POST_FFN_NORM=0` for diagnostics.
+                        let use_fused_post_ffn = !matches!(
+                            std::env::var("LARQL_FUSED_POST_FFN_NORM").as_deref(),
+                            Ok("0") | Ok("false") | Ok("off") | Ok("no")
                         );
-                        use crate::metal::ops::full_pipeline::encode_residual_add;
-                        encode_residual_add(
-                            &enc,
-                            &self.residual_add_pipeline,
-                            &h_post_attn,
-                            normed_ffn,
-                            new_h,
-                            hidden,
-                        );
+                        if use_fused_post_ffn {
+                            // Fused: rms_norm(down_out) + residual_add(h_post_attn,
+                            // normed_ffn) → new_h. Single dispatch, single TG;
+                            // saves 1 dispatch/layer × 34 ≈ 0.24 ms/tok end-to-end.
+                            // Math identical to the unfused chain — see
+                            // `shaders/post_ffn_norm_residual_add.rs`.
+                            enc.set_compute_pipeline_state(
+                                &self.post_ffn_norm_residual_add_pipeline,
+                            );
+                            enc.set_buffer(0, Some(&down_out), 0);
+                            enc.set_buffer(1, Some(&h_post_attn), 0);
+                            enc.set_buffer(2, Some(&post_ffn_buf), 0);
+                            enc.set_buffer(3, Some(new_h), 0);
+                            enc.set_bytes(
+                                4,
+                                4,
+                                &hidden_val as *const u32 as *const std::ffi::c_void,
+                            );
+                            enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
+                            enc.set_bytes(
+                                6,
+                                4,
+                                &norm_offset as *const f32 as *const std::ffi::c_void,
+                            );
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(1, 1, 1),
+                                MTLSize::new(256.min(hidden as u64), 1, 1),
+                            );
+                        } else {
+                            let normed_ffn = &normed_scratch;
+                            use crate::metal::ops::full_pipeline::encode_rms_norm;
+                            encode_rms_norm(
+                                &enc,
+                                &self.rms_norm_pipeline,
+                                &down_out,
+                                &post_ffn_buf,
+                                normed_ffn,
+                                hidden,
+                                eps,
+                                norm_offset,
+                            );
+                            use crate::metal::ops::full_pipeline::encode_residual_add;
+                            encode_residual_add(
+                                &enc,
+                                &self.residual_add_pipeline,
+                                &h_post_attn,
+                                normed_ffn,
+                                new_h,
+                                hidden,
+                            );
+                        }
                     } else {
                         use crate::metal::ops::full_pipeline::encode_residual_add;
                         encode_residual_add(

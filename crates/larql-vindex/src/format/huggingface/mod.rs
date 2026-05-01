@@ -37,8 +37,8 @@ pub(crate) const VINDEX_CORE_FILES: &[&str] = &[
 pub(crate) const VINDEX_WEIGHT_FILES: &[&str] = &[
     ATTN_WEIGHTS_BIN,
     NORMS_BIN,
-    "up_weights.bin",
-    "down_weights.bin",
+    UP_WEIGHTS_BIN,
+    DOWN_WEIGHTS_BIN,
     LM_HEAD_BIN,
     WEIGHT_MANIFEST_JSON,
 ];

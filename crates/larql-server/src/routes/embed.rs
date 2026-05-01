@@ -20,7 +20,10 @@ use larql_inference::forward::predict::logits_to_predictions_pub;
 use larql_vindex::ndarray::Array2;
 
 use crate::error::ServerError;
-use crate::http::BINARY_FFN_CONTENT_TYPE;
+use crate::http::{
+    BINARY_FFN_CONTENT_TYPE, JSON_CONTENT_TYPE, REQUEST_BODY_LIMIT_BYTES,
+    REQUEST_BODY_LIMIT_LARGE_BYTES,
+};
 use crate::state::{AppState, LoadedModel};
 
 // ── Request / response types ──────────────────────────────────────────────────
@@ -208,12 +211,9 @@ async fn handle_embed_inner(
         }
     };
 
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let is_binary = crate::wire::has_content_type(&headers, BINARY_FFN_CONTENT_TYPE);
 
-    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+    let bytes = match axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             return error_response(ServerError::BadRequest(format!("read body: {e}")));
@@ -222,7 +222,7 @@ async fn handle_embed_inner(
 
     let start = std::time::Instant::now();
 
-    let token_ids: Vec<u32> = if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
+    let token_ids: Vec<u32> = if is_binary {
         match parse_binary_embed_request(&bytes) {
             Ok(token_ids) => token_ids,
             Err(e) => return error_response(e),
@@ -255,7 +255,7 @@ async fn handle_embed_inner(
     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
 
     // Return binary if the client asked for it.
-    if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
+    if is_binary {
         let out = encode_binary_embed_response(&h);
         return ([(header::CONTENT_TYPE, BINARY_FFN_CONTENT_TYPE)], out).into_response();
     }
@@ -307,33 +307,29 @@ async fn handle_logits_inner(
         None => return error_response(ServerError::NotFound("model not found".into())),
     };
 
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let is_binary = crate::wire::has_content_type(&headers, BINARY_FFN_CONTENT_TYPE);
 
-    let bytes = match axum::body::to_bytes(body, 256 * 1024 * 1024).await {
+    let bytes = match axum::body::to_bytes(body, REQUEST_BODY_LIMIT_LARGE_BYTES).await {
         Ok(b) => b,
         Err(e) => return error_response(ServerError::BadRequest(format!("read body: {e}"))),
     };
 
-    let (residual_flat, top_k, temperature): (Vec<f32>, usize, f32) =
-        if content_type.contains(BINARY_FFN_CONTENT_TYPE) {
-            match parse_binary_logits_request(&bytes) {
-                Ok(floats) => (floats, default_top_k(), default_temperature()),
-                Err(e) => return error_response(e),
+    let (residual_flat, top_k, temperature): (Vec<f32>, usize, f32) = if is_binary {
+        match parse_binary_logits_request(&bytes) {
+            Ok(floats) => (floats, default_top_k(), default_temperature()),
+            Err(e) => return error_response(e),
+        }
+    } else {
+        let req: LogitsRequest = match serde_json::from_slice(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_response(ServerError::BadRequest(format!(
+                    "parse logits request: {e}"
+                )));
             }
-        } else {
-            let req: LogitsRequest = match serde_json::from_slice(&bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    return error_response(ServerError::BadRequest(format!(
-                        "parse logits request: {e}"
-                    )));
-                }
-            };
-            (req.residual, req.top_k, req.temperature)
         };
+        (req.residual, req.top_k, req.temperature)
+    };
 
     let hidden = model.config.hidden_size;
     if residual_flat.len() != hidden {
@@ -540,7 +536,7 @@ fn handle_embed_single_inner(
     let want_json = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("application/json"))
+        .map(|s| s.contains(JSON_CONTENT_TYPE))
         .unwrap_or(false);
 
     if want_json {

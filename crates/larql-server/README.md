@@ -22,6 +22,40 @@ For Gemma 4 26B-A4B and other hybrid-MoE models, this server is also the
 `Remote MoE shard topology` below for setup, and `ROADMAP.md → F-FLY` for
 multi-host deployment.)
 
+## What this is
+
+larql-server is the production face of the LARQL research thesis: that
+transformer FFN layers are compilable knowledge databases, that training is
+slow compilation, and that inference should be restructured around graph
+walks rather than monolithic matrix multiplication. As new LARQL paradigms
+become real, this is where they become network-addressable APIs.
+
+That gives the roadmap two tracks:
+
+- **Parity** — the server features any 2026 developer expects: OpenAI-compat
+  endpoints, stateful sessions, streaming, structured output, LoRA
+  hot-loading, prefix-caching for chat. Parity work is *defensive*: it
+  removes reasons-to-leave so the paradigm is reachable from the existing
+  ecosystem (Cursor, Continue, LangChain, OpenAI SDK, eval harnesses) without
+  asking anyone to adopt a weird API first.
+- **Paradigm** — capabilities that are unique to this substrate:
+  DESCRIBE / WALK / SELECT over the indexed knowledge graph, patch overlays
+  that edit model behaviour without retraining, residual-addressed FFN
+  execution, remote MoE expert shards as routable compute assets, and
+  federated knowledge graphs across multiple vindexes. Paradigm work is
+  *offensive*: it's the reason to stay once parity gets you in the door.
+
+Parity work is in service of paradigm work, not in competition with vLLM.
+The bar for parity is "what someone expects when they plug in their existing
+OpenAI client", not "every GPU-cluster optimisation vLLM ships". Once that
+bar is cleared, the question shifts from "why use larql instead of X" to
+"why *wouldn't* I use larql, given it does what X does *and* exposes the
+model as a queryable knowledge graph I can edit at runtime".
+
+> **For the framing in one place:** see [`THESIS.md`](./THESIS.md) for
+> why this is built as a *reference implementation* and what success
+> looks like (citations and pattern diffusion, not GitHub stars).
+
 ## Features
 
 - **Browse endpoints** — DESCRIBE, WALK, SELECT, RELATIONS, STATS (no weights needed)
@@ -947,20 +981,28 @@ larql-server/
 │   └── test_unit_*.rs          Focused unit tests (band_utils, state,
 │                               protocol parsing)
 └── src/
-    ├── main.rs                 CLI parsing, vindex loading, listener setup
-    │                           (TCP + optional UDS via --uds-path,
-    │                           TCP_NODELAY on accepted conns)
+    ├── main.rs                 Thin entry: parse Cli, init tracing, hand off
+    │                           to bootstrap::serve. ~26 LOC.
     ├── lib.rs                  Crate-public exports
-    ├── bootstrap.rs            Testable boot/discovery/load helpers
+    ├── bootstrap.rs            Cli struct + serve(): vindex load, warmups,
+    │                           listener setup (TCP + optional UDS via
+    │                           --uds-path, TCP_NODELAY on accepted conns,
+    │                           TLS, gRPC, grid announce).
     ├── state.rs                AppState: loaded models, probe labels, lazy
     │                           weights, expert_filter / unit_filter
     ├── error.rs                ServerError → HTTP status codes
+    ├── env_flags.rs            Single source of truth for LARQL_* env knobs
+    │                           (cached presence accessors via OnceLock)
+    ├── wire.rs                 Shared has_content_type() helper for routes
+    │                           that accept both binary and JSON bodies
+    ├── http.rs                 Shared HTTP route + content-type constants
+    │                           (BINARY_FFN_*, JSON_CONTENT_TYPE,
+    │                           REQUEST_BODY_LIMIT_*, BEARER_PREFIX, …)
     ├── auth.rs                 API key Bearer token middleware
     ├── ratelimit.rs            Per-IP token bucket rate limiting
     ├── cache.rs                TTL cache for DESCRIBE results
     ├── session.rs              Per-session PatchedVindex isolation
     ├── etag.rs                 ETag generation for CDN caching
-    ├── http.rs                 Shared HTTP route + content-type constants
     ├── ffn_l2_cache.rs         Per-model FFN L2 score cache
     ├── embed_store.rs          mmap-backed f16 embedding lookup (--embed-only)
     ├── band_utils.rs           Layer band parsing + filter helpers
@@ -978,10 +1020,19 @@ larql-server/
         ├── explain.rs          POST /v1/explain-infer (per-layer attention/FFN)
         ├── stream.rs           WS /v1/stream (layer-by-layer streaming)
         ├── walk_ffn.rs         POST /v1/walk-ffn (decoupled FFN dispatch)
-        ├── expert.rs           POST /v1/expert/{layer}/{id},
-        │                       POST /v1/expert/batch (legacy MoE wire),
-        │                       POST /v1/experts/layer-batch (residual once),
-        │                       POST /v1/experts/layer-batch-f16 (f16 wire)
+        ├── expert/             MoE expert dispatch — split by concern
+        │   ├── mod.rs          Re-exports + shared request/response types
+        │   ├── single.rs       run_expert + handle_expert
+        │   │                   (POST /v1/expert/{layer}/{id})
+        │   ├── batch_legacy.rs handle_expert_batch
+        │   │                   (POST /v1/expert/batch — pre-2026-05-01 wire)
+        │   ├── layer_batch.rs  handle_experts_layer_batch{,_f16}
+        │   │                   (POST /v1/experts/layer-batch[-f16])
+        │   ├── cpu.rs          run_experts_cpu_batch (rayon CPU dispatch)
+        │   ├── metal.rs        run_experts_metal_batch
+        │   │                   (#[cfg(feature = "metal-experts")])
+        │   └── warmup.rs       warmup_hnsw_unit_cache,
+        │                       warmup_metal_expert_cache
         ├── topology.rs         GET /v1/expert/topology (shard advertisement)
         ├── embed.rs            POST /v1/embed, /v1/logits, /v1/token/*
         ├── insert.rs           POST /v1/insert (knowledge mutation)
@@ -1006,7 +1057,7 @@ larql-server/
 ## Testing
 
 ```bash
-# Unit + integration tests (501 tests across lib + 14 test files; all green)
+# Unit + integration tests (~580 tests across lib + 14 test files; all green)
 cargo test -p larql-server
 
 # Synthetic demos (no real vindex)
@@ -1094,38 +1145,56 @@ wire opt-in for bandwidth-constrained links) are all in place from the
 
 ## What's coming
 
-The full forward-looking work is in `ROADMAP.md`. Headline items most
-likely to affect how you use the server:
+The full forward-looking work is in `ROADMAP.md`. Grouped by track (see
+"What this is" above):
+
+### Parity track (clears the bar so the paradigm is reachable)
 
 - **N0. OpenAI API compatibility** — `/v1/chat/completions`,
   `/v1/completions`, `/v1/responses` (stateful), `/v1/embeddings`
   (OpenAI-shape wrapper), `/v1/models`. Streaming via SSE, tool calls,
-  JSON-schema response_format. Once landed, every existing OpenAI
+  JSON-schema `response_format`. Once landed, every existing OpenAI
   client (Python `openai` SDK, JS `openai`, LangChain, LlamaIndex,
-  Cursor, Continue, Aider, eval harnesses, dashboards) becomes a
-  larql client unmodified.
+  Cursor, Continue, Aider, eval harnesses, dashboards) becomes a larql
+  client unmodified. Highest-leverage parity item — it's the adapter
+  layer the rest of the ecosystem speaks.
 - **N1. Stateful chat sessions** — KV-cache as a first-class resource
   (`POST /v1/sessions`, `/v1/sessions/{id}/append`). Today every
-  `/v1/infer` re-prefills from scratch; with sessions the KV-cache
-  stays resident across turns. Pairs with N0.3 (Responses API).
+  `/v1/infer` re-prefills from scratch; with sessions the KV-cache stays
+  resident across turns. Pairs with N0.3 (Responses API).
 - **N2. Async batch inference job queue** — `/v1/jobs` for
-  throughput-bound workloads (RAG document processing, evals,
-  embedding pre-compute) that don't share the SLO of real-time chat.
-- **N3. LoRA / adapter hot-loading per session** — multi-tenant
-  serving, hundreds of adapters in RAM next to one base model.
-- **N4. Multimodal API surface** — vision tower endpoint for Gemma 3/4
-  + Llama 3.2 vision variants (vindex extractor already handles the
-  weights; only the API surface is missing).
-- **N5. Federated knowledge graph over multiple vindexes** — unique
-  capability the larql architecture enables: ask "describe France
-  using Gemma's knowledge AND Llama's knowledge AND a custom vindex"
-  in one call. No other LLM serving stack can do this.
+  throughput-bound workloads (RAG document processing, evals, embedding
+  pre-compute) that don't share the SLO of real-time chat.
+- **N3. LoRA / adapter hot-loading per session** — multi-tenant serving,
+  hundreds of adapters in RAM next to one base model.
+- **F2. Streaming HTTP infer (SSE)**, **F7. KV-cache prefix sharing**,
+  **F17. Structured-output / grammar-constrained generation** — the
+  remaining table-stakes any 2026 chat client expects.
+
+### Paradigm track (the reason to stay once parity gets you in the door)
+
+- **Already shipped** — DESCRIBE / WALK / SELECT over the indexed
+  knowledge graph, patch overlays (`/v1/patches/apply`), residual-addressed
+  FFN execution (`/v1/walk-ffn`), remote MoE expert shards as routable
+  compute assets (`/v1/experts/layer-batch`, gRPC streaming overlap, UDS
+  same-host transport, f16 wire opt-in), embed-only / FFN-only mode splits,
+  CPU-first multi-host shard topology.
+- **N4. Multimodal API surface** — vision tower endpoint for Gemma 3/4 +
+  Llama 3.2 vision variants. The vindex extractor already handles the
+  weights; only the API surface is missing.
+- **N5. Federated knowledge graph over multiple vindexes** — ask
+  "describe France using Gemma's knowledge AND Llama's knowledge AND a
+  custom vindex" in one call, with per-edge model attribution and
+  confidence-weighted merge. No other LLM serving stack can do this; it
+  falls out of the substrate. Pairs with the LQL `USE REMOTE` /
+  `DESCRIBE … USING gemma, llama` syntax already hinted in the REPL.
 - **N6. Live blue-green vindex deployment** — load v2 alongside v1,
-  weighted traffic ramp, side-by-side metrics for canary rollout.
-- **F-FLY. Remote multi-shard deployment on fly.io** — the validation
-  step for the 2026-05-01 HTTP perf optimisations on real LAN-class
-  RTT (loopback can't tell us how f16 wire / TCP_NODELAY behave on a
-  real network).
+  weighted traffic ramp, side-by-side metrics for canary rollout. Possible
+  because vindexes are static artefacts, not in-process model state.
+- **F-FLY. Remote multi-shard deployment on fly.io** — validation that
+  the 2026-05-01 HTTP perf optimisations translate to real LAN-class RTT.
+  Loopback can't tell us how f16 wire / TCP_NODELAY behave on a real
+  network.
 
 A code-quality cleanup pass (Q1.1–Q1.10 — split `routes/expert.rs`,
 centralise env flags, lift remaining magic numbers) is also queued.

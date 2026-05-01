@@ -171,8 +171,8 @@ pub fn vindex_to_q4k(
         // The f32 weight files that the Q4K path replaces — don't
         // hard-link these, they'd bloat the output and be unused.
         ATTN_WEIGHTS_BIN,
-        "up_weights.bin",
-        "down_weights.bin",
+        UP_WEIGHTS_BIN,
+        DOWN_WEIGHTS_BIN,
         UP_FEATURES_BIN,
         DOWN_FEATURES_BIN,
         INTERLEAVED_BIN,
@@ -236,8 +236,8 @@ pub fn vindex_to_q4k(
 
     // Size reporting. FFN src = up_weights.bin + down_weights.bin
     // (already dense f32). FFN dst = interleaved_q4k.bin.
-    let src_ffn_bytes = size_of(&src.join("up_weights.bin")).unwrap_or(0)
-        + size_of(&src.join("down_weights.bin")).unwrap_or(0)
+    let src_ffn_bytes = size_of(&src.join(UP_WEIGHTS_BIN)).unwrap_or(0)
+        + size_of(&src.join(DOWN_WEIGHTS_BIN)).unwrap_or(0)
         + size_of(&src.join(GATE_VECTORS_BIN)).unwrap_or(0);
     let dst_ffn_bytes = size_of(&dst.join(INTERLEAVED_Q4K_BIN)).unwrap_or(0)
         + size_of(&dst.join(GATE_VECTORS_BIN)).unwrap_or(0);

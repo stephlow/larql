@@ -282,7 +282,10 @@ mod tests {
     /// prefill silently produces all-NaN.
     #[test]
     fn load_attn_q4k_rejects_legacy_148_byte_stride() {
-        let bad_len = 2048 * (2560 / 256) * 148; // 3_031_040 — what 8-Apr vindexes have
+        use crate::quant::registry::LEGACY_BLOCK_Q4_K_STRIDE;
+        use larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+        // 3_031_040 — what 8-Apr vindexes have.
+        let bad_len = 2048 * (2560 / K_QUANT_BLOCK_ELEMS) * LEGACY_BLOCK_Q4_K_STRIDE;
         let payload = vec![0u8; bad_len];
         let manifest = serde_json::json!([
             {

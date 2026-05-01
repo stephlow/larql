@@ -41,6 +41,10 @@ pub const SHADER: &str = r#"
 constant uint Q6K_GDC_ROWS_PER_TG = 4;
 constant uint Q6K_GDC_BLOCK_SIZE  = 210;
 
+// SANITY-CHECK COPY: this is the verbatim production
+// `q6k_geglu_gelu_tanh_down` body (per-row activation recompute, no
+// cache) — used to confirm the dispatch wiring of the new pipeline
+// works before re-introducing the cache.
 kernel void q6k_geglu_gelu_tanh_down_cached(
     device const uchar*  W_down [[buffer(0)]],
     device const float*  gate   [[buffer(1)]],
@@ -53,7 +57,8 @@ kernel void q6k_geglu_gelu_tanh_down_cached(
     uint sg_id     [[simdgroup_index_in_threadgroup]],
     uint tid       [[thread_index_in_threadgroup]])
 {
-    threadgroup float tg_act[256];
+    threadgroup float tg_gate[256];
+    threadgroup float tg_up[256];
 
     uint row_idx       = tg_id * Q6K_GDC_ROWS_PER_TG + sg_id;
     uint superblocks   = K / 256u;
@@ -61,27 +66,15 @@ kernel void q6k_geglu_gelu_tanh_down_cached(
     device const uchar* row = W_down + row_idx * bytes_per_row;
 
     float acc = 0.0f;
-    const float c = 0.7978845608f; // sqrt(2/π)
+    float c = 0.7978845608f;
 
     for (uint sb = 0u; sb < superblocks; sb++) {
         uint x_base = sb * 256u;
 
-        // ── Cooperative activation compute ──
-        // Each of 128 threads computes 2 elements of `tg_act` →
-        // covers all 256 elements of this super-block. Only ONE
-        // tanh() per element across the entire TG, vs per-row
-        // recomputation in the original kernel.
-        {
-            float g0 = gate[x_base + tid];
-            float u0 = up[x_base + tid];
-            float t0 = tanh(c * (g0 + 0.044715f * g0 * g0 * g0));
-            tg_act[tid] = 0.5f * g0 * (1.0f + t0) * u0;
-
-            float g1 = gate[x_base + tid + 128u];
-            float u1 = up[x_base + tid + 128u];
-            float t1 = tanh(c * (g1 + 0.044715f * g1 * g1 * g1));
-            tg_act[tid + 128u] = 0.5f * g1 * (1.0f + t1) * u1;
-        }
+        tg_gate[tid]        = gate[x_base + tid];
+        tg_gate[tid + 128u] = gate[x_base + tid + 128u];
+        tg_up[tid]          = up[x_base + tid];
+        tg_up[tid + 128u]   = up[x_base + tid + 128u];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (row_idx < N) {
@@ -104,7 +97,12 @@ kernel void q6k_geglu_gelu_tanh_down_cached(
                 int raw = int(lo4 | (hi2 << 4u)) - 32;
                 float w = d * float(sc[i >> 4u]) * float(raw);
 
-                acc = fma(w, tg_act[i], acc);
+                float gi = tg_gate[i];
+                float t = tanh(c * (gi + 0.044715f * gi * gi * gi));
+                float gelu_g = 0.5f * gi * (1.0f + t);
+                float ai = gelu_g * tg_up[i];
+
+                acc = fma(w, ai, acc);
             }
         }
 

@@ -6,6 +6,7 @@
 //! Pulled out of `overlay.rs` so the file holding `PatchedVindex`'s
 //! query/mutation API stays focused.
 
+use crate::index::types::DEFAULT_C_SCORE;
 use crate::index::FeatureMeta;
 
 use super::format::{decode_gate_vector, PatchOp, VindexPatch};
@@ -70,7 +71,7 @@ impl PatchedVindex {
                         FeatureMeta {
                             top_token: target.clone(),
                             top_token_id: 0,
-                            c_score: confidence.unwrap_or(0.9),
+                            c_score: confidence.unwrap_or(DEFAULT_C_SCORE),
                             top_k: vec![],
                         }
                     };

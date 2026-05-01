@@ -9,7 +9,7 @@
 //! One entry describes one tensor's slice within its `.bin` file:
 //! - `offset` / `length` — byte range within the file
 //! - `format` — quant tag, must round-trip via `quant::registry::lookup`
-//! - `shape` — `[rows, padded_cols]` after `pad_rows_to_256`
+//! - `shape` — `[rows, padded_cols]` after `pad_rows_to_block`
 //! - `key` — original tensor name (for human inspection / round-trip)
 //!
 //! The fields are deliberately laid out so the JSON shape matches what

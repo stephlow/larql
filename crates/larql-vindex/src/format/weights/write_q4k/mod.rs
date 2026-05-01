@@ -43,10 +43,10 @@ use feature_major_down::FeatureMajorDownState;
 /// (Q4_K/Q6_K super-blocks require length % 256 == 0).
 ///
 /// Kept only for unit-test coverage of the flat-padding helper pattern;
-/// production paths now use [`pad_rows_to_256`] since the shader reads
+/// production paths now use [`pad_rows_to_block`] since the shader reads
 /// each row as a fixed number of super-blocks.
 #[cfg(test)]
-fn pad_to_256(data: &[f32]) -> Vec<f32> {
+fn pad_to_block(data: &[f32]) -> Vec<f32> {
     let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
     let padded_len = data.len().div_ceil(block) * block;
     if padded_len == data.len() {
@@ -71,7 +71,7 @@ fn pad_to_256(data: &[f32]) -> Vec<f32> {
 /// small storage overhead (the padding columns are zero and contribute
 /// nothing to the dot product at dispatch time, provided the caller also
 /// zero-pads the input vector to `padded_cols`).
-pub(super) fn pad_rows_to_256(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
+pub(super) fn pad_rows_to_block(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
     debug_assert_eq!(data.len(), rows * cols);
     let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
     let padded_cols = cols.div_ceil(block) * block;
@@ -195,7 +195,7 @@ pub fn write_model_weights_q4k_with_opts(
             // where the dense intermediate is 2112). `padded_cols` is what the
             // matvec shader must use as `K`; callers also need to zero-pad the
             // input vector to the same width.
-            let (padded, padded_cols) = pad_rows_to_256(&data, rows, cols);
+            let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
             let q_bytes = if is_v {
                 quantize_q6_k(&padded)
             } else {
@@ -273,8 +273,8 @@ pub fn write_model_weights_q4k_with_opts(
                 // Without this, matrices with `cols % 256 != 0` (e.g. Gemma 4
                 // 26B A4B's down_proj with inner dim 2112) store contiguous
                 // quantisation that every row past row 0 reads wrong. See
-                // `pad_rows_to_256` docs.
-                let (padded, padded_cols) = pad_rows_to_256(&data, rows, cols);
+                // `pad_rows_to_block` docs.
+                let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
                 // Gate (i=0) and up (i=1) always Q4_K. Down (i=2) defaults
                 // to Q6_K for llama.cpp compatibility, Q4_K when opts.down_q4k.
                 let is_down = i == 2;
@@ -574,7 +574,7 @@ pub fn write_model_weights_q4k_with_opts(
 
     // ── lm_head_q4.bin ──
     if let Some((data, rows, cols)) = source.lm_head() {
-        let (padded, padded_cols) = pad_rows_to_256(&data, rows, cols);
+        let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
         let q_bytes = quantize_q4_k(&padded);
         std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
         // Record in norms manifest so a single weight_manifest.json references
@@ -713,24 +713,24 @@ mod helper_tests {
         assert_eq!(resolve_v_tensor(None, &k, false), None);
     }
 
-    // ── pad_to_256 ──
+    // ── pad_to_block ──
 
     #[test]
-    fn pad_to_256_noop_when_exact_multiple() {
+    fn pad_to_block_noop_when_exact_multiple() {
         let v = vec![1.0_f32; 256];
-        let padded = pad_to_256(&v);
+        let padded = pad_to_block(&v);
         assert_eq!(padded.len(), 256, "exact multiple must not grow");
         assert_eq!(padded, v);
 
         let v = vec![1.0_f32; 512];
-        let padded = pad_to_256(&v);
+        let padded = pad_to_block(&v);
         assert_eq!(padded.len(), 512);
     }
 
     #[test]
-    fn pad_to_256_zero_fills_to_next_block() {
+    fn pad_to_block_zero_fills_to_next_block() {
         let v = vec![1.0_f32; 200];
-        let padded = pad_to_256(&v);
+        let padded = pad_to_block(&v);
         assert_eq!(padded.len(), 256, "padded to next super-block");
         // First 200 preserved, last 56 zeroed.
         assert!(padded[..200].iter().all(|&x| x == 1.0));
@@ -738,17 +738,17 @@ mod helper_tests {
     }
 
     #[test]
-    fn pad_to_256_handles_one_below_multiple() {
+    fn pad_to_block_handles_one_below_multiple() {
         let v = vec![1.0_f32; 255];
-        let padded = pad_to_256(&v);
+        let padded = pad_to_block(&v);
         assert_eq!(padded.len(), 256);
         assert_eq!(padded[255], 0.0);
     }
 
     #[test]
-    fn pad_to_256_handles_one_above_multiple() {
+    fn pad_to_block_handles_one_above_multiple() {
         let v = vec![1.0_f32; 257];
-        let padded = pad_to_256(&v);
+        let padded = pad_to_block(&v);
         assert_eq!(
             padded.len(),
             512,
@@ -759,9 +759,9 @@ mod helper_tests {
     }
 
     #[test]
-    fn pad_to_256_empty_input_stays_empty() {
+    fn pad_to_block_empty_input_stays_empty() {
         let v: Vec<f32> = Vec::new();
-        let padded = pad_to_256(&v);
+        let padded = pad_to_block(&v);
         assert_eq!(padded.len(), 0);
     }
 }

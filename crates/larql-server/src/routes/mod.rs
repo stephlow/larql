@@ -27,7 +27,7 @@ use axum::Router;
 // Expert batch payloads can be large when the client batches all sequence
 // positions into one call per layer (N_positions × top_K × hidden floats as
 // JSON). 64 MB covers: 512 positions × 8 experts × 2816 floats × ~7 bytes/float.
-const EXPERT_BATCH_BODY_LIMIT: usize = 64 * 1024 * 1024;
+const EXPERT_BATCH_BODY_LIMIT: usize = crate::http::REQUEST_BODY_LIMIT_BYTES;
 
 use crate::state::AppState;
 

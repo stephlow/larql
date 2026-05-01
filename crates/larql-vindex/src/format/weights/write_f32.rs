@@ -362,11 +362,11 @@ pub fn write_model_weights_with_opts(
     }
 
     if write_ffn {
-        let up_path = dir.join("up_weights.bin");
+        let up_path = dir.join(UP_WEIGHTS_BIN);
         let mut up_file = BufWriter::new(std::fs::File::create(&up_path)?);
         let mut up_offset: u64 = 0;
 
-        let down_path = dir.join("down_weights.bin");
+        let down_path = dir.join(DOWN_WEIGHTS_BIN);
         let mut down_file = BufWriter::new(std::fs::File::create(&down_path)?);
         let mut down_offset: u64 = 0;
 
@@ -384,7 +384,7 @@ pub fn write_model_weights_with_opts(
                                 shape: vec![rows, cols],
                                 offset: up_offset,
                                 length: len,
-                                file: "up_weights.bin".into(),
+                                file: UP_WEIGHTS_BIN.into(),
                             });
                             up_offset += len;
                         }
@@ -398,7 +398,7 @@ pub fn write_model_weights_with_opts(
                                 shape: vec![rows, cols],
                                 offset: down_offset,
                                 length: len,
-                                file: "down_weights.bin".into(),
+                                file: DOWN_WEIGHTS_BIN.into(),
                             });
                             down_offset += len;
                         }
@@ -413,7 +413,7 @@ pub fn write_model_weights_with_opts(
                             shape: vec![rows, cols],
                             offset: up_offset,
                             length: len,
-                            file: "up_weights.bin".into(),
+                            file: UP_WEIGHTS_BIN.into(),
                         });
                         up_offset += len;
                     }
@@ -428,7 +428,7 @@ pub fn write_model_weights_with_opts(
                         shape: vec![rows, cols],
                         offset: up_offset,
                         length: len,
-                        file: "up_weights.bin".into(),
+                        file: UP_WEIGHTS_BIN.into(),
                     });
                     up_offset += len;
                 }
@@ -442,7 +442,7 @@ pub fn write_model_weights_with_opts(
                         shape: vec![rows, cols],
                         offset: down_offset,
                         length: len,
-                        file: "down_weights.bin".into(),
+                        file: DOWN_WEIGHTS_BIN.into(),
                     });
                     down_offset += len;
                 }

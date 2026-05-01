@@ -96,7 +96,7 @@ use larql_vindex::GateIndex as _;
 use serde::Deserialize;
 
 use crate::error::ServerError;
-use crate::http::BINARY_FFN_CONTENT_TYPE;
+use crate::http::{BINARY_FFN_CONTENT_TYPE, JSON_CONTENT_TYPE, REQUEST_BODY_LIMIT_BYTES};
 use crate::state::{elapsed_ms, AppState, LoadedModel};
 
 pub(crate) const BINARY_CT: &str = BINARY_FFN_CONTENT_TYPE;
@@ -493,14 +493,9 @@ pub async fn handle_walk_ffn(
 ) -> Result<Response, ServerError> {
     state.bump_requests();
 
-    let is_binary = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.starts_with(BINARY_CT))
-        .unwrap_or(false);
+    let is_binary = crate::wire::has_content_type(request.headers(), BINARY_CT);
 
-    let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
+    let body = axum::body::to_bytes(request.into_body(), REQUEST_BODY_LIMIT_BYTES)
         .await
         .map_err(|e| ServerError::BadRequest(format!("read body: {e}")))?;
 
@@ -556,7 +551,7 @@ pub async fn handle_walk_ffn(
         serde_json::to_vec(&result).map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
         .body(axum::body::Body::from(json_bytes))
         .unwrap())
 }

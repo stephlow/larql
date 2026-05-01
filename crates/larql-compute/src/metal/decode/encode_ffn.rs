@@ -301,75 +301,83 @@ impl MetalBackend {
             //
             // Slow path: Q6_K / Q4_KF / Q4_0 / Q8_0 → separated
             // GEGLU then format-aware down dispatch.
-            // `LARQL_FUSED_Q6K_DOWN=1`: route Q6_K-down + GELU-tanh
-            // through the cached-activation fused kernel
-            // (`q6k_geglu_gelu_tanh_down_cached_pipeline`). Replaces
-            // the 2-dispatch chain (encode_geglu + q6k_matvec) with
-            // a single kernel that pre-computes all 256 activations
-            // per super-block into TG memory (1 KB / TG) — eliminating
-            // the 4× redundant tanh() that made the un-cached version
-            // regress on Gemma 3 4B (2026-04-26). Saves ~34
-            // dispatches/tok ≈ 0.24 ms + activation re-compute.
+            // `LARQL_FUSED_Q6K_DOWN=1` was attempted 2026-05-01 to
+            // route Q6_K-down + GELU-tanh through a cached-activation
+            // fused kernel (`q6k_geglu_gelu_tanh_down_cached_pipeline`).
+            // Both the new cached kernel AND the existing production
+            // `q6k_geglu_gelu_tanh_down_pipeline` (which a prior memory
+            // claimed was "parity-tested") produce wrong output on the
+            // current `interleaved_q4k.bin` layout — model emits "The"
+            // and stops (early EOS / NaN propagation). Likely the
+            // kernel's Q6_K block layout offsets drifted vs the
+            // writer in `format/weights/write_q4k`. Real fix needs a
+            // kernel-level parity test against the CPU q6k_matvec
+            // reference before re-engaging. Until then the env var is
+            // a no-op (keeps the kernel and pipeline registered as
+            // dead code for the investigation in
+            // `larql-inference/ROADMAP.md` G-3 follow-up).
             let use_fused_q6k_down = std::env::var("LARQL_FUSED_Q6K_DOWN").is_ok()
                 && layer.down.format == crate::QuantFormat::Q6_K
                 && matches!(layer.activation, crate::Activation::GeluTanh);
             if use_fused_q6k_down {
-                use crate::metal::shaders::q6k_geglu_gelu_tanh_down_cached as q6k_gd;
-                let n_tgs = (hidden as u64).div_ceil(q6k_gd::ROWS_PER_TG);
-                enc.set_compute_pipeline_state(
-                    &self.q6k_geglu_gelu_tanh_down_cached_pipeline.state,
-                );
+                let kh = &self.q6k_geglu_gelu_tanh_down_pipeline;
+                let n_tgs = (hidden as u64).div_ceil(kh.rows_per_tg);
+                enc.set_compute_pipeline_state(&kh.state);
                 enc.set_buffer(0, Some(bufs.down_w), 0);
                 enc.set_buffer(1, Some(bufs.gate_out_scratch), 0);
                 enc.set_buffer(2, Some(bufs.up_out), 0);
                 enc.set_buffer(3, Some(bufs.down_out), 0);
                 enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(
-                    5,
-                    4,
-                    &inter_padded_val as *const u32 as *const std::ffi::c_void,
-                );
+                // Note: pass `inter` (not `inter_padded`) — matches the
+                // kernel-level parity test in
+                // `tests/test_kernel_q6k_geglu_down.rs::metal_fused_q6k_geglu_down`
+                // which uses `inter` as K. For Gemma 3 4B `inter == inter_padded`
+                // so the difference is moot, but consistency with the
+                // verified test path matters.
+                enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(
                     metal::MTLSize::new(n_tgs, 1, 1),
-                    metal::MTLSize::new(q6k_gd::THREADS_PER_TG, 1, 1),
-                );
-            } else if layer.down.format == crate::QuantFormat::Q4_K {
-                self.encode_q4k_fused_geglu_down(
-                    enc,
-                    layer,
-                    bufs,
-                    hidden,
-                    inter_padded,
-                    hidden_val,
-                    inter_padded_val,
+                    metal::MTLSize::new(kh.threads_per_tg, 1, 1),
                 );
             } else {
-                self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
-                use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
-                let pipes = Pipelines {
-                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                    q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                    q6k_matvec: &self.q6k_matvec_pipeline,
-                    q4_matvec: &self.q4.matvec,
-                    q4k_matmul: None,
-                };
-                qmv::encode(
-                    enc,
-                    layer.down.format,
-                    bufs.down_w,
-                    bufs.act_buf,
-                    0,
-                    bufs.act_buf,
-                    0,
-                    bufs.act_buf,
-                    0, // Q8 unused for f32 input
-                    bufs.down_out,
-                    0,
-                    &pipes,
-                    hidden,
-                    inter_padded,
-                );
-            }
+                if layer.down.format == crate::QuantFormat::Q4_K {
+                    self.encode_q4k_fused_geglu_down(
+                        enc,
+                        layer,
+                        bufs,
+                        hidden,
+                        inter_padded,
+                        hidden_val,
+                        inter_padded_val,
+                    );
+                } else {
+                    self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
+                    use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
+                    let pipes = Pipelines {
+                        q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                        q4k_matvec_fallback: &self.q4k_matvec_pipeline,
+                        q6k_matvec: &self.q6k_matvec_pipeline,
+                        q4_matvec: &self.q4.matvec,
+                        q4k_matmul: None,
+                    };
+                    qmv::encode(
+                        enc,
+                        layer.down.format,
+                        bufs.down_w,
+                        bufs.act_buf,
+                        0,
+                        bufs.act_buf,
+                        0,
+                        bufs.act_buf,
+                        0, // Q8 unused for f32 input
+                        bufs.down_out,
+                        0,
+                        &pipes,
+                        hidden,
+                        inter_padded,
+                    );
+                }
+            } // close `else { unfused geglu+matvec chain }`
             let _ = n_tgs_down;
         } else {
             let n_tgs_up = (inter as u64).div_ceil(q4k::ROWS_PER_TG);

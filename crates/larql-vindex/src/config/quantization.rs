@@ -5,6 +5,7 @@
 //! round-2 cleanup. `Fp4Config` carries a `ComplianceGate` (defined
 //! in the sibling `compliance` module).
 
+use larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
 use serde::{Deserialize, Serialize};
 
 use crate::format::filenames::{DOWN_FEATURES_FP8_BIN, GATE_VECTORS_FP4_BIN, UP_FEATURES_FP4_BIN};
@@ -111,7 +112,7 @@ impl Fp4Config {
     pub fn v1_defaults(projections: Projections) -> Self {
         Self {
             fp4_format_version: 1,
-            block_elements: 256,
+            block_elements: K_QUANT_BLOCK_ELEMS as u32,
             sub_block_elements: 32,
             sub_block_scale_dtype: "fp8_e4m3".into(),
             block_scale_dtype: "fp8_e4m3".into(),

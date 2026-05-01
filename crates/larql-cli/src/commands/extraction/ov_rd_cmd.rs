@@ -14,7 +14,7 @@ use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex,
 };
-use ndarray::{s, Array2};
+use ndarray::{s, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -275,6 +275,16 @@ struct OraclePqArgs {
     #[arg(long)]
     address_mixed_key_probe: bool,
 
+    /// Evaluate simple discrete keys on selected PQ groups only. Selected
+    /// groups are predicted from each key; unselected groups are evaluated as
+    /// either oracle-correct or majority/default.
+    #[arg(long)]
+    address_key_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-key-group-probe.
+    #[arg(long, default_value = "0")]
+    address_key_groups: String,
+
     /// Evaluate how sensitive Mode D is to address corruption.
     ///
     /// This keeps a prefix of oracle PQ groups and replaces the rest with
@@ -288,6 +298,27 @@ struct OraclePqArgs {
     /// with its train-set majority code while all other groups remain oracle.
     #[arg(long)]
     address_group_importance: bool,
+
+    /// Fit and evaluate fixed random-hyperplane LSH probes for selected PQ
+    /// groups. The selected groups are predicted from the residual entering the
+    /// target layer; other groups are evaluated both oracle-correct and
+    /// majority/default.
+    #[arg(long)]
+    address_lsh_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-lsh-group-probe.
+    #[arg(long, default_value = "0")]
+    address_lsh_groups: String,
+
+    /// Number of LSH bits per selected group. For a 4-bit PQ group, 4 LSH bits
+    /// creates 16 buckets.
+    #[arg(long, default_value_t = 4)]
+    address_lsh_bits: usize,
+
+    /// Number of deterministic random-hyperplane seeds to try per selected
+    /// group. The best seed is selected by train code accuracy.
+    #[arg(long, default_value_t = 32)]
+    address_lsh_seeds: usize,
 
     /// Limit prompts for bounded oracle runs.
     #[arg(long)]
@@ -777,8 +808,14 @@ struct OraclePqReport {
     mode_d_check: bool,
     address_probes: bool,
     address_mixed_key_probe: bool,
+    address_key_group_probe: bool,
+    address_key_groups: Vec<usize>,
     address_corruption_sweep: bool,
     address_group_importance: bool,
+    address_lsh_group_probe: bool,
+    address_lsh_groups: Vec<usize>,
+    address_lsh_bits: usize,
+    address_lsh_seeds: usize,
     selected_heads: Vec<HeadId>,
     heads: Vec<OraclePqHeadReport>,
 }
@@ -2513,6 +2550,57 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     if configs.is_empty() {
         return Err("no PQ configs selected".into());
     }
+    let mut key_groups = parse_usize_list(&args.address_key_groups)?;
+    key_groups.sort_unstable();
+    key_groups.dedup();
+    if args.address_key_group_probe {
+        if key_groups.is_empty() {
+            return Err(
+                "--address-key-group-probe requires at least one --address-key-groups value".into(),
+            );
+        }
+        for config in &configs {
+            for &group in &key_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-key-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut lsh_groups = parse_usize_list(&args.address_lsh_groups)?;
+    lsh_groups.sort_unstable();
+    lsh_groups.dedup();
+    if args.address_lsh_group_probe {
+        if lsh_groups.is_empty() {
+            return Err(
+                "--address-lsh-group-probe requires at least one --address-lsh-groups value".into(),
+            );
+        }
+        if args.address_lsh_bits == 0 {
+            return Err("--address-lsh-bits must be greater than zero".into());
+        }
+        if args.address_lsh_bits > 16 {
+            return Err("--address-lsh-bits is capped at 16 for bounded diagnostics".into());
+        }
+        if args.address_lsh_seeds == 0 {
+            return Err("--address-lsh-seeds must be greater than zero".into());
+        }
+        for config in &configs {
+            for &group in &lsh_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-lsh-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     let mut prompts = load_prompts(&args.prompts, args.max_prompts)?;
     if let Some(max_per_stratum) = args.max_per_stratum {
         prompts = limit_prompts_per_stratum(prompts, max_per_stratum);
@@ -2583,7 +2671,8 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         HashMap::new()
     };
-    let run_address_probes = args.address_probes || args.address_mixed_key_probe;
+    let run_address_probes =
+        args.address_probes || args.address_mixed_key_probe || args.address_key_group_probe;
     let address_probe_models = if run_address_probes {
         if !args.mode_d_check {
             return Err(
@@ -2606,13 +2695,42 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         HashMap::new()
     };
+    let address_lsh_models = if args.address_lsh_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-lsh-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting LSH group address probes for groups {:?} (bits={}, seeds={})",
+            lsh_groups, args.address_lsh_bits, args.address_lsh_seeds
+        );
+        fit_address_lsh_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &lsh_groups,
+            args.address_lsh_bits,
+            args.address_lsh_seeds,
+        )?
+    } else {
+        HashMap::new()
+    };
     if args.address_corruption_sweep && !args.mode_d_check {
         return Err("--address-corruption-sweep requires --mode-d-check".into());
     }
     if args.address_group_importance && !args.mode_d_check {
         return Err("--address-group-importance requires --mode-d-check".into());
     }
-    let majority_codes = if args.address_corruption_sweep || args.address_group_importance {
+    let majority_codes = if args.address_corruption_sweep
+        || args.address_group_importance
+        || args.address_lsh_group_probe
+        || args.address_key_group_probe
+    {
         eprintln!("Fitting per-group majority codes for address diagnostics");
         fit_majority_codes_for_codebooks(
             &mut weights,
@@ -2757,44 +2875,126 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                             )
                         })?;
                     for probe_model in probe_models {
-                        let predicted_codes_by_position = (0..token_ids.len())
-                            .map(|pos| probe_model.predict_codes(&token_ids, stratum, pos))
-                            .collect::<Vec<_>>();
-                        let address_match = address_match_report(
-                            &oracle_codes_by_position,
-                            &predicted_codes_by_position,
-                        );
-                        let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
-                            &mut weights,
-                            &token_ids,
-                            &index,
-                            *head,
-                            mode_d_table,
-                            &predicted_codes_by_position,
-                        )?;
-                        let predicted_logits = final_logits(&weights, &predicted_hidden);
-                        let predicted_logp = log_softmax(&predicted_logits);
-                        let predicted_top1 = argmax(&predicted_logits);
-                        let predicted_top5 = top_k_indices(&predicted_logits, 5);
-                        accumulators
-                            .get_mut(&(*head, config))
-                            .expect("oracle PQ accumulator missing")
-                            .add_address_probe(
-                                &probe_model.name,
-                                &probe_model.selected_group_keys,
-                                AddressProbePromptReport {
-                                    id: label.to_string(),
-                                    stratum: stratum.to_string(),
-                                    kl: kl_logp(&baseline_logp, &predicted_logp),
-                                    positions: oracle_codes_by_position.len(),
-                                    groups_correct: address_match.groups_correct,
-                                    groups_total: address_match.groups_total,
-                                    exact_address_match: address_match.exact_address_match,
-                                    top1_agree: baseline_top1 == predicted_top1,
-                                    baseline_top1_in_predicted_top5: predicted_top5
-                                        .contains(&baseline_top1),
-                                },
+                        let full_probe_enabled =
+                            args.address_probes || probe_model.name == "mixed_best_simple_key";
+                        if full_probe_enabled {
+                            let predicted_codes_by_position = (0..token_ids.len())
+                                .map(|pos| probe_model.predict_codes(&token_ids, stratum, pos))
+                                .collect::<Vec<_>>();
+                            let address_match = address_match_report(
+                                &oracle_codes_by_position,
+                                &predicted_codes_by_position,
                             );
+                            let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                            )?;
+                            let predicted_logits = final_logits(&weights, &predicted_hidden);
+                            let predicted_logp = log_softmax(&predicted_logits);
+                            let predicted_top1 = argmax(&predicted_logits);
+                            let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_model.name,
+                                    &probe_model.selected_group_keys,
+                                    AddressProbePromptReport {
+                                        id: label.to_string(),
+                                        stratum: stratum.to_string(),
+                                        kl: kl_logp(&baseline_logp, &predicted_logp),
+                                        positions: oracle_codes_by_position.len(),
+                                        groups_correct: address_match.groups_correct,
+                                        groups_total: address_match.groups_total,
+                                        exact_address_match: address_match.exact_address_match,
+                                        top1_agree: baseline_top1 == predicted_top1,
+                                        baseline_top1_in_predicted_top5: predicted_top5
+                                            .contains(&baseline_top1),
+                                    },
+                                );
+                        }
+                        if args.address_key_group_probe {
+                            let group_majority =
+                                majority_codes.get(&(*head, config)).ok_or_else(|| {
+                                    format!(
+                                        "missing majority codes for key group probe L{} H{} {:?}",
+                                        head.layer, head.head, config
+                                    )
+                                })?;
+                            for (probe_name, use_oracle_rest) in [
+                                (
+                                    format!(
+                                        "{}_groups_{:?}_oracle_rest",
+                                        probe_model.name, key_groups
+                                    ),
+                                    true,
+                                ),
+                                (
+                                    format!(
+                                        "{}_groups_{:?}_majority_rest",
+                                        probe_model.name, key_groups
+                                    ),
+                                    false,
+                                ),
+                            ] {
+                                let predicted_codes_by_position = oracle_codes_by_position
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(pos, oracle_codes)| {
+                                        let mut codes = if use_oracle_rest {
+                                            oracle_codes.clone()
+                                        } else {
+                                            group_majority.clone()
+                                        };
+                                        let probe_codes =
+                                            probe_model.predict_codes(&token_ids, stratum, pos);
+                                        for &group in &key_groups {
+                                            codes[group] = probe_codes[group];
+                                        }
+                                        codes
+                                    })
+                                    .collect::<Vec<_>>();
+                                let address_match = address_match_report(
+                                    &oracle_codes_by_position,
+                                    &predicted_codes_by_position,
+                                );
+                                let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                                    &mut weights,
+                                    &token_ids,
+                                    &index,
+                                    *head,
+                                    mode_d_table,
+                                    &predicted_codes_by_position,
+                                )?;
+                                let predicted_logits = final_logits(&weights, &predicted_hidden);
+                                let predicted_logp = log_softmax(&predicted_logits);
+                                let predicted_top1 = argmax(&predicted_logits);
+                                let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                                accumulators
+                                    .get_mut(&(*head, config))
+                                    .expect("oracle PQ accumulator missing")
+                                    .add_address_probe(
+                                        &probe_name,
+                                        &probe_model.selected_group_keys,
+                                        AddressProbePromptReport {
+                                            id: label.to_string(),
+                                            stratum: stratum.to_string(),
+                                            kl: kl_logp(&baseline_logp, &predicted_logp),
+                                            positions: oracle_codes_by_position.len(),
+                                            groups_correct: address_match.groups_correct,
+                                            groups_total: address_match.groups_total,
+                                            exact_address_match: address_match.exact_address_match,
+                                            top1_agree: baseline_top1 == predicted_top1,
+                                            baseline_top1_in_predicted_top5: predicted_top5
+                                                .contains(&baseline_top1),
+                                        },
+                                    );
+                            }
+                        }
                     }
                 }
 
@@ -2849,6 +3049,88 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                             .expect("oracle PQ accumulator missing")
                             .add_address_group_importance(
                                 replaced_group,
+                                AddressProbePromptReport {
+                                    id: label.to_string(),
+                                    stratum: stratum.to_string(),
+                                    kl: kl_logp(&baseline_logp, &predicted_logp),
+                                    positions: oracle_codes_by_position.len(),
+                                    groups_correct: address_match.groups_correct,
+                                    groups_total: address_match.groups_total,
+                                    exact_address_match: address_match.exact_address_match,
+                                    top1_agree: baseline_top1 == predicted_top1,
+                                    baseline_top1_in_predicted_top5: predicted_top5
+                                        .contains(&baseline_top1),
+                                },
+                            );
+                    }
+                }
+
+                if args.address_lsh_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for LSH group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let lsh_model = address_lsh_models.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing LSH group probe model for L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for LSH group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let layer_input =
+                        capture_layer_input_hidden(&mut weights, &token_ids, &index, head.layer)?;
+                    let selected_group_keys = lsh_model.selected_group_keys();
+                    for (probe_name, use_oracle_rest) in [
+                        (
+                            format!("lsh_groups_{:?}_oracle_rest", lsh_model.groups),
+                            true,
+                        ),
+                        (
+                            format!("lsh_groups_{:?}_majority_rest", lsh_model.groups),
+                            false,
+                        ),
+                    ] {
+                        let predicted_codes_by_position = oracle_codes_by_position
+                            .iter()
+                            .enumerate()
+                            .map(|(pos, oracle_codes)| {
+                                let base_codes = if use_oracle_rest {
+                                    oracle_codes.as_slice()
+                                } else {
+                                    group_majority.as_slice()
+                                };
+                                lsh_model.predict_selected_groups(&layer_input, pos, base_codes)
+                            })
+                            .collect::<Vec<_>>();
+                        let address_match = address_match_report(
+                            &oracle_codes_by_position,
+                            &predicted_codes_by_position,
+                        );
+                        let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                        )?;
+                        let predicted_logits = final_logits(&weights, &predicted_hidden);
+                        let predicted_logp = log_softmax(&predicted_logits);
+                        let predicted_top1 = argmax(&predicted_logits);
+                        let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_probe(
+                                &probe_name,
+                                &selected_group_keys,
                                 AddressProbePromptReport {
                                     id: label.to_string(),
                                     stratum: stratum.to_string(),
@@ -3009,8 +3291,22 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
         mode_d_check: args.mode_d_check,
         address_probes: args.address_probes,
         address_mixed_key_probe: args.address_mixed_key_probe,
+        address_key_group_probe: args.address_key_group_probe,
+        address_key_groups: if args.address_key_group_probe {
+            key_groups
+        } else {
+            Vec::new()
+        },
         address_corruption_sweep: args.address_corruption_sweep,
         address_group_importance: args.address_group_importance,
+        address_lsh_group_probe: args.address_lsh_group_probe,
+        address_lsh_groups: if args.address_lsh_group_probe {
+            lsh_groups
+        } else {
+            Vec::new()
+        },
+        address_lsh_bits: args.address_lsh_bits,
+        address_lsh_seeds: args.address_lsh_seeds,
         selected_heads,
         heads: head_reports,
     };
@@ -3875,6 +4171,51 @@ impl AddressProbeModel {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AddressLshGroupModel {
+    groups: Vec<usize>,
+    bits: usize,
+    group_majority: Vec<usize>,
+    group_maps: Vec<HashMap<usize, usize>>,
+    group_seeds: Vec<u64>,
+    group_train_accuracy: Vec<f64>,
+}
+
+impl AddressLshGroupModel {
+    fn selected_group_keys(&self) -> Vec<String> {
+        (0..self.group_majority.len())
+            .map(|group| {
+                if self.groups.contains(&group) {
+                    format!(
+                        "lsh{}bits_seed{}_train_acc_{:.3}",
+                        self.bits, self.group_seeds[group], self.group_train_accuracy[group]
+                    )
+                } else {
+                    "majority".to_string()
+                }
+            })
+            .collect()
+    }
+
+    fn predict_selected_groups(
+        &self,
+        layer_input: &Array2<f32>,
+        position: usize,
+        base_codes: &[usize],
+    ) -> Vec<usize> {
+        let mut codes = base_codes.to_vec();
+        let row = layer_input.row(position);
+        for &group in &self.groups {
+            let bucket = lsh_bucket(row, self.group_seeds[group], self.bits);
+            codes[group] = self.group_maps[group]
+                .get(&bucket)
+                .copied()
+                .unwrap_or(self.group_majority[group]);
+        }
+        codes
+    }
+}
+
 fn address_probe_names() -> Vec<&'static str> {
     vec![
         "position",
@@ -3904,6 +4245,33 @@ fn address_feature_key(name: &str, token_ids: &[u32], stratum: &str, position: u
         "position_stratum_token" => format!("p:{position}|s:{stratum}|t:{token}"),
         _ => format!("p:{position}"),
     }
+}
+
+fn lsh_bucket(row: ArrayView1<'_, f32>, seed: u64, bits: usize) -> usize {
+    let mut bucket = 0usize;
+    for bit in 0..bits {
+        let mut sum = 0.0_f64;
+        for (dim, &value) in row.iter().enumerate() {
+            let hash = splitmix64(
+                seed ^ ((bit as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ ((dim as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)),
+            );
+            let sign = if hash & 1 == 0 { -1.0 } else { 1.0 };
+            sum += value as f64 * sign;
+        }
+        if sum >= 0.0 {
+            bucket |= 1usize << bit;
+        }
+    }
+    bucket
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4382,6 +4750,185 @@ fn fit_address_probe_models(
             });
         }
         models.insert((*head, *config), probe_models);
+    }
+
+    Ok(models)
+}
+
+fn fit_address_lsh_group_models(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+    bits: usize,
+    seeds: usize,
+) -> Result<HashMap<(HeadId, PqConfig), AddressLshGroupModel>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+    let mut bucket_counts: HashMap<(HeadId, PqConfig, usize, u64, usize), Vec<usize>> =
+        HashMap::new();
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  lsh-fit [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let layer_input = h.clone();
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).ok_or_else(|| {
+                        format!("missing basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let head_means = means.get(head).ok_or_else(|| {
+                        format!("missing means for L{}H{}", head.layer, head.head)
+                    })?;
+                    let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                        format!("missing PCA basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let head_codebooks = codebooks
+                        .iter()
+                        .filter(|((codebook_head, _), _)| codebook_head == head)
+                        .collect::<Vec<_>>();
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row
+                            .as_slice()
+                            .ok_or("pre-W_O head row was not contiguous during LSH address fit")?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        let input_row = layer_input.row(pos);
+                        for ((_, config), codebook) in &head_codebooks {
+                            let coords = pca_basis.coordinates_with_rank(&z, config.k);
+                            let codes = codebook.quantize_indices(&coords);
+                            let levels = 1usize << config.bits_per_group;
+                            for (group, &code) in codes.iter().enumerate() {
+                                let counts = majority_counts
+                                    .entry((*head, *config, group))
+                                    .or_insert_with(|| vec![0; levels]);
+                                counts[code] += 1;
+                            }
+                            for &group in selected_groups {
+                                let code = codes[group];
+                                for seed in 0..seeds {
+                                    let bucket = lsh_bucket(input_row, seed as u64, bits);
+                                    let counts = bucket_counts
+                                        .entry((*head, *config, group, seed as u64, bucket))
+                                        .or_insert_with(|| vec![0; levels]);
+                                    counts[code] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    let mut models = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let mut group_majority = Vec::with_capacity(config.groups);
+        for group in 0..config.groups {
+            let majority = majority_counts
+                .get(&(*head, *config, group))
+                .map(|counts| argmax_usize(counts))
+                .unwrap_or(0);
+            group_majority.push(majority);
+        }
+
+        let mut group_maps = vec![HashMap::new(); config.groups];
+        let mut group_seeds = vec![0_u64; config.groups];
+        let mut group_train_accuracy = vec![0.0; config.groups];
+        for &group in selected_groups {
+            let mut best_seed = 0_u64;
+            let mut best_accuracy = -1.0_f64;
+            let mut best_map = HashMap::new();
+            for seed in 0..seeds {
+                let seed = seed as u64;
+                let mut map = HashMap::new();
+                let mut correct = 0usize;
+                let mut total = 0usize;
+                for ((map_head, map_config, map_group, map_seed, bucket), counts) in
+                    bucket_counts.iter()
+                {
+                    if map_head == head
+                        && map_config == config
+                        && *map_group == group
+                        && *map_seed == seed
+                    {
+                        let best = argmax_usize(counts);
+                        correct += counts[best];
+                        total += counts.iter().sum::<usize>();
+                        map.insert(*bucket, best);
+                    }
+                }
+                let accuracy = if total == 0 {
+                    0.0
+                } else {
+                    correct as f64 / total as f64
+                };
+                if accuracy > best_accuracy {
+                    best_accuracy = accuracy;
+                    best_seed = seed;
+                    best_map = map;
+                }
+            }
+            group_maps[group] = best_map;
+            group_seeds[group] = best_seed;
+            group_train_accuracy[group] = best_accuracy.max(0.0);
+        }
+
+        models.insert(
+            (*head, *config),
+            AddressLshGroupModel {
+                groups: selected_groups.to_vec(),
+                bits,
+                group_majority,
+                group_maps,
+                group_seeds,
+                group_train_accuracy,
+            },
+        );
     }
 
     Ok(models)
@@ -5351,6 +5898,50 @@ fn forward_q4k_predicted_address_mode_d_head(
             .into());
         }
 
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(h)
+}
+
+fn capture_layer_input_hidden(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    target_layer: usize,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..target_layer {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            run_layer_with_ffn(
+                weights,
+                &h,
+                layer,
+                &ffn,
+                false,
+                ple_inputs.get(layer),
+                shared_kv,
+            )
+            .map(|(h_new, _, kv_out)| (h_new, kv_out))
+        };
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!("layer {layer} returned no output").into());
+        }
         remove_layer_tensors(weights, inserted);
     }
 

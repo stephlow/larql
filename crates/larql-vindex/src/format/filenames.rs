@@ -30,6 +30,15 @@ pub const DOWN_META_BIN: &str = "down_meta.bin";
 pub const DOWN_FEATURES_BIN: &str = "down_features.bin";
 pub const UP_FEATURES_BIN: &str = "up_features.bin";
 
+// ── Layer-major FFN weight files (PyTorch `nn.Linear` orientation) ────
+//
+// `[layer, intermediate, hidden]` for up and `[layer, hidden, intermediate]`
+// for down — distinct from the feature-major projection files above.
+// Written by f32 extraction, consumed by Q4_K conversion + checksumming +
+// HuggingFace upload.
+pub const UP_WEIGHTS_BIN: &str = "up_weights.bin";
+pub const DOWN_WEIGHTS_BIN: &str = "down_weights.bin";
+
 /// Feature-major Q4_K-encoded down projections (W2 of perf round-4).
 ///
 /// On-disk PyTorch `nn.Linear` orientation for down is
@@ -132,8 +141,10 @@ mod tests {
             DOWN_FEATURES_FP8_BIN,
             DOWN_FEATURES_Q4K_BIN,
             DOWN_FEATURES_Q4K_MANIFEST_JSON,
+            DOWN_WEIGHTS_BIN,
             UP_FEATURES_BIN,
             UP_FEATURES_FP4_BIN,
+            UP_WEIGHTS_BIN,
             INTERLEAVED_BIN,
             INTERLEAVED_Q4_BIN,
             INTERLEAVED_Q4K_BIN,

@@ -444,6 +444,7 @@ prior two fusions; kept opt-in for completeness.
 | + `LARQL_FUSED_QK_NORM_ROPE=1` | ~10.35 ms | -0.10 ms |
 | + `residual_norm_store` (always-on) | ~10.07 ms | -0.38 ms |
 | + `LARQL_FUSED_POST_ATTN_NORM=1` | ~10.02 ms | -0.43 ms |
+| + `LARQL_FUSED_POST_FFN_NORM=1` | **~9.67 ms** | **-0.78 ms** |
 
 **End-to-end tok/s** (Gemma 3 4B, 30 tokens, warm GPU):
 
@@ -453,7 +454,32 @@ prior two fusions; kept opt-in for completeness.
 | v5 lm_head fix (correctness) | 71-72 |
 | + 2 fusions stacked | 73 |
 | + 3 fusions stacked | 71-72 (in noise) |
+| + 4 fusions stacked (env-gated) | 74-75 |
+| **All 4 fusions default-on** (shipped 2026-05-01) | **72-74** |
 | Ollama gemma3:4b | 96-104 |
+
+**Default-on shipped state** (no env vars needed): all four fusions
+land their measured savings without flag friction. End-to-end
+~72-74 tok/s sustained, generates "Paris" correctly. Opt-out flags
+still wired (`LARQL_FUSED_QK_NORM_ROPE=0`, `LARQL_FUSED_POST_ATTN_NORM=0`,
+`LARQL_FUSED_POST_FFN_NORM=0`) for diagnostic A/B if regressions
+ever surface. The fifth fusion (Q6_K geglu+down) remains broken
+and dead-code — needs kernel-level parity test against
+`cpu/ops/q4_common::q6k_matvec` to localise the bug before re-engaging.
+
+**Fourth fusion attempt — `q6k_geglu_gelu_tanh_down_cached`** (❌ both
+the new cached kernel AND the existing production
+`q6k_geglu_gelu_tanh_down` produce wrong output on
+gemma3-4b-q4k-v2 — model collapses to "The" and stops at first decode
+step). The prior memory claim "Q6_K fused kernels are
+parity-tested" no longer holds against the current
+`interleaved_q4k.bin` layout — likely the kernel's Q6_K block-byte
+offsets drifted vs the writer in `format/weights/write_q4k` at some
+point. Real fix needs a kernel-level parity test against
+`cpu/ops/q4_common::q6k_matvec` reference on synthetic data, then a
+re-route. Kernel and pipeline kept registered as dead code; env var
+`LARQL_FUSED_Q6K_DOWN` is a no-op until the underlying bug is
+diagnosed. See `shaders/q6k_geglu_gelu_tanh_down_cached.rs`.
 
 **Remaining gap to 80 tok/s** (~3 more fusions of similar mechanic
 needed):

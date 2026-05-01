@@ -16,6 +16,12 @@ use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataValue;
 use tracing::{error, info, warn};
 
+// ── Tunables ───────────────────────────────────────────────────────────────────
+
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
 // ── Config ─────────────────────────────────────────────────────────────────────
 
 pub struct AnnounceConfig {
@@ -43,7 +49,7 @@ pub struct AnnounceConfig {
 /// Returns immediately; the task runs for the process lifetime.
 pub fn run_announce(config: AnnounceConfig) {
     tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(1);
+        let mut backoff = RECONNECT_INITIAL_BACKOFF;
         loop {
             info!(
                 join_url = %config.join_url,
@@ -54,7 +60,7 @@ pub fn run_announce(config: AnnounceConfig) {
             match try_once(&config).await {
                 Ok(()) => {
                     info!("Grid stream closed cleanly — reconnecting");
-                    backoff = Duration::from_secs(1);
+                    backoff = RECONNECT_INITIAL_BACKOFF;
                 }
                 Err(e) => {
                     warn!(
@@ -62,7 +68,7 @@ pub fn run_announce(config: AnnounceConfig) {
                         backoff.as_secs()
                     );
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                    backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
                 }
             }
         }
@@ -150,7 +156,7 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
     // Spawn the heartbeat sender.
     let tx_hb = tx.clone();
     let hb_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
             if tx_hb.send(heartbeat_message()).await.is_err() {

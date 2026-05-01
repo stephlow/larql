@@ -102,7 +102,10 @@ larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" [OPTIONS]
 | `--tls-key <PATH>` | TLS private key | — |
 
 **Environment variables for tuning the MoE remote-expert path** — see
-`README.md → Environment variables` for the full table. Most relevant:
+`README.md → Environment variables` for the full table. The names live
+in `src/env_flags.rs` (single source of truth: each `LARQL_*` is a
+`pub const` with a cached presence accessor backed by `OnceLock`).
+Most relevant:
 
 - `LARQL_MOE_NO_SPLIT=1` — opt out of gRPC streaming overlap (default-on
   for gRPC shards; ~12% loopback gain).
@@ -110,6 +113,11 @@ larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" [OPTIONS]
   vs 11 KB per call; opt-in for LAN deployments).
 - `LARQL_HTTP_TIMING=1` / `LARQL_MOE_TIMING=1` — per-call / per-token
   diagnostic timing on stderr.
+- `LARQL_NO_WARMUP=1`, `LARQL_USE_LEGACY_CPU=1`,
+  `LARQL_USE_METAL_EXPERTS=1`, `LARQL_DISABLE_METAL_EXPERTS=1`,
+  `LARQL_DISABLE_Q4K_DIRECT=1`, `LARQL_METAL_VS_CPU_DEBUG=1`,
+  `LARQL_MOE_BATCH_MODE=<par|serial|chunked>` — operational + debug
+  knobs, all defined in the same module.
 
 **Examples:**
 
@@ -835,39 +843,32 @@ $5-20/month VPS. No GPU. No Python. No CUDA drivers.
 
 ## 11. Crate Structure
 
-```
-larql-server/
-├── Cargo.toml
-├── examples/
-│   ├── server_demo.rs          Synthetic vindex API demo
-│   └── server_bench.rs         Endpoint latency benchmarks
-├── tests/
-│   └── test_api.rs             Integration tests (76 tests)
-└── src/
-    ├── main.rs                 CLI parsing, server startup
-    ├── state.rs                AppState: loaded models, probe labels, lazy weights
-    ├── auth.rs                 API key Bearer token middleware
-    ├── ratelimit.rs            Per-IP token bucket rate limiting
-    ├── cache.rs                TTL cache for DESCRIBE results
-    ├── session.rs              Per-session PatchedVindex isolation
-    ├── error.rs                ServerError → HTTP status codes
-    ├── routes/
-    │   ├── mod.rs              Router setup (single + multi-model)
-    │   ├── describe.rs         GET /v1/describe (cached, relation labels)
-    │   ├── walk.rs             GET /v1/walk (with relation labels)
-    │   ├── select.rs           POST /v1/select (relation filter)
-    │   ├── relations.rs        GET /v1/relations
-    │   ├── stats.rs            GET /v1/stats
-    │   ├── infer.rs            POST /v1/infer
-    │   ├── patches.rs          POST/GET/DELETE /v1/patches
-    │   ├── health.rs           GET /v1/health
-    │   └── models.rs           GET /v1/models
-    ├── session.rs              Per-session PatchedVindex management
-    ├── auth.rs                 API key validation middleware
-    └── error.rs                Error types → HTTP status codes
-```
+Source layout reflects the 2026-05-01 Q1 cleanup pass — see
+`crates/larql-server/README.md → Crate Structure` for the canonical
+tree. Highlights for spec readers:
 
-**Dependencies:** `larql-vindex`, `larql-inference` (for INFER), `axum`, `tokio`, `serde_json`, `tower-http` (CORS, logging)
+- `main.rs` is a thin entry point (~26 LOC). All boot orchestration
+  lives in `bootstrap.rs::serve(cli)` so the same code path can be
+  driven from integration tests without going through clap.
+- `env_flags.rs` is the single source of truth for `LARQL_*` knobs;
+  every read goes through a cached accessor (`OnceLock`) and the
+  README env-var table references the same names.
+- `wire.rs::has_content_type(headers, expected)` is the shared
+  helper used by every route that accepts both binary and JSON bodies
+  (walk-ffn, embed, expert/batch).
+- `routes/expert/` is split into seven files — `single.rs`,
+  `batch_legacy.rs`, `layer_batch.rs`, `cpu.rs`, `metal.rs`,
+  `warmup.rs`, plus a `mod.rs` that re-exports the historical public
+  surface (`run_expert`, `run_experts_cpu_batch`, `handle_*`,
+  `warmup_*`). `metal.rs` is `#[cfg(feature = "metal-experts")]`.
+- `http.rs` carries shared protocol constants:
+  `BINARY_FFN_CONTENT_TYPE`, `JSON_CONTENT_TYPE`,
+  `REQUEST_BODY_LIMIT_BYTES` (64 MB), `REQUEST_BODY_LIMIT_LARGE_BYTES`
+  (256 MB; logits payloads), `BEARER_PREFIX`.
+
+**Dependencies:** `larql-vindex`, `larql-inference` (for INFER),
+`axum`, `axum-server` (rustls), `tokio`, `tonic` + `prost` (gRPC),
+`tower` + `tower-http` (concurrency, CORS, tracing), `clap`.
 
 ---
 
