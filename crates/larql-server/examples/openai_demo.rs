@@ -1,17 +1,29 @@
 //! Live OpenAI-compat demo — boots an in-process larql server and
-//! exercises `/v1/models`, `/v1/embeddings`, `/v1/completions`
-//! end-to-end against the loaded vindex.
+//! exercises `/v1/models`, `/v1/embeddings`, `/v1/completions`,
+//! `/v1/chat/completions` end-to-end against the loaded vindex.
 //!
 //! Usage:
 //!   cargo run -p larql-server --example openai_demo -- <vindex_path>
 //!
-//! Examples:
-//!   cargo run --release -p larql-server --example openai_demo -- \
-//!     output/gemma3-4b-q4k-streaming.vindex
+//! ## Recommended vindex
 //!
-//!   # MoE (will use full path; slow on CPU, ~1-3 tok/s):
-//!   cargo run --release -p larql-server --example openai_demo -- \
-//!     output/gemma4-26b-a4b-q4k.vindex
+//! Use **f16** vindexes for the demo — the un-KV-cached generation
+//! path used by `/v1/completions` and `/v1/chat/completions` produces
+//! correct, intelligible output (e.g. "The capital of France is" → "
+//! Paris."). On Q4_K vindexes the un-cached forward pass produces
+//! degenerate output (e.g. " is is is is"); the wire shape is still
+//! correct but the content isn't useful. This is fixed when the
+//! KV-cached generation path lands (N0.2-fast in ROADMAP).
+//!
+//! ```bash
+//! # Recommended for slice 1-3 demo:
+//! cargo run --release -p larql-server --example openai_demo -- \
+//!   output/gemma3-4b-f16.vindex
+//!
+//! # Q4_K vindex: wire shape correct, content degenerate (N0.2-fast):
+//! cargo run --release -p larql-server --example openai_demo -- \
+//!   output/gemma3-4b-q4k-streaming.vindex
+//! ```
 //!
 //! Pattern mirrors `bench_embed_server` / `bench_expert_server`: build
 //! the router via `tower::ServiceExt::oneshot`, no port binding, no

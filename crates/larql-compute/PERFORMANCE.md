@@ -58,6 +58,72 @@ predate both (a) the v5 lm_head correctness fix and (b) the 2026-05
 dispatch-fusion wave. The honest current number is ~76 tok/s with
 correct output.
 
+---
+
+## Decision log
+
+Canonical reference for **what is the production default and why**. Each
+entry is self-contained: options measured, data, chosen path, rationale,
+opt-out env vars. The "Recent changes" table below remains the chronological
+log; this section is the by-topic reference.
+
+Decision blocks added here when (a) a path was chosen between ≥2 measured
+candidates, OR (b) a candidate looked promising but was deliberately not
+promoted. Both are the kind of context that tends to evaporate from PRs and
+flat changelogs.
+
+### Decision: lm_head dispatch order (2026-05-02)
+
+**Question:** which Metal lm_head kernel runs by default for a non-CPU
+backend on a Q4_K vindex with tied embeddings (`gemma3-4b-q4k-v2`)?
+
+**Options measured** (Gemma 3 4B v2, M3 Max, quiet GPU, mean of 3 runs):
+
+| Path | lm_head ms | tok/s | Correct? | Bytes read/token |
+|---|---|---|---|---|
+| `LARQL_METAL_LM_HEAD=1` (production `q4k_matvec`) | 1.47 | 87.6 | **❌ argmax drift** ("Capital" / truncates after "is:") | 327 MB |
+| **Default: stride-32 Q4_K** (`q4k_matvec_stride32`) | **2.98** | **76.0** | ✓ "**Paris**" | **327 MB** |
+| f16 GEMV (`f16_gemv` on `embeddings.bin`) | 3.88 | 71.2 | ✓ "**Paris**" | 1.31 GB |
+| f32 BLAS fallback | (slow) | — | ✓ | 2.62 GB |
+
+**Chosen:** stride-32 Q4_K first → f16 GEMV fallback → f32 BLAS last resort.
+
+**Why:**
+- `q4k_matvec` is fastest but **broken** — its 32-lane simdgroup reduction
+  drifts ~1e-3 vs CPU's sequential dot product, enough to flip top-1 on
+  close-call tokens. The drift fails the canonical "Paris" smoke and the
+  `arch_golden_gemma3_4b_gpu` test. **Same family as the historical "81–84
+  tok/s on broken Q4_K dispatch" trap; pinned in ADR-015 as the fourth
+  instance of the broken-fast pattern.**
+- f16 GEMV is **4× more bandwidth** than Q4_K (1.31 GB vs 327 MB per
+  token). On hardware where `f32_gemv` is already at LPDDR5X peak
+  (387 GB/s on M3 Max), f16 cannot win on throughput regardless of
+  saved dequant work. Bandwidth math made this predictable; the bench
+  confirmed it (-5 tok/s end-to-end when f16 was tried as the default).
+- Stride-32 Q4_K keeps the Q4_K bandwidth win **and** matches `f16_gemv`'s
+  stable reduction tree. ~2.0 ms theoretical floor (327 MB / 387 GB/s
+  + dequant + sort + readback ≈ 2.95 ms measured).
+
+**Env vars:**
+- `LARQL_LM_HEAD_STRIDE32=0` — disable stride-32; use f16 then f32. For
+  A/B against the baseline.
+- `LARQL_METAL_LM_HEAD=1` — re-enable the broken-fast `q4k_matvec`
+  path. Debug-only; produces argmax drift on canonical smoke.
+
+**Where the f16 path *does* matter:** memory footprint on 31B models —
+the f32 fallback would allocate a 5.6 GB clone of the lm_head matrix on
+load. f16 avoids that one-time setup cost without paying the per-token
+bandwidth tax (because f16 stays on the fallback chain, not the hot
+path). See `f16_gemv_wiring_todo` memo for the original motivation.
+
+**Related:**
+- `crates/larql-compute/docs/adr/015-isolated-vs-batched-kernel-perf.md`
+  — broken-fast pattern, 4 confirmed instances.
+- `crates/larql-vindex/src/index/storage/lm_head/knn.rs` —
+  `lm_head_knn_backend_skip_q4k` is the dispatch site.
+
+---
+
 **Recent changes (2026-05-01 → 2026-05-02):**
 
 | Change | Model | Effect | Notes |

@@ -300,13 +300,14 @@ fn stream_chat_completion(
     let chat_id = format!("chatcmpl-{}", new_id_suffix());
 
     tokio::task::spawn_blocking(move || {
-        let weights = match model.get_or_load_weights() {
+        let mut weights_guard = match model.lock_weights_for_gen() {
             Ok(w) => w,
             Err(e) => {
                 let _ = tx.blocking_send(error_chunk(&e));
                 return;
             }
         };
+        let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
         let template = pick_template(&model);
         let prompt = render(template, &messages);
         let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
@@ -329,50 +330,57 @@ fn stream_chat_completion(
             return;
         }
 
-        // WalkFfn through the (possibly Q4_K) index — same path the
-        // existing /v1/infer mode=walk uses, takes &ModelWeights only.
+        let _ = temperature; // accepted; layer_graph::generate is greedy.
+
         let patched = model.patched.blocking_read();
-        let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
-        let _ = temperature; // accepted; WalkFfn path is greedy.
+        let index = patched.base();
+        let backend = larql_compute::default_backend();
+        let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+        let num_layers = weights.num_layers;
 
-        let mut ids = prompt_ids;
+        // Stream tokens via generate_streaming's per-token callback.
+        // The callback fires inside the decode loop; we push each
+        // chunk into the SSE channel and bail early on disconnect.
+        let chat_id_cb = chat_id.clone();
+        let model_id_cb = model_id.clone();
+        let tx_cb = tx.clone();
+        let stop_strings_cb = stop_strings.clone();
         let mut completion_text = String::new();
-        let mut finish_reason: &'static str = "length";
-
-        for _ in 0..max_tokens {
-            let pred =
-                larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
-            let next_id = match pred.token_ids.first() {
-                Some(&id) => id,
-                None => {
-                    finish_reason = "stop";
-                    break;
+        let mut early_stop = false;
+        let result = larql_inference::layer_graph::generate_streaming(
+            weights,
+            &model.tokenizer,
+            &prompt_ids,
+            max_tokens,
+            index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
+            larql_inference::SamplingConfig::greedy(),
+            &larql_inference::EosConfig::builtin(),
+            |_id, text, _prob| {
+                if early_stop {
+                    return;
                 }
-            };
-            let next_text = pred
-                .predictions
-                .first()
-                .map(|(t, _)| t.clone())
-                .unwrap_or_default();
-            let is_eos = larql_inference::vindex::is_end_of_turn(&next_text);
+                let chunk = build_chat_chunk(&chat_id_cb, &model_id_cb, None, Some(text), None);
+                if tx_cb.blocking_send(chunk).is_err() {
+                    early_stop = true;
+                    return;
+                }
+                completion_text.push_str(text);
+                if !stop_strings_cb.is_empty() && contains_any(&completion_text, &stop_strings_cb) {
+                    early_stop = true;
+                }
+            },
+        );
 
-            let chunk = build_chat_chunk(&chat_id, &model_id, None, Some(&next_text), None);
-            if tx.blocking_send(chunk).is_err() {
-                return;
-            }
-            completion_text.push_str(&next_text);
-            ids.push(next_id);
-
-            if is_eos {
-                finish_reason = "stop";
-                break;
-            }
-            if !stop_strings.is_empty() && contains_any(&completion_text, &stop_strings) {
-                finish_reason = "stop";
-                break;
-            }
-        }
-
+        // Final-chunk finish reason: layer_graph::generate halts on
+        // EOS internally; tokens.len() < max_tokens implies stop.
+        let finish_reason: &'static str = if early_stop || result.tokens.len() < max_tokens {
+            "stop"
+        } else {
+            "length"
+        };
         let final_chunk = build_chat_chunk(&chat_id, &model_id, None, None, Some(finish_reason));
         let _ = tx.blocking_send(final_chunk);
     });
@@ -427,9 +435,14 @@ fn run_chat_completion(
     temperature: f32,
     stop_strings: &[String],
 ) -> Result<(String, &'static str, usize, usize), ServerError> {
-    let weights = model
-        .get_or_load_weights()
+    // Take an exclusive write guard on the weights for the duration
+    // of generation. `larql_inference::layer_graph::generate` mutates
+    // `weights.tensors` (the per-layer Q4_K dequant cache), so other
+    // read paths block while one chat completion runs.
+    let mut weights_guard = model
+        .lock_weights_for_gen()
         .map_err(ServerError::InferenceUnavailable)?;
+    let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
 
     let template = pick_template(model);
     let prompt = render(template, messages);
@@ -445,44 +458,38 @@ fn run_chat_completion(
         ));
     }
     let prompt_token_count = prompt_ids.len();
+    let _ = temperature; // accepted; layer_graph::generate is greedy.
 
     let patched = model.patched.blocking_read();
-    let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
-    let _ = temperature; // accepted; WalkFfn path is greedy by construction.
+    let index = patched.base();
+    let backend = larql_compute::default_backend();
+    let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+    let num_layers = weights.num_layers;
+    let result = larql_inference::layer_graph::generate(
+        weights,
+        &model.tokenizer,
+        &prompt_ids,
+        max_tokens,
+        index,
+        &*backend,
+        &cached_layers,
+        0..num_layers,
+    );
 
-    let mut ids = prompt_ids;
     let mut completion_text = String::new();
     let mut completion_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
-
-    for _ in 0..max_tokens {
-        let pred = larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
-        let next_id = match pred.token_ids.first() {
-            Some(&id) => id,
-            None => {
-                finish_reason = "stop";
-                break;
-            }
-        };
-        let next_text = pred
-            .predictions
-            .first()
-            .map(|(t, _)| t.clone())
-            .unwrap_or_default();
-        let is_eos = larql_inference::vindex::is_end_of_turn(&next_text);
-        completion_text.push_str(&next_text);
+    for (text, _prob) in &result.tokens {
+        completion_text.push_str(text);
         completion_token_count += 1;
-        ids.push(next_id);
-
-        if is_eos {
+        if larql_inference::vindex::is_end_of_turn(text) {
             finish_reason = "stop";
             break;
         }
-        if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
-            completion_text = trim_at_stop(&completion_text, stop_strings);
-            finish_reason = "stop";
-            break;
-        }
+    }
+    if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
+        completion_text = trim_at_stop(&completion_text, stop_strings);
+        finish_reason = "stop";
     }
 
     Ok((
@@ -503,8 +510,10 @@ fn pick_template(model: &LoadedModel) -> larql_inference::prompt::ChatTemplate {
     use larql_inference::prompt::ChatTemplate;
     // Prefer the architecture's family signal when weights are loaded;
     // fall back to id heuristics when weights haven't been touched yet.
-    if let Some(weights) = model.weights.get() {
-        return ChatTemplate::for_family(weights.arch.family());
+    if let Some(cell) = model.weights.get() {
+        if let Ok(weights) = cell.read() {
+            return ChatTemplate::for_family(weights.arch.family());
+        }
     }
     ChatTemplate::for_model_id(&model.id)
 }

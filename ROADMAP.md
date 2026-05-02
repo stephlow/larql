@@ -78,6 +78,28 @@ Detail in `larql-inference/ROADMAP.md` § Mechanistic hooks (lazarus parity).
 
 ---
 
+## P1 — Research stack promotion: OV/RD → engine primitives
+
+Driver: make LARQL one of the strongest practical mechanistic
+interpretability stacks by promoting reusable experiment plumbing into
+stable engine APIs, while leaving fast-moving hypotheses in
+`larql dev ov-rd` and Python artifact analysis.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| R1 | Promote Q4K per-layer tensor insertion/removal from `ov_rd` into `larql-inference::vindex` | larql-inference | shipped |
+| R2 | Add Q4K hidden forward with `LayerHook`/intervention support | larql-inference | shipped |
+| R3 | Add pre-W_O capture/replacement hook adapters so experiments stop manually driving full layer loops | larql-inference | shipped |
+| R4 | Define a compact research trace artifact contract for prompt ids, tokens, layer inputs, pre-W_O rows, oracle codes, logits, and metrics | larql-inference + larql-cli | planned |
+| R5 | Keep PQ/address/codebook experiments in `larql dev ov-rd`; move only stable runtime contracts into engines | larql-cli | ongoing |
+
+Rule of thumb: engine code owns reusable capture/intervention/runtime
+primitives; `ov_rd` owns experiment orchestration, PQ variants, address
+probes, and report schemas until a runtime contract survives repeated
+experiments.
+
+---
+
 ## Critical path (P0 — what blocks the demo)
 
 Items in order. Each depends on the one above it.

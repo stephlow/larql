@@ -2,6 +2,32 @@
 
 ## Current: 72–75 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-02) | Ollama: ~96–104 tok/s | 4 KV engines
 
+## Open: Mechanistic research engine surface — Q4K interventions for OV/RD
+
+**Status**: In progress as of 2026-05-02.
+
+The existing CPU hook system (`forward::LayerHook`,
+`trace_forward_full_hooked`, `RecordHook`, `ZeroAblateHook`,
+`SteerHook`) is good for dense in-memory weights. The OV/RD work showed
+the next reusable boundary: Q4K/vindex-backed research passes need the
+same capture/intervention semantics without each CLI experiment manually
+dequantising layers and driving the full forward loop.
+
+Promotion plan:
+
+| # | Item | Status |
+|---|------|--------|
+| R1 | Public Q4K layer tensor insertion/removal helpers in `vindex::q4k_forward` | shipped |
+| R2 | Q4K hidden forward that accepts `LayerHook` for pre-layer/post-attention/post-layer interventions | shipped |
+| R3 | Pre-W_O capture/replacement adapters over the existing attention-block primitives | shipped |
+| R4 | Research trace export contract for prompt ids, tokens, layer-input rows, pre-W_O rows, logits, and metrics | planned |
+
+Keep PQ codebooks, Mode-D table fitting, address probes, and
+code-stability diagnostics in `larql dev ov-rd` until their artifact and
+runtime contracts are stable.
+
+---
+
 ## ✅ Metal lm_head — stride-32 Q4_K matvec, f16 GEMV fallback (correctness + perf fix, 2026-05-01)
 
 Gemma 3 4B Metal end-to-end was producing the wrong continuation

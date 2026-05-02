@@ -444,7 +444,8 @@ fn grpc_infer(
     model: &crate::state::LoadedModel,
     req: &InferRequest,
 ) -> Result<InferResponse, Status> {
-    let weights = model.get_or_load_weights().map_err(Status::unavailable)?;
+    let weights_guard = model.get_or_load_weights().map_err(Status::unavailable)?;
+    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let encoding = model
         .tokenizer
@@ -665,9 +666,10 @@ fn grpc_walk_ffn_full_output(
     use larql_inference::ffn::FfnBackend;
     use larql_vindex::ndarray::Array2;
 
-    let weights = model
+    let weights_guard = model
         .get_or_load_weights()
         .map_err(Status::failed_precondition)?;
+    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let patched = model.patched.blocking_read();
     let walk_ffn = larql_inference::vindex::WalkFfn::new_unlimited(weights, &*patched);

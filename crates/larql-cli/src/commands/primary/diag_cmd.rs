@@ -16,7 +16,6 @@
 //! looks fine on paper but the GPU phase is 2× slower than expected."
 
 use clap::Args;
-use std::path::PathBuf;
 
 use crate::commands::primary::cache;
 
@@ -234,25 +233,67 @@ fn resolve_lm_head_path(
 ) -> Vec<PathDecision> {
     let has_q4_data = index.has_lm_head_q4();
     let q4_ready = backend.has_q4() && has_q4_data && index.vocab_size > 0;
-    let f16_ready = !q4_ready && index.has_lm_head_f16() && index.vocab_size > 0;
-    let knn_ready = !q4_ready && !f16_ready && index.has_lm_head();
-    let bls_fallback = !q4_ready && !f16_ready && !knn_ready;
+    let f16_ready = index.has_lm_head_f16() && index.vocab_size > 0;
+    let is_non_cpu_backend =
+        backend.as_any().type_id() != std::any::TypeId::of::<larql_compute::CpuBackend>();
+    let stable_lm_head = is_non_cpu_backend && std::env::var("LARQL_METAL_LM_HEAD").is_err();
+    let stride32_env = std::env::var("LARQL_LM_HEAD_STRIDE32").unwrap_or_default();
+    let stride32_first = matches!(stride32_env.as_str(), "1" | "true" | "on" | "yes");
+    let stride32_disabled = matches!(stride32_env.as_str(), "0" | "false" | "off" | "no");
+
+    let q4_will_fire = q4_ready && !stable_lm_head;
+    let stride32_first_will_fire = stable_lm_head && stride32_first && q4_ready;
+    let f16_will_fire = if stable_lm_head {
+        !stride32_first_will_fire && f16_ready
+    } else {
+        !q4_will_fire && f16_ready
+    };
+    let stride32_fallback_will_fire = stable_lm_head
+        && !stride32_first_will_fire
+        && !f16_will_fire
+        && !stride32_disabled
+        && q4_ready;
+    let knn_ready = !q4_will_fire
+        && !stride32_first_will_fire
+        && !f16_will_fire
+        && !stride32_fallback_will_fire
+        && index.has_lm_head();
+    let bls_fallback = !q4_will_fire
+        && !stride32_first_will_fire
+        && !f16_will_fire
+        && !stride32_fallback_will_fire
+        && !knn_ready;
 
     vec![
         PathDecision {
-            label: "Q4 matvec (Metal fast)",
-            will_fire: q4_ready,
+            label: "Q4 matvec (fast)",
+            will_fire: q4_will_fire,
             note: format!(
-                "lm_head_q4 mmap/synth = {}, backend.has_q4 = {}, vocab_size > 0 = {}  → ~1.9 ms",
+                "lm_head_q4 mmap/synth = {}, backend.has_q4 = {}, stable override = {}  → opt-in with LARQL_METAL_LM_HEAD=1 on Metal",
                 has_q4_data,
                 backend.has_q4(),
-                index.vocab_size > 0,
+                stable_lm_head,
+            ),
+        },
+        PathDecision {
+            label: "Q4 stride32 stable",
+            will_fire: stride32_first_will_fire || stride32_fallback_will_fire,
+            note: format!(
+                "available = {}, mode = {}  → stable Q4 fallback / A-B path",
+                q4_ready,
+                if stride32_first {
+                    "first"
+                } else if stride32_disabled {
+                    "disabled"
+                } else {
+                    "fallback"
+                },
             ),
         },
         PathDecision {
             label: "f16 gemv (tied embed)",
-            will_fire: f16_ready,
-            note: format!("lm_head_f16 mmap = {}  → ~3-5 ms", index.has_lm_head_f16()),
+            will_fire: f16_will_fire,
+            note: format!("lm_head_f16 mmap = {}  → stable default on Metal", index.has_lm_head_f16()),
         },
         PathDecision {
             label: "f32 KNN (lm_head.bin)",
@@ -349,8 +390,6 @@ fn human_size(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
-
-use larql_compute::ComputeBackend as _;
 
 #[cfg(test)]
 mod tests {

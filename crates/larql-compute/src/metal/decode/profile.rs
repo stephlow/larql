@@ -7,14 +7,24 @@
 //! `LARQL_PROFILE_SPLIT=1`) can request per-stage timing without
 //! a parallel decode path.
 //!
-//! Today the implementation is **whole-token only** — the per-stage
-//! split (attn vs gate+up vs down) requires threading commit/wait
-//! boundaries through `decode_token_with_moe_fn` so each Metal stage
-//! contributes its own wall time. That's the next step. Until then,
-//! the `attn_ms` field carries the whole-token cost and the other
-//! two fields are zero, which mirrors what
-//! `decode_token_split_profile` reports on the trait today — but
-//! without the 567-LOC duplicate decode path that delivered it.
+//! Implementation (2026-05-02): when `LARQL_PROFILE_SPLIT=1` (or
+//! `LARQL_DECODE_STAGE_TIMING=1`) is set, `decode_token_with_moe_split_fn`
+//! inserts paired commit/wait boundaries between the attention block and
+//! the FFN block on every layer. The resulting per-stage GPU times land
+//! in a thread-local cell so [`MetalBackend::decode_token_split_profile`]
+//! can read them back.
+//!
+//! Granularity today is **attention vs full FFN block**:
+//! - `attn_ms` — Steps 1.5–5: QK-norm + RoPE + V-norm + KV append/attend
+//!   + O proj + post-attn residual + ffn-input norm.
+//! - `gate_up_ms` — the **entire FFN block**: gate + up + activation
+//!   (GEGLU/SiLU) + down + post-FFN residual.
+//! - `down_ms` — **0 for now**, reserved for the next-finer split that
+//!   breaks `encode_ffn_step` into `gate_up` and `down` phases.
+//!
+//! Cost: ~2 commit/waits per layer × 34 = ~68/token of cmd-buffer
+//! overhead (~2–3 ms on M3 Max). This is measurement-only mode; the
+//! production decode path is unchanged when the env var is unset.
 
 /// Per-stage wall-clock decode timings in milliseconds.
 ///
@@ -33,6 +43,36 @@ pub struct ProfileTimings {
     /// Wall time for the FFN down projection + post-FFN residual + scalar.
     /// Zero today.
     pub down_ms: f64,
+}
+
+/// True iff `LARQL_PROFILE_SPLIT=1` (or the legacy alias
+/// `LARQL_DECODE_STAGE_TIMING=1`) is set in the environment. Decode
+/// honours either flag for paired-commit per-stage profiling.
+pub fn split_profile_requested() -> bool {
+    std::env::var("LARQL_PROFILE_SPLIT").is_ok()
+        || std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok()
+}
+
+thread_local! {
+    /// Most recent per-stage timing recorded by
+    /// `decode_token_with_moe_split_fn` when `LARQL_PROFILE_SPLIT=1`.
+    /// `decode_token_split_profile` reads back from this cell.
+    static LAST_SPLIT_TIMINGS: std::cell::Cell<Option<ProfileTimings>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Store the latest per-stage timing for the current thread. Called by
+/// `decode_token_with_moe_split_fn` at the end of a token when
+/// [`split_profile_requested`] returned true.
+pub(crate) fn store_last_split_timings(t: ProfileTimings) {
+    LAST_SPLIT_TIMINGS.with(|cell| cell.set(Some(t)));
+}
+
+/// Take and clear the most recent per-stage timing recorded on the
+/// current thread. Returns `None` if `LARQL_PROFILE_SPLIT` was not set
+/// for the most recent decode call.
+pub fn take_last_split_timings() -> Option<ProfileTimings> {
+    LAST_SPLIT_TIMINGS.with(|cell| cell.take())
 }
 
 impl ProfileTimings {

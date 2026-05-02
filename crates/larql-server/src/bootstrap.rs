@@ -194,6 +194,40 @@ pub fn load_single_vindex(
                 "  Down features Q4K: loaded (W2 — per-feature decode skips q4k_ffn_layer cache)"
             );
         }
+
+        // For inference-capable vindexes (`/v1/completions`,
+        // `/v1/chat/completions`, `/v1/infer mode=walk`), load the
+        // attention + interleaved-FFN slices the inference path needs.
+        // Mirrors `larql_inference::open_inference_vindex` — without
+        // these the Q4K decode panics with "attn Q4K slices missing".
+        if !opts.no_infer && !opts.ffn_only && has_weights {
+            if path.join(LM_HEAD_BIN).is_file() {
+                let _ = index.load_lm_head(&path);
+            }
+            if path.join(LM_HEAD_Q4_BIN).is_file() {
+                let _ = index.load_lm_head_q4(&path);
+            }
+            if path.join(ATTN_WEIGHTS_Q4K_BIN).is_file() {
+                if let Err(e) = index.load_attn_q4k(&path) {
+                    warn!("  Attn Q4K: failed to load ({e}) — generation may not work");
+                } else {
+                    info!("  Attn Q4K: loaded (inference path enabled)");
+                }
+            } else if path.join(ATTN_WEIGHTS_Q8_BIN).is_file() {
+                if let Err(e) = index.load_attn_q8(&path) {
+                    warn!("  Attn Q8: failed to load ({e}) — generation may not work");
+                }
+            }
+            if path.join(INTERLEAVED_Q4K_BIN).is_file() {
+                if let Err(e) = index.load_interleaved_q4k(&path) {
+                    warn!("  Interleaved Q4K: failed to load ({e})");
+                }
+            } else if path.join(INTERLEAVED_Q4_BIN).is_file() {
+                if let Err(e) = index.load_interleaved_q4(&path) {
+                    warn!("  Interleaved Q4: failed to load ({e})");
+                }
+            }
+        }
     }
 
     if opts.ffn_only || opts.embed_only {
@@ -286,7 +320,6 @@ pub fn load_single_vindex(
         embed_store,
         release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
-        gen_lock: tokio::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         expert_filter: opts.expert_filter,

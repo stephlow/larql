@@ -91,28 +91,26 @@ const GOLDENS: &[Golden] = &[
     // geometry constants and silently dropped 75 % of vocab rows; CPU
     // and Metal goldens diverged because of that bug.
     //
-    // 2026-05-01: Metal lm_head now routes through the **stride-32
-    // Q4_K matvec** path (`shaders/q4k_matvec_stride32.rs`) by default
+    // 2026-05-02: Metal lm_head now routes through the **f16 GEMV**
+    // tied-embedding path by default
     // (`lm_head_topk` `prefer_cpu` branch in
     // `layer_graph/generate/lm_head.rs` calls
-    // `index.lm_head_knn_backend_skip_q4k(..., backend)`, which tries
-    // `backend.q4k_matvec_stride32` first, then f16 GEMV, then f32
-    // BLAS). Reason: the production `q4k_matvec` 32-lane simdgroup
+    // `index.lm_head_knn_backend_skip_q4k(..., backend)`, which tries f16
+    // GEMV first, then stride-32 Q4_K, then f32 BLAS). Reason: the
+    // production `q4k_matvec` 32-lane simdgroup
     // reduction with `lane & 1u` block split drifts ~1e-3 vs CPU's
     // sequential accumulator — enough to flip top-1 on close-call
     // tokens (e.g. " Capital" vs " capital" at decode step 1 on
-    // Gemma 3 4B — see `arch_golden_gemma3_4b_gpu`). The stride-32
-    // variant uses the same Q4_K bytes but lane `k` accumulates
-    // stride-32 elements followed by `simd_sum` — a reduction tree
-    // bit-equivalent to `f16_gemv`'s, converging on CPU rankings up
-    // to ~ULP noise (top-1 logit within ~1e-7 relative).
+    // Gemma 3 4B — see `arch_golden_gemma3_4b_gpu`). The f16 path keeps
+    // the stable reduction tree while avoiding the stride-32 Q4 correctness
+    // tax measured in the decode profile.
     //
     // The Metal pins below match CPU pins at top-5 set+order; top-1
     // logits differ by ~1e-3 (round-off, well inside `LOGIT_TOLERANCE`).
     // Opt back into the production Q4_K Metal path with
     // `LARQL_METAL_LM_HEAD=1` (faster ~1ms but flips top-1 on close
-    // calls); opt out of stride-32 to f16 GEMV with
-    // `LARQL_LM_HEAD_STRIDE32=0` (correct rank-1 but ~1ms slower).
+    // calls); force the stride-32 stable-Q4 path before f16 with
+    // `LARQL_LM_HEAD_STRIDE32=1`.
     //
     // The non-gemma3 Metal pins below (gemma4-31b dense, gemma4-31b
     // Q6_K down, llama2-7b, mistral-7b) still reflect older fix
@@ -124,12 +122,8 @@ const GOLDENS: &[Golden] = &[
         arch_name: "gemma3-4b-it",
         vindex_name: "gemma3-4b-q4k-v2",
         backend: "metal",
-        // Metal stride-32 Q4_K matvec (`q4k_matvec_stride32` shader):
-        // same top-5 set + order as CPU, top-1 logit within ~7e-4 abs
-        // (~2e-7 relative). The stride-32 reduction tree closely
-        // mirrors `f16_gemv`'s and converges on CPU's f32 BLAS result
-        // up to round-off — much tighter than the original v3/v4
-        // (Metal f32/f16 GEMV) paths.
+        // Metal f16 GEMV tied-embedding path: same top-5 set + order as
+        // CPU, top-1 logit within ~7e-4 abs (~2e-7 relative).
         top5_token_ids: [256240, 250251, 256331, 249309, 212287],
         top1_logit: 3693.571045,
     },
@@ -192,8 +186,8 @@ const GOLDENS: &[Golden] = &[
         arch_name: "gemma3-4b-it (Q4_K down)",
         vindex_name: "gemma3-4b-q4k-downq4k",
         backend: "metal",
-        // Metal stride-32 Q4_K matvec: bit-equivalent top-5 set + order
-        // to CPU, top-1 logit within ~7e-3 abs (~5e-7 relative).
+        // Metal f16 GEMV tied-embedding path: bit-equivalent top-5 set
+        // + order to CPU, top-1 logit within ~7e-3 abs (~5e-7 relative).
         top5_token_ids: [250251, 256240, 253044, 212287, 250492],
         top1_logit: 14667.830078,
     },

@@ -48,10 +48,11 @@ fn compute_residuals(
         return Vec::new();
     }
 
-    let weights = match model.get_or_load_weights() {
+    let weights_guard = match model.get_or_load_weights() {
         Ok(w) => w,
         Err(_) => return Vec::new(),
     };
+    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let prompt = format!(
         "The {} of {} is",

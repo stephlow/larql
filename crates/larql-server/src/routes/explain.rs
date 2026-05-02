@@ -92,9 +92,10 @@ fn explain_infer(
 ) -> Result<serde_json::Value, ServerError> {
     let start = std::time::Instant::now();
 
-    let weights = model
+    let weights_guard = model
         .get_or_load_weights()
         .map_err(ServerError::InferenceUnavailable)?;
+    let weights: &larql_inference::ModelWeights = &weights_guard;
     let encoding = model
         .tokenizer
         .encode(req.prompt.as_str(), true)

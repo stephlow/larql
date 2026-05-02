@@ -51,25 +51,17 @@ pub struct LoadedModel {
     /// `--layers START-END` sharding when available.
     pub release_mmap_after_request: bool,
     /// Model weights, lazy-loaded on first INFER request.
-    pub weights: std::sync::OnceLock<ModelWeights>,
-    /// Serializes the OpenAI-compat generation path
-    /// (`/v1/completions`, `/v1/chat/completions`).
     ///
-    /// `larql_inference::layer_graph::generate` requires
-    /// `&mut ModelWeights` because the per-layer Q4_K dequant cache
-    /// inside `weights.tensors` is mutated as layers are decoded.
-    /// `OnceLock` only exposes `&T` once filled, so the OpenAI handlers
-    /// take this lock and use a controlled `unsafe` cast to obtain
-    /// `&mut`. Holding the lock guarantees no concurrent OpenAI
-    /// generation request mutates the same map.
+    /// Wrapped in `RwLock` so the OpenAI generation path (which calls
+    /// `larql_inference::layer_graph::generate` and friends, all of
+    /// which take `&mut ModelWeights` to mutate the per-layer Q4_K
+    /// dequant cache) can take a write guard while every other read
+    /// path concurrently holds read guards. Read access is the common
+    /// case; write access is one-at-a-time per model.
     ///
-    /// Concurrent /v1/infer / /v1/walk-ffn read paths do **not** take
-    /// this lock (they pre-existed the openai work and use
-    /// `&ModelWeights` paths that don't touch the dequant cache the
-    /// same way). For typical single-user demo and small-shop traffic
-    /// this is fine; production-grade fix is N0.2-fast in the roadmap
-    /// (move all weights access behind a `RwLock`).
-    pub gen_lock: tokio::sync::Mutex<()>,
+    /// `OnceLock<RwLock<...>>` rather than `RwLock<Option<...>>` so
+    /// the lazy-init logic stays lock-free until first use.
+    pub weights: std::sync::OnceLock<std::sync::RwLock<ModelWeights>>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
@@ -110,9 +102,35 @@ impl LoadedModel {
     /// + embed entries from the weight manifest before mmap/decode,
     ///   so peak RSS during load reflects only what the walk-ffn
     ///   endpoint actually needs.
-    pub fn get_or_load_weights(&self) -> Result<&ModelWeights, String> {
-        if let Some(w) = self.weights.get() {
-            return Ok(w);
+    pub fn get_or_load_weights(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, ModelWeights>, String> {
+        let cell = self.ensure_weights_cell()?;
+        cell.read()
+            .map_err(|e| format!("weights RwLock poisoned: {e}"))
+    }
+
+    /// Acquire an exclusive write guard on the loaded weights.
+    ///
+    /// Used by the OpenAI generation path (`/v1/completions`,
+    /// `/v1/chat/completions`) — `larql_inference::layer_graph::generate`
+    /// and its variants take `&mut ModelWeights` because the per-layer
+    /// Q4_K dequant cache inside `weights.tensors` is mutated as layers
+    /// are decoded. Concurrent reads block while a generation is in
+    /// flight, but generation requests are typically rare and bounded;
+    /// the read fast path (walk-ffn / browse / embed) sees no
+    /// contention in steady state.
+    pub fn lock_weights_for_gen(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ModelWeights>, String> {
+        let cell = self.ensure_weights_cell()?;
+        cell.write()
+            .map_err(|e| format!("weights RwLock poisoned: {e}"))
+    }
+
+    fn ensure_weights_cell(&self) -> Result<&std::sync::RwLock<ModelWeights>, String> {
+        if let Some(cell) = self.weights.get() {
+            return Ok(cell);
         }
         let mut cb = larql_vindex::SilentLoadCallbacks;
 
@@ -144,12 +162,6 @@ impl LoadedModel {
                     skip_ffn: true,
                 }
             } else {
-                // --ffn-only server: skip the f32 hidden-major FFN tensors
-                // (up_weights.bin / down_weights.bin). The walk-ffn endpoint uses
-                // `WalkFfn::walk_ffn_full_mmap` which reads from the feature-major
-                // mmap (up_features.bin / down_features.bin via VectorIndex), not
-                // from `weights.tensors`. Decoding up_weights.bin into f32 heap
-                // costs ~3.4 GB on 4B / ~14 GB on 31B for zero benefit.
                 if self.ffn_only {
                     tracing::info!(
                         "ffn-only: skipping attn + ffn + lm_head + embed at load \
@@ -166,7 +178,7 @@ impl LoadedModel {
             larql_vindex::load_model_weights_with_opts(&self.path, &mut cb, opts)
                 .map_err(|e| format!("failed to load model weights: {e}"))?
         };
-        let _ = self.weights.set(weights);
+        let _ = self.weights.set(std::sync::RwLock::new(weights));
         Ok(self.weights.get().unwrap())
     }
 }
@@ -353,7 +365,6 @@ mod loaded_model_tests {
             embed_store: None,
             release_mmap_after_request: release_mmap,
             weights: std::sync::OnceLock::new(),
-            gen_lock: tokio::sync::Mutex::new(()),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             expert_filter: None,

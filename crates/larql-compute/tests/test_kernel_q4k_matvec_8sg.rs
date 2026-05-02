@@ -8,6 +8,7 @@ extern crate blas_src;
 
 use larql_compute::cpu::ops::q4_common::quantize_q4_k;
 use larql_compute::metal::MetalBackend;
+use larql_compute::prelude::*;
 use std::ffi::c_void;
 
 fn synth(len: usize, seed: u64) -> Vec<f32> {
@@ -18,6 +19,46 @@ fn synth(len: usize, seed: u64) -> Vec<f32> {
             ((s >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
         })
         .collect()
+}
+
+#[test]
+fn q4k_matvec_stride32_matches_cpu() {
+    let metal = match MetalBackend::new() {
+        Some(m) => m,
+        None => return,
+    };
+
+    let n = 17usize;
+    let k = 512usize;
+
+    let w = synth(n * k, 81);
+    let x = synth(k, 83);
+    let w_q4k = quantize_q4_k(&w);
+
+    let cpu = larql_compute::CpuBackend;
+    let cpu_out = cpu
+        .q4k_matvec(&w_q4k, &x, n, k)
+        .expect("CPU q4k matvec should be available");
+
+    use larql_compute::metal::shaders::q4k_matvec_stride32 as p;
+    let metal_out = dispatch(
+        &metal,
+        &metal.q4k_matvec_stride32_pipeline.state,
+        p::ROWS_PER_TG,
+        p::THREADS_PER_TG,
+        &w_q4k,
+        &x,
+        n,
+        k,
+    );
+
+    for (i, (a, b)) in cpu_out.iter().zip(&metal_out).enumerate() {
+        let diff = (a - b).abs();
+        assert!(
+            diff < 0.5,
+            "q4k_matvec_stride32 row {i}: cpu={a} metal={b} diff={diff}"
+        );
+    }
 }
 
 fn dispatch(

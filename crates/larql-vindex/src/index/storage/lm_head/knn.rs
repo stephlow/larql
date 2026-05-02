@@ -9,6 +9,21 @@
 
 use crate::index::core::VectorIndex;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stride32Mode {
+    Disabled,
+    Fallback,
+    First,
+}
+
+fn lm_head_stride32_mode() -> Stride32Mode {
+    match std::env::var("LARQL_LM_HEAD_STRIDE32") {
+        Ok(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes") => Stride32Mode::First,
+        Ok(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Stride32Mode::Disabled,
+        _ => Stride32Mode::Fallback,
+    }
+}
+
 impl VectorIndex {
     /// KNN against lm_head via a ComputeBackend. Tries paths in order:
     ///   1. Q4 matvec on `lm_head_q4.bin` (when present and backend has q4).
@@ -63,109 +78,81 @@ impl VectorIndex {
         }
         // 2. f16 path — tied-embed Gemma, ~2× the bandwidth of Q4 but still
         //    half of f32 and avoids a 5.6 GB heap allocation on 31B.
-        if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
-            let vocab = self.vocab_size;
-            let hidden = self.hidden_size;
-            if vocab > 0 {
-                let expected = vocab * hidden * 2;
-                if f16_mmap.len() >= expected {
-                    if let Some(x) = query.as_slice() {
-                        if top_k == 1 {
-                            if let Some((idx, score)) =
-                                backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
-                            {
-                                return vec![(idx, score)];
-                            }
-                        } else if let Some(hits) =
-                            backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
-                        {
-                            if !hits.is_empty() {
-                                return hits;
-                            }
-                        }
-                        if let Some(scores_vec) =
-                            backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
-                        {
-                            return Self::top_k_sorted(scores_vec, top_k);
-                        }
-                    }
-                }
-            }
+        if let Some(hits) = self.lm_head_f16_backend_hits(query, top_k, backend) {
+            return hits;
         }
         // 3. f32 BLAS fallback.
         self.lm_head_knn(query, top_k)
     }
 
     /// Same as `lm_head_knn_backend` but skips the **production**
-    /// `q4k_matvec` path (path 1 of the canonical chain) and tries
+    /// `q4k_matvec` path (path 1 of the canonical chain) — its 32-lane
+    /// simdgroup reduction drifts ~1e-3 vs CPU's sequential dot product,
+    /// which is enough to flip top-1 on close-call tokens (e.g.
+    /// " Capital" vs " capital" at decode step 1 of Gemma 3 4B). Tries
     /// stable-reduction alternatives in this order:
     ///
-    ///   1. Stride-32 Q4_K matvec (`backend.q4k_matvec_stride32`) on
+    ///   1. **Stride-32 Q4_K matvec** (`backend.q4k_matvec_stride32`) on
     ///      the same Q4_K bytes — same bandwidth as production
-    ///      `q4k_matvec`, but with `f16_gemv`'s reduction tree.
-    ///   2. f16 GEMV on `embeddings.bin` mmap (tied-embed only) —
-    ///      bigger read (1.3 GB vs 330 MB Q4_K) but always stable.
+    ///      `q4k_matvec` (~327 MB/token read), but with `f16_gemv`'s
+    ///      reduction tree. **Default first attempt** because Q4_K is
+    ///      4× cheaper bandwidth than f16 (327 MB vs 1.31 GB). Measured
+    ///      lm_head 2.95 ms vs f16 3.88 ms on Gemma 3 4B v2.
+    ///   2. f16 GEMV on `embeddings.bin` mmap (tied-embed only).
+    ///      Fallback for vindexes that don't have Q4_K lm_head bytes.
+    ///      Also reachable as the first attempt via the legacy
+    ///      `LARQL_LM_HEAD_STRIDE32=0` opt-out (kept for diagnostic A/B).
     ///   3. f32 BLAS fallback (`lm_head_knn`).
     ///
-    /// Why: Metal's production `q4k_matvec` 32-lane simdgroup reduction
-    /// (`shaders/q4k_matvec.rs::ix = lane & 1u`) drifts ~1e-3 vs CPU's
-    /// sequential dot product. On a 262K-vocab × 2560-hidden matvec
-    /// that's enough to flip top-1 on close-call tokens (e.g.
-    /// " Capital" vs " capital" at decode step 1 of Gemma 3 4B — see
-    /// `arch_golden_gemma3_4b_gpu`). The stride-32 variant
-    /// (`shaders/q4k_matvec_stride32.rs`) keeps the Q4_K bandwidth win
-    /// while matching `f16_gemv`'s stable reduction.
+    /// Decision history (2026-05-02): the f16-first ordering was tried
+    /// briefly and regressed lm_head 2.95 → 3.88 ms (-5 tok/s end-to-end)
+    /// on Gemma 3 4B because the 4× bandwidth difference dominates any
+    /// dequant savings — both kernels were already near LPDDR5X peak
+    /// (387 GB/s) for f32_gemv. See `PERFORMANCE.md` "Decision: lm_head
+    /// dispatch order".
+    ///
+    /// Env-var overrides:
+    ///   - `LARQL_LM_HEAD_STRIDE32=0` — disable stride-32 entirely; goes
+    ///     straight to f16 (then f32). Use to A/B the stride-32 win.
+    ///   - `LARQL_METAL_LM_HEAD=1` — route through `lm_head_knn_backend`
+    ///     instead, re-enabling the broken-fast `q4k_matvec` path. Debug
+    ///     only — produces argmax drift on canonical smoke. See ADR-015
+    ///     for the broken-fast pattern.
     ///
     /// `lm_head_topk` in `larql-inference::layer_graph::generate::lm_head`
-    /// routes here when the active backend is non-CPU (default;
-    /// override with `LARQL_METAL_LM_HEAD=1` to re-enable the production
-    /// `q4k_matvec` path).
+    /// routes here when the active backend is non-CPU (default).
     pub fn lm_head_knn_backend_skip_q4k(
         &self,
         query: &ndarray::Array1<f32>,
         top_k: usize,
         backend: &dyn larql_compute::ComputeBackend,
     ) -> Vec<(u32, f32)> {
-        // 1. Stride-32 Q4_K matvec on the same Q4_K bytes as the
-        //    production path — preserves the bandwidth advantage,
-        //    fixes the rank-1 drift. Falls through if the backend
-        //    doesn't implement the stable variant (default impl
-        //    returns None). `LARQL_LM_HEAD_STRIDE32=0` disables this
-        //    path so callers can A/B against the f16 fallback without
-        //    a rebuild.
-        let stride32_enabled = !matches!(
-            std::env::var("LARQL_LM_HEAD_STRIDE32").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
-        if stride32_enabled && backend.has_q4() {
-            let q4_bytes: Option<&[u8]> = self
-                .projections
-                .lm_head_q4_mmap
-                .as_ref()
-                .map(|m| m.as_ref() as &[u8])
-                .or_else(|| {
-                    self.projections
-                        .lm_head_q4_synth
-                        .as_ref()
-                        .map(|v| v.as_slice())
-                });
-            if let Some(q4_data) = q4_bytes {
-                let vocab = self.vocab_size;
-                let hidden = self.hidden_size;
-                if vocab > 0 {
-                    if let Some(x) = query.as_slice() {
-                        if let Some(scores_vec) =
-                            backend.q4k_matvec_stride32(q4_data, x, vocab, hidden)
-                        {
-                            return Self::top_k_sorted(scores_vec, top_k);
-                        }
-                    }
-                }
+        let stride32_mode = lm_head_stride32_mode();
+
+        // 1. Default stable path: stride-32 Q4_K matvec — Q4_K bandwidth
+        //    win + f16_gemv's stable reduction tree. Skipped when
+        //    `LARQL_LM_HEAD_STRIDE32=0`.
+        if stride32_mode != Stride32Mode::Disabled {
+            if let Some(hits) = self.lm_head_stride32_backend_hits(query, top_k, backend) {
+                return hits;
             }
         }
 
-        // 2. f16 GEMV on tied-embed `embeddings.bin` — stable reduction,
-        //    but ~2× the bandwidth of Q4_K.
+        // 2. f16 GEMV fallback for vindexes lacking Q4_K lm_head bytes.
+        if let Some(hits) = self.lm_head_f16_backend_hits(query, top_k, backend) {
+            return hits;
+        }
+
+        // 3. f32 BLAS last resort.
+        self.lm_head_knn(query, top_k)
+    }
+
+    fn lm_head_f16_backend_hits(
+        &self,
+        query: &ndarray::Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Vec<(u32, f32)>> {
         if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
             let vocab = self.vocab_size;
             let hidden = self.hidden_size;
@@ -177,26 +164,57 @@ impl VectorIndex {
                             if let Some((idx, score)) =
                                 backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
                             {
-                                return vec![(idx, score)];
+                                return Some(vec![(idx, score)]);
                             }
                         } else if let Some(hits) =
                             backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
                         {
                             if !hits.is_empty() {
-                                return hits;
+                                return Some(hits);
                             }
                         }
                         if let Some(scores_vec) =
                             backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
                         {
-                            return Self::top_k_sorted(scores_vec, top_k);
+                            return Some(Self::top_k_sorted(scores_vec, top_k));
                         }
                     }
                 }
             }
         }
-        // 3. f32 BLAS fallback.
-        self.lm_head_knn(query, top_k)
+        None
+    }
+
+    fn lm_head_stride32_backend_hits(
+        &self,
+        query: &ndarray::Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Vec<(u32, f32)>> {
+        if !backend.has_q4() {
+            return None;
+        }
+        let q4_bytes: Option<&[u8]> = self
+            .projections
+            .lm_head_q4_mmap
+            .as_ref()
+            .map(|m| m.as_ref() as &[u8])
+            .or_else(|| {
+                self.projections
+                    .lm_head_q4_synth
+                    .as_ref()
+                    .map(|v| v.as_slice())
+            });
+        let q4_data = q4_bytes?;
+        let vocab = self.vocab_size;
+        let hidden = self.hidden_size;
+        if vocab == 0 {
+            return None;
+        }
+        let x = query.as_slice()?;
+        backend
+            .q4k_matvec_stride32(q4_data, x, vocab, hidden)
+            .map(|scores_vec| Self::top_k_sorted(scores_vec, top_k))
     }
 
     /// Sort `scores` by descending value and keep the top `top_k`. Shared

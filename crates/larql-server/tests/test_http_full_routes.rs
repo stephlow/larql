@@ -44,7 +44,6 @@ fn model_functional_with_labels(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
-        gen_lock: tokio::sync::Mutex::new(()),
         probe_labels: labels,
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         expert_filter: None,

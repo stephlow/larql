@@ -1,7 +1,7 @@
 # ADR-015: Isolated kernel speedup ≠ end-to-end win when batched throughput is already saturated
 
-**Status**: Accepted (recurring pattern, three confirmed instances)
-**Date**: 2026-05-02
+**Status**: Accepted (recurring pattern, four confirmed instances)
+**Date**: 2026-05-02 (initial; updated with NR2 then `q4k_matvec` lm_head)
 **Context**: A pattern that has now reproduced across three independent kernel
 optimisation attempts on Gemma 3 4B decode. Future kernel work needs to budget
 benchmark cost against this prior — the isolated `diag_profile_kernels` number
@@ -19,15 +19,18 @@ End-to-end decode benchmarks then track the batched number, not the isolated
 one. The isolated win was real — it just was not load-bearing under the
 production workload.
 
-## Three confirmed instances
+## Four confirmed instances
 
 | Kernel | Isolated speedup | Batched delta | End-to-end | Outcome |
 |---|---|---|---|---|
 | `q4k_ffn_gate_up_f16acc` (2026-04-28) | 1.79× (0.607 → 0.340 ms) | within noise | parity on quiet GPU | opt-in only (`LARQL_F16_ACC=1`) |
 | `attn_fused` (2026-05-01) | merged 2 kernels into 1 | TGs collapse 12 → 8 | **−1.45 ms regression** | opt-in only (`LARQL_FUSED_ATTN=1`) |
 | `q4k_ffn_gate_up_nr2` (2026-05-02) | 1.47× (0.591 → 0.401 ms iso) | 279 → 267 GB/s (−4%) | **−0.62 ms regression on GPU fwd** | not promoted; opt-in `LARQL_GATE_UP_NR2=1` |
+| **`q4k_matvec` lm_head** (broken-fast) | n/a — different category | 1.47 ms vs stride-32's 2.95 ms | **+10 tok/s but FAILS smoke** ("Capital" / truncated) | opt-in only (`LARQL_METAL_LM_HEAD=1`); production stays on stride-32 |
 
-The mechanisms differ but the symptom is identical:
+The mechanisms differ but the symptom is identical at the perf level — a
+candidate that looks like a strict win at one measurement granularity and
+loses (or breaks) at the actual production granularity.
 
 - **f16 acc**: the kernel was already at 274 GB/s = 74% of LPDDR5X peak.
   Freed ALU cycles got absorbed by surrounding kernels' bandwidth contention
@@ -38,6 +41,17 @@ The mechanisms differ but the symptom is identical:
 - **NR2**: the isolated measurement caught dispatch-overhead amortisation
   that disappears once n_layers calls share one cmd buffer. The batched
   geometry is the production geometry, and NR2 is *worse* there.
+- **`q4k_matvec` lm_head**: the broken-fast variant. Same Q4_K bandwidth as
+  `q4k_matvec_stride32` (327 MB/token), but the 32-lane simdgroup
+  reduction tree drifts ~1e-3 vs CPU's sequential dot product. On a
+  262K-vocab × 2560-hidden matvec that's enough to flip top-1 on close-
+  call tokens — the canonical smoke ("The capital of France is **Paris**")
+  fails as "The Capital of France is: **" (capitalised and truncated).
+  Same family as the historical 2026-04-26 "81–84 tok/s on broken Q4_K
+  dispatch" trap (pre-fix `q4k_matvec` writing through `q4_matvec` and
+  leaving 75% of output rows unwritten). Listed here because it
+  surfaces under the same diagnostic — the kernel-level number looks
+  great, end-to-end fails. **The broken-fast number is never a baseline.**
 
 ## Diagnostic test before promoting any new kernel
 

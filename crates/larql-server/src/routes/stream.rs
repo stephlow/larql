@@ -280,15 +280,17 @@ async fn handle_stream_infer(
         return;
     }
 
-    let weights = match model.get_or_load_weights() {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = socket
-                .send(Message::Text(ws_error(e).to_string().into()))
-                .await;
-            return;
-        }
-    };
+    // Validate access first; hold the guard only inside the sync
+    // prediction block below so it doesn't cross any await
+    // (`std::sync::RwLockReadGuard` is `!Send`). Map straight to a
+    // String so the Result doesn't keep the guard alive past `?`.
+    let weights_check: Result<(), String> = model.get_or_load_weights().map(|_| ());
+    if let Err(e) = weights_check {
+        let _ = socket
+            .send(Message::Text(ws_error(e).to_string().into()))
+            .await;
+        return;
+    }
 
     let top_k = request["top"].as_u64().unwrap_or(5) as usize;
     let mode = request["mode"]
@@ -318,19 +320,25 @@ async fn handle_stream_infer(
 
     let start = std::time::Instant::now();
 
-    let predictions = if mode == INFER_MODE_DENSE {
-        larql_inference::predict(weights, &model.tokenizer, &token_ids, top_k).predictions
-    } else {
-        let patched = model.patched.blocking_read();
-        let r = larql_inference::infer_patched(
-            weights,
-            &model.tokenizer,
-            &*patched,
-            Some(&patched.knn_store),
-            &token_ids,
-            top_k,
-        );
-        r.predictions
+    let predictions = {
+        // Re-acquire the read guard for this sync compute block; drop
+        // before re-entering the await ladder.
+        let weights_guard = model.get_or_load_weights().expect("re-acquire weights");
+        let weights: &larql_inference::ModelWeights = &weights_guard;
+        if mode == INFER_MODE_DENSE {
+            larql_inference::predict(weights, &model.tokenizer, &token_ids, top_k).predictions
+        } else {
+            let patched = model.patched.blocking_read();
+            let r = larql_inference::infer_patched(
+                weights,
+                &model.tokenizer,
+                &*patched,
+                Some(&patched.knn_store),
+                &token_ids,
+                top_k,
+            );
+            r.predictions
+        }
     };
 
     // Stream each prediction.
@@ -508,7 +516,6 @@ mod tests {
             embed_store: None,
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
-            gen_lock: tokio::sync::Mutex::new(()),
             probe_labels: labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             expert_filter: None,

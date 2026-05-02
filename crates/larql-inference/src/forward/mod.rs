@@ -9,6 +9,7 @@
 //! - `embed`: Token embedding with architecture-specific scaling
 //! - `ple`: Per-Layer Embeddings (gated per-layer token embeddings)
 //! - `layer`: Single-layer dispatch (attention + FFN + PLE + scalar)
+//! - `layer_interventions`: Layer adapters for attention head replacement/ablation
 //! - `predict`: Logits computation and all predict_* entry points
 //!   - `predict/types`: Result structs and LayerMode enum
 //!   - `predict/raw`: RawForward and raw logit forward passes
@@ -25,6 +26,7 @@ pub mod hooks;
 pub mod infer_patched;
 pub mod kv_generate;
 pub mod layer;
+mod layer_interventions;
 pub mod lens;
 pub mod memit;
 pub mod ops;
@@ -57,8 +59,10 @@ pub use kv_generate::{
     generate_cached, generate_cached_backend, generate_cached_constrained, generate_cached_hooked,
     generate_cached_with_window,
 };
-pub use layer::{
-    run_attention_public, run_ffn, run_layer_with_ffn, run_layer_with_replaced_head_residual_delta,
+pub use layer::{run_attention_public, run_ffn, run_layer_with_capture_hooked, run_layer_with_ffn};
+pub use layer_interventions::{
+    run_layer_with_mapped_head_residual_delta, run_layer_with_mapped_pre_o_head,
+    run_layer_with_original_head_residual_delta, run_layer_with_replaced_head_residual_delta,
     run_layer_with_replaced_pre_o_head, run_layer_with_subtracted_pre_o_heads,
     run_layer_with_zeroed_pre_o_heads,
 };

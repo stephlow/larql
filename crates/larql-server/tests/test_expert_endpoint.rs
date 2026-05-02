@@ -256,7 +256,7 @@ fn make_loaded_model(
     };
 
     let lock = OnceLock::new();
-    lock.set(weights).ok();
+    lock.set(std::sync::RwLock::new(weights)).ok();
 
     LoadedModel {
         id: "test-moe".into(),
@@ -272,7 +272,6 @@ fn make_loaded_model(
         embed_store: None,
         release_mmap_after_request: false,
         weights: lock,
-        gen_lock: tokio::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         expert_filter: None,

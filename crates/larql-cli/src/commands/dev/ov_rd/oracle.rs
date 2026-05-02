@@ -3,12 +3,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Args;
-use larql_inference::attention::{run_attention_block_with_pre_o, SharedKV};
-use larql_inference::forward::ple::precompute_per_layer_inputs;
-use larql_inference::forward::{
-    embed_tokens_pub, run_layer_with_ffn, run_layer_with_replaced_pre_o_head,
-};
-use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
+use larql_inference::{encode_prompt, hidden_to_raw_logits};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex,
 };
@@ -27,7 +22,6 @@ use super::reports::{
     OracleLowrankReport, OracleRoundtripHeadReport, OracleRoundtripPromptReport,
     OracleRoundtripReport,
 };
-use super::runtime::{insert_q4k_layer_tensors, remove_layer_tensors};
 use super::static_replace::fit_static_means;
 use super::stats::StaticHeadMeans;
 use super::types::HeadId;
@@ -552,93 +546,46 @@ fn forward_q4k_oracle_roundtrip_head(
     head: HeadId,
     basis: &WoRoundtripBasis,
 ) -> Result<(Array2<f32>, RoundtripPatchMetrics), Box<dyn std::error::Error>> {
-    let mut h = embed_tokens_pub(weights, token_ids);
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
-    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
     let mut metrics = None;
 
-    for layer in 0..weights.num_layers {
-        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
-        let step = {
-            let shared_kv = weights
-                .arch
-                .kv_shared_source_layer(layer)
-                .and_then(|src| kv_cache.get(&src));
-            let ffn = WeightFfn { weights };
-            if layer == head.layer {
-                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
-                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
-                let head_dim = weights.arch.head_dim_for_layer(layer);
-                let start = head.head * head_dim;
-                let end = start + head_dim;
-                let mut replacement = Vec::with_capacity(pre_o.nrows() * head_dim);
-                let mut pre_sq = 0.0;
-                let mut visible_sq = 0.0;
-                let mut count = 0usize;
-                for pos in 0..pre_o.nrows() {
-                    let row = pre_o.slice(s![pos, start..end]);
-                    let values = row
-                        .as_slice()
-                        .ok_or("pre-W_O head row was not contiguous during roundtrip")?;
-                    let projected = basis.project(values);
-                    for (&original, &recon) in values.iter().zip(projected.iter()) {
-                        let delta = original as f64 - recon as f64;
-                        pre_sq += delta * delta;
-                    }
-                    let delta = values
-                        .iter()
-                        .zip(projected.iter())
-                        .map(|(&original, &recon)| original as f64 - recon as f64)
-                        .collect::<Vec<_>>();
-                    visible_sq += basis.visible_sq_norm(&delta);
-                    count += 1;
-                    replacement.extend_from_slice(&projected);
+    let h = larql_inference::vindex::predict_q4k_hidden_with_mapped_pre_o_head(
+        weights,
+        token_ids,
+        index,
+        head.layer,
+        head.head,
+        |original_head| {
+            let mut replacement = Vec::with_capacity(original_head.len());
+            let mut pre_sq = 0.0;
+            let mut visible_sq = 0.0;
+            let mut count = 0usize;
+            for pos in 0..original_head.nrows() {
+                let row = original_head.row(pos);
+                let values = row
+                    .as_slice()
+                    .ok_or("pre-W_O head row was not contiguous during roundtrip")?;
+                let projected = basis.project(values);
+                for (&original, &recon) in values.iter().zip(projected.iter()) {
+                    let delta = original as f64 - recon as f64;
+                    pre_sq += delta * delta;
                 }
-                metrics = Some(RoundtripPatchMetrics {
-                    pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
-                    wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
-                });
-                let replacement = Array2::from_shape_vec((pre_o.nrows(), head_dim), replacement)?;
-                run_layer_with_replaced_pre_o_head(
-                    weights,
-                    &h,
-                    layer,
-                    &ffn,
-                    head.head,
-                    &replacement,
-                    ple_inputs.get(layer),
-                    shared_kv,
-                )
-            } else {
-                run_layer_with_ffn(
-                    weights,
-                    &h,
-                    layer,
-                    &ffn,
-                    false,
-                    ple_inputs.get(layer),
-                    shared_kv,
-                )
-                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+                let delta = values
+                    .iter()
+                    .zip(projected.iter())
+                    .map(|(&original, &recon)| original as f64 - recon as f64)
+                    .collect::<Vec<_>>();
+                visible_sq += basis.visible_sq_norm(&delta);
+                count += 1;
+                replacement.extend_from_slice(&projected);
             }
-        };
-
-        if let Some((h_new, kv_out)) = step {
-            h = h_new;
-            if let Some(kv) = kv_out {
-                kv_cache.insert(layer, kv);
-            }
-        } else {
-            remove_layer_tensors(weights, inserted);
-            return Err(format!(
-                "forward failed at layer {layer} during oracle roundtrip L{} H{}",
-                head.layer, head.head
-            )
-            .into());
-        }
-
-        remove_layer_tensors(weights, inserted);
-    }
+            metrics = Some(RoundtripPatchMetrics {
+                pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
+                wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
+            });
+            Array2::from_shape_vec((original_head.nrows(), original_head.ncols()), replacement)
+                .map_err(|err| err.to_string())
+        },
+    )?;
 
     Ok((
         h,
@@ -656,106 +603,59 @@ fn forward_q4k_oracle_lowrank_head(
     means: &StaticHeadMeans,
     k: usize,
 ) -> Result<(Array2<f32>, RoundtripPatchMetrics), Box<dyn std::error::Error>> {
-    let mut h = embed_tokens_pub(weights, token_ids);
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
-    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
     let mut metrics = None;
 
-    for layer in 0..weights.num_layers {
-        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
-        let step = {
-            let shared_kv = weights
-                .arch
-                .kv_shared_source_layer(layer)
-                .and_then(|src| kv_cache.get(&src));
-            let ffn = WeightFfn { weights };
-            if layer == head.layer {
-                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
-                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
-                let head_dim = weights.arch.head_dim_for_layer(layer);
-                let start = head.head * head_dim;
-                let end = start + head_dim;
-                let mut replacement = Vec::with_capacity(pre_o.nrows() * head_dim);
-                let mut pre_sq = 0.0;
-                let mut visible_sq = 0.0;
-                let mut count = 0usize;
-                for pos in 0..pre_o.nrows() {
-                    let row = pre_o.slice(s![pos, start..end]);
-                    let values = row
-                        .as_slice()
-                        .ok_or("pre-W_O head row was not contiguous during lowrank")?;
-                    let base = means.positions.get(pos).unwrap_or(&means.global);
-                    let residual = values
-                        .iter()
-                        .zip(base.iter())
-                        .map(|(&yi, &bi)| yi - bi)
-                        .collect::<Vec<_>>();
-                    let z = basis.residual_to_z(&residual);
-                    let z_projected = pca_basis.project_with_rank(&z, k);
-                    let residual_projected = basis.z_to_residual(&z_projected);
-                    let projected = residual_projected
-                        .into_iter()
-                        .zip(base.iter())
-                        .map(|(ri, &bi)| ri + bi)
-                        .collect::<Vec<_>>();
-                    for (&original, &recon) in values.iter().zip(projected.iter()) {
-                        let delta = original as f64 - recon as f64;
-                        pre_sq += delta * delta;
-                    }
-                    let delta = values
-                        .iter()
-                        .zip(projected.iter())
-                        .map(|(&original, &recon)| original as f64 - recon as f64)
-                        .collect::<Vec<_>>();
-                    visible_sq += basis.visible_sq_norm(&delta);
-                    count += 1;
-                    replacement.extend_from_slice(&projected);
+    let h = larql_inference::vindex::predict_q4k_hidden_with_mapped_pre_o_head(
+        weights,
+        token_ids,
+        index,
+        head.layer,
+        head.head,
+        |original_head| {
+            let mut replacement = Vec::with_capacity(original_head.len());
+            let mut pre_sq = 0.0;
+            let mut visible_sq = 0.0;
+            let mut count = 0usize;
+            for pos in 0..original_head.nrows() {
+                let row = original_head.row(pos);
+                let values = row
+                    .as_slice()
+                    .ok_or("pre-W_O head row was not contiguous during lowrank")?;
+                let base = means.positions.get(pos).unwrap_or(&means.global);
+                let residual = values
+                    .iter()
+                    .zip(base.iter())
+                    .map(|(&yi, &bi)| yi - bi)
+                    .collect::<Vec<_>>();
+                let z = basis.residual_to_z(&residual);
+                let z_projected = pca_basis.project_with_rank(&z, k);
+                let residual_projected = basis.z_to_residual(&z_projected);
+                let projected = residual_projected
+                    .into_iter()
+                    .zip(base.iter())
+                    .map(|(ri, &bi)| ri + bi)
+                    .collect::<Vec<_>>();
+                for (&original, &recon) in values.iter().zip(projected.iter()) {
+                    let delta = original as f64 - recon as f64;
+                    pre_sq += delta * delta;
                 }
-                metrics = Some(RoundtripPatchMetrics {
-                    pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
-                    wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
-                });
-                let replacement = Array2::from_shape_vec((pre_o.nrows(), head_dim), replacement)?;
-                run_layer_with_replaced_pre_o_head(
-                    weights,
-                    &h,
-                    layer,
-                    &ffn,
-                    head.head,
-                    &replacement,
-                    ple_inputs.get(layer),
-                    shared_kv,
-                )
-            } else {
-                run_layer_with_ffn(
-                    weights,
-                    &h,
-                    layer,
-                    &ffn,
-                    false,
-                    ple_inputs.get(layer),
-                    shared_kv,
-                )
-                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+                let delta = values
+                    .iter()
+                    .zip(projected.iter())
+                    .map(|(&original, &recon)| original as f64 - recon as f64)
+                    .collect::<Vec<_>>();
+                visible_sq += basis.visible_sq_norm(&delta);
+                count += 1;
+                replacement.extend_from_slice(&projected);
             }
-        };
-
-        if let Some((h_new, kv_out)) = step {
-            h = h_new;
-            if let Some(kv) = kv_out {
-                kv_cache.insert(layer, kv);
-            }
-        } else {
-            remove_layer_tensors(weights, inserted);
-            return Err(format!(
-                "forward failed at layer {layer} during oracle lowrank L{} H{} K={}",
-                head.layer, head.head, k
-            )
-            .into());
-        }
-
-        remove_layer_tensors(weights, inserted);
-    }
+            metrics = Some(RoundtripPatchMetrics {
+                pre_wo_l2: (pre_sq / count.max(1) as f64).sqrt(),
+                wo_visible_l2: (visible_sq / count.max(1) as f64).sqrt(),
+            });
+            Array2::from_shape_vec((original_head.nrows(), original_head.ncols()), replacement)
+                .map_err(|err| err.to_string())
+        },
+    )?;
 
     Ok((
         h,

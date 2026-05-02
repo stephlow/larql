@@ -48,8 +48,8 @@ pub fn lm_head_topk(
     let is_metal_backend = backend.as_any().type_id() != std::any::TypeId::of::<CpuBackend>();
     if prefer_cpu && is_metal_backend {
         // Route to `lm_head_knn_backend_skip_q4k` — the same dispatch
-        // chain as `lm_head_knn_backend` but starting at the f16 GEMV
-        // path (path 2) instead of the Q4_K matvec path (path 1).
+        // chain as `lm_head_knn_backend` but starting at the stable f16
+        // GEMV path instead of the production Q4_K matvec path.
         //
         // Why: Metal's `q4k_matvec` 32-lane simdgroup reduction drifts
         // ~1e-3 vs CPU's sequential accumulator (different reduction
@@ -58,14 +58,16 @@ pub fn lm_head_topk(
         // " Capital" vs " capital" at decode step 1 of Gemma 3 4B).
         // Metal's `f16_gemv` shader uses a tighter reduction tree and
         // keeps top-1 stable end-to-end. Reads 1.3 GB of f16 weights
-        // per token vs 2.6 GB for f32 — roughly 2× faster than the
-        // f32 BLAS path on `weights.lm_head`.
+        // per token vs 2.6 GB for f32, and avoids the extra stride-32
+        // Q4 correctness path now that tied-embedding f16 is available
+        // in the hot path.
         //
         // For models where the f16 mmap isn't populated (no tied embed
-        // / no f16 lm_head), this falls through to `lm_head_knn` (f32
-        // BLAS). The Q4_K Metal path stays opt-in via
-        // `LARQL_METAL_LM_HEAD=1` for runs where the speed margin
-        // matters more than top-1 stability.
+        // / no f16 lm_head), this falls back to stride-32 Q4_K, then
+        // `lm_head_knn` (f32 BLAS). The Q4_K Metal path stays opt-in
+        // via `LARQL_METAL_LM_HEAD=1` for runs where the speed margin
+        // matters more than top-1 stability; the stride-32 fallback can
+        // be forced first with `LARQL_LM_HEAD_STRIDE32=1`.
         let hits = index.lm_head_knn_backend_skip_q4k(query, top_k, backend);
         let all_zero = !hits.is_empty() && hits.iter().all(|(_, s)| *s == 0.0 || s.is_nan());
         if !hits.is_empty() && !all_zero {

@@ -472,11 +472,14 @@ impl DecodeBackend for MetalBackend {
         head_dim: usize,
         rope_base: f32,
     ) -> (Option<Vec<f32>>, f64, f64, f64) {
-        // Whole-token timing today; per-stage split (attn vs gate+up vs
-        // down) lands when `Profile` decorator threads commit/wait
-        // boundaries through `decode_token_with_moe_fn` — see
-        // `metal::decode::profile` and ROADMAP P1.
-        use crate::metal::decode::ProfileTimings;
+        // Per-stage GPU timing comes from `decode_token_with_moe_split_fn`
+        // when `LARQL_PROFILE_SPLIT=1` is set: paired commit/wait boundaries
+        // around the attention vs FFN blocks land per-stage GPU windows in
+        // a thread-local. We read them back here. Without the env flag,
+        // we fall back to whole-token wall time in `attn_ms` so callers
+        // still see something useful — but they should set the flag to
+        // get the actual split.
+        use crate::metal::decode::profile;
         let t0 = std::time::Instant::now();
         let result = <Self as DecodeBackend>::decode_token(
             self,
@@ -491,14 +494,16 @@ impl DecodeBackend for MetalBackend {
             head_dim,
             rope_base,
         );
-        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        // Whole-token cost lives in `attn_ms` until the per-stage
-        // split is wired (see `metal::decode::profile`).
-        let timings = ProfileTimings {
-            attn_ms: total_ms,
-            gate_up_ms: 0.0,
-            down_ms: 0.0,
-        };
+        let timings = profile::take_last_split_timings().unwrap_or_else(|| {
+            // Fallback: whole-token wall time in `attn_ms`. Caller likely
+            // forgot to set `LARQL_PROFILE_SPLIT=1`.
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            profile::ProfileTimings {
+                attn_ms: total_ms,
+                gate_up_ms: 0.0,
+                down_ms: 0.0,
+            }
+        });
         eprintln!("{}", timings.format_summary(layers.len()));
         (result, timings.attn_ms, timings.gate_up_ms, timings.down_ms)
     }

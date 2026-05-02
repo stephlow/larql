@@ -188,118 +188,6 @@ pub fn run_layer_with_ffn(
     Some((h_out, activation, kv_out))
 }
 
-/// Run a single transformer layer while zeroing selected pre-W_O attention heads.
-///
-/// This is intended for OV ablation diagnostics: the selected query-head slices
-/// are zeroed after GQA and before W_O, then the normal FFN, PLE, and layer
-/// scalar path runs unchanged.
-#[allow(clippy::type_complexity)]
-pub fn run_layer_with_zeroed_pre_o_heads(
-    weights: &ModelWeights,
-    h: &Array2<f32>,
-    layer: usize,
-    ffn: &dyn FfnBackend,
-    heads: &[usize],
-    ple_input: Option<&Array2<f32>>,
-    shared_kv: Option<&SharedKV>,
-) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (h_post_attn, kv_out) = crate::attention::run_attention_block_zero_pre_o_heads(
-        weights, h, layer, heads, shared_kv,
-    )?;
-    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
-        let slice = h_post_attn.as_slice().unwrap_or(&[]);
-        let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
-        let _ = std::fs::write(&path, &bytes);
-    }
-    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
-    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(weights, &mut h_out, layer);
-    Some((h_out, kv_out))
-}
-
-/// Run a single transformer layer while replacing one pre-W_O attention head.
-///
-/// This supports static-injection gates: a head can be replaced by global,
-/// position, prompt-type, or token-role means while the rest of the block runs
-/// through the normal residual path.
-pub fn run_layer_with_replaced_pre_o_head(
-    weights: &ModelWeights,
-    h: &Array2<f32>,
-    layer: usize,
-    ffn: &dyn FfnBackend,
-    head: usize,
-    replacement: &Array2<f32>,
-    ple_input: Option<&Array2<f32>>,
-    shared_kv: Option<&SharedKV>,
-) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (h_post_attn, kv_out) = crate::attention::run_attention_block_replace_pre_o_head(
-        weights,
-        h,
-        layer,
-        head,
-        replacement,
-        shared_kv,
-    )?;
-    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
-    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(weights, &mut h_out, layer);
-    Some((h_out, kv_out))
-}
-
-/// Run a single transformer layer while subtracting selected pre-W_O head
-/// contributions after W_O projection and before the attention residual path.
-///
-/// This should match [`run_layer_with_zeroed_pre_o_heads`] up to numerical
-/// noise, and is used as a diagnostic for W_O block indexing.
-pub fn run_layer_with_subtracted_pre_o_heads(
-    weights: &ModelWeights,
-    h: &Array2<f32>,
-    layer: usize,
-    ffn: &dyn FfnBackend,
-    heads: &[usize],
-    ple_input: Option<&Array2<f32>>,
-    shared_kv: Option<&SharedKV>,
-) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (h_post_attn, kv_out) = crate::attention::run_attention_block_subtract_pre_o_heads(
-        weights, h, layer, heads, shared_kv,
-    )?;
-    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
-    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(weights, &mut h_out, layer);
-    Some((h_out, kv_out))
-}
-
-/// Run a single transformer layer while replacing one attention head's
-/// residual-space contribution after W_O projection.
-///
-/// This is the Mode D validation path: a precomputed lookup/add table can
-/// provide `replacement_delta` directly in residual space, bypassing W_O while
-/// preserving FFN, PLE, and layer scalar behavior.
-pub fn run_layer_with_replaced_head_residual_delta(
-    weights: &ModelWeights,
-    h: &Array2<f32>,
-    layer: usize,
-    ffn: &dyn FfnBackend,
-    head: usize,
-    replacement_delta: &Array2<f32>,
-    ple_input: Option<&Array2<f32>>,
-    shared_kv: Option<&SharedKV>,
-) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (h_post_attn, kv_out) = crate::attention::run_attention_block_replace_head_residual_delta(
-        weights,
-        h,
-        layer,
-        head,
-        replacement_delta,
-        shared_kv,
-    )?;
-    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
-    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(weights, &mut h_out, layer);
-    Some((h_out, kv_out))
-}
-
 /// Run a single transformer layer, optionally capturing attention weights.
 ///
 /// Backwards-compatible wrapper: behaves identically to the pre-hook version
@@ -342,7 +230,7 @@ pub(super) fn run_layer_with_capture(
 /// activation patching, ablation, and steering.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
-pub(super) fn run_layer_with_capture_hooked(
+pub fn run_layer_with_capture_hooked(
     weights: &ModelWeights,
     h: &Array2<f32>,
     layer: usize,
@@ -360,14 +248,26 @@ pub(super) fn run_layer_with_capture_hooked(
 )> {
     hook.on_pre_layer(layer, h);
 
-    let (mut h_post_attn, attn_weights) =
-        run_attention_inner(weights, h, layer, capture_attention, shared_kv)?;
+    let (mut h_post_attn, attn_weights, kv_out) = if shared_kv.is_some() {
+        let (h_post_attn, attn_weights) =
+            run_attention_inner(weights, h, layer, capture_attention, shared_kv)?;
+        (h_post_attn, attn_weights, None)
+    } else {
+        let (h_post_attn, _, attn_weights, k_rope, v_final) =
+            crate::attention::run_attention_block_with_kv_out(
+                weights,
+                h,
+                layer,
+                capture_attention,
+                None,
+            )?;
+        (h_post_attn, attn_weights, Some((k_rope, v_final)))
+    };
     if let Some(ref w) = attn_weights {
         hook.on_attention_weights(layer, w);
     }
     hook.on_post_attention(layer, &mut h_post_attn);
 
-    let kv_out = None;
     let (h_post_ffn, activation) = run_ffn(weights, &h_post_attn, layer, ffn, capture_activation);
     if let Some(ref act) = activation {
         hook.on_ffn_activation(layer, act);

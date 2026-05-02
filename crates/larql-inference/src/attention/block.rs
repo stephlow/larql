@@ -85,6 +85,22 @@ pub fn run_attention_block_with_pre_o(
     Some((h_post, pre_o))
 }
 
+/// Run attention with optional shared K/V and return the pre-O-projection
+/// output per query head.
+///
+/// This is the shared-KV-safe variant used by research/intervention adapters
+/// that need to inspect a pre-W_O head before deciding how to replace it.
+pub fn run_attention_block_shared_with_pre_o(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Array2<f32>)> {
+    let (h_post, _, _, _, _, pre_o) =
+        run_attention_block_core(weights, h, layer, false, shared_kv, None, None, None, None)?;
+    Some((h_post, pre_o))
+}
+
 /// Run attention while zeroing selected pre-O-projection query heads before W_O.
 ///
 /// Returns the post-attention residual and, when K/V were computed by this call,

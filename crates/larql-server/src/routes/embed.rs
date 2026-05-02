@@ -343,12 +343,13 @@ async fn handle_logits_inner(
         )));
     }
 
-    let weights = match model.get_or_load_weights() {
+    let weights_guard = match model.get_or_load_weights() {
         Ok(w) => w,
         Err(e) => {
             return error_response(ServerError::Internal(format!("load weights: {e}")));
         }
     };
+    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let start = std::time::Instant::now();
 

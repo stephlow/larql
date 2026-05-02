@@ -340,9 +340,10 @@ pub(crate) fn run_full_output_core(
     use larql_inference::ffn::FfnBackend;
     use larql_vindex::ndarray::Array2;
 
-    let weights = model
+    let weights_guard = model
         .get_or_load_weights()
         .map_err(ServerError::InferenceUnavailable)?;
+    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let patched = model.patched.blocking_read();
     let is_q4k = model.config.quant == larql_vindex::QuantFormat::Q4K;

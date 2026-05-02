@@ -72,9 +72,10 @@ fn run_infer(
         ));
     }
 
-    let weights = model
+    let weights_guard = model
         .get_or_load_weights()
         .map_err(ServerError::InferenceUnavailable)?;
+    let weights: &larql_inference::ModelWeights = &weights_guard;
 
     let encoding = model
         .tokenizer

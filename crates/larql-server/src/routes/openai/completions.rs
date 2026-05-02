@@ -260,13 +260,14 @@ fn stream_completions(
     let cmpl_id = format!("cmpl-{}", new_id_suffix());
 
     tokio::task::spawn_blocking(move || {
-        let weights = match model.get_or_load_weights() {
+        let mut weights_guard = match model.lock_weights_for_gen() {
             Ok(w) => w,
             Err(e) => {
                 let _ = tx.blocking_send(error_chunk(&e));
                 return;
             }
         };
+        let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
         let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
             Ok(e) => e,
             Err(e) => {
@@ -279,56 +280,53 @@ fn stream_completions(
             let _ = tx.blocking_send(error_chunk("prompt tokenises to empty"));
             return;
         }
+        let _ = temperature; // accepted; layer_graph::generate is greedy.
 
-        // Take a read guard on the patched vindex for the full
-        // generation. WalkFfn does gate-KNN through the (possibly Q4_K)
-        // index for every layer; holding the read guard for the
-        // generation duration keeps the index pinned and keeps the
-        // dequant cache warm across decode steps.
         let patched = model.patched.blocking_read();
-        let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
+        let index = patched.base();
+        let backend = larql_compute::default_backend();
+        let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+        let num_layers = weights.num_layers;
 
-        let mut ids = prompt_ids;
+        let cmpl_id_cb = cmpl_id.clone();
+        let model_id_cb = model_id.clone();
+        let tx_cb = tx.clone();
+        let stop_strings_cb = stop_strings.clone();
         let mut completion_text = String::new();
-        let mut finish_reason: &'static str = "length";
-
-        for _ in 0..max_tokens {
-            let pred =
-                larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
-            let next_id = match pred.token_ids.first() {
-                Some(&id) => id,
-                None => {
-                    finish_reason = "stop";
-                    break;
+        let mut early_stop = false;
+        let result = larql_inference::layer_graph::generate_streaming(
+            weights,
+            &model.tokenizer,
+            &prompt_ids,
+            max_tokens,
+            index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
+            larql_inference::SamplingConfig::greedy(),
+            &larql_inference::EosConfig::builtin(),
+            |_id, text, _prob| {
+                if early_stop {
+                    return;
                 }
-            };
-            let next_text = pred
-                .predictions
-                .first()
-                .map(|(t, _)| t.clone())
-                .unwrap_or_default();
-            let is_eos = larql_inference::vindex::is_end_of_turn(&next_text);
-            let _ = temperature; // accepted; not consumed by the WalkFfn path.
+                let chunk =
+                    build_text_completion_chunk(&cmpl_id_cb, &model_id_cb, Some(text), None);
+                if tx_cb.blocking_send(chunk).is_err() {
+                    early_stop = true;
+                    return;
+                }
+                completion_text.push_str(text);
+                if !stop_strings_cb.is_empty() && contains_any(&completion_text, &stop_strings_cb) {
+                    early_stop = true;
+                }
+            },
+        );
 
-            let chunk = build_text_completion_chunk(&cmpl_id, &model_id, Some(&next_text), None);
-            if tx.blocking_send(chunk).is_err() {
-                // Client disconnected.
-                return;
-            }
-            completion_text.push_str(&next_text);
-            ids.push(next_id);
-
-            if is_eos {
-                finish_reason = "stop";
-                break;
-            }
-            if !stop_strings.is_empty() && contains_any(&completion_text, &stop_strings) {
-                finish_reason = "stop";
-                break;
-            }
-        }
-
-        // Final chunk: finish_reason, no text.
+        let finish_reason: &'static str = if early_stop || result.tokens.len() < max_tokens {
+            "stop"
+        } else {
+            "length"
+        };
         let final_chunk =
             build_text_completion_chunk(&cmpl_id, &model_id, None, Some(finish_reason));
         let _ = tx.blocking_send(final_chunk);
@@ -376,15 +374,20 @@ fn run_completions_loop(
     stop_strings: &[String],
     echo: bool,
 ) -> Result<(Vec<CompletionChoice>, usize, usize), ServerError> {
-    let weights = model
-        .get_or_load_weights()
+    // Take an exclusive write guard on the weights. Each prompt in
+    // the batch is generated in turn under the same guard so the
+    // dequant cache only warms once.
+    let mut weights_guard = model
+        .lock_weights_for_gen()
         .map_err(ServerError::InferenceUnavailable)?;
-    // Hold the read guard + WalkFfn for the lifetime of the loop:
-    // gate-KNN through the (possibly Q4_K) index gives correct dense
-    // FFN output without needing f32 dense FFN weights resident.
+    let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
+    let _ = temperature; // accepted; layer_graph::generate is greedy.
+
     let patched = model.patched.blocking_read();
-    let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
-    let _ = temperature; // accepted; WalkFfn path is greedy by construction.
+    let index = patched.base();
+    let backend = larql_compute::default_backend();
+    let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+    let num_layers = weights.num_layers;
 
     let mut choices = Vec::with_capacity(prompts.len());
     let mut total_prompt_tokens = 0usize;
@@ -403,44 +406,31 @@ fn run_completions_loop(
         }
         total_prompt_tokens += prompt_ids.len();
 
-        let mut ids = prompt_ids.clone();
+        let result = larql_inference::layer_graph::generate(
+            weights,
+            &model.tokenizer,
+            &prompt_ids,
+            max_tokens,
+            index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
+        );
+
         let mut completion_text = String::new();
         let mut completion_token_count = 0usize;
         let mut finish_reason = "length";
-
-        for _ in 0..max_tokens {
-            let pred =
-                larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
-            let next_id = match pred.token_ids.first() {
-                Some(&id) => id,
-                None => {
-                    finish_reason = "stop";
-                    break;
-                }
-            };
-            let next_text = pred
-                .predictions
-                .first()
-                .map(|(t, _)| t.clone())
-                .unwrap_or_default();
-            let gen = Generated {
-                text: next_text.clone(),
-                eos: larql_inference::vindex::is_end_of_turn(&next_text),
-            };
-            completion_text.push_str(&gen.text);
+        for (text, _prob) in &result.tokens {
+            completion_text.push_str(text);
             completion_token_count += 1;
-            ids.push(next_id);
-
-            if gen.eos {
+            if larql_inference::vindex::is_end_of_turn(text) {
                 finish_reason = "stop";
                 break;
             }
-            if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
-                // Trim at the matched stop so it isn't included in the output.
-                completion_text = trim_at_stop(&completion_text, stop_strings);
-                finish_reason = "stop";
-                break;
-            }
+        }
+        if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
+            completion_text = trim_at_stop(&completion_text, stop_strings);
+            finish_reason = "stop";
         }
 
         total_completion_tokens += completion_token_count;

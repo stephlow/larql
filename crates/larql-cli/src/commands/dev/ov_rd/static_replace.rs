@@ -3,11 +3,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Args;
-use larql_inference::attention::{run_attention_block_with_pre_o, SharedKV};
+use larql_inference::attention::run_attention_block_with_pre_o;
 use larql_inference::forward::ple::precompute_per_layer_inputs;
-use larql_inference::forward::{
-    embed_tokens_pub, run_layer_with_ffn, run_layer_with_replaced_pre_o_head,
-};
+use larql_inference::forward::{embed_tokens_pub, run_layer_with_ffn};
 use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex,
@@ -431,61 +429,15 @@ fn forward_q4k_replace_pre_o_head(
     head: HeadId,
     replacement: &Array2<f32>,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-    let mut h = embed_tokens_pub(weights, token_ids);
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
-    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
-
-    for layer in 0..weights.num_layers {
-        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
-        let step = {
-            let shared_kv = weights
-                .arch
-                .kv_shared_source_layer(layer)
-                .and_then(|src| kv_cache.get(&src));
-            let ffn = WeightFfn { weights };
-            if layer == head.layer {
-                run_layer_with_replaced_pre_o_head(
-                    weights,
-                    &h,
-                    layer,
-                    &ffn,
-                    head.head,
-                    replacement,
-                    ple_inputs.get(layer),
-                    shared_kv,
-                )
-            } else {
-                run_layer_with_ffn(
-                    weights,
-                    &h,
-                    layer,
-                    &ffn,
-                    false,
-                    ple_inputs.get(layer),
-                    shared_kv,
-                )
-                .map(|(h_new, _, kv_out)| (h_new, kv_out))
-            }
-        };
-
-        if let Some((h_new, kv_out)) = step {
-            h = h_new;
-            if let Some(kv) = kv_out {
-                kv_cache.insert(layer, kv);
-            }
-        } else {
-            remove_layer_tensors(weights, inserted);
-            return Err(format!(
-                "forward failed at layer {layer} while replacing L{} H{}",
-                head.layer, head.head
-            )
-            .into());
-        }
-
-        remove_layer_tensors(weights, inserted);
-    }
-
-    Ok(h)
+    larql_inference::vindex::predict_q4k_hidden_with_replaced_pre_o_head(
+        weights,
+        token_ids,
+        index,
+        head.layer,
+        head.head,
+        replacement,
+    )
+    .map_err(Into::into)
 }
 
 fn final_logits(weights: &larql_inference::ModelWeights, h: &Array2<f32>) -> Vec<f32> {

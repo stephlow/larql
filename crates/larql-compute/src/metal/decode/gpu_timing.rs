@@ -102,11 +102,13 @@ impl TokenGpuTime {
 
     /// Print a token-summary line if `LARQL_GPU_TIMING=1`. `wall_ms`
     /// is the caller's CPU+GPU wall measurement (whatever they timed
-    /// around the whole token's work).  Adds a per-stage breakdown when
-    /// `LARQL_DECODE_STAGE_TIMING=1` is also set.
+    /// around the whole token's work). Adds a per-stage breakdown when
+    /// `LARQL_PROFILE_SPLIT=1` (or the legacy alias
+    /// `LARQL_DECODE_STAGE_TIMING=1`) is set.
     pub fn print_if_enabled(&self, wall_ms: f64) {
         let gpu_timing = std::env::var("LARQL_GPU_TIMING").is_ok();
-        let stage_timing = std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
+        let stage_timing = std::env::var("LARQL_PROFILE_SPLIT").is_ok()
+            || std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
         if !gpu_timing && !stage_timing {
             return;
         }

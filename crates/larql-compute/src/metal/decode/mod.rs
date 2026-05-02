@@ -313,13 +313,13 @@ impl MetalBackend {
             // before.
             let defer_ffn_for_split = split_mode && layer.moe.is_some();
 
-            // Stage-timing boundary: when LARQL_DECODE_STAGE_TIMING=1 (and we
-            // are NOT already splitting for MoE), close the encoder here so
+            // Stage-timing boundary: when LARQL_PROFILE_SPLIT=1 (or the legacy
+            // alias LARQL_DECODE_STAGE_TIMING=1), close the encoder here so
             // attention CB time can be recorded separately from FFN CB time.
-            // Adds ~1 commit/wait per layer (~0.5ms × 30 = ~15ms inflation
-            // on Gemma 4) — measurement-only mode, off by default.
-            let stage_timing_split =
-                !defer_ffn_for_split && std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
+            // Adds ~1 commit/wait per layer (~30-50µs each on M3 Max) —
+            // measurement-only mode, off by default. Skipped on MoE-deferred
+            // layers because their interleave block handles its own commits.
+            let stage_timing_split = !defer_ffn_for_split && profile::split_profile_requested();
             if stage_timing_split {
                 enc.end_encoding();
                 cmd.commit();
@@ -374,6 +374,22 @@ impl MetalBackend {
                     hidden,
                     use_fused_post_ffn,
                 );
+
+                // Paired commit boundary: closes the FFN cmd buffer started
+                // after the attention boundary above so its GPU window
+                // attributes cleanly to DenseFfn instead of leaking into the
+                // next layer's attention buffer (the bug the prior single-
+                // sided LARQL_DECODE_STAGE_TIMING path had). Skipped when has_moe
+                // because the MoE interleave below handles its own commits.
+                if stage_timing_split && !has_moe {
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::DenseFfn);
+                    cmd = self.queue.new_command_buffer().to_owned();
+                    enc = cmd.new_compute_command_encoder().to_owned();
+                    encoder_ended = false;
+                }
             }
 
             h_buf = new_h;
@@ -554,6 +570,18 @@ impl MetalBackend {
         // windows. Delta is CPU encoding + readback overhead.
         let wall_ms = _gpu_time_token_start.elapsed().as_secs_f64() * 1000.0;
         gpu_time.print_if_enabled(wall_ms);
+
+        // When LARQL_PROFILE_SPLIT=1, store the per-stage breakdown for
+        // `decode_token_split_profile` to read back. attn vs full-FFN
+        // granularity (gate_up_ms carries the whole FFN block; down_ms
+        // reserved for the next-finer split — see profile.rs doc-comment).
+        if profile::split_profile_requested() {
+            profile::store_last_split_timings(profile::ProfileTimings {
+                attn_ms: gpu_time.attn_ms,
+                gate_up_ms: gpu_time.dense_ffn_ms,
+                down_ms: 0.0,
+            });
+        }
 
         result
     }

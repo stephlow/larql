@@ -200,3 +200,18 @@ required). Source: `crates/larql-inference/examples/mech_interp_demo.rs`.
 The hook system landed across milestones M1–M8. Per-item file paths and
 design rationale: `crates/larql-inference/ROADMAP.md` § "P0:
 Mechanistic hooks (lazarus parity)".
+
+The next roadmap item is Q4K/vindex-backed research intervention:
+promote the reusable OV/RD plumbing into `larql-inference` so
+experiments can share Q4K per-layer tensor insertion, hooked Q4K
+forward passes, and stable trace/export contracts while keeping PQ
+variants and address probes in the dev harness.
+
+Current engine surface: `larql_inference::vindex::insert_q4k_layer_tensors`
+for scoped per-layer dense tensor materialization, and
+`larql_inference::vindex::predict_q4k_hidden_hooked` for dense-FFN Q4K
+hidden-state forward passes with `LayerHook` callbacks. Pre-W_O
+experiments can use
+`larql_inference::forward::run_layer_with_mapped_pre_o_head` at layer
+scope or `larql_inference::vindex::predict_q4k_hidden_with_mapped_pre_o_head`
+for a full Q4K forward pass with one mapped head.
