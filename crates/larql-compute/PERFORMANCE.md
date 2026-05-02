@@ -94,27 +94,74 @@ correct output.
 | Q4_K `sumy` precompute | Gemma 3 4B | neutral (within noise) | Compiler already hoisting; FMA chain unchanged |
 | Per-layer Q4K format + GPU expert dispatch | Gemma 4 26B A4B | **+75% overall (2.9 → 5.1 tok/s)** | Expert FFNs on GPU; see §26B A4B below |
 
-### Per-kernel batched throughput (corrected 2026-04-28)
+### Per-kernel batched throughput (refreshed 2026-05-02)
 
-`diag_profile_kernels`, M3 Max, gemma3-4b-q4k-v2:
+`diag_shader_bench --profile gemma3`, M3 Max, gemma3-4b-q4k-v2 (warmup 5, iters 30):
 
-| Kernel | Batched ms/call | GB/s | Per-token (×34) | Bottleneck |
+| Kernel | Batched ms/call | GB/s | Per-token (×34) | Notes |
 |---|---|---|---|---|
-| q6k_matvec (down, K=10240) | 0.065 ms | **331 GB/s** | 2.2 ms | bandwidth-bound, 83% of LPDDR5X peak |
-| q4k_ffn_gate_up_8sg (gate+up, K=2560) | 0.106 ms | **279 GB/s** | 3.6 ms | bandwidth-bound / dequant pressure |
-| q4k_ffn_gate_up_nr2 (candidate) | 0.110 ms | 267 GB/s | 3.8 ms | slower batched; do not promote |
-| q4k_matvec (Wo, K=8192) | 0.051 ms | 233 GB/s | 1.7 ms | lower util, but O-proj routing fix already captured |
-| q4k_q6k_qkv_normed (Q/K Q4_K, V Q6_K) | 0.133 ms | 198 GB/s | 4.5 ms | mixed QKV + input norm; now separately measured |
-| f32_gemv (lm_head, 262K×2560) | — | **349 GB/s** | 7.7 ms isolated | at LPDDR5X peak; production lm_head uses Q4_K stride32 path |
-| Wo + QKV + attention + 4× RMS norms | mixed | mixed | ~5.9 ms | mixed, presumed near-peak |
+| q6k_matvec_active / 4sg (down, K=10240) | 0.069 ms | **312 GB/s** | 2.3 ms | bandwidth-bound, ~84% of LPDDR5X peak; production default |
+| q6k_matvec_8sg | 0.069 ms | 311 GB/s | 2.4 ms | tied with 4sg at this granularity; opt-in only |
+| q4k_ffn_gate_up_8sg (production gate+up) | 0.107 ms | **275 GB/s** | 3.6 ms | bandwidth-bound; +2.1% end-to-end vs 4sg (not visible at batched-GB/s level) |
+| q4k_ffn_gate_up (4sg, original) | 0.107 ms | 276 GB/s | 3.6 ms | statistically tied with 8sg at the per-kernel level — the 8sg promotion was an end-to-end win, not a per-kernel one |
+| q4k_ffn_gate_up_f16acc (opt-in) | 0.110 ms | 268 GB/s | 3.7 ms | slower batched; do not promote (ADR-015 instance #1) |
+| q4k_ffn_gate_up_coop (opt-in) | 0.119 ms | 248 GB/s | 4.0 ms | slower batched; do not promote |
+| q4k_ffn_gate_up_nr2 (opt-in) | 0.120 ms | 246 GB/s | 4.1 ms | slower batched; do not promote (ADR-015 instance #3, gap widened from 267→246) |
+| q4k_matvec_8sg (Wo, K=8192) | 0.026 ms | 144 GB/s | 0.9 ms | lower util but small per-token cost |
+| q4k_q6k_qkv_proj (mixed Q/K Q4_K + V Q6_K) | 0.092 ms | 287 GB/s | 3.1 ms | production QKV path |
+| q4k_q6k_qkv_proj_normed (fused norm + QKV) | 0.135 ms | 194 GB/s | 4.6 ms | rereads H + norm per TG; default in production |
+| f32_gemv (lm_head, 262K×2560) | 0.866 ms | **387 GB/s** | 0.87 ms (×1) | near LPDDR5X peak; production lm_head uses Q4_K stride32 path |
 
 **No headroom in any single kernel.** The 1.30× decode gap to ollama is distributed across dispatch overhead + sustained-clock effects + the cumulative inefficiency of running fewer-fused kernels than llama.cpp.
 
 **Promotion rule (2026-05-02):** isolated kernel speedups are not promotion
-evidence for decode. Promote only when `diag_profile_kernels` production-batched
-GB/s improves and `larql bench --warmup 8 -n 30 --profile` improves with correct
-output. False positives now include `q4k_ffn_gate_up_f16acc`,
-`attn_fused`, and `q4k_ffn_gate_up_nr2`.
+evidence for decode. Promote only when production-batched GB/s improves AND
+`larql bench --warmup 8 -n 30 --profile` improves with correct output. False
+positives now include `q4k_ffn_gate_up_f16acc`, `attn_fused`,
+`q4k_ffn_gate_up_nr2`, and `q4k_ffn_gate_up_coop`. Canonical workflow below.
+
+### How to A/B a shader candidate
+
+Two commands. The save-then-compare flow is the contract for promoting a new
+shader to default — it implements the three-step diagnostic pinned in
+[ADR-015](docs/adr/015-isolated-vs-batched-kernel-perf.md).
+
+**Step 1 — capture a baseline** (commit `main` or whatever `HEAD` you trust):
+
+```bash
+cargo run --release --features metal -p larql-compute --example diag_shader_bench -- \
+  --profile gemma3 \
+  --json /tmp/larql-shaders-baseline.json
+```
+
+**Step 2 — change the shader, then compare:**
+
+```bash
+cargo run --release --features metal -p larql-compute --example diag_shader_bench -- \
+  --profile gemma3 \
+  --compare /tmp/larql-shaders-baseline.json \
+  --json /tmp/larql-shaders-current.json \
+  --threshold 5
+```
+
+Reads `--compare` first, prints per-kernel `improved` / `flat` / `regressed`
+(with the threshold percent), then writes the new JSON. `--threshold` defaults
+to 5%; tighten for noise-sensitive comparisons.
+
+**Step 3 — end-to-end bench A/B with correctness smoke:**
+
+```bash
+./target/release/larql run output/gemma3-4b-q4k-v2.vindex "The capital of France is" -n 8 --metal
+./target/release/larql bench output/gemma3-4b-q4k-v2.vindex --warmup 8 -n 30 --profile
+```
+
+The bench is the final word; the run output must still emit "Paris".
+
+**When step 2 says regressed or flat, do not run step 3.** Three sessions have
+been spent re-confirming that an isolated-only win does not carry — see
+ADR-015. The exception is the 8sg geometry pattern: kernels under ~75% of
+LPDDR5X peak have headroom to convert isolated wins into batched wins; above
+~80% peak the headroom is gone.
 
 ---
 

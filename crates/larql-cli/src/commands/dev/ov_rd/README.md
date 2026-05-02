@@ -95,25 +95,28 @@ runs are experimental probes, not stable vindex extraction verbs.
 Current split:
 
 ```text
-cmd.rs      CLI args, dispatch, experiment loops, and forward variants
-address.rs  address predictor models and address-match helpers
-basis.rs    W_O roundtrip basis, PCA basis, and Jacobi eigensolver
-input.rs    prompt loading, held-out splits, and CLI string parsers
-metrics.rs  KL, entropy, top-k, and distribution helpers
-pq.rs       PQ codebooks, Mode D tables, and k-means mechanics
-reports.rs  JSON artifact schemas
-runtime.rs  Q4K tensor insertion/removal and local dequantization
-stats.rs    running head stats and static mean accumulators
-types.rs    shared input/config identifiers
+cmd.rs             CLI dispatch only
+address.rs         address predictor models and address-match helpers
+basis.rs           W_O roundtrip basis, z-space PCA fitting, and eigensolver
+capture.rs         stage-0 pre-W_O capture and head statistics
+input.rs           prompt loading, held-out splits, and CLI string parsers
+metrics.rs         KL, entropy, top-k, and distribution helpers
+oracle.rs          roundtrip and low-rank oracle checks
+oracle_pq.rs       PQ fitting, Mode D validation, and address probes
+pq.rs              PQ codebooks, Mode D tables, and k-means mechanics
+reports.rs         JSON artifact schemas
+runtime.rs         Q4K tensor insertion/removal and local dequantization
+sanity.rs          no-op/subtract/residual-delta equivalence checks
+static_replace.rs  static mean replacement gate and shared static fitting
+stats.rs           running head stats and static mean accumulators
+types.rs           shared input/config identifiers
+zero_ablate.rs     zero pre-W_O ablation gate
 ```
 
 The next cleanup should continue splitting by experiment role:
 
 ```text
-capture.rs         stage-0 capture and statistics
-static_replace.rs  zero/static/no-op replacement gates
-oracle.rs          roundtrip and low-rank oracle checks
-oracle_pq.rs       PQ fitting and Mode D validation
+forward.rs  shared full-model forward replacement helpers, if more reuse appears
 ```
 
 Do this incrementally. The first invariant is that existing `larql dev ov-rd`

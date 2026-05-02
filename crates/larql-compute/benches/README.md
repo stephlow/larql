@@ -69,9 +69,11 @@ use:
 ```
 cargo run --release --features metal -p larql-compute --example diag_shader_bench
 cargo run --release --features metal -p larql-compute --example diag_shader_bench -- --profile gemma3 --json /tmp/larql-shaders.json
+cargo run --release --features metal -p larql-compute --example diag_shader_bench -- --profile gemma3 --compare /tmp/larql-shaders.json --threshold 5
 ```
 
 The shader bench is diagnostic rather than Criterion-based. Treat the
 batched column as the promotion signal; isolated timings include
 per-call command-buffer overhead and can make candidate kernels look
-better than they are in decode.
+better than they are in decode. `--compare` reads a prior JSON file
+from this tool and reports per-kernel `batched_ms` deltas.

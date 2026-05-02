@@ -5,6 +5,7 @@
 //! shader inventory, and keeps isolated timings visibly separate from
 //! production-shaped batched timings.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -31,6 +32,8 @@ pub struct Config {
     pub iters: usize,
     pub n_layers: usize,
     pub json: Option<PathBuf>,
+    pub compare: Option<PathBuf>,
+    pub threshold_pct: f64,
     pub inventory_only: bool,
 }
 
@@ -42,6 +45,8 @@ impl Default for Config {
             iters: 8,
             n_layers: 4,
             json: None,
+            compare: None,
+            threshold_pct: 5.0,
             inventory_only: false,
         }
     }
@@ -93,6 +98,17 @@ impl Config {
                     };
                     cfg.json = Some(PathBuf::from(path));
                 }
+                "--compare" => {
+                    i += 1;
+                    let Some(path) = args.get(i) else {
+                        return Err("--compare requires a path".into());
+                    };
+                    cfg.compare = Some(PathBuf::from(path));
+                }
+                "--threshold" => {
+                    i += 1;
+                    cfg.threshold_pct = parse_f64(args.get(i), "--threshold")?;
+                }
                 "--inventory-only" => cfg.inventory_only = true,
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unknown argument `{other}`")),
@@ -102,12 +118,15 @@ impl Config {
         if cfg.warmup == 0 || cfg.iters == 0 || cfg.n_layers == 0 {
             return Err("--warmup, --iters, and --layers must be non-zero".into());
         }
+        if !cfg.threshold_pct.is_finite() || cfg.threshold_pct < 0.0 {
+            return Err("--threshold must be a non-negative percentage".into());
+        }
         Ok(cfg)
     }
 }
 
 pub fn usage() -> String {
-    "Usage: cargo run --release --features metal -p larql-compute --example diag_shader_bench -- [--profile smoke|gemma3] [--warmup N] [--iters N] [--layers N] [--inventory-only] [--json PATH]".into()
+    "Usage: cargo run --release --features metal -p larql-compute --example diag_shader_bench -- [--profile smoke|gemma3] [--warmup N] [--iters N] [--layers N] [--inventory-only] [--json PATH] [--compare PATH] [--threshold PCT]".into()
 }
 
 fn parse_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {
@@ -115,6 +134,13 @@ fn parse_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("{flag} requires a value"))?
         .parse::<usize>()
         .map_err(|_| format!("{flag} requires a positive integer"))
+}
+
+fn parse_f64(value: Option<&String>, flag: &str) -> Result<f64, String> {
+    value
+        .ok_or_else(|| format!("{flag} requires a value"))?
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} requires a number"))
 }
 
 #[derive(Clone, Copy)]
@@ -168,6 +194,7 @@ pub struct BenchResult {
     pub batched_ms: Option<f64>,
     pub batched_gbs: Option<f64>,
     pub output_nonzero: Option<usize>,
+    pub sanity: &'static str,
     pub note: &'static str,
 }
 
@@ -213,6 +240,11 @@ pub fn run(cfg: &Config) -> Result<Vec<BenchResult>, String> {
 
     results.extend(run_benches(&metal, cfg, shape));
     print_results(&results);
+
+    if let Some(path) = &cfg.compare {
+        let baseline = load_baseline(path)?;
+        print_compare(&results, &baseline, path, cfg.threshold_pct);
+    }
 
     if let Some(path) = &cfg.json {
         std::fs::write(path, to_json(&results)).map_err(|e| format!("write json: {e}"))?;
@@ -350,6 +382,7 @@ fn bench_q4_0_matvec(metal: &MetalBackend, cfg: &Config, shape: Shape) -> BenchR
         w.len() as u64 + q8_x.len() as u64 + (q8_scales.len() * 4) as u64,
         &ob,
         n,
+        "checked",
         "Q4_0 x Q8 input matvec",
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -394,6 +427,7 @@ fn bench_q8_matvec(metal: &MetalBackend, cfg: &Config, shape: Shape) -> BenchRes
         w_q8.len() as u64 + (w_scales.len() * 4) as u64,
         &ob,
         n,
+        "checked",
         "Q8_0 x Q8 input matvec",
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -444,6 +478,7 @@ fn bench_qk_matvec(
         w.len() as u64,
         &ob,
         n,
+        "checked",
         note,
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -468,12 +503,13 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
     let gate_q4kf = quantize_q4_kf(&synth_f32(n * k, 0.53));
     let up_q4kf = quantize_q4_kf(&synth_f32(n * k, 0.54));
     let mut out = Vec::new();
-    for (name, kh, gate, up, note) in [
+    for (name, kh, gate, up, sanity, note) in [
         (
             "q4k_ffn_gate_up",
             &metal.q4k_ffn_gate_up_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
+            "checked",
             "baseline Q4_K gate+up",
         ),
         (
@@ -481,6 +517,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
             &metal.q4k_ffn_gate_up_8sg_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
+            "checked",
             "8-simdgroup Q4_K gate+up candidate/default path",
         ),
         (
@@ -488,6 +525,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
             &metal.q4k_ffn_gate_up_f16acc_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
+            "checked",
             "f16 accumulator candidate",
         ),
         (
@@ -495,6 +533,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
             &metal.q4k_ffn_gate_up_coop_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
+            "checked",
             "cooperative scale-load candidate",
         ),
         (
@@ -502,6 +541,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
             &metal.q4k_ffn_gate_up_nr2_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
+            "checked",
             "NR0=2 candidate",
         ),
         (
@@ -509,11 +549,12 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
             &metal.q4kf_ffn_gate_up_pipeline,
             gate_q4kf.as_slice(),
             up_q4kf.as_slice(),
-            "Q4_KF/GGUF-layout gate+up",
+            "layout-sensitive",
+            "Q4_KF/GGUF-layout gate+up; synthetic Q4_KF may not exercise every row",
         ),
     ] {
         out.push(bench_gate_up(
-            metal, cfg, shape, name, kh, gate, up, n, k, note,
+            metal, cfg, shape, name, kh, gate, up, n, k, sanity, note,
         ));
     }
     out
@@ -530,6 +571,7 @@ fn bench_gate_up(
     up: &[u8],
     n: usize,
     k: usize,
+    sanity: &'static str,
     note: &'static str,
 ) -> BenchResult {
     let x = synth_f32(k, 0.61);
@@ -553,6 +595,7 @@ fn bench_gate_up(
         (gate.len() + up.len()) as u64,
         &go,
         n,
+        sanity,
         note,
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -589,6 +632,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             &q4k_down,
             &gate,
             &up,
+            "checked",
             "Q4_K fused SiLU GEGLU down",
         ),
         bench_geglu_down(
@@ -601,6 +645,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             &q4k_down,
             &gate,
             &up,
+            "checked",
             "Q4_K fused GELU-tanh GEGLU down",
         ),
         bench_geglu_down(
@@ -613,6 +658,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             &q6k_down,
             &gate,
             &up,
+            "checked",
             "Q6_K fused SiLU GEGLU down",
         ),
         bench_geglu_down(
@@ -625,6 +671,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             &q6k_down,
             &gate,
             &up,
+            "checked",
             "Q6_K fused GELU-tanh GEGLU down",
         ),
         bench_geglu_down(
@@ -637,6 +684,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             &q6k_down,
             &gate,
             &up,
+            "checked",
             "Q6_K cached-activation GELU-tanh GEGLU down",
         ),
     ]
@@ -653,6 +701,7 @@ fn bench_geglu_down(
     weights: &[u8],
     gate: &[f32],
     up: &[f32],
+    sanity: &'static str,
     note: &'static str,
 ) -> BenchResult {
     let n = shape.hidden;
@@ -676,6 +725,7 @@ fn bench_geglu_down(
         weights.len() as u64 + (gate.len() * 8) as u64,
         &ob,
         n,
+        sanity,
         note,
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -711,6 +761,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             &q4_q,
             &q4_k,
             &q4_v,
+            "checked",
             "Q4_K fused QKV projection",
         ),
         bench_q4k_qkv(
@@ -722,7 +773,8 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             &q4kf_q,
             &q4kf_k,
             &q4kf_v,
-            "Q4_KF/GGUF fused QKV projection",
+            "layout-sensitive",
+            "Q4_KF/GGUF fused QKV projection; synthetic Q4_KF may not exercise every row",
         ),
         bench_q4k_q6k_qkv(
             metal,
@@ -734,6 +786,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             &q4_k,
             &q6_v,
             false,
+            "checked",
             "mixed Q4_K Q/K + Q6_K V fused QKV projection",
         ),
         bench_q4k_q6k_qkv(
@@ -746,6 +799,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             &q4_k,
             &q6_v,
             true,
+            "checked",
             "mixed Q4_K/Q6_K fused QKV projection with RMS norm",
         ),
     ]
@@ -761,6 +815,7 @@ fn bench_q4k_qkv(
     wq: &[u8],
     wk: &[u8],
     wv: &[u8],
+    sanity: &'static str,
     note: &'static str,
 ) -> BenchResult {
     let x = synth_f32(shape.hidden, 0.91);
@@ -791,6 +846,7 @@ fn bench_q4k_qkv(
         (wq.len() + wk.len() + wv.len()) as u64,
         &qb,
         shape.q_rows,
+        sanity,
         note,
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -824,6 +880,7 @@ fn bench_q4k_q6k_qkv(
     wk: &[u8],
     wv: &[u8],
     normed: bool,
+    sanity: &'static str,
     note: &'static str,
 ) -> BenchResult {
     let x = synth_f32(shape.hidden, 0.92);
@@ -858,6 +915,7 @@ fn bench_q4k_q6k_qkv(
         (wq.len() + wk.len() + wv.len()) as u64,
         &qb,
         shape.q_rows,
+        sanity,
         note,
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -917,6 +975,7 @@ fn bench_f32_gemv(metal: &MetalBackend, cfg: &Config, shape: Shape) -> BenchResu
         (weights.len() * 4) as u64,
         &ob,
         n,
+        "checked",
         "f32 row-per-simdgroup GEMV; Gemma3 profile caps N to avoid multi-GB synthetic allocation",
         |enc| {
             enc.set_compute_pipeline_state(&kh.state);
@@ -944,6 +1003,7 @@ fn measure_tiled(
     bytes_per_call: u64,
     output: &Buffer,
     output_len: usize,
+    sanity: &'static str,
     note: &'static str,
     encode: impl Fn(&ComputeCommandEncoderRef),
 ) -> BenchResult {
@@ -964,6 +1024,7 @@ fn measure_tiled(
         batched_ms: Some(batched_ms),
         batched_gbs: Some(gbs(bytes_per_call, batched_ms)),
         output_nonzero: Some(output_nonzero),
+        sanity,
         note,
     }
 }
@@ -1468,31 +1529,52 @@ fn inventory_results(include_benched: bool) -> Vec<BenchResult> {
             batched_ms: None,
             batched_gbs: None,
             output_nonzero: None,
+            sanity: inventory_sanity(i),
             note: i.note,
         })
         .collect()
 }
 
+fn inventory_sanity(i: &InventoryItem) -> &'static str {
+    match i.name {
+        "q4kf_ffn_gate_up" | "q4kf_qkv_proj" => "layout-sensitive",
+        _ if i.status == "bench" => "timed-mode",
+        _ => "not-timed",
+    }
+}
+
 fn print_inventory_rows(results: &[BenchResult]) {
-    println!("{:<34} {:<14} {:<10} Note", "Kernel", "Family", "Status");
+    println!(
+        "{:<34} {:<14} {:<10} {:<16} Note",
+        "Kernel", "Family", "Status", "Sanity"
+    );
     println!("{}", "-".repeat(96));
     for r in results {
         println!(
-            "{:<34} {:<14} {:<10} {}",
-            r.name, r.family, r.status, r.note
+            "{:<34} {:<14} {:<10} {:<16} {}",
+            r.name, r.family, r.status, r.sanity, r.note
         );
     }
 }
 
 fn print_results(results: &[BenchResult]) {
     println!(
-        "{:<34} {:<14} {:>5} {:>5} {:>9} {:>9} {:>9} {:>9} {:>8}",
-        "Kernel", "Family", "rows", "thr", "iso_ms", "iso_sd", "bat_ms", "GB/s", "nonzero"
+        "{:<34} {:<14} {:>5} {:>5} {:>9} {:>9} {:>9} {:>9} {:>8} {:<16}",
+        "Kernel",
+        "Family",
+        "rows",
+        "thr",
+        "iso_ms",
+        "iso_sd",
+        "bat_ms",
+        "GB/s",
+        "nonzero",
+        "Sanity"
     );
-    println!("{}", "-".repeat(112));
+    println!("{}", "-".repeat(130));
     for r in results.iter().filter(|r| r.status == "bench") {
         println!(
-            "{:<34} {:<14} {:>5} {:>5} {:>9.4} {:>9.4} {:>9.4} {:>9.1} {:>8}",
+            "{:<34} {:<14} {:>5} {:>5} {:>9.4} {:>9.4} {:>9.4} {:>9.1} {:>8} {:<16}",
             r.name,
             r.family,
             r.rows_per_tg.unwrap_or_default(),
@@ -1502,10 +1584,142 @@ fn print_results(results: &[BenchResult]) {
             r.batched_ms.unwrap_or_default(),
             r.batched_gbs.unwrap_or_default(),
             r.output_nonzero.unwrap_or_default(),
+            r.sanity,
         );
     }
     println!();
     println!("Use batched ms/GB/s for promotion decisions; isolated numbers include per-call command-buffer overhead.");
+}
+
+#[derive(Debug, Clone)]
+struct BaselineResult {
+    family: String,
+    batched_ms: Option<f64>,
+}
+
+fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineResult>, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("read compare json: {e}"))?;
+    let mut out = HashMap::new();
+    let mut rest = src.as_str();
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('}') else {
+            break;
+        };
+        let obj = &rest[..end];
+        rest = &rest[end + 1..];
+        let Some(name) = json_field_string(obj, "name") else {
+            continue;
+        };
+        let family = json_field_string(obj, "family").unwrap_or_default();
+        let batched_ms = json_field_number(obj, "batched_ms");
+        out.insert(name, BaselineResult { family, batched_ms });
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "compare json `{}` did not contain shader bench results",
+            path.display()
+        ));
+    }
+    Ok(out)
+}
+
+fn print_compare(
+    current: &[BenchResult],
+    baseline: &HashMap<String, BaselineResult>,
+    path: &PathBuf,
+    threshold_pct: f64,
+) {
+    println!();
+    println!(
+        "Comparison vs {} (batched_ms, threshold={threshold_pct:.1}%):",
+        path.display()
+    );
+    println!(
+        "{:<34} {:<14} {:>10} {:>10} {:>9} {:<10}",
+        "Kernel", "Family", "base_ms", "cur_ms", "delta", "Verdict"
+    );
+    println!("{}", "-".repeat(94));
+
+    let mut improved = 0usize;
+    let mut flat = 0usize;
+    let mut regressed = 0usize;
+    let mut missing = 0usize;
+
+    for r in current.iter().filter(|r| r.status == "bench") {
+        let Some(cur_ms) = r.batched_ms else {
+            continue;
+        };
+        let Some(base) = baseline.get(r.name) else {
+            missing += 1;
+            continue;
+        };
+        let Some(base_ms) = base.batched_ms else {
+            missing += 1;
+            continue;
+        };
+        if base_ms <= 0.0 {
+            missing += 1;
+            continue;
+        }
+        let delta = (cur_ms - base_ms) / base_ms * 100.0;
+        let verdict = if delta > threshold_pct {
+            regressed += 1;
+            "regressed"
+        } else if delta < -threshold_pct {
+            improved += 1;
+            "improved"
+        } else {
+            flat += 1;
+            "flat"
+        };
+        let family = if base.family.is_empty() {
+            r.family
+        } else {
+            base.family.as_str()
+        };
+        println!(
+            "{:<34} {:<14} {:>10.4} {:>10.4} {:>8.1}% {:<10}",
+            r.name, family, base_ms, cur_ms, delta, verdict
+        );
+    }
+
+    println!("summary: improved={improved} flat={flat} regressed={regressed} missing={missing}");
+}
+
+fn json_field_string(obj: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":\"");
+    let start = obj.find(&pattern)? + pattern.len();
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in obj[start..].chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+fn json_field_number(obj: &str, key: &str) -> Option<f64> {
+    let pattern = format!("\"{key}\":");
+    let start = obj.find(&pattern)? + pattern.len();
+    let tail = obj[start..].trim_start();
+    if tail.starts_with("null") {
+        return None;
+    }
+    let len = tail
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E'))
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .last()?;
+    tail[..len].parse::<f64>().ok()
 }
 
 fn to_json(results: &[BenchResult]) -> String {
@@ -1527,6 +1741,7 @@ fn to_json(results: &[BenchResult]) -> String {
         write!(s, ",\"batched_ms\":{}", opt_f64(r.batched_ms)).unwrap();
         write!(s, ",\"batched_gbs\":{}", opt_f64(r.batched_gbs)).unwrap();
         write!(s, ",\"output_nonzero\":{}", opt_usize(r.output_nonzero)).unwrap();
+        write!(s, ",\"sanity\":\"{}\"", json_escape(r.sanity)).unwrap();
         write!(s, ",\"note\":\"{}\"", json_escape(r.note)).unwrap();
         s.push('}');
     }
@@ -1549,4 +1764,33 @@ fn opt_f64(v: Option<f64>) -> String {
 
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_json_parser_reads_batched_ms() {
+        let path = std::env::temp_dir().join(format!(
+            "larql-shader-bench-compare-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"[
+  {"name":"q4k_matvec","family":"q4k-matvec","batched_ms":0.025000,"batched_gbs":147.7},
+  {"name":"f16_gemv","family":"lm-head","batched_ms":null}
+]"#,
+        )
+        .unwrap();
+
+        let parsed = load_baseline(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let q4k = parsed.get("q4k_matvec").unwrap();
+        assert_eq!(q4k.family, "q4k-matvec");
+        assert_eq!(q4k.batched_ms, Some(0.025));
+        assert_eq!(parsed.get("f16_gemv").unwrap().batched_ms, None);
+    }
 }

@@ -43,12 +43,12 @@ The mechanisms differ but the symptom is identical:
 
 Run all three measurements before deciding:
 
-1. **Isolated** (`diag_profile_kernels` first column): cheap, fastest signal.
+1. **Isolated** (`diag_shader_bench` `iso_ms` column): cheap, fastest signal.
    A regression here is enough to drop the candidate. A win here is
    necessary but not sufficient.
-2. **Batched** (`diag_profile_kernels` second column): the production
-   geometry. **This is the number that predicts end-to-end.** If batched
-   regresses or is within noise, the candidate is not a win.
+2. **Batched** (`diag_shader_bench` `bat_ms` / `GB/s` columns): the
+   production geometry. **This is the number that predicts end-to-end.**
+   If batched regresses or is within noise, the candidate is not a win.
 3. **End-to-end bench A/B** (`larql bench --warmup 8 -n 30 --profile`):
    final confirmation, with correctness smoke (`larql run "The capital of
    France is" -n 8 --metal` should still emit Paris).
@@ -56,6 +56,15 @@ Run all three measurements before deciding:
 Steps 1 and 2 take ~30 s total. Step 3 takes another minute. Skipping step 2
 and going straight from isolated → end-to-end has burned three sessions; do
 not skip it.
+
+### Mechanised flow (2026-05-02)
+
+`diag_shader_bench --profile gemma3` with `--json` and `--compare` automates
+steps 1 and 2 against a saved baseline. The full save-then-compare command
+pair lives in `crates/larql-compute/PERFORMANCE.md` under "How to A/B a
+shader candidate" — that is the canonical promotion gate. Use
+`--threshold N` to set the percent regression considered a real loss
+(default 5%).
 
 ## When the pattern does NOT apply
 

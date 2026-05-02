@@ -1,10 +1,16 @@
 mod address;
 mod basis;
+mod capture;
 pub mod cmd;
 mod input;
 mod metrics;
+mod oracle;
+mod oracle_pq;
 mod pq;
 mod reports;
 mod runtime;
+mod sanity;
+mod static_replace;
 mod stats;
 mod types;
+mod zero_ablate;

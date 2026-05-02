@@ -162,6 +162,7 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        gen_lock: tokio::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         expert_filter: None,

@@ -52,6 +52,24 @@ pub struct LoadedModel {
     pub release_mmap_after_request: bool,
     /// Model weights, lazy-loaded on first INFER request.
     pub weights: std::sync::OnceLock<ModelWeights>,
+    /// Serializes the OpenAI-compat generation path
+    /// (`/v1/completions`, `/v1/chat/completions`).
+    ///
+    /// `larql_inference::layer_graph::generate` requires
+    /// `&mut ModelWeights` because the per-layer Q4_K dequant cache
+    /// inside `weights.tensors` is mutated as layers are decoded.
+    /// `OnceLock` only exposes `&T` once filled, so the OpenAI handlers
+    /// take this lock and use a controlled `unsafe` cast to obtain
+    /// `&mut`. Holding the lock guarantees no concurrent OpenAI
+    /// generation request mutates the same map.
+    ///
+    /// Concurrent /v1/infer / /v1/walk-ffn read paths do **not** take
+    /// this lock (they pre-existed the openai work and use
+    /// `&ModelWeights` paths that don't touch the dequant cache the
+    /// same way). For typical single-user demo and small-shop traffic
+    /// this is fine; production-grade fix is N0.2-fast in the roadmap
+    /// (move all weights access behind a `RwLock`).
+    pub gen_lock: tokio::sync::Mutex<()>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
@@ -335,6 +353,7 @@ mod loaded_model_tests {
             embed_store: None,
             release_mmap_after_request: release_mmap,
             weights: std::sync::OnceLock::new(),
+            gen_lock: tokio::sync::Mutex::new(()),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             expert_filter: None,

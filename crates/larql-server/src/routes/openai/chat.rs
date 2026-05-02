@@ -49,8 +49,6 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
-use larql_inference::{ChatMLRenderer, GemmaRenderer, Llama3Renderer, TurnRenderer};
-
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
@@ -310,7 +308,7 @@ fn stream_chat_completion(
             }
         };
         let template = pick_template(&model);
-        let prompt = render_messages(template, &messages);
+        let prompt = render(template, &messages);
         let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
             Ok(e) => e,
             Err(e) => {
@@ -342,13 +340,8 @@ fn stream_chat_completion(
         let mut finish_reason: &'static str = "length";
 
         for _ in 0..max_tokens {
-            let pred = larql_inference::predict_with_ffn(
-                weights,
-                &model.tokenizer,
-                &ids,
-                1,
-                &walk_ffn,
-            );
+            let pred =
+                larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
             let next_id = match pred.token_ids.first() {
                 Some(&id) => id,
                 None => {
@@ -439,7 +432,7 @@ fn run_chat_completion(
         .map_err(ServerError::InferenceUnavailable)?;
 
     let template = pick_template(model);
-    let prompt = render_messages(template, messages);
+    let prompt = render(template, messages);
 
     let encoding = model
         .tokenizer
@@ -455,7 +448,7 @@ fn run_chat_completion(
 
     let patched = model.patched.blocking_read();
     let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
-    let _ = temperature; // accepted; WalkFfn path is greedy.
+    let _ = temperature; // accepted; WalkFfn path is greedy by construction.
 
     let mut ids = prompt_ids;
     let mut completion_text = String::new();
@@ -463,13 +456,7 @@ fn run_chat_completion(
     let mut finish_reason: &'static str = "length";
 
     for _ in 0..max_tokens {
-        let pred = larql_inference::predict_with_ffn(
-            weights,
-            &model.tokenizer,
-            &ids,
-            1,
-            &walk_ffn,
-        );
+        let pred = larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
         let next_id = match pred.token_ids.first() {
             Some(&id) => id,
             None => {
@@ -506,129 +493,31 @@ fn run_chat_completion(
     ))
 }
 
-// ── Template selection + multi-turn rendering ────────────────────────────────
+// ── Template selection ───────────────────────────────────────────────────────
+//
+// The multi-turn rendering itself lives in
+// `larql_inference::prompt::ChatTemplate::render_messages`. This handler
+// only needs to pick the right template variant for the loaded model.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Template {
-    Gemma,
-    Llama,
-    ChatML,
-    Mistral,
-    Plain,
-}
-
-fn pick_template(model: &LoadedModel) -> Template {
-    // Prefer the architecture's family signal if loaded weights expose
-    // one. Fall back to model id heuristics.
+fn pick_template(model: &LoadedModel) -> larql_inference::prompt::ChatTemplate {
+    use larql_inference::prompt::ChatTemplate;
+    // Prefer the architecture's family signal when weights are loaded;
+    // fall back to id heuristics when weights haven't been touched yet.
     if let Some(weights) = model.weights.get() {
-        let fam = weights.arch.family();
-        match fam {
-            "gemma2" | "gemma3" | "gemma4" => return Template::Gemma,
-            "llama" => return Template::Llama,
-            "qwen" | "qwen2" | "qwen3" | "deepseek" | "gpt_oss" => return Template::ChatML,
-            "mistral" | "mixtral" => return Template::Mistral,
-            _ => {}
-        }
+        return ChatTemplate::for_family(weights.arch.family());
     }
-    let id = model.id.to_ascii_lowercase();
-    if id.contains("gemma") {
-        Template::Gemma
-    } else if id.contains("mixtral") || id.contains("mistral") {
-        Template::Mistral
-    } else if id.contains("llama") {
-        Template::Llama
-    } else if id.contains("qwen") || id.contains("deepseek") || id.contains("chatml") {
-        Template::ChatML
-    } else {
-        Template::Plain
-    }
+    ChatTemplate::for_model_id(&model.id)
 }
 
-/// Render a message list into a single prompt string, ready to feed to
-/// the tokenizer. The final assistant-open marker is appended so the
-/// model continues from "I am about to speak as the assistant".
-fn render_messages(tpl: Template, messages: &[ChatMessage]) -> String {
-    match tpl {
-        Template::Gemma => render_via_renderer(&GemmaRenderer, messages),
-        Template::Llama => render_via_renderer(&Llama3Renderer, messages),
-        Template::ChatML => render_via_renderer(&ChatMLRenderer, messages),
-        Template::Mistral => render_mistral(messages),
-        Template::Plain => render_plain(messages),
-    }
-}
-
-fn render_via_renderer<R: TurnRenderer>(renderer: &R, messages: &[ChatMessage]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        out.push_str(&renderer.render(&m.role, &m.content));
-    }
-    out.push_str(&renderer.assistant_open());
-    out
-}
-
-/// Mistral / Mixtral: `[INST] {user} [/INST] {assistant}` with system
-/// prompt prepended to the first user turn.
-fn render_mistral(messages: &[ChatMessage]) -> String {
-    let mut out = String::new();
-    let mut pending_system: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < messages.len() {
-        let m = &messages[i];
-        match m.role.as_str() {
-            SYSTEM_ROLE => {
-                pending_system.push(m.content.clone());
-                i += 1;
-            }
-            USER_ROLE => {
-                let prefix = if pending_system.is_empty() {
-                    String::new()
-                } else {
-                    let p = pending_system.join("\n") + "\n\n";
-                    pending_system.clear();
-                    p
-                };
-                out.push_str(&format!("[INST] {prefix}{} [/INST]", m.content));
-                i += 1;
-                if let Some(next) = messages.get(i) {
-                    if next.role == ASSISTANT_ROLE {
-                        out.push_str(&format!(" {} ", next.content));
-                        i += 1;
-                    }
-                }
-            }
-            ASSISTANT_ROLE => {
-                // Stray assistant turn (no preceding user) — emit verbatim.
-                out.push_str(&format!(" {} ", m.content));
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    // Trailing system without a user turn → wrap as a user prompt so
-    // the model has somewhere to respond.
-    if !pending_system.is_empty() {
-        out.push_str(&format!("[INST] {} [/INST]", pending_system.join("\n")));
-    }
-    out
-}
-
-/// Plain template — for base / non-instruct models. Concatenates the
-/// messages with `User:` / `Assistant:` / `System:` markers and ends
-/// with an `Assistant:` open so the model continues. Not great, but
-/// better than dropping system prompts on the floor.
-fn render_plain(messages: &[ChatMessage]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        let label = match m.role.as_str() {
-            USER_ROLE => "User",
-            ASSISTANT_ROLE => "Assistant",
-            SYSTEM_ROLE => "System",
-            other => other,
-        };
-        out.push_str(&format!("{label}: {}\n", m.content));
-    }
-    out.push_str("Assistant: ");
-    out
+/// Adapter: convert our wire `ChatMessage` list to the `(role, content)`
+/// shape `ChatTemplate::render_messages` accepts. Pure plumbing — no
+/// rendering logic lives here any more.
+fn render(template: larql_inference::prompt::ChatTemplate, messages: &[ChatMessage]) -> String {
+    template.render_messages(
+        messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str())),
+    )
 }
 
 // ── chat-only request validation helper ─────────────────────────────────────
@@ -641,127 +530,11 @@ fn is_empty_json_array(v: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.into(),
-            content: content.into(),
-            tool_calls: None,
-            tool_call_id: None,
-        }
-    }
-
-    #[test]
-    fn render_gemma_multi_turn_includes_model_open() {
-        let out = render_messages(
-            Template::Gemma,
-            &[
-                msg("user", "hi"),
-                msg("assistant", "hello"),
-                msg("user", "more"),
-            ],
-        );
-        assert!(out.contains("<start_of_turn>user\nhi<end_of_turn>"));
-        assert!(out.contains("<start_of_turn>model\nhello<end_of_turn>"));
-        assert!(out.contains("<start_of_turn>user\nmore<end_of_turn>"));
-        assert!(out.ends_with("<start_of_turn>model\n"));
-    }
-
-    #[test]
-    fn render_chatml_multi_turn() {
-        let out = render_messages(
-            Template::ChatML,
-            &[
-                msg("system", "You are concise."),
-                msg("user", "hi"),
-                msg("assistant", "hello"),
-                msg("user", "more"),
-            ],
-        );
-        assert!(out.contains("<|im_start|>system\nYou are concise.<|im_end|>"));
-        assert!(out.contains("<|im_start|>user\nhi<|im_end|>"));
-        assert!(out.contains("<|im_start|>assistant\nhello<|im_end|>"));
-        assert!(out.ends_with("<|im_start|>assistant\n"));
-    }
-
-    #[test]
-    fn render_llama_multi_turn() {
-        let out = render_messages(
-            Template::Llama,
-            &[
-                msg("user", "hi"),
-                msg("assistant", "hello"),
-                msg("user", "more"),
-            ],
-        );
-        assert!(out.contains("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"));
-        assert!(out.contains("<|start_header_id|>assistant<|end_header_id|>\n\nhello<|eot_id|>"));
-        assert!(out.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
-    }
-
-    #[test]
-    fn render_mistral_prepends_system_to_first_user() {
-        let out = render_messages(
-            Template::Mistral,
-            &[msg("system", "Be brief."), msg("user", "hi")],
-        );
-        assert_eq!(out, "[INST] Be brief.\n\nhi [/INST]");
-    }
-
-    #[test]
-    fn render_mistral_handles_assistant_turn() {
-        let out = render_messages(
-            Template::Mistral,
-            &[
-                msg("user", "hi"),
-                msg("assistant", "hello"),
-                msg("user", "more"),
-            ],
-        );
-        assert_eq!(out, "[INST] hi [/INST] hello [INST] more [/INST]");
-    }
-
-    #[test]
-    fn render_plain_uses_role_labels() {
-        let out = render_messages(
-            Template::Plain,
-            &[msg("system", "Concise."), msg("user", "hi")],
-        );
-        assert_eq!(out, "System: Concise.\nUser: hi\nAssistant: ");
-    }
-
-    #[test]
-    fn pick_template_uses_id_heuristic_when_no_weights() {
-        // We can't construct a real LoadedModel here; cover the id-based
-        // fallback via the helper directly.
-        let cases = [
-            ("google/gemma-3-4b-it", Template::Gemma),
-            ("meta-llama/Llama-3.2-3B-Instruct", Template::Llama),
-            ("Qwen/Qwen2.5-7B-Instruct", Template::ChatML),
-            ("deepseek-ai/DeepSeek-V2", Template::ChatML),
-            ("mistralai/Mistral-7B-Instruct-v0.3", Template::Mistral),
-            ("mistralai/Mixtral-8x7B", Template::Mistral),
-            ("some-random-model", Template::Plain),
-            ("", Template::Plain),
-        ];
-        for (id, want) in cases {
-            let lower = id.to_ascii_lowercase();
-            let got = if lower.contains("gemma") {
-                Template::Gemma
-            } else if lower.contains("mixtral") || lower.contains("mistral") {
-                Template::Mistral
-            } else if lower.contains("llama") {
-                Template::Llama
-            } else if lower.contains("qwen")
-                || lower.contains("deepseek")
-                || lower.contains("chatml")
-            {
-                Template::ChatML
-            } else {
-                Template::Plain
-            };
-            assert_eq!(got, want, "id={id}");
-        }
-    }
+    // Multi-turn template rendering is tested in
+    // `larql_inference::prompt::render_messages_tests` (Gemma, ChatML,
+    // Llama, Mistral, Plain). This handler only marshals JSON to the
+    // inference helper, so our tests focus on the request-validation
+    // surface and shape decisions specific to the OpenAI wire.
 
     #[test]
     fn deserialize_chat_request_min() {

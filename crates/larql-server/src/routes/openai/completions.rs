@@ -409,13 +409,8 @@ fn run_completions_loop(
         let mut finish_reason = "length";
 
         for _ in 0..max_tokens {
-            let pred = larql_inference::predict_with_ffn(
-                weights,
-                &model.tokenizer,
-                &ids,
-                1,
-                &walk_ffn,
-            );
+            let pred =
+                larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
             let next_id = match pred.token_ids.first() {
                 Some(&id) => id,
                 None => {

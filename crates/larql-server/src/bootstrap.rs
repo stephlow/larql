@@ -286,6 +286,7 @@ pub fn load_single_vindex(
         embed_store,
         release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
+        gen_lock: tokio::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         expert_filter: opts.expert_filter,
