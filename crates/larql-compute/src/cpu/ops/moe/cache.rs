@@ -213,7 +213,7 @@ mod cache_format_tests {
     /// F32 path: passthrough.
     #[test]
     fn f32_dispatch_passthrough() {
-        let data: Vec<f32> = vec![1.0, -2.5, 3.14, 0.0];
+        let data: Vec<f32> = vec![1.0, -2.5, 3.125, 0.0];
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let out = cached_dequant(&bytes, QuantFormat::F32, data.len());
         assert_eq!(out.len(), data.len());

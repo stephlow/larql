@@ -8,6 +8,14 @@ use std::ffi::c_void;
 
 use crate::metal::buffers::BufferCache;
 
+fn shape_pairs_have_mismatch(existing: &[(usize, usize)], expected: &[(usize, usize)]) -> bool {
+    existing.iter().zip(expected.iter()).any(
+        |(&(actual_num_kv, actual_head_dim), &(expected_num_kv, expected_head_dim))| {
+            actual_num_kv != expected_num_kv || actual_head_dim != expected_head_dim
+        },
+    )
+}
+
 /// KV cache for one layer — pre-allocated Metal buffers.
 pub struct LayerKVCache {
     pub k_cache: Buffer, // [max_seq, num_kv_heads, head_dim] f32
@@ -71,6 +79,31 @@ impl KVCache {
             .map(|&(num_kv, hd)| LayerKVCache::new(bufs, max_seq, num_kv, hd))
             .collect();
         Self { layers }
+    }
+
+    /// Return true if any already-allocated layer disagrees with the
+    /// corresponding expected `(num_kv_heads, head_dim)` shape.
+    pub fn has_shape_mismatch(&self, shapes: &[(usize, usize)]) -> bool {
+        let existing: Vec<(usize, usize)> = self
+            .layers
+            .iter()
+            .map(|layer| (layer.num_kv_heads, layer.head_dim))
+            .collect();
+        shape_pairs_have_mismatch(&existing, shapes)
+    }
+
+    /// Grow the cache to cover `shapes`, preserving existing matching layers.
+    pub fn grow_to_shapes(
+        &mut self,
+        bufs: &BufferCache,
+        shapes: &[(usize, usize)],
+        max_seq: usize,
+    ) {
+        while self.layers.len() < shapes.len() {
+            let (num_kv_heads, head_dim) = shapes[self.layers.len()];
+            self.layers
+                .push(LayerKVCache::new(bufs, max_seq, num_kv_heads, head_dim));
+        }
     }
 
     pub fn clear(&mut self) {
@@ -180,4 +213,22 @@ pub fn append_and_attend(
     }
 
     cache.current_len += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    const SHAPE_SMALL: (usize, usize) = (2, 64);
+    const SHAPE_LARGE: (usize, usize) = (4, 128);
+
+    #[test]
+    fn shape_mismatch_detects_conflicting_existing_layer() {
+        assert!(!super::shape_pairs_have_mismatch(
+            &[SHAPE_SMALL],
+            &[SHAPE_SMALL, SHAPE_LARGE]
+        ));
+        assert!(super::shape_pairs_have_mismatch(
+            &[SHAPE_SMALL],
+            &[SHAPE_LARGE]
+        ));
+    }
 }

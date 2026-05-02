@@ -676,9 +676,10 @@ mod tests {
             .expect("attention weights captured at layer 0");
         // Per-head: heads.len() = num_q_heads, each row has one entry per
         // attended position (last token attends to all 3 positions).
+        let layer_num_q_heads = weights.arch.num_q_heads_for_layer(0);
         assert_eq!(
             attn.len(),
-            weights.num_q_heads,
+            layer_num_q_heads,
             "attention head count should equal num_q_heads"
         );
         for head in attn {

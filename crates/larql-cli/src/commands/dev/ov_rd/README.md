@@ -69,6 +69,8 @@ Keep Rust code here when it needs exact model/vindex behavior:
   attention/relation summaries or learned attention-pattern cluster IDs
 - targeted majority/stratum controls for selected PQ groups, so scale-up
   diagnostics do not need full 48-group importance sweeps
+- balanced Stage-0 capture subsets via `capture --max-per-stratum`, so grouped
+  prompt files can be sampled without creating one-off JSONL fixtures
 - W_O-visible Stage-0 ranking controls, for example
   `zero-ablate --stage0-rank wo-visible-variance`, so Gate 1 promotes heads by
   residual-space impact rather than raw pre-W_O variance when available

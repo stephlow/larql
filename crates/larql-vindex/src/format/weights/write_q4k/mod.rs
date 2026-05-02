@@ -595,7 +595,7 @@ pub fn write_model_weights_q4k_with_opts(
     }
 
     // norms + lm_head manifest (expert weights now in layers/ files, not manifest)
-    let mut all_entries = norm_entries;
+    let all_entries = norm_entries;
     let manifest_json = serde_json::to_string_pretty(&all_entries)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;

@@ -644,7 +644,7 @@ pub fn load_model_weights_q4k_shard(
             }
             if let Ok(f) = std::fs::File::open(&fpath) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
-                    if let Some((_fmt, num_entries, _inter, _hidden, offsets)) =
+                    if let Some((_fmt, _num_entries, _inter, _hidden, offsets)) =
                         parse_layer_weights_header(&mmap)
                     {
                         // Use the shared key builder from larql-models so the

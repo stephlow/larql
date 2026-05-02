@@ -7,6 +7,61 @@
 use crate::model::ModelWeights;
 use larql_compute::{FullPipelineLayer, MoeLayerWeights, QuantFormat, QuantWeight};
 
+pub(crate) const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AttentionGeometry {
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_base: f32,
+}
+
+pub(crate) fn attention_geometry_for_arch_layer(
+    weights: &ModelWeights,
+    layer: usize,
+) -> AttentionGeometry {
+    let arch = &*weights.arch;
+    let head_dim = arch.head_dim_for_layer(layer);
+    let num_q_heads = arch.num_q_heads_for_layer(layer);
+    let num_kv_heads = arch.num_kv_heads_for_layer(layer);
+    AttentionGeometry {
+        q_dim: num_q_heads * head_dim,
+        kv_dim: num_kv_heads * head_dim,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rope_base: arch.rope_base_for_layer(layer) as f32,
+    }
+}
+
+pub(crate) fn attention_geometry_for_pipeline_layer(
+    layer: &FullPipelineLayer<'_>,
+) -> AttentionGeometry {
+    AttentionGeometry {
+        q_dim: layer.num_q_heads * layer.head_dim,
+        kv_dim: layer.num_kv_heads * layer.head_dim,
+        num_q_heads: layer.num_q_heads,
+        num_kv_heads: layer.num_kv_heads,
+        head_dim: layer.head_dim,
+        rope_base: layer.rope_base,
+    }
+}
+
+pub(crate) fn kv_cache_shapes_for_arch(weights: &ModelWeights) -> Vec<(usize, usize)> {
+    let arch = &*weights.arch;
+    (0..weights.num_layers)
+        .map(|layer| {
+            (
+                arch.num_kv_heads_for_layer(layer),
+                arch.head_dim_for_layer(layer),
+            )
+        })
+        .collect()
+}
+
 /// Extract per-layer architecture parameters into a FullPipelineLayer.
 ///
 /// This is the single construction site for all per-layer params:

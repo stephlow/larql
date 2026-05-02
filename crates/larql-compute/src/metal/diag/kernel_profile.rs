@@ -23,6 +23,8 @@
 
 use std::time::Instant;
 
+const GEMMA3_4B_KV_DIM: usize = 4096;
+
 /// Result for a single kernel profiling run.
 #[derive(Debug, Clone)]
 pub struct KernelResult {
@@ -165,7 +167,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
     let hidden = 2560usize;
     let inter = 10240usize;
     let q_dim = 8192usize;
-    let kv_dim = 4096usize;
+    let kv_dim = GEMMA3_4B_KV_DIM;
     let sb = 256usize;
     let q4k_sb = 144usize;
     let q6k_sb = 210usize;

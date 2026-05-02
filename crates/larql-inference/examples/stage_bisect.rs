@@ -43,7 +43,7 @@ extern crate blas_src;
 use std::path::PathBuf;
 
 #[cfg(feature = "metal")]
-use larql_compute::ComputeBackend;
+use larql_compute::DecodeBackend;
 #[cfg(feature = "metal")]
 use larql_inference::residual_diff::{compare_stages, ParityThreshold, StageCapture};
 #[cfg(feature = "metal")]

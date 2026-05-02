@@ -457,7 +457,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     let block_size = 144;
     let super_block = 256;
-    if n_elements % super_block != 0 {
+    if !n_elements.is_multiple_of(super_block) {
         return Vec::new();
     }
     let n_blocks = n_elements / super_block;
@@ -572,7 +572,7 @@ pub fn q4k_matvec_into(out: &mut [f32], x: &[f32], w: &[u8], rows: usize, cols: 
         sum_x.push(s);
     }
 
-    for r in 0..rows {
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -622,7 +622,7 @@ pub fn q4k_matvec_into(out: &mut [f32], x: &[f32], w: &[u8], rows: usize, cols: 
                 acc += sc_hi * dot_hi - mn_hi * sumy_hi;
             }
         }
-        out[r] = acc;
+        *out_slot = acc;
     }
 }
 

@@ -132,10 +132,9 @@ where
     )
 }
 
-/// Streaming variant of [`generate_constrained_via_cpu_q4k`]. Fires
-/// `on_token(id, text, prob)` after each masked argmax pick so the
-/// caller can flush SSE chunks as the constrained decoder produces
-/// tokens.
+/// Streaming variant of [`generate_constrained_via_cpu_q4k`]. Greedy
+/// under the mask; for sampling under mask see
+/// [`generate_constrained_via_cpu_q4k_streaming_sampled`].
 pub(super) fn generate_constrained_via_cpu_q4k_streaming<M, F>(
     weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -149,9 +148,39 @@ where
     M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
+    generate_constrained_via_cpu_q4k_streaming_sampled(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        mask_fn,
+        on_token,
+        super::sampling::SamplingConfig::greedy(),
+    )
+}
+
+/// Sampling-aware bridge to the CPU Q4_K constrained decoder. Threads
+/// the caller's `SamplingConfig` (temperature/top_p/seed/penalties)
+/// through to token selection over the masked logits.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn generate_constrained_via_cpu_q4k_streaming_sampled<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    mask_fn: M,
+    on_token: F,
+    sampling: super::sampling::SamplingConfig,
+) -> GenerateResult
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str, f64),
+{
     let prefill_start = std::time::Instant::now();
-    let out = crate::vindex::generate_q4k_cpu_constrained_streaming(
-        weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token,
+    let out = crate::vindex::generate_q4k_cpu_constrained_streaming_sampled(
+        weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling,
     );
     let total_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     // Heuristic split: attribute the first token to prefill, the rest to

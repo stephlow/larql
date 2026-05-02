@@ -11,6 +11,7 @@
 
 use super::buffers::LayerBuffers;
 use crate::metal::buffers::BufferCache;
+use crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ;
 use crate::metal::ops::kv_cache::{KVCache, LayerKVCache};
 use crate::FullPipelineLayer;
 
@@ -28,7 +29,8 @@ pub(super) fn populate_kv_one_layer(
     let lhd = layer.head_dim;
     let lnkv = layer.num_kv_heads;
     while kv.layers.len() <= layer_idx {
-        kv.layers.push(LayerKVCache::new(bufs, 4096, lnkv, lhd));
+        kv.layers
+            .push(LayerKVCache::new(bufs, DEFAULT_KV_CACHE_MAX_SEQ, lnkv, lhd));
     }
     let total_kv = seq_len * lnkv * lhd;
     let k_src = lb.k_out[layer_idx].contents() as *const f32;
@@ -61,7 +63,8 @@ pub(super) fn populate_kv_after_commit(
         let lhd = layer.head_dim;
         let lnkv = layer.num_kv_heads;
         while kv.layers.len() <= l {
-            kv.layers.push(LayerKVCache::new(bufs, 4096, lnkv, lhd));
+            kv.layers
+                .push(LayerKVCache::new(bufs, DEFAULT_KV_CACHE_MAX_SEQ, lnkv, lhd));
         }
         let total_kv = seq_len * lnkv * lhd;
         let k_src = lb.k_out[l].contents() as *const f32;
@@ -201,7 +204,7 @@ mod tests {
         write_metal_f32(&lb.v_out[1], &l1_v);
 
         // Pre-allocated cache, 2 layers same dims.
-        let mut kv = KVCache::new(bufs, 2, 4096, num_kv_heads, head_dim);
+        let mut kv = KVCache::new(bufs, 2, DEFAULT_KV_CACHE_MAX_SEQ, num_kv_heads, head_dim);
         assert_eq!(kv.layers[0].current_len, 0);
         assert_eq!(kv.layers[1].current_len, 0);
 
@@ -212,7 +215,7 @@ mod tests {
         assert_eq!(kv.layers[1].current_len, seq_len);
 
         // Cache contents match what we stamped — and only the first
-        // `total` floats; the rest of the cache (max_seq=4096) stays
+        // `total` floats; the rest of the cache stays
         // at the buffer's zero-init.
         let l0_k_got = read_metal_f32(&kv.layers[0].k_cache, total);
         let l0_v_got = read_metal_f32(&kv.layers[0].v_cache, total);
@@ -281,7 +284,7 @@ mod tests {
         write_metal_f32(&lb.k_out[1], &k_pat);
         write_metal_f32(&lb.v_out[1], &v_pat);
 
-        let mut kv = KVCache::new(bufs, 2, 4096, num_kv_heads, head_dim);
+        let mut kv = KVCache::new(bufs, 2, DEFAULT_KV_CACHE_MAX_SEQ, num_kv_heads, head_dim);
         assert_eq!(kv.layers[0].current_len, 0);
         assert_eq!(kv.layers[1].current_len, 0);
 

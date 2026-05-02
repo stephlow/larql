@@ -34,6 +34,28 @@ fn ws_error(message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"type": WS_TYPE_ERROR, "message": message.into()})
 }
 
+/// Send a JSON value over the WebSocket as a text frame. Returns the
+/// underlying `axum::Error` if the peer has disconnected; callers
+/// typically use [`send_msg_or_return`] to short-circuit cleanly.
+async fn send_msg(socket: &mut WebSocket, value: &serde_json::Value) -> Result<(), axum::Error> {
+    socket.send(Message::Text(value.to_string().into())).await
+}
+
+/// Convenience: send + return on send failure (peer disconnected).
+/// Centralises the disconnect-handling pattern that otherwise repeats
+/// at every send site. Used inside loops where one bad write means
+/// the whole stream is over.
+async fn send_msg_or_return(socket: &mut WebSocket, value: &serde_json::Value) -> bool {
+    send_msg(socket, value).await.is_ok()
+}
+
+/// Send an error message, ignoring failures. The error is the last
+/// thing we'd send before returning anyway, so a closed socket here
+/// is fine.
+async fn send_error(socket: &mut WebSocket, message: impl Into<String>) {
+    let _ = send_msg(socket, &ws_error(message)).await;
+}
+
 fn ws_layer(layer: usize, edges: Vec<serde_json::Value>) -> serde_json::Value {
     serde_json::json!({
         "type": WS_TYPE_LAYER,
@@ -94,9 +116,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         let request: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
-                let _ = socket
-                    .send(Message::Text(ws_error(e.to_string()).to_string().into()))
-                    .await;
+                send_error(&mut socket, e.to_string()).await;
                 continue;
             }
         };
@@ -110,15 +130,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 handle_stream_infer(&mut socket, &state, &request).await;
             }
             _ => {
-                let _ = socket
-                    .send(Message::Text(
-                        ws_error(format!(
-                            "unknown message type: {msg_type}. Supported: describe, infer"
-                        ))
-                        .to_string()
-                        .into(),
-                    ))
-                    .await;
+                send_error(
+                    &mut socket,
+                    format!("unknown message type: {msg_type}. Supported: describe, infer"),
+                )
+                .await;
             }
         }
     }
@@ -130,11 +146,7 @@ async fn handle_stream_describe(
     request: &serde_json::Value,
 ) {
     for msg in stream_describe_messages(state, request).await {
-        if socket
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
+        if !send_msg_or_return(socket, &msg).await {
             return;
         }
     }
@@ -248,11 +260,7 @@ async fn handle_stream_infer(
     let prompt = match request["prompt"].as_str() {
         Some(p) if !p.is_empty() => p.to_string(),
         _ => {
-            let _ = socket
-                .send(Message::Text(
-                    ws_error("missing or empty prompt").to_string().into(),
-                ))
-                .await;
+            send_error(socket, "missing or empty prompt").await;
             return;
         }
     };
@@ -260,23 +268,13 @@ async fn handle_stream_infer(
     let model = match state.model(None) {
         Some(m) => Arc::clone(m),
         None => {
-            let _ = socket
-                .send(Message::Text(
-                    ws_error("no model loaded").to_string().into(),
-                ))
-                .await;
+            send_error(socket, "no model loaded").await;
             return;
         }
     };
 
     if model.infer_disabled {
-        let _ = socket
-            .send(Message::Text(
-                ws_error("inference disabled (--no-infer)")
-                    .to_string()
-                    .into(),
-            ))
-            .await;
+        send_error(socket, "inference disabled (--no-infer)").await;
         return;
     }
 
@@ -286,9 +284,7 @@ async fn handle_stream_infer(
     // String so the Result doesn't keep the guard alive past `?`.
     let weights_check: Result<(), String> = model.get_or_load_weights().map(|_| ());
     if let Err(e) = weights_check {
-        let _ = socket
-            .send(Message::Text(ws_error(e).to_string().into()))
-            .await;
+        send_error(socket, e).await;
         return;
     }
 
@@ -300,21 +296,13 @@ async fn handle_stream_infer(
     let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
         Ok(e) => e,
         Err(e) => {
-            let _ = socket
-                .send(Message::Text(ws_error(e.to_string()).to_string().into()))
-                .await;
+            send_error(socket, e.to_string()).await;
             return;
         }
     };
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     if token_ids.is_empty() {
-        let _ = socket
-            .send(Message::Text(
-                ws_error("empty prompt after tokenization")
-                    .to_string()
-                    .into(),
-            ))
-            .await;
+        send_error(socket, "empty prompt after tokenization").await;
         return;
     }
 
@@ -344,19 +332,13 @@ async fn handle_stream_infer(
     // Stream each prediction.
     for (rank, (token, prob)) in predictions.iter().enumerate() {
         let msg = ws_prediction(rank + 1, token, *prob);
-        if socket
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
+        if !send_msg_or_return(socket, &msg).await {
             return;
         }
     }
 
     let done_msg = ws_infer_done(prompt, mode, predictions.len(), elapsed_ms(start));
-    let _ = socket
-        .send(Message::Text(done_msg.to_string().into()))
-        .await;
+    let _ = send_msg(socket, &done_msg).await;
 }
 
 #[cfg(test)]
@@ -383,6 +365,13 @@ mod tests {
         assert_eq!(msg["type"], WS_TYPE_ERROR);
         assert_eq!(msg["message"], "bad input");
     }
+
+    // The send helpers need a live WebSocket to exercise; they're
+    // covered transitively by the integration suite (test_http_*),
+    // which exercises the WS upgrade path. The intent of the refactor
+    // is purely a deduplication of the
+    // `socket.send(Message::Text(value.to_string().into())).await`
+    // pattern that previously appeared at 8 sites.
 
     #[test]
     fn websocket_layer_shape_includes_edges() {

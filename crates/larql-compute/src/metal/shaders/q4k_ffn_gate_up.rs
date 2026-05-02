@@ -16,6 +16,7 @@
 //!   → simd_sum waits for slowest ix-group → regression.
 //! - float4 with uint16 correction factors: adds ALU complexity (inv16/inv256/inv4096
 //!   corrections) to an already ALU-limited kernel → regression.
+//!
 //! Current approach (simple, 128 threads/TG) is close to optimal for K=2560.
 
 pub const SHADER: &str = r#"

@@ -229,6 +229,11 @@ mod tests {
     use super::*;
     use crate::pipeline::*;
 
+    const HIDDEN_SMALL: usize = 1024;
+    const HIDDEN_GEMMA3_4B: usize = 2560;
+    const Q_DIM_SMALLER_THAN_HIDDEN: usize = 2048;
+    const Q_DIM_LARGER_THAN_HIDDEN: usize = 4096;
+
     /// Minimal `FullPipelineLayer` for testing geometry math. All
     /// weight / norm slices borrow from the leaked statics so a test
     /// can stash multiple layers in one Vec without lifetime
@@ -303,15 +308,17 @@ mod tests {
     fn q8_staging_uniform_geometry_picks_max_of_hidden_and_qdim() {
         // Gemma 3 4B: hidden=2560, q_dim = 8*256 = 2048 (q < hidden).
         let layers = synth_layers(4, 8, 4, 256);
-        let (q8_row_max, q8s_row_bytes) = q8_staging_size(&layers, 2560, 2048);
-        assert_eq!(q8_row_max, 2560); // hidden wins
-        assert_eq!(q8s_row_bytes, 2560 / 32 * 4); // 80 blocks × 4 bytes = 320
+        let (q8_row_max, q8s_row_bytes) =
+            q8_staging_size(&layers, HIDDEN_GEMMA3_4B, Q_DIM_SMALLER_THAN_HIDDEN);
+        assert_eq!(q8_row_max, HIDDEN_GEMMA3_4B); // hidden wins
+        assert_eq!(q8s_row_bytes, HIDDEN_GEMMA3_4B / 32 * 4); // 80 blocks × 4 bytes = 320
 
         // Larger Q than hidden: q_dim wins.
         let layers = synth_layers(4, 16, 4, 256); // q_dim = 16*256 = 4096
-        let (q8_row_max, q8s_row_bytes) = q8_staging_size(&layers, 2560, 4096);
-        assert_eq!(q8_row_max, 4096);
-        assert_eq!(q8s_row_bytes, 4096 / 32 * 4); // 512
+        let (q8_row_max, q8s_row_bytes) =
+            q8_staging_size(&layers, HIDDEN_GEMMA3_4B, Q_DIM_LARGER_THAN_HIDDEN);
+        assert_eq!(q8_row_max, Q_DIM_LARGER_THAN_HIDDEN);
+        assert_eq!(q8s_row_bytes, Q_DIM_LARGER_THAN_HIDDEN / 32 * 4); // 512
     }
 
     /// Mixed sliding/global geometry (Gemma 4 31B): different layers
@@ -343,12 +350,15 @@ mod tests {
     #[test]
     fn q8_staging_empty_layers_uses_fallback() {
         let layers: Vec<FullPipelineLayer<'static>> = vec![];
-        let (q8_row_max, _) = q8_staging_size(&layers, 2560, 2048);
+        let (q8_row_max, _) = q8_staging_size(&layers, HIDDEN_GEMMA3_4B, Q_DIM_SMALLER_THAN_HIDDEN);
         // hidden=2560 > fallback=2048, so hidden wins.
-        assert_eq!(q8_row_max, 2560);
+        assert_eq!(q8_row_max, HIDDEN_GEMMA3_4B);
 
-        let (q8_row_max, _) = q8_staging_size(&layers, 1024, 4096);
-        assert_eq!(q8_row_max, 4096, "fallback wins when fallback > hidden");
+        let (q8_row_max, _) = q8_staging_size(&layers, HIDDEN_SMALL, Q_DIM_LARGER_THAN_HIDDEN);
+        assert_eq!(
+            q8_row_max, Q_DIM_LARGER_THAN_HIDDEN,
+            "fallback wins when fallback > hidden"
+        );
     }
 
     /// `q8s_row_bytes` is always a multiple of 4 (one f32 per 32-elt

@@ -65,7 +65,7 @@ model as a queryable knowledge graph I can edit at runtime".
 
 ## Features
 
-- **OpenAI-compatible API** — `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/completions`, `POST /v1/chat/completions` (slices 1–2; SSE streaming + tools + JSON mode queued for slices 3-4). Existing `openai` Python/JS SDKs work unmodified — chat templates auto-detected from the model family (Gemma / Llama / ChatML / Mistral / plain)
+- **OpenAI-compatible API** — `GET /v1/models`, `POST /v1/embeddings` (with `encoding_format: "base64"`), `POST /v1/completions`, `POST /v1/chat/completions` with SSE streaming, structured outputs (`response_format: json_object | json_schema`), function calling (`tools` + `tool_choice`), tool-result replay (`role: "tool"`), repetition penalties (`frequency_penalty` / `presence_penalty`), and top-k logprobs all live. Existing `openai` Python/JS SDKs work unmodified — chat templates auto-detected from the model family (Gemma / Llama / ChatML / Mistral / plain)
 - **Browse endpoints** — DESCRIBE, WALK, SELECT, RELATIONS, STATS (no weights needed)
 - **Inference** — full forward pass with WalkFfn (weights lazy-loaded on first request)
 - **Remote MoE expert** — `/v1/experts/layer-batch` (residual once + K experts), gRPC streaming with overlap, f16 wire opt-in, UDS transport for same-host shards
@@ -104,11 +104,14 @@ larql serve output/gemma3-4b-v2.vindex --api-key "sk-abc123" --tls-cert cert.pem
 ### Quickstart with the OpenAI SDK
 
 larql-server speaks the OpenAI API. Point any existing `openai`
-Python or JS client at the larql `base_url` and it works unmodified
-(N0 slices 1–2: `/v1/models`, `/v1/embeddings`, `/v1/completions`,
-`/v1/chat/completions`). Chat completions auto-detect the chat
-template from the model family (Gemma / Llama / ChatML / Mistral /
-plain). SSE streaming + tools + JSON mode queued in slices 3-4.
+Python or JS client at the larql `base_url` and it works unmodified.
+The full surface — `/v1/models`, `/v1/embeddings` (`encoding_format:
+"base64"`), `/v1/completions`, `/v1/chat/completions` with SSE
+streaming, structured outputs (`response_format: json_object` /
+`json_schema`), function calling (`tools` + `tool_choice`),
+multi-turn tool-result replay, repetition penalties, and top-k
+logprobs — is live. Chat completions auto-detect the chat template
+from the model family (Gemma / Llama / ChatML / Mistral / plain).
 
 **Python:**
 
@@ -150,7 +153,110 @@ chat = client.chat.completions.create(
     max_tokens=10,
 )
 print(chat.choices[0].message.content)
+
+# Embeddings as base64 (~33% smaller wire)
+emb_b64 = client.embeddings.create(
+    model="gemma-3-4b",
+    input="France",
+    encoding_format="base64",
+)
+
+# Structured outputs — strict JSON Schema
+person = client.chat.completions.create(
+    model="gemma-3-4b",
+    messages=[{"role": "user", "content": "Describe Alice, age 30, who is admin."}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Person",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age":  {"type": "integer"},
+                    "role": {"type": "string", "enum": ["user", "admin", "guest"]},
+                },
+                "required": ["name", "age", "role"],
+            },
+        },
+    },
+)
+import json
+data = json.loads(person.choices[0].message.content)  # guaranteed to match schema
+
+# Function calling
+weather = client.chat.completions.create(
+    model="gemma-3-4b",
+    messages=[{"role": "user", "content": "Weather in Tokyo?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }],
+)
+call = weather.choices[0].message.tool_calls[0]
+# call.function.name, call.function.arguments  ('{"location":"Tokyo"}')
+
+# Multi-turn tool-result replay: feed the call + the tool's result back in
+chat2 = client.chat.completions.create(
+    model="gemma-3-4b",
+    messages=[
+        {"role": "user", "content": "Weather in Tokyo?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": call.id, "type": "function",
+             "function": {"name": call.function.name, "arguments": call.function.arguments}}
+        ]},
+        {"role": "tool", "tool_call_id": call.id, "content": "21 C, sunny"},
+    ],
+    max_tokens=32,
+)
+
+# Sampling + repetition penalties + logprobs
+sampled = client.chat.completions.create(
+    model="gemma-3-4b",
+    messages=[{"role": "user", "content": "Once upon a time"}],
+    max_tokens=20,
+    temperature=0.8,
+    top_p=0.9,
+    seed=42,
+    frequency_penalty=0.5,  # subtract freq * count(token) from each logit
+    presence_penalty=0.3,   # subtract presence for any token already seen
+    logprobs=True,
+    top_logprobs=3,
+)
+# sampled.choices[0].logprobs.content[i].{token, logprob, top_logprobs}
 ```
+
+#### Structured outputs and tool calling
+
+Constrained decoding is built on a **schema-typed JSON FSM** that
+masks the LM head per token. The same engine drives all three modes:
+
+| Request                                    | Schema the FSM enforces                                       |
+|--------------------------------------------|---------------------------------------------------------------|
+| `response_format: {type: "json_object"}`   | any structurally-valid JSON object                            |
+| `response_format: {type: "json_schema"}`   | `json_schema.schema` parsed to AST (strict mode supported)    |
+| `tools: [...]`, `tool_choice: "auto"`      | discriminated `OneOf` of `{name=Const, arguments=<args>}`     |
+| `tool_choice: {type:"function", function:{name}}` | single-tool branch from the union                       |
+
+Schema parser supports `type` (incl. `["string","null"]`), `properties`,
+`required`, `additionalProperties`, `items`, `minItems`/`maxItems`,
+`enum`, `const`, `oneOf` / `anyOf`, `minLength` / `maxLength`,
+`minimum` / `maximum`, plus integer-vs-number. `$ref`, `pattern`,
+`format`, `allOf`, `not` return 400 with a clear message — no silent
+relaxation. Sampling fields are honoured under the mask
+(`temperature`, `top_p`, `seed`, `frequency_penalty`,
+`presence_penalty`); pass `temperature: 0` (default) for deterministic
+output. Tools + `stream=true` emits the tool call as a single delta
+chunk followed by `finish_reason: "tool_calls"` (per-token argument
+streaming is a future tightening).
 
 **JS:**
 
@@ -342,10 +448,17 @@ cargo run -p larql-server --example server_bench --release
 | `/v1/embeddings` single (hidden=256) | 0.008 ms/op |
 | `/v1/embeddings` batch=8 (hidden=256) | 0.074 ms/op |
 | `/v1/completions` serialize | 0.001 ms/op (723 K ops/s) |
-| `/v1/completions` stream=true → 400 | 0.000 ms/op |
 | `/v1/chat/completions` serialize | 0.002 ms/op (635 K ops/s) |
 | `/v1/chat/completions` Gemma render (3 turns) | 0.000 ms/op (5.7 M ops/s) |
-| `/v1/chat/completions` tools → 400 | 0.001 ms/op |
+| **Constrained decoding (slice 4 fixed cost):** | |
+| FSM step `Schema::Any` (~50-char object) | 0.001 ms/op (1.01 M ops/s) |
+| FSM step strict Person schema | 0.002 ms/op (652 K ops/s) |
+| `parse_schema` Person (strict) | 0.001 ms/op (832 K ops/s) |
+| `synth_tools_schema` 2-function union | 0.004 ms/op (263 K ops/s) |
+| FSM tool-call OneOf (commit on `name`) | 0.025 ms/op (40 K ops/s) |
+| **Sampler extras (F18, F19, slice 4.10):** | |
+| Sampler with frequency_penalty (history N=8, vocab=256) | 0.001 ms/op (797 K ops/s) |
+| Sampler with temperature + top-p (no penalty) | 0.006 ms/op (171 K ops/s) |
 
 These numbers measure in-process synthetic index operations, not network
 latency or real model weight paging. For a live vindex, use:
@@ -1051,7 +1164,9 @@ input-token static embeddings, not a contrastively-trained sentence
 encoder. Useful as a baseline; not competitive with dedicated
 embedding models for retrieval ranking.
 
-`encoding_format: "base64"` returns 400 in slice 1 (follow-up).
+`encoding_format: "base64"` returns each vector as a base64-encoded
+little-endian f32 byte string (~33% smaller wire than the JSON float
+array form).
 
 #### POST /v1/completions
 
@@ -1081,14 +1196,15 @@ POST /v1/completions
 }
 ```
 
-Slice 1 limitations:
-- `stream=true` returns 400 (SSE arrives in slice 3)
-- `n>1` returns 400 (single completion per prompt)
-- `logprobs: int` accepted but response field always `null` (F18 follow-up)
-- `top_p` accepted but greedy/temperature only
-- Generation is un-KV-cached, O(N²) per token. For Gemma 3 4B that's
-  ~1-3 tok/s on CPU. The KV-cached fast path is N0.2-fast in the
-  ROADMAP.
+Live: SSE streaming via `stream: true` (one chunk per token,
+terminated by `data: [DONE]`); `temperature`, `top_p`, `seed`,
+`stop`, `frequency_penalty`, `presence_penalty` all honoured by the
+sampler; `logprobs: int` populates `choices[i].logprobs` with
+per-token entries (top-k alternatives are placeholder until the
+inference layer surfaces them — F18 follow-up); KV-cached generation
+on f16 vindexes (Q4_K vindexes use the per-step CPU fallback).
+Limitations: `n>1` → 400 (single completion per prompt); echo +
+batched prompts disallowed in stream mode.
 
 #### POST /v1/chat/completions
 
@@ -1125,24 +1241,27 @@ POST /v1/chat/completions
 }
 ```
 
-Slice 2 limitations:
-- `stream=true` → 400 (SSE arrives in slice 3)
-- `n>1` → 400
-- `tools`, `tool_choice` → 400 (slice 4 = N0.6 constrained decoding)
-- `response_format: {type: "json_object" | "json_schema"}` → 400 (slice 4)
-- `logprobs` / `top_logprobs` accepted, response field always `null` (F18)
-- `frequency_penalty`, `presence_penalty`, `seed`, `top_p` accepted but
-  ignored (greedy/temperature only)
-- Same un-KV-cached generation as `/v1/completions` — output content
-  quality depends on the path; wire shape is correct.
+When `tools` is on the request, the response shape switches to the
+tool-calls form: `message.content: null`, `tool_calls: [{id, type:
+"function", function: {name, arguments}}]`, `finish_reason:
+"tool_calls"`. `arguments` is JSON-stringified (OpenAI's wire shape).
+
+Live: SSE streaming, sampling fields (`temperature`, `top_p`, `seed`,
+`stop`, `frequency_penalty`, `presence_penalty`) honoured by the
+sampler — including under the constrained-decoding mask, constrained
+decoding via `response_format: json_object | json_schema` and `tools`
+/ `tool_choice` (see "Structured outputs and tool calling" in the
+Quickstart section above), tool-result replay via `role: "tool"`
+messages, top-k logprobs scaffolding (`logprobs: true` + `top_logprobs`).
+
+Limitations: `n>1` → 400; tools + `stream=true` emits the call as a
+single delta chunk rather than per-token argument streaming
+(per-token tightening pending); `top_logprobs` returns picked-token
+entries only — full top-K alternatives need inference work (F18
+follow-up).
 
 Coming next:
-- **N0.1 SSE** streaming via `text/event-stream` for both `/v1/completions`
-  and `/v1/chat/completions` (slice 3)
-- **N0.6** constrained decoding — `tools`, `tool_choice`,
-  `response_format: json_schema` via JSON schema → GBNF mask (slice 4)
-- **N0.3** Responses API (`/v1/responses`) — pairs with N1 stateful
-  sessions (slice 5)
+- **N0.3** Responses API (`/v1/responses`) — pairs with N1 stateful sessions
 
 ## Authentication
 

@@ -57,6 +57,7 @@ fn bf16_expert_tables<'a>(
     (experts_gate_up, experts_down)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_moe_weights<'a>(
     hidden: usize,
     inter: usize,

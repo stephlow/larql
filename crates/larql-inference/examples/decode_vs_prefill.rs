@@ -29,10 +29,12 @@ extern crate blas_src;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use larql_compute::ComputeBackend;
+use larql_compute::{ComputeBackend, DecodeBackend};
 use larql_inference::layer_graph::generate::generate;
 use larql_inference::layer_graph::CachedLayerGraph;
 use larql_inference::wrap_chat_prompt;
+
+const DEFAULT_EXAMPLE_KV_CACHE_MAX_SEQ: usize = 4096;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -153,8 +155,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // up to the prefill; then run one decode for `token_0_id`.
     let layers = build_layers(&w_metal, &q4_index, num_layers)?;
     let arch = &*w_metal.arch;
-    let q_dim = w_metal.num_q_heads * w_metal.head_dim;
-    let kv_dim = w_metal.num_kv_heads * w_metal.head_dim;
+    let head_dim = arch.head_dim_for_layer(0);
+    let num_q_heads = arch.num_q_heads_for_layer(0);
+    let num_kv_heads = arch.num_kv_heads_for_layer(0);
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
     let rope = arch.rope_base_for_layer(0) as f32;
 
     metal_backend.reset_kv_cache();
@@ -162,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        metal_backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        metal_backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_EXAMPLE_KV_CACHE_MAX_SEQ);
     }
 
     // Prefill: same path generate() uses internally.
@@ -182,9 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             q_dim,
             kv_dim,
             prompt_ids.len(),
-            w_metal.num_q_heads,
-            w_metal.num_kv_heads,
-            w_metal.head_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
             rope,
             qk_norm_val,
             softcap,
@@ -220,9 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             intermediate,
             q_dim,
             kv_dim,
-            w_metal.num_q_heads,
-            w_metal.num_kv_heads,
-            w_metal.head_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
             rope,
         )
         .ok_or("Metal decode_token returned None")?;

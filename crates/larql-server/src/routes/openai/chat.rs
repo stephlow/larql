@@ -325,14 +325,6 @@ pub async fn handle_chat_completions(
     let messages = req.messages;
 
     if req.stream.unwrap_or(false) {
-        if tools_active {
-            return Err(ServerError::BadRequest(
-                "tools + stream=true not yet supported. Send the request with \
-                 stream=false to get the tool_calls response, or omit tools to \
-                 stream free-text content."
-                    .into(),
-            ));
-        }
         return Ok(stream_chat_completion(
             model_arc,
             messages,
@@ -340,6 +332,7 @@ pub async fn handle_chat_completions(
             sampling_params,
             stop_strings,
             constrained_schema,
+            tools_active,
             model_id,
         )
         .into_response());
@@ -437,6 +430,7 @@ fn stream_chat_completion(
     sampling_params: super::util::SamplingParams,
     stop_strings: Vec<String>,
     constrained_schema: Option<Schema>,
+    tools_active: bool,
     model_id: String,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -479,39 +473,52 @@ fn stream_chat_completion(
         let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
         let num_layers = weights.num_layers;
 
-        // Per-token callback used by both the sampling and the
-        // constrained streaming paths. Pushes one SSE chunk per token
+        // Per-token callback used by the unconstrained / json-mode
+        // streaming paths. Pushes one SSE content-delta chunk per token
         // and tracks completion text so client-supplied stop strings
-        // can halt generation early. `early_stop` is shared with the
-        // post-loop finish-reason check via Rc<Cell<bool>> — ergonomic
-        // single-threaded mutable state, since the whole spawn_blocking
-        // body runs on one thread.
+        // can halt early. For `tools_active` runs the callback runs in
+        // *buffer* mode — it accumulates text without emitting chunks,
+        // because the OpenAI tool_calls delta shape only makes sense
+        // once the full tool name + arguments JSON is parsed.
+        // `early_stop` is shared with the post-loop finish-reason check
+        // via Rc<Cell<bool>> — ergonomic single-threaded mutable state,
+        // since the whole spawn_blocking body runs on one thread.
         let chat_id_cb = chat_id.clone();
         let model_id_cb = model_id.clone();
         let tx_cb = tx.clone();
         let stop_strings_cb = stop_strings.clone();
         let early_stop = std::rc::Rc::new(std::cell::Cell::new(false));
         let early_stop_cb = early_stop.clone();
-        let mut completion_text = String::new();
+        let buffered_text = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let buffered_text_cb = buffered_text.clone();
         let on_token = move |_id: u32, text: &str, _prob: f64| {
             if early_stop_cb.get() {
                 return;
             }
-            let chunk = build_chat_chunk(&chat_id_cb, &model_id_cb, None, Some(text), None);
-            if tx_cb.blocking_send(chunk).is_err() {
-                early_stop_cb.set(true);
-                return;
+            // Always buffer; tools_active reads from `buffered_text`
+            // after generation, content streaming reads token-by-token.
+            buffered_text_cb.borrow_mut().push_str(text);
+            if !tools_active {
+                let chunk = build_chat_chunk(&chat_id_cb, &model_id_cb, None, Some(text), None);
+                if tx_cb.blocking_send(chunk).is_err() {
+                    early_stop_cb.set(true);
+                    return;
+                }
             }
-            completion_text.push_str(text);
-            if !stop_strings_cb.is_empty() && contains_any(&completion_text, &stop_strings_cb) {
+            if !stop_strings_cb.is_empty()
+                && contains_any(&buffered_text_cb.borrow(), &stop_strings_cb)
+            {
                 early_stop_cb.set(true);
             }
         };
 
         let result = if let Some(schema) = constrained_schema {
-            let _ = sampling_params; // accepted but no-op for constrained (greedy)
+            // Sampling under mask: temperature/top_p/seed/penalties drive
+            // selection over the masked logits, falling back to greedy
+            // when the request didn't set them.
+            let (sampling, eos) = super::util::build_sampling_eos(sampling_params, &stop_strings);
             let mask = build_constrained_mask(&model.tokenizer, schema);
-            larql_inference::layer_graph::generate_constrained_streaming(
+            larql_inference::layer_graph::generate_constrained_streaming_sampled(
                 weights,
                 &model.tokenizer,
                 &prompt_ids,
@@ -522,6 +529,8 @@ fn stream_chat_completion(
                 0..num_layers,
                 mask,
                 on_token,
+                sampling,
+                &eos,
             )
         } else {
             let (sampling, eos) = super::util::build_sampling_eos(sampling_params, &stop_strings);
@@ -542,11 +551,38 @@ fn stream_chat_completion(
 
         // Final-chunk finish reason: layer_graph::generate halts on
         // EOS internally; tokens.len() < max_tokens implies stop.
-        let finish_reason: &'static str = if early_stop.get() || result.tokens.len() < max_tokens {
+        let finish_reason: &'static str = if tools_active {
+            "tool_calls"
+        } else if early_stop.get() || result.tokens.len() < max_tokens {
             "stop"
         } else {
             "length"
         };
+
+        // Tool-call delta: parse the buffered constrained output once
+        // generation finishes and emit a single chunk carrying the
+        // full `tool_calls[0]` payload. Per-token argument streaming
+        // is a tightening that lives in a follow-up — most OpenAI
+        // clients accumulate `tool_calls[i].function.arguments`
+        // incrementally and trigger only on `finish_reason: "tool_calls"`,
+        // so a single fat chunk is wire-compatible.
+        if tools_active {
+            let buffered = buffered_text.borrow().clone();
+            match build_tool_call_message(&buffered) {
+                Ok(msg) => {
+                    if let Some(calls) = msg.tool_calls.as_ref() {
+                        let chunk = build_chat_tool_calls_chunk(&chat_id, &model_id, calls);
+                        let _ = tx.blocking_send(chunk);
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(error_chunk(&format!(
+                        "tool_call output failed to parse: {e}"
+                    )));
+                }
+            }
+        }
+
         let final_chunk = build_chat_chunk(&chat_id, &model_id, None, None, Some(finish_reason));
         let _ = tx.blocking_send(final_chunk);
     });
@@ -589,6 +625,42 @@ fn build_chat_chunk(
         }]
     });
     chunk.to_string()
+}
+
+/// Build a streaming chunk that carries the full `tool_calls` payload
+/// in the delta. Each call gets an `index` field per OpenAI's chunk
+/// shape (so clients can demux multiple parallel tool calls); we emit
+/// the entire `name` + `arguments` in one chunk rather than splitting
+/// arguments per-token (a follow-up tightening).
+fn build_chat_tool_calls_chunk(id: &str, model: &str, calls: &[ToolCall]) -> String {
+    let tool_calls_json: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            serde_json::json!({
+                "index": i,
+                "id": c.id,
+                "type": c.kind,
+                "function": {
+                    "name": c.function.name,
+                    "arguments": c.function.arguments,
+                },
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": id,
+        "object": CHAT_COMPLETION_CHUNK_OBJECT,
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": tool_calls_json},
+            "finish_reason": serde_json::Value::Null,
+            "logprobs": serde_json::Value::Null,
+        }]
+    })
+    .to_string()
 }
 
 /// Render `messages` to a single prompt, then run the generation loop.
@@ -640,9 +712,12 @@ fn run_chat_completion(
     let num_layers = weights.num_layers;
 
     let result = if let Some(schema) = constrained_schema {
-        let _ = sampling_params; // accepted but no-op for constrained (greedy)
+        // Sampling under mask via the new `_sampled` variant — drives
+        // selection through the user's SamplingConfig over the masked
+        // logits. Greedy when no sampling fields are set.
+        let (sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
         let mask = build_constrained_mask(&model.tokenizer, schema);
-        larql_inference::layer_graph::generate_constrained(
+        larql_inference::layer_graph::generate_constrained_streaming_sampled(
             weights,
             &model.tokenizer,
             &prompt_ids,
@@ -652,6 +727,9 @@ fn run_chat_completion(
             &cached_layers,
             0..num_layers,
             mask,
+            |_, _, _| {}, // buffered path: no per-token callback
+            sampling,
+            &eos,
         )
     } else {
         let (sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
@@ -1051,6 +1129,37 @@ mod tests {
         let out = format_tool_calls(&tc);
         assert!(out.contains("calc"), "missing name in {out}");
         assert!(out.contains("{\"a\":1}"), "missing args in {out}");
+    }
+
+    #[test]
+    fn build_chat_tool_calls_chunk_shapes_delta_correctly() {
+        let calls = vec![ToolCall {
+            id: "call_xyz".into(),
+            kind: "function",
+            function: ToolCallFunction {
+                name: "calc".into(),
+                arguments: "{\"a\":1,\"b\":2}".into(),
+            },
+        }];
+        let chunk = build_chat_tool_calls_chunk("chatcmpl-x", "gemma", &calls);
+        let v: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["id"], "call_xyz");
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["type"],
+            "function"
+        );
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "calc"
+        );
+        // arguments is JSON-stringified.
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"a\":1,\"b\":2}"
+        );
+        assert!(v["choices"][0]["finish_reason"].is_null());
     }
 
     #[test]

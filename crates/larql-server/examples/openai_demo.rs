@@ -140,7 +140,7 @@ fn load_default(path: &str) -> Result<LoadedModel, Box<dyn std::error::Error + S
         expert_filter: None,
         unit_filter: None,
     };
-    Ok(load_single_vindex(path, opts)?)
+    load_single_vindex(path, opts)
 }
 
 // ── Demos ─────────────────────────────────────────────────────────────────────
@@ -296,29 +296,145 @@ async fn demo_chat_completions(app: &Router, model_id: &str) {
          /v1/completions wires them."
     );
 
-    section("POST /v1/chat/completions — tools field (returns 400 in slice 2)");
+    section("POST /v1/chat/completions — response_format: json_object");
     let req = serde_json::json!({
         "model": model_id,
-        "messages": [{"role": "user", "content": "x"}],
-        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
-        "max_tokens": 1
+        "messages": [
+            {"role": "system", "content": "Respond in JSON."},
+            {"role": "user",   "content": "Give me a tiny user profile."}
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 32
     });
+    println!("Request body:\n{}", pretty(&req));
     let t = Instant::now();
     let (status, body) = post_json(app, "/v1/chat/completions", &req).await;
-    println!("Status: {status}  ({} ms)", t.elapsed().as_millis());
+    println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
+    println!("{}", pretty(&body));
+    println!(
+        "\nNote: any structurally-valid JSON object. The constrained\n\
+         decoder masks every token whose surface chars would break\n\
+         JSON, and EOS is masked while the object is still open."
+    );
+
+    section("POST /v1/chat/completions — response_format: json_schema (strict)");
+    let req = serde_json::json!({
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": "Output JSON only."},
+            {"role": "user",   "content": "Describe Alice, age 30, who is admin."}
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Person",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "age":  {"type": "integer"},
+                        "role": {"type": "string", "enum": ["user", "admin", "guest"]}
+                    },
+                    "required": ["name", "age", "role"]
+                }
+            }
+        },
+        "max_tokens": 64
+    });
+    println!("Request body:\n{}", pretty(&req));
+    let t = Instant::now();
+    let (status, body) = post_json(app, "/v1/chat/completions", &req).await;
+    println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
+    println!("{}", pretty(&body));
+    println!(
+        "\nNote: strict mode flips additionalProperties=false by default,\n\
+         so unknown keys are rejected. `enum` becomes a oneOf-of-Const\n\
+         branches in the FSM and commits as soon as the literal string\n\
+         disambiguates."
+    );
+
+    section("POST /v1/chat/completions — tools (function calling)");
+    let req = serde_json::json!({
+        "model": model_id,
+        "messages": [
+            {"role": "user", "content": "What is the weather in London?"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "units":    {"type": "string", "enum": ["C", "F"]}
+                    },
+                    "required": ["location"]
+                }
+            }
+        }],
+        "max_tokens": 64
+    });
+    println!("Request body:\n{}", pretty(&req));
+    let t = Instant::now();
+    let (status, body) = post_json(app, "/v1/chat/completions", &req).await;
+    println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
+    println!("{}", pretty(&body));
+    println!(
+        "\nNote: each tool synthesises a `{{name=Const, arguments=<args>}}`\n\
+         schema branch; multiple tools become a discriminated OneOf.\n\
+         Output is parsed back into `message.tool_calls[]` with\n\
+         `finish_reason: \"tool_calls\"`. Tools + stream=true is wired\n\
+         too — buffered constrained gen, single delta chunk for the\n\
+         tool_calls payload, then a final finish-reason chunk."
+    );
+
+    section("POST /v1/chat/completions — tool-result replay (multi-turn)");
+    let req = serde_json::json!({
+        "model": model_id,
+        "messages": [
+            {"role": "user", "content": "Weather in London?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "get_weather", "arguments": "{\"location\":\"London\"}"
+                }}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "23 C, sunny"}
+        ],
+        "max_tokens": 32
+    });
+    println!("Request body:\n{}", pretty(&req));
+    let t = Instant::now();
+    let (status, body) = post_json(app, "/v1/chat/completions", &req).await;
+    println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
     println!("{}", pretty(&body));
 
-    section("POST /v1/chat/completions — response_format json_schema (returns 400)");
+    section("POST /v1/chat/completions — logprobs + repetition penalties");
     let req = serde_json::json!({
         "model": model_id,
-        "messages": [{"role": "user", "content": "x"}],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}},
-        "max_tokens": 1
+        "messages": [{"role": "user", "content": "Once upon a time"}],
+        "max_tokens": 6,
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "seed": 42,
+        "frequency_penalty": 0.5,
+        "presence_penalty": 0.3,
+        "logprobs": true,
+        "top_logprobs": 3
     });
+    println!("Request body:\n{}", pretty(&req));
     let t = Instant::now();
     let (status, body) = post_json(app, "/v1/chat/completions", &req).await;
-    println!("Status: {status}  ({} ms)", t.elapsed().as_millis());
+    println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
     println!("{}", pretty(&body));
+    println!(
+        "\nNote: temperature/top_p/seed are honoured by the sampler;\n\
+         frequency/presence penalties subtract from logits before softmax\n\
+         (clamped to [-2, 2]); logprobs:true populates choices[i].logprobs\n\
+         with one entry per emitted token."
+    );
 }
 
 fn print_client_snippets(model_id: &str) {
@@ -354,6 +470,68 @@ fn print_client_snippets(model_id: &str) {
                  max_tokens=10,\n\
              )\n\
              print(chat.choices[0].message.content)\n\
+             \n\
+             # base64 embeddings\n\
+             emb_b64 = client.embeddings.create(\n\
+                 model=\"{model_id}\",\n\
+                 input=\"France\",\n\
+                 encoding_format=\"base64\",\n\
+             )\n\
+             \n\
+             # Structured outputs — strict JSON Schema\n\
+             schema = {{\n\
+                 \"name\": \"Person\",\n\
+                 \"strict\": True,\n\
+                 \"schema\": {{\n\
+                     \"type\": \"object\",\n\
+                     \"properties\": {{\n\
+                         \"name\": {{\"type\": \"string\"}},\n\
+                         \"age\":  {{\"type\": \"integer\"}}\n\
+                     }},\n\
+                     \"required\": [\"name\", \"age\"]\n\
+                 }}\n\
+             }}\n\
+             person = client.chat.completions.create(\n\
+                 model=\"{model_id}\",\n\
+                 messages=[{{\"role\": \"user\", \"content\": \"Describe Bob, 42.\"}}],\n\
+                 response_format={{\"type\": \"json_schema\", \"json_schema\": schema}},\n\
+             )\n\
+             import json; data = json.loads(person.choices[0].message.content)\n\
+             \n\
+             # Function calling\n\
+             tools = [{{\n\
+                 \"type\": \"function\",\n\
+                 \"function\": {{\n\
+                     \"name\": \"get_weather\",\n\
+                     \"parameters\": {{\n\
+                         \"type\": \"object\",\n\
+                         \"properties\": {{\"location\": {{\"type\": \"string\"}}}},\n\
+                         \"required\": [\"location\"]\n\
+                     }}\n\
+                 }}\n\
+             }}]\n\
+             call = client.chat.completions.create(\n\
+                 model=\"{model_id}\",\n\
+                 messages=[{{\"role\": \"user\", \"content\": \"Weather in Paris?\"}}],\n\
+                 tools=tools,\n\
+             )\n\
+             # call.choices[0].message.tool_calls[0].function.{{name,arguments}}\n\
+             # Multi-turn: append the tool_call message and a {{role:tool, tool_call_id, content}}\n\
+             # message, then call again to let the model formulate the answer.\n\
+             \n\
+             # Sampling + repetition penalties + logprobs\n\
+             chat = client.chat.completions.create(\n\
+                 model=\"{model_id}\",\n\
+                 messages=[{{\"role\": \"user\", \"content\": \"Once upon a time\"}}],\n\
+                 max_tokens=20,\n\
+                 temperature=0.8,\n\
+                 top_p=0.9,\n\
+                 seed=42,\n\
+                 frequency_penalty=0.5,\n\
+                 presence_penalty=0.3,\n\
+                 logprobs=True,\n\
+                 top_logprobs=3,\n\
+             )\n\
          \n\
          curl:\n\
          \n\

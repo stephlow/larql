@@ -23,6 +23,7 @@ fn synth(len: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_q6k(
     metal: &MetalBackend,
     pipeline: &metal::ComputePipelineState,

@@ -74,6 +74,18 @@ fn assert_handle_matches_marker<K: TiledKernel>(handle: &KernelHandle, label: &s
     );
 }
 
+fn assert_q4k_selected_handle_matches_active_marker(handle: &KernelHandle, label: &str) {
+    match handle.kernel_name {
+        <shaders::q4k_matvec::Kernel as TiledKernel>::KERNEL_NAME => {
+            assert_handle_matches_marker::<shaders::q4k_matvec::Kernel>(handle, label);
+        }
+        <shaders::q4k_matvec_8sg::Kernel as TiledKernel>::KERNEL_NAME => {
+            assert_handle_matches_marker::<shaders::q4k_matvec_8sg::Kernel>(handle, label);
+        }
+        other => panic!("{label}: q4k_matvec_pipeline is bound to unsupported kernel '{other}'"),
+    }
+}
+
 /// The Q4 family — bundled in `Q4Pipelines`. Only `matvec` is a
 /// `KernelHandle`; `vecmat` and `f32_matvec` are flat-dispatch and
 /// stay as bare pipelines (intentional — see `metal/ops/q4_common.rs`).
@@ -87,9 +99,21 @@ fn q4_pipelines_handle_contract() {
 #[test]
 fn k_matvec_handle_contract() {
     let metal = get_metal();
-    assert_handle_matches_marker::<shaders::q4k_matvec::Kernel>(
+    assert_q4k_selected_handle_matches_active_marker(
         &metal.q4k_matvec_pipeline,
         "q4k_matvec_pipeline",
+    );
+    assert_handle_matches_marker::<shaders::q4k_matvec::Kernel>(
+        &metal.q4k_matvec_4sg_pipeline,
+        "q4k_matvec_4sg_pipeline",
+    );
+    assert_handle_matches_marker::<shaders::q4k_matvec_8sg::Kernel>(
+        &metal.q4k_matvec_8sg_pipeline,
+        "q4k_matvec_8sg_pipeline",
+    );
+    assert_handle_matches_marker::<shaders::q4k_matvec_stride32::Kernel>(
+        &metal.q4k_matvec_stride32_pipeline,
+        "q4k_matvec_stride32_pipeline",
     );
     assert_handle_matches_marker::<shaders::q6k_matvec::Kernel>(
         &metal.q6k_matvec_pipeline,

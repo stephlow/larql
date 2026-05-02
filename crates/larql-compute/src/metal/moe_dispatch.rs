@@ -152,23 +152,11 @@ impl MetalBackend {
         F: Fn(usize, usize) -> Option<(&'w [u8], &'w [u8])>,
     {
         let mut kv_guard = self.kv_cache.lock().unwrap();
-        if kv_guard.is_none() {
-            let shapes: Vec<(usize, usize)> = layers
-                .iter()
-                .map(|l| (l.num_kv_heads, l.head_dim))
-                .collect();
-            *kv_guard = Some(super::ops::kv_cache::KVCache::new_per_layer(
-                &self.bufs, &shapes, 4096,
-            ));
-        }
-        let kv = kv_guard.as_mut().unwrap();
-        while kv.layers.len() < layers.len() {
-            let l = kv.layers.len();
-            let (nkv, hd) = (layers[l].num_kv_heads, layers[l].head_dim);
-            kv.layers.push(super::ops::kv_cache::LayerKVCache::new(
-                &self.bufs, 4096, nkv, hd,
-            ));
-        }
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut kv_guard,
+            layers,
+            super::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
 
         // Cache scratch by `(top_k, hidden, intermediate_size)` on the
         // backend so the ~15 Metal buffer allocations (~120ms on Gemma 4
@@ -243,6 +231,7 @@ impl MetalBackend {
     ///     top_k down dispatches → committed and waited on once.
     ///   - 1 readback of `top_k × hidden` f32 expert outputs + CPU weighted sum
     ///     and post-experts norm.
+    ///
     /// Cache-backed shared Metal buffer for an arbitrary byte slice — the
     /// caller passes a stable byte slice (typically a Q4_K mmap region for
     /// one expert) and gets back a `Buffer` keyed on `(ptr, len)`.

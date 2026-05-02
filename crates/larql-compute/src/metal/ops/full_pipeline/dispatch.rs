@@ -30,7 +30,7 @@ pub struct LayerWeights<'a> {
     pub down_t_q4: &'a [u8],
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn encode_rms_norm(
     enc: &ComputeCommandEncoderRef,
     rms_pipeline: &ComputePipelineState,
@@ -97,7 +97,7 @@ pub fn encode_residual_add(
 /// supplied, QK-norm is applied **before** RoPE (matching `decode_token` and
 /// the Gemma 3/4 reference implementations). `fused_attention` is then called
 /// with `use_qk_norm = 0` to avoid a second normalisation.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn dispatch_full_pipeline(
     queue: &CommandQueue,
     bufs: &BufferCache,

@@ -17,6 +17,8 @@ pub const SHADER: &str = r#"
 // Output: out[seq, num_q * head_dim]
 //
 // One threadgroup per (head, query_position). Threads cooperate on key-dimension dot products.
+constant uint MAX_FUSED_ATTENTION_SEQ_LEN = 4096;
+
 kernel void fused_attention(
     device const float* Q       [[buffer(0)]],
     device const float* K       [[buffer(1)]],
@@ -98,7 +100,7 @@ kernel void fused_attention(
     }
 
     // ── Attention scores: Q · K^T for all k ≤ qi ──
-    threadgroup float tg_scores[4096]; // max seq_len
+    threadgroup float tg_scores[MAX_FUSED_ATTENTION_SEQ_LEN];
     threadgroup float tg_max = 0.0f;
     threadgroup float tg_sum = 0.0f;
 

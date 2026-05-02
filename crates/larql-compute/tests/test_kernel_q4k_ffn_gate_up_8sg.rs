@@ -34,6 +34,7 @@ fn rms_normed(len: usize, seed: u64) -> Vec<f32> {
 }
 
 /// Dispatch using a specific gate+up pipeline. Returns `(gate_out, up_out)`.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     metal: &MetalBackend,
     pipeline: &metal::ComputePipelineState,

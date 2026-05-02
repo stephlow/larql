@@ -61,6 +61,7 @@ fn q4k_matvec_stride32_matches_cpu() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     metal: &MetalBackend,
     pipeline: &metal::ComputePipelineState,

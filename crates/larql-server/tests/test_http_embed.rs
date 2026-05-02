@@ -786,9 +786,12 @@ async fn http_openai_chat_tools_unknown_choice_returns_400() {
 }
 
 #[tokio::test]
-async fn http_openai_chat_tools_with_stream_returns_400() {
-    // Streaming tool calls (delta chunks) is a separate slice — for
-    // now, tools + stream is rejected.
+async fn http_openai_chat_tools_with_stream_returns_event_stream() {
+    // Slice 4.11: tools + stream is now wired. Synthetic model has
+    // infer_disabled=true, but the SSE response shape is determined
+    // before the inference gate fires — confirm we get a 200 SSE
+    // content-type, not 400.
+    use axum::http::header;
     let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
     let resp = post_json(
         app,
@@ -801,7 +804,16 @@ async fn http_openai_chat_tools_with_stream_returns_400() {
         }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected SSE content-type, got {ct:?}"
+    );
 }
 
 #[tokio::test]

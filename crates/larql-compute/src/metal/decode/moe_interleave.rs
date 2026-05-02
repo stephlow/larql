@@ -50,7 +50,7 @@ pub(super) struct MoeCommandState<'a> {
 }
 
 impl MetalBackend {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(super) fn handle_moe_interleave(
         &self,
         layer: &FullPipelineLayer<'_>,

@@ -33,17 +33,11 @@ use serde_json::Value;
 use super::ast::{ArraySchema, NumberSchema, ObjectSchema, Schema, StringSchema};
 
 /// Caller-controlled defaults applied to the parser.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ParseOptions {
     /// When set, an Object with no `additionalProperties` keyword
     /// rejects unknown keys (OpenAI's `strict: true` semantics).
     pub strict: bool,
-}
-
-impl Default for ParseOptions {
-    fn default() -> Self {
-        Self { strict: false }
-    }
 }
 
 /// Parse a JSON-Schema value with the default (non-strict) options.

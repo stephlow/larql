@@ -4,16 +4,20 @@ use super::detok::Detokenizer;
 use super::eos::EosConfig;
 use super::sampling::{Sampler, SamplingConfig};
 use super::types::{GenerateResult, StageTimings};
+use crate::layer_graph::pipeline_layer::{
+    attention_geometry_for_arch_layer, kv_cache_shapes_for_arch, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+};
 use crate::layer_graph::CachedLayerGraph;
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
 use super::cpu::{
     backend_supports_fused_q4_pipeline, generate_constrained_via_cpu_q4k,
-    generate_constrained_via_cpu_q4k_streaming, generate_via_cpu_q4k,
+    generate_constrained_via_cpu_q4k_streaming_sampled, generate_via_cpu_q4k,
 };
 use super::lm_head::{
     backend_lm_head_scores, cpu_lm_head_topk, lm_head_topk, pick_next_token_masked,
+    pick_next_token_masked_sampled,
 };
 
 /// LM-head top-K size when running greedy decode. Matches the historical
@@ -222,9 +226,7 @@ where
         ffn_format,
     );
 
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope = arch.rope_base_for_layer(layer_range.start) as f32;
+    let attention = attention_geometry_for_arch_layer(weights, layer_range.start);
 
     // ── Phase 1: GPU prefill ──
     let prefill_start = std::time::Instant::now();
@@ -235,10 +237,8 @@ where
     // Without this, the lazy uniform allocation uses the first layer's dims for all layers,
     // causing global layers to read/write off the end of under-sized KV buffers.
     {
-        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
-            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
-            .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        let kv_shapes = kv_cache_shapes_for_arch(weights);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
     let seq_len = token_ids.len();
 
@@ -269,12 +269,12 @@ where
                             &x_pos,
                             hidden,
                             intermediate,
-                            q_dim,
-                            kv_dim,
-                            weights.num_q_heads,
-                            weights.num_kv_heads,
-                            weights.head_dim,
-                            rope,
+                            attention.q_dim,
+                            attention.kv_dim,
+                            attention.num_q_heads,
+                            attention.num_kv_heads,
+                            attention.head_dim,
+                            attention.rope_base,
                             norm_eps,
                             |layer_idx, expert_idx| {
                                 weights.get_layer_entry_bytes(layer_idx, expert_idx)
@@ -310,13 +310,13 @@ where
             &x,
             hidden,
             intermediate,
-            q_dim,
-            kv_dim,
+            attention.q_dim,
+            attention.kv_dim,
             seq_len,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
             qk_norm_val,
             softcap_val,
         ) {
@@ -469,12 +469,12 @@ where
                 &x_dec,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
             );
             r
         } else if {
@@ -495,12 +495,12 @@ where
                     &x_dec,
                     hidden,
                     intermediate,
-                    q_dim,
-                    kv_dim,
-                    weights.num_q_heads,
-                    weights.num_kv_heads,
-                    weights.head_dim,
-                    rope,
+                    attention.q_dim,
+                    attention.kv_dim,
+                    attention.num_q_heads,
+                    attention.num_kv_heads,
+                    attention.head_dim,
+                    attention.rope_base,
                     norm_eps,
                     |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx),
                 )
@@ -510,12 +510,12 @@ where
                     &x_dec,
                     hidden,
                     intermediate,
-                    q_dim,
-                    kv_dim,
-                    weights.num_q_heads,
-                    weights.num_kv_heads,
-                    weights.head_dim,
-                    rope,
+                    attention.q_dim,
+                    attention.kv_dim,
+                    attention.num_q_heads,
+                    attention.num_kv_heads,
+                    attention.head_dim,
+                    attention.rope_base,
                 )
             }
             #[cfg(not(feature = "metal"))]
@@ -524,12 +524,12 @@ where
                 &x_dec,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
             )
         } else {
             backend.decode_token(
@@ -537,12 +537,12 @@ where
                 &x_dec,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
             )
         };
         let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -735,9 +735,10 @@ where
 }
 
 /// Streaming variant of [`generate_constrained`] — fires
-/// `on_token(id, text, prob)` after each masked argmax pick so SSE
+/// `on_token(id, text, prob)` after each masked-argmax pick so SSE
 /// callers can flush JSON / structured-output chunks as they're
-/// produced. Identical pipeline otherwise.
+/// produced. Greedy under the mask; for sampling under mask see
+/// [`generate_constrained_streaming_sampled`].
 #[allow(clippy::too_many_arguments)]
 pub fn generate_constrained_streaming<M, F>(
     weights: &mut ModelWeights,
@@ -748,19 +749,64 @@ pub fn generate_constrained_streaming<M, F>(
     backend: &dyn ComputeBackend,
     cached_layers: &CachedLayerGraph,
     layer_range: std::ops::Range<usize>,
-    mut mask_fn: M,
-    mut on_token: F,
+    mask_fn: M,
+    on_token: F,
 ) -> GenerateResult
 where
     M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
+    generate_constrained_streaming_sampled(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        mask_fn,
+        on_token,
+        SamplingConfig::greedy(),
+        &EosConfig::builtin(),
+    )
+}
+
+/// Streaming + sampling-aware constrained decode. Drives token
+/// selection through the supplied [`SamplingConfig`] (temperature,
+/// top_p, top_k, seed, repetition penalties) over the *masked* logits.
+/// Pass `SamplingConfig::greedy()` for the existing argmax behaviour
+/// (which is what most JSON / tools modes want today).
+///
+/// `eos` is consulted on top of the built-in end-of-turn detection so
+/// the caller can extend the stop set with user-supplied stop strings.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_constrained_streaming_sampled<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    mut mask_fn: M,
+    mut on_token: F,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> GenerateResult
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str, f64),
+{
+    let _ = eos; // built-in end-of-turn check still primary; eos extension is a follow-up
+    let mut sampler = Sampler::new(sampling);
     // Same PLE delegation as `generate_streaming` — the Metal pipeline
     // doesn't implement Gemma 4 E2B's per-layer-input gate.
     let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
     if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
-        return generate_constrained_via_cpu_q4k_streaming(
-            weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token,
+        return generate_constrained_via_cpu_q4k_streaming_sampled(
+            weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling,
         );
     }
 
@@ -839,18 +885,14 @@ where
         ffn_format,
     );
 
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope = arch.rope_base_for_layer(layer_range.start) as f32;
+    let attention = attention_geometry_for_arch_layer(weights, layer_range.start);
 
     // ── Phase 1: GPU prefill ──
     let prefill_start = std::time::Instant::now();
     backend.reset_kv_cache();
     {
-        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
-            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
-            .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        let kv_shapes = kv_cache_shapes_for_arch(weights);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
     let seq_len = token_ids.len();
     let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
@@ -866,13 +908,13 @@ where
         &x,
         hidden,
         intermediate,
-        q_dim,
-        kv_dim,
+        attention.q_dim,
+        attention.kv_dim,
         seq_len,
-        weights.num_q_heads,
-        weights.num_kv_heads,
-        weights.head_dim,
-        rope,
+        attention.num_q_heads,
+        attention.num_kv_heads,
+        attention.head_dim,
+        attention.rope_base,
         qk_norm_val,
         softcap_val,
     ) {
@@ -905,7 +947,14 @@ where
     let mut decode_ms = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    let first = pick_next_token_masked(weights, &h_1d, &generated, backend, &mut mask_fn);
+    let first = pick_next_token_masked_sampled(
+        weights,
+        &h_1d,
+        &generated,
+        backend,
+        &mut mask_fn,
+        &mut sampler,
+    );
     let mut current_token_id = match first {
         Some((tid, _)) => {
             let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
@@ -945,12 +994,12 @@ where
             &x_dec,
             hidden,
             intermediate,
-            q_dim,
-            kv_dim,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
+            attention.q_dim,
+            attention.kv_dim,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
         );
 
         let h_1d = if let Some(h_out) = result {
@@ -969,7 +1018,14 @@ where
             break;
         };
 
-        let pick = pick_next_token_masked(weights, &h_1d, &generated, backend, &mut mask_fn);
+        let pick = pick_next_token_masked_sampled(
+            weights,
+            &h_1d,
+            &generated,
+            backend,
+            &mut mask_fn,
+            &mut sampler,
+        );
         decode_ms.push(decode_start.elapsed().as_secs_f64() * 1000.0);
 
         match pick {

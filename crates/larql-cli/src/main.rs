@@ -1,5 +1,19 @@
-#![allow(clippy::doc_overindented_list_items)]
-#![allow(clippy::type_complexity)]
+#![allow(
+    unused_imports,
+    clippy::doc_overindented_list_items,
+    clippy::excessive_precision,
+    clippy::for_kv_map,
+    clippy::io_other_error,
+    clippy::large_enum_variant,
+    clippy::manual_contains,
+    clippy::manual_is_multiple_of,
+    clippy::manual_repeat_n,
+    clippy::map_identity,
+    clippy::needless_lifetimes,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 use clap::{Parser, Subcommand};
 

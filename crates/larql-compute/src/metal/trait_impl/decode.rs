@@ -108,23 +108,12 @@ impl DecodeBackend for MetalBackend {
         use_qk_norm: bool,
         softcap: f32,
     ) -> Option<Vec<f32>> {
-        let num_layers = layers.len();
-        let shapes: Vec<(usize, usize)> = layers
-            .iter()
-            .map(|l| (l.num_kv_heads, l.head_dim))
-            .collect();
         let mut cache_guard = self.kv_cache.lock().unwrap();
-        if cache_guard.is_none() {
-            *cache_guard = Some(ops::kv_cache::KVCache::new_per_layer(
-                &self.bufs, &shapes, 4096,
-            ));
-        }
-        let kv = cache_guard.as_mut().unwrap();
-        while kv.layers.len() < num_layers {
-            let (nkv, hd) = shapes[kv.layers.len()];
-            kv.layers
-                .push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, nkv, hd));
-        }
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
 
         let has_moe = layers.iter().any(|l| l.moe.is_some());
         let geglu = if layers
@@ -267,13 +256,18 @@ impl DecodeBackend for MetalBackend {
     ) {
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(layer + 1, 4096, num_kv_heads, head_dim));
+            *cache_guard = Some(self.create_kv_cache(
+                layer + 1,
+                crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+                num_kv_heads,
+                head_dim,
+            ));
         }
         let kv = cache_guard.as_mut().unwrap();
         while kv.layers.len() <= layer {
             kv.layers.push(ops::kv_cache::LayerKVCache::new(
                 &self.bufs,
-                4096,
+                crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
                 num_kv_heads,
                 head_dim,
             ));
@@ -326,23 +320,12 @@ impl DecodeBackend for MetalBackend {
         head_dim: usize,
         rope_base: f32,
     ) -> Option<Vec<f32>> {
-        let num_layers = layers.len();
         let mut cache_guard = self.kv_cache.lock().unwrap();
-        if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
-        }
-        let kv = cache_guard.as_mut().unwrap();
-        // Grow if a later call uses a larger model than the first one
-        // sized the cache for.
-        while kv.layers.len() < num_layers {
-            let l = &layers[kv.layers.len()];
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(
-                &self.bufs,
-                4096,
-                l.num_kv_heads,
-                l.head_dim,
-            ));
-        }
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
         Some(MetalBackend::decode_token(
             self,
             kv,
@@ -373,21 +356,12 @@ impl DecodeBackend for MetalBackend {
         rope_base: f32,
         moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
-        let num_layers = layers.len();
         let mut cache_guard = self.kv_cache.lock().unwrap();
-        if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
-        }
-        let kv = cache_guard.as_mut().unwrap();
-        while kv.layers.len() < num_layers {
-            let l = &layers[kv.layers.len()];
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(
-                &self.bufs,
-                4096,
-                l.num_kv_heads,
-                l.head_dim,
-            ));
-        }
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
         Some(MetalBackend::decode_token_with_moe_fn(
             self,
             kv,
@@ -420,21 +394,12 @@ impl DecodeBackend for MetalBackend {
         moe_fire_fn: &mut dyn FnMut(usize, &[f32]),
         moe_collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
     ) -> Option<Vec<f32>> {
-        let num_layers = layers.len();
         let mut cache_guard = self.kv_cache.lock().unwrap();
-        if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
-        }
-        let kv = cache_guard.as_mut().unwrap();
-        while kv.layers.len() < num_layers {
-            let l = &layers[kv.layers.len()];
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(
-                &self.bufs,
-                4096,
-                l.num_kv_heads,
-                l.head_dim,
-            ));
-        }
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
         // Wrap fire so its return value is ignored — the decode-loop closure
         // already discards moe_fn's output when split mode is active.
         let mut fire_wrapper = |layer: usize, h: &[f32]| -> Vec<f32> {

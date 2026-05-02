@@ -611,9 +611,34 @@ impl MetalBackend {
         head_dim: usize,
     ) -> std::sync::MutexGuard<'_, Option<ops::kv_cache::KVCache>> {
         let mut guard = self.kv_cache.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
-        }
+        let shapes = vec![(num_kv_heads, head_dim); num_layers];
+        self.ensure_kv_cache_for_shapes(&mut guard, &shapes, decode::DEFAULT_KV_CACHE_MAX_SEQ);
+        guard
+    }
+
+    /// Access the KV cache using per-layer pipeline geometry.
+    ///
+    /// This is the preferred path for heterogeneous attention layouts; it
+    /// avoids the legacy uniform `(num_kv_heads, head_dim)` fallback.
+    pub fn kv_cache_mut_for_layers(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+    ) -> std::sync::MutexGuard<'_, Option<ops::kv_cache::KVCache>> {
+        let mut guard = self.kv_cache.lock().unwrap();
+        self.ensure_kv_cache_for_layers(&mut guard, layers, decode::DEFAULT_KV_CACHE_MAX_SEQ);
+        guard
+    }
+
+    /// Access the KV cache using explicit per-layer geometry.
+    ///
+    /// Use this when call sites pass absolute layer indices and only hold a
+    /// slice of pipeline layers locally.
+    pub fn kv_cache_mut_for_shapes(
+        &self,
+        shapes: &[(usize, usize)],
+    ) -> std::sync::MutexGuard<'_, Option<ops::kv_cache::KVCache>> {
+        let mut guard = self.kv_cache.lock().unwrap();
+        self.ensure_kv_cache_for_shapes(&mut guard, shapes, decode::DEFAULT_KV_CACHE_MAX_SEQ);
         guard
     }
 }

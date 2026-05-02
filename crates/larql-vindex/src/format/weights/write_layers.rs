@@ -17,14 +17,13 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
-use larql_models::ModelArchitecture;
-
 use crate::VindexError;
+use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 
 /// Format tag written into the file header. Extend as new formats land.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
 pub enum LayerWeightFormat {
     F32 = 0,
     F16 = 1,
@@ -50,6 +49,9 @@ pub struct LayerEntry {
     pub gate_up: Vec<u8>, // Q4_K [2*inter, hidden]
     pub down: Vec<u8>,    // Q6_K [hidden, inter_padded]  (same format as gate_up)
 }
+
+pub type LayerWeightOffsets = Vec<(usize, usize, usize, usize)>;
+pub type LayerWeightsHeader = (LayerWeightFormat, usize, usize, usize, LayerWeightOffsets);
 
 /// Write `layers/layer_{L:02}.weights` for one layer.
 ///
@@ -226,15 +228,7 @@ pub fn quantize_moe_entries(
 ///
 /// Returns `(format, num_entries, inter, hidden, offsets)` where
 /// `offsets[e] = (gate_up_offset, gate_up_bytes, down_offset, down_bytes)`.
-pub fn parse_layer_weights_header(
-    data: &[u8],
-) -> Option<(
-    LayerWeightFormat,
-    usize,
-    usize,
-    usize,
-    Vec<(usize, usize, usize, usize)>,
-)> {
+pub fn parse_layer_weights_header(data: &[u8]) -> Option<LayerWeightsHeader> {
     if data.len() < 24 {
         return None;
     }

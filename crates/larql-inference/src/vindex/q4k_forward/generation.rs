@@ -99,7 +99,7 @@ pub fn generate_q4k_cpu_remote(
     out
 }
 
-/// Constrained variant of [`generate_q4k_cpu`].
+/// Constrained variant of [`generate_q4k_cpu`]. Greedy under the mask.
 pub fn generate_q4k_cpu_constrained<M>(
     weights: &mut ModelWeights,
     tokenizer: &Tokenizer,
@@ -111,7 +111,7 @@ pub fn generate_q4k_cpu_constrained<M>(
 where
     M: FnMut(&[u32], &mut Vec<f32>),
 {
-    generate_q4k_cpu_constrained_streaming(
+    generate_q4k_cpu_constrained_streaming_sampled(
         weights,
         tokenizer,
         prompt_ids,
@@ -119,6 +119,7 @@ where
         index,
         mask_fn,
         |_, _, _| {},
+        crate::layer_graph::SamplingConfig::greedy(),
     )
 }
 
@@ -126,7 +127,42 @@ where
 /// Fires `on_token(id, text, prob)` after each masked argmax pick. Used
 /// by the OpenAI server's SSE path so JSON / structured-output streams
 /// can flush chunks as the constrained decoder produces them.
+///
+/// Greedy under the mask. For sampling under mask, see
+/// [`generate_q4k_cpu_constrained_streaming_sampled`].
 pub fn generate_q4k_cpu_constrained_streaming<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    mask_fn: M,
+    on_token: F,
+) -> Vec<(String, u32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str, f64),
+{
+    generate_q4k_cpu_constrained_streaming_sampled(
+        weights,
+        tokenizer,
+        prompt_ids,
+        max_tokens,
+        index,
+        mask_fn,
+        on_token,
+        crate::layer_graph::SamplingConfig::greedy(),
+    )
+}
+
+/// Sampling-aware streaming-constrained CPU Q4_K decode. Drives token
+/// selection through the supplied `SamplingConfig` (temperature, top_p,
+/// top_k, seed, repetition penalties) over the masked logits — so JSON
+/// / tools modes can be sampled rather than greedy when the caller asks.
+///
+/// Pass `SamplingConfig::greedy()` for the existing argmax behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_q4k_cpu_constrained_streaming_sampled<M, F>(
     weights: &mut ModelWeights,
     tokenizer: &Tokenizer,
     prompt_ids: &[u32],
@@ -134,6 +170,7 @@ pub fn generate_q4k_cpu_constrained_streaming<M, F>(
     index: &VectorIndex,
     mut mask_fn: M,
     mut on_token: F,
+    sampling: crate::layer_graph::SamplingConfig,
 ) -> Vec<(String, u32)>
 where
     M: FnMut(&[u32], &mut Vec<f32>),
@@ -142,6 +179,7 @@ where
     let mut ids = prompt_ids.to_vec();
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
+    let mut sampler = crate::layer_graph::Sampler::new(sampling);
 
     for _ in 0..max_tokens {
         let h = predict_q4k_hidden(weights, &ids, index, None);
@@ -152,13 +190,13 @@ where
         let mut logits = crate::forward::hidden_to_raw_logits(weights, &last_2d);
         mask_fn(&generated, &mut logits);
 
-        let (id, idx_score) = logits
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| !v.is_nan() && v.is_finite())
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, &s)| (i as u32, s))
-            .unwrap_or((0, f32::NEG_INFINITY));
+        let id = match sampler.sample_with_history(&logits, &generated) {
+            Some(id) => id,
+            None => break,
+        };
+        // Sanity: bail if the picked token's logit isn't finite (e.g.
+        // mask wiped every entry to -inf — the FSM rejected everything).
+        let idx_score = *logits.get(id as usize).unwrap_or(&f32::NEG_INFINITY);
         if !idx_score.is_finite() {
             break;
         }

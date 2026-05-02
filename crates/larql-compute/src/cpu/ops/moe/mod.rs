@@ -507,8 +507,8 @@ mod tests {
         let mut gate_up_blob = vec![0u8; num_experts * gu_stride];
         let mut down_blob = vec![0u8; num_experts * dn_stride];
         for e in 0..num_experts {
-            gate_up_blob[e * gu_stride] = (0xA0 + e as u8) & 0xFF;
-            down_blob[e * dn_stride] = (0xB0 + e as u8) & 0xFF;
+            gate_up_blob[e * gu_stride] = 0xA0 + e as u8;
+            down_blob[e * dn_stride] = 0xB0 + e as u8;
         }
         let experts_gate_up: Vec<&[u8]> = (0..num_experts)
             .map(|e| &gate_up_blob[e * gu_stride..(e + 1) * gu_stride])

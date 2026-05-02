@@ -444,11 +444,15 @@ pub fn predict_honest(
                     ffn_format,
                 );
 
-                // GPU pipeline uses uniform dims (sliding layer defaults). Models with
-                // per-layer variation (Gemma 4) route through CPU via has_post_norms().
-                let q_dim = weights.num_q_heads * weights.head_dim;
-                let kv_dim = weights.num_kv_heads * weights.head_dim;
-                let rope = arch.rope_base_for_layer(layer_range.start) as f32;
+                let attention = layers
+                    .first()
+                    .map(super::pipeline_layer::attention_geometry_for_pipeline_layer)
+                    .unwrap_or_else(|| {
+                        super::pipeline_layer::attention_geometry_for_arch_layer(
+                            weights,
+                            layer_range.start,
+                        )
+                    });
                 let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
                 let qk_norm = arch.attn_q_norm_key(layer_range.start).is_some();
 
@@ -461,12 +465,12 @@ pub fn predict_honest(
                         &x,
                         hidden,
                         intermediate,
-                        q_dim,
-                        kv_dim,
-                        weights.num_q_heads,
-                        weights.num_kv_heads,
-                        weights.head_dim,
-                        rope,
+                        attention.q_dim,
+                        attention.kv_dim,
+                        attention.num_q_heads,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        attention.rope_base,
                     ) {
                         let mut row = h.row_mut(0);
                         for j in 0..hidden {
@@ -488,13 +492,13 @@ pub fn predict_honest(
                         &x,
                         hidden,
                         intermediate,
-                        q_dim,
-                        kv_dim,
+                        attention.q_dim,
+                        attention.kv_dim,
                         1,
-                        weights.num_q_heads,
-                        weights.num_kv_heads,
-                        weights.head_dim,
-                        rope,
+                        attention.num_q_heads,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        attention.rope_base,
                         qk_norm,
                         softcap,
                     ) {
@@ -517,13 +521,13 @@ pub fn predict_honest(
                         &x,
                         hidden,
                         intermediate,
-                        q_dim,
-                        kv_dim,
+                        attention.q_dim,
+                        attention.kv_dim,
                         seq_len,
-                        weights.num_q_heads,
-                        weights.num_kv_heads,
-                        weights.head_dim,
-                        rope,
+                        attention.num_q_heads,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        attention.rope_base,
                         qk_norm,
                         softcap,
                     ) {
@@ -569,8 +573,8 @@ pub fn predict_honest(
                                 k_flat,
                                 v_flat,
                                 seq_len,
-                                weights.num_kv_heads,
-                                weights.head_dim,
+                                weights.arch.num_kv_heads_for_layer(abs_layer),
+                                weights.arch.head_dim_for_layer(abs_layer),
                             );
                         }
 

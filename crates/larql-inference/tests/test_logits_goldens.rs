@@ -44,6 +44,8 @@
 //! Skip semantics mirror the rest of the test_decode_* suite: missing
 //! vindexes return Ok with a skip note unless `LARQL_ARCH_STRICT=1`.
 
+#![allow(clippy::excessive_precision)]
+
 use std::path::PathBuf;
 
 use larql_compute::{ComputeBackend, CpuBackend};

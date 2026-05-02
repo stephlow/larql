@@ -35,7 +35,7 @@
 
 use std::path::PathBuf;
 
-use larql_compute::ComputeBackend;
+use larql_compute::DecodeBackend;
 use larql_inference::residual_diff::{compare_stages, ParityThreshold, StageCapture};
 use larql_inference::wrap_chat_prompt;
 use larql_vindex::{

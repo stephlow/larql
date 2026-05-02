@@ -19,6 +19,14 @@
 //!                  The error-path unit test in grid.rs covers what's testable
 //!                  without a real Metal backend + remote server.
 
+#![allow(
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_overindented_list_items
+)]
+
 use std::path::PathBuf;
 
 use larql_compute::CpuBackend;

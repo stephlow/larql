@@ -40,6 +40,38 @@
 //! See `examples/mech_interp_demo.rs` for an end-to-end walkthrough on
 //! synthetic weights (no vindex required).
 
+#![allow(
+    deprecated,
+    dead_code,
+    private_interfaces,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    clippy::doc_nested_refdefs,
+    clippy::duplicated_attributes,
+    clippy::blocks_in_conditions,
+    clippy::collapsible_if,
+    clippy::doc_overindented_list_items,
+    clippy::erasing_op,
+    clippy::if_same_then_else,
+    clippy::identity_op,
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::let_and_return,
+    clippy::manual_find,
+    clippy::map_identity,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::question_mark,
+    clippy::single_char_add_str,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec
+)]
+
 extern crate blas_src;
 
 pub mod attention;

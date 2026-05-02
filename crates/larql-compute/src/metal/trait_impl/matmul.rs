@@ -537,6 +537,7 @@ mod tests {
     ///   - the partial last TG (vocab not divisible by 256), which is the
     ///     case that broke `q4_matvec_topk` parity in development.
     ///   - vocab smaller than one TG (single partial TG only).
+    ///
     /// The Q4/f16 integration tests cover the typical "full TGs" path; this
     /// pins the boundary cases that those don't reach.
     #[test]

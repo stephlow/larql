@@ -197,7 +197,7 @@ pub fn q4k_q8k_matvec_scalar(
         return;
     }
 
-    for r in 0..rows {
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -238,7 +238,7 @@ pub fn q4k_q8k_matvec_scalar(
             }
             acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2 as f32;
         }
-        out[r] = acc;
+        *out_slot = acc;
     }
 }
 
@@ -308,7 +308,7 @@ pub fn q4k_q8k_matvec_neon(
     // Mask vector for low-nibble extraction (broadcast 0x0F across 16 lanes).
     let mask_lo = unsafe { vdupq_n_u8(0x0F) };
 
-    for r in 0..rows {
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -368,7 +368,7 @@ pub fn q4k_q8k_matvec_neon(
             }
             acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2 as f32;
         }
-        out[r] = acc;
+        *out_slot = acc;
     }
 }
 
@@ -763,9 +763,9 @@ mod tests {
         // Single super-block, single row matrix.
         let cols = 256;
         let rows = 4;
-        let x: Vec<f32> = (0..cols).map(|i| ((i as f32 * 0.013).sin())).collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.013).sin()).collect();
         let w_f32: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32 * 0.007).cos() * 0.5))
+            .map(|i| (i as f32 * 0.007).cos() * 0.5)
             .collect();
         let w_q4 = quantize_q4_k(&w_f32);
         assert_eq!(w_q4.len(), rows * 144);
@@ -798,11 +798,9 @@ mod tests {
     fn q8k_matvec_multi_block_within_noise() {
         let cols = 512; // 2 super-blocks
         let rows = 16;
-        let x: Vec<f32> = (0..cols)
-            .map(|i| ((i as f32 * 0.011).cos() * 2.0))
-            .collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.011).cos() * 2.0).collect();
         let w_f32: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32 * 0.009).sin() * 0.3))
+            .map(|i| (i as f32 * 0.009).sin() * 0.3)
             .collect();
         let w_q4 = quantize_q4_k(&w_f32);
 
@@ -904,10 +902,10 @@ mod tests {
         for &rows in &[2usize, 4, 7, 11, 16, 17] {
             let cols = 1024;
             let x: Vec<f32> = (0..cols)
-                .map(|i| ((i as f32 * 0.0173).sin() * 1.7 + (i as f32 * 0.041).cos() * 0.9))
+                .map(|i| (i as f32 * 0.0173).sin() * 1.7 + (i as f32 * 0.041).cos() * 0.9)
                 .collect();
             let w_f32: Vec<f32> = (0..rows * cols)
-                .map(|i| ((i as f32 * 0.013).cos() * 0.4 - (i as f32 * 0.027).sin() * 0.2))
+                .map(|i| (i as f32 * 0.013).cos() * 0.4 - (i as f32 * 0.027).sin() * 0.2)
                 .collect();
             let w_q4 = quantize_q4_k(&w_f32);
             let q8 = quantize_x_to_q8k(&x);
@@ -938,13 +936,13 @@ mod tests {
         let cols = 1024;
         let rows = 11;
         let x: Vec<f32> = (0..cols)
-            .map(|i| ((i as f32 * 0.0151).sin() * 1.4 + (i as f32 * 0.029).cos() * 0.7))
+            .map(|i| (i as f32 * 0.0151).sin() * 1.4 + (i as f32 * 0.029).cos() * 0.7)
             .collect();
         let g_f32: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32 * 0.011).cos() * 0.4 - (i as f32 * 0.027).sin() * 0.2))
+            .map(|i| (i as f32 * 0.011).cos() * 0.4 - (i as f32 * 0.027).sin() * 0.2)
             .collect();
         let u_f32: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32 * 0.013).sin() * 0.3 + (i as f32 * 0.041).cos() * 0.5))
+            .map(|i| (i as f32 * 0.013).sin() * 0.3 + (i as f32 * 0.041).cos() * 0.5)
             .collect();
         let g_w = quantize_q4_k(&g_f32);
         let u_w = quantize_q4_k(&u_f32);

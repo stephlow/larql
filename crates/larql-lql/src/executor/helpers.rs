@@ -1,5 +1,7 @@
 //! Shared helpers: formatting, token filtering.
 
+#![allow(clippy::items_after_test_module)]
+
 use std::path::Path;
 
 /// Get total size of a directory in bytes.

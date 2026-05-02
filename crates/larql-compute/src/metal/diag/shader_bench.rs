@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
@@ -18,6 +18,8 @@ use crate::metal::buffers::read_buffer_f32;
 use crate::metal::kernel::KernelHandle;
 use crate::metal::ops::q4_common::quantize_to_q8;
 use crate::metal::MetalBackend;
+
+const GEMMA3_4B_KV_ROWS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -169,7 +171,7 @@ impl Shape {
                 hidden: 2560,
                 inter: 10240,
                 q_rows: 8192,
-                kv_rows: 4096,
+                kv_rows: GEMMA3_4B_KV_ROWS,
                 // Full Gemma 3 vocab would allocate ~2.7GB for f32
                 // lm_head input alone. Keep shader bench usable by
                 // capping the synthetic f32/f16 gemv case while other
@@ -1627,7 +1629,7 @@ fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineResult>, Stri
 fn print_compare(
     current: &[BenchResult],
     baseline: &HashMap<String, BaselineResult>,
-    path: &PathBuf,
+    path: &Path,
     threshold_pct: f64,
 ) {
     println!();

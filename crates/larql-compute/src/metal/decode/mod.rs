@@ -13,6 +13,8 @@ mod setup;
 
 pub use profile::ProfileTimings;
 
+pub(crate) const DEFAULT_KV_CACHE_MAX_SEQ: usize = 4096;
+
 impl MetalBackend {
     /// Create a KV cache for decode mode with uniform per-layer dims.
     pub fn create_kv_cache(
@@ -34,6 +36,44 @@ impl MetalBackend {
         max_seq: usize,
     ) -> ops::kv_cache::KVCache {
         ops::kv_cache::KVCache::new_per_layer(&self.bufs, shapes, max_seq)
+    }
+
+    pub(crate) fn kv_shapes_for_layers(
+        layers: &[crate::FullPipelineLayer<'_>],
+    ) -> Vec<(usize, usize)> {
+        layers
+            .iter()
+            .map(|layer| (layer.num_kv_heads, layer.head_dim))
+            .collect()
+    }
+
+    pub(crate) fn ensure_kv_cache_for_layers<'a>(
+        &self,
+        cache: &'a mut Option<ops::kv_cache::KVCache>,
+        layers: &[crate::FullPipelineLayer<'_>],
+        max_seq: usize,
+    ) -> &'a mut ops::kv_cache::KVCache {
+        let shapes = Self::kv_shapes_for_layers(layers);
+        self.ensure_kv_cache_for_shapes(cache, &shapes, max_seq)
+    }
+
+    pub(crate) fn ensure_kv_cache_for_shapes<'a>(
+        &self,
+        cache: &'a mut Option<ops::kv_cache::KVCache>,
+        shapes: &[(usize, usize)],
+        max_seq: usize,
+    ) -> &'a mut ops::kv_cache::KVCache {
+        let needs_rebuild = cache
+            .as_ref()
+            .is_none_or(|kv| kv.has_shape_mismatch(shapes));
+
+        if needs_rebuild {
+            *cache = Some(self.create_kv_cache_per_layer(shapes, max_seq));
+        }
+
+        let kv = cache.as_mut().expect("KV cache initialized above");
+        kv.grow_to_shapes(&self.bufs, shapes, max_seq);
+        kv
     }
 
     /// Decode one token through all layers with KV cache.
@@ -85,7 +125,7 @@ impl MetalBackend {
         _num_kv_heads: usize,
         _head_dim: usize,
         _rope_base: f32,
-        mut moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
+        moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
     ) -> Vec<f32> {
         // Backwards-compat wrapper: forward to the split-aware impl with no
         // collect callback.
@@ -101,9 +141,7 @@ impl MetalBackend {
             _num_kv_heads,
             _head_dim,
             _rope_base,
-            moe_fn
-                .as_deref_mut()
-                .map(|f| f as &mut dyn FnMut(usize, &[f32]) -> Vec<f32>),
+            moe_fn,
             None,
         )
     }

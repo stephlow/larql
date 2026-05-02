@@ -6,8 +6,8 @@ extern crate blas_src;
 mod common;
 
 use common::{cos_sim, get_metal, max_diff};
-use larql_compute::cpu::ops::moe::run_single_expert;
-use larql_compute::{Activation, MoeScratch, QuantFormat};
+use larql_compute::prelude::*;
+use larql_compute::MoeScratch;
 
 fn synth_values(len: usize, seed: f32, scale: f32) -> Vec<f32> {
     (0..len)
@@ -52,6 +52,78 @@ fn make_q4k_experts(hidden: usize, inter: usize, top_k: usize) -> (Vec<Vec<u8>>,
     (gate_up, down)
 }
 
+fn gelu_tanh(x: f32) -> f32 {
+    let c = 0.797_884_6_f32;
+    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
+}
+
+fn matmul_vec(x: &[f32], w: &[f32], out_rows: usize, in_cols: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), in_cols);
+    debug_assert_eq!(w.len(), out_rows * in_cols);
+    let mut out = vec![0.0f32; out_rows];
+    for row in 0..out_rows {
+        let w_row = &w[row * in_cols..(row + 1) * in_cols];
+        out[row] = w_row.iter().zip(x).map(|(&wi, &xi)| wi * xi).sum();
+    }
+    out
+}
+
+fn run_single_expert_f32_reference(
+    h_norm: &[f32],
+    gate_up_bytes: &[u8],
+    down_bytes: &[u8],
+    hidden: usize,
+    inter: usize,
+) -> Vec<f32> {
+    let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+    let inter_padded = inter.div_ceil(block) * block;
+    let gate_up_w =
+        larql_compute::cpu::ops::q4_common::dequantize_q4_k(gate_up_bytes, 2 * inter * hidden);
+    let gate_w = &gate_up_w[..inter * hidden];
+    let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
+
+    let gate_out = matmul_vec(h_norm, gate_w, inter, hidden);
+    let up_out = matmul_vec(h_norm, up_w, inter, hidden);
+
+    let mut act = vec![0.0f32; inter_padded];
+    for j in 0..inter {
+        act[j] = gelu_tanh(gate_out[j]) * up_out[j];
+    }
+
+    let down_w =
+        larql_compute::cpu::ops::q4_common::dequantize_q4_k(down_bytes, hidden * inter_padded);
+    matmul_vec(&act, &down_w, hidden, inter_padded)
+}
+
+fn run_single_expert_separated_metal_reference(
+    metal: &larql_compute::metal::MetalBackend,
+    h_norm: &[f32],
+    gate_up_bytes: &[u8],
+    down_bytes: &[u8],
+    hidden: usize,
+    inter: usize,
+) -> Vec<f32> {
+    let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+    let inter_padded = inter.div_ceil(block) * block;
+    let row_bytes = (hidden / block) * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
+    let half = inter * row_bytes;
+    let gate = metal
+        .q4k_matvec(&gate_up_bytes[..half], h_norm, inter, hidden)
+        .expect("Metal gate q4k matvec");
+    let up = metal
+        .q4k_matvec(&gate_up_bytes[half..2 * half], h_norm, inter, hidden)
+        .expect("Metal up q4k matvec");
+
+    let mut act = vec![0.0f32; inter_padded];
+    for j in 0..inter {
+        act[j] = gelu_tanh(gate[j]) * up[j];
+    }
+
+    metal
+        .q4k_matvec(down_bytes, &act, hidden, inter_padded)
+        .expect("Metal down q4k matvec")
+}
+
 fn assert_preselected_dispatch_matches_cpu(label: &str, hidden: usize, inter: usize, top_k: usize) {
     let metal = get_metal();
     let h_norm = synth_values(hidden, 1.23, 0.35);
@@ -63,15 +135,23 @@ fn assert_preselected_dispatch_matches_cpu(label: &str, hidden: usize, inter: us
 
     let mut expected = vec![0.0f32; hidden];
     for e in 0..top_k {
-        let out = run_single_expert(
+        let out = run_single_expert_f32_reference(&h_norm, &gate_up[e], &down[e], hidden, inter);
+        for (acc, &v) in expected.iter_mut().zip(&out) {
+            *acc += v * expert_weights[e];
+        }
+    }
+
+    let mut separated_metal = vec![0.0f32; hidden];
+    for e in 0..top_k {
+        let out = run_single_expert_separated_metal_reference(
+            &metal,
             &h_norm,
             &gate_up[e],
             &down[e],
+            hidden,
             inter,
-            QuantFormat::Q4_K,
-            Activation::GeluTanh,
         );
-        for (acc, &v) in expected.iter_mut().zip(&out) {
+        for (acc, &v) in separated_metal.iter_mut().zip(&out) {
             *acc += v * expert_weights[e];
         }
     }
@@ -87,9 +167,22 @@ fn assert_preselected_dispatch_matches_cpu(label: &str, hidden: usize, inter: us
 
     let diff = max_diff(&expected, &got);
     let cos = cos_sim(&expected, &got);
+    let expected_max = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let rel = diff / expected_max.max(1.0);
+    let metal_diff = max_diff(&separated_metal, &got);
+    let metal_cos = cos_sim(&separated_metal, &got);
+    let metal_max = separated_metal
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max);
+    let metal_rel = metal_diff / metal_max.max(1.0);
+    let nonzero = got.iter().filter(|&&v| v.abs() > 1e-6).count();
     assert!(
-        diff < 1.0 && cos > 0.995,
-        "{label}: Metal MoE expert dispatch diverged from CPU: max_abs={diff:.3e} cos={cos:.6}"
+        nonzero > hidden / 2 && metal_rel < 1e-4 && metal_cos > 0.999_999,
+        "{label}: Metal MoE expert dispatch diverged from CPU: \
+         cpu_max_abs={diff:.3e} cpu_rel={rel:.3e} cpu_cos={cos:.6} \
+         metal_max_abs={metal_diff:.3e} metal_rel={metal_rel:.3e} \
+         metal_cos={metal_cos:.6} nonzero={nonzero}/{hidden}"
     );
 }
 

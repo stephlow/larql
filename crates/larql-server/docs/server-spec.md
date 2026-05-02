@@ -503,7 +503,10 @@ Response: {object: "list",
 - Pooling: **mean-pool** over per-token static embeddings. Equivalent
   to `np.mean(embeddings_table[token_ids], axis=0)`. Treat as
   "lookup-pooled" not "semantic" embeddings.
-- `encoding_format: "base64"` returns 400 in slice 1 (follow-up).
+- `encoding_format: "base64"` (slice 4.8) returns each vector as a
+  base64-encoded little-endian f32 byte string. ~33% smaller wire than
+  the JSON float-array form; many production OpenAI clients default to
+  base64.
 - `dimensions`, `user` accepted but no effect (logged via tracing).
 
 #### POST /v1/completions
@@ -519,29 +522,29 @@ Response: {id: "cmpl-...", object: "text_completion", created,
            usage: {prompt_tokens, completion_tokens, total_tokens}}
 ```
 
-Slice 1 constraints:
-- `stream=true` → 400 (SSE arrives in slice 3 alongside chat completions).
+Live: SSE streaming, KV-cached generation, `temperature` / `top_p` /
+`seed` / `stop` / `frequency_penalty` / `presence_penalty` honoured
+by the sampler, `logprobs: int` populates per-token entries (top-k
+alternatives placeholder pending inference work — F18 follow-up).
+Constraints:
 - `n>1` → 400.
-- `logprobs` → request field accepted, response field always `null`.
-- `top_p` → accepted but ignored (greedy/temperature only).
 - `stop` → string or string-array; first match halts generation; the
   matched substring is trimmed from the returned `text`.
-- `echo: true` → prepends the prompt to the returned `text`.
+- `echo: true` → prepends the prompt to the returned `text`. Disallowed
+  in stream mode.
+- Batched `prompt: [...]` disallowed in stream mode.
 - `best_of` → accepted, treated as 1.
-- Generation is un-KV-cached (`forward::predict_with_temperature` per
-  step); O(N²) in context length. KV-cached fast path is N0.2-fast
-  in the roadmap.
 
 `finish_reason` values: `"stop"` (EOS token, end-of-turn marker, or
 matched stop string) or `"length"` (hit `max_tokens`).
 
 #### POST /v1/chat/completions
 
-Slice 2 (shipped 2026-05-02). Multi-turn chat with chat-template
-rendering.
+Multi-turn chat with chat-template rendering.
 
 ```
-Request:  {model?, messages: [{role: "system"|"user"|"assistant", content}, ...],
+Request:  {model?, messages: [{role: "system"|"user"|"assistant"|"tool",
+                                content?, tool_calls?, tool_call_id?, name?}, ...],
            max_tokens?, temperature?, top_p?,
            stream?, n?, stop?,
            tools?, tool_choice?, response_format?,
@@ -551,9 +554,12 @@ Response: {id: "chatcmpl-...", object: "chat.completion", created,
            model,
            choices: [{
              index,
-             message: {role: "assistant", content},
-             finish_reason: "stop"|"length",
-             logprobs: null
+             message: {role: "assistant",
+                       content: string|null,
+                       tool_calls?: [{id, type:"function",
+                                      function: {name, arguments}}]},
+             finish_reason: "stop"|"length"|"tool_calls",
+             logprobs: ChatLogprobs | null
            }],
            usage: {prompt_tokens, completion_tokens, total_tokens}}
 ```
@@ -569,29 +575,76 @@ Chat-template selection (auto-detected):
   prepended to first user
 - anything else → Plain `User: ...\nAssistant: ...` markers
 
-Slice 2 constraints:
-- `stream=true` → 400 (SSE arrives in slice 3).
-- `n>1` → 400.
-- `tools`, `tool_choice` non-empty → 400 (slice 4 = N0.6 constrained
-  decoding).
-- `response_format != {"type": "text"}` → 400 (json_object,
-  json_schema land in slice 4).
-- `logprobs` / `top_logprobs` request fields accepted; response
-  field always `null` (F18 follow-up).
-- `frequency_penalty`, `presence_penalty`, `seed`, `top_p` accepted
-  but ignored (greedy/temperature only).
-- Messages with `tool_calls` or `tool_call_id` non-null → 400.
-- Generation reuses the un-KV-cached `/v1/completions` path —
-  N0.2-fast in the roadmap addresses both endpoints together.
+Sampling fields (`temperature`, `top_p`, `seed`, `stop`,
+`frequency_penalty`, `presence_penalty`) are honoured end-to-end
+through `SamplingConfig` + `EosConfig`. Penalties clamp to
+`[-2.0, 2.0]` per OpenAI's documented range.
 
-#### Coming next (N0 slices 3-5)
+Tool-result replay (slice 4.9): assistant messages may carry
+`tool_calls` and `content: null`; clients then send a follow-up
+`role: "tool"` message with `tool_call_id` and execution result in
+`content`. Both render into the chat template before the next
+generation pass.
 
-- **N0.1 SSE** — `text/event-stream` for streaming token output on
-  both `/v1/completions` and `/v1/chat/completions` (slice 3).
-- **N0.6** — constrained decoding via JSON schema → GBNF for
-  `tools` / `tool_choice` / `response_format: json_schema` (slice 4).
-- **N0.3** `/v1/responses` — Responses API + stateful sessions
-  (slice 5).
+`logprobs: true` (slice F18) populates `choices[i].logprobs.content[]`
+with `{token, logprob, bytes, top_logprobs}` per emitted token.
+`top_logprobs` currently returns the picked token only; the full
+top-K alternatives are gated on inference work.
+
+#### Constrained decoding (slice 4 / N0.6, shipped 2026-05-02)
+
+`response_format` and `tools` route the request through a
+schema-typed JSON FSM that masks the LM head per token.
+
+| Request                                         | Schema enforced                                    |
+|-------------------------------------------------|----------------------------------------------------|
+| `response_format: {"type":"text"}` (or omitted) | none (plain sampling)                              |
+| `response_format: {"type":"json_object"}`       | `Object(any)` — any structurally-valid JSON object |
+| `response_format: {"type":"json_schema", "json_schema":{"schema":..., "strict": bool}}` | parsed schema; `strict` flips `additionalProperties` default to false |
+| `tools: [{type:"function", function:{name, parameters}}, ...]` | `OneOf` of `{name=Const, arguments=<args>}` per tool |
+
+`tool_choice` resolves as: `"auto"` / `"required"` (default when tools
+present) → all branches; `"none"` → no constraint; `{type:"function",
+function:{name}}` → single matching branch. Unknown tool name → 400.
+
+JSON Schema parser supports `type` (incl. arrays like
+`["string","null"]`), `properties`, `required`, `additionalProperties`,
+`items`, `minItems`/`maxItems`, `enum`, `const`, `oneOf`/`anyOf`,
+`minLength`/`maxLength`, `minimum`/`maximum`, integer-vs-number.
+`$ref`, `pattern`, `format`, `allOf`, `not`, `if/then/else`, `false`
+schema → 400 with explicit message (no silent relaxation).
+
+Sampling under mask (slice 4.10): the constrained decoder runs
+through `pick_next_token_masked_sampled`, which consumes the same
+`SamplingConfig` as unconstrained generation. So `temperature`,
+`top_p`, `seed`, `frequency_penalty`, `presence_penalty` all apply
+on top of the mask. Defaults are greedy.
+
+Tool-call response shape: `message.content: null`, `tool_calls:
+[{id: "call_<hex>", type: "function", function: {name, arguments}}]`,
+`finish_reason: "tool_calls"`. `arguments` is JSON-stringified
+(matches OpenAI's wire shape; SDKs `json.loads` it).
+
+Tools + `stream=true` (slice 4.11): the constrained decoder runs in
+buffered mode and emits a single `chat.completion.chunk` carrying the
+full `delta.tool_calls[0]` payload, followed by a final chunk with
+`finish_reason: "tool_calls"`. Per-token argument streaming is a
+follow-up tightening — most OpenAI clients accumulate `arguments`
+incrementally and only act on `finish_reason`, so a single fat chunk
+is wire-compatible.
+
+EOS tokens are masked while the FSM is mid-structure and become legal
+once `is_complete()`. Per-step overhead is `O(vocab × avg_token_len)`
+for the surface-form replay; `build_mask` caches the surface-form
+table once per request, plus FSM clone+replay per candidate
+(~ns × token chars).
+
+Other constraints:
+- `n>1` → 400 (single completion per prompt).
+
+#### Coming next
+
+- **N0.3** `/v1/responses` — Responses API + stateful sessions.
 
 #### N0-router
 

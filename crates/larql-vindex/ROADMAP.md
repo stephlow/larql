@@ -126,6 +126,9 @@ dropping tensors required by that family.
 
 Work items:
 
+- [ ] Audit f32/Q4K writer entry points and loader surfaces for implicit
+  standard-attention assumptions. Keep executable support in one capability
+  helper rather than scattered family checks.
 - [ ] Replace `extract/build_from_vectors.rs` model-name heuristics
   (`contains("gemma")`, `contains("llama")`) with explicit architecture
   metadata or a validated architecture/config input.
@@ -133,8 +136,14 @@ Work items:
   architecture uses attention forms not represented by Q/K/V/O manifests
   (for example MLA), fail with a targeted unsupported-architecture error until
   that layout is implemented.
+- [ ] Centralise remaining protocol-like tensor/manifest tags used by
+  extraction and weight writers. User-facing text can stay local; schema keys,
+  quant tags, and file-kind strings should be named constants.
 - [ ] Extend f32/Q4K weight writers beyond standard Q/K/V/O when a concrete
   non-standard architecture contract is added.
+- [ ] Add tests that prove unsupported attention layouts are rejected before
+  any partial vindex write and that missing/unknown manifest tags do not
+  silently fall back to Q4_K or another default.
 - [ ] Add fixture tests that prove unknown/custom families do not inherit
   Gemma/Llama defaults through string matching.
 

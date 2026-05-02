@@ -346,44 +346,42 @@ impl MetalBackend {
                     metal::MTLSize::new(n_tgs, 1, 1),
                     metal::MTLSize::new(kh.threads_per_tg, 1, 1),
                 );
+            } else if layer.down.format == crate::QuantFormat::Q4_K {
+                self.encode_q4k_fused_geglu_down(
+                    enc,
+                    layer,
+                    bufs,
+                    hidden,
+                    inter_padded,
+                    hidden_val,
+                    inter_padded_val,
+                );
             } else {
-                if layer.down.format == crate::QuantFormat::Q4_K {
-                    self.encode_q4k_fused_geglu_down(
-                        enc,
-                        layer,
-                        bufs,
-                        hidden,
-                        inter_padded,
-                        hidden_val,
-                        inter_padded_val,
-                    );
-                } else {
-                    self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
-                    use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
-                    let pipes = Pipelines {
-                        q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                        q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                        q6k_matvec: &self.q6k_matvec_pipeline,
-                        q4_matvec: &self.q4.matvec,
-                        q4k_matmul: None,
-                    };
-                    qmv::encode(
-                        enc,
-                        layer.down.format,
-                        bufs.down_w,
-                        bufs.act_buf,
-                        0,
-                        bufs.act_buf,
-                        0,
-                        bufs.act_buf,
-                        0, // Q8 unused for f32 input
-                        bufs.down_out,
-                        0,
-                        &pipes,
-                        hidden,
-                        inter_padded,
-                    );
-                }
+                self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
+                use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
+                let pipes = Pipelines {
+                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                    q4k_matvec_fallback: &self.q4k_matvec_pipeline,
+                    q6k_matvec: &self.q6k_matvec_pipeline,
+                    q4_matvec: &self.q4.matvec,
+                    q4k_matmul: None,
+                };
+                qmv::encode(
+                    enc,
+                    layer.down.format,
+                    bufs.down_w,
+                    bufs.act_buf,
+                    0,
+                    bufs.act_buf,
+                    0,
+                    bufs.act_buf,
+                    0, // Q8 unused for f32 input
+                    bufs.down_out,
+                    0,
+                    &pipes,
+                    hidden,
+                    inter_padded,
+                );
             } // close `else { unfused geglu+matvec chain }`
             let _ = n_tgs_down;
         } else {

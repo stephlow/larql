@@ -25,7 +25,10 @@ use crate::forward::{apply_norm, embed_tokens_pub};
 use crate::layer_graph::generate::detok::Detokenizer;
 use crate::layer_graph::generate::eos::EosConfig;
 use crate::layer_graph::generate::lm_head_topk as lm_topk;
-use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+use crate::layer_graph::pipeline_layer::{
+    attention_geometry_for_arch_layer, build_pipeline_layers, kv_cache_shapes_for_arch,
+    DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+};
 
 /// IDs of tokens that should never be picked during text generation.
 ///
@@ -445,9 +448,7 @@ pub fn generate_with_remote_moe(
         ffn_format,
     );
 
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope = arch.rope_base_for_layer(0) as f32;
+    let attention = attention_geometry_for_arch_layer(weights, 0);
 
     // ── Open gRPC streams (one pair for the entire generation) ───────────────
     //
@@ -474,10 +475,8 @@ pub fn generate_with_remote_moe(
     // — each token processes with the proper remote expert contribution.
     backend.reset_kv_cache();
     {
-        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
-            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
-            .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        let kv_shapes = kv_cache_shapes_for_arch(weights);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
 
     let skip_moe = std::env::var("SKIP_MOE").is_ok();
@@ -542,12 +541,12 @@ pub fn generate_with_remote_moe(
             &x_tok,
             hidden,
             intermediate,
-            q_dim,
-            kv_dim,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
+            attention.q_dim,
+            attention.kv_dim,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
             &mut moe_fn,
         );
         if let Some(err) = step_error {
@@ -655,12 +654,12 @@ pub fn generate_with_remote_moe(
                 &x_tok,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
                 &mut moe_fn,
             )
         } else {
@@ -736,12 +735,12 @@ pub fn generate_with_remote_moe(
                 &x_tok,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
                 &mut fire_fn,
                 &mut collect_fn,
             );
@@ -874,17 +873,13 @@ pub fn generate_with_remote_moe_batch(
         ffn_format,
     );
 
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-    let rope = arch.rope_base_for_layer(0) as f32;
+    let attention = attention_geometry_for_arch_layer(weights, 0);
 
     // Prefill: sequential decode_token_with_moe (same as streaming variant).
     backend.reset_kv_cache();
     {
-        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
-            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
-            .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        let kv_shapes = kv_cache_shapes_for_arch(weights);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
 
     let skip_moe = std::env::var("SKIP_MOE").is_ok();
@@ -907,12 +902,12 @@ pub fn generate_with_remote_moe_batch(
             &x_tok,
             hidden,
             intermediate,
-            q_dim,
-            kv_dim,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
+            attention.q_dim,
+            attention.kv_dim,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
             &mut moe_fn_pass1,
         );
         // Dispatch captured layers
@@ -941,12 +936,12 @@ pub fn generate_with_remote_moe_batch(
             &x_tok,
             hidden,
             intermediate,
-            q_dim,
-            kv_dim,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
+            attention.q_dim,
+            attention.kv_dim,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
             &mut moe_fn_pass2,
         );
         if let Some(e) = step_error {
@@ -1005,12 +1000,12 @@ pub fn generate_with_remote_moe_batch(
             &x_tok,
             hidden,
             intermediate,
-            q_dim,
-            kv_dim,
-            weights.num_q_heads,
-            weights.num_kv_heads,
-            weights.head_dim,
-            rope,
+            attention.q_dim,
+            attention.kv_dim,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
             &mut moe_pass1,
         );
 
@@ -1041,12 +1036,12 @@ pub fn generate_with_remote_moe_batch(
                 &x_tok,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
                 &mut moe_pass2,
             )
             .ok_or_else(|| RemoteMoeError::BadResponse("pass2 returned None".into()))?;

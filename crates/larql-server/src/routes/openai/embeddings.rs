@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn encode_floats_base64_round_trip() {
-        let v = vec![1.0f32, -2.5, 3.14, 0.0];
+        let v = vec![1.0f32, -2.5, 0.5, 0.0];
         let encoded = encode_floats_base64(&v);
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded.as_bytes())

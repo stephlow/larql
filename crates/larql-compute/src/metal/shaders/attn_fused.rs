@@ -33,6 +33,7 @@
 //!  - tg_k_normed[256]  = 1 KB
 //!  - tg_scores[1024]   = 4 KB
 //!  - tg_red[8]         = 32 B
+//!
 //!  Total ~6 KB — well within 32 KB/TG.
 
 pub const SHADER: &str = r#"

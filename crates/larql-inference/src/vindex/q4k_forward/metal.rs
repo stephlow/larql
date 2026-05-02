@@ -4,6 +4,8 @@ use tokenizers::Tokenizer;
 
 use crate::forward::PredictResult;
 
+const MIN_KV_CACHE_SEQ: usize = 64;
+
 /// End-to-end predict on a Q4_K vindex driven by a Metal (or any Q4-capable)
 /// `ComputeBackend`.
 pub fn predict_q4k_metal(
@@ -14,7 +16,9 @@ pub fn predict_q4k_metal(
     index: &VectorIndex,
     backend: &dyn larql_compute::ComputeBackend,
 ) -> PredictResult {
-    use crate::layer_graph::pipeline_layer::{build_arch_params, resolve_attn_weights};
+    use crate::layer_graph::pipeline_layer::{
+        attention_geometry_for_pipeline_layer, build_arch_params, resolve_attn_weights,
+    };
     use larql_compute::QuantFormat;
 
     let arch = &*weights.arch;
@@ -55,7 +59,7 @@ pub fn predict_q4k_metal(
         })
         .collect();
 
-    let max_seq = token_ids.len().max(64);
+    let max_seq = token_ids.len().max(MIN_KV_CACHE_SEQ);
     let shapes: Vec<(usize, usize)> = layers
         .iter()
         .map(|l| (l.num_kv_heads, l.head_dim))
@@ -67,15 +71,7 @@ pub fn predict_q4k_metal(
     let embed = &weights.embed;
     let embed_scale = arch.embed_scale();
 
-    let q_dim_first = layers[0].num_q_heads * layers[0].head_dim;
-    let kv_dim_first = layers[0].num_kv_heads * layers[0].head_dim;
-    let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
-    let qk_norm = arch.attn_q_norm_key(0).is_some();
-
-    let _ = (q_dim_first, kv_dim_first, qk_norm, softcap);
-
-    let dims_q = layers[0].num_q_heads * layers[0].head_dim;
-    let dims_kv = layers[0].num_kv_heads * layers[0].head_dim;
+    let attention = attention_geometry_for_pipeline_layer(&layers[0]);
 
     let mut h_vec: Vec<f32> = Vec::with_capacity(hidden);
     for &tok in token_ids {
@@ -88,12 +84,12 @@ pub fn predict_q4k_metal(
                 &x,
                 hidden,
                 weights.intermediate_size,
-                dims_q,
-                dims_kv,
-                layers[0].num_q_heads,
-                layers[0].num_kv_heads,
-                layers[0].head_dim,
-                layers[0].rope_base,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
             )
             .expect("backend doesn't support decode_token - need Metal with Q4 kernels");
         h_vec = out;

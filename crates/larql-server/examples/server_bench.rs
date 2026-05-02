@@ -622,23 +622,153 @@ fn main() {
         },
     );
 
+    // ── Constrained decoding (slice 4 / N0.6) ────────────────────────────
+    //
+    // Fixed cost added to constrained-decoding requests over plain
+    // sampling. Token-level mask cost (per-step `O(vocab × avg_token_len)`)
+    // lives in the generate loop and isn't bench-able here without a
+    // real backend.
+    use larql_server::routes::openai::schema::{
+        parse_schema_with, resolve_tool_choice, synth_tools_schema, Fsm, ObjectSchema,
+        ParseOptions, Schema, ToolMode,
+    };
+
     bench(
-        "/v1/chat/completions request validation (tools → 400)",
-        1000,
+        "/v1/chat/completions FSM step Schema::Any (50-char object)",
+        5_000,
         100_000,
         || {
-            let body = br#"{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function"}],"max_tokens":1}"#;
-            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
-            req.get("tools")
-                .and_then(|v| v.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false)
+            let mut fsm = Fsm::any();
+            let _ = fsm.step_str(r#"{"name":"Alice","age":30,"role":"admin"}"#);
+            fsm.is_complete()
+        },
+    );
+
+    bench(
+        "/v1/chat/completions FSM step strict Person schema",
+        5_000,
+        100_000,
+        || {
+            let schema = Schema::object(ObjectSchema {
+                properties: [
+                    ("name".to_string(), Schema::string()),
+                    ("age".to_string(), Schema::integer()),
+                ]
+                .into_iter()
+                .collect(),
+                required: vec!["name".into(), "age".into()],
+                additional: None,
+            });
+            let mut fsm = Fsm::new(schema);
+            let _ = fsm.step_str(r#"{"name":"Bob","age":42}"#);
+            fsm.is_complete()
+        },
+    );
+
+    bench(
+        "/v1/chat/completions parse_schema (Person, strict)",
+        5_000,
+        100_000,
+        || {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age":  {"type": "integer"}
+                },
+                "required": ["name", "age"]
+            });
+            parse_schema_with(&schema, ParseOptions { strict: true }).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/chat/completions synth_tools_schema (2 functions)",
+        5_000,
+        50_000,
+        || {
+            let tools = serde_json::json!([
+                {"type": "function", "function": {"name": "calc",
+                    "parameters": {"type": "object",
+                        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                        "required": ["a", "b"]}}},
+                {"type": "function", "function": {"name": "search",
+                    "parameters": {"type": "object",
+                        "properties": {"q": {"type": "string"}},
+                        "required": ["q"]}}}
+            ]);
+            let names = vec!["calc".to_string(), "search".to_string()];
+            let mode = resolve_tool_choice(true, None, &names).unwrap();
+            synth_tools_schema(&tools, &mode).unwrap()
+        },
+    );
+
+    bench(
+        "/v1/chat/completions FSM tool-call OneOf (commit on name)",
+        5_000,
+        50_000,
+        || {
+            // Two tools distinguishable by `name` const — exercises
+            // OneOf's parallel-branch tracking + commit-on-disambiguation.
+            let tools = serde_json::json!([
+                {"type": "function", "function": {"name": "calc",
+                    "parameters": {"type": "object",
+                        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                        "required": ["a", "b"]}}},
+                {"type": "function", "function": {"name": "search",
+                    "parameters": {"type": "object",
+                        "properties": {"q": {"type": "string"}},
+                        "required": ["q"]}}}
+            ]);
+            let names = vec!["calc".to_string(), "search".to_string()];
+            let (schema, _) = synth_tools_schema(&tools, &ToolMode::Any).unwrap().unwrap();
+            let mut fsm = Fsm::new(schema);
+            let _ = fsm.step_str(r#"{"name":"calc","arguments":{"a":12,"b":30}}"#);
+            (fsm.is_complete(), names.len())
+        },
+    );
+
+    // ── Sampling extras (F18, F19, slice 4.10) ───────────────────────────
+
+    bench(
+        "Sampler with frequency_penalty (history N=8, vocab=256)",
+        5_000,
+        100_000,
+        || {
+            // Full-vocab logit slice with a small history triggers the
+            // penalty path. Greedy under penalty so RNG cost is zero.
+            let logits: Vec<f32> = (0..256u32).map(|i| i as f32 * 0.01).collect();
+            let cfg = larql_inference::SamplingConfig::greedy()
+                .with_frequency_penalty(0.5)
+                .with_presence_penalty(0.3);
+            let mut s = larql_inference::Sampler::new(cfg);
+            let history = [10u32, 20, 30, 10, 200, 150, 99, 50];
+            s.sample_with_history(&logits, &history)
+        },
+    );
+
+    bench(
+        "Sampler with temperature + top-p (no penalty)",
+        5_000,
+        50_000,
+        || {
+            let logits: Vec<f32> = (0..256u32).map(|i| i as f32 * 0.01).collect();
+            let cfg = larql_inference::SamplingConfig::temperature(0.8)
+                .with_top_p(0.9)
+                .with_seed(42);
+            let mut s = larql_inference::Sampler::new(cfg);
+            s.sample(&logits)
         },
     );
 
     println!(
         "  Note: OpenAI envelope adds ~10-20 µs over the underlying compute.\n\
-         Total /v1/embeddings latency = embed lookup (above) + ~5 µs encode."
+         Total /v1/embeddings latency = embed lookup (above) + ~5 µs encode.\n\
+         Constrained-decoding fixed cost = parse_schema (~µs) + per-step\n\
+         FSM clone+replay (~ns × token surface chars). Per-token mask cost\n\
+         (vocab iteration) is dominated by the generate loop, not the FSM.\n\
+         Repetition penalties add a HashMap-build + per-id subtraction\n\
+         pass — negligible vs the lm_head matvec."
     );
 
     println!("\n── Summary ──");

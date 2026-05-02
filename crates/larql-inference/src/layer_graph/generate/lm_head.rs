@@ -243,7 +243,7 @@ pub(super) fn backend_lm_head_scores(
 
 /// Apply `mask_fn` to dense logits, then return the argmax `(id, score)`
 /// over finite (post-mask) entries. Returns `None` if every entry is NaN
-/// or `-inf`.
+/// or `-inf`. Greedy under mask (no sampler).
 pub(super) fn pick_next_token_masked<M>(
     weights: &ModelWeights,
     h_1d: &ndarray::Array1<f32>,
@@ -265,4 +265,33 @@ where
         .filter(|(_, v)| !v.is_nan() && v.is_finite())
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, &s)| (i as u32, s))
+}
+
+/// Sampling-under-mask variant. Runs the dense LM head, applies the
+/// mask, then defers token selection to the caller-supplied
+/// [`Sampler`]. Repetition penalties on the sampler are applied as
+/// usual via the `generated` history.
+///
+/// Returns `(id, raw_post_mask_score)` so callers that record per-token
+/// probability still get the masked logit for the picked id (even
+/// though the multinomial draw used the softmaxed distribution).
+pub(super) fn pick_next_token_masked_sampled<M>(
+    weights: &ModelWeights,
+    h_1d: &ndarray::Array1<f32>,
+    generated: &[u32],
+    backend: &dyn ComputeBackend,
+    mask_fn: &mut M,
+    sampler: &mut super::sampling::Sampler,
+) -> Option<(u32, f32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+{
+    let mut logits = backend_lm_head_scores(weights, h_1d, backend);
+    if logits.is_empty() {
+        return None;
+    }
+    mask_fn(generated, &mut logits);
+    let id = sampler.sample_with_history(&logits, generated)?;
+    let score = *logits.get(id as usize)?;
+    Some((id, score))
 }

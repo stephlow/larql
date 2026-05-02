@@ -92,9 +92,6 @@ fn predict_hybrid_metal(
 
     let norm_offset = weights.arch.norm_weight_offset();
     let hidden = weights.hidden_size;
-    let q_dim = weights.num_q_heads * weights.head_dim;
-    let kv_dim = weights.num_kv_heads * weights.head_dim;
-
     // Build attention-only layer descriptors (FFN weights are dummies)
     let dummy = larql_compute::QuantWeight {
         data: &[],
@@ -108,6 +105,14 @@ fn predict_hybrid_metal(
                 .expect("No attention weights");
             super::pipeline_layer::build_arch_params(
                 weights, layer, wq, wk, wv, wo, dummy, dummy, dummy,
+            )
+        })
+        .collect();
+    let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+        .map(|layer| {
+            (
+                weights.arch.num_kv_heads_for_layer(layer),
+                weights.arch.head_dim_for_layer(layer),
             )
         })
         .collect();
@@ -138,17 +143,19 @@ fn predict_hybrid_metal(
 
         // GPU: attention only
         let h_post_attn_vec = {
-            let mut cache_guard =
-                metal.kv_cache_mut(weights.num_layers, weights.num_kv_heads, weights.head_dim);
+            let layer = &attn_layers[rel_idx];
+            let layer_q_dim = layer.num_q_heads * layer.head_dim;
+            let layer_kv_dim = layer.num_kv_heads * layer.head_dim;
+            let mut cache_guard = metal.kv_cache_mut_for_shapes(&kv_shapes);
             let kv_cache = cache_guard.as_mut().unwrap();
             metal.decode_attention_layer(
                 kv_cache,
-                &attn_layers[rel_idx],
+                layer,
                 abs_layer,
                 &x_vec,
                 hidden,
-                q_dim,
-                kv_dim,
+                layer_q_dim,
+                layer_kv_dim,
             )
         };
 
