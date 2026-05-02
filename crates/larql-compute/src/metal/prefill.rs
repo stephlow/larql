@@ -15,6 +15,19 @@ use crate::metal::buffers::BufferCache;
 
 /// Encode a quant matvec for a single position at the given offsets.
 /// The input buffer is read from `in_offset` bytes, output written to `out_offset` bytes.
+///
+/// **FIXME (dispatch geometry mismatch)** — the Q4_K / Q4_KF arms below
+/// hardcode `tgs = ceil(num_rows / 4)` and `THREADS_PER_TG = 128` (matching
+/// the legacy 4sg `q4k_matvec` shader). Since 2026-04-28, production binds
+/// `q4k_matvec_pipeline` to the 8sg variant (8 rows / 256 threads). Dispatching
+/// 128 threads against an 8sg kernel leaves simdgroups 4..7 unscheduled and
+/// half the rows unwritten — same family of bug as 077884b and the 2026-05-02
+/// lm_head fix. This function is dead code today (`#[allow(dead_code)]`,
+/// only called from the also-dead `dispatch_prefill`); production prefill
+/// routes through `prefill_q4` → `dispatch_full_pipeline` → `qmv::encode`,
+/// which uses `KernelHandle::rows_per_tg` / `threads_per_tg` correctly. If
+/// you ever revive `dispatch_prefill`, change the `&ComputePipelineState`
+/// params to `&KernelHandle` and pull geometry from there.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn encode_quant_matvec_at_offset(

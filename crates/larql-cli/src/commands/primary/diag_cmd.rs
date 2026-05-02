@@ -236,64 +236,59 @@ fn resolve_lm_head_path(
     let f16_ready = index.has_lm_head_f16() && index.vocab_size > 0;
     let is_non_cpu_backend =
         backend.as_any().type_id() != std::any::TypeId::of::<larql_compute::CpuBackend>();
-    let stable_lm_head = is_non_cpu_backend && std::env::var("LARQL_METAL_LM_HEAD").is_err();
+    let skip_q4k_env = std::env::var("LARQL_LM_HEAD_SKIP_Q4K").unwrap_or_default();
+    let skip_q4k =
+        is_non_cpu_backend && matches!(skip_q4k_env.as_str(), "1" | "true" | "on" | "yes");
     let stride32_env = std::env::var("LARQL_LM_HEAD_STRIDE32").unwrap_or_default();
-    let stride32_first = matches!(stride32_env.as_str(), "1" | "true" | "on" | "yes");
     let stride32_disabled = matches!(stride32_env.as_str(), "0" | "false" | "off" | "no");
 
-    let q4_will_fire = q4_ready && !stable_lm_head;
-    let stride32_first_will_fire = stable_lm_head && stride32_first && q4_ready;
-    let f16_will_fire = if stable_lm_head {
+    // Default order (since the 2026-05-02 dispatch-geometry fix):
+    //   1. Q4_K matvec (q4k_matvec_pipeline) — production default.
+    //   2. f16 GEMV — fallback when Q4_K bytes aren't available.
+    //   3. f32 KNN (lm_head.bin mmap).
+    //   4. f32 BLAS gemv on weights.lm_head.
+    //
+    // `LARQL_LM_HEAD_SKIP_Q4K=1` skips path 1 and starts at:
+    //   1. stride-32 Q4_K (`q4k_matvec_stride32`) when the Q4_K bytes exist
+    //      (further suppressed by `LARQL_LM_HEAD_STRIDE32=0`).
+    //   2. f16 GEMV, then the same f32 fallbacks.
+    let q4_will_fire = q4_ready && !skip_q4k;
+    let stride32_first_will_fire = skip_q4k && q4_ready && !stride32_disabled;
+    let f16_will_fire = if skip_q4k {
         !stride32_first_will_fire && f16_ready
     } else {
         !q4_will_fire && f16_ready
     };
-    let stride32_fallback_will_fire = stable_lm_head
-        && !stride32_first_will_fire
-        && !f16_will_fire
-        && !stride32_disabled
-        && q4_ready;
-    let knn_ready = !q4_will_fire
-        && !stride32_first_will_fire
-        && !f16_will_fire
-        && !stride32_fallback_will_fire
-        && index.has_lm_head();
-    let bls_fallback = !q4_will_fire
-        && !stride32_first_will_fire
-        && !f16_will_fire
-        && !stride32_fallback_will_fire
-        && !knn_ready;
+    let knn_ready =
+        !q4_will_fire && !stride32_first_will_fire && !f16_will_fire && index.has_lm_head();
+    let bls_fallback = !q4_will_fire && !stride32_first_will_fire && !f16_will_fire && !knn_ready;
 
     vec![
         PathDecision {
-            label: "Q4 matvec (fast)",
+            label: "Q4 matvec (fast, default)",
             will_fire: q4_will_fire,
             note: format!(
-                "lm_head_q4 mmap/synth = {}, backend.has_q4 = {}, stable override = {}  → opt-in with LARQL_METAL_LM_HEAD=1 on Metal",
+                "lm_head_q4 mmap/synth = {}, backend.has_q4 = {}, skip_q4k override = {}  → default Metal lm_head path post 2026-05-02 dispatch fix",
                 has_q4_data,
                 backend.has_q4(),
-                stable_lm_head,
+                skip_q4k,
             ),
         },
         PathDecision {
-            label: "Q4 stride32 stable",
-            will_fire: stride32_first_will_fire || stride32_fallback_will_fire,
+            label: "Q4 stride32 stable (skip_q4k)",
+            will_fire: stride32_first_will_fire,
             note: format!(
-                "available = {}, mode = {}  → stable Q4 fallback / A-B path",
+                "available = {}  → diagnostic A/B path, fires only with LARQL_LM_HEAD_SKIP_Q4K=1",
                 q4_ready,
-                if stride32_first {
-                    "first"
-                } else if stride32_disabled {
-                    "disabled"
-                } else {
-                    "fallback"
-                },
             ),
         },
         PathDecision {
             label: "f16 gemv (tied embed)",
             will_fire: f16_will_fire,
-            note: format!("lm_head_f16 mmap = {}  → stable default on Metal", index.has_lm_head_f16()),
+            note: format!(
+                "lm_head_f16 mmap = {}  → fallback when Q4_K unavailable",
+                index.has_lm_head_f16(),
+            ),
         },
         PathDecision {
             label: "f32 KNN (lm_head.bin)",

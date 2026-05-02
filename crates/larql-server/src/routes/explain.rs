@@ -135,6 +135,7 @@ fn explain_infer(
         (r.predictions, Vec::new(), Vec::new())
     };
     let residuals = walk_ffn.take_residuals();
+    let model_top1 = predictions_raw.first().cloned();
     let (predictions_raw, knn_override) = larql_inference::apply_knn_override(
         predictions_raw,
         &residuals,
@@ -272,7 +273,16 @@ fn explain_infer(
             "token": ovr.token,
             "cosine": ovr.cosine,
             "layer": ovr.layer,
+            "source": "knn_override",
+            "stage": "post_logits",
+            "materialized": false,
         });
+        if let Some((tok, prob)) = model_top1 {
+            body["knn_override"]["model_top1"] = serde_json::json!({
+                "token": tok,
+                "probability": round_probability(prob),
+            });
+        }
     }
     Ok(body)
 }

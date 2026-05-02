@@ -26,7 +26,7 @@ production workload.
 | `q4k_ffn_gate_up_f16acc` (2026-04-28) | 1.79× (0.607 → 0.340 ms) | within noise | parity on quiet GPU | opt-in only (`LARQL_F16_ACC=1`) |
 | `attn_fused` (2026-05-01) | merged 2 kernels into 1 | TGs collapse 12 → 8 | **−1.45 ms regression** | opt-in only (`LARQL_FUSED_ATTN=1`) |
 | `q4k_ffn_gate_up_nr2` (2026-05-02) | 1.47× (0.591 → 0.401 ms iso) | 279 → 267 GB/s (−4%) | **−0.62 ms regression on GPU fwd** | not promoted; opt-in `LARQL_GATE_UP_NR2=1` |
-| **`q4k_matvec` lm_head** (broken-fast) | n/a — different category | 1.47 ms vs stride-32's 2.95 ms | **+10 tok/s but FAILS smoke** ("Capital" / truncated) | opt-in only (`LARQL_METAL_LM_HEAD=1`); production stays on stride-32 |
+| **`q4k_matvec` lm_head** (broken-fast → fixed) | n/a — different category | 1.47 ms (broken) vs stride-32's 2.95 ms | initially +10 tok/s but FAILED smoke ("Capital" / truncated). **Root cause: dispatch geometry mismatch, not kernel-level drift. Fixed 2026-05-02 — kernel was correct all along.** | now production default; fixed `pipeline.rows_per_tg` / `threads_per_tg` lookup. Net **+8 tok/s end-to-end**. |
 
 The mechanisms differ but the symptom is identical at the perf level — a
 candidate that looks like a strict win at one measurement granularity and
@@ -41,17 +41,48 @@ loses (or breaks) at the actual production granularity.
 - **NR2**: the isolated measurement caught dispatch-overhead amortisation
   that disappears once n_layers calls share one cmd buffer. The batched
   geometry is the production geometry, and NR2 is *worse* there.
-- **`q4k_matvec` lm_head**: the broken-fast variant. Same Q4_K bandwidth as
-  `q4k_matvec_stride32` (327 MB/token), but the 32-lane simdgroup
-  reduction tree drifts ~1e-3 vs CPU's sequential dot product. On a
-  262K-vocab × 2560-hidden matvec that's enough to flip top-1 on close-
-  call tokens — the canonical smoke ("The capital of France is **Paris**")
-  fails as "The Capital of France is: **" (capitalised and truncated).
-  Same family as the historical 2026-04-26 "81–84 tok/s on broken Q4_K
-  dispatch" trap (pre-fix `q4k_matvec` writing through `q4_matvec` and
-  leaving 75% of output rows unwritten). Listed here because it
-  surfaces under the same diagnostic — the kernel-level number looks
-  great, end-to-end fails. **The broken-fast number is never a baseline.**
+- **`q4k_matvec` lm_head** (initial diagnosis WRONG, corrected 2026-05-02):
+  the symptom was a fast-but-broken kernel — identical Q4_K bandwidth as
+  `q4k_matvec_stride32` (327 MB/token) but at 1.47 ms vs 2.95 ms, with
+  argmax drift on the canonical "Paris" smoke ("Capital" / "is: **"
+  truncated). Initial conclusion: 32-lane simdgroup reduction tree drift.
+  **Real root cause: dispatch geometry mismatch.** `MetalBackend::q4k_matvec`
+  hardcoded the 4sg shader's `THREADS_PER_TG=128` while dispatching the
+  8sg `q4k_matvec_pipeline` (production default since 2026-04-28).
+  Simdgroups 4..7 of each 8sg TG never executed → half the rows in each
+  8-row TG were left unwritten → 50% of lm_head output corrupt → argmax
+  flipped on close-call tokens. **Same family as the 2026-04-26 `077884b`
+  "81–84 tok/s on broken Q4_K dispatch"** (pre-fix `q4k_matvec` routed
+  through `q4_matvec` with mismatched threadgroup geometry, 75% of
+  output rows unwritten). Once dispatch was corrected to use
+  `pipeline.rows_per_tg` / `pipeline.threads_per_tg`, parity test
+  `q4k_matvec_matches_cpu` flipped from 182.89 max diff to passing, and
+  the kernel's 1.85 ms/tok lm_head landed +8 tok/s end-to-end.
+  **Reclassified: not a broken kernel; a dispatch-geometry-mismatch
+  family, distinct from the iso-vs-batched pattern but worth pinning here
+  because the diagnostic surface is similar — a "broken-fast" number that
+  invites suspicion of the kernel before the dispatcher.**
+
+### Lesson — diagnostic order for "fast but wrong" results
+
+When a candidate kernel produces correct output on some inputs and wrong
+output on others (especially close-call top-1 flips), the order to check is:
+
+1. **Dispatch geometry first.** Does the dispatch site use the bound
+   pipeline's `rows_per_tg` / `threads_per_tg`, or hardcoded shader-module
+   constants? If hardcoded constants and the pipeline binds to a different
+   variant, you have an under-dispatch — half the simdgroups don't run,
+   half the output rows unwritten. **Two confirmed instances** (077884b
+   and the 2026-05-02 `q4k_matvec` lm_head) — both fast-and-wrong with
+   correct-looking partial output that masks the bug on simple prompts
+   and surfaces on close-call tokens.
+2. **Shader correctness next.** Run the kernel with a known-good dispatch
+   (or vary the dispatch geometry to match). If parity still fails,
+   suspect the shader.
+3. **Reduction tree last.** FP rounding from a parallel reduction can
+   drift on the order of 1e-3 — enough to flip top-1 only when scores are
+   already razor-thin. If the diff is larger than 1e-2, it is almost
+   certainly NOT the reduction tree.
 
 ## Diagnostic test before promoting any new kernel
 

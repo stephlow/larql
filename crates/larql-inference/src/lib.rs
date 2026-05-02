@@ -113,10 +113,10 @@ pub use forward::{
     logit_lens_top1, predict, predict_from_hidden, predict_from_hidden_with_ffn, predict_with_ffn,
     predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router, predict_with_strategy,
     run_memit, run_memit_with_target_opt, trace_forward, trace_forward_full,
-    trace_forward_with_ffn, walk_trace_from_residuals, InferPatchedResult, KnnOverride,
-    LayerAttentionCapture, LayerMode, MemitFact, MemitFactResult, MemitResult, PredictResult,
-    PredictResultWithAttention, PredictResultWithResiduals, RawForward, SpecCapture, TargetDelta,
-    TargetDeltaOpts, TraceResult, KNN_COSINE_THRESHOLD,
+    trace_forward_with_ffn, walk_trace_from_residuals, InferPatchedResult, InferenceWeights,
+    KnnOverride, LayerAttentionCapture, LayerMode, MemitFact, MemitFactResult, MemitResult,
+    PredictResult, PredictResultWithAttention, PredictResultWithResiduals, RawForward, SpecCapture,
+    TargetDelta, TargetDeltaOpts, TraceResult, KNN_COSINE_THRESHOLD,
 };
 pub use layer_graph::{
     build_adaptive_graph,

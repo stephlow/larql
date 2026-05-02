@@ -44,6 +44,27 @@ fn format_predictions(predictions: &[(String, f64)]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn format_knn_override(
+    ovr: &larql_inference::KnnOverride,
+    model_top1: Option<&(String, f64)>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "token": &ovr.token,
+        "cosine": ovr.cosine,
+        "layer": ovr.layer,
+        "source": "knn_override",
+        "stage": "post_logits",
+        "materialized": false,
+    });
+    if let Some((tok, prob)) = model_top1 {
+        value["model_top1"] = serde_json::json!({
+            "token": tok,
+            "probability": round_probability(*prob),
+        });
+    }
+    value
+}
+
 fn infer_mode_flags(mode: &str) -> (bool, bool, bool) {
     let is_compare = mode == INFER_MODE_COMPARE;
     let use_walk = mode == INFER_MODE_WALK || is_compare;
@@ -94,23 +115,20 @@ fn run_infer(
     let mut result = serde_json::Map::new();
     result.insert("prompt".into(), serde_json::json!(req.prompt));
 
-    // Helper: run walk inference against a PatchedVindex
+    // Helper: run walk inference against a PatchedVindex.
     let run_walk = |patched: &larql_vindex::PatchedVindex| {
-        let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, patched);
-        let walk_start = std::time::Instant::now();
-        let pred = larql_inference::predict_with_ffn(
+        larql_inference::infer_patched(
             weights,
             &model.tokenizer,
+            patched,
+            Some(&patched.knn_store),
             &token_ids,
             req.top,
-            &walk_ffn,
-        );
-        let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
-        (pred, walk_ms)
+        )
     };
 
     if use_walk {
-        let (pred, walk_ms) = if let Some(sid) = session_id {
+        let pred = if let Some(sid) = session_id {
             // Session-scoped: use session's PatchedVindex
             let sessions = state.sessions.sessions_blocking_write();
             if let Some(session) = sessions.get(sid) {
@@ -126,12 +144,18 @@ fn run_infer(
         };
 
         let predictions = format_predictions(&pred.predictions);
+        if let Some(ovr) = &pred.knn_override {
+            result.insert(
+                "knn_override".into(),
+                format_knn_override(ovr, pred.model_top1.as_ref()),
+            );
+        }
 
         if is_compare {
             result.insert(INFER_MODE_WALK.into(), serde_json::json!(predictions));
             result.insert(
                 "walk_ms".into(),
-                serde_json::json!((walk_ms * 10.0).round() / 10.0),
+                serde_json::json!((pred.walk_ms * 10.0).round() / 10.0),
             );
         } else {
             result.insert("predictions".into(), serde_json::json!(predictions));

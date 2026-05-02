@@ -560,6 +560,95 @@ logic in the request entry points.
 
 ## P0: Active
 
+### F-COLLECT. Parallelize shard collection in `forward_moe_stream_collect_with_timing`
+
+**Status**: Not started.
+
+**Driver**: 2026-05-02 bottleneck analysis on the local Metal MoE path
+vs the CPU/grid path (single shard, colocated). Both land at ~19 tok/s
+because the grid sequentially blocks on each shard's `collect_with_timing()?`
+in `crates/larql-inference/src/ffn/moe_remote.rs:1984`. With one shard,
+sequential = max. With 2+ shards over real network, the per-layer
+collect time stacks instead of overlapping.
+
+**Concrete impact** (Gemma 4 26B-A4B, 30 MoE layers, top_k=8):
+
+| Topology | Per-shard wall (RTT) | Collect/layer today (sequential) | Collect/layer fixed (parallel) | Saved per token |
+|---|---|---|---|---|
+| 1 shard local | ~8 ms | ~8 ms | ~8 ms (no change) | 0 |
+| 2 shards LAN (~5 ms RTT) | ~5–10 ms | sum ≈ 10–20 ms | max ≈ 5–10 ms | ~5–10 ms × 30 layers = **150–300 ms/tok** |
+| 4 shards LAN | ~5–10 ms | sum ≈ 20–40 ms | max ≈ 5–10 ms | ~15–30 ms × 30 layers = **450–900 ms/tok** |
+| 4 shards cross-region (~50 ms RTT) | ~50 ms | sum ≈ 200 ms | max ≈ 50 ms | ~150 ms × 30 layers = **4500 ms/tok** |
+
+The `fire` half of `forward_moe_stream_fire` already pushes to all
+streams' channels in a non-blocking loop — concurrency exists at the
+wire layer; the bug is the blocking serial collect on top.
+
+**Fix**: change the collect loop from
+
+```rust
+for stream in streams.iter().take(n_streams) {
+    let (partial, server_compute_ms) = stream.collect_with_timing()?;
+    // accumulate into out
+}
+```
+
+to a concurrent join. `tokio::join_all` if the call site is async, or
+`std::thread::scope` / `rayon::par_iter().map(...)` if not (each
+`collect_with_timing` blocks on a condvar inside `ShardStream`, so
+parallelism comes from holding multiple condvars in flight). Picking
+between these depends on whether `ShardStream::collect_with_timing` is
+`Send + Sync`; check before deciding.
+
+**Acceptance**: `LARQL_MOE_TIMING=1` summary line on a 2-shard run
+reports `collect ≈ max(per_shard)`, not `sum(per_shard)`. End-to-end
+tok/s on a 2-shard local-loopback run improves measurably.
+
+**Strategic context**: this is the load-bearing primitive for the
+"split in grids" axis of LARQL — the future Kimi K2.6 / DeepSeek V4
+deployment shapes will need 8+ shards. Without this fix, the grid
+scales backwards: more shards = more sequential collect time.
+
+### F-LOCAL-MOE. Local Metal MoE optimisations (CPU staging + batched dispatch)
+
+**Status**: Not started.
+
+**Driver**: same 2026-05-02 bottleneck analysis. On the local Metal
+MoE path, **67% of wall is CPU work**, only 33% is GPU active (51 ms
+wall = 17 ms GPU + 33 ms CPU + sync). The GPU is barely loaded — the
+CPU-side per-layer router + memcpy of 8 expert Q4_K byte slices into
+staging buffers + commit/wait sync is dominating.
+
+For the "run large models on consumer hardware" axis, every ms here
+matters — the user runs LARQL on a single M3 Max, the grid isn't
+available.
+
+**Two levers, both CPU-path-safe**:
+
+1. **Zero-copy expert byte aliasing**: today
+   `gpu_moe_dispatch_with_scratch` memcpys ~300 KB per expert × 8 ×
+   30 layers = ~72 MB of Q4_K bytes per token into pre-allocated
+   staging buffers. The infra already exists —
+   `MetalBackend::cached_buffer_for_bytes` does
+   `new_buffer_with_bytes_no_copy` for the shard server's pre-staged
+   path. Wiring it for the local path eliminates the per-layer
+   memcpy entirely; experts alias the model's mmap directly.
+   **Estimated win: 5–10 ms/tok.**
+
+2. **Batched expert GPU dispatch**: today each MoE layer issues 24
+   GPU dispatches (8 × `q4k_ffn_gate_up` + 8 × `geglu` + 8 ×
+   `q4k_matvec` for down). Batching these into ~3 dispatches/layer
+   using per-expert offsets into the already-staged buffers reduces
+   dispatch overhead from ~720 calls/token to ~90.
+   **Estimated win: 3–5 ms/tok.**
+
+Combined: **8–15 ms/tok off the local path → 23–28 tok/s** on Gemma 4
+26B-A4B Metal MoE (from 19.4 tok/s today).
+
+**Acceptance**: `LARQL_GPU_TIMING=1` shows `cpu` shrunk by ~10 ms/tok;
+`larql bench gemma4-26b-a4b-q4k-v2` shows ≥23 tok/s warm-state on
+M3 Max with output unchanged.
+
 ### F-FLY. Remote multi-shard deployment on fly.io
 
 **Status**: Not started — next session.
@@ -1030,6 +1119,54 @@ measures the additional TCP overhead per fan-out.
 
 ## P2: Forward-looking
 
+### G-SCALE. Run T-class models on grid (Kimi K2.6, DeepSeek V4 scale)
+
+**Driver**: LARQL's strategic axis is "run large models on consumer
+hardware OR split across grids." T-class MoE models (Kimi K2 ≈ 1T total
+params, top-K ≈ 8; DeepSeek V3 ≈ 671B, top-K=2; future K2.6 / V4 likely
+similar shape) can't fit on any single consumer machine — the grid
+deployment shape is **the only way** to run them locally.
+
+**What changes vs Gemma 4 26B A4B (today's reference)**:
+
+| Dimension | Gemma 4 26B-A4B | Kimi K2 (~1T) | DeepSeek V3 (~671B) |
+|---|---|---|---|
+| Total params | 26B | ~1T | 671B |
+| Layers | 30 | ~60 | 61 |
+| Experts/layer | 128 | ~384 | 256 |
+| Top-K active | 8 | 8 | 8 |
+| Active params/token | ~5B | ~37B | ~37B |
+| Q4_K vindex size (estimate) | 16 GB | ~600 GB | ~400 GB |
+
+**Implications for the grid primitives**:
+
+1. **Memory-conscious shard layout**. A T-class model's expert table is
+   100× our current. With 16 GB consumer-class RAM per shard, K2 needs
+   ~40 shards just to fit. Per-shard memory targeting matters: each
+   shard owns a tight `(layer, expert_id)` set of mmap pages and never
+   loads the rest. The `--units PATH` JSON manifest already supports
+   per-(layer, expert) ownership; **G5 below** (per-shard expert routing
+   in router-protocol) lights it up at the router layer.
+2. **Parallel shard collect is non-negotiable**. With 40+ shards,
+   sequential collect would compound to seconds/token. **F-COLLECT**
+   above is the prerequisite.
+3. **Streaming expert byte transfer**. T-class expert weights per layer
+   may not fit in RAM even on a fat shard if it owns many experts. The
+   shard's mmap+page-fault behaviour does the right thing today (only
+   active expert pages are paged in), but **G4 mmap residency control**
+   below becomes operationally important — long-running shards need
+   `madvise(DONTNEED)` after a layer to reclaim RSS.
+4. **Router-side fan-out batching**. With 40+ shards and 30+ layers,
+   per-layer round-trips dominate. Multi-layer `forward_moe_predispatch`
+   (already exists) becomes the default rather than an opt-in; the
+   pass-1 approximation cost is negligible compared to 40-shard ×
+   30-layer sequential RTT.
+
+**Status**: Forward-looking. **F-COLLECT** + **G5** + **G4** are the
+direct prerequisites; once those land we should attempt a multi-shard
+deployment of one T-class model end-to-end as a capability check, even
+if perf is exploratory rather than production-tuned.
+
 ### G4. mmap residency control endpoint
 **Impact**: For long-running shards under memory pressure, expose
 `POST /v1/mmap/advise {layers, advice: "willneed"|"dontneed"}` so
@@ -1177,11 +1314,21 @@ Live smoke (`gemma3-4b-q4k-streaming.vindex`, port 18081):
   / `response_format: json_schema` via JSON schema → GBNF mask.
 - **Slice 5 (N0.3)** — `/v1/responses` Responses API, pairs with N1
   stateful sessions.
-- **N0.2-fast** — KV-cached generation path. Both `/v1/completions`
-  and `/v1/chat/completions` benefit. Requires `LoadedModel.weights`
-  to live behind a `RwLock` (or `ModelWeights.tensors` interior-
-  mutable); ~20 readers across the crate. Currently ~1-3 tok/s on
-  Gemma 3 4B; expect 30-50× speedup once KV-cached.
+- **N0.2-fast (shipped 2026-05-02)** — KV-cached generation path now
+  live for both `/v1/completions` and `/v1/chat/completions`.
+  `LoadedModel.weights` migrated from `OnceLock<ModelWeights>` to
+  `OnceLock<RwLock<ModelWeights>>`; OpenAI handlers acquire a write
+  guard via `lock_weights_for_gen()` and call
+  `larql_inference::layer_graph::generate{,_streaming}` which auto-
+  dispatches f16 vindexes to the fused KV-cached path and Q4_K +
+  CPU vindexes to the per-step `predict_q4k` fallback. Output on
+  Gemma 3 4B: "The capital of France is" → " Paris.\n\nParis is"
+  (was " is is is is" pre-fix). Multi-turn chat template rendering
+  moved into `larql_inference::prompt::ChatTemplate::render_messages`,
+  shrinking the openai handlers further. `bootstrap.rs` now mirrors
+  `larql_inference::open_inference_vindex` by loading
+  `attn_weights_q4k.bin` + `interleaved_q4k.bin` for inference-capable
+  vindexes (without these the Q4_K decode panics).
 - **base64 encoding** for `/v1/embeddings` — small follow-up.
 - **N0-router** — OpenAI surface on `larql-router` (grid front);
   tracked under "Router-side OpenAI surface" in P1.

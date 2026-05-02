@@ -699,7 +699,10 @@ async fn http_openai_chat_tools_returns_400() {
 }
 
 #[tokio::test]
-async fn http_openai_chat_response_format_json_schema_returns_400() {
+async fn http_openai_chat_response_format_json_schema_missing_schema_field_returns_400() {
+    // {type: "json_schema"} requires `json_schema: {schema: ...}` —
+    // the empty inner object has no `schema` key, so we 400 with a
+    // pointer at the missing field.
     let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
     let resp = post_json(
         app,
@@ -707,6 +710,60 @@ async fn http_openai_chat_response_format_json_schema_returns_400() {
         serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {"type": "json_schema", "json_schema": {}},
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_chat_response_format_json_schema_is_accepted() {
+    // Full {type: "json_schema", json_schema: {name, schema, strict}}
+    // request — synthetic model 503s because infer_disabled, which
+    // confirms the schema parsed cleanly through to the inference gate.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "Person",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"}
+                        },
+                        "required": ["name", "age"]
+                    }
+                }
+            },
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_response_format_json_schema_invalid_returns_400() {
+    // Schema uses an unsupported feature ($ref) — parser bubbles up
+    // a clear 400.
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"$ref": "#/foo"}}
+            },
             "max_tokens": 1
         }),
     )
@@ -730,6 +787,42 @@ async fn http_openai_chat_response_format_text_is_accepted() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_response_format_json_object_is_accepted() {
+    // {type: "json_object"} compiles to a Schema::Object(any) FSM and
+    // routes through generate_constrained. The synthetic model has
+    // infer_disabled=true so we still 503 — that's our signal that the
+    // request shape parsed cleanly through the constrained-mode path.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_response_format_unknown_type_returns_400() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "yaml"},
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -805,4 +898,65 @@ async fn http_openai_chat_multi_unknown_model_returns_404() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn http_openai_chat_sampling_params_accepted() {
+    // Wire-shape contract: temperature, top_p, seed, stop must be
+    // accepted on the request and not rejected by validation. The
+    // synthetic model has infer_disabled=true so the request reaches
+    // the inference gate (503) — that's our signal that all sampling
+    // fields parsed cleanly upstream.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "seed": 42,
+            "stop": ["\n\n", "STOP"],
+            "max_tokens": 4
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_stop_accepts_single_string() {
+    // OpenAI's `stop` is `string | string[]`; the StopSpec untagged
+    // enum should accept a bare string without validation errors.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "\n",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_completions_sampling_params_accepted() {
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "prompt": "hi",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "seed": 42,
+            "stop": ["\n\n"],
+            "max_tokens": 4
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

@@ -13,19 +13,15 @@
 //! )
 //! ```
 //!
-//! ## Generation path (slice 1 + 3)
+//! ## Generation path
 //!
-//! Slice 1 runs an **un-KV-cached generation loop** —
-//! `larql_inference::forward::predict_with_temperature` is invoked
-//! once per generated token, re-running the full forward pass each
-//! step. Cost is O(N²) in context length. Functional and immutable
-//! (`&ModelWeights`-only), so it serializes cleanly with concurrent
-//! `/v1/infer` traffic.
-//!
-//! The fast KV-cached path (`larql_inference::layer_graph::generate`)
-//! requires `&mut ModelWeights` for the per-layer Q4_K dequant cache.
-//! Wiring that into `LoadedModel` requires putting `ModelWeights` behind
-//! a `RwLock`; roadmap'd as N0.2-fast.
+//! Buffered + SSE both run the **KV-cached** generation loop in
+//! `larql_inference::layer_graph::generate{,_with_sampling,_streaming}`.
+//! The buffered path uses `generate_with_sampling`; the SSE path uses
+//! `generate_streaming` and pumps the per-token callback into an mpsc
+//! channel. Generation acquires an exclusive write guard on
+//! `LoadedModel.weights` for the duration; concurrent reads block,
+//! other endpoints are unaffected in steady state.
 //!
 //! ## Streaming (slice 3)
 //!
@@ -66,7 +62,6 @@ use super::util::{contains_any, error_chunk, new_id_suffix, trim_at_stop, unix_n
 
 const TEXT_COMPLETION_OBJECT: &str = "text_completion";
 const DEFAULT_MAX_TOKENS: usize = 16;
-const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -83,11 +78,12 @@ pub struct CompletionsRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Top-p (nucleus) sampling — accepted for shape-compat but ignored
-    /// in this slice (greedy/temperature only). See N0.2-fast.
+    /// Nucleus (top-p) filter applied after temperature scaling. Only
+    /// honoured when `temperature > 0`; for greedy decoding it's a no-op.
     #[serde(default)]
     pub top_p: Option<f32>,
-    /// Streaming via SSE — returns 501 in this slice (N0.1 SSE follow-up).
+    /// Streaming via SSE — emits one `text_completion` chunk per token,
+    /// terminated by `data: [DONE]\n\n`.
     #[serde(default)]
     pub stream: Option<bool>,
     /// Number of completions per prompt — only `n=1` supported; values
@@ -106,7 +102,8 @@ pub struct CompletionsRequest {
     /// Best-of — accepted, ignored (treats as 1).
     #[serde(default)]
     pub best_of: Option<usize>,
-    /// Seed for reproducible sampling — accepted, ignored in greedy mode.
+    /// Seed for reproducible sampling. Same seed + same temperature +
+    /// same prompt produces the same tokens. No-op for greedy mode.
     #[serde(default)]
     pub seed: Option<u64>,
     /// End-user id — logged via tracing if set, otherwise no-op.
@@ -168,7 +165,9 @@ pub async fn handle_completions(
     }
 
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE).max(0.0);
+    let temperature = req.temperature;
+    let top_p = req.top_p;
+    let seed = req.seed;
     let stop_strings: Vec<String> = req
         .stop
         .as_ref()
@@ -203,6 +202,8 @@ pub async fn handle_completions(
             prompt,
             max_tokens,
             temperature,
+            top_p,
+            seed,
             stop_strings,
             model_id,
         )
@@ -217,6 +218,8 @@ pub async fn handle_completions(
                 &prompts,
                 max_tokens,
                 temperature,
+                top_p,
+                seed,
                 &stop_strings,
                 echo,
             )
@@ -242,11 +245,14 @@ pub async fn handle_completions(
 /// Build an SSE response that streams one chunk per generated token.
 /// Final chunk carries `finish_reason`; the stream terminates with
 /// `data: [DONE]\n\n`.
+#[allow(clippy::too_many_arguments)]
 fn stream_completions(
     model: Arc<LoadedModel>,
     prompt: String,
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
     stop_strings: Vec<String>,
     model_id: String,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -274,7 +280,9 @@ fn stream_completions(
             let _ = tx.blocking_send(error_chunk("prompt tokenises to empty"));
             return;
         }
-        let _ = temperature; // accepted; layer_graph::generate is greedy.
+
+        let (sampling, eos) =
+            super::util::build_sampling_eos(temperature, top_p, seed, &stop_strings);
 
         let patched = model.patched.blocking_read();
         let index = patched.base();
@@ -297,8 +305,8 @@ fn stream_completions(
             &*backend,
             &cached_layers,
             0..num_layers,
-            larql_inference::SamplingConfig::greedy(),
-            &larql_inference::EosConfig::builtin(),
+            sampling,
+            &eos,
             |_id, text, _prob| {
                 if early_stop {
                     return;
@@ -360,11 +368,14 @@ fn build_text_completion_chunk(
 
 /// Generate completions for every prompt. Returns
 /// `(choices, prompt_tokens_sum, completion_tokens_sum)`.
+#[allow(clippy::too_many_arguments)]
 fn run_completions_loop(
     model: &LoadedModel,
     prompts: &[String],
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
     stop_strings: &[String],
     echo: bool,
 ) -> Result<(Vec<CompletionChoice>, usize, usize), ServerError> {
@@ -375,7 +386,6 @@ fn run_completions_loop(
         .lock_weights_for_gen()
         .map_err(ServerError::InferenceUnavailable)?;
     let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
-    let _ = temperature; // accepted; layer_graph::generate is greedy.
 
     let patched = model.patched.blocking_read();
     let index = patched.base();
@@ -400,7 +410,14 @@ fn run_completions_loop(
         }
         total_prompt_tokens += prompt_ids.len();
 
-        let result = larql_inference::layer_graph::generate(
+        // Build a fresh (sampling, eos) per prompt so the seed advances
+        // deterministically — `SamplingConfig::with_seed` keeps the same
+        // RNG seed across each prompt, which is what callers expect when
+        // a seed is provided.
+        let (sampling, eos) =
+            super::util::build_sampling_eos(temperature, top_p, seed, stop_strings);
+
+        let result = larql_inference::layer_graph::generate_with_sampling(
             weights,
             &model.tokenizer,
             &prompt_ids,
@@ -409,6 +426,8 @@ fn run_completions_loop(
             &*backend,
             &cached_layers,
             0..num_layers,
+            sampling,
+            &eos,
         );
 
         let mut completion_text = String::new();

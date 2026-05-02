@@ -3,7 +3,7 @@
 //! Memory-efficient: O(seq) per position, never materializes full [seq, seq] matrix.
 //! Uses BLAS gemv for both Q·K scores and softmax·V accumulation.
 
-use super::AttentionWeights;
+use super::{AttentionAllWeights, AttentionWeights};
 use ndarray::Array2;
 
 /// GQA with causal masking (no weight capture).
@@ -39,8 +39,62 @@ pub fn gqa_attention_with_weights(
     capture: bool,
     softcap: Option<f32>,
 ) -> (Array2<f32>, Option<AttentionWeights>) {
+    let (out, last, _) = gqa_attention_capture(
+        q, k, v, num_q, head_dim, reps, scale, seq_len, capture, false, softcap,
+    );
+    (out, last)
+}
+
+/// GQA that captures every query-position attention distribution.
+///
+/// Diagnostic/capture tooling uses this for relation-state probes. Production
+/// inference should use [`gqa_attention`] or [`gqa_attention_with_weights`].
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_with_all_weights(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    v: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    softcap: Option<f32>,
+) -> (Array2<f32>, AttentionAllWeights) {
+    let (out, _, all) = gqa_attention_capture(
+        q, k, v, num_q, head_dim, reps, scale, seq_len, false, true, softcap,
+    );
+    (
+        out,
+        all.expect("all-position attention capture requested but missing"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gqa_attention_capture(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    v: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    capture_last: bool,
+    capture_all: bool,
+    softcap: Option<f32>,
+) -> (
+    Array2<f32>,
+    Option<AttentionWeights>,
+    Option<AttentionAllWeights>,
+) {
     let mut out = Array2::<f32>::zeros((seq_len, num_q * head_dim));
-    let mut captured_heads: Vec<Vec<f32>> = if capture {
+    let mut captured_heads: Vec<Vec<f32>> = if capture_last {
+        Vec::with_capacity(num_q)
+    } else {
+        Vec::new()
+    };
+    let mut captured_all_heads: Vec<Vec<Vec<f32>>> = if capture_all {
         Vec::with_capacity(num_q)
     } else {
         Vec::new()
@@ -51,6 +105,11 @@ pub fn gqa_attention_with_weights(
     let mut scores_buf = vec![0.0f32; seq_len];
 
     for h in 0..num_q {
+        let mut captured_positions: Vec<Vec<f32>> = if capture_all {
+            Vec::with_capacity(seq_len)
+        } else {
+            Vec::new()
+        };
         let kv_h = h / reps;
         let q_off = h * head_dim;
         let kv_off = kv_h * head_dim;
@@ -85,10 +144,15 @@ pub fn gqa_attention_with_weights(
                 *score *= inv_sum;
             }
 
-            if capture && qi == last_pos {
+            if capture_last && qi == last_pos {
                 let mut captured = vec![0.0f32; seq_len];
                 captured[..causal_len].copy_from_slice(&scores_buf[..causal_len]);
                 captured_heads.push(captured);
+            }
+            if capture_all {
+                let mut captured = vec![0.0f32; seq_len];
+                captured[..causal_len].copy_from_slice(&scores_buf[..causal_len]);
+                captured_positions.push(captured);
             }
 
             let v_block = v.slice(ndarray::s![0..causal_len, kv_off..kv_off + head_dim]);
@@ -99,9 +163,12 @@ pub fn gqa_attention_with_weights(
                 out[[qi, q_off + d]] = weighted_v[d];
             }
         }
+        if capture_all {
+            captured_all_heads.push(captured_positions);
+        }
     }
 
-    let weights = if capture {
+    let weights = if capture_last {
         Some(AttentionWeights {
             heads: captured_heads,
         })
@@ -109,7 +176,15 @@ pub fn gqa_attention_with_weights(
         None
     };
 
-    (out, weights)
+    let all_weights = if capture_all {
+        Some(AttentionAllWeights {
+            heads: captured_all_heads,
+        })
+    } else {
+        None
+    };
+
+    (out, weights, all_weights)
 }
 
 #[cfg(test)]

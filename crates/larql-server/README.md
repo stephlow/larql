@@ -203,15 +203,20 @@ For an end-to-end live walkthrough that boots an in-process server
 and exercises every endpoint with a real vindex:
 
 ```bash
-# f16 vindex — full intelligible output ("The capital of France is" → " Paris."):
+# f16 vindex (fastest, KV-cached attention):
 cargo run --release -p larql-server --example openai_demo -- \
   output/gemma3-4b-f16.vindex
 
-# Q4_K vindex — wire shape correct, content degenerate on the un-KV-cached
-# generation path (fixed by N0.2-fast in ROADMAP):
+# Q4_K vindex (also produces real output; per-step Q4_K decode is
+# O(N²) so high `max_tokens` runs are slow on CPU):
 cargo run --release -p larql-server --example openai_demo -- \
   output/gemma3-4b-q4k-streaming.vindex
 ```
+
+Both produce intelligible output ("The capital of France is" → "
+Paris.") — generation runs through `larql_inference::layer_graph::generate`
+which auto-dispatches to the KV-cached f16 path or the per-step Q4_K
+CPU path based on the loaded vindex format.
 
 ## CLI Options
 

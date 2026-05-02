@@ -9,7 +9,8 @@ use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
 use super::cpu::{
-    backend_supports_fused_q4_pipeline, generate_constrained_via_cpu_q4k, generate_via_cpu_q4k,
+    backend_supports_fused_q4_pipeline, generate_constrained_via_cpu_q4k,
+    generate_constrained_via_cpu_q4k_streaming, generate_via_cpu_q4k,
 };
 use super::lm_head::{
     backend_lm_head_scores, cpu_lm_head_topk, lm_head_topk, pick_next_token_masked,
@@ -712,17 +713,52 @@ pub fn generate_constrained<M>(
     backend: &dyn ComputeBackend,
     cached_layers: &CachedLayerGraph,
     layer_range: std::ops::Range<usize>,
-    mut mask_fn: M,
+    mask_fn: M,
 ) -> GenerateResult
 where
     M: FnMut(&[u32], &mut Vec<f32>),
+{
+    generate_constrained_streaming(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        mask_fn,
+        |_, _, _| {},
+    )
+}
+
+/// Streaming variant of [`generate_constrained`] — fires
+/// `on_token(id, text, prob)` after each masked argmax pick so SSE
+/// callers can flush JSON / structured-output chunks as they're
+/// produced. Identical pipeline otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_constrained_streaming<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    mut mask_fn: M,
+    mut on_token: F,
+) -> GenerateResult
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str, f64),
 {
     // Same PLE delegation as `generate_streaming` — the Metal pipeline
     // doesn't implement Gemma 4 E2B's per-layer-input gate.
     let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
     if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
-        return generate_constrained_via_cpu_q4k(
-            weights, tokenizer, token_ids, max_tokens, index, mask_fn,
+        return generate_constrained_via_cpu_q4k_streaming(
+            weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token,
         );
     }
 
@@ -874,6 +910,7 @@ where
         Some((tid, _)) => {
             let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
             let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
+            on_token(tid, &tok_str, 1.0);
             tokens.push((tok_str, 1.0));
             generated.push(tid);
             if is_eos {
@@ -939,6 +976,7 @@ where
             Some((tid, _)) => {
                 let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
                 let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
+                on_token(tid, &tok_str, 1.0);
                 tokens.push((tok_str, 1.0));
                 generated.push(tid);
                 current_token_id = tid;

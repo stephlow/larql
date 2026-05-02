@@ -216,11 +216,20 @@ struct LayerTiming {
     per_shard: Vec<(f32, f32)>,
 }
 
-/// Sum of per-shard wall times — gives the inner-loop's collect wait.  Note
-/// shards collect sequentially today (loop in `forward_moe_stream_collect`),
-/// so this matches `collect_ms` to within microseconds.
+/// Sum of per-shard wall times — pre-2026-05-02 this matched `collect_ms`
+/// because shards collected sequentially. After the parallel-collect change
+/// (`forward_moe_stream_collect_with_timing` uses `std::thread::scope`),
+/// `collect_ms ≈ max(per_shard.wall)` not the sum. Kept for diagnostics:
+/// `shard_wall_sum / collect_ms` shows the parallel-collect speedup ratio
+/// (≥ N for an N-shard topology where the parallelism is fully realised).
 fn shard_wall_sum(t: &LayerTiming) -> f32 {
     t.per_shard.iter().map(|(w, _)| *w).sum()
+}
+
+/// Max of per-shard wall times — post-2026-05-02 this matches `collect_ms`
+/// to within microseconds (parallel collect → bound by the slowest shard).
+fn shard_wall_max(t: &LayerTiming) -> f32 {
+    t.per_shard.iter().map(|(w, _)| *w).fold(0.0, f32::max)
 }
 
 fn shard_compute_max(t: &LayerTiming) -> f32 {

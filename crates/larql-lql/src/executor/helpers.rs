@@ -37,6 +37,20 @@ pub(crate) fn format_bytes(b: u64) -> String {
     }
 }
 
+pub(crate) fn format_knn_override_summary(
+    ovr: &larql_inference::KnnOverride,
+    model_top1: Option<&(String, f64)>,
+) -> String {
+    let base = format!(
+        "source=knn_override/post_logits, cos={:.2}, L{}",
+        ovr.cosine, ovr.layer
+    );
+    match model_top1 {
+        Some((tok, prob)) => format!("{base}, model_top1={} ({:.2}%)", tok, prob * 100.0),
+        None => base,
+    }
+}
+
 /// Heuristic: is a token readable enough to show to the user?
 /// Filters out encoding garbage, isolated combining marks, etc.
 pub(crate) fn is_readable_token(tok: &str) -> bool {
@@ -57,6 +71,27 @@ pub(crate) fn is_readable_token(tok: &str) -> bool {
         .count();
     let total = tok.chars().count();
     readable * 2 >= total && total > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_knn_override_summary;
+
+    #[test]
+    fn knn_override_summary_names_post_logits_source_and_model_top1() {
+        let ovr = larql_inference::KnnOverride {
+            token: "Colchester".into(),
+            cosine: 0.987,
+            layer: 26,
+        };
+
+        let summary = format_knn_override_summary(&ovr, Some(&("London".into(), 0.42)));
+
+        assert!(summary.contains("source=knn_override/post_logits"));
+        assert!(summary.contains("cos=0.99"));
+        assert!(summary.contains("L26"));
+        assert!(summary.contains("model_top1=London (42.00%)"));
+    }
 }
 
 /// Stricter filter for SHOW RELATIONS and DESCRIBE: content words only.

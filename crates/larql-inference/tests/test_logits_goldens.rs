@@ -87,30 +87,26 @@ const PROMPT: &str = "The capital of France is";
 const GOLDENS: &[Golden] = &[
     // Gemma 3/4 are tied-embedding models — LM head goes through the
     // synthesised Q4_0 path (`backend.q4_matvec` against `lm_head_q4_synth`).
-    // Pre-2026-04-25 the Metal dispatcher imported the wrong shader's
-    // geometry constants and silently dropped 75 % of vocab rows; CPU
-    // and Metal goldens diverged because of that bug.
     //
-    // 2026-05-02: Metal lm_head now routes through the **f16 GEMV**
-    // tied-embedding path by default
-    // (`lm_head_topk` `prefer_cpu` branch in
-    // `layer_graph/generate/lm_head.rs` calls
-    // `index.lm_head_knn_backend_skip_q4k(..., backend)`, which tries f16
-    // GEMV first, then stride-32 Q4_K, then f32 BLAS). Reason: the
-    // production `q4k_matvec` 32-lane simdgroup
-    // reduction with `lane & 1u` block split drifts ~1e-3 vs CPU's
-    // sequential accumulator — enough to flip top-1 on close-call
-    // tokens (e.g. " Capital" vs " capital" at decode step 1 on
-    // Gemma 3 4B — see `arch_golden_gemma3_4b_gpu`). The f16 path keeps
-    // the stable reduction tree while avoiding the stride-32 Q4 correctness
-    // tax measured in the decode profile.
+    // History of Metal dispatcher bugs that caused CPU/Metal divergence
+    // here, both since fixed:
+    //   1. Pre-2026-04-25 — the Metal dispatcher imported the wrong
+    //      shader's geometry constants and silently dropped 75% of vocab
+    //      rows.
+    //   2. 2026-05-02 — `MetalBackend::q4k_matvec` hardcoded the 4sg
+    //      shader's `THREADS_PER_TG=128` while dispatching the 8sg
+    //      `q4k_matvec_pipeline` (production default since 2026-04-28),
+    //      leaving simdgroups 4..7 unscheduled and dropping half the
+    //      lm_head rows. Diagnosed initially as a kernel reduction-tree
+    //      drift; root cause was the dispatch site (now uses
+    //      `pipeline.rows_per_tg` / `pipeline.threads_per_tg`).
     //
-    // The Metal pins below match CPU pins at top-5 set+order; top-1
-    // logits differ by ~1e-3 (round-off, well inside `LOGIT_TOLERANCE`).
-    // Opt back into the production Q4_K Metal path with
-    // `LARQL_METAL_LM_HEAD=1` (faster ~1ms but flips top-1 on close
-    // calls); force the stride-32 stable-Q4 path before f16 with
-    // `LARQL_LM_HEAD_STRIDE32=1`.
+    // After both fixes, Metal lm_head routes through the production
+    // `q4k_matvec` (~1.85 ms/tok on Gemma 3 4B v2) and matches CPU pins
+    // at top-5 set + order. Top-1 logits differ by ~1e-3 (round-off,
+    // well inside `LOGIT_TOLERANCE`). Set `LARQL_LM_HEAD_SKIP_Q4K=1` to
+    // route through the stride-32 + f16 fallback chain instead — useful
+    // for diagnostic A/B against a known-stable reduction tree.
     //
     // The non-gemma3 Metal pins below (gemma4-31b dense, gemma4-31b
     // Q6_K down, llama2-7b, mistral-7b) still reflect older fix

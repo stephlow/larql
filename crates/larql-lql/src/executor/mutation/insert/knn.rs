@@ -54,10 +54,8 @@ impl Session {
         let residual_key: Vec<f32>;
         let target_id: u32;
         if has_weights {
-            let (path, _config, patched) = self.require_vindex()?;
+            let (path, config, patched) = self.require_vindex()?;
             let mut cb = larql_vindex::SilentLoadCallbacks;
-            let weights = larql_vindex::load_model_weights(path, &mut cb)
-                .map_err(|e| LqlError::exec("failed to load weights", e))?;
             let tokenizer = larql_vindex::load_vindex_tokenizer(path)
                 .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
 
@@ -74,13 +72,14 @@ impl Session {
                 .map_err(|e| LqlError::exec("tokenize error", e))?;
             let token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
-            let walk_ffn = larql_inference::vindex::WalkFfn::new_unlimited_with_trace(
-                &weights,
-                patched.base(),
-            );
-            let _result =
-                larql_inference::predict_with_ffn(&weights, &tokenizer, &token_ids, 1, &walk_ffn);
-            let residuals = walk_ffn.take_residuals();
+            // `InferenceWeights::load` branches on `config.quant` — callers
+            // do not need to know the on-disk format.
+            let mut iw = larql_inference::InferenceWeights::load(path, config, &mut cb)
+                .map_err(|e| LqlError::exec("failed to load model weights", e))?;
+            let residuals = iw
+                .infer_patched(&tokenizer, patched, None, &token_ids, 1)
+                .residuals;
+
             residual_key = residuals
                 .into_iter()
                 .find(|(l, _)| *l == install_layer)

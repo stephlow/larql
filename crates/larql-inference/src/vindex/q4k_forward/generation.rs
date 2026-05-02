@@ -106,10 +106,38 @@ pub fn generate_q4k_cpu_constrained<M>(
     prompt_ids: &[u32],
     max_tokens: usize,
     index: &VectorIndex,
-    mut mask_fn: M,
+    mask_fn: M,
 ) -> Vec<(String, u32)>
 where
     M: FnMut(&[u32], &mut Vec<f32>),
+{
+    generate_q4k_cpu_constrained_streaming(
+        weights,
+        tokenizer,
+        prompt_ids,
+        max_tokens,
+        index,
+        mask_fn,
+        |_, _, _| {},
+    )
+}
+
+/// Streaming-callback variant of [`generate_q4k_cpu_constrained`].
+/// Fires `on_token(id, text, prob)` after each masked argmax pick. Used
+/// by the OpenAI server's SSE path so JSON / structured-output streams
+/// can flush chunks as the constrained decoder produces them.
+pub fn generate_q4k_cpu_constrained_streaming<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    mut mask_fn: M,
+    mut on_token: F,
+) -> Vec<(String, u32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str, f64),
 {
     let mut ids = prompt_ids.to_vec();
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -137,6 +165,7 @@ where
         let tok = tokenizer.decode(&[id], true).unwrap_or_default();
 
         let stop = is_end_of_turn(&tok);
+        on_token(id, &tok, 1.0);
         out.push((tok, id));
         ids.push(id);
         generated.push(id);

@@ -30,6 +30,20 @@ runtime contracts are stable.
 
 ## ✅ Metal lm_head — stride-32 Q4_K matvec, f16 GEMV fallback (correctness + perf fix, 2026-05-01)
 
+> **2026-05-02 follow-up — the root cause was wrong.** What was diagnosed
+> as a kernel-level reduction-tree drift turned out to be a dispatch
+> geometry mismatch (`MetalBackend::q4k_matvec` hardcoding the 4sg
+> shader's `THREADS_PER_TG=128` while dispatching the 8sg pipeline,
+> production default since 2026-04-28 — same family as 077884b). With
+> the dispatcher fixed to use `pipeline.rows_per_tg` /
+> `pipeline.threads_per_tg`, the production `q4k_matvec` is correct AND
+> ~1.10 ms/tok faster than stride-32. **Stride-32 is now the diagnostic
+> fallback; production default is `lm_head_knn_backend` with
+> `q4k_matvec` first.** End-to-end: 76.3 → 84.0 tok/s on Gemma 3 4B,
+> gap to ollama 1.30× → 1.18×. Diagnostic A/B via
+> `LARQL_LM_HEAD_SKIP_Q4K=1`. The historical bisect below is preserved
+> for context.
+
 Gemma 3 4B Metal end-to-end was producing the wrong continuation
 ("The Capital of France is:  **") on `"The capital of France is"`
 while CPU produced the correct "**Paris**" answer. Bisected:
@@ -71,8 +85,10 @@ production `q4k_matvec` first-path with a 3-step ladder:
      dispatchable.
   3. f32 BLAS fallback (`lm_head_knn`).
 
-Opt out of stride-32 with `LARQL_LM_HEAD_STRIDE32=0`; opt back into
-the production Q4_K path with `LARQL_METAL_LM_HEAD=1`.
+**Env vars (post 2026-05-02 dispatch fix):** the production Q4_K path
+is the default; `LARQL_LM_HEAD_SKIP_Q4K=1` routes through this
+stride-32 chain for diagnostic A/B. Within the chain,
+`LARQL_LM_HEAD_STRIDE32=0` disables the stride-32 fallback.
 
 Five attempts on the way to this:
 - v1: route through `CpuBackend` via `index.lm_head_knn_backend` —

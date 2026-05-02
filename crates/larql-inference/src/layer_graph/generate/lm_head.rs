@@ -26,48 +26,25 @@ pub fn lm_head_topk(
     top_k: usize,
     backend: &dyn ComputeBackend,
 ) -> Vec<(u32, f32)> {
-    // Metal q4k_matvec on the lm_head produces sub-percent logit drift
-    // vs CPU q4k_matvec. Each row of the 262K-vocab × 2560-hidden matvec
-    // is reduced across a 32-lane simdgroup with a 2-way inter-superblock
-    // split (`q4k_matvec.rs::ix = lane & 1u`); CPU runs the same dot
-    // product as a sequential per-element accumulator. Both paths use
-    // f32 throughout but the reduction trees differ, and that's enough
-    // to flip top-1 on close-call tokens. End-to-end symptom on Gemma 3
-    // 4B: prompt "The capital of France is" continues with " Capital"
-    // (capital C, no answer) on Metal vs " capital ... **Paris**" on
-    // CPU; per-layer hidden parity holds at cos≥0.99995 across all 34
-    // layers (`test_decode_consistency_gemma3_4b_2steps`), so the drift
-    // is fully concentrated in the lm_head matvec.
+    // Default route: `lm_head_knn_backend` — Metal `q4k_matvec` first
+    // (1.85 ms/tok on Gemma 3 4B, was 2.95 ms via the stride-32 workaround
+    // before the 2026-05-02 dispatch-geometry fix), f16 GEMV fallback for
+    // vindexes lacking Q4_K lm_head bytes, f32 BLAS as last resort.
     //
-    // Default-route the lm_head through `CpuBackend` whenever the
-    // active compute backend isn't already CPU; opt back into Metal
-    // with `LARQL_METAL_LM_HEAD=1` (~1ms/tok faster but token-flip risk
-    // on close-ranking pairs). Same correctness-over-speed pattern
-    // shipped for the Metal MoE expert path.
-    let prefer_cpu = std::env::var("LARQL_METAL_LM_HEAD").is_err();
+    // `LARQL_LM_HEAD_SKIP_Q4K=1` routes through `_skip_q4k` instead
+    // (stride-32 Q4_K → f16 → f32) for diagnostic A/B against the Q4_K
+    // path. See `crates/larql-compute/PERFORMANCE.md` "Decision: lm_head
+    // dispatch order" for the full root-cause history.
+    let skip_q4k = matches!(
+        std::env::var("LARQL_LM_HEAD_SKIP_Q4K").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    );
     let is_metal_backend = backend.as_any().type_id() != std::any::TypeId::of::<CpuBackend>();
-    if prefer_cpu && is_metal_backend {
-        // Route to `lm_head_knn_backend_skip_q4k` — the same dispatch
-        // chain as `lm_head_knn_backend` but starting at the stable f16
-        // GEMV path instead of the production Q4_K matvec path.
-        //
-        // Why: Metal's `q4k_matvec` 32-lane simdgroup reduction drifts
-        // ~1e-3 vs CPU's sequential accumulator (different reduction
-        // tree, same f32 precision). On the 262K × 2560 lm_head matvec
-        // that's enough to flip top-1 on close-call tokens (e.g.
-        // " Capital" vs " capital" at decode step 1 of Gemma 3 4B).
-        // Metal's `f16_gemv` shader uses a tighter reduction tree and
-        // keeps top-1 stable end-to-end. Reads 1.3 GB of f16 weights
-        // per token vs 2.6 GB for f32, and avoids the extra stride-32
-        // Q4 correctness path now that tied-embedding f16 is available
-        // in the hot path.
-        //
-        // For models where the f16 mmap isn't populated (no tied embed
-        // / no f16 lm_head), this falls back to stride-32 Q4_K, then
-        // `lm_head_knn` (f32 BLAS). The Q4_K Metal path stays opt-in
-        // via `LARQL_METAL_LM_HEAD=1` for runs where the speed margin
-        // matters more than top-1 stability; the stride-32 fallback can
-        // be forced first with `LARQL_LM_HEAD_STRIDE32=1`.
+    if skip_q4k && is_metal_backend {
+        // Diagnostic path: skip the Q4_K Metal matvec and use stride-32
+        // Q4_K (or f16 GEMV / f32 BLAS) instead. Useful for verifying
+        // top-1 stability against a known-stable reduction tree, or for
+        // vindexes where the Q4_K lm_head bytes aren't populated.
         let hits = index.lm_head_knn_backend_skip_q4k(query, top_k, backend);
         let all_zero = !hits.is_empty() && hits.iter().all(|(_, s)| *s == 0.0 || s.is_nan());
         if !hits.is_empty() && !all_zero {

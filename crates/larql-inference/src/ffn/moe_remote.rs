@@ -475,7 +475,7 @@ impl Shard {
 
                 Ok(ShardStream {
                     work_tx,
-                    result_rx,
+                    result_rx: std::sync::Mutex::new(result_rx),
                     _runtime: rt,
                 })
             }
@@ -1979,12 +1979,47 @@ impl RemoteMoeBackend {
             return Ok((vec![0.0f32; hidden], Vec::new()));
         }
 
+        // Parallel collect across shards: spawn one OS thread per stream and
+        // join them all. Each thread blocks on its shard's `result_rx` condvar
+        // independently, so the per-layer collect wall time is `max(per_shard)`
+        // not `sum(per_shard)`. The win scales linearly with shard count and
+        // is the load-bearing primitive for multi-shard remote topologies
+        // (Kimi K2.6 / DeepSeek V4 class deployments) — see roadmap F-COLLECT.
+        //
+        // Single-shard runs hit the `n_streams == 1` shortcut to skip the
+        // thread::scope overhead (~50µs/layer) — measurable on a single-shard
+        // colocated bench where parallel and sequential are equivalent anyway.
+        type CollectResult = (f32, Result<(Vec<f32>, f32), RemoteMoeError>);
+        let results: Vec<CollectResult> = if n_streams == 1 {
+            let t0 = std::time::Instant::now();
+            let res = streams[0].collect_with_timing();
+            let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            vec![(wall_ms, res)]
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = streams
+                    .iter()
+                    .take(n_streams)
+                    .map(|stream| {
+                        s.spawn(move || -> CollectResult {
+                            let t0 = std::time::Instant::now();
+                            let res = stream.collect_with_timing();
+                            let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                            (wall_ms, res)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("collect thread panicked"))
+                    .collect()
+            })
+        };
+
         let mut out = vec![0.0f32; hidden];
         let mut per_shard: Vec<(f32, f32)> = Vec::with_capacity(n_streams);
-        for stream in streams.iter().take(n_streams) {
-            let t0 = std::time::Instant::now();
-            let (partial, server_compute_ms) = stream.collect_with_timing()?;
-            let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        for (wall_ms, res) in results {
+            let (partial, server_compute_ms) = res?;
             per_shard.push((wall_ms, server_compute_ms));
             if partial.len() == hidden {
                 for (acc, v) in out.iter_mut().zip(partial.iter()) {
@@ -2169,7 +2204,15 @@ pub struct ShardStream {
     /// Blocking result channel: tokio task → Metal thread.
     /// Each item is `(h2, server_compute_ms)` — `compute_ms` is `0.0` when the
     /// server isn't recording timing.
-    result_rx: std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), RemoteMoeError>>,
+    ///
+    /// `std::sync::mpsc::Receiver` is `!Sync` (only `Send`); wrapping in
+    /// `Mutex` makes `ShardStream: Sync`, which the parallel
+    /// `forward_moe_stream_collect_with_timing` requires to spawn one
+    /// `std::thread::scope` thread per shard. The mutex is contended only if
+    /// two threads ever called `collect()` on the same stream concurrently —
+    /// which the API contract forbids — so the lock is uncontended in
+    /// practice and adds only the futex check cost.
+    result_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), RemoteMoeError>>>,
     /// Keep the runtime alive so the tokio task keeps running.
     _runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }
@@ -2196,11 +2239,10 @@ impl ShardStream {
     /// Collect with the server's `compute_ms` value attached. `compute_ms` is
     /// `0.0` when the server isn't recording timing (`LARQL_MOE_TIMING` unset).
     pub fn collect_with_timing(&self) -> Result<(Vec<f32>, f32), RemoteMoeError> {
-        self.result_rx
-            .recv()
-            .unwrap_or(Err(RemoteMoeError::BadResponse(
-                "shard result channel closed".into(),
-            )))
+        let rx = self.result_rx.lock().expect("result_rx mutex poisoned");
+        rx.recv().unwrap_or(Err(RemoteMoeError::BadResponse(
+            "shard result channel closed".into(),
+        )))
     }
 
     /// Convenience: fire then collect.

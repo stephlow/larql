@@ -28,15 +28,21 @@
 //! 2. Substring match on `model.id` ("gemma", "llama", "qwen", …)
 //! 3. Plain (fallback for unknown families and base models)
 //!
-//! ## Slice 2 limitations
+//! ## Generation path
 //!
-//! - `stream=true` returns 400 (SSE arrives in slice 3)
+//! Buffered + SSE streaming both call
+//! `larql_inference::layer_graph::generate{,_streaming}` which is KV-
+//! cached on f16 vindexes (and falls back to a per-step Q4_K decode
+//! when the backend is CPU + Q4K). Generation acquires an exclusive
+//! write guard on `LoadedModel.weights` for the duration; concurrent
+//! reads block but other endpoints are unaffected in steady state.
+//!
+//! ## Slice 2-3 limitations
+//!
 //! - `tools` / `tool_choice` returns 400 (slice 4 = N0.6 constrained decoding)
 //! - `response_format: json_object | json_schema` returns 400 (slice 4)
 //! - `n>1` returns 400
 //! - `logprobs` request field accepted, response field always `null` (F18)
-//! - generation is un-KV-cached, ~1-3 tok/s on CPU for Gemma 3 4B
-//!   (KV-cached fast path = N0.2-fast in ROADMAP)
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -52,6 +58,7 @@ use tokio_stream::StreamExt as _;
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
+use super::schema::{ObjectSchema, Schema};
 use super::util::{contains_any, error_chunk, new_id_suffix, trim_at_stop, unix_now, StopSpec};
 
 const CHAT_COMPLETION_OBJECT: &str = "chat.completion";
@@ -60,7 +67,6 @@ const ASSISTANT_ROLE: &str = "assistant";
 const SYSTEM_ROLE: &str = "system";
 const USER_ROLE: &str = "user";
 const DEFAULT_MAX_TOKENS: usize = 256;
-const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 #[derive(Deserialize)]
 pub struct ChatMessage {
@@ -83,10 +89,12 @@ pub struct ChatCompletionsRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Top-p — accepted, ignored (greedy/temperature only in slice 2).
+    /// Nucleus (top-p) filter applied after temperature scaling. Only
+    /// honoured when `temperature > 0`; for greedy decoding it's a no-op.
     #[serde(default)]
     pub top_p: Option<f32>,
-    /// Streaming via SSE — returns 400 in slice 2 (slice 3 SSE follow-up).
+    /// Streaming via SSE — emits one `chat.completion.chunk` per token,
+    /// terminated by `data: [DONE]\n\n`.
     #[serde(default)]
     pub stream: Option<bool>,
     /// Number of completions per prompt — only n=1 supported.
@@ -111,13 +119,16 @@ pub struct ChatCompletionsRequest {
     /// slice 4. Returns 400 for any non-text response_format.
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
-    /// Seed for reproducible sampling — accepted, ignored in greedy mode.
+    /// Seed for reproducible sampling. Same seed + same temperature +
+    /// same prompt produces the same tokens. No-op for greedy mode
+    /// (greedy is already deterministic on argmax).
     #[serde(default)]
     pub seed: Option<u64>,
     /// End-user id — logged via tracing if set.
     #[serde(default)]
     pub user: Option<String>,
-    /// Frequency / presence penalties — accepted, ignored in slice 2.
+    /// Frequency / presence penalties — accepted for shape compat;
+    /// the sampler does not yet apply repetition penalties (F19).
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
@@ -179,22 +190,7 @@ pub async fn handle_chat_completions(
                 .into(),
         ));
     }
-    if let Some(rf) = req.response_format.as_ref() {
-        // Reject any explicit non-text response_format. `{type: "text"}` is
-        // the OpenAI default and we treat it as a no-op.
-        let is_text_default = rf
-            .get("type")
-            .and_then(|t| t.as_str())
-            .map(|s| s == "text")
-            .unwrap_or(false);
-        if !is_text_default {
-            return Err(ServerError::BadRequest(
-                "response_format != \"text\" (json_object, json_schema) not yet \
-                 supported; arrives in N0 slice 4."
-                    .into(),
-            ));
-        }
-    }
+    let constrained_schema = schema_for_response_format(req.response_format.as_ref())?;
     for (i, m) in req.messages.iter().enumerate() {
         if m.tool_calls
             .as_ref()
@@ -226,12 +222,14 @@ pub async fn handle_chat_completions(
     }
 
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE).max(0.0);
     let stop_strings: Vec<String> = req
         .stop
         .as_ref()
         .map(|s| s.as_slice().to_vec())
         .unwrap_or_default();
+    let temperature = req.temperature;
+    let top_p = req.top_p;
+    let seed = req.seed;
     let model_id = req.model.clone().unwrap_or_else(|| model.id.clone());
     let model_arc = model.clone();
     let messages = req.messages;
@@ -242,7 +240,10 @@ pub async fn handle_chat_completions(
             messages,
             max_tokens,
             temperature,
+            top_p,
+            seed,
             stop_strings,
+            constrained_schema,
             model_id,
         )
         .into_response());
@@ -255,7 +256,10 @@ pub async fn handle_chat_completions(
                 &messages,
                 max_tokens,
                 temperature,
+                top_p,
+                seed,
                 &stop_strings,
+                constrained_schema,
             )
         })
         .await
@@ -288,12 +292,16 @@ pub async fn handle_chat_completions(
 /// `delta: {role: "assistant"}`; subsequent chunks emit
 /// `delta: {content: "<token text>"}`; the final chunk has empty
 /// `delta` and `finish_reason`. Stream terminates with `data: [DONE]`.
+#[allow(clippy::too_many_arguments)]
 fn stream_chat_completion(
     model: Arc<LoadedModel>,
     messages: Vec<ChatMessage>,
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
     stop_strings: Vec<String>,
+    constrained_schema: Option<Schema>,
     model_id: String,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -330,53 +338,77 @@ fn stream_chat_completion(
             return;
         }
 
-        let _ = temperature; // accepted; layer_graph::generate is greedy.
-
         let patched = model.patched.blocking_read();
         let index = patched.base();
         let backend = larql_compute::default_backend();
         let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
         let num_layers = weights.num_layers;
 
-        // Stream tokens via generate_streaming's per-token callback.
-        // The callback fires inside the decode loop; we push each
-        // chunk into the SSE channel and bail early on disconnect.
+        // Per-token callback used by both the sampling and the
+        // constrained streaming paths. Pushes one SSE chunk per token
+        // and tracks completion text so client-supplied stop strings
+        // can halt generation early. `early_stop` is shared with the
+        // post-loop finish-reason check via Rc<Cell<bool>> — ergonomic
+        // single-threaded mutable state, since the whole spawn_blocking
+        // body runs on one thread.
         let chat_id_cb = chat_id.clone();
         let model_id_cb = model_id.clone();
         let tx_cb = tx.clone();
         let stop_strings_cb = stop_strings.clone();
+        let early_stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        let early_stop_cb = early_stop.clone();
         let mut completion_text = String::new();
-        let mut early_stop = false;
-        let result = larql_inference::layer_graph::generate_streaming(
-            weights,
-            &model.tokenizer,
-            &prompt_ids,
-            max_tokens,
-            index,
-            &*backend,
-            &cached_layers,
-            0..num_layers,
-            larql_inference::SamplingConfig::greedy(),
-            &larql_inference::EosConfig::builtin(),
-            |_id, text, _prob| {
-                if early_stop {
-                    return;
-                }
-                let chunk = build_chat_chunk(&chat_id_cb, &model_id_cb, None, Some(text), None);
-                if tx_cb.blocking_send(chunk).is_err() {
-                    early_stop = true;
-                    return;
-                }
-                completion_text.push_str(text);
-                if !stop_strings_cb.is_empty() && contains_any(&completion_text, &stop_strings_cb) {
-                    early_stop = true;
-                }
-            },
-        );
+        let on_token = move |_id: u32, text: &str, _prob: f64| {
+            if early_stop_cb.get() {
+                return;
+            }
+            let chunk = build_chat_chunk(&chat_id_cb, &model_id_cb, None, Some(text), None);
+            if tx_cb.blocking_send(chunk).is_err() {
+                early_stop_cb.set(true);
+                return;
+            }
+            completion_text.push_str(text);
+            if !stop_strings_cb.is_empty() && contains_any(&completion_text, &stop_strings_cb) {
+                early_stop_cb.set(true);
+            }
+        };
+
+        let result = if let Some(schema) = constrained_schema {
+            let _ = (temperature, top_p, seed); // accepted but no-op for constrained
+            let mask = build_constrained_mask(&model.tokenizer, schema);
+            larql_inference::layer_graph::generate_constrained_streaming(
+                weights,
+                &model.tokenizer,
+                &prompt_ids,
+                max_tokens,
+                index,
+                &*backend,
+                &cached_layers,
+                0..num_layers,
+                mask,
+                on_token,
+            )
+        } else {
+            let (sampling, eos) =
+                super::util::build_sampling_eos(temperature, top_p, seed, &stop_strings);
+            larql_inference::layer_graph::generate_streaming(
+                weights,
+                &model.tokenizer,
+                &prompt_ids,
+                max_tokens,
+                index,
+                &*backend,
+                &cached_layers,
+                0..num_layers,
+                sampling,
+                &eos,
+                on_token,
+            )
+        };
 
         // Final-chunk finish reason: layer_graph::generate halts on
         // EOS internally; tokens.len() < max_tokens implies stop.
-        let finish_reason: &'static str = if early_stop || result.tokens.len() < max_tokens {
+        let finish_reason: &'static str = if early_stop.get() || result.tokens.len() < max_tokens {
             "stop"
         } else {
             "length"
@@ -425,15 +457,25 @@ fn build_chat_chunk(
     chunk.to_string()
 }
 
-/// Render `messages` to a single prompt, then run the un-KV-cached
-/// generation loop. Returns `(text, finish_reason, prompt_tokens,
-/// completion_tokens)`.
+/// Render `messages` to a single prompt, then run the generation loop.
+/// Returns `(text, finish_reason, prompt_tokens, completion_tokens)`.
+///
+/// Branches on `constrained_schema`:
+/// - `None` → sampling path (`generate_with_sampling`).
+/// - `Some(schema)` → grammar-mask path (`generate_constrained`).
+///   Sampling fields (temperature/top_p/seed) are accepted but ignored
+///   in this slice — constrained decoding is greedy by design so JSON /
+///   structured output is deterministic.
+#[allow(clippy::too_many_arguments)]
 fn run_chat_completion(
     model: &LoadedModel,
     messages: &[ChatMessage],
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
     stop_strings: &[String],
+    constrained_schema: Option<Schema>,
 ) -> Result<(String, &'static str, usize, usize), ServerError> {
     // Take an exclusive write guard on the weights for the duration
     // of generation. `larql_inference::layer_graph::generate` mutates
@@ -458,23 +500,43 @@ fn run_chat_completion(
         ));
     }
     let prompt_token_count = prompt_ids.len();
-    let _ = temperature; // accepted; layer_graph::generate is greedy.
 
     let patched = model.patched.blocking_read();
     let index = patched.base();
     let backend = larql_compute::default_backend();
     let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
     let num_layers = weights.num_layers;
-    let result = larql_inference::layer_graph::generate(
-        weights,
-        &model.tokenizer,
-        &prompt_ids,
-        max_tokens,
-        index,
-        &*backend,
-        &cached_layers,
-        0..num_layers,
-    );
+
+    let result = if let Some(schema) = constrained_schema {
+        let _ = (temperature, top_p, seed); // accepted but no-op for constrained
+        let mask = build_constrained_mask(&model.tokenizer, schema);
+        larql_inference::layer_graph::generate_constrained(
+            weights,
+            &model.tokenizer,
+            &prompt_ids,
+            max_tokens,
+            index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
+            mask,
+        )
+    } else {
+        let (sampling, eos) =
+            super::util::build_sampling_eos(temperature, top_p, seed, stop_strings);
+        larql_inference::layer_graph::generate_with_sampling(
+            weights,
+            &model.tokenizer,
+            &prompt_ids,
+            max_tokens,
+            index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
+            sampling,
+            &eos,
+        )
+    };
 
     let mut completion_text = String::new();
     let mut completion_token_count = 0usize;
@@ -533,6 +595,95 @@ fn render(template: larql_inference::prompt::ChatTemplate, messages: &[ChatMessa
 
 fn is_empty_json_array(v: &serde_json::Value) -> bool {
     v.as_array().map(|a| a.is_empty()).unwrap_or(false)
+}
+
+/// Map an OpenAI `response_format` field to the `Schema` the FSM
+/// should enforce. `None` (or `{type: "text"}`) means "no constrained
+/// decoding" — fall through to the sampling path.
+///
+/// `json_object` compiles to `Schema::Object(any)`. `json_schema`
+/// reaches into `json_schema.schema` and runs the JSON Schema parser
+/// with `strict: true` when the `strict` field is set (matching
+/// OpenAI's structured-outputs contract).
+fn schema_for_response_format(
+    rf: Option<&serde_json::Value>,
+) -> Result<Option<Schema>, ServerError> {
+    let Some(rf) = rf else {
+        return Ok(None);
+    };
+    let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+    match kind {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(Schema::object(ObjectSchema::any()))),
+        "json_schema" => {
+            let js = rf.get("json_schema").ok_or_else(|| {
+                ServerError::BadRequest(
+                    "response_format.type=json_schema requires a json_schema field".into(),
+                )
+            })?;
+            let schema_value = js.get("schema").ok_or_else(|| {
+                ServerError::BadRequest("response_format.json_schema.schema is required".into())
+            })?;
+            // OpenAI's `strict: true` flips the additionalProperties default
+            // to false. Default is `false` here so non-strict callers can
+            // still send extra keys.
+            let strict = js.get("strict").and_then(|v| v.as_bool()).unwrap_or(false);
+            let opts = super::schema::ParseOptions { strict };
+            let parsed = super::schema::parse_schema_with(schema_value, opts)
+                .map_err(|e| ServerError::BadRequest(format!("invalid json_schema: {e}")))?;
+            Ok(Some(parsed))
+        }
+        other => Err(ServerError::BadRequest(format!(
+            "response_format.type {other:?} is not supported (expected \
+             \"text\" | \"json_object\" | \"json_schema\")"
+        ))),
+    }
+}
+
+/// Resolve common end-of-turn token ids for the loaded model. The
+/// constrained-mask uses these to gate EOS — the model can't truncate
+/// while the FSM is mid-structure, but once the FSM is complete the
+/// EOS tokens become legal again.
+///
+/// Looks up a small set of well-known special markers
+/// (`<end_of_turn>`, `<|im_end|>`, `<eos>`, `</s>`, etc.) via
+/// `tokenizer.token_to_id` and ignores any that aren't present in the
+/// vocab.
+fn resolve_eos_token_ids(
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
+) -> std::collections::HashSet<u32> {
+    let mut ids = std::collections::HashSet::new();
+    for tok in [
+        "<end_of_turn>",
+        "<|end_of_turn|>",
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<|eom_id|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<eos>",
+        "</s>",
+    ] {
+        if let Some(id) = tokenizer.token_to_id(tok) {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
+/// Build the masked-vocab callback the constrained generator expects.
+/// Wraps the tokenizer in `Arc` (the schema mask caches surface forms
+/// per id), seeds a fresh FSM from `schema`, and includes the model's
+/// EOS marker ids so structured output can terminate cleanly once the
+/// FSM hits `is_complete()`.
+fn build_constrained_mask(
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
+    schema: Schema,
+) -> impl FnMut(&[u32], &mut Vec<f32>) {
+    let eos_ids = resolve_eos_token_ids(tokenizer);
+    let tk: std::sync::Arc<larql_inference::tokenizers::Tokenizer> =
+        std::sync::Arc::new(tokenizer.clone());
+    super::schema::build_mask(tk, super::schema::Fsm::new(schema), String::new(), eos_ids)
 }
 
 #[cfg(test)]

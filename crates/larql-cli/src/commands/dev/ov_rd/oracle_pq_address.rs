@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use larql_inference::attention::run_attention_block_with_pre_o;
+use larql_inference::attention::{
+    run_attention_block_with_pre_o, run_attention_block_with_pre_o_and_all_attention_weights,
+};
 use larql_inference::forward::ple::precompute_per_layer_inputs;
 use larql_inference::forward::{embed_tokens_pub, run_layer_with_ffn};
 use larql_inference::{encode_prompt, WeightFfn};
@@ -8,18 +10,30 @@ use larql_vindex::VectorIndex;
 use ndarray::{s, ArrayView1};
 
 use super::address::{
-    address_feature_key, address_probe_names, lsh_bucket, predict_code_from_hyperplanes,
-    prev_ffn_feature_key, prev_ffn_feature_probe_names, top_feature_ids_from_activation_row,
-    train_binary_hyperplane, AddressLshGroupModel, AddressProbeModel, AddressSupervisedGroupModel,
+    address_feature_key, address_probe_names, attention_cluster_key, attention_cluster_probe_names,
+    attention_pattern_features, attention_relation_key, attention_relation_probe_names, lsh_bucket,
+    nearest_attention_cluster, predict_code_from_hyperplanes, prev_ffn_feature_key,
+    prev_ffn_feature_probe_names, top_feature_ids_from_activation_row, train_binary_hyperplane,
+    AddressAttentionClusterGroupModel, AddressLshGroupModel, AddressProbeModel,
+    AddressSupervisedGroupModel,
 };
 use super::basis::{WoRoundtripBasis, ZPcaBasis};
 use super::metrics::argmax_usize;
-use super::pq::PqCodebook;
+use super::pq::{kmeans_centroids, PqCodebook};
 use super::runtime::{insert_q4k_layer_tensors, remove_layer_tensors};
 use super::stats::StaticHeadMeans;
 use super::types::{HeadId, PqConfig, PromptRecord};
 
 type SampleVisitResult = Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Debug, Clone)]
+struct AttentionClusterFitSample {
+    features: Vec<f64>,
+    codes: Vec<usize>,
+    token_ids: Vec<u32>,
+    stratum: String,
+    position: usize,
+}
 
 pub(super) fn fit_address_probe_models(
     weights: &mut larql_inference::ModelWeights,
@@ -51,7 +65,8 @@ pub(super) fn fit_address_probe_models(
         "address-fit",
         false,
         0,
-        |head, config, pos, codes, token_ids, stratum, _, _| {
+        false,
+        |head, config, pos, codes, token_ids, stratum, _, _, _| {
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
                 let counts = majority_counts
@@ -181,7 +196,8 @@ pub(super) fn fit_address_prev_ffn_feature_group_models(
         "prev-ffn-feature-fit",
         false,
         feature_top_k,
-        |head, config, pos, codes, token_ids, stratum, _, prev_features| {
+        false,
+        |head, config, pos, codes, token_ids, stratum, _, prev_features, _| {
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
                 let counts = majority_counts
@@ -266,6 +282,267 @@ pub(super) fn fit_address_prev_ffn_feature_group_models(
     Ok(models)
 }
 
+pub(super) fn fit_address_attention_relation_group_models(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+) -> Result<HashMap<(HeadId, PqConfig), Vec<AddressProbeModel>>, Box<dyn std::error::Error>> {
+    let names = attention_relation_probe_names();
+    let mut key_counts: HashMap<(HeadId, PqConfig, String, usize, String), Vec<usize>> =
+        HashMap::new();
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+
+    visit_code_samples(
+        weights,
+        index,
+        tokenizer,
+        prompts,
+        heads,
+        bases,
+        means,
+        pca_bases,
+        codebooks,
+        "attention-relation-fit",
+        false,
+        0,
+        true,
+        |head, config, pos, codes, token_ids, stratum, _, _, attention_weights| {
+            for (group, &code) in codes.iter().enumerate() {
+                let levels = 1usize << config.bits_per_group;
+                let counts = majority_counts
+                    .entry((head, config, group))
+                    .or_insert_with(|| vec![0; levels]);
+                counts[code] += 1;
+            }
+            let attention_weights =
+                attention_weights.ok_or("missing attention row during relation address fit")?;
+            for &group in selected_groups {
+                let code = codes[group];
+                for name in &names {
+                    let key =
+                        attention_relation_key(name, token_ids, stratum, pos, attention_weights);
+                    let levels = 1usize << config.bits_per_group;
+                    let counts = key_counts
+                        .entry((head, config, (*name).to_string(), group, key))
+                        .or_insert_with(|| vec![0; levels]);
+                    counts[code] += 1;
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut models = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let mut probe_models = Vec::new();
+        for name in &names {
+            let mut group_majority = Vec::with_capacity(config.groups);
+            let mut group_maps = vec![HashMap::new(); config.groups];
+            let mut group_train_accuracy = vec![0.0; config.groups];
+            for group in 0..config.groups {
+                let majority = majority_counts
+                    .get(&(*head, *config, group))
+                    .map(|counts| argmax_usize(counts))
+                    .unwrap_or(0);
+                group_majority.push(majority);
+            }
+            for &group in selected_groups {
+                let mut map = HashMap::new();
+                let mut correct = 0usize;
+                let mut total = 0usize;
+                for ((map_head, map_config, map_name, map_group, key), counts) in key_counts.iter()
+                {
+                    if map_head == head
+                        && map_config == config
+                        && map_name == name
+                        && *map_group == group
+                    {
+                        let best = argmax_usize(counts);
+                        correct += counts[best];
+                        total += counts.iter().sum::<usize>();
+                        map.insert(key.clone(), best);
+                    }
+                }
+                group_maps[group] = map;
+                group_train_accuracy[group] = if total == 0 {
+                    0.0
+                } else {
+                    correct as f64 / total as f64
+                };
+            }
+            let selected_group_keys = (0..config.groups)
+                .map(|group| {
+                    if selected_groups.contains(&group) {
+                        format!("{}_train_acc_{:.3}", name, group_train_accuracy[group])
+                    } else {
+                        "majority".to_string()
+                    }
+                })
+                .collect();
+            probe_models.push(AddressProbeModel {
+                name: (*name).to_string(),
+                group_majority,
+                group_maps,
+                group_train_accuracy,
+                selected_group_keys,
+            });
+        }
+        models.insert((*head, *config), probe_models);
+    }
+
+    Ok(models)
+}
+
+pub(super) fn fit_address_attention_cluster_group_models(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+    cluster_counts: &[usize],
+) -> Result<
+    HashMap<(HeadId, PqConfig), Vec<AddressAttentionClusterGroupModel>>,
+    Box<dyn std::error::Error>,
+> {
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+    let mut samples: HashMap<(HeadId, PqConfig), Vec<AttentionClusterFitSample>> = HashMap::new();
+
+    visit_code_samples(
+        weights,
+        index,
+        tokenizer,
+        prompts,
+        heads,
+        bases,
+        means,
+        pca_bases,
+        codebooks,
+        "attention-cluster-fit",
+        false,
+        0,
+        true,
+        |head, config, pos, codes, token_ids, stratum, _, _, attention_weights| {
+            for (group, &code) in codes.iter().enumerate() {
+                let levels = 1usize << config.bits_per_group;
+                let counts = majority_counts
+                    .entry((head, config, group))
+                    .or_insert_with(|| vec![0; levels]);
+                counts[code] += 1;
+            }
+            let attention_weights =
+                attention_weights.ok_or("missing attention row during cluster address fit")?;
+            samples
+                .entry((head, config))
+                .or_default()
+                .push(AttentionClusterFitSample {
+                    features: attention_pattern_features(attention_weights, pos),
+                    codes: codes.to_vec(),
+                    token_ids: token_ids.to_vec(),
+                    stratum: stratum.to_string(),
+                    position: pos,
+                });
+            Ok(())
+        },
+    )?;
+
+    let mut models = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let train_samples = samples.get(&(*head, *config)).cloned().unwrap_or_default();
+        let feature_rows = train_samples
+            .iter()
+            .map(|sample| sample.features.clone())
+            .collect::<Vec<_>>();
+        let mut group_majority = Vec::with_capacity(config.groups);
+        for group in 0..config.groups {
+            let majority = majority_counts
+                .get(&(*head, *config, group))
+                .map(|counts| argmax_usize(counts))
+                .unwrap_or(0);
+            group_majority.push(majority);
+        }
+
+        let mut cluster_models = Vec::new();
+        for &cluster_count in cluster_counts {
+            let centroids = kmeans_centroids(&feature_rows, cluster_count, 25);
+            let assignments = train_samples
+                .iter()
+                .map(|sample| nearest_attention_cluster(&sample.features, &centroids))
+                .collect::<Vec<_>>();
+            for name in attention_cluster_probe_names(cluster_count) {
+                let mut key_counts: HashMap<(usize, String), Vec<usize>> = HashMap::new();
+                for (sample, &cluster) in train_samples.iter().zip(assignments.iter()) {
+                    let key = attention_cluster_key(
+                        &name,
+                        &sample.token_ids,
+                        &sample.stratum,
+                        sample.position,
+                        cluster,
+                    );
+                    for &group in selected_groups {
+                        let levels = 1usize << config.bits_per_group;
+                        let counts = key_counts
+                            .entry((group, key.clone()))
+                            .or_insert_with(|| vec![0; levels]);
+                        counts[sample.codes[group]] += 1;
+                    }
+                }
+
+                let mut group_maps = vec![HashMap::new(); config.groups];
+                let mut group_train_accuracy = vec![0.0; config.groups];
+                for &group in selected_groups {
+                    let mut correct = 0usize;
+                    let mut total = 0usize;
+                    for ((map_group, key), counts) in key_counts.iter() {
+                        if *map_group == group {
+                            let best = argmax_usize(counts);
+                            correct += counts[best];
+                            total += counts.iter().sum::<usize>();
+                            group_maps[group].insert(key.clone(), best);
+                        }
+                    }
+                    group_train_accuracy[group] = if total == 0 {
+                        0.0
+                    } else {
+                        correct as f64 / total as f64
+                    };
+                }
+                let selected_group_keys = (0..config.groups)
+                    .map(|group| {
+                        if selected_groups.contains(&group) {
+                            format!("{}_train_acc_{:.3}", name, group_train_accuracy[group])
+                        } else {
+                            "majority".to_string()
+                        }
+                    })
+                    .collect();
+                cluster_models.push(AddressAttentionClusterGroupModel {
+                    name,
+                    groups: selected_groups.to_vec(),
+                    centroids: centroids.clone(),
+                    group_majority: group_majority.clone(),
+                    group_maps,
+                    selected_group_keys,
+                });
+            }
+        }
+        models.insert((*head, *config), cluster_models);
+    }
+
+    Ok(models)
+}
+
 pub(super) fn fit_address_lsh_group_models(
     weights: &mut larql_inference::ModelWeights,
     index: &VectorIndex,
@@ -297,7 +574,8 @@ pub(super) fn fit_address_lsh_group_models(
         "lsh-fit",
         true,
         0,
-        |head, config, _pos, codes, _token_ids, _stratum, input_row, _| {
+        false,
+        |head, config, _pos, codes, _token_ids, _stratum, input_row, _, _| {
             let input_row = input_row.ok_or("missing layer-input row during LSH address fit")?;
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
@@ -421,7 +699,8 @@ pub(super) fn fit_address_supervised_group_models(
         "supervised-fit",
         true,
         0,
-        |head, config, _pos, codes, _token_ids, _stratum, input_row, _| {
+        false,
+        |head, config, _pos, codes, _token_ids, _stratum, input_row, _, _| {
             let input_row =
                 input_row.ok_or("missing layer-input row during supervised address fit")?;
             for (group, &code) in codes.iter().enumerate() {
@@ -527,7 +806,8 @@ pub(super) fn fit_majority_codes_for_codebooks(
         "majority-fit",
         false,
         0,
-        |head, config, _pos, codes, _token_ids, _stratum, _, _| {
+        false,
+        |head, config, _pos, codes, _token_ids, _stratum, _, _, _| {
             for (group, &code) in codes.iter().enumerate() {
                 let levels = 1usize << config.bits_per_group;
                 let counts = majority_counts
@@ -568,6 +848,7 @@ fn visit_code_samples<F>(
     label_prefix: &str,
     with_layer_input: bool,
     prev_ffn_feature_top_k: usize,
+    with_attention_relation: bool,
     mut visit: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -580,6 +861,7 @@ where
         &str,
         Option<&[f32]>,
         Option<&[usize]>,
+        Option<&[f32]>,
     ) -> SampleVisitResult,
 {
     let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
@@ -618,8 +900,21 @@ where
                 } else {
                     None
                 };
-                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
-                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let capture = if with_attention_relation {
+                    let (_, pre_o, all_weights) =
+                        run_attention_block_with_pre_o_and_all_attention_weights(
+                            weights, &h, layer, None,
+                        )
+                        .ok_or_else(|| {
+                            format!("pre-W_O/all-attention capture failed at layer {layer}")
+                        })?;
+                    (pre_o, Some(all_weights))
+                } else {
+                    let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                        .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                    (pre_o, None)
+                };
+                let (pre_o, all_weights) = capture;
                 let head_dim = weights.arch.head_dim_for_layer(layer);
                 for head in layer_heads {
                     let basis = bases.get(head).ok_or_else(|| {
@@ -651,6 +946,11 @@ where
                         let z = basis.residual_to_z(&residual);
                         let input_row = layer_input.as_ref().map(|input| input.row(pos).to_vec());
                         let prev_features = prev_ffn_features_by_pos.get(pos).map(Vec::as_slice);
+                        let attention_row = all_weights
+                            .as_ref()
+                            .and_then(|weights| weights.heads.get(head.head))
+                            .and_then(|head_weights| head_weights.get(pos))
+                            .map(Vec::as_slice);
                         for ((_, config), codebook) in &head_codebooks {
                             let coords = pca_basis.coordinates_with_rank(&z, config.k);
                             let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
@@ -663,6 +963,7 @@ where
                                 stratum,
                                 input_row.as_deref(),
                                 prev_features,
+                                attention_row,
                             )?;
                         }
                     }

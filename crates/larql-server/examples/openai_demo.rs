@@ -5,22 +5,19 @@
 //! Usage:
 //!   cargo run -p larql-server --example openai_demo -- <vindex_path>
 //!
-//! ## Recommended vindex
+//! ## Vindex compatibility
 //!
-//! Use **f16** vindexes for the demo — the un-KV-cached generation
-//! path used by `/v1/completions` and `/v1/chat/completions` produces
-//! correct, intelligible output (e.g. "The capital of France is" → "
-//! Paris."). On Q4_K vindexes the un-cached forward pass produces
-//! degenerate output (e.g. " is is is is"); the wire shape is still
-//! correct but the content isn't useful. This is fixed when the
-//! KV-cached generation path lands (N0.2-fast in ROADMAP).
+//! Both **f16** and **Q4_K** vindexes produce correct, intelligible
+//! output now that the KV-cached generation path is wired up
+//! (e.g. "The capital of France is" → " Paris.").
 //!
 //! ```bash
-//! # Recommended for slice 1-3 demo:
+//! # f16 (fastest, KV-cached):
 //! cargo run --release -p larql-server --example openai_demo -- \
 //!   output/gemma3-4b-f16.vindex
 //!
-//! # Q4_K vindex: wire shape correct, content degenerate (N0.2-fast):
+//! # Q4_K (correct output; CPU per-step Q4_K decode is O(N²) so
+//! # high `max_tokens` runs are slow):
 //! cargo run --release -p larql-server --example openai_demo -- \
 //!   output/gemma3-4b-q4k-streaming.vindex
 //! ```
@@ -211,24 +208,31 @@ async fn demo_completions(app: &Router, model_id: &str) {
     println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
     println!("{}", pretty(&body));
     println!(
-        "\nNote: slice 1 generation is un-KV-cached — expect ~1-3 tok/s on\n\
-         CPU for Gemma 3 4B. KV-cached fast path is N0.2-fast in ROADMAP.\n\
-         Output text quality depends on the base model and the chat\n\
-         template (which slice 1 doesn't apply); chat completions in\n\
-         slice 2 (N0.1) will render the chat template."
+        "\nNote: generation runs through the KV-cached path\n\
+         (`larql_inference::layer_graph::generate_with_sampling`) on\n\
+         f16 vindexes, with a per-step Q4_K fallback on CPU+Q4_K\n\
+         vindexes. Output text quality depends on the base model."
     );
 
-    section("POST /v1/completions — stream=true (returns 400 in slice 1)");
+    section("POST /v1/completions — temperature + top_p + seed (reproducible)");
     let req = serde_json::json!({
         "model": model_id,
-        "prompt": "x",
-        "max_tokens": 1,
-        "stream": true
+        "prompt": "Once upon a time",
+        "max_tokens": 6,
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "seed": 42
     });
+    println!("Request body:\n{}", pretty(&req));
     let t = Instant::now();
     let (status, body) = post_json(app, "/v1/completions", &req).await;
-    println!("Status: {status}  ({} ms)", t.elapsed().as_millis());
+    println!("\nStatus: {status}  ({} ms)", t.elapsed().as_millis());
     println!("{}", pretty(&body));
+    println!(
+        "\nNote: seed=42 + temperature>0 makes output reproducible —\n\
+         re-running with the same prompt and seed yields the same\n\
+         tokens. Drop the seed to get a fresh sample each call."
+    );
 
     section("POST /v1/completions — n=3 (returns 400)");
     let req = serde_json::json!({
@@ -261,10 +265,10 @@ async fn demo_chat_completions(app: &Router, model_id: &str) {
     println!("{}", pretty(&body));
     println!(
         "\nNote: messages render through the model's chat template\n\
-         (Gemma / Llama / ChatML / Mistral / Plain). Output content\n\
-         quality depends on the un-KV-cached generation path —\n\
-         N0.2-fast (KV-cached) addresses that. Wire shape is what's\n\
-         verified here."
+         (Gemma / Llama / ChatML / Mistral / Plain) before going into\n\
+         the KV-cached generation loop. Sampling fields\n\
+         (temperature, top_p, seed, stop) plumb through the same way\n\
+         /v1/completions wires them."
     );
 
     section("POST /v1/chat/completions — tools field (returns 400 in slice 2)");

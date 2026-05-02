@@ -24,6 +24,7 @@
 pub mod embed;
 pub mod hooks;
 pub mod infer_patched;
+pub mod inference_weights;
 pub mod kv_generate;
 pub mod layer;
 mod layer_interventions;
@@ -55,6 +56,7 @@ pub use infer_patched::{
     apply_knn_override, infer_patched, infer_patched_q4k, walk_trace_from_residuals,
     InferPatchedResult, KnnOverride, KNN_COSINE_THRESHOLD,
 };
+pub use inference_weights::InferenceWeights;
 pub use kv_generate::{
     generate_cached, generate_cached_backend, generate_cached_constrained, generate_cached_hooked,
     generate_cached_with_window,

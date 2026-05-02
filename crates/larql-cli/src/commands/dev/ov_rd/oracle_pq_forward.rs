@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use larql_inference::attention::SharedKV;
+use larql_inference::attention::{
+    run_attention_block_with_pre_o_and_all_attention_weights, SharedKV,
+};
 use larql_inference::forward::ple::precompute_per_layer_inputs;
 use larql_inference::forward::{embed_tokens_pub, run_layer_with_ffn};
 use larql_inference::{hidden_to_raw_logits, WeightFfn};
@@ -266,6 +268,70 @@ pub(super) fn capture_prev_ffn_feature_keys(
     }
 
     Ok(prev_features_by_pos)
+}
+
+pub(super) fn capture_attention_relation_rows(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..=head.layer {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        if layer == head.layer {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let (_, _, all_weights) = run_attention_block_with_pre_o_and_all_attention_weights(
+                weights, &h, layer, shared_kv,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "all-position attention capture failed at L{}H{}",
+                    head.layer, head.head
+                )
+            })?;
+            remove_layer_tensors(weights, inserted);
+            return all_weights.heads.get(head.head).cloned().ok_or_else(|| {
+                format!("attention capture missing L{}H{}", head.layer, head.head).into()
+            });
+        }
+
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            run_layer_with_ffn(
+                weights,
+                &h,
+                layer,
+                &ffn,
+                false,
+                ple_inputs.get(layer),
+                shared_kv,
+            )
+            .map(|(h_new, _, kv_out)| (h_new, kv_out))
+        };
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!("layer {layer} returned no output").into());
+        }
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Err(format!("target layer {} was not reached", head.layer).into())
 }
 
 pub(super) fn final_logits(weights: &larql_inference::ModelWeights, h: &Array2<f32>) -> Vec<f32> {

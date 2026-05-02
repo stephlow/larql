@@ -357,6 +357,14 @@ impl Session {
             }
         }
 
+        if let Some(override_obj) = result["knn_override"].as_object() {
+            out.push(remote_knn_override_line(override_obj));
+            out.push(
+                "note: KNN override is a post-logits retrieval sidecar, not an FFN/residual edit."
+                    .into(),
+            );
+        }
+
         if let Some(ms) = result["latency_ms"].as_f64() {
             out.push(format!("{:.0}ms (remote)", ms));
         }
@@ -402,7 +410,21 @@ impl Session {
         let mut out = Vec::new();
         out.push(format!("Inference trace for {:?}{}:", prompt, band_label));
 
-        if let Some(preds) = result["predictions"].as_array() {
+        if let Some(override_obj) = result["knn_override"].as_object() {
+            let tok = override_obj
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            out.push(format!(
+                "Prediction: {} ({})",
+                tok,
+                remote_knn_override_summary(override_obj)
+            ));
+            out.push(
+                "Pending retrieval override: not part of the residual/FFN trace until materialized."
+                    .into(),
+            );
+        } else if let Some(preds) = result["predictions"].as_array() {
             if let Some(first) = preds.first() {
                 let tok = first["token"].as_str().unwrap_or("?");
                 let prob = first["probability"].as_f64().unwrap_or(0.0);
@@ -968,4 +990,42 @@ impl Session {
             ))),
         }
     }
+}
+
+fn remote_knn_override_line(override_obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let tok = override_obj
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    format!(
+        "KNN override: {} ({})",
+        tok,
+        remote_knn_override_summary(override_obj)
+    )
+}
+
+fn remote_knn_override_summary(
+    override_obj: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let cosine = override_obj
+        .get("cosine")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let layer = override_obj
+        .get("layer")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut summary = format!("source=knn_override/post_logits, cos={cosine:.2}, L{layer}");
+    if let Some(model_top1) = override_obj.get("model_top1").and_then(|v| v.as_object()) {
+        let tok = model_top1
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let prob = model_top1
+            .get("probability")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        summary.push_str(&format!(", model_top1={} ({:.2}%)", tok, prob * 100.0));
+    }
+    summary
 }

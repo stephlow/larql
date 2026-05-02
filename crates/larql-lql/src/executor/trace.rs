@@ -6,6 +6,13 @@
 
 use crate::ast::{Range, TracePositionMode};
 use crate::error::LqlError;
+use crate::executor::helpers::format_knn_override_summary;
+
+#[derive(Debug)]
+struct PendingRetrievalOverride {
+    override_: larql_inference::KnnOverride,
+    model_top1: Option<(String, f64)>,
+}
 
 impl super::Session {
     pub(crate) fn exec_trace(
@@ -24,7 +31,8 @@ impl super::Session {
         {
             let ffn = larql_inference::WeightFfn { weights };
             return self.exec_trace_with_ffn(
-                weights, tokenizer, &ffn, prompt, answer, decompose, layers, positions, save,
+                weights, tokenizer, &ffn, None, None, prompt, answer, decompose, layers, positions,
+                save,
             );
         }
 
@@ -37,6 +45,15 @@ impl super::Session {
                 config.model,
                 path.display(),
             )));
+        }
+
+        if config.quant != larql_vindex::QuantFormat::None {
+            return Err(LqlError::Execution(
+                "TRACE does not yet support quantised (q4k) vindexes — the decomposed forward \
+                 pass requires f32 attention tensors that are not present in q4k format. \
+                 Tracked as T2 in the ROADMAP."
+                    .into(),
+            ));
         }
 
         let mut cb = larql_vindex::SilentLoadCallbacks;
@@ -52,7 +69,17 @@ impl super::Session {
         let walk_ffn = larql_inference::vindex::WalkFfn::new_unlimited(&weights, patched);
 
         self.exec_trace_with_ffn(
-            &weights, &tokenizer, &walk_ffn, prompt, answer, decompose, layers, positions, save,
+            &weights,
+            &tokenizer,
+            &walk_ffn,
+            Some(patched as &dyn larql_vindex::GateIndex),
+            Some(&patched.knn_store),
+            prompt,
+            answer,
+            decompose,
+            layers,
+            positions,
+            save,
         )
     }
 
@@ -62,6 +89,8 @@ impl super::Session {
         weights: &larql_inference::ModelWeights,
         tokenizer: &larql_inference::tokenizers::Tokenizer,
         ffn: &dyn larql_inference::FfnBackend,
+        gate_index: Option<&dyn larql_vindex::GateIndex>,
+        knn_store: Option<&larql_vindex::KnnStore>,
         prompt: &str,
         answer: Option<&str>,
         decompose: bool,
@@ -73,6 +102,26 @@ impl super::Session {
             .encode(prompt, true)
             .map_err(|e| LqlError::exec("tokenize error", e))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+        let pending_retrieval_override = match (gate_index, knn_store) {
+            (Some(gate_index), Some(store)) if !store.is_empty() => {
+                let infer = larql_inference::infer_patched(
+                    weights,
+                    tokenizer,
+                    gate_index,
+                    Some(store),
+                    &token_ids,
+                    1,
+                );
+                infer
+                    .knn_override
+                    .map(|override_| PendingRetrievalOverride {
+                        override_,
+                        model_top1: infer.model_top1,
+                    })
+            }
+            _ => None,
+        };
 
         let pos = match positions {
             Some(TracePositionMode::All) => larql_inference::TracePositions::All,
@@ -159,6 +208,7 @@ impl super::Session {
                     layer_str, w.rank, w.prob, w.attn_logit, w.ffn_logit, who,
                 ));
             }
+            append_pending_retrieval_override(&mut out, pending_retrieval_override.as_ref());
             return self.maybe_save_and_return(out, &trace, weights, save);
         }
 
@@ -195,6 +245,7 @@ impl super::Session {
                     layer_str, attn_norm, ffn_norm, res_norm, ratio,
                 ));
             }
+            append_pending_retrieval_override(&mut out, pending_retrieval_override.as_ref());
             return self.maybe_save_and_return(out, &trace, weights, save);
         }
 
@@ -221,6 +272,7 @@ impl super::Session {
             ));
         }
 
+        append_pending_retrieval_override(&mut out, pending_retrieval_override.as_ref());
         self.maybe_save_and_return(out, &trace, weights, save)
     }
 
@@ -255,4 +307,24 @@ impl super::Session {
 
 fn vec_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+fn append_pending_retrieval_override(
+    out: &mut Vec<String>,
+    pending: Option<&PendingRetrievalOverride>,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    out.push(String::new());
+    out.push("Pending retrieval override:".into());
+    out.push(format!(
+        "  {} ({})",
+        pending.override_.token,
+        format_knn_override_summary(&pending.override_, pending.model_top1.as_ref())
+    ));
+    out.push(
+        "  note: KNN sidecar is applied after logits; it is not part of this residual/FFN DAG."
+            .into(),
+    );
 }

@@ -85,42 +85,36 @@ impl VectorIndex {
         self.lm_head_knn(query, top_k)
     }
 
-    /// Same as `lm_head_knn_backend` but skips the **production**
-    /// `q4k_matvec` path (path 1 of the canonical chain) — its 32-lane
-    /// simdgroup reduction drifts ~1e-3 vs CPU's sequential dot product,
-    /// which is enough to flip top-1 on close-call tokens (e.g.
-    /// " Capital" vs " capital" at decode step 1 of Gemma 3 4B). Tries
-    /// stable-reduction alternatives in this order:
+    /// Diagnostic alternative to `lm_head_knn_backend` — skips the
+    /// production `q4k_matvec` path and tries stable-reduction
+    /// alternatives in this order:
     ///
     ///   1. **Stride-32 Q4_K matvec** (`backend.q4k_matvec_stride32`) on
     ///      the same Q4_K bytes — same bandwidth as production
-    ///      `q4k_matvec` (~327 MB/token read), but with `f16_gemv`'s
-    ///      reduction tree. **Default first attempt** because Q4_K is
-    ///      4× cheaper bandwidth than f16 (327 MB vs 1.31 GB). Measured
-    ///      lm_head 2.95 ms vs f16 3.88 ms on Gemma 3 4B v2.
+    ///      `q4k_matvec` (~327 MB/token), but with `f16_gemv`'s
+    ///      reduction tree. ~2.95 ms/tok lm_head on Gemma 3 4B v2.
     ///   2. f16 GEMV on `embeddings.bin` mmap (tied-embed only).
-    ///      Fallback for vindexes that don't have Q4_K lm_head bytes.
-    ///      Also reachable as the first attempt via the legacy
-    ///      `LARQL_LM_HEAD_STRIDE32=0` opt-out (kept for diagnostic A/B).
+    ///      Fallback when Q4_K bytes aren't populated. ~3.88 ms/tok.
     ///   3. f32 BLAS fallback (`lm_head_knn`).
     ///
-    /// Decision history (2026-05-02): the f16-first ordering was tried
-    /// briefly and regressed lm_head 2.95 → 3.88 ms (-5 tok/s end-to-end)
-    /// on Gemma 3 4B because the 4× bandwidth difference dominates any
-    /// dequant savings — both kernels were already near LPDDR5X peak
-    /// (387 GB/s) for f32_gemv. See `PERFORMANCE.md` "Decision: lm_head
-    /// dispatch order".
+    /// **History:** before 2026-05-02 this was the production default,
+    /// because `lm_head_knn_backend` (which calls `q4k_matvec`) was
+    /// producing argmax drift on close-call tokens. Root cause turned
+    /// out to be a dispatch geometry mismatch in `MetalBackend::q4k_matvec`,
+    /// not a kernel-level reduction-tree drift. With the dispatch fix,
+    /// `q4k_matvec` is correct AND ~1.10 ms/tok faster than stride-32,
+    /// so the canonical chain is now the default and this path is
+    /// reachable via `LARQL_LM_HEAD_SKIP_Q4K=1` as a diagnostic A/B.
+    /// See `PERFORMANCE.md` "Decision: lm_head dispatch order" for
+    /// the full root-cause write-up.
     ///
-    /// Env-var overrides:
-    ///   - `LARQL_LM_HEAD_STRIDE32=0` — disable stride-32 entirely; goes
-    ///     straight to f16 (then f32). Use to A/B the stride-32 win.
-    ///   - `LARQL_METAL_LM_HEAD=1` — route through `lm_head_knn_backend`
-    ///     instead, re-enabling the broken-fast `q4k_matvec` path. Debug
-    ///     only — produces argmax drift on canonical smoke. See ADR-015
-    ///     for the broken-fast pattern.
+    /// Env-var overrides (within this fallback chain):
+    ///   - `LARQL_LM_HEAD_STRIDE32=0` — disable stride-32 entirely; go
+    ///     straight to f16 (then f32). Used to A/B the stride-32 win.
     ///
     /// `lm_head_topk` in `larql-inference::layer_graph::generate::lm_head`
-    /// routes here when the active backend is non-CPU (default).
+    /// routes here only when `LARQL_LM_HEAD_SKIP_Q4K=1` is set on a
+    /// non-CPU backend; the canonical path is `lm_head_knn_backend`.
     pub fn lm_head_knn_backend_skip_q4k(
         &self,
         query: &ndarray::Array1<f32>,

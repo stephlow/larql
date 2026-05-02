@@ -47,6 +47,10 @@ pub struct InferPatchedResult {
     /// the walk FFN's own top-`(k-1)`. When `None`, this is the walk FFN's
     /// raw top-k.
     pub predictions: Vec<(String, f64)>,
+    /// Walk FFN's raw top-1 before the KnnStore post-logits override is
+    /// applied. This lets display layers show what the model path produced
+    /// before an unmaterialized retrieval sidecar changed the answer.
+    pub model_top1: Option<(String, f64)>,
     /// Metadata on the KNN override for callers that want to surface it
     /// (e.g. the LQL display layer prints `"KNN override, cos=X, L{layer}"`).
     pub knn_override: Option<KnnOverride>,
@@ -81,10 +85,12 @@ pub fn infer_patched(
     let walk_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let residuals = walk_ffn.take_residuals();
+    let model_top1 = raw.first().cloned();
     let (predictions, knn_override) = apply_knn_override(raw, &residuals, knn_store, top_k);
 
     InferPatchedResult {
         predictions,
+        model_top1,
         knn_override,
         residuals,
         walk_ms,
@@ -117,10 +123,12 @@ pub fn infer_patched_q4k(
     let walk_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let residuals = walk_ffn.take_residuals();
+    let model_top1 = raw.first().cloned();
     let (predictions, knn_override) = apply_knn_override(raw, &residuals, knn_store, top_k);
 
     InferPatchedResult {
         predictions,
+        model_top1,
         knn_override,
         residuals,
         walk_ms,

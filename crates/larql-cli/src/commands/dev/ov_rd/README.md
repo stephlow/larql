@@ -36,6 +36,7 @@ larql_inference::vindex::predict_q4k_hidden_with_subtracted_pre_o_heads
 larql_inference::vindex::predict_q4k_hidden_with_mapped_head_residual_delta
 larql_inference::vindex::predict_q4k_hidden_with_replaced_head_residual_delta
 larql_inference::vindex::predict_q4k_hidden_with_original_head_residual_delta
+larql_inference::attention::run_attention_block_with_pre_o_and_all_attention_weights
 ```
 
 Those APIs preserve the hard runtime invariants:
@@ -63,6 +64,9 @@ Keep Rust code here when it needs exact model/vindex behavior:
 - oracle low-rank and PQ reconstruction
 - Mode D residual-delta table materialization
 - final-logit KL/top-k evaluation through the real forward path
+- model-native discrete address probes whose inputs are already produced by a
+  real forward pass, for example previous-layer FFN top-feature IDs and
+  attention/relation summaries or learned attention-pattern cluster IDs
 - canonical JSON artifacts that other tools consume
 
 The command should remain an orchestrator plus faithful runtime validator. It
@@ -137,11 +141,12 @@ metrics.rs         KL, entropy, top-k, and distribution helpers
 oracle.rs          roundtrip and low-rank oracle checks
 oracle_pq.rs       PQ experiment orchestration and address probe evaluation
 oracle_pq_address.rs
-                  address-probe and majority-code fitting
+                  address-probe, previous-FFN feature-key, attention-relation-key,
+                  attention-cluster-key, and majority-code fitting
 oracle_pq_eval.rs  shared predicted-address evaluation helper
 oracle_pq_fit.rs   PQ codebook fitting
 oracle_pq_forward.rs
-                  PQ/Mode-D model calls plus experiment-specific mapping logic
+                  PQ/Mode-D model calls plus experiment-specific capture/mapping logic
 oracle_pq_mode_d.rs
                   Mode D residual-table materialization helpers
 oracle_pq_reports.rs

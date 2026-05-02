@@ -8,11 +8,12 @@ use larql_vindex::{
 };
 use std::collections::HashMap;
 
-use super::address::prev_ffn_feature_key;
+use super::address::{attention_relation_key, prev_ffn_feature_key};
 use super::basis::*;
 use super::input::*;
 use super::metrics::*;
 use super::oracle_pq_address::{
+    fit_address_attention_cluster_group_models, fit_address_attention_relation_group_models,
     fit_address_lsh_group_models, fit_address_prev_ffn_feature_group_models,
     fit_address_probe_models, fit_address_supervised_group_models,
     fit_majority_codes_for_codebooks,
@@ -20,8 +21,8 @@ use super::oracle_pq_address::{
 use super::oracle_pq_eval::evaluate_predicted_address;
 use super::oracle_pq_fit::fit_pq_codebooks;
 use super::oracle_pq_forward::{
-    capture_layer_input_hidden, capture_prev_ffn_feature_keys, final_logits,
-    forward_q4k_oracle_pq_head, forward_q4k_oracle_pq_mode_d_head,
+    capture_attention_relation_rows, capture_layer_input_hidden, capture_prev_ffn_feature_keys,
+    final_logits, forward_q4k_oracle_pq_head, forward_q4k_oracle_pq_mode_d_head,
 };
 use super::oracle_pq_mode_d::{corruption_keep_values, materialize_mode_d_tables};
 use super::oracle_pq_reports::OraclePqPointAccumulator;
@@ -167,6 +168,30 @@ pub(super) struct OraclePqArgs {
     /// hash keys.
     #[arg(long, default_value_t = 4)]
     address_prev_ffn_feature_top_k: usize,
+
+    /// Fit and evaluate selected PQ groups from discrete attention/relation
+    /// state keys. This tests whether the dominant address is carried by QK
+    /// routing structure rather than token or FFN-feature state.
+    #[arg(long)]
+    address_attention_relation_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-attention-relation-group-probe.
+    #[arg(long, default_value = "0")]
+    address_attention_relation_groups: String,
+
+    /// Fit and evaluate selected PQ groups from learned attention-pattern
+    /// cluster IDs. This is a discrete relation-catalogue probe over fixed
+    /// features derived from the full attention distribution.
+    #[arg(long)]
+    address_attention_cluster_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-attention-cluster-group-probe.
+    #[arg(long, default_value = "0")]
+    address_attention_cluster_groups: String,
+
+    /// Comma-separated k values for attention-pattern clustering.
+    #[arg(long, default_value = "16,32")]
+    address_attention_cluster_ks: String,
 
     /// Comma-separated PQ groups whose centroids are fit separately per
     /// prompt stratum. This is a codebook-layout diagnostic for cases where a
@@ -350,6 +375,57 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                 if group >= config.groups {
                     return Err(format!(
                         "--address-prev-ffn-feature-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut attention_relation_groups = parse_usize_list(&args.address_attention_relation_groups)?;
+    attention_relation_groups.sort_unstable();
+    attention_relation_groups.dedup();
+    if args.address_attention_relation_group_probe {
+        if attention_relation_groups.is_empty() {
+            return Err("--address-attention-relation-group-probe requires at least one --address-attention-relation-groups value".into());
+        }
+        for config in &configs {
+            for &group in &attention_relation_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-attention-relation-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut attention_cluster_groups = parse_usize_list(&args.address_attention_cluster_groups)?;
+    attention_cluster_groups.sort_unstable();
+    attention_cluster_groups.dedup();
+    let mut attention_cluster_ks = parse_usize_list(&args.address_attention_cluster_ks)?;
+    attention_cluster_ks.sort_unstable();
+    attention_cluster_ks.dedup();
+    if args.address_attention_cluster_group_probe {
+        if attention_cluster_groups.is_empty() {
+            return Err("--address-attention-cluster-group-probe requires at least one --address-attention-cluster-groups value".into());
+        }
+        if attention_cluster_ks.is_empty() {
+            return Err("--address-attention-cluster-ks must include at least one k".into());
+        }
+        for &cluster_count in &attention_cluster_ks {
+            if !(2..=128).contains(&cluster_count) {
+                return Err(
+                    "--address-attention-cluster-ks values must be between 2 and 128".into(),
+                );
+            }
+        }
+        for config in &configs {
+            for &group in &attention_cluster_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-attention-cluster-groups includes group {group}, but config {:?} has only {} groups",
                         config, config.groups
                     )
                     .into());
@@ -545,6 +621,53 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     } else {
         HashMap::new()
     };
+    let address_attention_relation_models = if args.address_attention_relation_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-attention-relation-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting attention-relation group address probes for groups {:?}",
+            attention_relation_groups
+        );
+        fit_address_attention_relation_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &attention_relation_groups,
+        )?
+    } else {
+        HashMap::new()
+    };
+    let address_attention_cluster_models = if args.address_attention_cluster_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-attention-cluster-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting attention-pattern cluster group address probes for groups {:?} (k={:?})",
+            attention_cluster_groups, attention_cluster_ks
+        );
+        fit_address_attention_cluster_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &attention_cluster_groups,
+            &attention_cluster_ks,
+        )?
+    } else {
+        HashMap::new()
+    };
     if args.address_corruption_sweep && !args.mode_d_check {
         return Err("--address-corruption-sweep requires --mode-d-check".into());
     }
@@ -557,6 +680,8 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         || args.address_supervised_group_probe
         || args.address_key_group_probe
         || args.address_prev_ffn_feature_group_probe
+        || args.address_attention_relation_group_probe
+        || args.address_attention_cluster_group_probe
     {
         eprintln!("Fitting per-group majority codes for address diagnostics");
         fit_majority_codes_for_codebooks(
@@ -1108,6 +1233,183 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                     }
                 }
 
+                if args.address_attention_relation_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for attention-relation group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let relation_models = address_attention_relation_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                        format!(
+                            "missing attention-relation group probe model for L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for attention-relation group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let attention_rows =
+                        capture_attention_relation_rows(&mut weights, &token_ids, &index, *head)?;
+                    for probe_model in relation_models {
+                        let selected_group_keys = probe_model.selected_group_keys.clone();
+                        for (probe_name, use_oracle_rest) in [
+                            (
+                                format!(
+                                    "{}_groups_{:?}_oracle_rest",
+                                    probe_model.name, attention_relation_groups
+                                ),
+                                true,
+                            ),
+                            (
+                                format!(
+                                    "{}_groups_{:?}_majority_rest",
+                                    probe_model.name, attention_relation_groups
+                                ),
+                                false,
+                            ),
+                        ] {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let mut codes = if use_oracle_rest {
+                                        oracle_codes.clone()
+                                    } else {
+                                        group_majority.clone()
+                                    };
+                                    let attention_weights =
+                                        attention_rows.get(pos).map(Vec::as_slice).unwrap_or(&[]);
+                                    let key = attention_relation_key(
+                                        &probe_model.name,
+                                        &token_ids,
+                                        stratum,
+                                        pos,
+                                        attention_weights,
+                                    );
+                                    let probe_codes = probe_model.predict_codes_from_key(&key);
+                                    for &group in &attention_relation_groups {
+                                        codes[group] = probe_codes[group];
+                                    }
+                                    codes
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_name,
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
+                        }
+                    }
+                }
+
+                if args.address_attention_cluster_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for attention-cluster group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let cluster_models = address_attention_cluster_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                            format!(
+                                "missing attention-cluster group probe model for L{} H{} {:?}",
+                                head.layer, head.head, config
+                            )
+                        })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for attention-cluster group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let attention_rows =
+                        capture_attention_relation_rows(&mut weights, &token_ids, &index, *head)?;
+                    for cluster_model in cluster_models {
+                        let selected_group_keys = cluster_model.selected_group_keys.clone();
+                        for (probe_name, use_oracle_rest) in [
+                            (
+                                format!(
+                                    "{}_groups_{:?}_oracle_rest",
+                                    cluster_model.name, attention_cluster_groups
+                                ),
+                                true,
+                            ),
+                            (
+                                format!(
+                                    "{}_groups_{:?}_majority_rest",
+                                    cluster_model.name, attention_cluster_groups
+                                ),
+                                false,
+                            ),
+                        ] {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let base_codes = if use_oracle_rest {
+                                        oracle_codes.as_slice()
+                                    } else {
+                                        group_majority.as_slice()
+                                    };
+                                    let attention_weights =
+                                        attention_rows.get(pos).map(Vec::as_slice).unwrap_or(&[]);
+                                    cluster_model.predict_selected_groups(
+                                        &token_ids,
+                                        stratum,
+                                        pos,
+                                        attention_weights,
+                                        base_codes,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &probe_name,
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
+                        }
+                    }
+                }
+
                 if args.address_corruption_sweep {
                     let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
                         format!(
@@ -1277,6 +1579,23 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
             Vec::new()
         },
         address_prev_ffn_feature_top_k: args.address_prev_ffn_feature_top_k,
+        address_attention_relation_group_probe: args.address_attention_relation_group_probe,
+        address_attention_relation_groups: if args.address_attention_relation_group_probe {
+            attention_relation_groups
+        } else {
+            Vec::new()
+        },
+        address_attention_cluster_group_probe: args.address_attention_cluster_group_probe,
+        address_attention_cluster_groups: if args.address_attention_cluster_group_probe {
+            attention_cluster_groups
+        } else {
+            Vec::new()
+        },
+        address_attention_cluster_ks: if args.address_attention_cluster_group_probe {
+            attention_cluster_ks
+        } else {
+            Vec::new()
+        },
         stratum_conditioned_pq_groups,
         selected_heads,
         heads: head_reports,

@@ -27,36 +27,43 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 
 ---
 
-## Current state (2026-05-02)
+## Current state (2026-05-02, post dispatch-geometry fix)
 
 ```
-larql-metal  gemma3-4b-q4k-v2     76.1–76.7 tok/s 13.06–13.14 ms/tok (post O-proj routing fix, quiet GPU)
-larql-metal  gemma3-4b-q4k-v2     74.6–75.6 tok/s 13.22–13.41 ms/tok (initial post O-proj routing fix)
+larql-metal  gemma3-4b-q4k-v2     83.3–84.1 tok/s 11.89–12.00 ms/tok (post dispatch-geometry fix, quiet GPU)
+larql-metal  gemma3-4b-q4k-v2     76.1–76.7 tok/s 13.06–13.14 ms/tok (pre dispatch fix; stride-32 lm_head workaround)
+larql-metal  gemma3-4b-q4k-v2     74.6–75.6 tok/s 13.22–13.41 ms/tok (post O-proj routing fix only)
 larql-metal  gemma3-4b-q4k-v2     72–75 tok/s      13.5–13.9 ms/tok  (pre O-proj routing fix)
-Ollama       gemma3:4b            99.5–100.6 tok/s ~10.0 ms/tok (steady-state, same harness)
-Gap          ~1.30×               ~2.9 ms/tok
+Ollama       gemma3:4b            98.5–99.7 tok/s ~10.0 ms/tok (steady-state, same harness)
+Gap          1.18×                ~2.0 ms/tok                 (was 1.30× before dispatch fix)
 
-larql-metal  gemma4-26B-A4B         5.1 tok/s  ~194ms/tok   (Phase 1 GPU dispatch; Phase 2 open)
-SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok   (attention + dense FFN only)
+larql-metal  gemma4-26B-A4B        19.0–19.8 tok/s ~52ms/tok  (post 2026-05-02 moe_dispatch geometry fix)
+larql-metal  gemma4-26B-A4B          5.1 tok/s   ~194ms/tok   (pre-fix; broken dispatch was masking ~3.8× perf AND degrading output)
+SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok    (attention + dense FFN only)
 ```
 
-Per-stage (Gemma 3 4B, 30-token run, 8 warmup, 2026-05-02):
+Per-stage (Gemma 3 4B, 30-token run, 8 warmup, 2026-05-02 post dispatch fix):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | ~11.11–11.25 ms | 78–79% |
-| lm_head | ~2.95–3.04 ms | 21% |
-| embed + norm + detok | ~0.05 ms | <1% |
+| GPU fwd | ~11.11–11.21 ms | 85–86% |
+| lm_head | **~1.84–1.85 ms** | 14% |
+| embed + norm + detok | ~0.04 ms | <1% |
 
-The lm_head jumped from ~2.2 ms to ~3.0 ms when the **lm_head v5 stride-32
-correctness fix** landed (2026-05-01) — the new reduction tree matches the
-CPU ranking exactly (model now emits "Paris" not gibberish), at a measured
-~0.7 ms cost vs. the prior incorrect kernel.
+The dispatch-geometry fix (2026-05-02) cuts lm_head from 2.95 → 1.85 ms
+(−1.14 ms/tok, +7.7 tok/s end-to-end) by making `MetalBackend::q4k_matvec`
+and the three sibling sites in `moe_dispatch.rs` + `decode/encode_ffn.rs`
+use `pipeline.rows_per_tg` / `pipeline.threads_per_tg` instead of hardcoding
+`shaders::q4k_matvec::ROWS_PER_TG`. Production has bound the 8sg pipeline
+since 2026-04-28; the hardcoded 4sg constants left simdgroups 4..7 of
+each TG unscheduled, corrupting half the lm_head output rows. See
+"Decision: lm_head dispatch order" below for full root-cause analysis.
 
 The 78.7 / 80.3 tok/s headlines below are preserved for context but
-predate both (a) the v5 lm_head correctness fix and (b) the 2026-05
-dispatch-fusion wave. The honest current number is ~76 tok/s with
-correct output.
+predate (a) the v5 lm_head stride-32 correctness *workaround*, (b) the
+2026-05 dispatch-fusion wave, and (c) the 2026-05-02 dispatch-geometry
+*fix* that obviated the workaround. The honest current number is **84
+tok/s** with correct output, gap to ollama 1.18×.
 
 ---
 
@@ -72,55 +79,80 @@ candidates, OR (b) a candidate looked promising but was deliberately not
 promoted. Both are the kind of context that tends to evaporate from PRs and
 flat changelogs.
 
-### Decision: lm_head dispatch order (2026-05-02)
+### Decision: lm_head dispatch order (2026-05-02, revised)
 
 **Question:** which Metal lm_head kernel runs by default for a non-CPU
 backend on a Q4_K vindex with tied embeddings (`gemma3-4b-q4k-v2`)?
+
+**The "broken-fast" `q4k_matvec` was a dispatch bug, not a kernel bug.**
+Earlier write-up (preserved in git history) attributed the argmax drift
+to `q4k_matvec`'s 32-lane simdgroup reduction tree. **Wrong root cause.**
+The actual bug: `MetalBackend::q4k_matvec` (and three sibling sites in
+`moe_dispatch.rs` + the non-gated FFN path) hardcoded the 4sg shader's
+`THREADS_PER_TG=128` while dispatching the 8sg `q4k_matvec_pipeline`
+(production default since 2026-04-28). With only 128 threads dispatched,
+simdgroups 4..7 of each 8sg TG never executed — half the rows in each
+8-row TG were left unwritten. Same family as the historical 2026-04-26
+`077884b` "81–84 tok/s on broken Q4_K dispatch" trap.
+
+**Fix:** dispatch with the actually-bound pipeline's geometry —
+`pipeline.rows_per_tg` / `pipeline.threads_per_tg` instead of the static
+4sg constants. Once fixed, `q4k_matvec_matches_cpu` parity test passes
+on the same shape that previously failed by 182.89.
 
 **Options measured** (Gemma 3 4B v2, M3 Max, quiet GPU, mean of 3 runs):
 
 | Path | lm_head ms | tok/s | Correct? | Bytes read/token |
 |---|---|---|---|---|
-| `LARQL_METAL_LM_HEAD=1` (production `q4k_matvec`) | 1.47 | 87.6 | **❌ argmax drift** ("Capital" / truncates after "is:") | 327 MB |
-| **Default: stride-32 Q4_K** (`q4k_matvec_stride32`) | **2.98** | **76.0** | ✓ "**Paris**" | **327 MB** |
-| f16 GEMV (`f16_gemv` on `embeddings.bin`) | 3.88 | 71.2 | ✓ "**Paris**" | 1.31 GB |
-| f32 BLAS fallback | (slow) | — | ✓ | 2.62 GB |
+| **Default: `q4k_matvec` (post-dispatch-fix)** | **1.85** | **83.3** | ✓ "**Paris**" | 327 MB |
+| `LARQL_LM_HEAD_SKIP_Q4K=1` → stride-32 Q4_K | 2.98 | 76.0 | ✓ "**Paris**" | 327 MB |
+| stride-32 → f16 GEMV (within `_skip_q4k` fallback) | 3.88 | 71.2 | ✓ "**Paris**" | 1.31 GB |
+| f32 BLAS fallback (last resort) | (slow) | — | ✓ | 2.62 GB |
 
-**Chosen:** stride-32 Q4_K first → f16 GEMV fallback → f32 BLAS last resort.
+**Chosen:** `q4k_matvec` (now correct) first → f16 GEMV / f32 fallback chain.
 
 **Why:**
-- `q4k_matvec` is fastest but **broken** — its 32-lane simdgroup reduction
-  drifts ~1e-3 vs CPU's sequential dot product, enough to flip top-1 on
-  close-call tokens. The drift fails the canonical "Paris" smoke and the
-  `arch_golden_gemma3_4b_gpu` test. **Same family as the historical "81–84
-  tok/s on broken Q4_K dispatch" trap; pinned in ADR-015 as the fourth
-  instance of the broken-fast pattern.**
-- f16 GEMV is **4× more bandwidth** than Q4_K (1.31 GB vs 327 MB per
-  token). On hardware where `f32_gemv` is already at LPDDR5X peak
-  (387 GB/s on M3 Max), f16 cannot win on throughput regardless of
-  saved dequant work. Bandwidth math made this predictable; the bench
-  confirmed it (-5 tok/s end-to-end when f16 was tried as the default).
-- Stride-32 Q4_K keeps the Q4_K bandwidth win **and** matches `f16_gemv`'s
-  stable reduction tree. ~2.0 ms theoretical floor (327 MB / 387 GB/s
-  + dequant + sort + readback ≈ 2.95 ms measured).
+- `q4k_matvec` is now correct AND the fastest option. After the dispatch
+  fix it produces identical top-1 to the CPU reference and runs at
+  1.85 ms/tok lm_head. **+8 tok/s end-to-end vs the stride-32 workaround**.
+- Stride-32 was the workaround for the dispatch-bug-disguised-as-
+  reduction-tree-drift. Now redundant on production paths but kept on
+  the `_skip_q4k` fallback chain for vindexes lacking Q4_K lm_head bytes
+  and as a diagnostic A/B.
+- f16 GEMV remains in the fallback chain only — bandwidth math makes it
+  4× more expensive than Q4_K (1.31 GB vs 327 MB), so it never wins on
+  throughput when the Q4_K path is healthy. Where f16 matters is **memory
+  footprint on 31B models**: the f32 fallback would allocate a 5.6 GB
+  clone of the lm_head matrix on load. f16 avoids that one-time setup
+  cost. See `f16_gemv_wiring_todo` memo for the original motivation.
 
 **Env vars:**
-- `LARQL_LM_HEAD_STRIDE32=0` — disable stride-32; use f16 then f32. For
-  A/B against the baseline.
-- `LARQL_METAL_LM_HEAD=1` — re-enable the broken-fast `q4k_matvec`
-  path. Debug-only; produces argmax drift on canonical smoke.
+- `LARQL_LM_HEAD_SKIP_Q4K=1` — diagnostic A/B; routes to
+  `lm_head_knn_backend_skip_q4k` (stride-32 first, then f16, then f32).
+- `LARQL_LM_HEAD_STRIDE32=0` — only meaningful inside the `_skip_q4k`
+  chain; disables stride-32 there too.
 
-**Where the f16 path *does* matter:** memory footprint on 31B models —
-the f32 fallback would allocate a 5.6 GB clone of the lm_head matrix on
-load. f16 avoids that one-time setup cost without paying the per-token
-bandwidth tax (because f16 stays on the fallback chain, not the hot
-path). See `f16_gemv_wiring_todo` memo for the original motivation.
+(The legacy `LARQL_METAL_LM_HEAD=1` env var was removed 2026-05-02 —
+the path it used to enable IS the default now, so the override has no
+purpose.)
+
+**Lesson for future kernel bring-ups:** when an "isolated" or "broken-fast"
+kernel result looks too good — particularly when the kernel produces
+correct output on some prompts but flips on others — **suspect a dispatch
+geometry mismatch first** before blaming reduction trees or numerical
+precision. Two confirmed instances now (077884b 4-rows-vs-8-rows on Q4_K
+dispatch; this 4sg-constants-on-8sg-pipeline). Both signatures: hardcoded
+shader-module constants while the bound pipeline has different geometry.
+**Always dispatch through `pipeline.rows_per_tg` / `pipeline.threads_per_tg`.**
 
 **Related:**
 - `crates/larql-compute/docs/adr/015-isolated-vs-batched-kernel-perf.md`
-  — broken-fast pattern, 4 confirmed instances.
-- `crates/larql-vindex/src/index/storage/lm_head/knn.rs` —
-  `lm_head_knn_backend_skip_q4k` is the dispatch site.
+  — broken-fast pattern; this entry corrects the 4th instance from
+  "kernel-level drift" to "dispatch-geometry mismatch."
+- `crates/larql-compute/src/metal/trait_impl/quant_matvec.rs::q4k_matvec`
+  — fixed dispatch site.
+- `crates/larql-compute/src/metal/moe_dispatch.rs` — three sibling sites
+  fixed in the same pass.
 
 ---
 
@@ -231,9 +263,9 @@ LPDDR5X peak have headroom to convert isolated wins into batched wins; above
 
 ---
 
-## Gemma 4 26B A4B — MoE model (2026-04-26)
+## Gemma 4 26B A4B — MoE model (2026-04-26, updated 2026-05-02)
 
-Machine: M3 Max, 5-token prompt, 15 warmup / 30 measured tokens  
+Machine: M3 Max, 5-token prompt, 5 warmup / 30 measured tokens  
 Vindex: `gemma-4-26B-A4B-it.vindex` (30 layers, 128 experts/layer, top-K=8, inter=704, hidden=2816)
 
 ### Progress log
@@ -242,30 +274,81 @@ Vindex: `gemma-4-26B-A4B-it.vindex` (30 layers, 128 experts/layer, top-K=8, inte
 |---|---|---|---|
 | BF16 blob baseline | 2.9 | 334ms | — |
 | Batched MoE prefill | 3.9 | 246ms | +35% |
-| Q4K per-layer format + GPU expert dispatch | **5.1** | **~194ms** | **+75% from baseline** |
+| Q4K per-layer format + GPU expert dispatch | 5.1 | ~194ms | +75% from baseline |
+| **moe_dispatch geometry fix** (2026-05-02) | **~19.4** | **~52ms** | **+3.8× from prior** |
 | GPU-only ceiling (`SKIP_MOE=1`) | 56.8 | 15ms | theoretical max |
 
-### Current bottleneck: Metal buffer allocation overhead
+### What the 2026-05-02 moe_dispatch fix changed
 
-GPU fwd 194ms breaks down as:
-- Actual GPU compute (30 × attention + dense FFN + 8 expert dispatches): ~40ms
-- 30 MoE layer syncs (commit + wait for h_post_attn routing): ~30ms
-- **Metal buffer allocation: ~120ms** — root cause of remaining gap
+Same root cause as the Gemma 3 4B lm_head fix: three sites in
+`metal/moe_dispatch.rs` (per-expert down projection) hardcoded the legacy
+4sg `q4k_matvec` shader's `THREADS_PER_TG=128` while dispatching the
+`q4k_matvec_pipeline` (bound to the 8sg variant since 2026-04-28).
+Per token, that meant:
 
-Per decode token, `gpu_moe_dispatch` calls `self.bufs.output()` ~10 times per
-layer (gate buf, up buf, 8 down bufs, act buf, outputs buf) = 300 allocations/token.
-Each `MTLResourceOptions::StorageModeShared` allocation of 1–9 MB takes ~0.4ms
-on M3 Max = ~120ms total.
+- 30 MoE layers × top_k=8 = **240 broken expert dispatches**.
+- Each dispatched `ceil(hidden/4)` TGs × 128 threads — DOUBLE the TG
+  count the 8sg kernel needed, but only the first 4 of 8 simdgroups
+  per TG actually ran.
+- Net: **2× dispatch overhead × half the work-per-TG = ~140ms/tok of
+  wasted GPU time**, plus half the down-projection rows in each TG
+  left unwritten (silently degrading output: short truncated
+  responses, missed continuations).
 
-### Phase 2: pre-allocated scratch buffers (open)
+Fixed by reading `pipeline.rows_per_tg` / `pipeline.threads_per_tg`
+from the bound `KernelHandle` instead of hardcoding shader-module
+constants. Output went from "Paris." (truncated) to "1. Paris (France)
+2. Berlin (Germany) 3. Rome (Italy)" (coherent, multilingual-capable),
+and tok/s went from 5.1 → 19.4.
 
-Pre-allocate fixed-size staging buffers once before the decode loop in
-`decode_token_q4k_moe`, same pattern as `decode_token`'s scratch buffer
-pre-allocation (which eliminated 550 allocations → 20 for the dense path).
-Sizes are fixed for a given model — known at init time from `moe.intermediate_size`,
-`moe.num_experts`, `moe.top_k`, `hidden`.
+**The 5.1 tok/s baseline was lying** — it logged as "post Phase 1 GPU
+dispatch" as if it were the new floor; it was actually bug-locked. The
+prior assumption that "Metal buffer allocation overhead is the
+bottleneck" was reading a corrupted measurement: ~140ms of the supposed
+194ms GPU-fwd was the broken-dispatch waste, not the buffer allocation.
 
-Expected result: ~15–20 tok/s (~4× current), closing most of the gap to the GPU ceiling.
+### Phase 2: pre-allocated scratch buffers — DONE (already shipped, attribution corrected 2026-05-02)
+
+`MoeScratch::new` pre-allocates all expert staging buffers (gate, up,
+per-expert down × top_k, activation, output) once per model shape and
+caches by `(top_k, hidden, intermediate_size)` on the backend. Per-layer
+`gpu_moe_dispatch_with_scratch` calls only memcpy expert bytes into the
+existing buffer contents — no `bufs.output(...)` calls in the hot path.
+Confirmed by audit: every `bufs.output(...)` in `moe_dispatch.rs` is in
+`MoeScratch::new` (one-shot), never per-layer.
+
+The 19.4 tok/s baseline measured 2026-05-02 includes both Phase 2 AND
+the dispatch geometry fix from the same day. Pre-2026-05-02 the 5.1
+tok/s "Phase 1" headline was Phase 2 *infrastructure was wired* but
+the dispatch geometry was bug-locking the perf — the broken-dispatch
+2× TG overhead was being attributed to "Metal buffer allocation
+overhead" in the prior write-up. Both diagnoses turned out to be
+reading the same corrupted measurement.
+
+### Remaining 26B headroom: 19.4 → 56.8 tok/s ceiling
+
+The SKIP_MOE ceiling (56.8 tok/s, 15 ms GPU fwd) is "attention + dense
+FFN only" — what 26B would do if the experts cost zero. Current MoE
+overhead: 52 - 15 = **37 ms/tok of expert work** spread across 30
+layers × top_k=8 = 240 expert dispatches (~155 µs/dispatch) plus 30
+per-layer commit/wait syncs.
+
+Real next levers (in rough EV order):
+
+1. **Batched expert dispatch** — fuse the 8 separate gate+up + 8
+   activation + 8 down dispatches per layer into one or two batched
+   calls with per-expert offsets. Reduces dispatch count from ~24/layer
+   to ~3/layer, ~21 saved × 30 layers × ~10 µs = up to 6 ms/tok.
+2. **Reduce per-layer sync count** — current pipeline commits + waits
+   between attention/dense-FFN and experts so CPU can read `h_post_attn`,
+   route, and stage expert weights. Folding the routing into a small
+   GPU kernel would let the experts launch on the same cmd buffer.
+   ~30 syncs × ~50 µs = ~1.5 ms/tok.
+3. **Larger TG geometry for expert matmuls** — each expert is a small
+   N=2816 matmul; bigger TGs may amortize dispatch better.
+
+These are real shader work, not the cheap "audit dispatch geometry"
+class of fix.
 
 ---
 
