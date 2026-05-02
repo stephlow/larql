@@ -8,9 +8,7 @@ pub mod health;
 pub mod infer;
 pub mod insert;
 pub mod models;
-pub mod openai_chat;
-pub mod openai_completions;
-pub mod openai_embeddings;
+pub mod openai;
 pub mod patches;
 pub mod relations;
 pub mod select;
@@ -122,17 +120,11 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route(LOGITS, post(embed::handle_logits))
         .route(TOKEN_ENCODE, get(embed::handle_token_encode))
         .route(TOKEN_DECODE, get(embed::handle_token_decode))
-        .route(
-            OPENAI_EMBEDDINGS,
-            post(openai_embeddings::handle_embeddings),
-        )
-        .route(
-            OPENAI_COMPLETIONS,
-            post(openai_completions::handle_completions),
-        )
+        .route(OPENAI_EMBEDDINGS, post(openai::handle_embeddings))
+        .route(OPENAI_COMPLETIONS, post(openai::handle_completions))
         .route(
             OPENAI_CHAT_COMPLETIONS,
-            post(openai_chat::handle_chat_completions),
+            post(openai::handle_chat_completions),
         )
         .with_state(state)
 }
@@ -160,17 +152,11 @@ pub fn multi_model_router(state: Arc<AppState>) -> Router {
         .route(M_TOKEN_ENCODE, get(embed::handle_token_encode_multi))
         .route(M_TOKEN_DECODE, get(embed::handle_token_decode_multi))
         // OpenAI-compat endpoints (multi-model: client passes `model` in body).
-        .route(
-            OPENAI_EMBEDDINGS,
-            post(openai_embeddings::handle_embeddings),
-        )
-        .route(
-            OPENAI_COMPLETIONS,
-            post(openai_completions::handle_completions),
-        )
+        .route(OPENAI_EMBEDDINGS, post(openai::handle_embeddings))
+        .route(OPENAI_COMPLETIONS, post(openai::handle_completions))
         .route(
             OPENAI_CHAT_COMPLETIONS,
-            post(openai_chat::handle_chat_completions),
+            post(openai::handle_chat_completions),
         )
         .with_state(state)
 }

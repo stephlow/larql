@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
-use super::embed::embed_tokens;
+use crate::routes::embed::embed_tokens;
 
 const EMBEDDING_OBJECT: &str = "embedding";
 const LIST_OBJECT: &str = "list";

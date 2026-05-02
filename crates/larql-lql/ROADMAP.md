@@ -2,13 +2,51 @@
 
 ## Current state
 
-INSERT/SELECT/USE/COMPILE/TRACE grammar fully parsed. 317 tests passing
-(146 parser, 93+ executor integration, 17 in-module unit tests). INSERT
+INSERT/SELECT/USE/COMPILE/TRACE grammar fully parsed. INSERT
 supports `MODE KNN` (residual retrieval override, validated at 25K edges)
 and `MODE COMPOSE` (FFN-overlay, ~5–10 facts/layer). `COMPILE INTO VINDEX`
 bakes patches into canonical `down_weights.bin`. `COMPILE INTO MODEL` applies
-MEMIT (opt-in via `LARQL_MEMIT_ENABLE=1`). `WITH alpha/gate_scale/refine_rounds/mode`
-clauses accepted; `refine_rounds` implementation is a TODO (see P1 below).
+MEMIT (opt-in via `LARQL_MEMIT_ENABLE=1`). `ALPHA` and `MODE` clauses are
+accepted on `INSERT`; `ALPHA` only affects `MODE COMPOSE`.
+
+---
+
+## P0: Review cleanup — correctness and persistence
+
+### DELETE / UPDATE relation predicates
+**Status**: Done
+**Files**: `src/executor/mutation/delete.rs`, `src/executor/mutation/update.rs`,
+`src/executor/tests.rs`
+Parser accepts `WHERE relation = ...`, and the executor now evaluates it
+through `RelationClassifier`. Vindexes without relation labels fail loudly
+instead of treating relation-only mutations as broad matches.
+
+### COMPILE path semantics
+**Status**: Done
+**Files**: `src/executor/lifecycle/compile/mod.rs`, `src/executor/tests.rs`
+`COMPILE "<path>" INTO ...` now loads the supplied vindex in an isolated
+session and compiles that source from disk. Use `COMPILE CURRENT` when active
+session patches or unsaved overlays should be included.
+
+### Balanced COMPOSE patch persistence
+**Status**: Done
+**Files**: `src/executor/mutation/insert/mod.rs`,
+`src/executor/mutation/rebalance.rs`, `src/executor/tests.rs`
+Pending compose patch ops refresh gate/up/down payloads from the overlay after
+balancing and rebalance updates, so `SAVE PATCH` persists the latest vectors.
+
+### Parser trailing input
+**Status**: Done
+**Files**: `src/parser/mod.rs`, `src/parser/tests.rs`, `src/repl.rs`
+Single-statement parsing now requires EOF after the optional semicolon / pipe
+parse. Batch splitting remains in the REPL path.
+
+### Examples, docs, and benches drift
+**Status**: Done
+**Files**: `README.md`, `docs/spec.md`, `../../docs/lql-guide.md`,
+`examples/*.rs`, `benches/*.rs`
+Docs and benchmarks reflect KNN default, compose-only `ALPHA`, single-layer
+COMPOSE behavior, and the compile benchmark now includes a down-override bake.
 
 ---
 

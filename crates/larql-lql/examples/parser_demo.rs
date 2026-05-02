@@ -154,12 +154,12 @@ fn main() {
         r#"INSERT INTO EDGES (entity, relation, target) VALUES ("John", "occupation", "engineer") AT LAYER 26 CONFIDENCE 0.8;"#,
     );
     demo(
-        "INSERT (with ALPHA — stubborn fact)",
-        r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") ALPHA 0.5;"#,
+        "INSERT (COMPOSE with ALPHA — stubborn fact)",
+        r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") ALPHA 0.5 MODE COMPOSE;"#,
     );
     demo(
-        "INSERT (all knobs: layer + confidence + alpha)",
-        r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") AT LAYER 24 CONFIDENCE 0.95 ALPHA 0.3;"#,
+        "INSERT (all COMPOSE knobs: layer + confidence + alpha)",
+        r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") AT LAYER 24 CONFIDENCE 0.95 ALPHA 0.3 MODE COMPOSE;"#,
     );
     demo(
         "DELETE",

@@ -17,7 +17,6 @@ pub mod hf_cmd;
 pub mod index_gates_cmd;
 pub mod kg_bench_cmd;
 pub mod ov_gate_cmd;
-pub mod ov_rd_cmd;
 pub mod predict_cmd;
 pub mod projection_test_cmd;
 pub mod qk_modes_cmd;

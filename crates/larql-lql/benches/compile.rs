@@ -147,16 +147,9 @@ fn bench_compile_no_patches(c: &mut Criterion) {
 }
 
 /// `COMPILE INTO VINDEX` on a vindex that has model weights
-/// (`down_weights.bin` present). With no patch overlay this measures
-/// the structural cost of the bake — hard-link unchanging files,
-/// fresh-write `gate_vectors.bin`, and (if there were down overrides)
-/// the `patch_down_weights` copy + seek-write loop. With zero
-/// overrides the down_weights file is hardlinked from source instead.
-///
-/// The override-baking path itself (`patch_down_weights`) is unit-
-/// tested for correctness in `executor/lifecycle/compile/bake.rs`'s
-/// in-module tests. End-to-end exercise of the override path against
-/// a real Gemma 4B vindex lives in the `compile_demo` example.
+/// (`down_weights.bin` present). The first case measures the structural
+/// cost with zero overrides; the second injects a single down-vector
+/// override so the benchmark exercises the copy + seek-write bake path.
 fn bench_compile_with_weights(c: &mut Criterion) {
     let mut group = c.benchmark_group("compile_into_vindex");
     group.sample_size(20);
@@ -170,6 +163,42 @@ fn bench_compile_with_weights(c: &mut Criterion) {
             let mut session = Session::new();
             let use_stmt = parse(&format!(r#"USE "{}";"#, src_dir.display())).unwrap();
             session.execute(&use_stmt).unwrap();
+            let stmt = parse(&format!(
+                r#"COMPILE CURRENT INTO VINDEX "{}";"#,
+                dst.display()
+            ))
+            .unwrap();
+            session.execute(&stmt).unwrap();
+        });
+        let _ = std::fs::remove_dir_all(&dst);
+    });
+
+    group.bench_function("with_weights_one_down_override", |b| {
+        let dst = std::env::temp_dir().join("larql_compile_bench_dst_one_override");
+        b.iter(|| {
+            let _ = std::fs::remove_dir_all(&dst);
+            let mut session = Session::new();
+            let use_stmt = parse(&format!(r#"USE "{}";"#, src_dir.display())).unwrap();
+            session.execute(&use_stmt).unwrap();
+            {
+                let overlay = session.patched_overlay_mut().expect("vindex backend");
+                overlay.insert_feature(
+                    0,
+                    0,
+                    vec![1.0; 64],
+                    FeatureMeta {
+                        top_token: "patched".into(),
+                        top_token_id: 1,
+                        c_score: 0.9,
+                        top_k: vec![TopKEntry {
+                            token: "patched".into(),
+                            token_id: 1,
+                            logit: 0.9,
+                        }],
+                    },
+                );
+                overlay.set_down_vector(0, 0, vec![0.25; 64]);
+            }
             let stmt = parse(&format!(
                 r#"COMPILE CURRENT INTO VINDEX "{}";"#,
                 dst.display()

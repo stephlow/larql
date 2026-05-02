@@ -14,9 +14,18 @@ use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_tokenizer, SilentLoadCallbacks, VectorIndex,
 };
-use ndarray::{s, Array2, ArrayView1};
-use serde::{Deserialize, Serialize};
+use ndarray::{s, Array2};
 use std::collections::HashMap;
+
+use super::address::*;
+use super::basis::*;
+use super::input::*;
+use super::metrics::*;
+use super::pq::*;
+use super::reports::*;
+use super::runtime::*;
+use super::stats::*;
+use super::types::*;
 
 #[derive(Args)]
 pub struct OvRdArgs {
@@ -320,6 +329,37 @@ struct OraclePqArgs {
     #[arg(long, default_value_t = 32)]
     address_lsh_seeds: usize,
 
+    /// Fit and evaluate supervised binary-hyperplane address probes for
+    /// selected PQ groups. The selected groups are predicted from the residual
+    /// entering the target layer; other groups are evaluated both
+    /// oracle-correct and majority/default.
+    #[arg(long)]
+    address_supervised_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-supervised-group-probe.
+    #[arg(long, default_value = "0")]
+    address_supervised_groups: String,
+
+    /// SGD epochs for supervised binary-hyperplane group address probes.
+    #[arg(long, default_value_t = 16)]
+    address_supervised_epochs: usize,
+
+    /// SGD learning rate for supervised binary-hyperplane group address probes.
+    #[arg(long, default_value_t = 0.05)]
+    address_supervised_lr: f32,
+
+    /// L2 weight decay for supervised binary-hyperplane group address probes.
+    #[arg(long, default_value_t = 1e-4)]
+    address_supervised_l2: f32,
+
+    /// Report train/eval PQ code distribution stability for selected groups.
+    #[arg(long)]
+    address_code_stability: bool,
+
+    /// Comma-separated PQ groups for --address-code-stability.
+    #[arg(long, default_value = "0")]
+    address_code_stability_groups: String,
+
     /// Comma-separated PQ groups whose centroids are fit separately per
     /// prompt stratum. This is a codebook-layout diagnostic for cases where a
     /// single global PQ group carries a hard prose/structured tail.
@@ -343,260 +383,6 @@ struct OraclePqArgs {
     /// Held-out modulo offset used with --eval-mod.
     #[arg(long, default_value_t = 0)]
     eval_offset: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PromptRecord {
-    id: Option<String>,
-    stratum: Option<String>,
-    prompt: String,
-}
-
-#[derive(Debug)]
-struct RunningHeadStats {
-    count: u64,
-    sum: Vec<f64>,
-    sum_sq_norm: f64,
-}
-
-impl RunningHeadStats {
-    fn new(head_dim: usize) -> Self {
-        Self {
-            count: 0,
-            sum: vec![0.0; head_dim],
-            sum_sq_norm: 0.0,
-        }
-    }
-
-    fn add(&mut self, values: &[f32]) {
-        self.count += 1;
-        let mut sq = 0.0f64;
-        for (dst, &v) in self.sum.iter_mut().zip(values.iter()) {
-            let vf = v as f64;
-            *dst += vf;
-            sq += vf * vf;
-        }
-        self.sum_sq_norm += sq;
-    }
-
-    fn finish(&self) -> FinishedHeadStats {
-        if self.count == 0 {
-            return FinishedHeadStats {
-                count: 0,
-                mean_norm_sq: 0.0,
-                second_moment: 0.0,
-                variance: 0.0,
-                rms_norm: 0.0,
-            };
-        }
-        let n = self.count as f64;
-        let mean_norm_sq = self
-            .sum
-            .iter()
-            .map(|v| {
-                let m = *v / n;
-                m * m
-            })
-            .sum::<f64>();
-        let second_moment = self.sum_sq_norm / n;
-        let variance = (second_moment - mean_norm_sq).max(0.0);
-        FinishedHeadStats {
-            count: self.count,
-            mean_norm_sq,
-            second_moment,
-            variance,
-            rms_norm: second_moment.sqrt(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MeanAccumulator {
-    count: u64,
-    sum: Vec<f64>,
-}
-
-impl MeanAccumulator {
-    fn new(dim: usize) -> Self {
-        Self {
-            count: 0,
-            sum: vec![0.0; dim],
-        }
-    }
-
-    fn add(&mut self, values: &[f32]) {
-        self.count += 1;
-        for (dst, &value) in self.sum.iter_mut().zip(values.iter()) {
-            *dst += value as f64;
-        }
-    }
-
-    fn mean(&self) -> Vec<f32> {
-        if self.count == 0 {
-            return vec![0.0; self.sum.len()];
-        }
-        let n = self.count as f64;
-        self.sum.iter().map(|v| (*v / n) as f32).collect()
-    }
-}
-
-#[derive(Debug)]
-struct StaticHeadAccumulator {
-    global: MeanAccumulator,
-    positions: Vec<MeanAccumulator>,
-    strata: HashMap<String, MeanAccumulator>,
-    position_strata: HashMap<String, Vec<MeanAccumulator>>,
-}
-
-impl StaticHeadAccumulator {
-    fn new(head_dim: usize) -> Self {
-        Self {
-            global: MeanAccumulator::new(head_dim),
-            positions: Vec::new(),
-            strata: HashMap::new(),
-            position_strata: HashMap::new(),
-        }
-    }
-
-    fn add(&mut self, position: usize, stratum: &str, values: &[f32]) {
-        self.global.add(values);
-        while self.positions.len() <= position {
-            self.positions
-                .push(MeanAccumulator::new(self.global.sum.len()));
-        }
-        self.positions[position].add(values);
-        self.strata
-            .entry(stratum.to_string())
-            .or_insert_with(|| MeanAccumulator::new(self.global.sum.len()))
-            .add(values);
-        let by_position = self.position_strata.entry(stratum.to_string()).or_default();
-        while by_position.len() <= position {
-            by_position.push(MeanAccumulator::new(self.global.sum.len()));
-        }
-        by_position[position].add(values);
-    }
-
-    fn finish(&self) -> StaticHeadMeans {
-        StaticHeadMeans {
-            count: self.global.count,
-            head_dim: self.global.sum.len(),
-            global: self.global.mean(),
-            positions: self.positions.iter().map(MeanAccumulator::mean).collect(),
-            strata: self
-                .strata
-                .iter()
-                .map(|(key, value)| (key.clone(), value.mean()))
-                .collect(),
-            position_strata: self
-                .position_strata
-                .iter()
-                .map(|(key, values)| {
-                    (
-                        key.clone(),
-                        values.iter().map(MeanAccumulator::mean).collect(),
-                    )
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct StaticHeadMeans {
-    count: u64,
-    head_dim: usize,
-    global: Vec<f32>,
-    positions: Vec<Vec<f32>>,
-    strata: HashMap<String, Vec<f32>>,
-    position_strata: HashMap<String, Vec<Vec<f32>>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct FinishedHeadStats {
-    count: u64,
-    mean_norm_sq: f64,
-    second_moment: f64,
-    variance: f64,
-    rms_norm: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HeadReport {
-    layer: usize,
-    head: usize,
-    head_dim: usize,
-    stats: FinishedHeadStats,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    wo_visible_stats: Option<FinishedHeadStats>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CaptureReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    layers: Vec<usize>,
-    max_positions: Option<usize>,
-    #[serde(default)]
-    wo_visible: bool,
-    heads: Vec<HeadReport>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct HeadId {
-    layer: usize,
-    head: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ZeroStratumReport {
-    stratum: String,
-    prompts: usize,
-    mean_kl: f64,
-    max_kl: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ZeroPromptReport {
-    id: String,
-    stratum: String,
-    kl: f64,
-    delta_cross_entropy_bits: f64,
-    baseline_top1: u32,
-    ablated_top1: u32,
-    top1_agree: bool,
-    baseline_top1_in_ablated_top5: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ZeroHeadReport {
-    layer: usize,
-    head: usize,
-    ablation_kind: String,
-    patch_location: String,
-    preserved_components: Vec<String>,
-    bounded_vocab_size: Option<usize>,
-    prompts: usize,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    mean_delta_cross_entropy_bits: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    strata: Vec<ZeroStratumReport>,
-    worst_examples: Vec<ZeroPromptReport>,
-    per_prompt: Vec<ZeroPromptReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct ZeroAblationReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    selected_heads: Vec<HeadId>,
-    heads: Vec<ZeroHeadReport>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -630,350 +416,6 @@ const STATIC_REPLACEMENT_KINDS: [StaticReplacementKind; 6] = [
     StaticReplacementKind::PositionPlusStratum,
     StaticReplacementKind::PositionStratum,
 ];
-
-#[derive(Debug, Serialize)]
-struct StaticReplacementReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    train_prompts_seen: usize,
-    eval_prompts_seen: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    eval_mod: Option<usize>,
-    eval_offset: usize,
-    selected_heads: Vec<HeadId>,
-    heads: Vec<StaticHeadReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct SanityCheckReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    selected_heads: Vec<HeadId>,
-    heads: Vec<SanityHeadReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct SanityHeadReport {
-    layer: usize,
-    head: usize,
-    prompts: usize,
-    noop_mean_kl: f64,
-    noop_max_kl: f64,
-    noop_max_abs_logit_diff: f64,
-    residual_delta_noop_mean_kl: f64,
-    residual_delta_noop_max_kl: f64,
-    residual_delta_noop_max_abs_logit_diff: f64,
-    zero_subtract_mean_kl: f64,
-    zero_subtract_max_kl: f64,
-    zero_subtract_max_abs_logit_diff: f64,
-    per_prompt: Vec<SanityPromptReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct SanityPromptReport {
-    id: String,
-    stratum: String,
-    noop_kl: f64,
-    noop_max_abs_logit_diff: f64,
-    residual_delta_noop_kl: f64,
-    residual_delta_noop_max_abs_logit_diff: f64,
-    zero_subtract_kl: f64,
-    zero_subtract_max_abs_logit_diff: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleRoundtripReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    sigma_rel_cutoff: f64,
-    selected_heads: Vec<HeadId>,
-    heads: Vec<OracleRoundtripHeadReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleRoundtripHeadReport {
-    layer: usize,
-    head: usize,
-    head_dim: usize,
-    rank_retained: usize,
-    sigma_max: f64,
-    sigma_min_retained: f64,
-    sigma_rel_cutoff: f64,
-    prompts: usize,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    max_abs_logit_diff: f64,
-    mean_pre_wo_l2: f64,
-    max_pre_wo_l2: f64,
-    mean_wo_visible_l2: f64,
-    max_wo_visible_l2: f64,
-    per_prompt: Vec<OracleRoundtripPromptReport>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OracleRoundtripPromptReport {
-    id: String,
-    stratum: String,
-    kl: f64,
-    max_abs_logit_diff: f64,
-    pre_wo_l2: f64,
-    wo_visible_l2: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleLowrankReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    static_base: String,
-    ks: Vec<usize>,
-    sigma_rel_cutoff: f64,
-    selected_heads: Vec<HeadId>,
-    heads: Vec<OracleLowrankHeadReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleLowrankHeadReport {
-    layer: usize,
-    head: usize,
-    head_dim: usize,
-    rank_retained: usize,
-    empirical_rank: usize,
-    sigma_max: f64,
-    sigma_min_retained: f64,
-    static_train_samples: u64,
-    points: Vec<OracleLowrankPointReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleLowrankPointReport {
-    k: usize,
-    prompts: usize,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    mean_delta_cross_entropy_bits: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    mean_baseline_top1_prob: f64,
-    mean_lowrank_prob_of_baseline_top1: f64,
-    mean_baseline_top1_margin: f64,
-    mean_pre_wo_l2: f64,
-    mean_wo_visible_l2: f64,
-    per_prompt: Vec<OracleLowrankPromptReport>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OracleLowrankPromptReport {
-    id: String,
-    stratum: String,
-    kl: f64,
-    delta_cross_entropy_bits: f64,
-    baseline_top1: u32,
-    lowrank_top1: u32,
-    top1_agree: bool,
-    baseline_top1_in_lowrank_top5: bool,
-    baseline_top1_prob: f64,
-    baseline_top2: u32,
-    baseline_top2_prob: f64,
-    baseline_top1_margin: f64,
-    lowrank_top1_prob: f64,
-    lowrank_prob_of_baseline_top1: f64,
-    lowrank_top1_margin: f64,
-    pre_wo_l2: f64,
-    wo_visible_l2: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-struct PqConfig {
-    k: usize,
-    groups: usize,
-    bits_per_group: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct OraclePqReport {
-    index: String,
-    prompt_file: String,
-    prompts_seen: usize,
-    train_prompts_seen: usize,
-    eval_prompts_seen: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_per_stratum: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    eval_mod: Option<usize>,
-    eval_offset: usize,
-    static_base: String,
-    configs: Vec<PqConfig>,
-    sigma_rel_cutoff: f64,
-    pq_iters: usize,
-    mode_d_check: bool,
-    address_probes: bool,
-    address_mixed_key_probe: bool,
-    address_key_group_probe: bool,
-    address_key_groups: Vec<usize>,
-    address_corruption_sweep: bool,
-    address_group_importance: bool,
-    address_lsh_group_probe: bool,
-    address_lsh_groups: Vec<usize>,
-    address_lsh_bits: usize,
-    address_lsh_seeds: usize,
-    stratum_conditioned_pq_groups: Vec<usize>,
-    selected_heads: Vec<HeadId>,
-    heads: Vec<OraclePqHeadReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct OraclePqHeadReport {
-    layer: usize,
-    head: usize,
-    head_dim: usize,
-    rank_retained: usize,
-    empirical_rank: usize,
-    sigma_max: f64,
-    sigma_min_retained: f64,
-    static_train_samples: u64,
-    points: Vec<OraclePqPointReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct OraclePqPointReport {
-    k: usize,
-    groups: usize,
-    bits_per_group: usize,
-    oracle_address_bits: usize,
-    coefficient_codebook_bytes_f32: usize,
-    mode_d_residual_table_bytes_bf16: usize,
-    prompts: usize,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    mean_delta_cross_entropy_bits: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    mean_baseline_top1_prob: f64,
-    mean_pq_prob_of_baseline_top1: f64,
-    mean_baseline_top1_margin: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_mean_kl: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_p95_kl: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_max_kl: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_top1_agreement: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_top5_contains_baseline_top1: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coeff_mode_d_max_abs_logit_diff: Option<f64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    address_probes: Vec<AddressProbeReport>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    address_corruption_sweep: Vec<AddressCorruptionReport>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    address_group_importance: Vec<AddressGroupImportanceReport>,
-    mean_pre_wo_l2: f64,
-    mean_wo_visible_l2: f64,
-    per_prompt: Vec<OraclePqPromptReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct AddressProbeReport {
-    name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    selected_group_keys: Vec<String>,
-    prompts: usize,
-    positions: usize,
-    group_accuracy: f64,
-    exact_address_accuracy: f64,
-    mean_groups_correct_per_sequence: f64,
-    mean_groups_correct_per_position: f64,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    worst_examples: Vec<AddressProbePromptReport>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AddressProbePromptReport {
-    id: String,
-    stratum: String,
-    kl: f64,
-    positions: usize,
-    groups_correct: usize,
-    groups_total: usize,
-    exact_address_match: bool,
-    top1_agree: bool,
-    baseline_top1_in_predicted_top5: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct AddressCorruptionReport {
-    label: String,
-    oracle_groups_kept: usize,
-    prompts: usize,
-    positions: usize,
-    group_accuracy: f64,
-    exact_address_accuracy: f64,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    worst_examples: Vec<AddressProbePromptReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct AddressGroupImportanceReport {
-    replaced_group: usize,
-    prompts: usize,
-    positions: usize,
-    group_accuracy: f64,
-    exact_address_accuracy: f64,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    worst_examples: Vec<AddressProbePromptReport>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OraclePqPromptReport {
-    id: String,
-    stratum: String,
-    kl: f64,
-    delta_cross_entropy_bits: f64,
-    baseline_top1: u32,
-    pq_top1: u32,
-    top1_agree: bool,
-    baseline_top1_in_pq_top5: bool,
-    baseline_top1_prob: f64,
-    baseline_top2: u32,
-    baseline_top2_prob: f64,
-    baseline_top1_margin: f64,
-    pq_top1_prob: f64,
-    pq_prob_of_baseline_top1: f64,
-    pq_top1_margin: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_kl: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_top1: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode_d_top1_agree: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    baseline_top1_in_mode_d_top5: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coeff_mode_d_max_abs_logit_diff: Option<f64>,
-    pre_wo_l2: f64,
-    wo_visible_l2: f64,
-}
 
 #[derive(Debug)]
 struct OraclePqPointAccumulator {
@@ -1035,7 +477,12 @@ impl OraclePqPointAccumulator {
             .add(prompt);
     }
 
-    fn finish(self, config: PqConfig, hidden_dim: usize) -> OraclePqPointReport {
+    fn finish(
+        self,
+        config: PqConfig,
+        hidden_dim: usize,
+        code_stability: Vec<CodeStabilityReport>,
+    ) -> OraclePqPointReport {
         let kls: Vec<f64> = self.prompts.iter().map(|p| p.kl).collect();
         let levels = 1usize << config.bits_per_group;
         let mode_d_kls = self
@@ -1145,6 +592,7 @@ impl OraclePqPointAccumulator {
                 .into_iter()
                 .map(|(replaced_group, acc)| acc.finish_group_importance(replaced_group))
                 .collect(),
+            code_stability,
             mean_pre_wo_l2: mean(&self.prompts.iter().map(|p| p.pre_wo_l2).collect::<Vec<_>>()),
             mean_wo_visible_l2: mean(
                 &self
@@ -1454,31 +902,6 @@ impl SanityHeadAccumulator {
             per_prompt: self.prompts,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-struct StaticHeadReport {
-    layer: usize,
-    head: usize,
-    train_samples: u64,
-    modes: Vec<StaticModeReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct StaticModeReport {
-    replacement_kind: String,
-    patch_location: String,
-    runtime_class: String,
-    prompts: usize,
-    mean_kl: f64,
-    p95_kl: f64,
-    max_kl: f64,
-    mean_delta_cross_entropy_bits: f64,
-    top1_agreement: f64,
-    top5_contains_baseline_top1: f64,
-    strata: Vec<ZeroStratumReport>,
-    worst_examples: Vec<ZeroPromptReport>,
-    per_prompt: Vec<ZeroPromptReport>,
 }
 
 #[derive(Debug)]
@@ -2608,6 +2031,58 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let mut supervised_groups = parse_usize_list(&args.address_supervised_groups)?;
+    supervised_groups.sort_unstable();
+    supervised_groups.dedup();
+    if args.address_supervised_group_probe {
+        if supervised_groups.is_empty() {
+            return Err(
+                "--address-supervised-group-probe requires at least one --address-supervised-groups value".into(),
+            );
+        }
+        if args.address_supervised_epochs == 0 {
+            return Err("--address-supervised-epochs must be greater than zero".into());
+        }
+        if args.address_supervised_lr <= 0.0 {
+            return Err("--address-supervised-lr must be greater than zero".into());
+        }
+        if args.address_supervised_l2 < 0.0 {
+            return Err("--address-supervised-l2 must be non-negative".into());
+        }
+        for config in &configs {
+            for &group in &supervised_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-supervised-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut code_stability_groups = parse_usize_list(&args.address_code_stability_groups)?;
+    code_stability_groups.sort_unstable();
+    code_stability_groups.dedup();
+    if args.address_code_stability {
+        if code_stability_groups.is_empty() {
+            return Err(
+                "--address-code-stability requires at least one --address-code-stability-groups value"
+                    .into(),
+            );
+        }
+        for config in &configs {
+            for &group in &code_stability_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-code-stability-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     let mut stratum_conditioned_pq_groups = parse_usize_list(&args.stratum_conditioned_pq_groups)?;
     stratum_conditioned_pq_groups.sort_unstable();
     stratum_conditioned_pq_groups.dedup();
@@ -2743,6 +2218,35 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         HashMap::new()
     };
+    let address_supervised_models = if args.address_supervised_group_probe {
+        if !args.mode_d_check {
+            return Err("--address-supervised-group-probe requires --mode-d-check".into());
+        }
+        eprintln!(
+            "Fitting supervised group address probes for groups {:?} (epochs={}, lr={}, l2={})",
+            supervised_groups,
+            args.address_supervised_epochs,
+            args.address_supervised_lr,
+            args.address_supervised_l2
+        );
+        fit_address_supervised_group_models(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &supervised_groups,
+            args.address_supervised_epochs,
+            args.address_supervised_lr,
+            args.address_supervised_l2,
+        )?
+    } else {
+        HashMap::new()
+    };
     if args.address_corruption_sweep && !args.mode_d_check {
         return Err("--address-corruption-sweep requires --mode-d-check".into());
     }
@@ -2752,6 +2256,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     let majority_codes = if args.address_corruption_sweep
         || args.address_group_importance
         || args.address_lsh_group_probe
+        || args.address_supervised_group_probe
         || args.address_key_group_probe
     {
         eprintln!("Fitting per-group majority codes for address diagnostics");
@@ -2765,6 +2270,27 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
             &means,
             &pca_bases,
             &codebooks,
+        )?
+    } else {
+        HashMap::new()
+    };
+    let code_stability = if args.address_code_stability {
+        eprintln!(
+            "Measuring PQ code stability for groups {:?}",
+            code_stability_groups
+        );
+        measure_code_stability(
+            &mut weights,
+            &index,
+            &tokenizer,
+            &fit_prompts,
+            &eval_prompts,
+            &selected_heads,
+            &bases,
+            &means,
+            &pca_bases,
+            &codebooks,
+            &code_stability_groups,
         )?
     } else {
         HashMap::new()
@@ -3176,6 +2702,101 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                if args.address_supervised_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for supervised group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let supervised_model = address_supervised_models
+                        .get(&(*head, config))
+                        .ok_or_else(|| {
+                            format!(
+                                "missing supervised group probe model for L{} H{} {:?}",
+                                head.layer, head.head, config
+                            )
+                        })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for supervised group probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let layer_input =
+                        capture_layer_input_hidden(&mut weights, &token_ids, &index, head.layer)?;
+                    let selected_group_keys = supervised_model.selected_group_keys();
+                    for (probe_name, use_oracle_rest) in [
+                        (
+                            format!(
+                                "supervised_hyperplane_groups_{:?}_oracle_rest",
+                                supervised_model.groups
+                            ),
+                            true,
+                        ),
+                        (
+                            format!(
+                                "supervised_hyperplane_groups_{:?}_majority_rest",
+                                supervised_model.groups
+                            ),
+                            false,
+                        ),
+                    ] {
+                        let predicted_codes_by_position = oracle_codes_by_position
+                            .iter()
+                            .enumerate()
+                            .map(|(pos, oracle_codes)| {
+                                let base_codes = if use_oracle_rest {
+                                    oracle_codes.as_slice()
+                                } else {
+                                    group_majority.as_slice()
+                                };
+                                supervised_model.predict_selected_groups(
+                                    &layer_input,
+                                    pos,
+                                    base_codes,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let address_match = address_match_report(
+                            &oracle_codes_by_position,
+                            &predicted_codes_by_position,
+                        );
+                        let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                            stratum,
+                        )?;
+                        let predicted_logits = final_logits(&weights, &predicted_hidden);
+                        let predicted_logp = log_softmax(&predicted_logits);
+                        let predicted_top1 = argmax(&predicted_logits);
+                        let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_probe(
+                                &probe_name,
+                                &selected_group_keys,
+                                AddressProbePromptReport {
+                                    id: label.to_string(),
+                                    stratum: stratum.to_string(),
+                                    kl: kl_logp(&baseline_logp, &predicted_logp),
+                                    positions: oracle_codes_by_position.len(),
+                                    groups_correct: address_match.groups_correct,
+                                    groups_total: address_match.groups_total,
+                                    exact_address_match: address_match.exact_address_match,
+                                    top1_agree: baseline_top1 == predicted_top1,
+                                    baseline_top1_in_predicted_top5: predicted_top5
+                                        .contains(&baseline_top1),
+                                },
+                            );
+                    }
+                }
+
                 if args.address_corruption_sweep {
                     let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
                         format!(
@@ -3290,7 +2911,11 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
             let acc = accumulators
                 .remove(&(*head, config))
                 .expect("oracle PQ accumulator missing at finish");
-            points.push(acc.finish(config, weights.hidden_size));
+            let stability = code_stability
+                .get(&(*head, config))
+                .cloned()
+                .unwrap_or_default();
+            points.push(acc.finish(config, weights.hidden_size, stability));
         }
         head_reports.push(OraclePqHeadReport {
             layer: head.layer,
@@ -3337,6 +2962,21 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         address_lsh_bits: args.address_lsh_bits,
         address_lsh_seeds: args.address_lsh_seeds,
+        address_supervised_group_probe: args.address_supervised_group_probe,
+        address_supervised_groups: if args.address_supervised_group_probe {
+            supervised_groups
+        } else {
+            Vec::new()
+        },
+        address_supervised_epochs: args.address_supervised_epochs,
+        address_supervised_lr: args.address_supervised_lr,
+        address_supervised_l2: args.address_supervised_l2,
+        address_code_stability: args.address_code_stability,
+        address_code_stability_groups: if args.address_code_stability {
+            code_stability_groups
+        } else {
+            Vec::new()
+        },
         stratum_conditioned_pq_groups,
         selected_heads,
         heads: head_reports,
@@ -3400,78 +3040,6 @@ fn add_pre_o_wo_visible_stats(
     }
 }
 
-fn load_prompts(
-    path: &PathBuf,
-    max_prompts: Option<usize>,
-) -> Result<Vec<PromptRecord>, Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(path)?;
-    let mut prompts = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        prompts.push(serde_json::from_str::<PromptRecord>(line)?);
-        if max_prompts.is_some_and(|n| prompts.len() >= n) {
-            break;
-        }
-    }
-    Ok(prompts)
-}
-
-fn limit_prompts_per_stratum(
-    prompts: Vec<PromptRecord>,
-    max_per_stratum: usize,
-) -> Vec<PromptRecord> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut selected = Vec::new();
-    for prompt in prompts {
-        let key = prompt
-            .stratum
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let count = counts.entry(key).or_default();
-        if *count < max_per_stratum {
-            *count += 1;
-            selected.push(prompt);
-        }
-    }
-    selected
-}
-
-fn split_prompt_records(
-    prompts: &[PromptRecord],
-    eval_mod: usize,
-    eval_offset: usize,
-) -> Result<(Vec<PromptRecord>, Vec<PromptRecord>), Box<dyn std::error::Error>> {
-    if eval_mod == 0 {
-        return Err("--eval-mod must be greater than zero".into());
-    }
-    if eval_offset >= eval_mod {
-        return Err("--eval-offset must be smaller than --eval-mod".into());
-    }
-    let mut fit = Vec::new();
-    let mut eval = Vec::new();
-    for (idx, prompt) in prompts.iter().cloned().enumerate() {
-        if idx % eval_mod == eval_offset {
-            eval.push(prompt);
-        } else {
-            fit.push(prompt);
-        }
-    }
-    if fit.is_empty() || eval.is_empty() {
-        return Err("held-out split produced an empty fit or eval set".into());
-    }
-    eprintln!(
-        "Held-out split: fit_prompts={}, eval_prompts={} (idx % {} == {})",
-        fit.len(),
-        eval.len(),
-        eval_mod,
-        eval_offset
-    );
-    Ok((fit, eval))
-}
-
 fn select_zero_ablation_heads(
     args: &ZeroAblateArgs,
 ) -> Result<Vec<HeadId>, Box<dyn std::error::Error>> {
@@ -3504,68 +3072,6 @@ fn select_zero_ablation_heads(
     heads.sort_by_key(|h| (h.layer, h.head));
     heads.dedup();
     Ok(heads)
-}
-
-fn parse_head_spec(spec: &str) -> Result<Vec<HeadId>, Box<dyn std::error::Error>> {
-    let mut heads = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (layer, head) = part
-            .split_once(':')
-            .ok_or_else(|| format!("invalid head spec '{part}', expected layer:head"))?;
-        heads.push(HeadId {
-            layer: layer.parse()?,
-            head: head.parse()?,
-        });
-    }
-    Ok(heads)
-}
-
-fn parse_usize_list(spec: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-    let mut values = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        values.push(part.parse()?);
-    }
-    Ok(values)
-}
-
-fn parse_pq_configs(spec: &str) -> Result<Vec<PqConfig>, Box<dyn std::error::Error>> {
-    let mut configs = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let fields = part.split(':').collect::<Vec<_>>();
-        if fields.len() != 3 {
-            return Err(format!("invalid PQ config '{part}', expected K:groups:bits").into());
-        }
-        let config = PqConfig {
-            k: fields[0].parse()?,
-            groups: fields[1].parse()?,
-            bits_per_group: fields[2].parse()?,
-        };
-        if config.k == 0 || config.groups == 0 || config.bits_per_group == 0 {
-            return Err(format!("invalid zero value in PQ config '{part}'").into());
-        }
-        if config.k % config.groups != 0 {
-            return Err(format!("PQ config '{part}' requires K divisible by groups").into());
-        }
-        if config.bits_per_group > 12 {
-            return Err(format!("PQ config '{part}' has too many bits/group for smoke run").into());
-        }
-        configs.push(config);
-    }
-    configs.sort_by_key(|c| (c.k, c.groups, c.bits_per_group));
-    configs.dedup();
-    Ok(configs)
 }
 
 fn forward_q4k_zero_pre_o_head(
@@ -3835,545 +3341,6 @@ fn forward_q4k_noop_replace_head_residual_delta(
     }
 
     Ok(h)
-}
-
-#[derive(Debug)]
-struct WoRoundtripBasis {
-    head_dim: usize,
-    gram: Vec<Vec<f64>>,
-    vectors: Vec<Vec<f64>>,
-    sigmas: Vec<f64>,
-    sigma_max: f64,
-    sigma_min_retained: f64,
-    sigma_rel_cutoff: f64,
-}
-
-impl WoRoundtripBasis {
-    fn rank_retained(&self) -> usize {
-        self.vectors.len()
-    }
-
-    fn project(&self, y: &[f32]) -> Vec<f32> {
-        self.project_with_rank(y, self.vectors.len())
-    }
-
-    fn project_with_rank(&self, y: &[f32], k: usize) -> Vec<f32> {
-        let mut out = vec![0.0f64; self.head_dim];
-        for v in self.vectors.iter().take(k.min(self.vectors.len())) {
-            let coeff = v
-                .iter()
-                .zip(y.iter())
-                .map(|(&vi, &yi)| vi * yi as f64)
-                .sum::<f64>();
-            for (dst, &vi) in out.iter_mut().zip(v.iter()) {
-                *dst += coeff * vi;
-            }
-        }
-        out.into_iter().map(|value| value as f32).collect()
-    }
-
-    fn residual_to_z(&self, residual: &[f32]) -> Vec<f64> {
-        self.vectors
-            .iter()
-            .zip(self.sigmas.iter())
-            .map(|(v, &sigma)| {
-                sigma
-                    * v.iter()
-                        .zip(residual.iter())
-                        .map(|(&vi, &ri)| vi * ri as f64)
-                        .sum::<f64>()
-            })
-            .collect()
-    }
-
-    fn z_to_residual(&self, z: &[f64]) -> Vec<f32> {
-        let mut residual = vec![0.0f64; self.head_dim];
-        for ((v, &sigma), &zi) in self.vectors.iter().zip(self.sigmas.iter()).zip(z.iter()) {
-            if sigma == 0.0 {
-                continue;
-            }
-            let coeff = zi / sigma;
-            for (dst, &vi) in residual.iter_mut().zip(v.iter()) {
-                *dst += coeff * vi;
-            }
-        }
-        residual.into_iter().map(|value| value as f32).collect()
-    }
-
-    fn visible_sq_norm(&self, delta: &[f64]) -> f64 {
-        let mut total = 0.0;
-        for i in 0..self.head_dim {
-            let mut row = 0.0;
-            for j in 0..self.head_dim {
-                row += self.gram[i][j] * delta[j];
-            }
-            total += delta[i] * row;
-        }
-        total.max(0.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RoundtripPatchMetrics {
-    pre_wo_l2: f64,
-    wo_visible_l2: f64,
-}
-
-fn build_roundtrip_bases(
-    weights: &mut larql_inference::ModelWeights,
-    index: &VectorIndex,
-    heads: &[HeadId],
-    sigma_rel_cutoff: f64,
-) -> Result<HashMap<HeadId, WoRoundtripBasis>, Box<dyn std::error::Error>> {
-    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
-    for head in heads {
-        heads_by_layer.entry(head.layer).or_default().push(*head);
-    }
-
-    let mut bases = HashMap::new();
-    for (layer, layer_heads) in heads_by_layer {
-        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
-        let w_o = weights
-            .tensors
-            .get(&weights.arch.attn_o_key(layer))
-            .ok_or_else(|| format!("missing W_O tensor at layer {layer}"))?;
-        let head_dim = weights.arch.head_dim_for_layer(layer);
-        for head in layer_heads {
-            let start = head.head * head_dim;
-            let end = start + head_dim;
-            let w_o_head = w_o.slice(s![.., start..end]);
-            let basis = build_wo_roundtrip_basis(&w_o_head, sigma_rel_cutoff)?;
-            bases.insert(head, basis);
-        }
-        remove_layer_tensors(weights, inserted);
-    }
-
-    Ok(bases)
-}
-
-fn build_wo_roundtrip_basis(
-    w_o_head: &ndarray::ArrayBase<impl ndarray::Data<Elem = f32>, ndarray::Ix2>,
-    sigma_rel_cutoff: f64,
-) -> Result<WoRoundtripBasis, Box<dyn std::error::Error>> {
-    let hidden = w_o_head.nrows();
-    let head_dim = w_o_head.ncols();
-    let mut gram = vec![vec![0.0f64; head_dim]; head_dim];
-    for row in 0..hidden {
-        for i in 0..head_dim {
-            let wi = w_o_head[[row, i]] as f64;
-            for j in i..head_dim {
-                gram[i][j] += wi * w_o_head[[row, j]] as f64;
-            }
-        }
-    }
-    for i in 0..head_dim {
-        for j in 0..i {
-            gram[i][j] = gram[j][i];
-        }
-    }
-
-    let (eigenvalues, eigenvectors) = jacobi_symmetric_eigen(&gram, 100, 1e-10);
-    let mut pairs: Vec<(f64, Vec<f64>)> = eigenvalues.into_iter().zip(eigenvectors).collect();
-    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let sigma_max = pairs
-        .first()
-        .map(|(value, _)| value.max(0.0).sqrt())
-        .unwrap_or(0.0);
-    let cutoff = sigma_max * sigma_rel_cutoff;
-    let mut vectors = Vec::new();
-    let mut sigmas = Vec::new();
-    let mut sigma_min_retained = 0.0;
-    for (value, vector) in pairs {
-        let sigma = value.max(0.0).sqrt();
-        if sigma > cutoff {
-            sigma_min_retained = if sigma_min_retained == 0.0 {
-                sigma
-            } else {
-                sigma_min_retained.min(sigma)
-            };
-            sigmas.push(sigma);
-            vectors.push(vector);
-        }
-    }
-    if vectors.is_empty() && sigma_max > 0.0 {
-        return Err("W_O roundtrip retained zero singular directions".into());
-    }
-
-    Ok(WoRoundtripBasis {
-        head_dim,
-        gram,
-        vectors,
-        sigmas,
-        sigma_max,
-        sigma_min_retained,
-        sigma_rel_cutoff,
-    })
-}
-
-fn jacobi_symmetric_eigen(
-    input: &[Vec<f64>],
-    max_sweeps: usize,
-    tolerance: f64,
-) -> (Vec<f64>, Vec<Vec<f64>>) {
-    let n = input.len();
-    let mut a = input.to_vec();
-    let mut v = vec![vec![0.0f64; n]; n];
-    for i in 0..n {
-        v[i][i] = 1.0;
-    }
-
-    for _ in 0..max_sweeps {
-        let mut max_value = 0.0;
-        let mut p = 0;
-        let mut q = 1.min(n.saturating_sub(1));
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let value = a[i][j].abs();
-                if value > max_value {
-                    max_value = value;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-        if max_value < tolerance || n < 2 {
-            break;
-        }
-
-        let app = a[p][p];
-        let aqq = a[q][q];
-        let apq = a[p][q];
-        if apq == 0.0 {
-            continue;
-        }
-        let tau = (aqq - app) / (2.0 * apq);
-        let t = if tau >= 0.0 {
-            1.0 / (tau + (1.0 + tau * tau).sqrt())
-        } else {
-            -1.0 / (-tau + (1.0 + tau * tau).sqrt())
-        };
-        let c = 1.0 / (1.0 + t * t).sqrt();
-        let s = t * c;
-
-        for k in 0..n {
-            if k != p && k != q {
-                let akp = a[k][p];
-                let akq = a[k][q];
-                let new_kp = c * akp - s * akq;
-                let new_kq = s * akp + c * akq;
-                a[k][p] = new_kp;
-                a[p][k] = new_kp;
-                a[k][q] = new_kq;
-                a[q][k] = new_kq;
-            }
-        }
-        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-        a[p][q] = 0.0;
-        a[q][p] = 0.0;
-
-        for row in &mut v {
-            let vip = row[p];
-            let viq = row[q];
-            row[p] = c * vip - s * viq;
-            row[q] = s * vip + c * viq;
-        }
-    }
-
-    let eigenvalues = (0..n).map(|i| a[i][i]).collect::<Vec<_>>();
-    let eigenvectors = (0..n)
-        .map(|col| (0..n).map(|row| v[row][col]).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    (eigenvalues, eigenvectors)
-}
-
-#[derive(Debug)]
-struct ZPcaBasis {
-    vectors: Vec<Vec<f64>>,
-}
-
-impl ZPcaBasis {
-    fn rank(&self) -> usize {
-        self.vectors.len()
-    }
-
-    fn coordinates_with_rank(&self, z: &[f64], k: usize) -> Vec<f64> {
-        self.vectors
-            .iter()
-            .take(k.min(self.vectors.len()))
-            .map(|v| v.iter().zip(z.iter()).map(|(&vi, &zi)| vi * zi).sum())
-            .collect()
-    }
-
-    fn reconstruct_from_coordinates(&self, coords: &[f64]) -> Vec<f64> {
-        let dim = self.vectors.first().map(|v| v.len()).unwrap_or(0);
-        let mut out = vec![0.0; dim];
-        for (coord, v) in coords.iter().zip(self.vectors.iter()) {
-            for (dst, &vi) in out.iter_mut().zip(v.iter()) {
-                *dst += coord * vi;
-            }
-        }
-        out
-    }
-
-    fn project_with_rank(&self, z: &[f64], k: usize) -> Vec<f64> {
-        let coords = self.coordinates_with_rank(z, k);
-        self.reconstruct_from_coordinates(&coords)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PqCodebook {
-    config: PqConfig,
-    centroids: Vec<Vec<Vec<f64>>>,
-    stratum_centroids: HashMap<String, HashMap<usize, Vec<Vec<f64>>>>,
-}
-
-impl PqCodebook {
-    fn quantize_indices(&self, coords: &[f64]) -> Vec<usize> {
-        self.quantize_indices_for_stratum(coords, "unknown")
-    }
-
-    fn quantize_indices_for_stratum(&self, coords: &[f64], stratum: &str) -> Vec<usize> {
-        let group_dim = self.config.k / self.config.groups;
-        (0..self.config.groups)
-            .map(|group| {
-                let start = group * group_dim;
-                let end = start + group_dim;
-                nearest_centroid_index(
-                    &coords[start..end],
-                    self.centroids_for_group(stratum, group),
-                )
-            })
-            .collect()
-    }
-
-    fn quantize_from_indices(&self, indices: &[usize]) -> Vec<f64> {
-        self.quantize_from_indices_for_stratum(indices, "unknown")
-    }
-
-    fn quantize_from_indices_for_stratum(&self, indices: &[usize], stratum: &str) -> Vec<f64> {
-        let group_dim = self.config.k / self.config.groups;
-        let mut out = vec![0.0; self.config.k];
-        for (group, &index) in indices.iter().take(self.config.groups).enumerate() {
-            let start = group * group_dim;
-            let end = start + group_dim;
-            let centroid = &self.centroids_for_group(stratum, group)[index];
-            out[start..end].copy_from_slice(centroid);
-        }
-        out
-    }
-
-    fn centroids_for_group(&self, stratum: &str, group: usize) -> &[Vec<f64>] {
-        self.stratum_centroids
-            .get(stratum)
-            .and_then(|groups| groups.get(&group))
-            .unwrap_or(&self.centroids[group])
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ModeDTable {
-    static_delta_by_position: Vec<Vec<f32>>,
-    static_global_delta: Vec<f32>,
-    group_tables: Vec<Vec<Vec<f32>>>,
-    stratum_group_tables: HashMap<String, HashMap<usize, Vec<Vec<f32>>>>,
-}
-
-impl ModeDTable {
-    fn delta_for_position_codes(&self, position: usize, codes: &[usize]) -> Vec<f32> {
-        self.delta_for_position_codes_with_stratum(position, codes, "unknown")
-    }
-
-    fn delta_for_position_codes_with_stratum(
-        &self,
-        position: usize,
-        codes: &[usize],
-        stratum: &str,
-    ) -> Vec<f32> {
-        let mut out = self
-            .static_delta_by_position
-            .get(position)
-            .unwrap_or(&self.static_global_delta)
-            .clone();
-        for (group, &code) in codes.iter().enumerate() {
-            let table = &self.table_for_group(stratum, group)[code];
-            for (dst, &value) in out.iter_mut().zip(table.iter()) {
-                *dst += value;
-            }
-        }
-        out
-    }
-
-    fn table_for_group(&self, stratum: &str, group: usize) -> &[Vec<f32>] {
-        self.stratum_group_tables
-            .get(stratum)
-            .and_then(|groups| groups.get(&group))
-            .unwrap_or(&self.group_tables[group])
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AddressProbeModel {
-    name: String,
-    group_majority: Vec<usize>,
-    group_maps: Vec<HashMap<String, usize>>,
-    group_train_accuracy: Vec<f64>,
-    selected_group_keys: Vec<String>,
-}
-
-impl AddressProbeModel {
-    fn predict_codes(&self, token_ids: &[u32], stratum: &str, position: usize) -> Vec<usize> {
-        let key = address_feature_key(&self.name, token_ids, stratum, position);
-        self.group_maps
-            .iter()
-            .enumerate()
-            .map(|(group, map)| {
-                map.get(&key)
-                    .copied()
-                    .unwrap_or_else(|| self.group_majority[group])
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AddressLshGroupModel {
-    groups: Vec<usize>,
-    bits: usize,
-    group_majority: Vec<usize>,
-    group_maps: Vec<HashMap<usize, usize>>,
-    group_seeds: Vec<u64>,
-    group_train_accuracy: Vec<f64>,
-}
-
-impl AddressLshGroupModel {
-    fn selected_group_keys(&self) -> Vec<String> {
-        (0..self.group_majority.len())
-            .map(|group| {
-                if self.groups.contains(&group) {
-                    format!(
-                        "lsh{}bits_seed{}_train_acc_{:.3}",
-                        self.bits, self.group_seeds[group], self.group_train_accuracy[group]
-                    )
-                } else {
-                    "majority".to_string()
-                }
-            })
-            .collect()
-    }
-
-    fn predict_selected_groups(
-        &self,
-        layer_input: &Array2<f32>,
-        position: usize,
-        base_codes: &[usize],
-    ) -> Vec<usize> {
-        let mut codes = base_codes.to_vec();
-        let row = layer_input.row(position);
-        for &group in &self.groups {
-            let bucket = lsh_bucket(row, self.group_seeds[group], self.bits);
-            codes[group] = self.group_maps[group]
-                .get(&bucket)
-                .copied()
-                .unwrap_or(self.group_majority[group]);
-        }
-        codes
-    }
-}
-
-fn address_probe_names() -> Vec<&'static str> {
-    vec![
-        "position",
-        "stratum",
-        "position_stratum",
-        "token_id",
-        "prev_token_id",
-        "token_bigram",
-        "position_stratum_token",
-    ]
-}
-
-fn address_feature_key(name: &str, token_ids: &[u32], stratum: &str, position: usize) -> String {
-    let token = token_ids.get(position).copied().unwrap_or(0);
-    let prev = if position == 0 {
-        u32::MAX
-    } else {
-        token_ids.get(position - 1).copied().unwrap_or(0)
-    };
-    match name {
-        "position" => format!("p:{position}"),
-        "stratum" => format!("s:{stratum}"),
-        "position_stratum" => format!("p:{position}|s:{stratum}"),
-        "token_id" => format!("t:{token}"),
-        "prev_token_id" => format!("pt:{prev}"),
-        "token_bigram" => format!("pt:{prev}|t:{token}"),
-        "position_stratum_token" => format!("p:{position}|s:{stratum}|t:{token}"),
-        _ => format!("p:{position}"),
-    }
-}
-
-fn lsh_bucket(row: ArrayView1<'_, f32>, seed: u64, bits: usize) -> usize {
-    let mut bucket = 0usize;
-    for bit in 0..bits {
-        let mut sum = 0.0_f64;
-        for (dim, &value) in row.iter().enumerate() {
-            let hash = splitmix64(
-                seed ^ ((bit as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    ^ ((dim as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)),
-            );
-            let sign = if hash & 1 == 0 { -1.0 } else { 1.0 };
-            sum += value as f64 * sign;
-        }
-        if sum >= 0.0 {
-            bucket |= 1usize << bit;
-        }
-    }
-    bucket
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AddressMatchSummary {
-    groups_correct: usize,
-    groups_total: usize,
-    exact_address_match: bool,
-}
-
-fn address_match_report(
-    oracle_codes_by_position: &[Vec<usize>],
-    predicted_codes_by_position: &[Vec<usize>],
-) -> AddressMatchSummary {
-    let mut groups_correct = 0usize;
-    let mut groups_total = 0usize;
-    let mut exact_address_match = true;
-    for (oracle, predicted) in oracle_codes_by_position
-        .iter()
-        .zip(predicted_codes_by_position.iter())
-    {
-        if oracle != predicted {
-            exact_address_match = false;
-        }
-        for (&oracle_code, &predicted_code) in oracle.iter().zip(predicted.iter()) {
-            groups_total += 1;
-            if oracle_code == predicted_code {
-                groups_correct += 1;
-            }
-        }
-    }
-    AddressMatchSummary {
-        groups_correct,
-        groups_total,
-        exact_address_match,
-    }
 }
 
 #[derive(Debug)]
@@ -5037,6 +4004,439 @@ fn fit_address_lsh_group_models(
     Ok(models)
 }
 
+fn fit_address_supervised_group_models(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+    epochs: usize,
+    lr: f32,
+    l2: f32,
+) -> Result<HashMap<(HeadId, PqConfig), AddressSupervisedGroupModel>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut majority_counts: HashMap<(HeadId, PqConfig, usize), Vec<usize>> = HashMap::new();
+    let mut samples: HashMap<(HeadId, PqConfig), Vec<(Vec<f32>, Vec<usize>)>> = HashMap::new();
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!(
+            "  supervised-fit [{}/{}] {}",
+            prompt_idx + 1,
+            prompts.len(),
+            label
+        );
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let layer_input = h.clone();
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).ok_or_else(|| {
+                        format!("missing basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let head_means = means.get(head).ok_or_else(|| {
+                        format!("missing means for L{}H{}", head.layer, head.head)
+                    })?;
+                    let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                        format!("missing PCA basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let head_codebooks = codebooks
+                        .iter()
+                        .filter(|((codebook_head, _), _)| codebook_head == head)
+                        .collect::<Vec<_>>();
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row.as_slice().ok_or(
+                            "pre-W_O head row was not contiguous during supervised address fit",
+                        )?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        let input_row = layer_input.row(pos).to_vec();
+                        for ((_, config), codebook) in &head_codebooks {
+                            let coords = pca_basis.coordinates_with_rank(&z, config.k);
+                            let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
+                            let levels = 1usize << config.bits_per_group;
+                            for (group, &code) in codes.iter().enumerate() {
+                                let counts = majority_counts
+                                    .entry((*head, *config, group))
+                                    .or_insert_with(|| vec![0; levels]);
+                                counts[code] += 1;
+                            }
+                            samples
+                                .entry((*head, *config))
+                                .or_default()
+                                .push((input_row.clone(), codes));
+                        }
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    let mut models = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let train_samples = samples.get(&(*head, *config)).cloned().unwrap_or_default();
+        let dim = train_samples.first().map(|(row, _)| row.len()).unwrap_or(0);
+        let mut group_majority = Vec::with_capacity(config.groups);
+        for group in 0..config.groups {
+            let majority = majority_counts
+                .get(&(*head, *config, group))
+                .map(|counts| argmax_usize(counts))
+                .unwrap_or(0);
+            group_majority.push(majority);
+        }
+
+        let mut group_hyperplanes = vec![Vec::new(); config.groups];
+        let mut group_train_accuracy = vec![0.0; config.groups];
+        for &group in selected_groups {
+            let mut bit_planes = Vec::with_capacity(config.bits_per_group);
+            for bit in 0..config.bits_per_group {
+                let labels = train_samples
+                    .iter()
+                    .map(|(_, codes)| ((codes[group] >> bit) & 1) != 0)
+                    .collect::<Vec<_>>();
+                let rows = train_samples
+                    .iter()
+                    .map(|(row, _)| row.as_slice())
+                    .collect::<Vec<_>>();
+                bit_planes.push(train_binary_hyperplane(&rows, &labels, dim, epochs, lr, l2));
+            }
+
+            let mut correct = 0usize;
+            for (row, codes) in &train_samples {
+                let predicted = predict_code_from_hyperplanes(row, &bit_planes);
+                if predicted == codes[group] {
+                    correct += 1;
+                }
+            }
+            group_train_accuracy[group] = if train_samples.is_empty() {
+                0.0
+            } else {
+                correct as f64 / train_samples.len() as f64
+            };
+            group_hyperplanes[group] = bit_planes;
+        }
+
+        models.insert(
+            (*head, *config),
+            AddressSupervisedGroupModel {
+                groups: selected_groups.to_vec(),
+                bits_per_group: config.bits_per_group,
+                epochs,
+                lr,
+                l2,
+                group_majority,
+                group_hyperplanes,
+                group_train_accuracy,
+            },
+        );
+    }
+
+    Ok(models)
+}
+
+#[derive(Debug, Clone)]
+struct CodeDistributionCounts {
+    group_counts: HashMap<usize, Vec<usize>>,
+    stratum_group_counts: HashMap<String, HashMap<usize, Vec<usize>>>,
+}
+
+impl CodeDistributionCounts {
+    fn new(selected_groups: &[usize], levels: usize) -> Self {
+        Self {
+            group_counts: selected_groups
+                .iter()
+                .map(|&group| (group, vec![0; levels]))
+                .collect(),
+            stratum_group_counts: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, group: usize, code: usize, stratum: &str, levels: usize) {
+        if let Some(counts) = self.group_counts.get_mut(&group) {
+            counts[code] += 1;
+        }
+        self.stratum_group_counts
+            .entry(stratum.to_string())
+            .or_default()
+            .entry(group)
+            .or_insert_with(|| vec![0; levels])[code] += 1;
+    }
+}
+
+fn measure_code_stability(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    train_prompts: &[PromptRecord],
+    eval_prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+) -> Result<HashMap<(HeadId, PqConfig), Vec<CodeStabilityReport>>, Box<dyn std::error::Error>> {
+    let train = collect_code_distribution_counts(
+        weights,
+        index,
+        tokenizer,
+        train_prompts,
+        heads,
+        bases,
+        means,
+        pca_bases,
+        codebooks,
+        selected_groups,
+        "code-stability-train",
+    )?;
+    let eval = collect_code_distribution_counts(
+        weights,
+        index,
+        tokenizer,
+        eval_prompts,
+        heads,
+        bases,
+        means,
+        pca_bases,
+        codebooks,
+        selected_groups,
+        "code-stability-eval",
+    )?;
+
+    let mut reports = HashMap::new();
+    for ((head, config), _) in codebooks {
+        let levels = 1usize << config.bits_per_group;
+        let empty_counts = CodeDistributionCounts::new(selected_groups, levels);
+        let train_counts = train.get(&(*head, *config)).unwrap_or(&empty_counts);
+        let eval_counts = eval.get(&(*head, *config)).unwrap_or(&empty_counts);
+        let mut group_reports = Vec::new();
+        for &group in selected_groups {
+            let train_group = train_counts
+                .group_counts
+                .get(&group)
+                .cloned()
+                .unwrap_or_else(|| vec![0; levels]);
+            let eval_group = eval_counts
+                .group_counts
+                .get(&group)
+                .cloned()
+                .unwrap_or_else(|| vec![0; levels]);
+            let train_top = argmax_usize(&train_group);
+            let eval_top = argmax_usize(&eval_group);
+            let mut stratum_names = train_counts
+                .stratum_group_counts
+                .keys()
+                .chain(eval_counts.stratum_group_counts.keys())
+                .cloned()
+                .collect::<Vec<_>>();
+            stratum_names.sort();
+            stratum_names.dedup();
+            let by_stratum = stratum_names
+                .into_iter()
+                .map(|stratum| {
+                    let train_s = train_counts
+                        .stratum_group_counts
+                        .get(&stratum)
+                        .and_then(|groups| groups.get(&group))
+                        .cloned()
+                        .unwrap_or_else(|| vec![0; levels]);
+                    let eval_s = eval_counts
+                        .stratum_group_counts
+                        .get(&stratum)
+                        .and_then(|groups| groups.get(&group))
+                        .cloned()
+                        .unwrap_or_else(|| vec![0; levels]);
+                    let train_s_top = argmax_usize(&train_s);
+                    let eval_s_top = argmax_usize(&eval_s);
+                    CodeStabilityStratumReport {
+                        stratum,
+                        train_positions: train_s.iter().sum(),
+                        eval_positions: eval_s.iter().sum(),
+                        train_entropy_bits: entropy_bits(&train_s),
+                        eval_entropy_bits: entropy_bits(&eval_s),
+                        train_top_code: train_s_top,
+                        train_top_code_mass: code_mass(&train_s, train_s_top),
+                        eval_top_code: eval_s_top,
+                        eval_top_code_mass: code_mass(&eval_s, eval_s_top),
+                        train_eval_js_bits: js_divergence_bits(&train_s, &eval_s),
+                    }
+                })
+                .collect();
+            group_reports.push(CodeStabilityReport {
+                group,
+                train_positions: train_group.iter().sum(),
+                eval_positions: eval_group.iter().sum(),
+                train_entropy_bits: entropy_bits(&train_group),
+                eval_entropy_bits: entropy_bits(&eval_group),
+                train_top_code: train_top,
+                train_top_code_mass: code_mass(&train_group, train_top),
+                eval_top_code: eval_top,
+                eval_top_code_mass: code_mass(&eval_group, eval_top),
+                train_eval_js_bits: js_divergence_bits(&train_group, &eval_group),
+                by_stratum,
+            });
+        }
+        reports.insert((*head, *config), group_reports);
+    }
+
+    Ok(reports)
+}
+
+fn collect_code_distribution_counts(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+    bases: &HashMap<HeadId, WoRoundtripBasis>,
+    means: &HashMap<HeadId, StaticHeadMeans>,
+    pca_bases: &HashMap<HeadId, ZPcaBasis>,
+    codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    selected_groups: &[usize],
+    label_prefix: &str,
+) -> Result<HashMap<(HeadId, PqConfig), CodeDistributionCounts>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+    let mut counts = HashMap::new();
+    for ((head, config), _) in codebooks {
+        counts.insert(
+            (*head, *config),
+            CodeDistributionCounts::new(selected_groups, 1usize << config.bits_per_group),
+        );
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!(
+            "  {label_prefix} [{}/{}] {}",
+            prompt_idx + 1,
+            prompts.len(),
+            label
+        );
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let basis = bases.get(head).ok_or_else(|| {
+                        format!("missing basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let head_means = means.get(head).ok_or_else(|| {
+                        format!("missing means for L{}H{}", head.layer, head.head)
+                    })?;
+                    let pca_basis = pca_bases.get(head).ok_or_else(|| {
+                        format!("missing PCA basis for L{}H{}", head.layer, head.head)
+                    })?;
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let head_codebooks = codebooks
+                        .iter()
+                        .filter(|((codebook_head, _), _)| codebook_head == head)
+                        .collect::<Vec<_>>();
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        let values = row
+                            .as_slice()
+                            .ok_or("pre-W_O head row was not contiguous during code stability")?;
+                        let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                        let residual = values
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&yi, &bi)| yi - bi)
+                            .collect::<Vec<_>>();
+                        let z = basis.residual_to_z(&residual);
+                        for ((_, config), codebook) in &head_codebooks {
+                            let coords = pca_basis.coordinates_with_rank(&z, config.k);
+                            let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
+                            let levels = 1usize << config.bits_per_group;
+                            let point_counts =
+                                counts.get_mut(&(*head, *config)).ok_or_else(|| {
+                                    format!(
+                                        "missing code stability counts for L{}H{} {:?}",
+                                        head.layer, head.head, config
+                                    )
+                                })?;
+                            for &group in selected_groups {
+                                point_counts.add(group, codes[group], stratum, levels);
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    Ok(counts)
+}
+
 fn fit_majority_codes_for_codebooks(
     weights: &mut larql_inference::ModelWeights,
     index: &VectorIndex,
@@ -5157,69 +4557,6 @@ fn corruption_keep_values(groups: usize) -> Vec<usize> {
         .into_iter()
         .filter(|value| *value <= groups)
         .collect()
-}
-
-fn kmeans_centroids(samples: &[Vec<f64>], k: usize, iterations: usize) -> Vec<Vec<f64>> {
-    if samples.is_empty() {
-        return vec![Vec::new(); k];
-    }
-    let dim = samples[0].len();
-    let mut centroids = (0..k)
-        .map(|idx| samples[(idx * samples.len()) / k].clone())
-        .collect::<Vec<_>>();
-    let mut assignments = vec![0usize; samples.len()];
-    for _ in 0..iterations {
-        let mut changed = false;
-        for (sample_idx, sample) in samples.iter().enumerate() {
-            let nearest = nearest_centroid_index(sample, &centroids);
-            if assignments[sample_idx] != nearest {
-                assignments[sample_idx] = nearest;
-                changed = true;
-            }
-        }
-        let mut sums = vec![vec![0.0; dim]; k];
-        let mut counts = vec![0usize; k];
-        for (sample, &cluster) in samples.iter().zip(assignments.iter()) {
-            counts[cluster] += 1;
-            for (dst, &value) in sums[cluster].iter_mut().zip(sample.iter()) {
-                *dst += value;
-            }
-        }
-        for cluster in 0..k {
-            if counts[cluster] == 0 {
-                continue;
-            }
-            let inv = 1.0 / counts[cluster] as f64;
-            for value in &mut sums[cluster] {
-                *value *= inv;
-            }
-            centroids[cluster] = sums[cluster].clone();
-        }
-        if !changed {
-            break;
-        }
-    }
-    centroids
-}
-
-fn nearest_centroid_index(sample: &[f64], centroids: &[Vec<f64>]) -> usize {
-    let mut best_idx = 0usize;
-    let mut best_dist = f64::INFINITY;
-    for (idx, centroid) in centroids.iter().enumerate() {
-        let dist = sample
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&a, &b)| {
-                let d = a - b;
-                d * d
-            })
-            .sum::<f64>();
-        if dist < best_dist {
-            best_dist = dist;
-            best_idx = idx;
-        }
-    }
-    best_idx
 }
 
 fn materialize_mode_d_tables(
@@ -6086,212 +5423,4 @@ fn final_logits(weights: &larql_inference::ModelWeights, h: &Array2<f32>) -> Vec
     let last = h.nrows().saturating_sub(1);
     let h_last = h.slice(s![last..last + 1, ..]).to_owned();
     hidden_to_raw_logits(weights, &h_last)
-}
-
-fn log_softmax(logits: &[f32]) -> Vec<f64> {
-    let max_logit = logits
-        .iter()
-        .map(|&v| v as f64)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let sum_exp = logits
-        .iter()
-        .map(|&v| ((v as f64) - max_logit).exp())
-        .sum::<f64>();
-    let log_z = max_logit + sum_exp.ln();
-    logits.iter().map(|&v| (v as f64) - log_z).collect()
-}
-
-fn kl_logp(p_logp: &[f64], q_logp: &[f64]) -> f64 {
-    p_logp
-        .iter()
-        .zip(q_logp.iter())
-        .map(|(&lp, &lq)| {
-            let p = lp.exp();
-            p * (lp - lq)
-        })
-        .sum()
-}
-
-fn token_prob(logp: &[f64], token_id: u32) -> f64 {
-    logp.get(token_id as usize)
-        .map(|value| value.exp())
-        .unwrap_or(0.0)
-}
-
-fn argmax_usize(values: &[usize]) -> usize {
-    values
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, value)| *value)
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
-}
-
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| ((x as f64) - (y as f64)).abs())
-        .fold(0.0, f64::max)
-}
-
-fn argmax(values: &[f32]) -> u32 {
-    values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as u32)
-        .unwrap_or(0)
-}
-
-fn top_k_indices(values: &[f32], k: usize) -> Vec<u32> {
-    let mut pairs: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();
-    let take = k.min(pairs.len());
-    pairs.select_nth_unstable_by(take.saturating_sub(1), |a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    pairs.truncate(take);
-    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    pairs.into_iter().map(|(idx, _)| idx as u32).collect()
-}
-
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        0.0
-    } else {
-        values.iter().sum::<f64>() / values.len() as f64
-    }
-}
-
-fn bool_rate(values: impl Iterator<Item = bool>) -> f64 {
-    let mut total = 0usize;
-    let mut hits = 0usize;
-    for value in values {
-        total += 1;
-        if value {
-            hits += 1;
-        }
-    }
-    if total == 0 {
-        0.0
-    } else {
-        hits as f64 / total as f64
-    }
-}
-
-fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let rank = ((values.len() - 1) as f64 * p).ceil() as usize;
-    values[rank.min(values.len() - 1)]
-}
-
-fn insert_q4k_layer_tensors(
-    weights: &mut larql_inference::ModelWeights,
-    index: &VectorIndex,
-    layer: usize,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let attn = index
-        .attn_q4k_layer_data(layer)
-        .ok_or_else(|| format!("attn Q4K slices missing for layer {layer}"))?;
-    let ffn = index
-        .interleaved_q4k_layer_data(layer)
-        .ok_or_else(|| format!("ffn Q4K slices missing for layer {layer}"))?;
-
-    let arch = &*weights.arch;
-    let hidden = weights.hidden_size;
-    let num_q = arch.num_q_heads_for_layer(layer);
-    let num_kv = arch.num_kv_heads_for_layer(layer);
-    let head_dim = arch.head_dim_for_layer(layer);
-    let q_dim = num_q * head_dim;
-    let kv_dim = num_kv * head_dim;
-    let intermediate = index.num_features(layer);
-
-    let q_key = arch.attn_q_key(layer);
-    let k_key = arch.attn_k_key(layer);
-    let v_key = arch.attn_v_key(layer);
-    let o_key = arch.attn_o_key(layer);
-    let gate_key = arch.ffn_gate_key(layer);
-    let up_key = arch.ffn_up_key(layer);
-    let down_key = arch.ffn_down_key(layer);
-
-    weights.tensors.insert(
-        q_key.clone(),
-        dequantize_matrix(attn[0].0, attn[0].1, q_dim, hidden).into_shared(),
-    );
-    weights.tensors.insert(
-        k_key.clone(),
-        dequantize_matrix(attn[1].0, attn[1].1, kv_dim, hidden).into_shared(),
-    );
-    weights.tensors.insert(
-        v_key.clone(),
-        dequantize_matrix(attn[2].0, attn[2].1, kv_dim, hidden).into_shared(),
-    );
-    weights.tensors.insert(
-        o_key.clone(),
-        dequantize_matrix(attn[3].0, attn[3].1, hidden, q_dim).into_shared(),
-    );
-    weights.tensors.insert(
-        gate_key.clone(),
-        dequantize_matrix(ffn[0].0, ffn[0].1, intermediate, hidden).into_shared(),
-    );
-    weights.tensors.insert(
-        up_key.clone(),
-        dequantize_matrix(ffn[1].0, ffn[1].1, intermediate, hidden).into_shared(),
-    );
-
-    let inter_padded = intermediate.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
-        * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
-    let w_down = if inter_padded != intermediate {
-        let w = dequantize_matrix(ffn[2].0, ffn[2].1, hidden, inter_padded);
-        w.slice(s![.., ..intermediate]).to_owned()
-    } else {
-        dequantize_matrix(ffn[2].0, ffn[2].1, hidden, intermediate)
-    };
-    weights
-        .tensors
-        .insert(down_key.clone(), w_down.into_shared());
-
-    Ok(vec![q_key, k_key, v_key, o_key, gate_key, up_key, down_key])
-}
-
-fn remove_layer_tensors(weights: &mut larql_inference::ModelWeights, keys: Vec<String>) {
-    for key in keys {
-        weights.tensors.remove(&key);
-    }
-}
-
-fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Array2<f32> {
-    let n = rows * cols;
-    let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
-    let padded = n.div_ceil(block) * block;
-    let info = larql_vindex::quant::registry::lookup(format)
-        .unwrap_or_else(|| panic!("unsupported quant format in vindex: {format}"));
-    let floats =
-        (info.dequantize)(bytes, padded).unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
-    let truncated = if floats.len() > n {
-        floats[..n].to_vec()
-    } else {
-        floats
-    };
-    Array2::from_shape_vec((rows, cols), truncated).expect("shape mismatch dequantising matrix")
-}
-
-fn parse_layer_spec(spec: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-    let mut layers = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.contains('-') {
-            let (a, b) = part
-                .split_once('-')
-                .ok_or_else(|| format!("invalid range: {part}"))?;
-            let start: usize = a.parse()?;
-            let end: usize = b.parse()?;
-            layers.extend(start..=end);
-        } else {
-            layers.push(part.parse()?);
-        }
-    }
-    Ok(layers)
 }

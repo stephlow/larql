@@ -38,19 +38,26 @@
 //! - generation is un-KV-cached, ~1-3 tok/s on CPU for Gemma 3 4B
 //!   (KV-cached fast path = N0.2-fast in ROADMAP)
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt as _;
 
 use larql_inference::{ChatMLRenderer, GemmaRenderer, Llama3Renderer, TurnRenderer};
 
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
+use super::util::{contains_any, error_chunk, new_id_suffix, trim_at_stop, unix_now, StopSpec};
+
 const CHAT_COMPLETION_OBJECT: &str = "chat.completion";
+const CHAT_COMPLETION_CHUNK_OBJECT: &str = "chat.completion.chunk";
 const ASSISTANT_ROLE: &str = "assistant";
 const SYSTEM_ROLE: &str = "system";
 const USER_ROLE: &str = "user";
@@ -119,22 +126,6 @@ pub struct ChatCompletionsRequest {
     pub presence_penalty: Option<f32>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-pub enum StopSpec {
-    Single(String),
-    Multi(Vec<String>),
-}
-
-impl StopSpec {
-    fn as_slice(&self) -> &[String] {
-        match self {
-            StopSpec::Single(s) => std::slice::from_ref(s),
-            StopSpec::Multi(v) => v.as_slice(),
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub struct ChatChoiceMessage {
     pub role: &'static str,
@@ -170,16 +161,9 @@ pub struct ChatCompletionsResponse {
 pub async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionsRequest>,
-) -> Result<Json<ChatCompletionsResponse>, ServerError> {
+) -> Result<Response, ServerError> {
     state.bump_requests();
 
-    if req.stream.unwrap_or(false) {
-        return Err(ServerError::BadRequest(
-            "stream=true not yet supported on /v1/chat/completions; SSE arrives \
-             in N0 slice 3 (see ROADMAP). Use stream=false for now."
-                .into(),
-        ));
-    }
     if req.n.unwrap_or(1) > 1 {
         return Err(ServerError::BadRequest(
             "n>1 not yet supported; only n=1 (single completion per prompt)".into(),
@@ -254,6 +238,18 @@ pub async fn handle_chat_completions(
     let model_arc = model.clone();
     let messages = req.messages;
 
+    if req.stream.unwrap_or(false) {
+        return Ok(stream_chat_completion(
+            model_arc,
+            messages,
+            max_tokens,
+            temperature,
+            stop_strings,
+            model_id,
+        )
+        .into_response());
+    }
+
     let (text, finish_reason, prompt_tokens, completion_tokens) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
             run_chat_completion(
@@ -286,7 +282,146 @@ pub async fn handle_chat_completions(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
-    }))
+    })
+    .into_response())
+}
+
+/// SSE stream for `/v1/chat/completions`. First chunk emits
+/// `delta: {role: "assistant"}`; subsequent chunks emit
+/// `delta: {content: "<token text>"}`; the final chunk has empty
+/// `delta` and `finish_reason`. Stream terminates with `data: [DONE]`.
+fn stream_chat_completion(
+    model: Arc<LoadedModel>,
+    messages: Vec<ChatMessage>,
+    max_tokens: usize,
+    temperature: f32,
+    stop_strings: Vec<String>,
+    model_id: String,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let chat_id = format!("chatcmpl-{}", new_id_suffix());
+
+    tokio::task::spawn_blocking(move || {
+        let weights = match model.get_or_load_weights() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = tx.blocking_send(error_chunk(&e));
+                return;
+            }
+        };
+        let template = pick_template(&model);
+        let prompt = render_messages(template, &messages);
+        let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.blocking_send(error_chunk(&format!("tokenize: {e}")));
+                return;
+            }
+        };
+        let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+        if prompt_ids.is_empty() {
+            let _ = tx.blocking_send(error_chunk("rendered prompt tokenises to empty"));
+            return;
+        }
+
+        // First chunk: role="assistant" delta. OpenAI's chat completion
+        // stream contract starts with this, even before any content.
+        let first = build_chat_chunk(&chat_id, &model_id, Some(ASSISTANT_ROLE), None, None);
+        if tx.blocking_send(first).is_err() {
+            return;
+        }
+
+        // WalkFfn through the (possibly Q4_K) index — same path the
+        // existing /v1/infer mode=walk uses, takes &ModelWeights only.
+        let patched = model.patched.blocking_read();
+        let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
+        let _ = temperature; // accepted; WalkFfn path is greedy.
+
+        let mut ids = prompt_ids;
+        let mut completion_text = String::new();
+        let mut finish_reason: &'static str = "length";
+
+        for _ in 0..max_tokens {
+            let pred = larql_inference::predict_with_ffn(
+                weights,
+                &model.tokenizer,
+                &ids,
+                1,
+                &walk_ffn,
+            );
+            let next_id = match pred.token_ids.first() {
+                Some(&id) => id,
+                None => {
+                    finish_reason = "stop";
+                    break;
+                }
+            };
+            let next_text = pred
+                .predictions
+                .first()
+                .map(|(t, _)| t.clone())
+                .unwrap_or_default();
+            let is_eos = larql_inference::vindex::is_end_of_turn(&next_text);
+
+            let chunk = build_chat_chunk(&chat_id, &model_id, None, Some(&next_text), None);
+            if tx.blocking_send(chunk).is_err() {
+                return;
+            }
+            completion_text.push_str(&next_text);
+            ids.push(next_id);
+
+            if is_eos {
+                finish_reason = "stop";
+                break;
+            }
+            if !stop_strings.is_empty() && contains_any(&completion_text, &stop_strings) {
+                finish_reason = "stop";
+                break;
+            }
+        }
+
+        let final_chunk = build_chat_chunk(&chat_id, &model_id, None, None, Some(finish_reason));
+        let _ = tx.blocking_send(final_chunk);
+    });
+
+    let stream = ReceiverStream::new(rx)
+        .map(|data| Event::default().data(data))
+        .chain(tokio_stream::once(Event::default().data("[DONE]")))
+        .map(Ok::<_, Infallible>);
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn build_chat_chunk(
+    id: &str,
+    model: &str,
+    role: Option<&str>,
+    content: Option<&str>,
+    finish_reason: Option<&'static str>,
+) -> String {
+    let mut delta = serde_json::Map::new();
+    if let Some(r) = role {
+        delta.insert("role".into(), serde_json::Value::String(r.to_string()));
+    }
+    if let Some(c) = content {
+        delta.insert("content".into(), serde_json::Value::String(c.to_string()));
+    }
+    let chunk = serde_json::json!({
+        "id": id,
+        "object": CHAT_COMPLETION_CHUNK_OBJECT,
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": serde_json::Value::Object(delta),
+            "finish_reason": match finish_reason {
+                Some(r) => serde_json::Value::String(r.to_string()),
+                None => serde_json::Value::Null,
+            },
+            "logprobs": serde_json::Value::Null,
+        }]
+    });
+    chunk.to_string()
 }
 
 /// Render `messages` to a single prompt, then run the un-KV-cached
@@ -318,18 +453,22 @@ fn run_chat_completion(
     }
     let prompt_token_count = prompt_ids.len();
 
+    let patched = model.patched.blocking_read();
+    let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
+    let _ = temperature; // accepted; WalkFfn path is greedy.
+
     let mut ids = prompt_ids;
     let mut completion_text = String::new();
     let mut completion_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
 
     for _ in 0..max_tokens {
-        let pred = larql_inference::forward::predict_with_temperature(
+        let pred = larql_inference::predict_with_ffn(
             weights,
             &model.tokenizer,
             &ids,
             1,
-            temperature,
+            &walk_ffn,
         );
         let next_id = match pred.token_ids.first() {
             Some(&id) => id,
@@ -492,50 +631,10 @@ fn render_plain(messages: &[ChatMessage]) -> String {
     out
 }
 
-// ── Small helpers shared with /v1/completions ────────────────────────────────
+// ── chat-only request validation helper ─────────────────────────────────────
 
 fn is_empty_json_array(v: &serde_json::Value) -> bool {
     v.as_array().map(|a| a.is_empty()).unwrap_or(false)
-}
-
-fn contains_any(haystack: &str, needles: &[String]) -> bool {
-    needles
-        .iter()
-        .any(|n| !n.is_empty() && haystack.contains(n.as_str()))
-}
-
-fn trim_at_stop(haystack: &str, needles: &[String]) -> String {
-    let mut earliest: Option<usize> = None;
-    for n in needles {
-        if n.is_empty() {
-            continue;
-        }
-        if let Some(idx) = haystack.find(n.as_str()) {
-            earliest = Some(earliest.map_or(idx, |e| e.min(idx)));
-        }
-    }
-    match earliest {
-        Some(i) => haystack[..i].to_string(),
-        None => haystack.to_string(),
-    }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn new_id_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("{:016x}{:08x}", now_ns, n)
 }
 
 #[cfg(test)]
@@ -694,13 +793,5 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.max_tokens, Some(50));
         assert_eq!(req.temperature, Some(0.0));
-    }
-
-    #[test]
-    fn stop_spec_single_or_multi() {
-        let single: StopSpec = serde_json::from_value(serde_json::json!("\\n\\n")).unwrap();
-        assert_eq!(single.as_slice(), &["\\n\\n".to_string()]);
-        let multi: StopSpec = serde_json::from_value(serde_json::json!(["a", "b"])).unwrap();
-        assert_eq!(multi.as_slice(), &["a".to_string(), "b".to_string()]);
     }
 }

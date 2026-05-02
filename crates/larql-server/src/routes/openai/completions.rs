@@ -13,40 +13,56 @@
 //! )
 //! ```
 //!
-//! ## Implementation note (slice 1)
+//! ## Generation path (slice 1 + 3)
 //!
-//! This first slice runs an **un-KV-cached generation loop** —
-//! `larql_inference::predict_with_temperature` is invoked once per
-//! generated token, re-running the full forward pass each step. Cost is
-//! O(N²) in context length. Functional and immutable
+//! Slice 1 runs an **un-KV-cached generation loop** —
+//! `larql_inference::forward::predict_with_temperature` is invoked
+//! once per generated token, re-running the full forward pass each
+//! step. Cost is O(N²) in context length. Functional and immutable
 //! (`&ModelWeights`-only), so it serializes cleanly with concurrent
 //! `/v1/infer` traffic.
 //!
 //! The fast KV-cached path (`larql_inference::layer_graph::generate`)
 //! requires `&mut ModelWeights` for the per-layer Q4_K dequant cache.
 //! Wiring that into `LoadedModel` requires putting `ModelWeights` behind
-//! a `RwLock` (every existing `&ModelWeights` reader becomes a read-guard
-//! holder); roadmap'd as N0.2-fast.
+//! a `RwLock`; roadmap'd as N0.2-fast.
 //!
-//! ## Streaming
+//! ## Streaming (slice 3)
 //!
-//! `stream: true` returns 501 in this slice. SSE arrives in N0.1 streaming
-//! along with `/v1/chat/completions/stream`.
+//! `stream: true` returns an SSE response — `text/event-stream` with
+//! one `data: {chunk}\n\n` event per generated token, terminated by
+//! `data: [DONE]\n\n`. Each chunk's shape mirrors the OpenAI
+//! Completions stream: `{id, object: "text_completion", created,
+//! model, choices: [{text, index, finish_reason, logprobs: null}]}`.
+//! The final chunk before `[DONE]` carries `finish_reason: "stop" |
+//! "length"`.
+//!
+//! Generation runs on the blocking pool; the stream channel is
+//! capacity-bounded so the producer back-pressures naturally on slow
+//! clients. Client disconnect cleans up early on the next
+//! `blocking_send` failure.
 //!
 //! ## Logprobs
 //!
 //! `logprobs: int` returns `null` in the response. Top-k log-probabilities
 //! over the lm_head distribution land in F18.
 
+use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt as _;
 
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
+
+use super::util::{contains_any, error_chunk, new_id_suffix, trim_at_stop, unix_now, StopSpec};
 
 const TEXT_COMPLETION_OBJECT: &str = "text_completion";
 const DEFAULT_MAX_TOKENS: usize = 16;
@@ -104,22 +120,6 @@ pub struct CompletionsRequest {
     pub user: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-pub enum StopSpec {
-    Single(String),
-    Multi(Vec<String>),
-}
-
-impl StopSpec {
-    fn as_slice(&self) -> &[String] {
-        match self {
-            StopSpec::Single(s) => std::slice::from_ref(s),
-            StopSpec::Multi(v) => v.as_slice(),
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub struct CompletionChoice {
     pub text: String,
@@ -149,16 +149,9 @@ pub struct CompletionsResponse {
 pub async fn handle_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
-) -> Result<Json<CompletionsResponse>, ServerError> {
+) -> Result<Response, ServerError> {
     state.bump_requests();
 
-    if req.stream.unwrap_or(false) {
-        return Err(ServerError::BadRequest(
-            "stream=true not yet supported on /v1/completions; SSE arrives in N0.1 \
-             (see ROADMAP). Use stream=false."
-                .into(),
-        ));
-    }
     if req.n.unwrap_or(1) > 1 {
         return Err(ServerError::BadRequest(
             "n>1 not yet supported; only n=1 (single completion per prompt)".into(),
@@ -194,8 +187,35 @@ pub async fn handle_completions(
     let model_id = req.model.clone().unwrap_or_else(|| model.id.clone());
     let model_arc = model.clone();
 
-    // Run the generation loop on the blocking pool so the tokio runtime
-    // stays responsive to other requests.
+    if req.stream.unwrap_or(false) {
+        // Streaming mode: SSE response. `echo` and batched prompts are
+        // not supported in stream mode (OpenAI's stream contract is
+        // one prompt → one stream of chunks).
+        if echo {
+            return Err(ServerError::BadRequest(
+                "echo=true is not supported with stream=true".into(),
+            ));
+        }
+        if prompts.len() > 1 {
+            return Err(ServerError::BadRequest(
+                "batched prompts (prompt: [...]) are not supported with stream=true; \
+                 send one prompt per request"
+                    .into(),
+            ));
+        }
+        let prompt = prompts.into_iter().next().unwrap();
+        return Ok(stream_completions(
+            model_arc,
+            prompt,
+            max_tokens,
+            temperature,
+            stop_strings,
+            model_id,
+        )
+        .into_response());
+    }
+
+    // Non-streaming: the existing buffered path.
     let (choices, prompt_tokens, completion_tokens) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
             run_completions_loop(
@@ -213,10 +233,7 @@ pub async fn handle_completions(
     Ok(Json(CompletionsResponse {
         id: format!("cmpl-{}", new_id_suffix()),
         object: TEXT_COMPLETION_OBJECT,
-        created: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        created: unix_now(),
         model: model_id,
         choices,
         usage: CompletionsUsage {
@@ -224,7 +241,129 @@ pub async fn handle_completions(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
-    }))
+    })
+    .into_response())
+}
+
+/// Build an SSE response that streams one chunk per generated token.
+/// Final chunk carries `finish_reason`; the stream terminates with
+/// `data: [DONE]\n\n`.
+fn stream_completions(
+    model: Arc<LoadedModel>,
+    prompt: String,
+    max_tokens: usize,
+    temperature: f32,
+    stop_strings: Vec<String>,
+    model_id: String,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let cmpl_id = format!("cmpl-{}", new_id_suffix());
+
+    tokio::task::spawn_blocking(move || {
+        let weights = match model.get_or_load_weights() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = tx.blocking_send(error_chunk(&e));
+                return;
+            }
+        };
+        let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.blocking_send(error_chunk(&format!("tokenize: {e}")));
+                return;
+            }
+        };
+        let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+        if prompt_ids.is_empty() {
+            let _ = tx.blocking_send(error_chunk("prompt tokenises to empty"));
+            return;
+        }
+
+        // Take a read guard on the patched vindex for the full
+        // generation. WalkFfn does gate-KNN through the (possibly Q4_K)
+        // index for every layer; holding the read guard for the
+        // generation duration keeps the index pinned and keeps the
+        // dequant cache warm across decode steps.
+        let patched = model.patched.blocking_read();
+        let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
+
+        let mut ids = prompt_ids;
+        let mut completion_text = String::new();
+        let mut finish_reason: &'static str = "length";
+
+        for _ in 0..max_tokens {
+            let pred =
+                larql_inference::predict_with_ffn(weights, &model.tokenizer, &ids, 1, &walk_ffn);
+            let next_id = match pred.token_ids.first() {
+                Some(&id) => id,
+                None => {
+                    finish_reason = "stop";
+                    break;
+                }
+            };
+            let next_text = pred
+                .predictions
+                .first()
+                .map(|(t, _)| t.clone())
+                .unwrap_or_default();
+            let is_eos = larql_inference::vindex::is_end_of_turn(&next_text);
+            let _ = temperature; // accepted; not consumed by the WalkFfn path.
+
+            let chunk = build_text_completion_chunk(&cmpl_id, &model_id, Some(&next_text), None);
+            if tx.blocking_send(chunk).is_err() {
+                // Client disconnected.
+                return;
+            }
+            completion_text.push_str(&next_text);
+            ids.push(next_id);
+
+            if is_eos {
+                finish_reason = "stop";
+                break;
+            }
+            if !stop_strings.is_empty() && contains_any(&completion_text, &stop_strings) {
+                finish_reason = "stop";
+                break;
+            }
+        }
+
+        // Final chunk: finish_reason, no text.
+        let final_chunk =
+            build_text_completion_chunk(&cmpl_id, &model_id, None, Some(finish_reason));
+        let _ = tx.blocking_send(final_chunk);
+    });
+
+    let stream = ReceiverStream::new(rx)
+        .map(|data| Event::default().data(data))
+        .chain(tokio_stream::once(Event::default().data("[DONE]")))
+        .map(Ok::<_, Infallible>);
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn build_text_completion_chunk(
+    id: &str,
+    model: &str,
+    text: Option<&str>,
+    finish_reason: Option<&'static str>,
+) -> String {
+    let chunk = serde_json::json!({
+        "id": id,
+        "object": TEXT_COMPLETION_OBJECT,
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "text": text.unwrap_or(""),
+            "index": 0,
+            "logprobs": serde_json::Value::Null,
+            "finish_reason": match finish_reason {
+                Some(r) => serde_json::Value::String(r.to_string()),
+                None => serde_json::Value::Null,
+            },
+        }]
+    });
+    chunk.to_string()
 }
 
 /// Generate completions for every prompt. Returns
@@ -240,6 +379,12 @@ fn run_completions_loop(
     let weights = model
         .get_or_load_weights()
         .map_err(ServerError::InferenceUnavailable)?;
+    // Hold the read guard + WalkFfn for the lifetime of the loop:
+    // gate-KNN through the (possibly Q4_K) index gives correct dense
+    // FFN output without needing f32 dense FFN weights resident.
+    let patched = model.patched.blocking_read();
+    let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, &*patched);
+    let _ = temperature; // accepted; WalkFfn path is greedy by construction.
 
     let mut choices = Vec::with_capacity(prompts.len());
     let mut total_prompt_tokens = 0usize;
@@ -264,12 +409,12 @@ fn run_completions_loop(
         let mut finish_reason = "length";
 
         for _ in 0..max_tokens {
-            let pred = larql_inference::forward::predict_with_temperature(
+            let pred = larql_inference::predict_with_ffn(
                 weights,
                 &model.tokenizer,
                 &ids,
                 1,
-                temperature,
+                &walk_ffn,
             );
             let next_id = match pred.token_ids.first() {
                 Some(&id) => id,
@@ -322,41 +467,6 @@ fn run_completions_loop(
     Ok((choices, total_prompt_tokens, total_completion_tokens))
 }
 
-fn contains_any(haystack: &str, needles: &[String]) -> bool {
-    needles
-        .iter()
-        .any(|n| !n.is_empty() && haystack.contains(n.as_str()))
-}
-
-fn trim_at_stop(haystack: &str, needles: &[String]) -> String {
-    let mut earliest: Option<usize> = None;
-    for n in needles {
-        if n.is_empty() {
-            continue;
-        }
-        if let Some(idx) = haystack.find(n.as_str()) {
-            earliest = Some(earliest.map_or(idx, |e| e.min(idx)));
-        }
-    }
-    match earliest {
-        Some(i) => haystack[..i].to_string(),
-        None => haystack.to_string(),
-    }
-}
-
-/// Generate a short hex id suffix for `cmpl-...`. Not cryptographically
-/// strong; uniqueness across one server lifetime is sufficient.
-fn new_id_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("{:016x}{:08x}", now_ns, n)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,35 +489,5 @@ mod tests {
             CompletionPrompt::Batch(v) => assert_eq!(v, vec!["a", "b"]),
             _ => panic!(),
         }
-    }
-
-    #[test]
-    fn stop_spec_single_or_multi() {
-        let single: StopSpec = serde_json::from_value(serde_json::json!("\\n")).unwrap();
-        assert_eq!(single.as_slice(), &["\\n".to_string()]);
-        let multi: StopSpec = serde_json::from_value(serde_json::json!(["a", "b"])).unwrap();
-        assert_eq!(multi.as_slice(), &["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn trim_at_stop_finds_earliest() {
-        let s = "hello world stop here";
-        let stops = vec!["stop".to_string(), "world".to_string()];
-        assert_eq!(trim_at_stop(s, &stops), "hello ");
-    }
-
-    #[test]
-    fn contains_any_matches_substring() {
-        let stops = vec!["END".to_string()];
-        assert!(contains_any("text END more", &stops));
-        assert!(!contains_any("text only", &stops));
-    }
-
-    #[test]
-    fn new_id_suffix_is_unique_within_thread() {
-        let a = new_id_suffix();
-        let b = new_id_suffix();
-        assert_ne!(a, b);
-        assert_eq!(a.len(), b.len());
     }
 }

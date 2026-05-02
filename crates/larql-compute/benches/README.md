@@ -60,3 +60,18 @@ Each covers a *different layer of the abstraction stack*:
 For *full-pipeline* throughput (whole-decode-token, generation tok/s),
 use `examples/compare_*` — those are end-to-end benchmarks that the
 kernel-level criterion suite intentionally doesn't cover.
+
+## Metal shader diagnostics
+
+For a Metal shader inventory plus direct isolated/batched GPU timings,
+use:
+
+```
+cargo run --release --features metal -p larql-compute --example diag_shader_bench
+cargo run --release --features metal -p larql-compute --example diag_shader_bench -- --profile gemma3 --json /tmp/larql-shaders.json
+```
+
+The shader bench is diagnostic rather than Criterion-based. Treat the
+batched column as the promotion signal; isolated timings include
+per-call command-buffer overhead and can make candidate kernels look
+better than they are in decode.

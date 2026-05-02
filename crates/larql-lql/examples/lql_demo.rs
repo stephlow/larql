@@ -250,12 +250,12 @@ SHOW MODELS;
             r#"INSERT INTO EDGES (entity, relation, target) VALUES ("a", "b", "c") AT LAYER 26 CONFIDENCE 0.8;"#,
         ),
         (
-            "INSERT ALPHA",
-            r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") ALPHA 0.5;"#,
+            "INSERT COMPOSE ALPHA",
+            r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") ALPHA 0.5 MODE COMPOSE;"#,
         ),
         (
-            "INSERT all knobs",
-            r#"INSERT INTO EDGES (entity, relation, target) VALUES ("a", "r", "b") AT LAYER 24 CONFIDENCE 0.9 ALPHA 0.3;"#,
+            "INSERT all COMPOSE knobs",
+            r#"INSERT INTO EDGES (entity, relation, target) VALUES ("a", "r", "b") AT LAYER 24 CONFIDENCE 0.9 ALPHA 0.3 MODE COMPOSE;"#,
         ),
         (
             "DELETE",

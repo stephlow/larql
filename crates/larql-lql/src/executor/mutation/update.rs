@@ -5,6 +5,8 @@ use crate::ast::{Assignment, Condition, Value};
 use crate::error::LqlError;
 use crate::executor::Session;
 
+use super::{relation_filter_matches, string_condition};
+
 impl Session {
     pub(crate) fn exec_update(
         &mut self,
@@ -41,16 +43,17 @@ impl Session {
                     None
                 }
             });
+        let relation_filter = string_condition(conditions, "relation");
 
         // Collect updates, then record
         let mut update_ops: Vec<(usize, usize, larql_vindex::FeatureMeta)> = Vec::new();
-        {
-            let (_path, _config, patched) = self.require_patched_mut()?;
+        let matches: Vec<(usize, usize)> = {
+            let (_path, _config, patched) = self.require_vindex()?;
 
             // Fast path: explicit (layer, feature) — same shape as DELETE.
             // Bypasses `find_features` so the caller can target a single
-            // slot directly without needing to match by entity/relation.
-            let matches: Vec<(usize, usize)> =
+            // slot directly without needing to match by entity.
+            let candidates: Vec<(usize, usize)> =
                 if let (Some(layer), Some(feature)) = (layer_filter, feature_filter) {
                     vec![(layer, feature)]
                 } else {
@@ -59,9 +62,26 @@ impl Session {
                         .find_features(entity_filter, None, layer_filter)
                 };
 
-            if matches.is_empty() {
-                return Ok(vec!["  (no matching features found)".into()]);
+            let mut matches = Vec::new();
+            for (layer, feature) in candidates {
+                if relation_filter_matches(
+                    self.relation_classifier(),
+                    relation_filter,
+                    layer,
+                    feature,
+                )? {
+                    matches.push((layer, feature));
+                }
             }
+            matches
+        };
+
+        if matches.is_empty() {
+            return Ok(vec!["  (no matching features found)".into()]);
+        }
+
+        {
+            let (_path, _config, patched) = self.require_patched_mut()?;
 
             for &(layer, feature) in &matches {
                 if let Some(meta) = patched.feature_meta(layer, feature) {

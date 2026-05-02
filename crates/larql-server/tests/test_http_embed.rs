@@ -382,15 +382,64 @@ async fn http_openai_embeddings_empty_input_returns_400() {
 // ══════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn http_openai_completions_stream_true_returns_400() {
+async fn http_openai_completions_stream_with_echo_returns_400() {
+    // echo=true is not supported in stream mode (one-prompt-one-stream).
     let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
     let resp = post_json(
         app,
         "/v1/completions",
-        serde_json::json!({"prompt": "hi", "stream": true, "max_tokens": 1}),
+        serde_json::json!({
+            "prompt": "hi",
+            "stream": true,
+            "echo": true,
+            "max_tokens": 1
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_completions_stream_with_batched_prompts_returns_400() {
+    // Batched prompts not supported with stream=true.
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "prompt": ["hi", "there"],
+            "stream": true,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_openai_completions_stream_returns_event_stream_content_type() {
+    use axum::http::header;
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "prompt": "hi",
+            "stream": true,
+            "max_tokens": 2
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected SSE content-type, got {ct:?}"
+    );
 }
 
 #[tokio::test]
@@ -586,7 +635,14 @@ async fn http_openai_embeddings_with_auth_correct_bearer_returns_200() {
 // ══════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn http_openai_chat_stream_true_returns_400() {
+async fn http_openai_chat_stream_returns_event_stream_content_type() {
+    // model() has infer_disabled=true, but the dispatch happens before
+    // the inference step — actually no, infer_disabled is checked first
+    // and returns 503 even for stream. Use model_infer_enabled (empty
+    // tokenizer) — generation will tokenise the prompt to empty and
+    // emit an error chunk before [DONE], but the response headers and
+    // status should be SSE.
+    use axum::http::header;
     let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
     let resp = post_json(
         app,
@@ -594,11 +650,20 @@ async fn http_openai_chat_stream_true_returns_400() {
         serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true,
-            "max_tokens": 1
+            "max_tokens": 2
         }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected SSE content-type, got {ct:?}"
+    );
 }
 
 #[tokio::test]

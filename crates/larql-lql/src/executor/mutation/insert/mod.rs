@@ -75,7 +75,7 @@ impl Session {
         }
 
         // ── Phase 2: install slots ──
-        let installed = self.install_slots(
+        let mut installed = self.install_slots(
             &plan,
             &captured.per_layer,
             alpha_mul,
@@ -106,6 +106,7 @@ impl Session {
         if plan.use_constellation {
             self.balance_installed(&installed, entity, relation, target)?;
             self.cross_fact_regression_check(&installed)?;
+            self.refresh_installed_patch_ops_from_overlay(&mut installed)?;
 
             // Register THIS fact for future cross-balance passes.
             let rel_words = relation.replace(['-', '_'], " ");
@@ -138,6 +139,40 @@ impl Session {
             alpha_override,
             alpha_mul,
         ))
+    }
+}
+
+impl Session {
+    fn refresh_installed_patch_ops_from_overlay(
+        &self,
+        installed: &mut [compose::InstalledSlot],
+    ) -> Result<(), LqlError> {
+        if installed.is_empty() {
+            return Ok(());
+        }
+
+        let (_, _, patched) = self.require_vindex()?;
+        for slot in installed {
+            if let larql_vindex::PatchOp::Insert {
+                gate_vector_b64,
+                up_vector_b64,
+                down_vector_b64,
+                ..
+            } = &mut slot.patch_op
+            {
+                if let Some(gate) = patched.overrides_gate_at(slot.layer, slot.feature) {
+                    *gate_vector_b64 = Some(larql_vindex::patch::core::encode_gate_vector(gate));
+                }
+                if let Some(up) = patched.up_override_at(slot.layer, slot.feature) {
+                    *up_vector_b64 = Some(larql_vindex::patch::core::encode_gate_vector(up));
+                }
+                if let Some(down) = patched.down_override_at(slot.layer, slot.feature) {
+                    *down_vector_b64 = Some(larql_vindex::patch::core::encode_gate_vector(down));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -707,6 +707,32 @@ fn delete_no_matches_returns_message() {
 }
 
 #[test]
+fn delete_relation_filter_without_labels_errors_before_mutating() {
+    let (mut session, dir) = vindex_session("delete_relation_no_labels");
+
+    let stmt = parser::parse(r#"DELETE FROM EDGES WHERE relation = "capital";"#).unwrap();
+    let err = session
+        .execute(&stmt)
+        .expect_err("relation-only DELETE should not silently match everything");
+
+    assert!(
+        err.to_string()
+            .contains("relation filters require relation labels"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        session
+            .patch_recording
+            .as_ref()
+            .map(|r| r.operations.is_empty())
+            .unwrap_or(false),
+        "failed DELETE should not record patch operations"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn update_feature_target_succeeds() {
     let (mut session, dir) = vindex_session("update_target");
 
@@ -723,6 +749,33 @@ fn update_feature_target_succeeds() {
     assert!(
         session.patch_recording.is_some(),
         "UPDATE should have started an auto-patch session"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn update_relation_filter_without_labels_errors_before_mutating() {
+    let (mut session, dir) = vindex_session("update_relation_no_labels");
+
+    let stmt =
+        parser::parse(r#"UPDATE EDGES SET target = "London" WHERE relation = "capital";"#).unwrap();
+    let err = session
+        .execute(&stmt)
+        .expect_err("relation-only UPDATE should not silently match everything");
+
+    assert!(
+        err.to_string()
+            .contains("relation filters require relation labels"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        session
+            .patch_recording
+            .as_ref()
+            .map(|r| r.operations.is_empty())
+            .unwrap_or(false),
+        "failed UPDATE should not record patch operations"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -876,6 +929,84 @@ fn show_patches_with_no_patches_returns_message() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn refresh_recorded_patch_ops_for_slots_persists_latest_overlay_vectors() {
+    use larql_models::TopKEntry;
+    use larql_vindex::{FeatureMeta, PatchOp};
+
+    let (mut session, dir) = vindex_session("refresh_patch_ops");
+
+    {
+        let overlay = session.patched_overlay_mut().expect("vindex backend");
+        overlay.insert_feature(
+            0,
+            0,
+            vec![1.0, 0.0, 0.0, 0.0],
+            FeatureMeta {
+                top_token: "old".into(),
+                top_token_id: 7,
+                c_score: 0.5,
+                top_k: vec![TopKEntry {
+                    token: "old".into(),
+                    token_id: 7,
+                    logit: 0.5,
+                }],
+            },
+        );
+        overlay.set_up_vector(0, 0, vec![0.1, 0.2, 0.3, 0.4]);
+        overlay.set_down_vector(0, 0, vec![0.5, 0.6, 0.7, 0.8]);
+    }
+
+    session.patch_recording = Some(PatchRecording {
+        path: String::new(),
+        operations: vec![PatchOp::Insert {
+            layer: 0,
+            feature: 0,
+            relation: Some("capital".into()),
+            entity: "Atlantis".into(),
+            target: "Poseidon".into(),
+            confidence: Some(0.9),
+            gate_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                9.0, 9.0, 9.0, 9.0,
+            ])),
+            up_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                9.0, 9.0, 9.0, 9.0,
+            ])),
+            down_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                9.0, 9.0, 9.0, 9.0,
+            ])),
+            down_meta: None,
+        }],
+    });
+
+    {
+        let overlay = session.patched_overlay_mut().expect("vindex backend");
+        overlay.set_up_vector(0, 0, vec![1.1, 1.2, 1.3, 1.4]);
+        overlay.set_down_vector(0, 0, vec![2.1, 2.2, 2.3, 2.4]);
+    }
+
+    session
+        .refresh_recorded_patch_ops_for_slots(&[(0, 0)])
+        .expect("refresh patch ops");
+
+    let PatchOp::Insert {
+        up_vector_b64,
+        down_vector_b64,
+        ..
+    } = &session.patch_recording.as_ref().unwrap().operations[0]
+    else {
+        panic!("expected insert op");
+    };
+    let up = larql_vindex::patch::core::decode_gate_vector(up_vector_b64.as_ref().unwrap())
+        .expect("decode refreshed up");
+    let down = larql_vindex::patch::core::decode_gate_vector(down_vector_b64.as_ref().unwrap())
+        .expect("decode refreshed down");
+
+    assert_eq!(up, vec![1.1, 1.2, 1.3, 1.4]);
+    assert_eq!(down, vec![2.1, 2.2, 2.3, 2.4]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── COMPILE INTO VINDEX integration tests ──────────────────────────────
 
 #[test]
@@ -897,6 +1028,54 @@ fn compile_into_vindex_no_patches_succeeds() {
         "expected compile output: {joined}"
     );
     assert!(output.exists(), "compiled vindex directory should exist");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_path_into_vindex_uses_supplied_source_without_active_backend() {
+    let dir = make_test_vindex_dir("compile_path_source");
+    let output = dir.join("compiled_from_path.vindex");
+    let mut session = Session::new();
+
+    let stmt = parser::parse(&format!(
+        r#"COMPILE "{}" INTO VINDEX "{}";"#,
+        dir.display(),
+        output.display()
+    ))
+    .unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("path-form COMPILE INTO VINDEX should load its source");
+    let joined = out.join("\n");
+
+    assert!(
+        joined.contains("Compiled"),
+        "expected compile output: {joined}"
+    );
+    assert!(output.exists(), "compiled vindex directory should exist");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_path_into_model_reports_supplied_source_requirements() {
+    let dir = make_test_vindex_dir("compile_path_model_source");
+    let output = dir.join("model_out");
+    let mut session = Session::new();
+
+    let stmt = parser::parse(&format!(
+        r#"COMPILE "{}" INTO MODEL "{}";"#,
+        dir.display(),
+        output.display()
+    ))
+    .unwrap();
+    let err = session
+        .execute(&stmt)
+        .expect_err("browse-only source should fail after path source is loaded");
+
+    assert!(
+        err.to_string().contains("requires model weights"),
+        "expected source-level model-weight error, got: {err}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

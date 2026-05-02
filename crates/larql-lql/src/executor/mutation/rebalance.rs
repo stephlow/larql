@@ -109,6 +109,13 @@ impl Session {
             }
         }
 
+        let slots: Vec<(usize, usize)> = self
+            .installed_edges
+            .iter()
+            .map(|fact| (fact.layer, fact.feature))
+            .collect();
+        self.refresh_recorded_patch_ops_for_slots(&slots)?;
+
         // Summary
         let mut in_band = 0usize;
         let mut below = 0usize;

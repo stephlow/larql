@@ -50,6 +50,10 @@ impl Parser {
                             self.advance();
                             positions = Some(TracePositionMode::All);
                         }
+                        Token::Ident(s) if s.eq_ignore_ascii_case("last") => {
+                            self.advance();
+                            positions = Some(TracePositionMode::Last);
+                        }
                         _ => {
                             positions = Some(TracePositionMode::Last);
                         }

@@ -20,7 +20,7 @@ const EXPLAIN_INFER: &str = r#"EXPLAIN INFER "The capital of France is" TOP 5;"#
 
 const INSERT_MIN: &str =
     r#"INSERT INTO EDGES (entity, relation, target) VALUES ("John", "lives-in", "London");"#;
-const INSERT_FULL: &str = r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") AT LAYER 24 CONFIDENCE 0.95 ALPHA 0.30;"#;
+const INSERT_FULL: &str = r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital-of", "Poseidon") AT LAYER 24 CONFIDENCE 0.95 ALPHA 0.30 MODE COMPOSE;"#;
 const UPDATE: &str =
     r#"UPDATE EDGES SET target = "London", confidence = 0.9 WHERE layer = 26 AND feature = 8821;"#;
 const DELETE: &str = r#"DELETE FROM EDGES WHERE layer = 26 AND feature = 8821;"#;
@@ -47,7 +47,7 @@ fn bench_parse_single(c: &mut Criterion) {
         ("infer", INFER),
         ("explain_infer", EXPLAIN_INFER),
         ("insert_min", INSERT_MIN),
-        ("insert_full_with_alpha", INSERT_FULL),
+        ("insert_full_compose_with_alpha", INSERT_FULL),
         ("update", UPDATE),
         ("delete", DELETE),
         ("merge", MERGE),

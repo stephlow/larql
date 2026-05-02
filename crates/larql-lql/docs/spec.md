@@ -478,6 +478,10 @@ DELETE FROM EDGES
     AND relation = "lives-in";
 ```
 
+`relation` predicates require relation labels in the active vindex
+(`relation_clusters.json` / probe labels). On unlabeled vindexes, target by
+`layer` + `feature` or omit the relation predicate.
+
 ```
 UPDATE EDGES
     SET <field> = <value> [, <field> = <value>]...
@@ -567,10 +571,12 @@ DIFF "gemma3-4b.vindex" "gemma3-4b-medical.vindex"
 ```
 
 ```
-COMPILE CURRENT INTO VINDEX <output_path>
+COMPILE {CURRENT | <vindex_path>} INTO VINDEX <output_path>
     [ON CONFLICT {LAST_WINS | HIGHEST_CONFIDENCE | FAIL}]
 
--- Flatten all applied patches into a new clean vindex.
+-- Flatten the current session's applied patches into a new clean vindex.
+-- Path form loads that source vindex from disk as-is; use CURRENT when
+-- you need to include unsaved or applied session overlays.
 -- The result is a fully self-contained vindex with no overlay or sidecar:
 -- the inserted features' down/gate/up vectors are written into the
 -- canonical weight files (column-rewrite at the inserted slots), and
@@ -602,9 +608,10 @@ COMPILE CURRENT INTO VINDEX "gemma3-4b-medical.vindex"
 ```
 
 ```
-COMPILE CURRENT INTO MODEL <output_path> [FORMAT safetensors|gguf]
+COMPILE {CURRENT | <vindex_path>} INTO MODEL <output_path> [FORMAT safetensors|gguf]
 
--- Compile the current vindex (with patches) into plain model weights.
+-- Compile the current vindex (with patches) or a path-loaded vindex into
+-- plain model weights.
 -- If the patch overlay contains INSERT operations, MEMIT closed-form
 -- weight editing is used to bake the inserted facts into W_down at the
 -- install layer(s). The output is a standard safetensors / gguf file

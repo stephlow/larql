@@ -7,6 +7,7 @@ mod commands;
 mod formatting;
 mod utils;
 
+use commands::dev::ov_rd::cmd as ov_rd_cmd;
 use commands::diagnostics::parity as parity_cmd;
 use commands::extraction::*;
 use commands::primary::*;

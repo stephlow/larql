@@ -1,9 +1,7 @@
 //! `COMPILE ... INTO {MODEL, VINDEX}` — dispatch + shared MEMIT fact
 //! collection.
 
-use std::path::PathBuf;
-
-use crate::ast::{CompileConflict, CompileTarget, OutputFormat, VindexRef};
+use crate::ast::{CompileConflict, CompileTarget, OutputFormat, UseTarget, VindexRef};
 use crate::error::LqlError;
 use crate::executor::{Backend, Session};
 
@@ -21,21 +19,39 @@ impl Session {
         target: CompileTarget,
         on_conflict: Option<CompileConflict>,
     ) -> Result<Vec<String>, LqlError> {
-        let vindex_path = match vindex {
-            VindexRef::Current => match &self.backend {
-                Backend::Vindex { path, .. } => path.clone(),
-                _ => return Err(LqlError::NoBackend),
-            },
-            VindexRef::Path(p) => PathBuf::from(p),
-        };
-
-        match target {
-            CompileTarget::Vindex => self.exec_compile_into_vindex(
-                &vindex_path,
-                output,
-                on_conflict.unwrap_or(CompileConflict::LastWins),
-            ),
-            CompileTarget::Model => self.exec_compile_into_model(&vindex_path, output),
+        match vindex {
+            VindexRef::Current => {
+                let vindex_path = match &self.backend {
+                    Backend::Vindex { path, .. } => path.clone(),
+                    _ => return Err(LqlError::NoBackend),
+                };
+                match target {
+                    CompileTarget::Vindex => self.exec_compile_into_vindex(
+                        &vindex_path,
+                        output,
+                        on_conflict.unwrap_or(CompileConflict::LastWins),
+                    ),
+                    CompileTarget::Model => self.exec_compile_into_model(&vindex_path, output),
+                }
+            }
+            VindexRef::Path(path) => {
+                let mut source_session = Session::new();
+                source_session.exec_use(&UseTarget::Vindex(path.clone()))?;
+                let source_path = match &source_session.backend {
+                    Backend::Vindex { path, .. } => path.clone(),
+                    _ => return Err(LqlError::NoBackend),
+                };
+                match target {
+                    CompileTarget::Vindex => source_session.exec_compile_into_vindex(
+                        &source_path,
+                        output,
+                        on_conflict.unwrap_or(CompileConflict::LastWins),
+                    ),
+                    CompileTarget::Model => {
+                        source_session.exec_compile_into_model(&source_path, output)
+                    }
+                }
+            }
         }
     }
 }

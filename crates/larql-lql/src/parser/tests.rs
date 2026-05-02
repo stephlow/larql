@@ -1860,6 +1860,17 @@ fn parse_trace_positions_all() {
 }
 
 #[test]
+fn parse_trace_positions_last() {
+    let stmt = parse(r#"TRACE "The capital of France is" POSITIONS LAST;"#).unwrap();
+    match stmt {
+        Statement::Trace { positions, .. } => {
+            assert_eq!(positions.unwrap(), TracePositionMode::Last);
+        }
+        _ => panic!("expected Trace"),
+    }
+}
+
+#[test]
 fn parse_trace_full() {
     let stmt = parse(
         r#"TRACE "The capital of France is" FOR "Paris" DECOMPOSE LAYERS 22-27 SAVE "out.trace";"#,
@@ -1922,4 +1933,16 @@ fn keyword_field_names_consistent() {
     assert_eq!(Keyword::FfnDown.as_field_name(), "ffn_down");
     assert_eq!(Keyword::AttnOv.as_field_name(), "attn_ov");
     assert_eq!(Keyword::AutoExtract.as_field_name(), "auto_extract");
+}
+
+#[test]
+fn parser_rejects_trailing_tokens_after_semicolon() {
+    let result = parse(r#"STATS; SELECT * FROM EDGES;"#);
+    assert!(result.is_err(), "single-statement parser must reject tails");
+}
+
+#[test]
+fn parser_rejects_trailing_identifier_without_semicolon() {
+    let result = parse(r#"STATS unexpected"#);
+    assert!(result.is_err(), "single-statement parser must consume EOF");
 }
