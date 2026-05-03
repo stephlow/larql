@@ -9,7 +9,8 @@
 //!         `q4k_q6k_qkv_proj`
 //!       * anything else → per-projection fallback through `quant_matvec`
 //!   - **Q4_0** (legacy Q8 input) — fused norm+Q8 quantize, then
-//!     `q8_qkv_proj`.
+//!     per-projection Q4_0 matvec.
+//!   - **Q8_0** — fused norm+Q8 quantize, then `q8_qkv_proj`.
 //!
 //! Used to live inline in `decode_token_with_moe_fn`. Pulled out here
 //! so the hot decode function stays scannable.
@@ -267,12 +268,12 @@ impl MetalBackend {
         }
     }
 
-    // ── Q4_0 legacy: norm+Q8 → Q8 QKV ────────────────────────────────────────
+    // ── Q4_0 / Q8_0 legacy: norm+Q8 → QKV ────────────────────────────────────
 
     fn encode_q4_0_norm_and_qkv(
         &self,
         enc: &ComputeCommandEncoderRef,
-        _layer: &FullPipelineLayer,
+        layer: &FullPipelineLayer,
         bufs: &QkvBufs<'_>,
         dims: QkvDims,
     ) {
@@ -300,31 +301,80 @@ impl MetalBackend {
             MTLSize::new(256.min(hidden as u64), 1, 1),
         );
 
-        let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u32;
-        let q_rows = layer_q_dim as u32;
-        let k_rows = layer_kv_dim as u32;
-        let v_rows = layer_kv_dim as u32;
-        let k_val = hidden as u32;
-        enc.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline.state);
-        enc.set_buffer(0, Some(bufs.wq), 0);
-        enc.set_buffer(1, Some(bufs.wk), 0);
-        enc.set_buffer(2, Some(bufs.wv), 0);
-        enc.set_buffer(3, Some(bufs.ffn_q8), 0);
-        enc.set_buffer(4, Some(bufs.wq_scales), 0);
-        enc.set_buffer(5, Some(bufs.wk_scales), 0);
-        enc.set_buffer(6, Some(bufs.wv_scales), 0);
-        enc.set_buffer(7, Some(bufs.ffn_q8s), 0);
-        enc.set_buffer(8, Some(bufs.q_out), 0);
-        enc.set_buffer(9, Some(bufs.k_out), 0);
-        enc.set_buffer(10, Some(bufs.v_out), 0);
-        enc.set_bytes(11, 4, &q_rows as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(12, 4, &k_rows as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(13, 4, &v_rows as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(14, 4, &k_val as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new((total_rows as u64).div_ceil(8), 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        if layer.wq.format == crate::QuantFormat::Q8_0
+            && layer.wk.format == crate::QuantFormat::Q8_0
+            && layer.wv.format == crate::QuantFormat::Q8_0
+        {
+            let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u32;
+            let q_rows = layer_q_dim as u32;
+            let k_rows = layer_kv_dim as u32;
+            let v_rows = layer_kv_dim as u32;
+            let k_val = hidden as u32;
+            enc.set_compute_pipeline_state(&self.q8_qkv_proj_pipeline.state);
+            enc.set_buffer(0, Some(bufs.wq), 0);
+            enc.set_buffer(1, Some(bufs.wk), 0);
+            enc.set_buffer(2, Some(bufs.wv), 0);
+            enc.set_buffer(3, Some(bufs.ffn_q8), 0);
+            enc.set_buffer(4, Some(bufs.wq_scales), 0);
+            enc.set_buffer(5, Some(bufs.wk_scales), 0);
+            enc.set_buffer(6, Some(bufs.wv_scales), 0);
+            enc.set_buffer(7, Some(bufs.ffn_q8s), 0);
+            enc.set_buffer(8, Some(bufs.q_out), 0);
+            enc.set_buffer(9, Some(bufs.k_out), 0);
+            enc.set_buffer(10, Some(bufs.v_out), 0);
+            enc.set_bytes(11, 4, &q_rows as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(12, 4, &k_rows as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(13, 4, &v_rows as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(14, 4, &k_val as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((total_rows as u64).div_ceil(8), 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        } else {
+            use crate::metal::stages::qkv_proj::{self, Proj};
+            use crate::metal::stages::quant_matvec::Pipelines;
+            let pipes = Pipelines {
+                q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                q4k_matvec_fallback: &self.q4k_matvec_pipeline,
+                q6k_matvec: &self.q6k_matvec_pipeline,
+                q4_matvec: &self.q4.matvec,
+                q4k_matmul: None,
+            };
+            qkv_proj::encode_per_proj(
+                enc,
+                &pipes,
+                bufs.h_in,
+                0,
+                bufs.ffn_q8,
+                0,
+                bufs.ffn_q8s,
+                0,
+                [
+                    Proj {
+                        format: layer.wq.format,
+                        w_buf: bufs.wq,
+                        out_buf: bufs.q_out,
+                        out_off: 0,
+                        rows: layer_q_dim,
+                    },
+                    Proj {
+                        format: layer.wk.format,
+                        w_buf: bufs.wk,
+                        out_buf: bufs.k_out,
+                        out_off: 0,
+                        rows: layer_kv_dim,
+                    },
+                    Proj {
+                        format: layer.wv.format,
+                        w_buf: bufs.wv,
+                        out_buf: bufs.v_out,
+                        out_off: 0,
+                        rows: layer_kv_dim,
+                    },
+                ],
+                hidden,
+            );
+        }
     }
 
     // ── Fused RMS norm + Q4K/Q6K QKV (Gemma 3/4 production path) ─────────────

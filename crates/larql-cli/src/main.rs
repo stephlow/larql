@@ -95,6 +95,10 @@ enum Commands {
     /// activation, norm, or expert-routing math when refactoring.
     Parity(parity_cmd::ParityArgs),
 
+    /// Shannon-style next-token bit measurements and demo compression.
+    #[command(subcommand)]
+    Shannon(shannon_cmd::ShannonCommand),
+
     // ── Server ──────────────────────────────────────────────────────
     #[command(next_help_heading = "Server")]
     /// Serve a vindex over HTTP + gRPC.
@@ -469,6 +473,7 @@ fn main() {
         Commands::Bench(args) => bench_cmd::run(args),
         Commands::Diag(args) => diag_cmd::run(args),
         Commands::Parity(args) => parity_cmd::run(args),
+        Commands::Shannon(cmd) => shannon_cmd::run(cmd),
         Commands::Pull(args) => pull_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
         Commands::List(args) => list_cmd::run(args),

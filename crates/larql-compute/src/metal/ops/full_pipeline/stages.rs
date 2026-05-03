@@ -38,8 +38,9 @@ pub(super) struct InputNormQkvPipes<'a> {
 
 /// Stage 1+3 — input norm followed by Q/K/V projection. Format-aware
 /// per layer (Q4_K family takes f32 input through a fused or
-/// per-projection shader; Q4_0 family fuses the norm with Q8 quant
-/// then dispatches the fused-Q8-QKV shader).
+/// per-projection shader; Q4_0 fuses the norm with Q8 quant then
+/// dispatches per-projection Q4_0 matvec; Q8_0 uses the fused-Q8-QKV
+/// shader).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_input_norm_and_qkv(
     cmd: &CommandBufferRef,
@@ -178,7 +179,10 @@ pub(super) fn encode_input_norm_and_qkv(
         }
         enc.end_encoding();
     } else {
-        // Q8_0: fused rms_norm+Q8-quantise, then fused Q8 QKV projection.
+        // Legacy Q8-input formats: first fuse rms_norm+Q8-quantise, then
+        // route by weight layout. Q4_0 weights stay packed Q4_0 and must go
+        // through the Q4_0 matvec helper; Q8_0 weights use the fused Q8 QKV
+        // shader with separate per-row weight scales.
         let enc = cmd.new_compute_command_encoder();
         for pos in 0..seq_len {
             input_norm::encode_q8(
@@ -195,29 +199,71 @@ pub(super) fn encode_input_norm_and_qkv(
                 ctx.eps,
                 ctx.norm_offset,
             );
-            qkv_proj::encode_fused_q8(
-                enc,
-                pipes.q8_qkv_proj,
-                &lb.wq[l],
-                &lb.wq_scale[l],
-                &lb.wk[l],
-                &lb.wk_scale[l],
-                &lb.wv[l],
-                &lb.wv_scale[l],
-                &lb.q8[l],
-                q8_off(pos),
-                &lb.q8s[l],
-                q8s_off(pos),
-                &lb.q_out[l],
-                q_off(pos),
-                &lb.k_out[l],
-                kv_off(pos),
-                &lb.v_out[l],
-                kv_off(pos),
-                ctx.layer_q_dim,
-                ctx.layer_kv_dim,
-                hidden,
-            );
+            if layer.wq.format == crate::QuantFormat::Q8_0
+                && layer.wk.format == crate::QuantFormat::Q8_0
+                && layer.wv.format == crate::QuantFormat::Q8_0
+            {
+                qkv_proj::encode_fused_q8(
+                    enc,
+                    pipes.q8_qkv_proj,
+                    &lb.wq[l],
+                    &lb.wq_scale[l],
+                    &lb.wk[l],
+                    &lb.wk_scale[l],
+                    &lb.wv[l],
+                    &lb.wv_scale[l],
+                    &lb.q8[l],
+                    q8_off(pos),
+                    &lb.q8s[l],
+                    q8s_off(pos),
+                    &lb.q_out[l],
+                    q_off(pos),
+                    &lb.k_out[l],
+                    kv_off(pos),
+                    &lb.v_out[l],
+                    kv_off(pos),
+                    ctx.layer_q_dim,
+                    ctx.layer_kv_dim,
+                    hidden,
+                );
+            } else {
+                let pos_qoff = q_off(pos);
+                let pos_kvoff = kv_off(pos);
+                qkv_proj::encode_per_proj(
+                    enc,
+                    &pipes.qm_pipes,
+                    &lb.h[l],
+                    h_off(pos),
+                    &lb.q8[l],
+                    q8_off(pos),
+                    &lb.q8s[l],
+                    q8s_off(pos),
+                    [
+                        qkv_proj::Proj {
+                            format: layer.wq.format,
+                            w_buf: &lb.wq[l],
+                            out_buf: &lb.q_out[l],
+                            out_off: pos_qoff,
+                            rows: ctx.layer_q_dim,
+                        },
+                        qkv_proj::Proj {
+                            format: layer.wk.format,
+                            w_buf: &lb.wk[l],
+                            out_buf: &lb.k_out[l],
+                            out_off: pos_kvoff,
+                            rows: ctx.layer_kv_dim,
+                        },
+                        qkv_proj::Proj {
+                            format: layer.wv.format,
+                            w_buf: &lb.wv[l],
+                            out_buf: &lb.v_out[l],
+                            out_off: pos_kvoff,
+                            rows: ctx.layer_kv_dim,
+                        },
+                    ],
+                    hidden,
+                );
+            }
         }
         enc.end_encoding();
     }

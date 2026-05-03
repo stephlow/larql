@@ -305,7 +305,7 @@ fn main() {
 
     // ── Force lazy weight load (cheaper to time it explicitly here) ───────────
     let (_, weights_load_ms) = time_ms(|| {
-        model_a
+        let _ = model_a
             .get_or_load_weights()
             .expect("get_or_load_weights on shard A");
     });

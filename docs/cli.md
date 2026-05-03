@@ -18,6 +18,7 @@ a local directory path — see [Model resolution](#model-resolution) below.
 | `list` | Show cached vindexes (model, size, layers, hidden). |
 | `show <model>` | Vindex metadata and file inventory. |
 | `rm <model>` | Evict a cached vindex. |
+| `shannon <subcmd>` | Next-token bit scoring, slot probes, repetition probes, and demo arithmetic coding. |
 | `serve <model>` | Serve a vindex over HTTP + gRPC. |
 
 ## Build / extract
@@ -105,6 +106,34 @@ larql chat <MODEL> [OPTIONS]
 ```
 
 Same flag set as `run`, minus the positional prompt.
+
+### `larql shannon`
+
+Shannon-style measurement tools for scripted demos. These use the dense
+transformer forward pass to score the actual next token as
+`-log2 p(token | context)`. They are measurement tools, not production
+compressors.
+
+```bash
+larql shannon score google/gemma-3-4b-it --corpus frankenstein.txt --bytes 50000
+larql shannon slot google/gemma-3-4b-it --prefix "The capital of France is " --answer Paris
+larql shannon repeat google/gemma-3-4b-it --text frankenstein.txt --needle "created"
+larql shannon encode google/gemma-3-4b-it --in frankenstein_4kb.txt --out compressed.lsc
+larql shannon decode google/gemma-3-4b-it --in compressed.lsc --out recovered.txt
+```
+
+| Subcommand | Description |
+|---|---|
+| `score` | Score a corpus and print bits/token, bits/char, bits/byte, and total bits. |
+| `slot` | Score an answer span after a prefix and show top predictions before the slot. |
+| `repeat` | Score each occurrence of a string in its real preceding context. |
+| `encode` | Write a real arithmetic-coded bitstream driven by model probabilities. Intended for short excerpts. |
+| `decode` | Reconstruct text from `encode` output using the same model. |
+
+`encode` / `decode` are deliberately slow today because decode reruns the
+model for each recovered token. The payload is real entropy-coded data;
+the file also includes a small header with the first token, token count,
+original byte count, context size, and payload length.
 
 ### `larql pull`
 
