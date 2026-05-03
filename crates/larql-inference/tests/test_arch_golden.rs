@@ -18,10 +18,12 @@
 //!     `"The capital of France is"`).
 //!   - `LARQL_ARCH_TOKENS=<n>` — override the generated-token budget (default 3).
 //!
-//! **Why not `#[ignore]`?** `cargo test` runs these by default so anyone who
-//! breaks an arch in an edit-test loop notices immediately. Skipped cases
-//! aren't failures; skipped cases are the common path on CI that doesn't
-//! cache 40 GB of weights.
+//! These real-vindex checks are `#[ignore]` so the default `cargo test`
+//! path stays fast. Run them explicitly with:
+//!
+//! ```sh
+//! cargo test -p larql-inference --test test_arch_golden -- --ignored
+//! ```
 
 use std::path::{Path, PathBuf};
 
@@ -332,42 +334,52 @@ fn exercise_case(case: &ArchCase, backend_kind: BackendKind) {
 // change that breaks one is a bug even if the other still passes.
 
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_gemma3_4b_gpu() {
     exercise_case(&CASES[0], BackendKind::Gpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_gemma3_4b_cpu() {
     exercise_case(&CASES[0], BackendKind::Cpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_gemma4_31b_dense_gpu() {
     exercise_case(&CASES[1], BackendKind::Gpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_gemma4_31b_dense_cpu() {
     exercise_case(&CASES[1], BackendKind::Cpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_gemma4_26b_a4b_moe_gpu() {
     exercise_case(&CASES[2], BackendKind::Gpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_gemma4_26b_a4b_moe_cpu() {
     exercise_case(&CASES[2], BackendKind::Cpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_llama2_7b_gpu() {
     exercise_case(&CASES[3], BackendKind::Gpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_llama2_7b_cpu() {
     exercise_case(&CASES[3], BackendKind::Cpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_mistral_7b_gpu() {
     exercise_case(&CASES[4], BackendKind::Gpu);
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn arch_mistral_7b_cpu() {
     exercise_case(&CASES[4], BackendKind::Cpu);
 }

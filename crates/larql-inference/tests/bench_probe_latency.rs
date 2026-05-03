@@ -1,12 +1,20 @@
-// Quick latency benchmark: forward_to_layer vs generate_cached timing
-// Run as: cargo test --test bench_probe_latency --release -- --nocapture
+// Quick latency benchmark: forward_to_layer vs generate_cached timing.
+// Opt in with:
+//   LARQL_MODEL=<path-or-hf-id> cargo test --test bench_probe_latency --release -- --nocapture
 use larql_inference::forward::generate_cached_constrained;
 use larql_inference::{encode_prompt, forward::forward_to_layer, InferenceModel, WeightFfn};
 use std::time::Instant;
 
 #[test]
+#[ignore = "model latency benchmark; set LARQL_MODEL and run with --ignored"]
 fn bench_probe_vs_generate() {
-    let mid = std::env::var("LARQL_MODEL").unwrap_or_else(|_| "google/gemma-3-4b-it".to_string());
+    let mid = match std::env::var("LARQL_MODEL") {
+        Ok(mid) => mid,
+        Err(_) => {
+            eprintln!("skip: set LARQL_MODEL to run this latency benchmark");
+            return;
+        }
+    };
     let model = match InferenceModel::load(&mid) {
         Ok(m) => m,
         Err(e) => {

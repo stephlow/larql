@@ -410,6 +410,56 @@ struct ServeArgs {
     /// Logging level.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Only load and serve layers in this range (inclusive, e.g. "0-19").
+    /// Pages outside the range are never touched; RSS scales with shard size.
+    #[arg(long)]
+    layers: Option<String>,
+
+    /// Only load and serve experts in this range (inclusive, e.g. "0-63").
+    /// Used to shard the expert bank across servers for MoE models.
+    /// Mutually exclusive with --units.
+    #[arg(long)]
+    experts: Option<String>,
+
+    /// Path to a JSON manifest for fine-grained per-(layer, expert) ownership.
+    /// Mutually exclusive with --experts.
+    #[arg(long, value_name = "PATH")]
+    units: Option<std::path::PathBuf>,
+
+    /// Run as an embed-service endpoint (loads only embeddings + lm_head).
+    #[arg(long)]
+    embed_only: bool,
+
+    /// Eager-build HNSW index for every owned layer at startup. Requires --hnsw.
+    #[arg(long)]
+    warmup_hnsw: bool,
+
+    /// Pre-load inference weights and prefetch all owned layer mmap pages at boot.
+    #[arg(long)]
+    warmup_walk_ffn: bool,
+
+    /// Bind a Unix domain socket alongside TCP for same-host MoE shard clients.
+    #[arg(long, value_name = "PATH")]
+    uds_path: Option<std::path::PathBuf>,
+
+    /// Join one or more router grids (comma-separated gRPC addresses).
+    /// Example: "grpc://router-a:50052,grpc://router-b:50052"
+    /// Requires --public-url so routers know where to direct clients.
+    #[arg(long)]
+    join: Option<String>,
+
+    /// Public HTTP URL clients use to reach this server (used with --join).
+    #[arg(long)]
+    public_url: Option<String>,
+
+    /// Shared secret matching the router's --grid-key (or set LARQL_GRID_KEY env var).
+    #[arg(long)]
+    grid_key: Option<String>,
+
+    /// Trust X-Forwarded-For when rate limiting (enable only behind a trusted proxy).
+    #[arg(long)]
+    trust_forwarded_for: bool,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -628,6 +678,46 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref key) = args.tls_key {
         cmd_args.push("--tls-key".into());
         cmd_args.push(key.display().to_string());
+    }
+    if let Some(ref range) = args.layers {
+        cmd_args.push("--layers".into());
+        cmd_args.push(range.clone());
+    }
+    if let Some(ref range) = args.experts {
+        cmd_args.push("--experts".into());
+        cmd_args.push(range.clone());
+    }
+    if let Some(ref path) = args.units {
+        cmd_args.push("--units".into());
+        cmd_args.push(path.display().to_string());
+    }
+    if args.embed_only {
+        cmd_args.push("--embed-only".into());
+    }
+    if args.warmup_hnsw {
+        cmd_args.push("--warmup-hnsw".into());
+    }
+    if args.warmup_walk_ffn {
+        cmd_args.push("--warmup-walk-ffn".into());
+    }
+    if let Some(ref path) = args.uds_path {
+        cmd_args.push("--uds-path".into());
+        cmd_args.push(path.display().to_string());
+    }
+    if let Some(ref addrs) = args.join {
+        cmd_args.push("--join".into());
+        cmd_args.push(addrs.clone());
+    }
+    if let Some(ref url) = args.public_url {
+        cmd_args.push("--public-url".into());
+        cmd_args.push(url.clone());
+    }
+    if let Some(ref key) = args.grid_key {
+        cmd_args.push("--grid-key".into());
+        cmd_args.push(key.clone());
+    }
+    if args.trust_forwarded_for {
+        cmd_args.push("--trust-forwarded-for".into());
     }
 
     let exe = std::env::current_exe().ok();

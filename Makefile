@@ -1,4 +1,4 @@
-.PHONY: build release test check clean fmt lint demos bench bench-save bench-check coverage coverage-summary
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-save bench-check coverage coverage-summary
 
 # Build
 build:
@@ -8,8 +8,30 @@ release:
 	cargo build --release -p larql-cli
 
 # Test
-test:
+#
+# Default test target is intentionally fast: no integration binaries, no
+# model-backed ignored tests. Use `test-full` for the historical full
+# workspace run, and `test-models` for real-model/vindex checks.
+test: test-fast
+
+test-fast:
+	cargo test --workspace --lib --bins
+
+test-full:
 	cargo test --workspace
+
+test-integration:
+	cargo test --workspace --tests
+
+test-models:
+	cargo test -p larql-inference --test test_arch_golden -- --ignored
+	cargo test -p larql-inference --test test_logits_goldens -- --ignored
+	cargo test -p larql-inference --test test_gemma3_smoke -- --ignored
+	cargo test -p larql-inference --test test_generate_q4k_cpu -- --ignored
+	cargo test -p larql-inference --test bench_probe_latency -- --ignored --nocapture
+	cargo test -p larql-inference --test test_llm_dispatch -- --ignored --nocapture
+	cargo test -p larql-inference --test test_constrained_dispatch -- --ignored --nocapture
+	cargo test -p larql-inference --test test_trie_dispatch -- --ignored --nocapture
 
 # Check (compile without building)
 check:
@@ -26,7 +48,7 @@ lint:
 	cargo clippy --workspace --tests -- -D warnings
 
 # All quality checks
-ci: fmt-check lint test
+ci: fmt-check lint test-full
 
 # Clean
 clean:

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 use super::types::{HeadId, PqConfig};
@@ -509,4 +511,158 @@ pub(super) struct OraclePqPromptReport {
     pub(super) coeff_mode_d_max_abs_logit_diff: Option<f64>,
     pub(super) pre_wo_l2: f64,
     pub(super) wo_visible_l2: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OracleEditCatalogReport {
+    pub(super) index: String,
+    pub(super) prompt_file: String,
+    pub(super) prompts_seen: usize,
+    pub(super) train_prompts_seen: usize,
+    pub(super) eval_prompts_seen: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) max_per_stratum: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) eval_mod: Option<usize>,
+    pub(super) eval_offset: usize,
+    pub(super) static_base: String,
+    pub(super) spaces: Vec<String>,
+    pub(super) edit_counts: Vec<usize>,
+    pub(super) pca_rank: usize,
+    pub(super) sigma_rel_cutoff: f64,
+    pub(super) kmeans_iters: usize,
+    pub(super) selected_heads: Vec<HeadId>,
+    pub(super) heads: Vec<OracleEditCatalogHeadReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OracleEditCatalogHeadReport {
+    pub(super) layer: usize,
+    pub(super) head: usize,
+    pub(super) head_dim: usize,
+    pub(super) rank_retained: usize,
+    pub(super) empirical_rank: usize,
+    pub(super) sigma_max: f64,
+    pub(super) sigma_min_retained: f64,
+    pub(super) static_train_samples: u64,
+    pub(super) points: Vec<OracleEditCatalogPointReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OracleEditCatalogPointReport {
+    pub(super) space: String,
+    pub(super) edits: usize,
+    pub(super) address_bits: usize,
+    pub(super) residual_table_bytes_bf16: usize,
+    pub(super) prompts: usize,
+    pub(super) mean_kl: f64,
+    pub(super) p95_kl: f64,
+    pub(super) max_kl: f64,
+    pub(super) mean_delta_cross_entropy_bits: f64,
+    pub(super) top1_agreement: f64,
+    pub(super) top5_contains_baseline_top1: f64,
+    pub(super) mean_baseline_top1_prob: f64,
+    pub(super) mean_catalog_prob_of_baseline_top1: f64,
+    pub(super) mean_baseline_top1_margin: f64,
+    pub(super) per_prompt: Vec<OracleEditCatalogPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct OracleEditCatalogPromptReport {
+    pub(super) id: String,
+    pub(super) stratum: String,
+    pub(super) kl: f64,
+    pub(super) delta_cross_entropy_bits: f64,
+    pub(super) baseline_top1: u32,
+    pub(super) catalog_top1: u32,
+    pub(super) top1_agree: bool,
+    pub(super) baseline_top1_in_catalog_top5: bool,
+    pub(super) baseline_top1_prob: f64,
+    pub(super) baseline_top2: u32,
+    pub(super) baseline_top2_prob: f64,
+    pub(super) baseline_top1_margin: f64,
+    pub(super) catalog_top1_prob: f64,
+    pub(super) catalog_prob_of_baseline_top1: f64,
+    pub(super) catalog_top1_margin: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OraclePqExceptionReport {
+    pub(super) index: String,
+    pub(super) prompt_file: String,
+    pub(super) prompts_seen: usize,
+    pub(super) train_prompts_seen: usize,
+    pub(super) eval_prompts_seen: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) max_per_stratum: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) eval_mod: Option<usize>,
+    pub(super) eval_offset: usize,
+    pub(super) static_base: String,
+    pub(super) base_config: PqConfig,
+    pub(super) exception_edits: Vec<usize>,
+    pub(super) tail_fracs: Vec<f64>,
+    pub(super) tail_selector: String,
+    pub(super) sigma_rel_cutoff: f64,
+    pub(super) pq_iters: usize,
+    pub(super) exception_iters: usize,
+    pub(super) selected_heads: Vec<HeadId>,
+    pub(super) heads: Vec<OraclePqExceptionHeadReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OraclePqExceptionHeadReport {
+    pub(super) layer: usize,
+    pub(super) head: usize,
+    pub(super) head_dim: usize,
+    pub(super) rank_retained: usize,
+    pub(super) empirical_rank: usize,
+    pub(super) sigma_max: f64,
+    pub(super) sigma_min_retained: f64,
+    pub(super) static_train_samples: u64,
+    pub(super) points: Vec<OraclePqExceptionPointReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OraclePqExceptionPointReport {
+    pub(super) exception_edits: usize,
+    pub(super) tail_frac: f64,
+    pub(super) train_error_samples: usize,
+    pub(super) train_error_samples_used: usize,
+    pub(super) base_address_bits: usize,
+    pub(super) exception_address_bits: usize,
+    pub(super) total_address_bits: usize,
+    pub(super) base_table_bytes_bf16: usize,
+    pub(super) exception_table_bytes_bf16: usize,
+    pub(super) total_table_bytes_bf16: usize,
+    pub(super) prompts: usize,
+    pub(super) mean_kl: f64,
+    pub(super) p95_kl: f64,
+    pub(super) max_kl: f64,
+    pub(super) mean_delta_cross_entropy_bits: f64,
+    pub(super) top1_agreement: f64,
+    pub(super) top5_contains_baseline_top1: f64,
+    pub(super) mean_baseline_top1_prob: f64,
+    pub(super) mean_exception_prob_of_baseline_top1: f64,
+    pub(super) mean_baseline_top1_margin: f64,
+    pub(super) per_prompt: Vec<OraclePqExceptionPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct OraclePqExceptionPromptReport {
+    pub(super) id: String,
+    pub(super) stratum: String,
+    pub(super) kl: f64,
+    pub(super) delta_cross_entropy_bits: f64,
+    pub(super) baseline_top1: u32,
+    pub(super) exception_top1: u32,
+    pub(super) top1_agree: bool,
+    pub(super) baseline_top1_in_exception_top5: bool,
+    pub(super) baseline_top1_prob: f64,
+    pub(super) baseline_top2: u32,
+    pub(super) baseline_top2_prob: f64,
+    pub(super) baseline_top1_margin: f64,
+    pub(super) exception_top1_prob: f64,
+    pub(super) exception_prob_of_baseline_top1: f64,
+    pub(super) exception_top1_margin: f64,
 }

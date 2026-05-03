@@ -120,6 +120,8 @@ larql shannon slot google/gemma-3-4b-it --prefix "The capital of France is " --a
 larql shannon repeat google/gemma-3-4b-it --text frankenstein.txt --needle "created"
 larql shannon encode google/gemma-3-4b-it --in frankenstein_4kb.txt --out compressed.lsc
 larql shannon decode google/gemma-3-4b-it --in compressed.lsc --out recovered.txt
+larql shannon encode google/gemma-3-4b-it --vindex ./gemma-q4k.vindex --metal --in frankenstein_4kb.txt --out compressed.lsc
+larql shannon decode google/gemma-3-4b-it --vindex ./gemma-q4k.vindex --metal --in compressed.lsc --out recovered.txt
 ```
 
 | Subcommand | Description |
@@ -130,10 +132,13 @@ larql shannon decode google/gemma-3-4b-it --in compressed.lsc --out recovered.tx
 | `encode` | Write a real arithmetic-coded bitstream driven by model probabilities. Intended for short excerpts. |
 | `decode` | Reconstruct text from `encode` output using the same model. |
 
-`encode` / `decode` are deliberately slow today because decode reruns the
-model for each recovered token. The payload is real entropy-coded data;
-the file also includes a small header with the first token, token count,
-original byte count, context size, and payload length.
+Without `--vindex`, `encode` / `decode` rerun the dense model for each
+recovered token and are intended only for short excerpts. With `--vindex
+--metal`, Q4K vindexes use the Metal KV-cache path and a full-vocabulary
+LM-head query for each forced token, which makes the arithmetic-code demo
+practical for longer clips. The payload is real entropy-coded data; the file
+also includes a small header with the first token, token count, original byte
+count, context size, and payload length.
 
 ### `larql pull`
 

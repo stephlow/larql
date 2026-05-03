@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
-fn model_id() -> String {
-    std::env::var("LARQL_MODEL").unwrap_or_else(|_| "google/gemma-3-4b-it".to_string())
+fn model_id() -> Option<String> {
+    std::env::var("LARQL_MODEL").ok()
 }
 
 fn wasm_dir() -> PathBuf {
@@ -208,13 +208,17 @@ No extra text."#;
 // ── Test ──────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "loads a real model; set LARQL_MODEL and run with --ignored"]
 fn constrained_dispatch_pipeline() {
     if !wasm_dir().exists() {
         eprintln!("skip: wasm dir missing");
         return;
     }
 
-    let mid = model_id();
+    let Some(mid) = model_id() else {
+        eprintln!("skip: set LARQL_MODEL to run constrained_dispatch_pipeline");
+        return;
+    };
     let model = match InferenceModel::load(&mid) {
         Ok(m) => m,
         Err(e) => {

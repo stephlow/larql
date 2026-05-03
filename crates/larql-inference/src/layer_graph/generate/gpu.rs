@@ -37,6 +37,217 @@ fn lmhead_k_for_sampling(cfg: &SamplingConfig) -> usize {
     }
 }
 
+/// Timings and forced tokens from [`stream_forced_full_logits`].
+#[derive(Debug, Clone, Default)]
+pub struct ForcedLogitsResult {
+    /// Tokens returned by the caller and forced into the decode cache.
+    pub forced_tokens: Vec<u32>,
+    /// Fused prefill time for the seed token.
+    pub prefill_ms: f64,
+    /// Per forced-token decode-step time. Length is `forced_tokens.len() - 1`
+    /// when at least one token was forced.
+    pub decode_ms: Vec<f64>,
+}
+
+/// Stream full-vocabulary next-token logits while forcing known tokens
+/// through the Q4K/Metal KV-cache path.
+///
+/// This is the Shannon-codec primitive: unlike [`generate_streaming`], this
+/// does not sample. At each step the caller receives logits for
+/// `p(next_token | context)` and returns the token id to append to the cache.
+/// Encode returns the known corpus token; decode returns the arithmetic-decoded
+/// token. The implementation reuses the same fused prefill and
+/// `decode_token` machinery as generation, so each step extends the KV cache
+/// instead of recomputing the full prefix.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_forced_full_logits<F>(
+    weights: &mut ModelWeights,
+    first_token: u32,
+    target_steps: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    mut on_logits: F,
+) -> Result<ForcedLogitsResult, String>
+where
+    F: FnMut(usize, &[f32]) -> Result<u32, String>,
+{
+    if target_steps == 0 {
+        return Ok(ForcedLogitsResult::default());
+    }
+    if !backend_supports_fused_q4_pipeline(backend) {
+        return Err("forced Shannon logits require a fused Q4 backend; pass --metal".into());
+    }
+    if weights.arch.has_per_layer_embeddings() {
+        return Err("forced Shannon logits do not yet support per-layer embeddings".into());
+    }
+    if weights.has_per_layer_ffn() {
+        return Err("forced Shannon logits do not yet support per-layer expert FFN blobs".into());
+    }
+
+    let norm_offset = weights.arch.norm_weight_offset();
+    let hidden = weights.hidden_size;
+    let gate_index: &dyn larql_vindex::GateIndex = index;
+    let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
+        (Some(mmap), true)
+    } else {
+        (gate_index.interleaved_q4_mmap_ref(), false)
+    };
+    let has_q4k = index.attn_q4k_layer_data(0).is_some();
+    let has_q8 = index.attn_q8_layer_data(0).is_some();
+    if !backend.has_q4() || q4_ffn.is_none() || (!has_q4k && !has_q8) {
+        return Err(
+            "vindex is missing Q4 attention/FFN data required for forced Shannon logits".into(),
+        );
+    }
+
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    let intermediate = gate_index.num_features(0);
+    let q4_ffn_per_matrix = ffn_format
+        .packed_matrix_bytes(intermediate, hidden)
+        .ok_or_else(|| "invalid Q4 FFN packed geometry".to_string())?;
+    let q4_ffn_mmap = q4_ffn.unwrap();
+    let num_layers = weights.num_layers;
+    let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
+        weights,
+        index,
+        0..num_layers,
+        q4_ffn_mmap,
+        q4_ffn_per_matrix,
+        ffn_format,
+    );
+    let attention = attention_geometry_for_arch_layer(weights, 0);
+
+    let prefill_start = std::time::Instant::now();
+    backend.reset_kv_cache();
+    {
+        let kv_shapes = kv_cache_shapes_for_arch(weights);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
+    }
+
+    let h_embed = crate::forward::embed_tokens_pub(weights, &[first_token]);
+    let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+    let softcap_val = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+    let qk_norm_val = weights.arch.attn_q_norm_key(0).is_some();
+    let h_vec = backend
+        .prefill_q4(
+            &layers,
+            &x,
+            hidden,
+            intermediate,
+            attention.q_dim,
+            attention.kv_dim,
+            1,
+            attention.num_q_heads,
+            attention.num_kv_heads,
+            attention.head_dim,
+            attention.rope_base,
+            qk_norm_val,
+            softcap_val,
+        )
+        .ok_or_else(|| "Q4 prefill failed".to_string())?;
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    let mut h_1d = final_norm_row(weights, &h_vec, hidden, norm_offset)?;
+
+    let mut forced_tokens = Vec::with_capacity(target_steps);
+    let mut decode_ms = Vec::with_capacity(target_steps.saturating_sub(1));
+    for step in 0..target_steps {
+        let logits = full_logits_from_vindex(index, weights, &h_1d, backend)?;
+        let forced = on_logits(step, &logits)?;
+        forced_tokens.push(forced);
+
+        if step + 1 == target_steps {
+            break;
+        }
+
+        let decode_start = std::time::Instant::now();
+        let h_tok = crate::forward::embed_tokens_pub(weights, &[forced]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let h_out = backend
+            .decode_token(
+                &layers,
+                &x_dec,
+                hidden,
+                intermediate,
+                attention.q_dim,
+                attention.kv_dim,
+                attention.num_q_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.rope_base,
+            )
+            .ok_or_else(|| format!("Q4 decode failed at forced step {step}"))?;
+        h_1d = final_norm_row(weights, &h_out, hidden, norm_offset)?;
+        decode_ms.push(decode_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    Ok(ForcedLogitsResult {
+        forced_tokens,
+        prefill_ms,
+        decode_ms,
+    })
+}
+
+fn final_norm_row(
+    weights: &ModelWeights,
+    h_vec: &[f32],
+    hidden: usize,
+    norm_offset: f32,
+) -> Result<ndarray::Array1<f32>, String> {
+    if h_vec.len() < hidden {
+        return Err(format!(
+            "hidden vector too short: got {}, need {}",
+            h_vec.len(),
+            hidden
+        ));
+    }
+    let start = h_vec.len() - hidden;
+    let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_vec[start..].to_vec())
+        .map_err(|e| format!("hidden shape error: {e}"))?;
+    let h_final =
+        crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
+    Ok(h_final.row(0).to_owned())
+}
+
+fn full_logits_from_vindex(
+    index: &larql_vindex::VectorIndex,
+    weights: &ModelWeights,
+    h_1d: &ndarray::Array1<f32>,
+    backend: &dyn ComputeBackend,
+) -> Result<Vec<f32>, String> {
+    let vocab = index.vocab_size.max(weights.vocab_size);
+    if vocab == 0 {
+        return Err("vocab size is zero".into());
+    }
+    // Shannon coding needs encode and decode to rebuild identical frequency
+    // tables. Prefer the stable-reduction LM-head route over the fastest
+    // production route; tiny low-order logit drift is enough to desync an
+    // arithmetic decoder on longer excerpts.
+    let hits = index.lm_head_knn_backend_skip_q4k(h_1d, vocab, backend);
+    if hits.is_empty() {
+        return Err("vindex lm_head returned no scores".into());
+    }
+
+    let inv_scale = 1.0 / weights.arch.logits_scaling();
+    let softcap = weights.arch.final_logit_softcapping();
+    let mut logits = vec![f32::NEG_INFINITY; vocab];
+    for (tid, score) in hits {
+        let idx = tid as usize;
+        if idx >= logits.len() {
+            continue;
+        }
+        let mut logit = score * inv_scale;
+        if let Some(cap) = softcap {
+            logit = (logit / cap).tanh() * cap;
+        }
+        logits[idx] = logit;
+    }
+    Ok(logits)
+}
+
 /// Greedy multi-token generation. Thin wrapper over
 /// [`generate_with_sampling`] with [`SamplingConfig::greedy`] and
 /// [`EosConfig::builtin`] — preserves the historical behaviour of every

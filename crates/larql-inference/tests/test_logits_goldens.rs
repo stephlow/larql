@@ -41,8 +41,12 @@
 //! already has strong evidence of correctness — pinning it gives
 //! the regression detector without the Python dependency.
 //!
-//! Skip semantics mirror the rest of the test_decode_* suite: missing
-//! vindexes return Ok with a skip note unless `LARQL_ARCH_STRICT=1`.
+//! These real-vindex checks are `#[ignore]` so default `cargo test` stays
+//! fast. Run explicitly with:
+//!
+//! ```sh
+//! cargo test -p larql-inference --test test_logits_goldens -- --ignored
+//! ```
 
 #![allow(clippy::excessive_precision)]
 
@@ -441,37 +445,45 @@ fn run_cpu(vindex: &str) {
 
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma3_4b_metal() {
     run_metal("gemma3-4b-q4k-v2");
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma3_4b_cpu() {
     run_cpu("gemma3-4b-q4k-v2");
 }
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma4_31b_dense_metal() {
     run_metal("gemma4-31b-q4k");
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma4_31b_dense_cpu() {
     run_cpu("gemma4-31b-q4k");
 }
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_llama2_7b_metal() {
     run_metal("llama2-7b-q4k");
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_llama2_7b_cpu() {
     run_cpu("llama2-7b-q4k");
 }
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_mistral_7b_metal() {
     run_metal("mistral-7b-v0.1-q4k");
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_mistral_7b_cpu() {
     run_cpu("mistral-7b-v0.1-q4k");
 }
@@ -479,25 +491,30 @@ fn logits_golden_mistral_7b_cpu() {
 // after the fused-kernel default flip.
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma3_4b_q4k_down_metal() {
     run_metal("gemma3-4b-q4k-downq4k");
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma3_4b_q4k_down_cpu() {
     run_cpu("gemma3-4b-q4k-downq4k");
 }
 // Gemma 4 31B Q6_K-down variant.
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma4_31b_q6kdown_metal() {
     run_metal("gemma4-31b-q4k-q6kdown");
 }
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma4_31b_q6kdown_cpu() {
     run_cpu("gemma4-31b-q4k-q6kdown");
 }
 // Gemma 4 E2B (PLE auto-routes to CPU even under `--metal`).
 #[test]
+#[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma4_e2b_cpu() {
     run_cpu("gemma4-e2b-q4k");
 }

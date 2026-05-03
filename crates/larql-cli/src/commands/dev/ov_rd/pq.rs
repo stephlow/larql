@@ -128,7 +128,7 @@ pub(super) fn kmeans_centroids(samples: &[Vec<f64>], k: usize, iterations: usize
     centroids
 }
 
-fn nearest_centroid_index(sample: &[f64], centroids: &[Vec<f64>]) -> usize {
+pub(super) fn nearest_centroid_index(sample: &[f64], centroids: &[Vec<f64>]) -> usize {
     let mut best_idx = 0usize;
     let mut best_dist = f64::INFINITY;
     for (idx, centroid) in centroids.iter().enumerate() {

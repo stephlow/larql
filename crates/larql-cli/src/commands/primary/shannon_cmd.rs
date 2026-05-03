@@ -20,7 +20,11 @@ use ndarray::{s, Array2};
 const LN_2: f64 = std::f64::consts::LN_2;
 const DEFAULT_CONTEXT: usize = 512;
 const DEFAULT_STRIDE: usize = 256;
-const FREQ_TOTAL: u32 = 1 << 24;
+// Arithmetic coding must rebuild the exact same integer frequency table when
+// decoding. The vindex/Metal path is fast but can produce tiny cross-run float
+// drift, so keep this comfortably above Gemma's 262K vocab without making the
+// table hypersensitive to low-order logit differences.
+const FREQ_TOTAL: u32 = 1 << 19;
 const CODE_BITS: u32 = 32;
 const TOP_VALUE: u64 = (1u64 << CODE_BITS) - 1;
 const FIRST_QTR: u64 = TOP_VALUE / 4 + 1;
@@ -129,8 +133,17 @@ pub struct EncodeArgs {
     bytes: Option<usize>,
 
     /// Previous tokens visible to the model for each arithmetic-code step.
+    /// Ignored when --vindex is used; the KV-cache path uses full context.
     #[arg(long, default_value_t = 256)]
     context: usize,
+
+    /// Use a Q4K vindex for KV-cached forced-token scoring instead of raw HF weights.
+    #[arg(long, value_name = "DIR")]
+    vindex: Option<PathBuf>,
+
+    /// Use the best GPU backend for the vindex path. Required for the fast Q4K path.
+    #[arg(long)]
+    metal: bool,
 }
 
 #[derive(Args)]
@@ -145,6 +158,14 @@ pub struct DecodeArgs {
     /// Recovered UTF-8 text output.
     #[arg(long, value_name = "FILE")]
     out: PathBuf,
+
+    /// Use a Q4K vindex for KV-cached forced-token scoring instead of raw HF weights.
+    #[arg(long, value_name = "DIR")]
+    vindex: Option<PathBuf>,
+
+    /// Use the best GPU backend for the vindex path. Required for the fast Q4K path.
+    #[arg(long)]
+    metal: bool,
 }
 
 pub fn run(cmd: ShannonCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -276,6 +297,9 @@ fn run_repeat(args: RepeatArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_encode(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.vindex.is_some() {
+        return run_encode_vindex(args);
+    }
     if args.context < 1 {
         return Err("--context must be at least 1".into());
     }
@@ -332,6 +356,9 @@ fn run_encode(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_decode(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.vindex.is_some() {
+        return run_decode_vindex(args);
+    }
     let mut raw = Vec::new();
     fs::File::open(&args.input)?.read_to_end(&mut raw)?;
     let blob = ShannonFile::from_bytes(&raw)?;
@@ -365,6 +392,179 @@ fn run_decode(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&args.out, text.as_bytes())?;
     println!("decoded:         {:>10} bytes", text.len());
     println!("expected:        {:>10} bytes", blob.original_bytes);
+    println!("wrote: {}", args.out.display());
+    Ok(())
+}
+
+struct VindexShannonRuntime {
+    weights: larql_inference::ModelWeights,
+    tokenizer: tokenizers::Tokenizer,
+    index: larql_vindex::VectorIndex,
+    backend: Box<dyn larql_compute::ComputeBackend>,
+}
+
+fn load_vindex_runtime(
+    vindex: &PathBuf,
+    metal: bool,
+) -> Result<VindexShannonRuntime, Box<dyn std::error::Error>> {
+    if !metal {
+        return Err("--vindex Shannon encode/decode currently requires --metal".into());
+    }
+
+    eprintln!("loading vindex {}...", vindex.display());
+    let start = Instant::now();
+    let cfg = larql_vindex::load_vindex_config(vindex)?;
+    if cfg.quant != larql_vindex::QuantFormat::Q4K {
+        return Err(format!(
+            "--vindex fast Shannon path requires Q4K, found {:?}",
+            cfg.quant
+        )
+        .into());
+    }
+
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let weights = larql_vindex::load_model_weights_q4k(vindex, &mut cb)?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex)?;
+    let mut index = larql_vindex::VectorIndex::load_vindex(vindex, &mut cb)?;
+    index.load_attn_q4k(vindex)?;
+    index.load_interleaved_q4k(vindex)?;
+    let _ = index.load_lm_head_q4(vindex);
+    let backend = larql_compute::default_backend();
+    if !backend.has_q4() {
+        return Err("Metal/Q4 backend is not available".into());
+    }
+    eprintln!(
+        "loaded vindex. {} layers, hidden_size={}, backend={} ({:.1}s)",
+        weights.num_layers,
+        weights.hidden_size,
+        backend.name(),
+        start.elapsed().as_secs_f64()
+    );
+
+    Ok(VindexShannonRuntime {
+        weights,
+        tokenizer,
+        index,
+        backend,
+    })
+}
+
+fn run_encode_vindex(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let vindex = args.vindex.as_ref().ok_or("--vindex missing")?;
+    let text = read_text(&args.input, args.bytes)?;
+    let mut rt = load_vindex_runtime(vindex, args.metal)?;
+    let ids = encode_prompt(&rt.tokenizer, &*rt.weights.arch, &text)?;
+    if ids.len() < 2 {
+        return Err("input must tokenize to at least one encoded token".into());
+    }
+
+    eprintln!(
+        "encoding {} bytes as {} target tokens with KV-cached vindex...",
+        text.len(),
+        ids.len() - 1
+    );
+    let pb = progress_bar((ids.len() - 1) as u64, "encoding");
+    let mut encoder = ArithmeticEncoder::new();
+    let forced = larql_inference::layer_graph::generate::stream_forced_full_logits(
+        &mut rt.weights,
+        ids[0],
+        ids.len() - 1,
+        &rt.index,
+        rt.backend.as_ref(),
+        |step, logits| {
+            let target = ids[step + 1];
+            let counts = quantized_counts(logits).map_err(|e| format!("quantize logits: {e}"))?;
+            let (low, high) =
+                interval_for_symbol(&counts, target).map_err(|e| format!("interval: {e}"))?;
+            encoder.encode(low, high, FREQ_TOTAL);
+            pb.inc(1);
+            Ok(target)
+        },
+    )?;
+    pb.finish_and_clear();
+
+    let payload = encoder.finish();
+    let blob = ShannonFile {
+        // The vindex fast path is full-context within the GPU KV cache. Use
+        // u32::MAX so old CPU decode treats this as "effectively unlimited"
+        // for normal demo-sized files.
+        context: u32::MAX,
+        first_token: ids[0],
+        target_tokens: (ids.len() - 1) as u64,
+        original_bytes: text.len() as u64,
+        payload,
+    };
+    let bytes = blob.to_bytes();
+    fs::write(&args.out, &bytes)?;
+
+    let chars = text.chars().count().max(1) as f64;
+    println!("original:        {:>10} bytes", text.len());
+    println!("payload:         {:>10} bytes", blob.payload.len());
+    println!("file:            {:>10} bytes", bytes.len());
+    println!("tokens:          {:>10}", ids.len() - 1);
+    println!(
+        "ratio(payload):  {:>10.2}x",
+        text.len() as f64 / blob.payload.len().max(1) as f64
+    );
+    println!(
+        "bits/char:       {:>10.3}",
+        blob.payload.len() as f64 * 8.0 / chars
+    );
+    println!("prefill:         {:>10.1} ms", forced.prefill_ms);
+    if !forced.decode_ms.is_empty() {
+        let avg = forced.decode_ms.iter().sum::<f64>() / forced.decode_ms.len() as f64;
+        println!("decode avg:      {:>10.1} ms/token", avg);
+    }
+    println!("wrote: {}", args.out.display());
+    Ok(())
+}
+
+fn run_decode_vindex(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let vindex = args.vindex.as_ref().ok_or("--vindex missing")?;
+    let mut raw = Vec::new();
+    fs::File::open(&args.input)?.read_to_end(&mut raw)?;
+    let blob = ShannonFile::from_bytes(&raw)?;
+    let mut rt = load_vindex_runtime(vindex, args.metal)?;
+    let mut decoder = ArithmeticDecoder::new(&blob.payload);
+
+    eprintln!(
+        "decoding {} target tokens with KV-cached vindex...",
+        blob.target_tokens
+    );
+    let pb = progress_bar(blob.target_tokens, "decoding");
+    let forced = larql_inference::layer_graph::generate::stream_forced_full_logits(
+        &mut rt.weights,
+        blob.first_token,
+        blob.target_tokens as usize,
+        &rt.index,
+        rt.backend.as_ref(),
+        |_step, logits| {
+            let counts = quantized_counts(logits).map_err(|e| format!("quantize logits: {e}"))?;
+            let value = decoder.scaled_value(FREQ_TOTAL);
+            let (symbol, low, high) =
+                symbol_for_value(&counts, value).map_err(|e| format!("decode symbol: {e}"))?;
+            decoder.decode(low, high, FREQ_TOTAL);
+            pb.inc(1);
+            Ok(symbol)
+        },
+    )?;
+    pb.finish_and_clear();
+
+    let mut ids = Vec::with_capacity(forced.forced_tokens.len() + 1);
+    ids.push(blob.first_token);
+    ids.extend_from_slice(&forced.forced_tokens);
+    let text = rt
+        .tokenizer
+        .decode(&ids, true)
+        .map_err(|e| format!("decode error: {e}"))?;
+    fs::write(&args.out, text.as_bytes())?;
+    println!("decoded:         {:>10} bytes", text.len());
+    println!("expected:        {:>10} bytes", blob.original_bytes);
+    println!("prefill:         {:>10.1} ms", forced.prefill_ms);
+    if !forced.decode_ms.is_empty() {
+        let avg = forced.decode_ms.iter().sum::<f64>() / forced.decode_ms.len() as f64;
+        println!("decode avg:      {:>10.1} ms/token", avg);
+    }
     println!("wrote: {}", args.out.display());
     Ok(())
 }

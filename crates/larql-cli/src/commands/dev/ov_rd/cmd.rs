@@ -1,10 +1,12 @@
 use clap::{Args, Subcommand};
 
 use super::capture::{run_capture, CaptureArgs};
+use super::edit_catalog::{run_oracle_edit_catalog, OracleEditCatalogArgs};
 use super::oracle::{
     run_oracle_lowrank, run_oracle_roundtrip, OracleLowrankArgs, OracleRoundtripArgs,
 };
 use super::oracle_pq::{run_oracle_pq, OraclePqArgs};
+use super::pq_exception::{run_oracle_pq_exception, OraclePqExceptionArgs};
 use super::sanity::{run_sanity_check, SanityCheckArgs};
 use super::static_replace::{run_static_replace, StaticReplaceArgs};
 use super::zero_ablate::{run_zero_ablate, ZeroAblateArgs};
@@ -37,6 +39,12 @@ enum OvRdCommand {
 
     /// Oracle RD: oracle-addressed product quantization in PCA coordinates.
     OraclePq(OraclePqArgs),
+
+    /// Oracle RD: full residual-edit catalogues in hidden/PCA spaces.
+    OracleEditCatalog(OracleEditCatalogArgs),
+
+    /// Oracle RD: base PQ table plus oracle-addressed exception residuals.
+    OraclePqException(OraclePqExceptionArgs),
 }
 
 pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -48,5 +56,7 @@ pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
         OvRdCommand::OracleRoundtrip(roundtrip) => run_oracle_roundtrip(roundtrip),
         OvRdCommand::OracleLowrank(lowrank) => run_oracle_lowrank(lowrank),
         OvRdCommand::OraclePq(pq) => run_oracle_pq(pq),
+        OvRdCommand::OracleEditCatalog(edit_catalog) => run_oracle_edit_catalog(edit_catalog),
+        OvRdCommand::OraclePqException(exception) => run_oracle_pq_exception(exception),
     }
 }

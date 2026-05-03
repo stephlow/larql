@@ -7,7 +7,6 @@
 ///
 /// Requires:
 ///   - LARQL_MODEL env var pointing to a model path or HuggingFace ID
-///     (defaults to "google/gemma-3-4b-it")
 ///   - larql-experts pre-built for wasm32-wasip1
 ///
 /// Skip behaviour: any missing pre-condition prints a message and returns
@@ -22,8 +21,8 @@ use serde_json::{json, Value};
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
-fn model_id() -> String {
-    std::env::var("LARQL_MODEL").unwrap_or_else(|_| "google/gemma-3-4b-it".to_string())
+fn model_id() -> Option<String> {
+    std::env::var("LARQL_MODEL").ok()
 }
 
 fn wasm_dir() -> PathBuf {
@@ -98,6 +97,7 @@ No extra text."#;
 // ── Single test function ──────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "loads a real model; set LARQL_MODEL and run with --ignored"]
 fn llm_dispatch_pipeline() {
     // ── Pre-conditions ──
     if !wasm_dir().exists() {
@@ -105,7 +105,10 @@ fn llm_dispatch_pipeline() {
         return;
     }
 
-    let mid = model_id();
+    let Some(mid) = model_id() else {
+        eprintln!("skip: set LARQL_MODEL to run llm_dispatch_pipeline");
+        return;
+    };
     let model = match InferenceModel::load(&mid) {
         Ok(m) => m,
         Err(e) => {

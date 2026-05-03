@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
-fn model_id() -> String {
-    std::env::var("LARQL_MODEL").unwrap_or_else(|_| "google/gemma-3-4b-it".to_string())
+fn model_id() -> Option<String> {
+    std::env::var("LARQL_MODEL").ok()
 }
 
 fn wasm_dir() -> PathBuf {
@@ -277,13 +277,17 @@ fn system_for_model(mid: &str) -> &'static str {
 // ── Test ──────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "loads a real model and probe; set LARQL_MODEL and run with --ignored"]
 fn trie_dispatch_pipeline() {
     if !wasm_dir().exists() {
         eprintln!("skip: wasm dir missing");
         return;
     }
 
-    let mid = model_id();
+    let Some(mid) = model_id() else {
+        eprintln!("skip: set LARQL_MODEL to run trie_dispatch_pipeline");
+        return;
+    };
     let dirs = probe_search_dirs();
     let pp = match CascadeTrie::find(&mid, &dirs) {
         Some(p) => p,

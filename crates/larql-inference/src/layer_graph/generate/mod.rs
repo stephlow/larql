@@ -22,6 +22,7 @@ pub use eos::{EosConfig, BUILTIN_STOP_STRINGS, GENERATION_CONFIG_FILENAME};
 pub use gpu::{
     generate, generate_constrained, generate_constrained_streaming,
     generate_constrained_streaming_sampled, generate_streaming, generate_with_sampling,
+    stream_forced_full_logits, ForcedLogitsResult,
 };
 pub use lm_head::lm_head_topk;
 pub use sampling::{Sampler, SamplingConfig};

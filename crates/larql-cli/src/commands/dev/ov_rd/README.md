@@ -62,6 +62,8 @@ Keep Rust code here when it needs exact model/vindex behavior:
 - attention `pre_W_O` capture for fitting/statistics passes
 - `W_O`-visible projection and roundtrip checks
 - oracle low-rank and PQ reconstruction
+- direct residual-edit catalogue diagnostics
+- base-PQ-plus-exception residual catalogue diagnostics
 - Mode D residual-delta table materialization
 - final-logit KL/top-k evaluation through the real forward path
 - model-native discrete address probes whose inputs are already produced by a
@@ -146,6 +148,7 @@ capture.rs         stage-0 pre-W_O capture and head statistics
 input.rs           prompt loading, held-out splits, and CLI string parsers
 metrics.rs         KL, entropy, top-k, and distribution helpers
 oracle.rs          roundtrip and low-rank oracle checks
+edit_catalog.rs    full-vector residual-edit catalogue diagnostics in hidden/PCA space
 oracle_pq.rs       PQ experiment orchestration and address probe evaluation
 oracle_pq_address.rs
                   address-probe, previous-FFN feature-key, attention-relation-key,
@@ -161,6 +164,8 @@ oracle_pq_reports.rs
 oracle_pq_stability.rs
                   PQ code distribution stability diagnostics
 pq.rs              PQ codebooks, Mode D tables, and k-means mechanics
+pq_exception.rs    base-PQ-plus-exception residual catalogue diagnostics, with
+                  residual-error and prompt-KL tail selectors
 reports.rs         JSON artifact schemas
 runtime.rs         thin shim over inference Q4K tensor insertion/removal
 sanity.rs          no-op/subtract/residual-delta equivalence checks
