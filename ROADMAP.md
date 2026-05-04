@@ -1,638 +1,254 @@
 # LARQL Roadmap
 
-Top-level plan of record. Per-crate specifics live in
-`crates/<crate>/ROADMAP.md`; this file tracks user-visible features,
-the demo narrative, and cross-crate work.
-
-## Current state
-
-- **490 tests passing** across 14 suites, 0 build warnings.
-- **Primary CLI verbs** in place: `run`, `chat`, `pull`, `list`, `show`,
-  `rm`, `link`, `serve`. Legacy research commands under `larql dev
-  <subcmd>` with argv trampoline for backwards-compat.
-- **Dual cache** (HuggingFace hub + `~/.cache/larql/local/`) with
-  shorthand resolution (`larql run gemma3-4b-it-vindex …`).
-- **Remote FFN path (Phase 0 — dense):** `POST /v1/walk-ffn`
-  `full_output: true` returns hidden-size output vectors per layer;
-  `RemoteWalkBackend` in `larql-inference` drops into `predict_with_ffn`
-  unchanged; `larql run --ffn URL` + `larql serve --ffn-only` wire it
-  end-to-end. gRPC mirror also landed.
-- **Vindex size reductions:** `--compact` (drops
-  `up_weights.bin`/`down_weights.bin`), `--drop-gate-vectors` (rebuilds
-  gate from `interleaved_q4k.bin` at load), `--quant q4k` implies f16
-  on side-channel tensors. Combined: a new 31B q4k extract is **~22 GB
-  vs 52 GB before** (~60% smaller).
+Top-level plan. Per-crate detail lives in each crate's own `ROADMAP.md`.
+This file tracks the demo narrative, the critical path, and cross-crate sequencing.
 
 ---
 
-## P0 — Act 2 of the demo: "The experts live elsewhere"
+## Crate roadmaps
 
-### Phase 1 — MoE inference path (blocks Act 2)
-
-The whole Act 2 story is MoE-distributed.
-
-- [x] **Gemma 4 MoE architecture hooks** in
-  `crates/larql-models/src/architectures/gemma4.rs` — `is_hybrid_moe`,
-  `num_experts`, `num_experts_per_token`, `moe_router_key`,
-  `packed_experts_gate_up_key`, `packed_experts_down_key`, per-layer
-  norms (`pre_feedforward_layernorm_2`, `post_feedforward_layernorm_2`),
-  `moe_router_per_expert_scale_key`, `layer_scalar_key`.
-- [x] **CPU MoE forward pass** (`crates/larql-compute/src/cpu/ops/moe.rs`):
-  BF16 expert dequant, router softmax, top-K selection, per-expert
-  gated FFN (gate_proj + up_proj + SiLU + down_proj), weighted sum,
-  post-experts RMSNorm. Wired into `decode_token` via GPU/CPU interleave.
-- [x] **Metal decode with CPU MoE interleave** — GPU runs dense FFN per
-  layer, CPU reads `h_post_attn` (unified memory), runs MoE, adds
-  output to `new_h`. Layer scalar correctly applied only to the
-  combined FFN+MoE delta (`h_post_attn + scalar * (dense + moe)`),
-  not to the full residual.
-- [x] **Gemma 4 26B A4B coherent output** — first end-to-end working
-  Metal inference (2026-04-24). The four fixes that had to land together:
-    1. **Row-padded Q4_K/Q6_K storage** for matrices whose inner dim
-       isn't a multiple of 256 (26B A4B's dense `intermediate_size=2112`
-       → 8.25 super-blocks per row). Old extraction stored contiguously,
-       shader read wrong bytes for every `down_proj` row past 0. See
-       `pad_rows_to_256` in `crates/larql-vindex/src/format/weights/write.rs`
-       + `inter_padded` dispatch in `metal/decode/mod.rs`.
-    2. **Parameter-free router RMSNorm** — HF's `Gemma4TextRouter.norm`
-       is `with_scale=False` (no tensor on disk). Added arch trait
-       `moe_router_norm_parameter_free()` and the `rms_norm_no_weight`
-       branch in `cpu/ops/moe/forward.rs`.
-    3. **Outer `post_feedforward_layernorm.weight`** (un-suffixed)
-       extracted + applied to `(h1 + h2)` before the residual add —
-       distinct from the `_1` dense-branch norm.
-    4. **`layer_scalar` scales the whole layer output** (`new_h *=
-       layer_scalar`) not the FFN delta — matches HF's final
-       `hidden_states *= self.layer_scalar` in `DecoderLayer.forward`.
-  Validated end-to-end by residual-diff against HF bf16 (see
-  Correctness infrastructure below): L0 `layer_out` cos improved from
-  0.7018 → 0.9998; L29 cos from −0.27 → 0.93.
-- [ ] **Batched MoE prefill** — current MoE prefill uses token-by-token
-  `decode_token` calls (correct, but O(seq_len) serial GPU dispatches
-  per layer). Replace with a batched prefill that processes all prompt
-  positions in one pass, interleaving GPU dense FFN and CPU MoE at each
-  layer. See `crates/larql-compute/src/metal/trait_impl.rs::prefill_q4`
-  and `full_pipeline.rs::dispatch_full_pipeline`.
-- [ ] **Fix `dispatch_full_pipeline` layer_scalar** — currently scales
-  the full residual including `h_post_attn` instead of applying
-  `new_h *= layer_scalar` at the end of the layer (HF-accurate). The
-  decode path now does this correctly via `apply_whole_layer_scalar`
-  in `metal/decode/moe_combine.rs`; prefill path (only matters for
-  seq_len>1 with non-MoE `layer_scalar` models) still needs the same.
-- [ ] **Chat-template-aware prompting** — 26B A4B is instruct-tuned
-  and answers trivia confidently only via the chat template. On raw
-  prompts it wanders (HF top-1 on "The capital of France is" is
-  `' CAP'`, not `' Paris'`). The architecture regression test now
-  asserts against what HF actually produces, but the `run` CLI should
-  auto-apply the template for IT models — see P1 "Chat template" below.
-- [ ] **MoE-aware forward pass on CPU path** — `predict_q4k` /
-  `WeightFfn::forward` has no MoE. The non-Metal CPU path produces
-  wrong output on Gemma 4 26B. Wire `cpu_moe_forward` into
-  `larql-inference/src/forward/layer.rs`.
-- [ ] Wire `RouterIndex` (already exists at
-  `crates/larql-vindex/src/index/router.rs`) into the client-side
-  forward pass so the router runs locally.
-
-### Phase 2 — Remote expert protocol (Act 2 wire format)
-
-- [ ] `POST /v1/expert/{layer}/{expert_id}` — input residual, output
-  residual delta (hidden-size).
-- [ ] `POST /v1/expert/batch` — list of `{layer, expert_id, residual}`,
-  returns list of deltas. Collapses a layer's K experts into one HTTP
-  round trip per server.
-- [ ] `--experts 0-31` flag on `larql serve` — load + serve a subset
-  of expert IDs so experts can be sharded across machines.
-- [ ] `RemoteExpertBackend` in `larql-inference` — MoE-path analog of
-  `RemoteWalkBackend`. Handles the sharding map (expert ID range →
-  URL), parallel per-layer dispatch, per-expert error handling.
-
-### Phase 3 — LQL / CLI ergonomics
-
-- [ ] `USE "..." WALK ONLY WITH EXPERTS REMOTE { "range": "url", ... };`
-  grammar. Extend `crates/larql-lql/src/parser/lifecycle.rs` + executor.
-- [ ] `RESHARD EXPERTS { ... };` statement for live redistribution
-  (for the "kill one shard, rewire on the fly" proof shot).
-- [ ] `larql run --experts '0-31=URL1,32-63=URL2'` CLI flag (MoE
-  counterpart to `--ffn`).
-
-### Phase 4 — Data prep
-
-- [ ] `larql slice <vindex> --parts attn,embed,norms,router,index,tokenizer`
-  (new subcommand) — carve an attention-only / router-only vindex out
-  of a full one without re-extracting from the source model.
-
-### Phase 5 — Deferred until film
-
-- [ ] GPU attention on the client side. `run_attention_block_gpu`
-  already exists in `crates/larql-inference/src/attention/gpu.rs` but
-  isn't the default path in `forward/layer.rs`. Wire Metal/CUDA into
-  the walk-only forward pass so client-side attention runs on GPU
-  while FFN/experts go remote.
+| Crate | Owns |
+|---|---|
+| [larql-compute](crates/larql-compute/ROADMAP.md) | Metal GPU kernels, MoE prefill, platform expansion |
+| [larql-inference](crates/larql-inference/ROADMAP.md) | Forward pass, generation quality, KV engines |
+| [larql-server](crates/larql-server/ROADMAP.md) | HTTP API, gRPC grid, remote expert protocol |
+| [larql-cli](crates/larql-cli/ROADMAP.md) | CLI UX, sampling flags, streaming display |
+| [larql-lql](crates/larql-lql/ROADMAP.md) | LQL grammar, INSERT/SELECT/USE extensions |
+| [larql-core](crates/larql-core/ROADMAP.md) | Graph data model, algorithms, serialization |
+| [larql-vindex](crates/larql-vindex/ROADMAP.md) | Vindex format, storage, extraction |
+| [larql-models](crates/larql-models/ROADMAP.md) | Architecture definitions, model loading |
 
 ---
 
-## P1 — Generation UX (chat template, sampling, stopping)
+## Current state (2026-05-02)
 
-The current `larql run` output loops ("ParisatthecapitalofFranceis...") because
-three standard inference features are missing. All are independent and any one
-improves the experience.
+- **2,000+ tests passing** across the workspace, 0 build warnings.
+- **Primary CLI verbs** in place: `run`, `chat`, `pull`, `list`, `show`, `rm`, `link`, `serve`, `bench`.
+- **Gemma 3 4B Metal**: **83–84 tok/s** (Ollama steady: 98.5–99.7). **Gap: 1.18×** (was 1.30× before the 2026-05-02 dispatch-geometry fix).
+- **Gemma 4 26B A4B Metal**: **19.4 tok/s** (was 5.1 — bug-locked under the same dispatch-geometry mismatch; correct multilingual output now).
+- **Grid (CPU MoE on remote shards)**: 18.3 tok/s 1-shard / 17.3 tok/s 2-shard local-loopback, both with parallel collect (`std::thread::scope`) and parallel fire (`rayon::par_iter`). Multi-host LAN/cross-region scaling unblocked by F-COLLECT in `crates/larql-server/ROADMAP.md`.
+- **Remote FFN (dense)**: `larql run --ffn URL` + `larql serve --ffn-only` wired end-to-end.
+- **gRPC grid**: 2-shard self-assembling grid live-validated on 26B A4B.
+- **4 KV-cache engines**: MarkovRS (287×), UnlimitedContext (254×), TurboQuant (4×), Apollo (20,000×) — all at ~95 tok/s on Gemma 3 4B Metal.
 
-### Chat template
-**Status**: Not started
-**Impact**: High — instruction-tuned models (Gemma 3/4 IT, Mistral-Instruct)
-loop or produce garbage without their expected prompt format.
+---
 
-`larql run` sends raw text to the model. IT models expect a structured
-turn format, e.g. Gemma 4:
+## Demo narrative
+
+### Act 1 — "The model is the database"
+Run Gemma 3 4B or 4 26B locally. The vindex is the model; `larql run` queries it.
+Show: latency, footprint, `larql walk` tracing a fact through layers.
+
+**Status**: Works end-to-end. Needs chat-template + EOS fix so it doesn't loop.
+
+### Act 2 — "The experts live elsewhere"
+Split a MoE model across machines. Client holds attention weights; each shard
+holds a subset of expert IDs. The forward pass fans out to shards per token.
+
+**Status**: Server-side grid works. Missing: remote expert endpoints (`/v1/expert/*`),
+`RemoteExpertBackend` client, chat-template-aware prompting.
+
+### Act 3 — "Replace an expert"
+Swap expert 42 at layer 18 for a custom one. Observe the model's behaviour change.
+
+**Status**: Expert ID selection TBD. Requires Act 2 first.
+
+---
+
+## P0 — Mechanistic surface (lazarus parity)
+
+Driver: replace the chuk-mlx engine in `chuk-mcp-lazarus` with larql. Lazarus
+exposes ~77 inference-time MCP tools (capture, ablate, patch, steer, probe,
+DLA, KV-surgery). Larql is currently strong on weight-level edits (MEMIT, KNN,
+LQL) and weak on inference-time inspection/intervention. The 77 tools collapse
+to one missing primitive: a **programmatic forward-hook system**. Once that
+lands the rest is mostly Python wrappers.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| M1 | `LayerHook` trait + CPU plumbing (read + write) | larql-inference | shipped |
+| M2 | `RecordHook`, `ZeroAblateHook`, `SteerHook`, `CompositeHook` | larql-inference | shipped |
+| M3 | Activation patching (cross-prompt residual swap) | larql-inference | shipped |
+| M4 | Full logit lens — `logit_lens_topk`, `track_token`, `track_race` | larql-inference | shipped |
+| M5 | `KvCache::{get_layer, set_layer, clear_layer, clone_layer_from, clone_layer_position_range}` | larql-inference | shipped |
+| M6 | Hooks during multi-token generation (`generate_cached_hooked` on CPU; Metal `generate` stays fast by design) | larql-inference | shipped |
+| M7 | `W_E` / `W_U` + `embedding_neighbors` + `project_through_unembed` | larql-inference | shipped |
+| M8 | pyo3 `PyWalkModel` mech-interp methods (capture / ablate / steer / patch / lens / generate_with_hooks) | larql-python | shipped |
+
+Detail in `larql-inference/ROADMAP.md` § Mechanistic hooks (lazarus parity).
+
+---
+
+## P0 — Best-in-class mechanistic interpretability engine
+
+Driver: make LARQL's executed mechanisms queryable, attributable, patchable,
+and reproducible. This is the layer above lazarus parity: not just hooks, but
+evidence-grade traces and causal operators over the actual vindex-backed
+inference path.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| MI0 | Faithful residual DAG: TRACE uses the canonical layer runner and pins additive reconstruction | larql-inference | shipped |
+| MI1 | Python `WalkModel.trace()` / `patch_activations()` use `WalkFfn` instead of dense fallback | larql-python + larql-inference | shipped |
+| MI2 | Backend-parametric donor capture and activation patching | larql-inference | shipped |
+| MI3 | Strict trace artifacts: complete ordered chains, exact file length, `TRACE SAVE` requires `POSITIONS ALL` | larql-inference + larql-lql | shipped |
+| MI4 | Golden parity: TRACE final residual/logits match canonical forward; extend to WalkFfn, patched vindex, Q4K, MoE | larql-inference | partial — dense/custom backend pinned |
+| MI5 | Rich attribution objects: attention-head writes, FFN feature activations, router/expert decisions, provenance | larql-inference + larql-python | planned |
+| MI6 | Causal operators beyond residual replacement: head/feature/router/expert/KV patching | larql-inference + larql-python | planned |
+| MI7 | Q4K/MoE trace and patch parity with explicit precision caveats | larql-inference + larql-vindex | planned |
+| MI8 | Python experiment ergonomics: batched prompts, donor/recipient alignment, causal metrics, reproducibility metadata | larql-python | planned |
+
+Near-term order: finish MI4 parity coverage, then add attribution records where
+the forward path already exposes data, then expand patching operators one
+mechanism at a time.
+
+---
+
+## P1 — Research stack promotion: OV/RD → engine primitives
+
+Driver: make LARQL one of the strongest practical mechanistic
+interpretability stacks by promoting reusable experiment plumbing into
+stable engine APIs, while leaving fast-moving hypotheses in
+`larql dev ov-rd` and Python artifact analysis.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| R1 | Promote Q4K per-layer tensor insertion/removal from `ov_rd` into `larql-inference::vindex` | larql-inference | shipped |
+| R2 | Add Q4K hidden forward with `LayerHook`/intervention support | larql-inference | shipped |
+| R3 | Add pre-W_O capture/replacement hook adapters so experiments stop manually driving full layer loops | larql-inference | shipped |
+| R4 | Define a compact research trace artifact contract for prompt ids, tokens, layer inputs, pre-W_O rows, oracle codes, logits, and metrics | larql-inference + larql-cli | planned |
+| R5 | Keep PQ/address/codebook experiments in `larql dev ov-rd`; move only stable runtime contracts into engines | larql-cli | ongoing |
+
+Rule of thumb: engine code owns reusable capture/intervention/runtime
+primitives; `ov_rd` owns experiment orchestration, PQ variants, address
+probes, and report schemas until a runtime contract survives repeated
+experiments.
+
+---
+
+## P0 — Interpretability truthfulness + commit semantics
+
+Driver: make the current edit model honest before the demo, then earn the
+stronger "INSERT commits into weights" story. Today default `INSERT MODE KNN`
+is a retrieval overlay persisted in `knn_store.bin`; `COMPILE INTO VINDEX`
+bakes compose/MEMIT overlays but carries that KNN sidecar forward. That is a
+snapshot/package operation, not a mechanical commit of the journal into FFN
+features.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| T1 | Tag KNN overrides visibly in `INFER`, `EXPLAIN INFER`, and `TRACE` as post-logits retrieval events, including the model's unoverridden top-1 | larql-lql + larql-inference | planned |
+| T2 | Fix decomposed `TRACE` to route through the shared layer sequence, including PLE/layer-scalar deltas or equivalent captured intermediates | larql-inference | shipped |
+| T3 | Make Python `WalkModel.trace()` use the vindex `WalkFfn`/patch overlay rather than dense `WeightFfn` | larql-python + larql-inference | shipped |
+| T4 | Replace gate-KNN absolute-dot feature ranking in interpretability displays with post-activation magnitude, or filter ghost negative gates after activation | larql-vindex + larql-inference | planned |
+| T5 | Fix L1 FFN cache activation capture: cache activations with outputs or bypass cache when activations are requested | larql-inference | planned |
+| T6 | Rename residual-capture embedding-neighbor fields (`top_token`) or add separate true logit-lens fields | larql-inference + larql-models | planned |
+| T7 | Pin TRACE evidence with final residual/logit parity tests across dense, custom backend, WalkFfn, patched vindex, Q4K, and MoE paths | larql-inference | partial |
+| C1 | Add explicit compile modes: default commit/materialize semantics vs `SNAPSHOT` preserving `knn_store.bin` | larql-lql + larql-vindex | design |
+| C2 | Implement KNN materialization by lowering retrieval entries into compose/MEMIT/FFN edits, then dropping or marking committed sidecar entries | larql-lql + larql-vindex + larql-inference | planned |
+| C3 | Add acceptance tests: session KNN equivalence, trace conversion, and generalization beyond stored prompts | larql-lql + larql-inference | planned |
+
+Acceptance target for materialization:
+
+```text
+INFER(session_with_knn, q) == INFER(materialized_vindex, q)
 ```
-<start_of_turn>user
-The capital of France is<end_of_turn>
-<start_of_turn>model
-```
-Without it, the model sees a bare continuation task and loops greedily.
 
-Fix: read `tokenizer_config.json` from the vindex (already present for
-HF-extracted models — lives next to `config.json`). Parse the
-`chat_template` Jinja field. Apply it in `larql run` before tokenising.
-`minijinja` crate is the standard Rust choice. `larql chat` should always
-apply the template; `larql run` can expose `--no-chat-template` for raw use.
+for affected canonical prompts, plus a stronger trace/generalization check:
+session trace reports pending retrieval; materialized trace shows residual/FFN
+evidence; nearby unstored prompts behave through the materialized edit rather
+than through a lookup sidecar.
 
-### EOS detection and stop strings
-**Status**: Partial — `generate.rs` checks for `<eos>`, `</s>`,
-`<|endoftext|>` but Gemma 4 uses `<end_of_turn>` which is not in that list.
-**Impact**: High — without EOS stopping, greedy decode runs to `--max-tokens`.
-
-Fix: read `eos_token_id` (and `eos_token_ids` list) from `config.json`;
-also read `stop_strings` from `generation_config.json` (Gemma 4 lists
-`<end_of_turn>` there). Check decoded token string + token ID at every
-step in `generate.rs`. `run_cmd.rs` could expose `--stop STRING` for
-overrides.
-
-### Token spacing / detokenisation display
-**Status**: Not started
-**Impact**: Medium — "Paris at the capital..." prints as "Parisatthecapital".
-
-HuggingFace tokenizers use a leading-space convention (`▁Paris`) — the
-`tokenizers` crate's `decode` already handles this when
-`skip_special_tokens = true`. The bug is likely that `tokenizer.decode`
-is called per-token with `false` (keeps `▁` prefix stripped) instead of
-accumulating and decoding the full sequence, or that `trim()` is stripping
-the leading space. Fix in `generate.rs` decode loop: `decode(&[tid], false)`
-and keep the raw string; only trim the very first token.
-
-### Sampling (temperature / top-p / top-k)
-**Status**: Not started
-**Impact**: Medium for quality, needed for non-deterministic output.
-
-Current path is always greedy (argmax). Add `--temperature F`, `--top-p F`,
-`--top-k N` flags to `run_cmd.rs`. Sampling happens after the lm_head
-scores are computed in `generate.rs` — no GPU changes required.
-
-### Repetition penalty
-**Status**: Not started
-**Impact**: Medium — practical fix for the greedy looping problem without
-requiring a full chat template. Useful for raw-prompt (`larql run`) and
-base models where no chat template exists.
-
-Add `--repetition-penalty F` (default 1.0 = off). Before argmax / sampling,
-divide each token's logit by the penalty if that token appears in the
-recently generated window. Standard implementation: logit ÷ penalty for
-tokens in the last N generated positions. No GPU changes required — purely
-a logits post-processing step in `generate.rs`.
-
-### Multi-turn conversation state
-**Status**: Not started — `larql chat` resets KV cache per turn today.
-**Impact**: High — "chat" implies the model remembers what it said. Without
-this, each line in chat mode is an independent cold-start forward pass.
-
-Fix: maintain a running `token_ids` buffer across turns in `run_cmd.rs`.
-After each model response, append the response token IDs to the buffer
-before the next user turn. Wrap each turn pair in the chat template
-(`<start_of_turn>user … model …`) incrementally. Pass the full buffer
-to `generate()` so the KV cache grows across turns. Expose `--max-context N`
-to bound memory (evict oldest turns when the context window fills).
-
-### Token streaming
-
-### Long context / dynamic KV cache
-**Status**: Hard-capped at 4096 tokens today.
-**Impact**: High — Gemma 4's headline feature is 1M context. 4096 is a
-non-starter for long conversations and the demo's "database" framing.
-
-Two parts:
-1. **Configurable max** — expose `--max-context N` (default 8192).
-   `KVCache::new_per_layer` already takes `max_seq`; thread `N` through
-   `prefill_q4` / `decode_token` call sites in `generate.rs`.
-2. **Dynamic growth** — when `current_len` reaches `max_seq`, either
-   evict the oldest window (sliding, already implemented as
-   `--kv-cache markov-bounded`) or double the buffer. The Metal KV
-   cache buffers are pre-allocated; growth requires a realloc + copy on
-   the GPU side. A simpler interim: warn and truncate at `max_seq`,
-   document as a known limit.
-**Status**: Not started
-**Impact**: High for UX — without streaming, the CLI is silent until all
-`--max-tokens` are done. A 64-token run on Gemma 4 26B takes ~10s with no
-output; streaming makes it feel interactive immediately.
-
-Fix: `generate.rs` currently collects tokens into a `Vec` and returns.
-Change to accept a `on_token: impl FnMut(&str, f64)` callback (or a
-`std::sync::mpsc::Sender`). In `run_cmd.rs`, the callback prints each token
-to stdout and flushes. The `larql serve` OpenAI-compatible path (`/v1/chat/completions`
-with `stream: true`) would use SSE chunks from the same callback.
-Chat mode in `run_cmd.rs` already flushes stdout per turn — streaming
-just moves the flush inside the generate loop.
-
-### OpenAI-compatible `/v1/chat/completions`
-**Status**: Not started — `larql serve` has custom endpoints but no
-OpenAI-compatible chat surface.
-**Impact**: High for adoption — makes LARQL a drop-in backend for
-Continue.dev, Open WebUI, LiteLLM, and any tool that speaks the
-OpenAI API. The "you can do this too" demo moment needs a working URL.
-
-With chat template + streaming landing, this is largely wiring:
-- `POST /v1/chat/completions` — accept `{model, messages, stream,
-  temperature, max_tokens}`, apply the model's chat template to the
-  `messages` array, call `generate()`, return `ChatCompletionResponse`
-  (non-stream) or SSE `data: {"choices":[{"delta":...}]}` chunks (stream).
-- `GET /v1/models` — return the loaded vindex name so clients can
-  enumerate available models.
-- Wire into `larql-server/src/routes/` alongside the existing endpoints.
-
-### Auto-extract on `larql run hf://`
-**Status**: Not started.
-**Impact**: High for adoption — the current flow is `larql extract` →
-`larql link` → `larql run`. Three commands before inference starts.
-The "you can do this too" moment needs one.
-
-Fix: in `cache::resolve_model`, if the shorthand looks like `hf://owner/name`
-and no cached vindex matches, offer to run `larql extract` inline
-(with a confirmation prompt or `--yes` flag). Download the safetensors
-from HuggingFace, stream-extract to a temp directory, move to the
-local cache, then proceed with inference. Re-uses the existing
-`larql extract` pipeline — the new code is only in the cache resolver
-and a progress display wrapper.
-
-### Gemma 3 4B regression smoke test
-**Status**: Not started — no CI check verifies correctness after
-compute / inference changes.
-**Impact**: Medium — after the MoE and layer_scalar changes, nothing
-formally verifies Gemma 3 4B still produces "Paris" at expected
-probability. One bad merge could silently break the most-used model.
-
-Fix: add a `tests/integration/` test (or `larql-cli` example) that
-loads `gemma3-4b-q4k-streaming` (already in the local cache), runs
-`larql run "The capital of France is" -n 1 --metal`, and asserts the
-first token is "Paris". Gate on `CI_INTEGRATION=1` so it doesn't run
-on every PR but does run before release branches.
+Until C1-C3 ship, video language should distinguish three mechanisms:
+KNN journal/retrieval overlay, compose FFN overlay, and compiled/baked weights.
 
 ---
 
-## P1 — Autoregressive generation quality
+## P1 — Model architecture independence hardening
 
-### CPU KV cache for autoregressive generation — **SHIPPED**
+Driver: keep LARQL from becoming "Gemma-shaped with exceptions." The core
+`ModelArchitecture` trait is the right boundary, but several production paths
+still infer family from strings, pass scalar attention geometry through
+per-layer pipelines, or advertise architectures whose extraction/inference
+contracts are incomplete.
 
-Two-phase autoregressive decoder in `larql-inference/src/forward/kv_generate.rs`:
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| AI1 | Gate supported architecture families by executable contracts: extraction, vindex weight writing, forward/decode, trace, and prompt rendering | larql-models + larql-vindex + larql-inference | planned |
+| AI2 | Implement or explicitly reject MLA architectures in vindex writers and inference; DeepSeek is detected today but `mla_*` tensors are not consumed outside `larql-models` | larql-models + larql-vindex + larql-inference | planned |
+| AI3 | Remove scalar attention-geometry fallbacks from backend decode APIs; allocate KV/cache/scratch from `FullPipelineLayer` per-layer shapes everywhere | larql-compute + larql-inference | planned |
+| AI4 | Replace vector-only extraction's model-name family guesses with explicit metadata or validated architecture input | larql-vindex | planned |
+| AI5 | Roll validated loading/detection through inference, extraction, CLI, and server entry points where missing config should fail fast | larql-models consumers | planned |
+| AI6 | Harden vindex extraction/write paths with explicit capability gates, named manifest/tensor tags, and tests proving unsupported attention layouts fail before writing partial indexes | larql-vindex + larql-models | next |
 
-- **Prefill** uses `run_attention_with_kv` to capture post-RoPE K and
-  post-V-norm V per layer into a `KvCache`.
-- **Decode** step in `crates/larql-inference/src/attention/decode.rs`:
-  `run_attention_block_decode_step` takes the new token's hidden +
-  the layer's existing cache, computes Q/K/V for just that row with
-  `apply_rope_partial_at(position=cached_len)`, concatenates the new
-  K/V onto the cache, runs `gqa_attention_decode_step` (O(cached_len)
-  per head), returns updated cache.
-
-Backend-agnostic via `FfnBackend` — works with `WalkFfn` (local) and
-`RemoteWalkBackend` (FFN over HTTP). Measured on Gemma 3 4B f32:
-
-- **Local, no cache (before):** ~1.2 s per decode step, O(N²) growing
-- **Local, KV-cached (now):** ~0.6 s/token steady
-- **Remote FFN, KV-cached (now):** ~0.5-0.6 s/token steady — same
-  protocol as the no-cache version, just many fewer tokens re-shipped
-
-Limitations:
-- Skips Gemma 4 E2B per-layer embeddings (PLE) and layer-scalar
-  application in the decode loop. Fine for Gemma 3. For full
-  Gemma 4 correctness wire `apply_per_layer_embedding` + `apply_layer_scalar`
-  into `generate_cached`'s decode layer.
-- Q4K CPU path still uses its own no-cache loop (`run_q4k_generate_cpu`).
-  Q4K + Metal shader `generate()` remains the fast Q4K path.
-
-### KV cache strategy selector — **SHIPPED (partial)**
-
-`larql run --kv-cache <strategy>` selects how past-token state is kept:
-
-- `standard` *(default)* — full FP32 K/V, unbounded. Shipped.
-- `markov-bounded` — sliding window (StreamingLLM-style). Shipped.
-  Pass `--context-window N` for the window size. Older tokens drop
-  off; memory stays O(window) regardless of generation length.
-- `none` — re-run full forward per decode step. O(N²). Shipped as
-  correctness fallback.
-
-Not yet wired into the live decode path (all in `crates/kv-cache-benchmark/`):
-
-- `markov-full` — active residual window + cold-tier reconstruction
-  via checkpoint layers. Compressed storage via residuals not K/V.
-  See `crates/kv-cache-benchmark/src/markov_residual/`. Needs a
-  reconstruction primitive that rehydrates K/V for cold-tier
-  positions from `token_ids + checkpoint_residual`.
-- `turboquant` — per-tensor Q4/Q8 compression of cached K/V. See
-  `crates/kv-cache-benchmark/src/turboquant/`. Needs per-step
-  quantize/dequantize around the cache append.
-- `graph-walk` — experimental, unclear production viability.
-
-### Shader attention + remote FFN
-
-### Metal speedup for non-Q4K decode
-
-**Status:** backend is auto-detected and threaded through
-`generate_cached_backend`, but in practice **single-token decode
-matmuls stay on CPU** because they fall below the Metal backend's
-calibrated FLOP threshold (~500M). Per-layer projections on 4B are
-only 5-7M FLOP each — far under the break-even point where GPU
-dispatch overhead is worth paying.
-
-**What this means today:**
-- `larql run` on f16/f32 vindexes uses CPU BLAS projections regardless
-  of `--metal` availability. The KV cache is still the decisive win
-  (~6× speedup vs no-cache).
-- `larql run --metal` on a **Q4K vindex** routes to
-  `larql_inference::layer_graph::generate` (the shader
-  `full_pipeline_q4` — all layers fused in one command buffer, KV-
-  cached decode on GPU). This is the real GPU path.
-
-**What would actually win on f16/f32:**
-1. **Fused f16 full_pipeline shader** — same structure as Q4K's
-   `full_pipeline` but with f16 weights. Multi-day shader work.
-2. **Batched / speculative decode** — emit N tokens per forward pass
-   (draft model, Medusa heads, or speculative sampling). N×M FLOP
-   per matmul would clear the threshold. Compatible with remote FFN
-   if the batching happens client-side.
-
-See `crates/larql-compute/benches/{linalg,matmul}.rs` and the
-many `crates/larql-compute/examples/profile_*.rs` for the measured
-GPU-vs-CPU break-even curves — the threshold isn't arbitrary.
-
-### Shader attention + remote FFN (Act 2 endgame)
-
-Q4K + Metal + remote FFN — the ultimate Act 2 configuration. The
-shader pipeline (`full_pipeline_q4` / `decode_token`) currently
-dispatches attention AND FFN as fused GPU kernels reading from the
-Q4K mmap. For remote FFN we'd need to decompose per-layer into:
-attention-only GPU kernel → copy residual to host → HTTP round trip
-→ copy FFN output back to GPU → next layer's attention. Per-layer
-host+network hop kills throughput unless we batch across layers or
-use async pipelining.
-
-Worth doing for the Act 2 demo but non-trivial. See
-`larql-inference/src/layer_graph/{generate,pipeline_layer,prefill}.rs`
-— the fused paths need splitting at the attention/FFN seam.
-
-## P1 — Loose ends in shipped features
-
-### `--compact` loader reconstruction — WalkFfn-only today
-
-`larql extract --compact` drops `up_weights.bin` + `down_weights.bin`
-from the extract. `WalkFfn` (the production inference path) works fine
-— it reads feature-major `{up,down}_features.bin` directly. The dense
-ground-truth path (`WeightFfn`, used by `larql dev walk --compare` for
-validation) panics with a clear message.
-
-**Why deferred.** The naive fix is to reconstitute
-`Array2<f32>` tensors in `ModelWeights.tensors` at load time. For
-`down_proj` this requires a transpose (feature-major `[intermediate,
-hidden]` → safetensors `[hidden, intermediate]`) which means an owned
-copy — **~27 GB of extra heap on 31B**, not viable.
-
-**Proper fix.** Refactor `WeightFfn::forward` (or `ModelWeights`) to
-accept feature-major views and pass the transpose flag through to BLAS
-gemm. Cross-cutting change: `crates/larql-inference/src/ffn/weight.rs`,
-`crates/larql-inference/src/model.rs`, and the `dot_proj` helpers. ~1
-focused session.
-
-**Impact.** Unblocks `--compact --compare` for validation workflows.
-Does not affect `larql run` or the demo.
-
-### MoE compact mode — refused today
-
-`larql extract --compact` on an MoE architecture refuses with:
-> *"ffn_compact not yet supported for MoE architectures — per-expert
-> feature-major files don't exist yet"*
-
-**Why deferred.** Two blockers:
-
-1. **Router lives in `up_weights.bin`.** The MoE write path stuffs
-   per-expert up weights *and* the router matrix together into
-   `up_weights.bin`. Skipping that file loses the router, so the model
-   can't dispatch to experts at all. Fix: split the router into its
-   own file (`router_weights.bin` already exists as the intended home
-   — see `crates/larql-vindex/src/index/router.rs`).
-2. **No per-expert feature-major files.** `up_features.bin` /
-   `down_features.bin` are single-matrix-per-layer. MoE-compact would
-   need per-expert equivalents (~N× the file count or a new layout),
-   plus a tool that produces them. No consumer exists yet.
-
-**When to do it.** Pairs naturally with Phase 1 (MoE inference path)
-and Phase 2 (per-expert server endpoint). Building those requires a
-per-expert-addressable storage layout anyway; compact-MoE falls out of
-it.
-
-### `larql dev walk --compact` compatibility
-
-`larql dev walk --compare` against a `--compact` vindex panics (see
-above). The panic message points at `WalkFfn` but doesn't explain
-`--compare` is the specific operation that's blocked. Improve the
-error or disable the `--compare` flag at arg-parse time when the
-target vindex is compact.
-
-### Cross-vindex dedup (tokenizer, down_meta)
-
-Tokenizer (~32 MB) and `down_meta.bin` (~30 MB) are identical across
-different-precision extracts of the same base model. With ~7 linked
-vindexes in the local cache that's ~200 MB of duplicate data. Low
-priority — worth doing as a content-addressed store if the cache
-grows, otherwise skip.
+Acceptance target: adding a new transformer architecture should require changes
+inside `larql-models::architectures/*` and explicit capability decisions at
+storage/forward boundaries, not incidental string matches or hidden Gemma/Llama
+defaults in extraction and decode.
 
 ---
 
-## P2 — Demo production
+## Critical path (P0 — what blocks the demo)
 
-### Pre-film checklist for the Gemma 4 MoE video
+Items in order. Each depends on the one above it.
 
-- [ ] Confirm Gemma 4 26B A4B config once the model card is public:
-  expert count per layer, top-K, exact active-param figure, GQA ratio.
-  Every `~` figure in `docs/demo-script-gemma4-moe.md` needs a real
-  number before recording.
-- [ ] Measure real footprint + latency on `google/gemma-4-31b-it` for
-  Act 1. Replace every `~` in the Act 1 section.
-- [ ] Reliability pass on `RemoteWalkBackend` (timeouts, retries,
-  mid-layer failure, partial shard outage). A hung HTTP call during
-  recording kills the take.
-- [ ] `RemoteExpertBackend` (doesn't exist yet — see Phase 2) same
-  pass.
-- [ ] Decide the repo-public date. `cargo install larql-cli && larql
-  serve` should be live the week the video drops so "you can do this
-  too" lands with a working command.
-- [ ] Pick expert IDs for the Video 3 teaser swap — one that fires on
-  medical prompts, one that doesn't — so the "replace expert 42 at
-  layer 18" shot lands concretely.
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| 1 | Chat template + EOS stop | larql-inference + larql-cli | not started |
+| 2 | Token streaming | larql-inference + larql-cli | not started |
+| 3 | **Per-layer FFN format** (`layers/`, GPU dispatch) Phase 2: pre-alloc buffers | larql-vindex + larql-compute | shipped — `MoeScratch` pre-allocates once per decode call; combined with the 2026-05-02 dispatch-geometry fix, 26B A4B Metal now runs at **19.4 tok/s** (was bug-locked at 5.1) |
+| 4 | MoE-aware CPU forward pass (non-Metal fallback) | larql-inference | not started |
+| 5 | Wire `RouterIndex` client-side | larql-inference | not started |
+| 6 | `POST /v1/expert/{layer}/{expert_id}` | larql-server | not started |
+| 7 | `POST /v1/expert/batch` | larql-server | not started |
+| 8 | `--experts 0-31` flag on `larql serve` | larql-server | not started |
+| 9 | `RemoteExpertBackend` client | larql-inference | not started |
+| 10 | Reliability pass (timeouts, retries) | larql-server | not started |
 
-### Memory-footprint `--ffn-only` on the server
-
-`larql serve --ffn-only` today is an operating-mode declaration — it
-disables `/v1/infer`, advertises `mode: ffn-service` in `/v1/stats`,
-but still loads full `ModelWeights` into RAM. A real FFN-service
-doesn't need attention weights resident.
-
-Add `load_model_weights_ffn_only` to `larql-vindex` that skips
-attention tensors on the server side. Payoff: serve an MoE without
-the attention weights taking a third of RAM.
+Items 1–2 are needed for Act 1. Item 3's MoE performance gate landed
+2026-05-02: 26B A4B Metal now runs at 19.4 tok/s (was 5.1, bug-locked
+under the dispatch-geometry mismatch in `moe_dispatch.rs`). SKIP_MOE
+ceiling 56.8 tok/s — remaining headroom is real expert-dispatch work,
+not allocation. Items 4–10 are needed for Act 2. See
+`larql-vindex/ROADMAP.md P0` and `larql-server/ROADMAP.md` (F-COLLECT,
+F-LOCAL-MOE, G-SCALE) for the next levers.
 
 ---
 
-## Done (ship log)
+## P1 — Generation UX (parallel to critical path)
 
-### Gemma 4 26B A4B end-to-end correctness (2026-04-24)
-Closed four independent gaps that together produced garbage output on
-the hybrid-MoE 26B A4B model; aligned non-MoE models (Gemma 3 4B,
-Gemma 4 31B, Mistral 7B) were unaffected and continue to pass. See
-`crates/larql-compute/ROADMAP.md` P0.5 for full per-fix detail.
+Details in `larql-inference/ROADMAP.md` and `larql-cli/ROADMAP.md`.
 
-- **Q4_K/Q6_K row alignment** — 26B A4B's `intermediate_size=2112`
-  isn't a multiple of 256, breaking `down_proj` matvec on any
-  matrix whose inner dim isn't super-block-aligned. Fix: per-row
-  zero-pad during extraction (`pad_rows_to_256`), dispatch with
-  `K = inter_padded`. Future vindexes with any non-256 inner dim
-  now work automatically.
-- **Parameter-free router RMSNorm** — Gemma 4's `Gemma4TextRouter.norm`
-  has no learned weight. Added arch flag + `rms_norm_no_weight`.
-- **Outer `post_feedforward_layernorm`** extracted and wired — was
-  being conflated with the `_1` dense-branch norm.
-- **`layer_scalar` applied to whole layer output** not the FFN
-  delta — matches HF's `hidden_states *= self.layer_scalar`.
-
-### Correctness infrastructure (2026-04-24)
-Tooling to keep the above from regressing, and to localise any
-future cross-model forward-pass bug to the right layer / block:
-
-- **Architecture regression suite** —
-  `crates/larql-inference/tests/test_arch_golden.rs` runs one
-  `#[test]` per `(arch × backend)`. Skip-if-missing for vindex
-  cache, so CI stays green but local runs catch breakage
-  immediately. Covers Gemma 3, Gemma 4 dense, Gemma 4 hybrid MoE,
-  Llama 2 base, Mistral 7B base across GPU + CPU backends.
-- **HF-reference residual diff** — `LARQL_DUMP_RESIDUALS=<path>`
-  writes every layer's `layer_in` / `h_post_attn` / `layer_out` in
-  a binary format symmetric with `/tmp/hf_residuals.py` (hooks
-  `Gemma4TextDecoderLayer` in HF transformers). `/tmp/diff_residuals.py`
-  prints per-layer cosine + RMS-delta and points at the first
-  layer where attention vs FFN diverges. Caught the row-alignment
-  bug by bisecting L0 sub-components (attention matched at
-  cos=0.9989; down_proj matvec dropped to 0.023).
-- **L0 intermediate dumps** (`LARQL_DUMP_L0=<dir>`) — writes
-  gate_out, up_out, GEGLU act, down_out, h1, moe_out for the first
-  layer. `/tmp/diff_l0_gate_up.py` computes HF's manual MLP from
-  the captured pre-norm input and diffs each projection.
-- **Vindex surgical patcher** —
-  `crates/larql-cli/examples/patch_down_proj.rs` re-quantises
-  `layers.N.mlp.down_proj.weight` entries with row-padding from an
-  existing vindex. Avoids a ~hour-long 42 GB re-extract when only
-  one tensor class needs redoing.
-
-### CLI redesign (primary / dev split)
-- New verbs: `run`, `chat`, `pull`, `list`, `show`, `rm`, `link`.
-- Research commands moved under `larql dev <subcmd>`; legacy names
-  transparently trampolined.
-- Dual cache (HuggingFace hub + `~/.cache/larql/local/`) with
-  shorthand resolution and source disambiguation.
-- `larql serve --ffn-only` flag propagated through CLI → server →
-  `/v1/stats`.
-
-### Phase 0 — dense remote FFN baseline
-- `POST /v1/walk-ffn` extended with `full_output: true` +
-  `seq_len: N`. Server runs the architecture-correct `WalkFfn`,
-  returns `[seq_len × hidden]` row-major.
-- gRPC mirror (`WalkFfnRequest` / `WalkFfnLayerResult` proto fields).
-- `RemoteWalkBackend` in `larql-inference` implements `FfnBackend`,
-  slots into `predict_with_ffn` unchanged.
-- `larql run --ffn URL` + `larql dev walk --ffn-remote URL` CLI flags.
-- `examples/remote_walk_parity.rs` localhost parity probe.
-
-### Vindex size reductions
-- `--quant q4k` defaults gate_vectors + embeddings to f16 (previously
-  f32 — silent ~32% bloat on every q4k extract).
-- `--compact` skips `up_weights.bin` + `down_weights.bin` (saves 3.4
-  GB on 4B f16 / ~14 GB proportionally on 31B non-Q4K).
-- `--drop-gate-vectors` skips `gate_vectors.bin` on Q4K extracts;
-  loader reconstructs from `interleaved_q4k.bin` at load time. 2.3 s
-  on 4B / ~12 s on 31B cost, saves 1.7 GB / 13.9 GB respectively.
-  Measured via `crates/larql-vindex/examples/bench_gate_dequant.rs`.
-
-### Decoupled-inference memory asymmetry (real, pre-load filtered)
-- `LoadWeightsOptions { skip_attn, skip_ffn, skip_lm_head, skip_embed }`
-  filters weight manifest entries before mmap+decode — peak RSS
-  reflects only what the caller wanted (no allocator-pooling lie).
-- Server `--ffn-only`: skips attn + ffn + lm_head + embed at load.
-  Walk-ffn endpoint uses `walk_ffn_full_mmap` which reads
-  feature-major mmap, not heap tensors.
-- Client `--ffn URL`: skips FFN tensors at load. Attention + embed +
-  norms + lm_head only on heap.
-- Measured on Gemma 3 4B f32 (`gemma3-4b-v2.vindex`):
-  - Server RSS: 12.8 GB idle → **12.8 GB through inference** (never grew)
-  - Client load: 22.5 s → **7.9 s** (2.8× faster)
-  - Forward pass: 3.83 s → **0.83 s** (4.6× faster — no FFN tensor
-    touches on the client)
-  - Paris @ 80.66% — bit-identical to local unlimited-K walk
-- Drop-post-load helpers (`ModelWeights::drop_{attn,ffn,lm_head,embed}_weights`)
-  still exist but Rust's system allocator pools freed memory —
-  post-load drops reduce heap accounting but not process RSS.
-  Superseded by the pre-load filter for the demo path.
-- `larql serve` now resolves cache shorthands (`larql serve gemma4-31b-q4k`
-  works, not just full paths) via the same `cache::resolve_model`
-  logic `larql run` uses.
-- `larql run` / `larql dev walk` default `--top-k` to `usize::MAX`
-  (unlimited). The old `top-k=10` default silently produced garbage
-  on stale/low-K vindexes; removing the cap matches the server's
-  `WalkFfn::new_unlimited` behavior.
-
-### Extract tiers + default flip
-- New `ExtractLevel::Attention` tier sits between `Browse` and
-  `Inference`: includes attention + norms but not FFN. This is the
-  first-class way to carve a client-side vindex for the Act 2 demo
-  (`larql extract <model> --level attention`). No more ad-hoc slicing.
-- Strict `Browse < Attention < Inference < All` ordering + helper
-  methods (`writes_attn()` / `writes_ffn()` / `writes_lm_head()`)
-  drive what each tier writes. Writers now actually honor the
-  boundaries — previously only Browse was meaningfully different from
-  non-Browse.
-- **Default flip.** `larql extract` now defaults to `--level inference`
-  + f16. The common case (`larql extract <model> -o x.vindex`) produces
-  an inference-ready vindex out of the box, no flags needed. `--f32`
-  opts out of f16 for the rare case someone wants it.
-
-### Gemma 4 config plumbing
-- Fixed three missing `final_logit_softcapping` initializers
-  (pre-existing compile break on the `architecture-b` branch).
-- Dropped an unused `mut` on a closure binding in
-  `format/weights/write.rs`.
-
-### Test coverage
-- **490 tests across 14 suites**, zero warnings.
-- New: cache resolution (19), argv trampoline (8),
-  `RemoteWalkBackend` wire format + config + error shape (10), server
-  validation + stats mode advertisement (7), local-cache scan
-  end-to-end.
+- Sampling: `--temperature`, `--top-p`, `--top-k`, `--repetition-penalty`
+- Multi-turn state: running KV across `larql chat` turns
+- Long context: `--max-context N`, dynamic KV buffer growth
+- OpenAI-compatible `/v1/chat/completions` (after streaming lands)
+- Auto-extract on `larql run hf://owner/name`
+- Gemma 3 4B regression smoke test (gate on `CI_INTEGRATION=1`)
 
 ---
 
-## Non-goals
+## P2 — Film checklist
 
-- **Not a general model-serving framework.** LARQL's pitch is "the
-  model is the database"; inference is a vehicle for the interpretable
-  vindex, not the product. We optimize for composability, editability,
-  and the demo narrative — not raw throughput against vLLM/TensorRT.
-- **Not a training system.** `COMPILE` writes into weights; that's
-  patch-level edits, not gradient descent. Stays out of scope.
-- **Not HF-compatible on the output side.** We extract *from* HF
-  models but the vindex format is our own. A vindex is not meant to be
-  loadable by `transformers.AutoModel`.
+- [ ] Confirm Gemma 4 26B A4B public config (expert count, top-K, active-param figure, GQA ratio). Replace every `~` in `docs/demo-script-gemma4-moe.md`.
+- [ ] Measure real footprint + latency on `google/gemma-4-31b-it` for Act 1.
+- [ ] Reliability pass on `RemoteWalkBackend` (timeouts, retries, partial shard outage).
+- [ ] `RemoteExpertBackend` same reliability pass.
+- [ ] Decide repo-public date. `cargo install larql-cli && larql serve` must be live the week the video drops.
+- [ ] Pick expert IDs for the Act 3 swap shot — one that fires on medical prompts, one that doesn't.
+
+---
+
+## Loose ends (shipped features with open follow-ups)
+
+| Item | Crate | Detail |
+|---|---|---|
+| `KernelHandle` spread to 9 remaining tiled shaders | larql-compute | Mechanical, same pattern as q4_matvec_v4 |
+| `dispatch_full_pipeline` 30+ params | larql-compute | Bundle into `FullPipelineRefs<'_>` context |
+| `QuantFormat` match spread (14 files) | larql-compute | Introduce `FormatRoute` enum |
+| `ProfileTimings` producer | larql-compute | Wire commit/wait boundaries into decode_token |
+| Benches in CI | larql-compute | GHA workflow written, needs trigger merged |
+| `--compact` loader for non-MoE models | larql-vindex | `WeightFfn::forward` panics on compact vindex |
+| MoE compact mode | larql-vindex | Blocked on per-expert feature-major files |
+| Fix `dispatch_full_pipeline` layer_scalar (dense) | larql-compute | Non-urgent: Gemma 3 4B has scalar=0 |
+| Cross-vindex dedup (tokenizer, down_meta) | larql-vindex | Low priority, ~200 MB duplicated at 7 vindexes |

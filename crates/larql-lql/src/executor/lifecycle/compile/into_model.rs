@@ -4,8 +4,9 @@
 use std::path::PathBuf;
 
 use crate::error::LqlError;
+use crate::executor::helpers::{dir_size, format_bytes};
 use crate::executor::Session;
-use crate::executor::helpers::{format_bytes, dir_size};
+use larql_vindex::format::filenames::TOKENIZER_JSON;
 
 use super::collect_memit_facts_with_recording;
 
@@ -23,7 +24,8 @@ impl Session {
                 "COMPILE INTO MODEL requires model weights in the vindex.\n\
                  This vindex was built without --include-weights.\n\
                  Rebuild: EXTRACT MODEL \"{}\" INTO \"{}\" WITH ALL",
-                config.model, vindex_path.display()
+                config.model,
+                vindex_path.display()
             )));
         }
 
@@ -46,8 +48,7 @@ impl Session {
             .map(|r| r.operations.clone())
             .unwrap_or_default();
         let (_, _, patched) = self.require_vindex()?;
-        let memit_facts =
-            collect_memit_facts_with_recording(patched, vindex_path, &recording_ops)?;
+        let memit_facts = collect_memit_facts_with_recording(patched, vindex_path, &recording_ops)?;
 
         let mut out = Vec::new();
         // MEMIT is opt-in via `LARQL_MEMIT_ENABLE=1`; see the matching
@@ -69,7 +70,8 @@ impl Session {
             out.push(format!(
                 "MEMIT: {} fact(s) across {} layer(s)",
                 memit_facts.len(),
-                memit_facts.iter()
+                memit_facts
+                    .iter()
                     .map(|f| f.layer)
                     .collect::<std::collections::HashSet<_>>()
                     .len(),
@@ -88,21 +90,12 @@ impl Session {
                     &tokenizer,
                 )
             } else {
-                larql_inference::run_memit(
-                    &weights,
-                    &memit_facts,
-                    ridge,
-                    target_alpha,
-                    &tokenizer,
-                )
+                larql_inference::run_memit(&weights, &memit_facts, ridge, target_alpha, &tokenizer)
             }
             .map_err(|e| LqlError::Execution(format!("MEMIT failed: {e}")))?;
 
             for result in &results {
-                let delta_norm: f32 = result.delta_w.iter()
-                    .map(|v| v * v)
-                    .sum::<f32>()
-                    .sqrt();
+                let delta_norm: f32 = result.delta_w.iter().map(|v| v * v).sum::<f32>().sqrt();
                 out.push(format!(
                     "  L{}: ΔW_down applied ({} facts, ‖ΔW‖={:.2})",
                     result.layer,
@@ -126,14 +119,21 @@ impl Session {
         larql_vindex::write_model_weights(&weights, &output_dir, &mut build_cb)
             .map_err(|e| LqlError::exec("failed to write model", e))?;
 
-        let tok_src = vindex_path.join("tokenizer.json");
-        let tok_dst = output_dir.join("tokenizer.json");
+        let tok_src = vindex_path.join(TOKENIZER_JSON);
+        let tok_dst = output_dir.join(TOKENIZER_JSON);
         if tok_src.exists() {
             std::fs::copy(&tok_src, &tok_dst)
                 .map_err(|e| LqlError::exec("failed to copy tokenizer", e))?;
         }
 
-        out.insert(0, format!("Compiled {} → {}", vindex_path.display(), output_dir.display()));
+        out.insert(
+            0,
+            format!(
+                "Compiled {} → {}",
+                vindex_path.display(),
+                output_dir.display()
+            ),
+        );
         out.push(format!("Model: {}", config.model));
         out.push(format!("Size: {}", format_bytes(dir_size(&output_dir))));
         Ok(out)

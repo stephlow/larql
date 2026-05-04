@@ -7,13 +7,22 @@
 ## Entry Points
 
 ```
-load_model_dir(path)     → auto-detect format, load ModelWeights
-  ├── safetensors/       → safetensors::load_model_dir
-  ├── *.gguf             → gguf::load_gguf
-  └── error              → ModelError::NotADirectory
+load_model_dir(path)                   → auto-detect format, load all tensors
+load_model_dir_validated(path)         → validate architecture before loading tensors
+load_model_dir_walk_only(path)         → skip FFN tensors at parse/dequant time (no heap spike)
+load_model_dir_walk_only_validated(path)
+load_model_dir_filtered(path, skip_fn) → skip any tensors matching predicate
+load_model_dir_filtered_validated(path, skip_fn)
+  ├── *.safetensors/     → loading::safetensors
+  ├── *.gguf             → loading::gguf::load_gguf_filtered
+  └── error              → ModelError::{NotADirectory, NoSafetensors}
 
 resolve_model_path(name) → resolve HF cache path to model directory
 ```
+
+Use validated entry points for inference, extraction, and long-running servers.
+Use permissive entry points for inspection/conversion tools that need to report
+or repair incomplete configs.
 
 ## Safetensors Pipeline
 
@@ -37,12 +46,19 @@ Read config.json → serde_json::Value
 parse_model_config() → ModelConfig
   ↓
 Match model_type → Box<dyn ModelArchitecture>
+  ↓
+Validated entry points call arch.validate()
 ```
 
 Config parsing handles:
 - Top-level config (Llama, Qwen, etc.)
 - Nested `text_config` (multimodal Gemma 3/4)
 - Fallback defaults per model family
+
+Detection is intentionally permissive so tooling can inspect partial configs.
+Validated entry points call `arch.validate()` to fail fast on invalid dimensions,
+head geometry, RoPE values, per-layer metadata, KV sharing, or MoE routing. The
+validation implementation and diagnostic field constants live in `validation.rs`.
 
 ### 3. Load Tensors
 
@@ -56,11 +72,14 @@ For each shard:
   For each tensor:
     Strip key prefix (e.g., "model." → "")
     Read raw bytes from mmap region
+    If tensor is a packed BF16 expert block:
+      store a retained mmap byte range instead of copying to heap
+      skip f32 conversion
     Convert dtype:
       f32 → use directly
       f16 → quant::half::decode_f16
       bf16 → quant::half::decode_bf16
-      other → ModelError::UnsupportedDtype
+      other → collected into ModelWeights::skipped_tensors (not fatal)
     ↓
     Reshape to Array2<f32> (2D: [rows, cols])
     Convert to ArcArray2<f32> (shared ownership)
@@ -124,11 +143,19 @@ GGUF metadata keys map to config.json fields:
 | `{arch}.attention.head_count_kv` | `num_kv_heads` |
 | `{arch}.rope.freq_base` | `rope_base` |
 
+Absent optional GGUF metadata is omitted from the synthesized config so the
+same architecture defaults and loader fallbacks used by safetensors configs
+still apply. For example, a Llama GGUF without `{arch}.rope.freq_base` gets the
+standard 10,000 RoPE base instead of an explicit zero, and missing vocab size
+can still fall back to tokenizer metadata.
+
 ### 3. Load Tensors
 
 ```
 For each tensor descriptor:
   Read name, shape, dtype, offset
+  Normalize key ("blk.N." → "layers.N.", etc.)
+  Apply optional skip predicate before reading/dequantizing data
   Seek to data offset
   ↓
   Match dtype:
@@ -137,12 +164,20 @@ For each tensor descriptor:
     BF16 → quant::half::decode_bf16
     Q4_0 → quant::ggml::dequantize (block decode)
     Q4_1 → quant::ggml::dequantize
+    Q5_0 → quant::ggml::dequantize
+    Q5_1 → quant::ggml::dequantize
     Q8_0 → quant::ggml::dequantize
+    Q4_K → quant::ggml::dequantize
+    Q6_K → quant::ggml::dequantize
     other → ModelError::UnsupportedDtype
   ↓
-  Strip GGUF key prefix ("blk.N." → "layers.N.")
-  Reshape + insert into tensors
+  Reshape GGUF `[cols, rows]` dimensions into standard `[rows, cols]`
+  row-major ndarray matrices and insert into tensors
 ```
+
+`load_gguf_filtered` applies the predicate after key normalization and before
+data-size calculation and dequantization. This is what keeps walk-only GGUF
+loads from expanding FFN tensors into f32.
 
 ### 4. Key Translation
 
@@ -155,15 +190,22 @@ GGUF uses different key patterns than safetensors:
 | `token_embd.weight` | `embed_tokens.weight` |
 | `output_norm.weight` | `norm.weight` |
 
+The replacement table is centralized in `loading/gguf.rs`; add new GGUF key
+forms there rather than scattering ad-hoc rewrites through loading code.
+
 ## ModelWeights Struct
 
 ```rust
 pub struct ModelWeights {
-    pub tensors: HashMap<String, WeightArray>,  // 2D weight matrices
-    pub vectors: HashMap<String, Vec<f32>>,     // 1D vectors (norms, biases)
-    pub embed: WeightArray,                      // Embedding matrix
-    pub lm_head: WeightArray,                    // Output projection
-    pub arch: Box<dyn ModelArchitecture>,         // Detected architecture
+    pub tensors: HashMap<String, WeightArray>,   // 2D weight matrices
+    pub vectors: HashMap<String, Vec<f32>>,      // 1D vectors (norms, biases)
+    pub raw_bytes: HashMap<String, Vec<u8>>,     // Small packed-byte fallback/test tensors
+    pub skipped_tensors: Vec<(String, String)>,  // (key, dtype) for unsupported dtypes
+    pub packed_mmaps: HashMap<String, Mmap>,     // Retained memory-mapped packed files
+    pub packed_byte_ranges: HashMap<String, (String, usize, usize)>, // key → (file, offset, len)
+    pub embed: WeightArray,                       // Embedding matrix [vocab, hidden]
+    pub lm_head: WeightArray,                     // Output projection (may be tied to embed)
+    pub arch: Box<dyn ModelArchitecture>,          // Detected architecture
     // Cached config values for hot-path access:
     pub num_layers: usize,
     pub hidden_size: usize,
@@ -176,12 +218,46 @@ pub struct ModelWeights {
 }
 ```
 
-### drop_ffn_weights
+### Memory management methods
 
-Removes FFN tensors from memory for walk-only mode. Matches patterns:
+| Method | Frees | Use case |
+|--------|-------|----------|
+| `drop_ffn_weights()` | gate/up/down projections, packed expert blocks | Walk-only inference (vindex-backed FFN) |
+| `drop_attn_weights()` | Q/K/V/O projections, QK norms | Server-side FFN-only deployment |
+| `drop_lm_head()` | Output projection matrix | Server that doesn't compute logits |
+| `drop_embed()` | Input embedding matrix | Server that receives residuals, not tokens |
+
+All return freed bytes. Typical savings for a 4B model:
+- `drop_ffn_weights`: ~13 GB (~80% of parameters)
+- `drop_attn_weights`: ~1 GB
+- `drop_lm_head` / `drop_embed`: ~2.7 GB each
+
+Packed byte tensors are read through `ModelWeights::get_packed_bytes()`, which
+checks retained mmap ranges first and falls back to `raw_bytes`. Gemma 4 A4B
+packed BF16 expert tensors are kept in mmap ranges during safetensors loading
+so loading does not clone multi-GB expert blocks into heap memory.
+
+Pattern matching for `drop_ffn_weights`:
 - `gate_proj`, `up_proj`, `down_proj` (dense models)
+- `mlp.c_fc`, `mlp.c_proj` (StarCoder2)
 - `ffn_gate`, `ffn_up`, `ffn_down` (GGUF key format)
 - `mlp.experts`, `block_sparse_moe.experts` (MoE per-expert)
 - `packed_gate_up_blocks`, `packed_down_blocks` (GPT-OSS MXFP4)
 
-Typical savings: ~13GB for a 4B model (~80% of total weights are FFN).
+Loader string constants are centralized in code:
+- `weights.rs` owns shared FFN/attention classifiers and packed expert key fragments.
+- `loading/safetensors.rs` owns safetensors/GGUF extension names, HF cache path fragments, and GPT-OSS MXFP4 suffix/key helpers.
+- `loading/gguf.rs` owns GGUF metadata suffixes and the GGUF-to-HF key replacement table.
+
+### skipped_tensors
+
+Tensors with unsupported dtypes (I64 attention masks, U8 token type IDs, etc.) are collected here rather than causing a load failure. Each entry is `(tensor_key, dtype_string)`. Check after loading to detect unexpected format gaps:
+
+```rust
+let weights = load_model_dir_validated(path)?;
+for (key, dtype) in &weights.skipped_tensors {
+    if !["I64", "I32", "U8"].iter().any(|&d| dtype.contains(d)) {
+        eprintln!("unexpected skipped tensor: {key} ({dtype})");
+    }
+}
+```

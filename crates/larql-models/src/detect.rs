@@ -16,6 +16,7 @@ use crate::architectures::qwen::QwenArch;
 use crate::architectures::starcoder2::StarCoder2Arch;
 use crate::architectures::tinymodel::TinyModelArch;
 use crate::config::{ModelArchitecture, ModelConfig, RopeScaling};
+use crate::validation::ConfigValidationError;
 
 /// Error from model detection/config parsing.
 #[derive(Debug, thiserror::Error)]
@@ -34,19 +35,32 @@ pub enum ModelError {
     NotADirectory(std::path::PathBuf),
     #[error("no safetensors files in {0}")]
     NoSafetensors(std::path::PathBuf),
+    #[error("config validation failed: {0:?}")]
+    ConfigValidation(Vec<ConfigValidationError>),
 }
 
 /// Read config.json from a model directory and return the architecture.
 pub fn detect_architecture(model_dir: &Path) -> Result<Box<dyn ModelArchitecture>, ModelError> {
-    let config_path = model_dir.join("config.json");
-    let config_json = if config_path.exists() {
-        let text = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str::<serde_json::Value>(&text)?
-    } else {
-        serde_json::json!({})
-    };
-
+    let config_json = read_config_json(model_dir)?;
     Ok(detect_from_json(&config_json))
+}
+
+/// Read config.json from a model directory, detect the architecture, and validate it.
+pub fn detect_architecture_validated(
+    model_dir: &Path,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    let arch = detect_architecture(model_dir)?;
+    validate_detected_architecture(arch)
+}
+
+fn read_config_json(model_dir: &Path) -> Result<serde_json::Value, ModelError> {
+    let config_path = model_dir.join("config.json");
+    if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)?;
+        Ok(serde_json::from_str::<serde_json::Value>(&text)?)
+    } else {
+        Ok(serde_json::json!({}))
+    }
 }
 
 /// Detect architecture from an already-parsed config.json value.
@@ -84,6 +98,44 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
     }
 }
 
+/// Detect architecture from an already-parsed config.json value and validate it.
+pub fn detect_from_json_validated(
+    config: &serde_json::Value,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    let arch = detect_from_json(config);
+    validate_detected_architecture(arch)
+}
+
+pub(crate) fn validate_detected_architecture(
+    arch: Box<dyn ModelArchitecture>,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    match arch.validate() {
+        Ok(()) => Ok(arch),
+        Err(errors) => Err(ModelError::ConfigValidation(errors)),
+    }
+}
+
+// ── RoPE base defaults ───────────────────────────────────────────────────────
+/// Default RoPE theta for Gemma family models.
+const ROPE_BASE_GEMMA: f64 = 1_000_000.0;
+/// Default RoPE theta for all other model families.
+const ROPE_BASE_DEFAULT: f64 = 10_000.0;
+
+// ── Config field name aliases ────────────────────────────────────────────────
+// Different model families use different JSON keys for the same concept.
+// Ordering is priority: first match wins.
+
+/// Total routed expert count: DeepSeek, Qwen MoE, Mixtral variants.
+const NUM_EXPERTS_KEYS: &[&str] = &["n_routed_experts", "num_local_experts", "num_experts"];
+
+/// Experts activated per token: llama.cpp / HF spelling variants.
+const NUM_EXPERTS_PER_TOK_KEYS: &[&str] = &["num_experts_per_tok", "num_experts_per_token"];
+
+/// Return the first `u64` found under any of `keys` in `config`.
+fn field_u64(config: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| config[k].as_u64())
+}
+
 /// Parse ModelConfig from a config.json value.
 /// Handles both top-level and nested text_config (multimodal models).
 fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
@@ -98,7 +150,11 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
 
     // Pick defaults based on model type.
     let is_gemma = model_type.starts_with("gemma");
-    let rope_default = if is_gemma { 1_000_000.0 } else { 10_000.0 };
+    let rope_default = if is_gemma {
+        ROPE_BASE_GEMMA
+    } else {
+        ROPE_BASE_DEFAULT
+    };
 
     let num_layers = text_config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
     let hidden_size = text_config["hidden_size"].as_u64().unwrap_or(2048) as usize;
@@ -113,8 +169,10 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .map(|v| v as usize)
         .unwrap_or(if default_head_dim > 0 {
             default_head_dim
-        } else {
+        } else if num_q_heads > 0 {
             hidden_size / num_q_heads
+        } else {
+            0
         });
     let num_kv_heads = text_config["num_key_value_heads"].as_u64().unwrap_or(4) as usize;
     // RoPE base: check rope_parameters.full_attention.rope_theta (Gemma 4),
@@ -135,15 +193,9 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let sliding_window = text_config["sliding_window"].as_u64().map(|v| v as usize);
 
     // MoE fields
-    let num_experts = text_config["n_routed_experts"]
-        .as_u64()
-        .or_else(|| text_config["num_local_experts"].as_u64())
-        .or_else(|| text_config["num_experts"].as_u64())
-        .map(|v| v as usize);
-    let num_experts_per_token = text_config["num_experts_per_tok"]
-        .as_u64()
-        .or_else(|| text_config["num_experts_per_token"].as_u64())
-        .map(|v| v as usize);
+    let num_experts = field_u64(text_config, NUM_EXPERTS_KEYS).map(|v| v as usize);
+    let num_experts_per_token =
+        field_u64(text_config, NUM_EXPERTS_PER_TOK_KEYS).map(|v| v as usize);
     let num_shared_experts = text_config["n_shared_experts"].as_u64().map(|v| v as usize);
     // Gemma 4 A4B hybrid MoE fields
     let enable_moe_block = text_config["enable_moe_block"].as_bool().unwrap_or(false);
@@ -510,10 +562,7 @@ mod tests {
         assert_eq!(arch.num_experts(), 128);
         assert_eq!(arch.num_experts_per_token(), 8);
         assert_eq!(arch.moe_intermediate_size(), 768);
-        assert_eq!(
-            arch.moe_router_key(0).unwrap(),
-            "layers.0.mlp.gate.weight"
-        );
+        assert_eq!(arch.moe_router_key(0).unwrap(), "layers.0.mlp.gate.weight");
         assert_eq!(
             arch.expert_ffn_gate_key(0, 5).unwrap(),
             "layers.0.mlp.experts.5.gate_proj.weight"
@@ -1111,7 +1160,7 @@ mod tests {
         // sliding layers still ship v_proj in safetensors.
         assert!(arch.config().attention_k_eq_v);
         assert!(!arch.v_shares_k(0)); // sliding
-        assert!(arch.v_shares_k(5));  // global
+        assert!(arch.v_shares_k(5)); // global
 
         // V-norm (parameter-free RMSNorm on V states)
         assert!(arch.has_v_norm());

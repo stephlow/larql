@@ -6,16 +6,28 @@
 //! 3. RoPE applied separately to K, then K/V copied to KV cache
 //! 4. Fused attention called with skip_rope=1 (Q and K pre-RoPE'd)
 
-use std::ffi::c_void;
 use metal::*;
+use std::ffi::c_void;
 
-use crate::metal::buffers::BufferCache;
-use crate::metal::shaders::q4_matvec as q4mv_shader;
+use super::ops::full_pipeline::{encode_residual_add, encode_rms_norm};
 use super::ops::q4_common::Q4Pipelines;
-use super::ops::full_pipeline::{encode_rms_norm, encode_residual_add};
+use crate::metal::buffers::BufferCache;
 
 /// Encode a quant matvec for a single position at the given offsets.
 /// The input buffer is read from `in_offset` bytes, output written to `out_offset` bytes.
+///
+/// **FIXME (dispatch geometry mismatch)** — the Q4_K / Q4_KF arms below
+/// hardcode `tgs = ceil(num_rows / 4)` and `THREADS_PER_TG = 128` (matching
+/// the legacy 4sg `q4k_matvec` shader). Since 2026-04-28, production binds
+/// `q4k_matvec_pipeline` to the 8sg variant (8 rows / 256 threads). Dispatching
+/// 128 threads against an 8sg kernel leaves simdgroups 4..7 unscheduled and
+/// half the rows unwritten — same family of bug as 077884b and the 2026-05-02
+/// lm_head fix. This function is dead code today (`#[allow(dead_code)]`,
+/// only called from the also-dead `dispatch_prefill`); production prefill
+/// routes through `prefill_q4` → `dispatch_full_pipeline` → `qmv::encode`,
+/// which uses `KernelHandle::rows_per_tg` / `threads_per_tg` correctly. If
+/// you ever revive `dispatch_prefill`, change the `&ComputePipelineState`
+/// params to `&KernelHandle` and pull geometry from there.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn encode_quant_matvec_at_offset(
@@ -74,16 +86,20 @@ fn encode_quant_matvec_at_offset(
         crate::QuantFormat::Q4_0 => {
             let n = num_rows as u32;
             let k = hidden as u32;
-            let num_tgs = (num_rows as u64).div_ceil(q4mv_shader::ROWS_PER_TG);
-            // Q4_0 needs Q8 input — but for prefill we use Q4_K/Q6_K path only.
-            // Fallback: use f32 input path (q4_f32_matvec)
+            // Prefill's Q4_0 path uses the f32-input matvec kernel
+            // (`q4_f32_matvec`), which is one thread per output row —
+            // flat dispatch, no per-TG row tiling. 256 threads/TG is
+            // a generic occupancy-friendly default.
             enc.set_compute_pipeline_state(q4_pipeline);
             enc.set_buffer(0, Some(buf_w), 0);
             enc.set_buffer(1, Some(buf_input), in_offset);
             enc.set_buffer(2, Some(buf_out), out_offset);
             enc.set_bytes(3, 4, &n as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &k as *const u32 as *const c_void);
-            enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), MTLSize::new(q4mv_shader::THREADS_PER_TG, 1, 1));
+            enc.dispatch_threads(
+                MTLSize::new(num_rows as u64, 1, 1),
+                MTLSize::new(256.min(num_rows as u64), 1, 1),
+            );
         }
         crate::QuantFormat::Q8_0 => {
             // Q8_0 needs Q8 input — not supported in prefill offset mode
@@ -101,6 +117,7 @@ fn encode_quant_matvec_at_offset(
                 MTLSize::new(256, 1, 1),
             );
         }
+        crate::QuantFormat::BF16 | crate::QuantFormat::F16 | crate::QuantFormat::F32 => {}
     }
 }
 
@@ -150,8 +167,14 @@ pub fn dispatch_prefill(
     let gate_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.gate.data)).collect();
     let up_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.up.data)).collect();
     let down_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.down.data)).collect();
-    let input_norm_bufs: Vec<_> = layers.iter().map(|l| bufs.transient_from_f32(l.input_norm)).collect();
-    let post_attn_norm_bufs: Vec<_> = layers.iter().map(|l| bufs.transient_from_f32(l.post_attn_norm)).collect();
+    let input_norm_bufs: Vec<_> = layers
+        .iter()
+        .map(|l| bufs.transient_from_f32(l.input_norm))
+        .collect();
+    let post_attn_norm_bufs: Vec<_> = layers
+        .iter()
+        .map(|l| bufs.transient_from_f32(l.post_attn_norm))
+        .collect();
 
     // Initial hidden state: [seq_len, hidden]
     let mut h_buf = bufs.transient_from_f32(x);
@@ -184,7 +207,10 @@ pub fn dispatch_prefill(
             enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
             enc.set_bytes(5, 4, &norm_offset as *const f32 as *const c_void);
-            enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+            enc.dispatch_threads(
+                MTLSize::new(hidden as u64, 1, 1),
+                MTLSize::new(256.min(hidden as u64), 1, 1),
+            );
             enc.end_encoding();
         }
 
@@ -197,24 +223,57 @@ pub fn dispatch_prefill(
             let in_off = (s * hidden * 4) as u64;
             // Q projection
             let enc = cmd.new_compute_command_encoder();
-            encode_quant_matvec_at_offset(enc, attn_format,
-                &q4.f32_matvec, q8_matvec_pipeline, q4k_matvec_pipeline, q6k_matvec_pipeline,
-                &wq_bufs[l], &norm_out, in_off,
-                &q_out, (s * q_dim * 4) as u64, q_dim, hidden);
+            encode_quant_matvec_at_offset(
+                enc,
+                attn_format,
+                &q4.f32_matvec,
+                q8_matvec_pipeline,
+                q4k_matvec_pipeline,
+                q6k_matvec_pipeline,
+                &wq_bufs[l],
+                &norm_out,
+                in_off,
+                &q_out,
+                (s * q_dim * 4) as u64,
+                q_dim,
+                hidden,
+            );
             enc.end_encoding();
             // K projection
             let enc = cmd.new_compute_command_encoder();
-            encode_quant_matvec_at_offset(enc, layers[l].wk.format,
-                &q4.f32_matvec, q8_matvec_pipeline, q4k_matvec_pipeline, q6k_matvec_pipeline,
-                &wk_bufs[l], &norm_out, in_off,
-                &k_out, (s * kv_dim * 4) as u64, kv_dim, hidden);
+            encode_quant_matvec_at_offset(
+                enc,
+                layers[l].wk.format,
+                &q4.f32_matvec,
+                q8_matvec_pipeline,
+                q4k_matvec_pipeline,
+                q6k_matvec_pipeline,
+                &wk_bufs[l],
+                &norm_out,
+                in_off,
+                &k_out,
+                (s * kv_dim * 4) as u64,
+                kv_dim,
+                hidden,
+            );
             enc.end_encoding();
             // V projection
             let enc = cmd.new_compute_command_encoder();
-            encode_quant_matvec_at_offset(enc, layers[l].wv.format,
-                &q4.f32_matvec, q8_matvec_pipeline, q4k_matvec_pipeline, q6k_matvec_pipeline,
-                &wv_bufs[l], &norm_out, in_off,
-                &v_out, (s * kv_dim * 4) as u64, kv_dim, hidden);
+            encode_quant_matvec_at_offset(
+                enc,
+                layers[l].wv.format,
+                &q4.f32_matvec,
+                q8_matvec_pipeline,
+                q4k_matvec_pipeline,
+                q6k_matvec_pipeline,
+                &wv_bufs[l],
+                &norm_out,
+                in_off,
+                &v_out,
+                (s * kv_dim * 4) as u64,
+                kv_dim,
+                hidden,
+            );
             enc.end_encoding();
         }
 
@@ -264,10 +323,21 @@ pub fn dispatch_prefill(
         let o_out = bufs.output(hidden_bytes * seq_len as u64);
         for s in 0..seq_len {
             let enc = cmd.new_compute_command_encoder();
-            encode_quant_matvec_at_offset(enc, layers[l].wo.format,
-                &q4.f32_matvec, q8_matvec_pipeline, q4k_matvec_pipeline, q6k_matvec_pipeline,
-                &wo_bufs[l], &attn_out, (s * q_dim * 4) as u64,
-                &o_out, (s * hidden * 4) as u64, hidden, q_dim);
+            encode_quant_matvec_at_offset(
+                enc,
+                layers[l].wo.format,
+                &q4.f32_matvec,
+                q8_matvec_pipeline,
+                q4k_matvec_pipeline,
+                q6k_matvec_pipeline,
+                &wo_bufs[l],
+                &attn_out,
+                (s * q_dim * 4) as u64,
+                &o_out,
+                (s * hidden * 4) as u64,
+                hidden,
+                q_dim,
+            );
             enc.end_encoding();
         }
 
@@ -281,12 +351,26 @@ pub fn dispatch_prefill(
                 // Post-norm: norm(O) + residual
                 let normed = bufs.output(hidden_bytes);
                 let enc = cmd.new_compute_command_encoder();
-                encode_rms_norm(enc, rms_norm_pipeline,
-                    &o_out, &post_attn_norm_bufs[l], &normed, hidden, eps, norm_offset);
+                encode_rms_norm(
+                    enc,
+                    rms_norm_pipeline,
+                    &o_out,
+                    &post_attn_norm_bufs[l],
+                    &normed,
+                    hidden,
+                    eps,
+                    norm_offset,
+                );
                 enc.end_encoding();
                 let enc = cmd.new_compute_command_encoder();
-                encode_residual_add(enc, residual_add_pipeline,
-                    &h_buf, &normed, &h_post_attn, hidden);
+                encode_residual_add(
+                    enc,
+                    residual_add_pipeline,
+                    &h_buf,
+                    &normed,
+                    &h_post_attn,
+                    hidden,
+                );
                 enc.end_encoding();
             } else {
                 // Standard: residual + O
@@ -297,7 +381,10 @@ pub fn dispatch_prefill(
                 enc.set_buffer(1, Some(&o_out), h_off);
                 enc.set_buffer(2, Some(&h_post_attn), h_off);
                 enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
-                enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(hidden as u64, 1, 1),
+                    MTLSize::new(256.min(hidden as u64), 1, 1),
+                );
                 enc.end_encoding();
             }
             // FFN norm — use pre_ffn_norm if available (Gemma post-norm), else post_attn_norm
@@ -316,7 +403,10 @@ pub fn dispatch_prefill(
             enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
             enc.set_bytes(5, 4, &norm_offset as *const f32 as *const c_void);
-            enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+            enc.dispatch_threads(
+                MTLSize::new(hidden as u64, 1, 1),
+                MTLSize::new(256.min(hidden as u64), 1, 1),
+            );
             enc.end_encoding();
         }
 
@@ -406,7 +496,10 @@ pub fn dispatch_prefill(
                     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
                     enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
                     enc.set_bytes(5, 4, &norm_offset as *const f32 as *const c_void);
-                    enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                    enc.dispatch_threads(
+                        MTLSize::new(hidden as u64, 1, 1),
+                        MTLSize::new(256.min(hidden as u64), 1, 1),
+                    );
                     enc.end_encoding();
                     let enc = cmd.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(residual_add_pipeline);
@@ -414,7 +507,10 @@ pub fn dispatch_prefill(
                     enc.set_buffer(1, Some(&normed), 0);
                     enc.set_buffer(2, Some(&new_h), off);
                     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
-                    enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                    enc.dispatch_threads(
+                        MTLSize::new(hidden as u64, 1, 1),
+                        MTLSize::new(256.min(hidden as u64), 1, 1),
+                    );
                     enc.end_encoding();
                 } else {
                     let enc = cmd.new_compute_command_encoder();
@@ -424,7 +520,10 @@ pub fn dispatch_prefill(
                     enc.set_buffer(1, Some(&down_out), off);
                     enc.set_buffer(2, Some(&new_h), off);
                     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
-                    enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                    enc.dispatch_threads(
+                        MTLSize::new(hidden as u64, 1, 1),
+                        MTLSize::new(256.min(hidden as u64), 1, 1),
+                    );
                     enc.end_encoding();
                 }
             } else {
@@ -435,7 +534,10 @@ pub fn dispatch_prefill(
                 enc.set_buffer(1, Some(&down_out), off);
                 enc.set_buffer(2, Some(&new_h), off);
                 enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
-                enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(hidden as u64, 1, 1),
+                    MTLSize::new(256.min(hidden as u64), 1, 1),
+                );
                 enc.end_encoding();
             }
         }

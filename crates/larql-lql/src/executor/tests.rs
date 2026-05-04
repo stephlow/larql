@@ -418,6 +418,7 @@ fn make_test_weights() -> larql_inference::ModelWeights {
         tensors,
         vectors,
         raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
@@ -634,6 +635,8 @@ fn make_test_vindex_dir(tag: &str) -> std::path::PathBuf {
         down_top_k: 5,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 
@@ -704,6 +707,32 @@ fn delete_no_matches_returns_message() {
 }
 
 #[test]
+fn delete_relation_filter_without_labels_errors_before_mutating() {
+    let (mut session, dir) = vindex_session("delete_relation_no_labels");
+
+    let stmt = parser::parse(r#"DELETE FROM EDGES WHERE relation = "capital";"#).unwrap();
+    let err = session
+        .execute(&stmt)
+        .expect_err("relation-only DELETE should not silently match everything");
+
+    assert!(
+        err.to_string()
+            .contains("relation filters require relation labels"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        session
+            .patch_recording
+            .as_ref()
+            .map(|r| r.operations.is_empty())
+            .unwrap_or(false),
+        "failed DELETE should not record patch operations"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn update_feature_target_succeeds() {
     let (mut session, dir) = vindex_session("update_target");
 
@@ -720,6 +749,33 @@ fn update_feature_target_succeeds() {
     assert!(
         session.patch_recording.is_some(),
         "UPDATE should have started an auto-patch session"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn update_relation_filter_without_labels_errors_before_mutating() {
+    let (mut session, dir) = vindex_session("update_relation_no_labels");
+
+    let stmt =
+        parser::parse(r#"UPDATE EDGES SET target = "London" WHERE relation = "capital";"#).unwrap();
+    let err = session
+        .execute(&stmt)
+        .expect_err("relation-only UPDATE should not silently match everything");
+
+    assert!(
+        err.to_string()
+            .contains("relation filters require relation labels"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        session
+            .patch_recording
+            .as_ref()
+            .map(|r| r.operations.is_empty())
+            .unwrap_or(false),
+        "failed UPDATE should not record patch operations"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -873,6 +929,84 @@ fn show_patches_with_no_patches_returns_message() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn refresh_recorded_patch_ops_for_slots_persists_latest_overlay_vectors() {
+    use larql_models::TopKEntry;
+    use larql_vindex::{FeatureMeta, PatchOp};
+
+    let (mut session, dir) = vindex_session("refresh_patch_ops");
+
+    {
+        let overlay = session.patched_overlay_mut().expect("vindex backend");
+        overlay.insert_feature(
+            0,
+            0,
+            vec![1.0, 0.0, 0.0, 0.0],
+            FeatureMeta {
+                top_token: "old".into(),
+                top_token_id: 7,
+                c_score: 0.5,
+                top_k: vec![TopKEntry {
+                    token: "old".into(),
+                    token_id: 7,
+                    logit: 0.5,
+                }],
+            },
+        );
+        overlay.set_up_vector(0, 0, vec![0.1, 0.2, 0.3, 0.4]);
+        overlay.set_down_vector(0, 0, vec![0.5, 0.6, 0.7, 0.8]);
+    }
+
+    session.patch_recording = Some(PatchRecording {
+        path: String::new(),
+        operations: vec![PatchOp::Insert {
+            layer: 0,
+            feature: 0,
+            relation: Some("capital".into()),
+            entity: "Atlantis".into(),
+            target: "Poseidon".into(),
+            confidence: Some(0.9),
+            gate_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                9.0, 9.0, 9.0, 9.0,
+            ])),
+            up_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                9.0, 9.0, 9.0, 9.0,
+            ])),
+            down_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                9.0, 9.0, 9.0, 9.0,
+            ])),
+            down_meta: None,
+        }],
+    });
+
+    {
+        let overlay = session.patched_overlay_mut().expect("vindex backend");
+        overlay.set_up_vector(0, 0, vec![1.1, 1.2, 1.3, 1.4]);
+        overlay.set_down_vector(0, 0, vec![2.1, 2.2, 2.3, 2.4]);
+    }
+
+    session
+        .refresh_recorded_patch_ops_for_slots(&[(0, 0)])
+        .expect("refresh patch ops");
+
+    let PatchOp::Insert {
+        up_vector_b64,
+        down_vector_b64,
+        ..
+    } = &session.patch_recording.as_ref().unwrap().operations[0]
+    else {
+        panic!("expected insert op");
+    };
+    let up = larql_vindex::patch::core::decode_gate_vector(up_vector_b64.as_ref().unwrap())
+        .expect("decode refreshed up");
+    let down = larql_vindex::patch::core::decode_gate_vector(down_vector_b64.as_ref().unwrap())
+        .expect("decode refreshed down");
+
+    assert_eq!(up, vec![1.1, 1.2, 1.3, 1.4]);
+    assert_eq!(down, vec![2.1, 2.2, 2.3, 2.4]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── COMPILE INTO VINDEX integration tests ──────────────────────────────
 
 #[test]
@@ -894,6 +1028,54 @@ fn compile_into_vindex_no_patches_succeeds() {
         "expected compile output: {joined}"
     );
     assert!(output.exists(), "compiled vindex directory should exist");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_path_into_vindex_uses_supplied_source_without_active_backend() {
+    let dir = make_test_vindex_dir("compile_path_source");
+    let output = dir.join("compiled_from_path.vindex");
+    let mut session = Session::new();
+
+    let stmt = parser::parse(&format!(
+        r#"COMPILE "{}" INTO VINDEX "{}";"#,
+        dir.display(),
+        output.display()
+    ))
+    .unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("path-form COMPILE INTO VINDEX should load its source");
+    let joined = out.join("\n");
+
+    assert!(
+        joined.contains("Compiled"),
+        "expected compile output: {joined}"
+    );
+    assert!(output.exists(), "compiled vindex directory should exist");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_path_into_model_reports_supplied_source_requirements() {
+    let dir = make_test_vindex_dir("compile_path_model_source");
+    let output = dir.join("model_out");
+    let mut session = Session::new();
+
+    let stmt = parser::parse(&format!(
+        r#"COMPILE "{}" INTO MODEL "{}";"#,
+        dir.display(),
+        output.display()
+    ))
+    .unwrap();
+    let err = session
+        .execute(&stmt)
+        .expect_err("browse-only source should fail after path source is loaded");
+
+    assert!(
+        err.to_string().contains("requires model weights"),
+        "expected source-level model-weight error, got: {err}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -970,6 +1152,8 @@ fn compile_on_conflict_fail_detects_collision() {
                 target: "t".into(),
                 confidence: Some(0.9),
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             }],
         };
@@ -1018,6 +1202,8 @@ fn compile_on_conflict_last_wins_succeeds() {
                 target: "t".into(),
                 confidence: Some(0.9),
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: None,
             }],
         };
@@ -1052,6 +1238,8 @@ fn memit_facts_count_inserts_only() {
             target: "Y".into(),
             confidence: Some(0.9),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         },
         PatchOp::Delete {
@@ -1063,6 +1251,8 @@ fn memit_facts_count_inserts_only() {
             layer: 0,
             feature: 2,
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         },
     ];
@@ -1093,6 +1283,8 @@ fn memit_facts_deduplicate_across_patches() {
             target: "Paris".into(),
             confidence: Some(conf),
             gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: None,
         }],
     };
@@ -1424,18 +1616,211 @@ fn knn_store_insert_at_layer_hint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── InferenceWeights format dispatch ──
+//
+// These tests verify that the format-agnostic abstraction routes correctly
+// without branching on `config.quant` in callers.
+
+#[test]
+fn knn_insert_q4k_flagged_no_weights_uses_embedding_fallback() {
+    // A vindex with quant=Q4K but has_model_weights=false must still use the
+    // embedding-key fallback path (not the InferenceWeights path). The quant
+    // flag should be irrelevant when there are no weights to load.
+    use larql_models::TopKEntry;
+    use larql_vindex::{ExtractLevel, FeatureMeta, StorageDtype, VectorIndex, VindexConfig};
+
+    let dir = std::env::temp_dir().join("larql_lql_test_q4k_embed_fallback");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let hidden = 4;
+    let num_features = 3;
+    let num_layers = 2;
+    let vocab_size = 10;
+
+    let make_meta = |tok: &str, id: u32, c: f32| FeatureMeta {
+        top_token: tok.to_string(),
+        top_token_id: id,
+        c_score: c,
+        top_k: vec![TopKEntry {
+            token: tok.to_string(),
+            token_id: id,
+            logit: c,
+        }],
+    };
+    let gate0 = ndarray::Array2::<f32>::zeros((num_features, hidden));
+    let gate1 = ndarray::Array2::<f32>::zeros((num_features, hidden));
+    let meta0 = vec![
+        Some(make_meta("Paris", 100, 0.95)),
+        Some(make_meta("French", 101, 0.88)),
+        Some(make_meta("Europe", 102, 0.75)),
+    ];
+    let meta1 = vec![
+        Some(make_meta("Berlin", 200, 0.90)),
+        None,
+        Some(make_meta("Spain", 202, 0.70)),
+    ];
+    let index = VectorIndex::new(
+        vec![Some(gate0), Some(gate1)],
+        vec![Some(meta0), Some(meta1)],
+        num_layers,
+        hidden,
+    );
+    let mut config = VindexConfig {
+        version: 2,
+        model: "test/q4k-no-weights".into(),
+        family: "llama".into(),
+        source: None,
+        checksums: None,
+        num_layers,
+        hidden_size: hidden,
+        intermediate_size: num_features,
+        vocab_size,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::Browse,
+        dtype: StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::Q4K, // quantised flag…
+        layer_bands: None,
+        layers: Vec::new(),
+        down_top_k: 5,
+        has_model_weights: false, // …but no weights on disk
+        model_config: None,
+        fp4: None,
+        ffn_layout: None,
+    };
+    index.save_vindex(&dir, &mut config).unwrap();
+    let embed_bytes = vec![0u8; vocab_size * hidden * 4];
+    std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    session.execute(&stmt).expect("USE");
+
+    // INSERT must succeed via the embedding-key fallback — not attempt to load q4k weights.
+    let stmt = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target) VALUES ("Atlantis", "capital", "Poseidon");"#,
+    ).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("INSERT should use embedding fallback on q4k+no-weights");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("KNN store"),
+        "expected KNN store mode: {joined}"
+    );
+    assert!(
+        joined.contains("embedding key"),
+        "expected embedding-key mode (no weights): {joined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_on_q4k_vindex_returns_clear_error() {
+    // TRACE should return a helpful error on q4k vindexes rather than the
+    // cryptic "load_model_weights only handles float weights" message.
+    use larql_models::TopKEntry;
+    use larql_vindex::{ExtractLevel, FeatureMeta, StorageDtype, VectorIndex, VindexConfig};
+
+    let dir = std::env::temp_dir().join("larql_lql_test_q4k_trace_error");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let hidden = 4;
+    let num_features = 2;
+    let num_layers = 2;
+    let vocab_size = 10;
+
+    let make_meta = |tok: &str, id: u32, c: f32| FeatureMeta {
+        top_token: tok.to_string(),
+        top_token_id: id,
+        c_score: c,
+        top_k: vec![TopKEntry {
+            token: tok.to_string(),
+            token_id: id,
+            logit: c,
+        }],
+    };
+    let gate0 = ndarray::Array2::<f32>::zeros((num_features, hidden));
+    let meta0 = vec![
+        Some(make_meta("test", 1, 0.5)),
+        Some(make_meta("foo", 2, 0.3)),
+    ];
+    let index = VectorIndex::new(
+        vec![Some(gate0.clone()), Some(gate0)],
+        vec![Some(meta0.clone()), Some(meta0)],
+        num_layers,
+        hidden,
+    );
+    let mut config = VindexConfig {
+        version: 2,
+        model: "test/q4k-trace".into(),
+        family: "llama".into(),
+        source: None,
+        checksums: None,
+        num_layers,
+        hidden_size: hidden,
+        intermediate_size: num_features,
+        vocab_size,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::Browse,
+        dtype: StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::Q4K,
+        layer_bands: None,
+        layers: Vec::new(),
+        down_top_k: 5,
+        has_model_weights: true,
+        model_config: None,
+        fp4: None,
+        ffn_layout: None,
+    };
+    index.save_vindex(&dir, &mut config).unwrap();
+    let embed_bytes = vec![0u8; vocab_size * hidden * 4];
+    std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
+
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    session.execute(&stmt).expect("USE");
+
+    let stmt = parser::parse(r#"TRACE "hello world";"#).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T2") || msg.contains("q4k") || msg.contains("quantised"),
+        "expected clear q4k error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("only handles float"),
+        "must not expose internal loader error: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── COMPACT MAJOR persistence (Backend::Vindex.memit_store wiring) ──
 
 #[test]
 fn memit_store_mut_unavailable_without_backend() {
     let mut session = Session::new();
-    assert!(matches!(session.memit_store_mut().unwrap_err(), LqlError::NoBackend));
+    assert!(matches!(
+        session.memit_store_mut().unwrap_err(),
+        LqlError::NoBackend
+    ));
 }
 
 #[test]
 fn memit_store_mut_returns_empty_store_on_fresh_vindex() {
     let (mut session, dir) = vindex_session("memit_empty");
-    let store = session.memit_store_mut().expect("vindex backend has memit_store");
+    let store = session
+        .memit_store_mut()
+        .expect("vindex backend has memit_store");
     assert_eq!(store.num_cycles(), 0);
     assert_eq!(store.total_facts(), 0);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1528,7 +1913,8 @@ fn rebalance_without_backend_is_noop() {
         .execute(&stmt)
         .expect("REBALANCE with empty install set should succeed");
     assert!(
-        out.iter().any(|line| line.contains("no compose-mode installs")),
+        out.iter()
+            .any(|line| line.contains("no compose-mode installs")),
         "expected empty-installs note in: {out:?}"
     );
 }
@@ -1543,7 +1929,8 @@ fn rebalance_without_compose_installs_is_noop() {
         .execute(&stmt)
         .expect("REBALANCE on empty compose set should succeed");
     assert!(
-        out.iter().any(|line| line.contains("no compose-mode installs")),
+        out.iter()
+            .any(|line| line.contains("no compose-mode installs")),
         "expected empty-installs note in: {out:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);

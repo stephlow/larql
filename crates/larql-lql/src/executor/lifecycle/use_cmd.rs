@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use crate::ast::UseTarget;
 use crate::error::LqlError;
+use crate::executor::helpers::{dir_size, format_number};
 use crate::executor::{Backend, Session};
-use crate::executor::helpers::{format_number, dir_size};
 use crate::relations::RelationClassifier;
+use larql_vindex::format::filenames::KNN_STORE_BIN;
 
 impl Session {
     pub(crate) fn exec_use(&mut self, target: &UseTarget) -> Result<Vec<String>, LqlError> {
@@ -63,7 +64,7 @@ impl Session {
                 let mut patched = larql_vindex::PatchedVindex::new(index);
 
                 // Load KNN store if present (Architecture B)
-                let knn_path = path.join("knn_store.bin");
+                let knn_path = path.join(KNN_STORE_BIN);
                 if knn_path.exists() {
                     match larql_vindex::KnnStore::load(&knn_path) {
                         Ok(store) => {
@@ -88,7 +89,10 @@ impl Session {
                 self.auto_patch = false;
                 Ok(out)
             }
-            UseTarget::Model { id, auto_extract: _ } => {
+            UseTarget::Model {
+                id,
+                auto_extract: _,
+            } => {
                 let mut out = Vec::new();
                 out.push(format!("Loading model: {id}..."));
 
@@ -102,10 +106,7 @@ impl Session {
                 let size_gb = dir_size(&model_path) as f64 / (1024.0 * 1024.0 * 1024.0);
                 out.push(format!(
                     "Using model: {} ({} layers, hidden={}, {:.1} GB, live weights)",
-                    id,
-                    weights.num_layers,
-                    weights.hidden_size,
-                    size_gb,
+                    id, weights.num_layers, weights.hidden_size, size_gb,
                 ));
                 out.push("Supported: INFER, EXPLAIN INFER, STATS. For WALK/DESCRIBE/SELECT, use EXTRACT first.".into());
 

@@ -11,6 +11,11 @@ categories = ["science"]
 [dependencies]
 # Matrix types
 ndarray = { version = "0.16", features = ["blas"] }
+# MoE expert parallelism: top-k experts run independently per token.
+rayon = "1.10"
+# Wire-format constants (Q4_K_BLOCK_ELEMS, etc.) for padding decisions.
+# Tests/benches depend on it too — keep both lists in sync.
+larql-models = { path = "../larql-models" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
@@ -19,12 +24,20 @@ openblas-src = { version = "0.10", features = ["system"] }
 # Metal GPU (macOS only, optional)
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }
+# Direct objc msg_send! for Metal API not exposed by metal-rs 0.29 —
+# specifically `MTLCommandBuffer.GPUStartTime/GPUEndTime` for production
+# decode timing diagnostics. Same major version metal-rs uses internally.
+objc = { version = "0.2", optional = true }
 blas-src = { version = "0.10", features = ["accelerate"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+blas-src = { version = "0.10", features = ["openblas"], default-features = false }
+openblas-src = { version = "0.10", features = ["system"] }
 
 
 [features]
 default = []
-metal = ["dep:metal"]
+metal = ["dep:metal", "dep:objc"]
 # cuda = []  # Future: CUDA backend
 
 [build-dependencies]
@@ -37,7 +50,6 @@ libc = "0.2"
 criterion = "0.5"
 serde_json = "1"
 memmap2 = "0.9"
-larql-models = { path = "../larql-models" }
 
 [[bench]]
 name = "matmul"
@@ -45,4 +57,8 @@ harness = false
 
 [[bench]]
 name = "linalg"
+harness = false
+
+[[bench]]
+name = "quant_matvec"
 harness = false

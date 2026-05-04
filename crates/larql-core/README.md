@@ -19,9 +19,24 @@ graph.add_edge(
     Edge::new("Paris", "river", "Seine")
         .with_confidence(0.88)
 );
+assert_eq!(
+    graph.try_add_edge(Edge::new("France", "capital", "Paris")),
+    EdgeInsertResult::Duplicate
+);
+assert_eq!(
+    graph.insert_edge(
+        Edge::new("France", "capital", "Paris")
+            .with_confidence(0.97)
+            .with_source(SourceType::Parametric)
+    ),
+    EdgeInsertResult::Replaced
+);
 
 // Query
 let capitals = graph.select("France", Some("capital"));
+let capital = graph.get_edge("France", "capital", "Paris").unwrap();
+let edges_to_paris = graph.edges_between("France", "Paris");
+let outgoing_relations = graph.outgoing_relations("France");
 let (dest, path) = graph.walk("France", &["capital", "river"]).unwrap();
 assert_eq!(dest, "Seine");
 
@@ -40,9 +55,20 @@ save_json(&graph, "knowledge.larql.json").unwrap();
 |------|---------|
 | `Graph` | Indexed edge collection with adjacency, reverse, keyword indexes |
 | `Edge` | Directed fact: subject --relation--> object, with confidence and metadata |
+| `EdgeInsertResult` | Explicit mutation result: Inserted, Duplicate, or Replaced |
 | `Schema` | Optional relation type registry and node type inference rules |
 | `Node` | Computed entity with degree info and inferred type |
 | `SourceType` | Edge origin: Parametric, Document, Installed, Wikidata, Manual, Unknown |
+
+`list_entities()`, `list_relations()`, `nodes()`, search tie-breaks, and
+connected components are deterministic. Exact triple lookup is available via
+`get_edge(subject, relation, object)`, and multiedge pair lookup is available
+via `edges_between(subject, object)`.
+
+`add_edge()` preserves the legacy behavior of silently skipping duplicate
+triples. `try_add_edge()` reports `Inserted` or `Duplicate` without replacing,
+while `insert_edge()` upserts by exact triple and can return `Replaced` when
+confidence, source, metadata, or injection changes.
 
 ## Algorithms
 
@@ -57,6 +83,12 @@ save_json(&graph, "knowledge.larql.json").unwrap();
 | Merge | `merge_graphs()` with Union/MaxConfidence/SourcePriority | O(E) |
 | Diff | `diff()` | O(E) |
 | Subgraph | `graph.subgraph()` | O(E within depth) |
+
+Shortest path stores the exact edge chosen during Dijkstra/A*, so returned paths
+and costs stay consistent for multiedges with different relations or weights.
+`TraversalResult.edges` contains edges actually traversed to newly discovered
+nodes. `diff()` reports same-triple changes to confidence, source, metadata,
+and injection.
 
 ## LLM Integration
 
@@ -80,6 +112,10 @@ save_json(&graph, "knowledge.larql.json").unwrap();
 | Checkpoint | (append-only) | (crash-safe log) | - | - |
 
 Packed binary uses string interning — repeated relation names stored once.
+Packed decoding validates header offsets, record bounds, string indexes, and
+metadata ranges before reading. CSV import/export supports quoted commas,
+quotes, CRLF/LF newlines, and multiline fields for the five graph columns:
+`subject,relation,object,confidence,source`.
 
 ## Crate Structure
 
@@ -103,7 +139,7 @@ larql-core/src/
 │   └── diff.rs             Graph diffing (added, removed, changed)
 ├── engine/
 │   ├── provider.rs         ModelProvider trait, PredictionResult
-│   ├─�� http_provider.rs    OpenAI-compatible HTTP provider (feature-gated)
+│   ├── http_provider.rs    OpenAI-compatible HTTP provider (feature-gated)
 │   ├── mock_provider.rs    Mock provider for testing
 │   ├── bfs.rs              BFS knowledge extraction from LLM
 │   ├── chain.rs            Multi-token chaining
@@ -112,53 +148,74 @@ larql-core/src/
     ├── format.rs           Format enum, auto-detection from extension
     ├── json.rs             JSON serialization (Python-compatible)
     ├── msgpack.rs          MessagePack (feature-gated)
-    ├── packed.rs           String-interned binary format
-    ├── csv.rs              Simple CSV import/export
+    ├── packed.rs           String-interned binary format with corrupt-input checks
+    ├── csv.rs              CSV import/export with quoted-field support
     └── checkpoint.rs       Append-only crash-safe log
 ```
 
 ## Testing
 
 ```bash
-cargo test -p larql-core                                  # 167 tests
+cargo test -p larql-core                                  # 183 tests
+cargo test -p larql-core --no-default-features --features msgpack
+cargo clippy -p larql-core --tests -- -D warnings
+cargo llvm-cov -p larql-core --summary-only
 cargo run --release -p larql-core --example bench_graph   # Benchmark
 cargo run -p larql-core --example graph_demo              # Feature showcase
 cargo run -p larql-core --example algorithm_demo          # Algorithm examples
 ```
 
-### Benchmarks (100K edges, M3 Max)
+### Benchmarks (100K edges, release build)
 
 | Operation | Latency |
 |-----------|---------|
-| Insert (100K edges) | 152ms (1.5us/edge) |
+| Insert (100K edges) | 154ms (1.5us/edge) |
 | select(entity, relation) | 0.1us |
 | exists(s, r, o) | 0.1us |
-| search(keyword, 10) | 0.5us |
-| shortest_path (1K nodes) | 14us |
+| search(keyword, 10) | 0.7us |
+| shortest_path (1K nodes) | 19.3us |
 | connected_components (1K nodes) | 478us |
-| are_connected (1K nodes) | 14us |
-| walk_all_paths (3 hops) | 1.1us |
-| bfs_traversal (depth=5) | 11us |
-| pagerank (1K nodes) | 12ms |
-| filter (100K, confidence) | 56ms |
-| Packed binary serialize (100K) | 22ms |
+| are_connected (1K nodes) | 14.7us |
+| walk_all_paths (3 hops) | 1.3us |
+| bfs_traversal (depth=5) | 12.2us |
+| pagerank (1K nodes) | 13.80ms |
+| filter (100K, confidence) | 71.61ms |
+| JSON serialize / deserialize (100K) | 152.75ms / 380.47ms |
+| MsgPack serialize / deserialize (100K) | 150.63ms / 356.58ms |
+| Packed binary serialize / deserialize (100K) | 24.23ms / 271.03ms |
+| stats (100K edges) | 65.36ms |
 
-### Test Coverage (167 tests)
+### Test Coverage (183 tests)
 
 - Graph: construction, queries, walk, search, subgraph, stats, dedupe
+- Accessors: deterministic entities, relations, nodes, search tie-breaks, exact edge and multiedge lookup
+- Mutation: legacy duplicate skipping, explicit duplicate reporting, upsert replacement
 - Edge: builder pattern, equality, hashing, compact serialization
 - Schema: type rules, inference, JSON roundtrip
-- Algorithms: shortest path, PageRank, BFS/DFS, merge, diff, filter
+- Algorithms: shortest path, multiedge reconstruction, PageRank, BFS/DFS, merge, diff, filter
 - Components: enumeration, connectivity, disconnected graphs, edge cases
 - Walk: highest-confidence selection, multi-path, all-paths, limits
 - Remove edge: index rebuild correctness
 - Search: empty query, no match, case insensitive
-- Serialization: JSON/MsgPack/Packed roundtrips, metadata preservation
+- Serialization: JSON/MsgPack/Packed roundtrips, metadata preservation, corrupt packed input
+- CSV: quoted commas, escaped quotes, multiline fields, confidence/source roundtrips
+- Diff: confidence, source, metadata, and injection changes
 - BFS extraction: mock provider, depth, multi-seed, max_entities
 - Token chaining: multi-token, stop tokens, probability threshold
 - Templates: registry, JSON load/save
 - Checkpoint: append, replay, persistence
 - Python compatibility: format interop
+
+Current `cargo llvm-cov` summary:
+
+| Command | Line coverage | Region coverage |
+|---------|---------------|-----------------|
+| `cargo llvm-cov -p larql-core --summary-only` | 77.92% | 78.60% |
+| `cargo llvm-cov -p larql-core --no-default-features --features msgpack --summary-only` | 79.84% | 79.91% |
+
+Default coverage includes the optional HTTP provider. The no-default/msgpack
+profile is a better signal for the core graph/serialization surface until
+`HttpProvider` has a local mock-server test.
 
 ## Design Principles
 

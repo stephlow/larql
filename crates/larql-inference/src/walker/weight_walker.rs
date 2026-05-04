@@ -10,10 +10,11 @@
 use larql_core::core::edge::Edge;
 use larql_core::core::enums::SourceType;
 use larql_core::core::graph::Graph;
+use larql_vindex::format::filenames::*;
 
 use super::utils::{count_threshold, decode_token, partial_top_k_column, top_entities};
 use crate::error::InferenceError;
-use crate::model::{load_model_dir, resolve_model_path, ModelWeights};
+use crate::model::{load_model_dir_validated, resolve_model_path, ModelWeights};
 
 /// Result of walking a single layer.
 #[derive(Debug, Clone)]
@@ -105,9 +106,9 @@ struct RawEdge {
 impl WeightWalker {
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir(&model_path)?;
+        let weights = load_model_dir_validated(&model_path)?;
 
-        let tokenizer_path = model_path.join("tokenizer.json");
+        let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {
             return Err(InferenceError::MissingTensor(
                 "tokenizer.json not found".into(),
@@ -357,4 +358,43 @@ pub fn walk_model(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ThresholdCounts ───────────────────────────────────────────────────────
+
+    #[test]
+    fn threshold_counts_default_all_zero() {
+        let t = ThresholdCounts::default();
+        assert_eq!(t.t_01, 0);
+        assert_eq!(t.t_05, 0);
+        assert_eq!(t.t_10, 0);
+        assert_eq!(t.t_25, 0);
+        assert_eq!(t.t_50, 0);
+        assert_eq!(t.t_75, 0);
+        assert_eq!(t.t_90, 0);
+    }
+
+    // ── WalkConfig ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_config_default_values() {
+        let c = WalkConfig::default();
+        assert_eq!(c.top_k, 5);
+        assert!((c.min_score - 0.02).abs() < 1e-6);
+    }
+
+    // ── LayerStats ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn layer_stats_default_zero() {
+        let s = LayerStats::default();
+        assert_eq!(s.self_loop_count, 0);
+        assert_eq!(s.self_loop_pct, 0.0);
+        assert!(s.top_subjects.is_empty());
+        assert!(s.top_objects.is_empty());
+    }
 }

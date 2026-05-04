@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
+use axum::Json;
 use serde::Deserialize;
 
 use crate::error::ServerError;
-use crate::state::{AppState, LoadedModel};
+use crate::state::{elapsed_ms, AppState, LoadedModel};
 
 #[derive(Deserialize)]
 pub struct SelectRequest {
@@ -28,8 +28,12 @@ pub struct SelectRequest {
     pub order: String,
 }
 
-fn default_limit() -> usize { 20 }
-fn default_order() -> String { "desc".into() }
+fn default_limit() -> usize {
+    20
+}
+fn default_order() -> String {
+    "desc".into()
+}
 
 fn select_edges(
     model: &LoadedModel,
@@ -95,19 +99,33 @@ fn select_edges(
     match req.order_by.as_deref() {
         Some("gate_score") | Some("confidence") | Some("c_score") => {
             rows.sort_by(|a, b| {
-                let cmp = a.c_score.partial_cmp(&b.c_score).unwrap_or(std::cmp::Ordering::Equal);
-                if descending { cmp.reverse() } else { cmp }
+                let cmp = a
+                    .c_score
+                    .partial_cmp(&b.c_score)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                if descending {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
             });
         }
         Some("layer") => {
             rows.sort_by(|a, b| {
                 let cmp = a.layer.cmp(&b.layer);
-                if descending { cmp.reverse() } else { cmp }
+                if descending {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
             });
         }
         _ => {
             rows.sort_by(|a, b| {
-                let cmp = a.c_score.partial_cmp(&b.c_score).unwrap_or(std::cmp::Ordering::Equal);
+                let cmp = a
+                    .c_score
+                    .partial_cmp(&b.c_score)
+                    .unwrap_or(std::cmp::Ordering::Equal);
                 cmp.reverse()
             });
         }
@@ -132,12 +150,10 @@ fn select_edges(
         })
         .collect();
 
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
     Ok(serde_json::json!({
         "edges": edges,
         "total": total,
-        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        "latency_ms": elapsed_ms(start),
     }))
 }
 
@@ -146,10 +162,7 @@ pub async fn handle_select(
     Json(req): Json<SelectRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(None)
-        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
-    let model = Arc::clone(model);
+    let model = state.model_or_err(None)?.clone();
     let result = tokio::task::spawn_blocking(move || select_edges(&model, &req))
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
@@ -162,10 +175,7 @@ pub async fn handle_select_multi(
     Json(req): Json<SelectRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
-    let model = state
-        .model(Some(&model_id))
-        .ok_or_else(|| ServerError::NotFound(format!("model '{}' not found", model_id)))?;
-    let model = Arc::clone(model);
+    let model = state.model_or_err(Some(&model_id))?.clone();
     let result = tokio::task::spawn_blocking(move || select_edges(&model, &req))
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;

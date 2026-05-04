@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use crate::ast::{Component, ExtractLevel, Range};
 use crate::error::LqlError;
-use crate::executor::{Backend, Session};
 use crate::executor::helpers::format_number;
+use crate::executor::{Backend, Session};
 use crate::relations::RelationClassifier;
+use larql_vindex::format::filenames::KNN_STORE_BIN;
 
 impl Session {
     pub(crate) fn exec_extract(
@@ -78,7 +79,7 @@ impl Session {
         let mut patched = larql_vindex::PatchedVindex::new(index);
 
         // Load KNN store if present (Architecture B)
-        let knn_path = output_dir.join("knn_store.bin");
+        let knn_path = output_dir.join(KNN_STORE_BIN);
         if knn_path.exists() {
             if let Ok(store) = larql_vindex::KnnStore::load(&knn_path) {
                 patched.knn_store = store;

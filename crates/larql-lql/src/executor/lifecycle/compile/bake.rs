@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::LqlError;
+use larql_vindex::format::filenames::{DOWN_WEIGHTS_BIN, GATE_VECTORS_BIN, WEIGHT_MANIFEST_JSON};
 
 pub(super) fn copy_for_patch(src: &std::path::Path, dst: &std::path::Path) -> Result<(), LqlError> {
     let _ = std::fs::remove_file(dst);
@@ -23,8 +24,8 @@ pub(super) fn patch_down_weights(
     config: &larql_vindex::VindexConfig,
     overrides: &HashMap<(usize, usize), Vec<f32>>,
 ) -> Result<(), LqlError> {
-    let src = source_dir.join("down_weights.bin");
-    let dst = dest_dir.join("down_weights.bin");
+    let src = source_dir.join(DOWN_WEIGHTS_BIN);
+    let dst = dest_dir.join(DOWN_WEIGHTS_BIN);
     if !src.exists() {
         return Err(LqlError::Execution(
             "source vindex has no down_weights.bin — cannot bake overrides".into(),
@@ -119,7 +120,7 @@ pub(super) fn apply_memit_deltas_to_down_weights(
     config: &larql_vindex::VindexConfig,
     results: &[larql_inference::MemitResult],
 ) -> Result<(), LqlError> {
-    let dst = dest_dir.join("down_weights.bin");
+    let dst = dest_dir.join(DOWN_WEIGHTS_BIN);
     if !dst.exists() {
         return Err(LqlError::Execution(
             "apply_memit_deltas: down_weights.bin not found in output dir".into(),
@@ -190,7 +191,10 @@ pub(super) fn apply_memit_deltas_to_down_weights(
                 }
                 if dtype_bytes == 4 {
                     let cur = f32::from_le_bytes([
-                        buf[cell], buf[cell + 1], buf[cell + 2], buf[cell + 3],
+                        buf[cell],
+                        buf[cell + 1],
+                        buf[cell + 2],
+                        buf[cell + 3],
                     ]);
                     let next = cur + delta;
                     buf[cell..cell + 4].copy_from_slice(&next.to_le_bytes());
@@ -236,8 +240,8 @@ pub(super) fn patch_gate_vectors(
     if gate_overrides.is_empty() {
         return Ok(());
     }
-    let src = source_dir.join("gate_vectors.bin");
-    let dst = dest_dir.join("gate_vectors.bin");
+    let src = source_dir.join(GATE_VECTORS_BIN);
+    let dst = dest_dir.join(GATE_VECTORS_BIN);
     if !src.exists() {
         return Err(LqlError::Execution(
             "source vindex has no gate_vectors.bin — cannot bake gate overrides".into(),
@@ -344,7 +348,7 @@ pub(super) fn patch_up_weights(
 
     // Read the weight manifest from the SOURCE vindex — the dest copy
     // was hard-linked from source and we haven't modified the manifest.
-    let manifest_path = source_dir.join("weight_manifest.json");
+    let manifest_path = source_dir.join(WEIGHT_MANIFEST_JSON);
     if !manifest_path.exists() {
         // Manifestless vindex — we can't safely locate the up tensors.
         // Log and skip. The compiled vindex will still have baked
@@ -367,18 +371,32 @@ pub(super) fn patch_up_weights(
     // those layers is silently skipped.
     let mut layer_up_lookup: HashMap<usize, (String, u64, u64)> = HashMap::new();
     for entry in &entries {
-        let Some(key) = entry.get("key").and_then(|v| v.as_str()) else { continue };
+        let Some(key) = entry.get("key").and_then(|v| v.as_str()) else {
+            continue;
+        };
         if !key.contains("up_proj") {
             continue;
         }
-        let Some(file) = entry.get("file").and_then(|v| v.as_str()) else { continue };
-        let Some(offset) = entry.get("offset").and_then(|v| v.as_u64()) else { continue };
-        let Some(length) = entry.get("length").and_then(|v| v.as_u64()) else { continue };
+        let Some(file) = entry.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(offset) = entry.get("offset").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(length) = entry.get("length").and_then(|v| v.as_u64()) else {
+            continue;
+        };
         // Extract the layer number from the key: the segment after
         // `layers.` and before the next `.`.
-        let Some(rest) = key.split("layers.").nth(1) else { continue };
-        let Some(layer_str) = rest.split('.').next() else { continue };
-        let Ok(layer) = layer_str.parse::<usize>() else { continue };
+        let Some(rest) = key.split("layers.").nth(1) else {
+            continue;
+        };
+        let Some(layer_str) = rest.split('.').next() else {
+            continue;
+        };
+        let Ok(layer) = layer_str.parse::<usize>() else {
+            continue;
+        };
         layer_up_lookup.insert(layer, (file.to_string(), offset, length));
     }
 
@@ -479,7 +497,11 @@ mod tests {
     /// Build a minimal `VindexConfig` shaped for these tests.
     /// Only the dimensions matter for `patch_down_weights`; everything
     /// else is dummy.
-    fn mini_config(num_layers: usize, hidden: usize, intermediate: usize) -> larql_vindex::VindexConfig {
+    fn mini_config(
+        num_layers: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> larql_vindex::VindexConfig {
         larql_vindex::VindexConfig {
             version: 1,
             model: "test".into(),
@@ -499,6 +521,8 @@ mod tests {
             down_top_k: 10,
             has_model_weights: true,
             model_config: None,
+            fp4: None,
+            ffn_layout: None,
         }
     }
 
@@ -554,7 +578,9 @@ mod tests {
         let mut out = Vec::with_capacity(hidden);
         for row in 0..hidden {
             let cell = (layer * layer_elems + row * intermediate + feature) * 4;
-            out.push(f32::from_le_bytes(bytes[cell..cell + 4].try_into().unwrap()));
+            out.push(f32::from_le_bytes(
+                bytes[cell..cell + 4].try_into().unwrap(),
+            ));
         }
         let _ = num_layers; // unused but documents the layout
         out
@@ -620,8 +646,9 @@ mod tests {
         // Adjacent column at L2 F4 must be untouched.
         let neighbour = read_column_f32(&dst, layer, feature - 1, num_layers, hidden, intermediate);
         for (row, val) in neighbour.iter().enumerate() {
-            let expected =
-                ((layer * hidden * intermediate + row * intermediate + (feature - 1)) as f32) * 0.001;
+            let expected = ((layer * hidden * intermediate + row * intermediate + (feature - 1))
+                as f32)
+                * 0.001;
             assert!(
                 (val - expected).abs() < 1e-6,
                 "L2 F4 row {row}: got {val}, expected {expected}"

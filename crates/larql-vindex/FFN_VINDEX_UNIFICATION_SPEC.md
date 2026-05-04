@@ -1,6 +1,9 @@
 # FFN-Vindex Unification Spec
 
 **Version:** 0.1 (2026-04-15)
+**Status (2026-04-25):** Not yet implemented. `patch/knn_store.rs` and the
+KNN override branch in `exec_infer` still exist; this spec describes the
+target state, not current code. Tracked in [ROADMAP.md](ROADMAP.md) under P2.
 **Scope:** `larql-vindex`, `larql-lql`, `larql-inference`, `larql-python`
 **Goal:** Collapse arch-B's parallel `KnnStore` into the FFN vindex itself. One data structure, one INSERT path, one INFER path.
 

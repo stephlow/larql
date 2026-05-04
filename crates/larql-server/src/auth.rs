@@ -7,6 +7,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 
+use crate::http::{BEARER_PREFIX, HEALTH_PATH};
 use crate::state::AppState;
 
 /// Middleware that validates the Authorization: Bearer <api_key> header.
@@ -22,7 +23,7 @@ pub async fn auth_middleware(
     };
 
     // Allow health checks without auth.
-    if request.uri().path() == "/v1/health" {
+    if request.uri().path() == HEALTH_PATH {
         return Ok(next.run(request).await);
     }
 
@@ -32,8 +33,8 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok());
 
     match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let token = &header[7..];
+        Some(header) if header.starts_with(BEARER_PREFIX) => {
+            let token = &header[BEARER_PREFIX.len()..];
             if token == required_key {
                 Ok(next.run(request).await)
             } else {

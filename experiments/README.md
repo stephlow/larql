@@ -105,6 +105,11 @@ Attention output sensitivity to residual perturbation.
 ### 18 — Transformer Recutting
 FSM artifacts for Gemma 3 4B — Phase A. Residual stream recutting experiments.
 
+### 38 — OV Rate-Distortion
+LARQL-native pre-W_O attention capture and rate-distortion gating. Classifies
+heads as static, negligible, tableable, addressing-failed, or irreducible, then
+reports the byte/FLOP split needed for graph-walkable attention.
+
 ---
 
 ## Routing & Geometry

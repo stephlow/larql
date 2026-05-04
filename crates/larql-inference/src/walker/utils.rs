@@ -109,3 +109,161 @@ pub fn partial_top_k_column(
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     indexed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use std::collections::HashMap;
+
+    // ── round4 ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn round4_rounds_to_four_decimal_places() {
+        assert_eq!(round4(1.23456789), 1.2346);
+        assert_eq!(round4(0.0), 0.0);
+        assert_eq!(round4(1.0), 1.0);
+    }
+
+    #[test]
+    fn round4_preserves_exact_values() {
+        assert_eq!(round4(0.1234), 0.1234);
+        assert_eq!(round4(-3.5678), -3.5678);
+    }
+
+    // ── top_entities ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn top_entities_returns_top_n_by_count() {
+        let mut counts: HashMap<String, (usize, f64)> = HashMap::new();
+        counts.insert("a".into(), (5, 2.5)); // count=5, avg_conf=0.5
+        counts.insert("b".into(), (10, 8.0)); // count=10, avg_conf=0.8
+        counts.insert("c".into(), (2, 1.0)); // count=2, avg_conf=0.5
+        let top = top_entities(&counts, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, "b"); // highest count first
+        assert_eq!(top[0].1, 10);
+        assert_eq!(top[1].0, "a");
+    }
+
+    #[test]
+    fn top_entities_averages_confidence_correctly() {
+        let mut counts: HashMap<String, (usize, f64)> = HashMap::new();
+        counts.insert("x".into(), (4, 2.0)); // avg = 0.5
+        let top = top_entities(&counts, 1);
+        assert!((top[0].2 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn top_entities_empty_map_returns_empty() {
+        let counts: HashMap<String, (usize, f64)> = HashMap::new();
+        assert!(top_entities(&counts, 5).is_empty());
+    }
+
+    #[test]
+    fn top_entities_n_larger_than_map_returns_all() {
+        let mut counts: HashMap<String, (usize, f64)> = HashMap::new();
+        counts.insert("x".into(), (1, 1.0));
+        counts.insert("y".into(), (2, 2.0));
+        let top = top_entities(&counts, 100);
+        assert_eq!(top.len(), 2);
+    }
+
+    // ── count_threshold ───────────────────────────────────────────────────────
+
+    fn fresh() -> super::super::weight_walker::ThresholdCounts {
+        super::super::weight_walker::ThresholdCounts::default()
+    }
+
+    #[test]
+    fn count_threshold_increments_all_for_high_value() {
+        let mut t = fresh();
+        count_threshold(&mut t, 0.95);
+        assert_eq!(t.t_01, 1);
+        assert_eq!(t.t_05, 1);
+        assert_eq!(t.t_10, 1);
+        assert_eq!(t.t_25, 1);
+        assert_eq!(t.t_50, 1);
+        assert_eq!(t.t_75, 1);
+        assert_eq!(t.t_90, 1);
+    }
+
+    #[test]
+    fn count_threshold_increments_only_low_for_small_value() {
+        let mut t = fresh();
+        count_threshold(&mut t, 0.03);
+        assert_eq!(t.t_01, 1);
+        assert_eq!(t.t_05, 0);
+        assert_eq!(t.t_10, 0);
+    }
+
+    #[test]
+    fn count_threshold_none_for_zero() {
+        let mut t = fresh();
+        count_threshold(&mut t, 0.0);
+        assert_eq!(t.t_01, 0);
+    }
+
+    // ── current_date ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn current_date_has_yyyy_mm_dd_format() {
+        let d = current_date();
+        let parts: Vec<&str> = d.split('-').collect();
+        assert_eq!(parts.len(), 3, "expected YYYY-MM-DD, got: {d}");
+        assert_eq!(parts[0].len(), 4, "year should be 4 digits");
+        assert_eq!(parts[1].len(), 2, "month should be 2 digits");
+        assert_eq!(parts[2].len(), 2, "day should be 2 digits");
+    }
+
+    // ── partial_top_k ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn partial_top_k_returns_k_items_in_desc_order() {
+        let data = vec![0.1f32, 0.9, 0.3, 0.7, 0.5];
+        let top = partial_top_k(&data, 3);
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].0, 1); // index of 0.9
+        assert_eq!(top[1].0, 3); // index of 0.7
+        assert!(top[0].1 >= top[1].1, "should be descending");
+        assert!(top[1].1 >= top[2].1);
+    }
+
+    #[test]
+    fn partial_top_k_zero_k_returns_empty() {
+        let data = vec![1.0f32, 2.0, 3.0];
+        assert!(partial_top_k(&data, 0).is_empty());
+    }
+
+    #[test]
+    fn partial_top_k_k_larger_than_data_returns_all_sorted() {
+        let data = vec![0.5f32, 0.1, 0.9];
+        let top = partial_top_k(&data, 100);
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].0, 2); // 0.9 first
+    }
+
+    #[test]
+    fn partial_top_k_empty_input_returns_empty() {
+        assert!(partial_top_k(&[], 5).is_empty());
+    }
+
+    // ── partial_top_k_column ──────────────────────────────────────────────────
+
+    #[test]
+    fn partial_top_k_column_extracts_correct_column() {
+        // 4×3 matrix; column 1 values are [2, 5, 1, 8]
+        let data: Vec<f32> = vec![0.0, 2.0, 0.0, 0.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 8.0, 0.0];
+        let m = Array2::from_shape_vec((4, 3), data).unwrap();
+        let top = partial_top_k_column(&m, 1, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, 3); // row 3 has value 8
+        assert_eq!(top[1].0, 1); // row 1 has value 5
+    }
+
+    #[test]
+    fn partial_top_k_column_k_zero_returns_empty() {
+        let m = Array2::from_elem((4, 2), 1.0f32);
+        assert!(partial_top_k_column(&m, 0, 0).is_empty());
+    }
+}

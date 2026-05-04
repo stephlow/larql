@@ -34,14 +34,40 @@ The rungs are not interchangeable — they answer different questions:
 
 ## Implementation status
 
-| Strategy | End-to-end real | Synthetic encode/decode |
-|---|---|---|
-| Standard KV | ✓ `real_model::kv_capture` + `standard_kv` | ✓ |
-| TurboQuant | ✓ `real_model::turboquant_layer` + `turboquant` | ✓ |
-| Markov RS (W=512) | ✓ `real_model::markov_layer` (`rs_prefill`, `rs_decode_step`) — proven bit-perfect end-to-end (Tier 1 / variant iv-dense) | ✓ |
-| `UnlimitedContextEngine` (Tier 2) | ✓ `unlimited_context::` — Rust port of `chuk-mlx/.../unlimited_engine.py`; integration tests `tests/test_unlimited_context.rs` | — |
-| `ApolloEngine` (Tier 3) | ✓ full end-to-end pipeline on real apollo11_store + Gemma 3 4B. **Four entry points** (`query_greedy`, `query_greedy_compressed`, `query_generate_uncompressed`, `query_generate_compressed` — detailed under Row 5 notes below). Positional-proximity retrieval + answer-only injection produces `" John"` as top-1 for "Who won the porridge eating contest?" on both the uncompressed and compressed paths. | — |
-| Graph Walk | partial — `real_model::graph_walk_layer` + memory accounting via `graph_walk::GraphWalk`; does not implement `KvStrategy` (no K/V reconstruction without cracked attention) | — |
+All engines now live in `larql_inference::engines::kv_engines/`. This crate
+re-exports from there; the implementations are no longer duplicated here.
+
+| Strategy | Lives in | End-to-end real | Synthetic |
+|---|---|---|---|
+| Standard KV | `real_model::kv_capture` | ✓ | ✓ `standard_kv` |
+| TurboQuant | `larql_inference::engines::kv_engines::turbo_quant` | ✓ (~95 tok/s Metal) | ✓ |
+| Markov RS | `larql_inference::engines::kv_engines::markov_residual` | ✓ (~95 tok/s Metal, bit-perfect) | ✓ |
+| UnlimitedContext | `larql_inference::engines::kv_engines::unlimited_context` | ✓ (~94 tok/s Metal) | ✓ |
+| ApolloEngine | `larql_inference::engines::kv_engines::apollo` | ✓ (compressed path via `forward_from_layer`) | ✓ |
+| Graph Walk | `graph_walk::GraphWalk` (memory accounting only) | partial | — |
+
+### Speed (Gemma 3 4B, Metal Q4K, 2026-04-26)
+
+All engines use `prefill_q4k`/`decode_step_q4k` → Metal `decode_token` pipeline:
+
+```
+Backend                           prefill    ms/tok   tok/s
+larql-metal (standard)            58ms       13ms     76.7
+markov-rs (Q4K Metal)             294ms      10.5ms   95.2
+unlimited-context (Q4K Metal)     208ms      10.6ms   94.3
+turbo-quant 4-bit (Q4K Metal)     203ms      10.6ms   94.8
+turbo-quant 3-bit (Q4K Metal)     201ms      10.6ms   94.3
+```
+
+Apollo runs on the CPU compressed path (4 layers via `forward_from_layer`).
+
+### Criterion benchmarks
+
+```
+cargo bench -p kv-cache-benchmark --bench kv_strategies
+```
+
+30 benchmarks across 6 groups: encode, wht, memory_sweep, accuracy, engine_kind, engine_memory.
 
 ### Latest measured run — 2026-04-23, Gemma 3 4B (q4k vindex)
 

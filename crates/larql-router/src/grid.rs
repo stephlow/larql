@@ -12,9 +12,8 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    AckMsg, AnnounceMsg, Gap, GridService, ModelCoverage, RejectMsg, RouterMessage,
-    RouterPayload, ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest,
-    StatusResponse,
+    AckMsg, AnnounceMsg, Gap, GridService, ModelCoverage, RejectMsg, RouterMessage, RouterPayload,
+    ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest, StatusResponse,
 };
 
 // ── Per-server record ─────────────────────────────────────────────────────────
@@ -112,7 +111,9 @@ impl GridState {
         let mut out = HashMap::with_capacity(layers.len());
         for &layer in layers {
             match self.route(model_id, layer as u32) {
-                Some(url) => { out.insert(layer, url); }
+                Some(url) => {
+                    out.insert(layer, url);
+                }
                 None => return Err(layer),
             }
         }
@@ -142,7 +143,10 @@ impl GridState {
             by_model.entry(&entry.model_id).or_default().push(entry);
         }
         for (model_id, entries) in &by_model {
-            let layer_count: u32 = entries.iter().map(|e| e.layer_end - e.layer_start + 1).sum();
+            let layer_count: u32 = entries
+                .iter()
+                .map(|e| e.layer_end - e.layer_start + 1)
+                .sum();
             tracing::info!(
                 model_id = model_id,
                 servers = entries.len(),
@@ -152,11 +156,30 @@ impl GridState {
         }
     }
 
+    /// All distinct `listen_url` values across all registered servers.
+    /// Used by the `/v1/stats` proxy to find a shard to forward to.
+    pub fn all_shard_urls(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.servers
+            .values()
+            .filter_map(|s| {
+                if seen.insert(s.listen_url.clone()) {
+                    Some(s.listen_url.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn status_response(&self) -> StatusResponse {
         // Build per-model coverage
         let mut by_model: HashMap<String, Vec<&ServerEntry>> = HashMap::new();
         for entry in self.servers.values() {
-            by_model.entry(entry.model_id.clone()).or_default().push(entry);
+            by_model
+                .entry(entry.model_id.clone())
+                .or_default()
+                .push(entry);
         }
 
         let models: Vec<ModelCoverage> = by_model
@@ -230,11 +253,19 @@ pub struct GridServiceImpl {
 impl GridServiceImpl {
     #[allow(dead_code)]
     pub fn new(state: Arc<RwLock<GridState>>) -> Self {
-        Self { state, next_id: AtomicU64::new(1), grid_key: None }
+        Self {
+            state,
+            next_id: AtomicU64::new(1),
+            grid_key: None,
+        }
     }
 
     pub fn new_with_key(state: Arc<RwLock<GridState>>, key: Option<String>) -> Self {
-        Self { state, next_id: AtomicU64::new(1), grid_key: key }
+        Self {
+            state,
+            next_id: AtomicU64::new(1),
+            grid_key: key,
+        }
     }
 
     fn alloc_server_id(&self) -> String {
@@ -374,5 +405,124 @@ impl GridService for GridServiceImpl {
     ) -> Result<Response<StatusResponse>, Status> {
         let resp = self.state.read().await.status_response();
         Ok(Response::new(resp))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        server_id: &str,
+        listen_url: &str,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+    ) -> ServerEntry {
+        ServerEntry {
+            server_id: server_id.into(),
+            listen_url: listen_url.into(),
+            model_id: model_id.into(),
+            layer_start,
+            layer_end,
+            cpu_pct: 0.0,
+            ram_used: 1024,
+            requests_in_flight: 0,
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn route_uses_inclusive_layer_ranges() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 2));
+        state.register(entry("b", "http://b", "model-a", 3, 5));
+
+        assert_eq!(state.route(Some("model-a"), 0).as_deref(), Some("http://a"));
+        assert_eq!(state.route(Some("model-a"), 2).as_deref(), Some("http://a"));
+        assert_eq!(state.route(Some("model-a"), 3).as_deref(), Some("http://b"));
+        assert_eq!(state.route(Some("model-a"), 5).as_deref(), Some("http://b"));
+        assert_eq!(state.route(Some("model-a"), 6), None);
+    }
+
+    #[test]
+    fn route_without_model_uses_any_model_table() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+
+        assert_eq!(state.route(None, 1).as_deref(), Some("http://a"));
+        assert_eq!(state.route(None, 2), None);
+    }
+
+    #[test]
+    fn route_prefers_least_loaded_replica() {
+        let mut state = GridState::default();
+        let mut busy = entry("busy", "http://busy", "model-a", 0, 4);
+        busy.requests_in_flight = 12;
+        let mut idle = entry("idle", "http://idle", "model-a", 0, 4);
+        idle.requests_in_flight = 1;
+
+        state.register(busy);
+        state.register(idle);
+
+        assert_eq!(
+            state.route(Some("model-a"), 3).as_deref(),
+            Some("http://idle")
+        );
+    }
+
+    #[test]
+    fn deregister_removes_server_from_route_table() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 2));
+        state.register(entry("b", "http://b", "model-a", 3, 5));
+
+        state.deregister("a");
+
+        assert_eq!(state.route(Some("model-a"), 1), None);
+        assert_eq!(state.route(Some("model-a"), 4).as_deref(), Some("http://b"));
+    }
+
+    #[test]
+    fn heartbeat_updates_load_without_rebuilding_topology() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 4));
+        state.register(entry("b", "http://b", "model-a", 0, 4));
+
+        state.update_heartbeat("a", 80.0, 2048, 20);
+        state.update_heartbeat("b", 10.0, 1024, 0);
+
+        assert_eq!(state.route(Some("model-a"), 2).as_deref(), Some("http://b"));
+        let a = state.servers.get("a").unwrap();
+        assert_eq!(a.cpu_pct, 80.0);
+        assert_eq!(a.ram_used, 2048);
+        assert_eq!(a.requests_in_flight, 20);
+    }
+
+    #[test]
+    fn route_all_returns_first_uncovered_layer() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+        state.register(entry("b", "http://b", "model-a", 3, 4));
+
+        assert_eq!(state.route_all(Some("model-a"), &[0, 1, 2, 3]), Err(2));
+    }
+
+    #[test]
+    fn status_response_reports_shards_and_gaps() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+        state.register(entry("b", "http://b", "model-a", 3, 4));
+
+        let status = state.status_response();
+
+        assert_eq!(status.servers.len(), 2);
+        assert_eq!(status.models.len(), 1);
+        let model = &status.models[0];
+        assert_eq!(model.model_id, "model-a");
+        assert_eq!(model.shards.len(), 2);
+        assert_eq!(model.gaps.len(), 1);
+        assert_eq!(model.gaps[0].layer_start, 2);
+        assert_eq!(model.gaps[0].layer_end, 2);
     }
 }

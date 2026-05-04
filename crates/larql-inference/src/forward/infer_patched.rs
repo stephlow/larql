@@ -21,8 +21,8 @@ use larql_vindex::{GateIndex, KnnStore, PatchedVindex, VectorIndex, WalkHit};
 use tokenizers::Tokenizer;
 
 use crate::model::ModelWeights;
-use crate::vindex::WalkFfn;
 use crate::vindex::predict_q4k_with_ffn;
+use crate::vindex::WalkFfn;
 
 use super::predict::predict_with_ffn;
 use super::PredictResult;
@@ -47,6 +47,10 @@ pub struct InferPatchedResult {
     /// the walk FFN's own top-`(k-1)`. When `None`, this is the walk FFN's
     /// raw top-k.
     pub predictions: Vec<(String, f64)>,
+    /// Walk FFN's raw top-1 before the KnnStore post-logits override is
+    /// applied. This lets display layers show what the model path produced
+    /// before an unmaterialized retrieval sidecar changed the answer.
+    pub model_top1: Option<(String, f64)>,
     /// Metadata on the KNN override for callers that want to surface it
     /// (e.g. the LQL display layer prints `"KNN override, cos=X, L{layer}"`).
     pub knn_override: Option<KnnOverride>,
@@ -75,15 +79,18 @@ pub fn infer_patched(
     let walk_ffn = WalkFfn::new_unlimited_with_trace(weights, gate_index);
 
     let start = std::time::Instant::now();
-    let PredictResult { predictions: raw, .. } =
-        predict_with_ffn(weights, tokenizer, token_ids, top_k, &walk_ffn);
+    let PredictResult {
+        predictions: raw, ..
+    } = predict_with_ffn(weights, tokenizer, token_ids, top_k, &walk_ffn);
     let walk_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let residuals = walk_ffn.take_residuals();
+    let model_top1 = raw.first().cloned();
     let (predictions, knn_override) = apply_knn_override(raw, &residuals, knn_store, top_k);
 
     InferPatchedResult {
         predictions,
+        model_top1,
         knn_override,
         residuals,
         walk_ms,
@@ -110,15 +117,18 @@ pub fn infer_patched_q4k(
     let walk_ffn = WalkFfn::new_unlimited_with_trace(weights_ref, gate_index);
 
     let start = std::time::Instant::now();
-    let PredictResult { predictions: raw, .. } =
-        predict_q4k_with_ffn(weights, tokenizer, token_ids, top_k, index, &walk_ffn);
+    let PredictResult {
+        predictions: raw, ..
+    } = predict_q4k_with_ffn(weights, tokenizer, token_ids, top_k, index, &walk_ffn);
     let walk_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let residuals = walk_ffn.take_residuals();
+    let model_top1 = raw.first().cloned();
     let (predictions, knn_override) = apply_knn_override(raw, &residuals, knn_store, top_k);
 
     InferPatchedResult {
         predictions,
+        model_top1,
         knn_override,
         residuals,
         walk_ms,
@@ -254,8 +264,7 @@ mod tests {
         let residuals = vec![(5, vec![1.0, 0.0, 0.0])];
         let store = KnnStore::default();
 
-        let (predictions, override_) =
-            apply_knn_override(raw.clone(), &residuals, Some(&store), 3);
+        let (predictions, override_) = apply_knn_override(raw.clone(), &residuals, Some(&store), 3);
 
         assert!(override_.is_none());
         assert_eq!(predictions, raw);
@@ -273,7 +282,10 @@ mod tests {
         let ovr = override_.expect("key exactly matches residual — override must fire");
         assert_eq!(ovr.token, "Poseidon");
         assert_eq!(ovr.layer, 5);
-        assert!(ovr.cosine > 0.99, "cosine of identical vectors must be ~1.0");
+        assert!(
+            ovr.cosine > 0.99,
+            "cosine of identical vectors must be ~1.0"
+        );
 
         assert_eq!(predictions.len(), 3);
         assert_eq!(predictions[0], ("Poseidon".to_string(), 1.0));
@@ -290,7 +302,10 @@ mod tests {
         let (predictions, override_) =
             apply_knn_override(raw(&["a", "b", "c"]), &residuals, Some(&store), 3);
 
-        assert!(override_.is_none(), "orthogonal residual must not trigger override");
+        assert!(
+            override_.is_none(),
+            "orthogonal residual must not trigger override"
+        );
         assert_eq!(predictions[0].0, "a");
     }
 
@@ -304,7 +319,10 @@ mod tests {
         let (predictions, override_) =
             apply_knn_override(raw(&["a", "b", "c"]), &residuals, Some(&store), 3);
 
-        assert!(override_.is_none(), "residual layer not in store — no override");
+        assert!(
+            override_.is_none(),
+            "residual layer not in store — no override"
+        );
         assert_eq!(predictions[0].0, "a");
     }
 
@@ -313,10 +331,7 @@ mod tests {
         // Two stored layers both match; the earliest one (by iteration order
         // of the residuals slice) must take precedence.
         let key = vec![1.0, 0.0, 0.0];
-        let residuals = vec![
-            (5, key.clone()),
-            (7, key.clone()),
-        ];
+        let residuals = vec![(5, key.clone()), (7, key.clone())];
         let mut store = make_store_with_key(5, key.clone(), "First");
         store.add(
             7,
@@ -328,8 +343,7 @@ mod tests {
             1.0,
         );
 
-        let (predictions, override_) =
-            apply_knn_override(raw(&["a"]), &residuals, Some(&store), 5);
+        let (predictions, override_) = apply_knn_override(raw(&["a"]), &residuals, Some(&store), 5);
 
         let ovr = override_.unwrap();
         assert_eq!(ovr.token, "First");

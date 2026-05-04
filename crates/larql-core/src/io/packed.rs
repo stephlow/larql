@@ -46,8 +46,8 @@ impl StringTable {
         idx
     }
 
-    fn resolve(&self, idx: u32) -> &str {
-        &self.strings[idx as usize]
+    fn resolve(&self, idx: u32) -> Option<&str> {
+        self.strings.get(idx as usize).map(String::as_str)
     }
 
     fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -173,9 +173,10 @@ pub fn to_packed_bytes(graph: &Graph) -> Result<Vec<u8>, GraphError> {
         let rel = strings.intern(&edge.relation);
         let obj = strings.intern(&edge.object);
 
-        let meta_blob = edge.metadata.as_ref().map(|m| {
-            serde_json::to_vec(m).unwrap_or_default()
-        });
+        let meta_blob = edge
+            .metadata
+            .as_ref()
+            .map(|m| serde_json::to_vec(m).unwrap_or_default());
 
         let inj_blob = edge.injection.map(|(layer, score)| {
             let mut buf = Vec::with_capacity(12);
@@ -254,9 +255,7 @@ pub fn to_packed_bytes(graph: &Graph) -> Result<Vec<u8>, GraphError> {
     buf.extend_from_slice(&meta_section);
 
     // Write string table
-    strings
-        .write_to(&mut buf)
-        .map_err(GraphError::Io)?;
+    strings.write_to(&mut buf).map_err(GraphError::Io)?;
 
     Ok(buf)
 }
@@ -277,23 +276,60 @@ pub fn from_packed_bytes(bytes: &[u8]) -> Result<Graph, GraphError> {
             "unsupported format version: {version}"
         )));
     }
-    let num_edges = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if flags != 0 {
+        return Err(GraphError::Deserialize(format!(
+            "unsupported packed flags: {flags}"
+        )));
+    }
+    let num_edges_u64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let num_edges: usize = num_edges_u64.try_into().map_err(|_| {
+        GraphError::Deserialize(format!(
+            "edge count too large for platform: {num_edges_u64}"
+        ))
+    })?;
     let num_strings = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let string_table_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+    let string_table_offset_u64 = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    let string_table_offset: usize = string_table_offset_u64.try_into().map_err(|_| {
+        GraphError::Deserialize(format!(
+            "string table offset too large for platform: {string_table_offset_u64}"
+        ))
+    })?;
+    if string_table_offset > bytes.len() {
+        return Err(GraphError::Deserialize(format!(
+            "string table offset {string_table_offset} exceeds file length {}",
+            bytes.len()
+        )));
+    }
+
+    let edge_section_size = num_edges
+        .checked_mul(EDGE_RECORD_SIZE)
+        .ok_or_else(|| GraphError::Deserialize("edge section size overflow".to_string()))?;
+    let edge_section_end = HEADER_SIZE
+        .checked_add(edge_section_size)
+        .ok_or_else(|| GraphError::Deserialize("edge section end overflow".to_string()))?;
+    if edge_section_end > string_table_offset {
+        return Err(GraphError::Deserialize(format!(
+            "edge section end {edge_section_end} exceeds string table offset {string_table_offset}"
+        )));
+    }
 
     // Read string table
     let string_data = &bytes[string_table_offset..];
     let strings = StringTable::read_from(string_data, num_strings)?;
 
     // Metadata section is between edge records and string table
-    let edge_section_end = HEADER_SIZE + num_edges * EDGE_RECORD_SIZE;
     let meta_section = &bytes[edge_section_end..string_table_offset];
 
     // Read edge records
     let mut graph = Graph::new();
     for i in 0..num_edges {
         let offset = HEADER_SIZE + i * EDGE_RECORD_SIZE;
-        let rec = &bytes[offset..offset + EDGE_RECORD_SIZE];
+        let rec = bytes
+            .get(offset..offset + EDGE_RECORD_SIZE)
+            .ok_or_else(|| {
+                GraphError::Deserialize(format!("truncated edge record at index {i}"))
+            })?;
 
         let subj_idx = u32::from_le_bytes(rec[0..4].try_into().unwrap());
         let rel_idx = u32::from_le_bytes(rec[4..8].try_into().unwrap());
@@ -305,16 +341,40 @@ pub fn from_packed_bytes(bytes: &[u8]) -> Result<Graph, GraphError> {
         let meta_offset = u32::from_le_bytes(rec[20..24].try_into().unwrap()) as usize;
         let meta_len = u32::from_le_bytes(rec[24..28].try_into().unwrap()) as usize;
 
-        let subject = strings.resolve(subj_idx).to_string();
-        let relation = strings.resolve(rel_idx).to_string();
-        let object = strings.resolve(obj_idx).to_string();
+        let subject = strings
+            .resolve(subj_idx)
+            .ok_or_else(|| {
+                GraphError::Deserialize(format!("subject string index out of range: {subj_idx}"))
+            })?
+            .to_string();
+        let relation = strings
+            .resolve(rel_idx)
+            .ok_or_else(|| {
+                GraphError::Deserialize(format!("relation string index out of range: {rel_idx}"))
+            })?
+            .to_string();
+        let object = strings
+            .resolve(obj_idx)
+            .ok_or_else(|| {
+                GraphError::Deserialize(format!("object string index out of range: {obj_idx}"))
+            })?
+            .to_string();
 
         let mut edge = Edge::new(subject, relation, object)
             .with_confidence(conf as f64)
             .with_source(source);
 
         // Decode metadata + injection from blob
-        if meta_len > 0 && meta_offset + meta_len <= meta_section.len() {
+        if meta_len > 0 {
+            let meta_end = meta_offset.checked_add(meta_len).ok_or_else(|| {
+                GraphError::Deserialize(format!("metadata range overflow at edge index {i}"))
+            })?;
+            if meta_end > meta_section.len() {
+                return Err(GraphError::Deserialize(format!(
+                    "metadata range {meta_offset}..{meta_end} exceeds metadata section length {} at edge index {i}",
+                    meta_section.len()
+                )));
+            }
             let blob = &meta_section[meta_offset..meta_offset + meta_len];
 
             if has_meta && has_inj && blob.len() >= 8 {
@@ -329,12 +389,13 @@ pub fn from_packed_bytes(bytes: &[u8]) -> Result<Graph, GraphError> {
                     u32::from_le_bytes(blob[meta_json_end..meta_json_end + 4].try_into().unwrap())
                         as usize;
                 let inj_score = f32::from_le_bytes(
-                    blob[meta_json_end + 4..meta_json_end + 8].try_into().unwrap(),
+                    blob[meta_json_end + 4..meta_json_end + 8]
+                        .try_into()
+                        .unwrap(),
                 ) as f64;
                 edge.injection = Some((inj_layer, inj_score));
             } else if has_meta {
-                if let Ok(meta) =
-                    serde_json::from_slice::<HashMap<String, serde_json::Value>>(blob)
+                if let Ok(meta) = serde_json::from_slice::<HashMap<String, serde_json::Value>>(blob)
                 {
                     edge.metadata = Some(meta);
                 }
@@ -365,11 +426,7 @@ pub fn load_packed(path: impl AsRef<Path>) -> Result<Graph, GraphError> {
 }
 
 fn estimate_string_table_size(strings: &StringTable) -> usize {
-    strings
-        .strings
-        .iter()
-        .map(|s| 4 + s.len())
-        .sum::<usize>()
+    strings.strings.iter().map(|s| 4 + s.len()).sum::<usize>()
 }
 
 #[cfg(test)]
@@ -520,6 +577,64 @@ mod tests {
     #[test]
     fn test_invalid_magic() {
         let bytes = vec![0u8; 40];
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_string_table_offset_returns_error() {
+        let graph = Graph::new();
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        let bad_offset = (bytes.len() as u64 + 1).to_le_bytes();
+        bytes[24..32].copy_from_slice(&bad_offset);
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_truncated_edge_section_returns_error() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 2]);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_out_of_range_string_index_returns_error() {
+        let mut graph = Graph::new();
+        graph.add_edge(Edge::new("A", "rel", "B"));
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        bytes[32..36].copy_from_slice(&99u32.to_le_bytes());
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_metadata_range_returns_error() {
+        let mut graph = Graph::new();
+        graph.add_edge(Edge::new("A", "rel", "B").with_metadata("key", serde_json::json!("v")));
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        let bad_len = u32::MAX.to_le_bytes();
+        bytes[56..60].copy_from_slice(&bad_len);
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unsupported_flags_return_error() {
+        let graph = Graph::new();
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
+
         let result = from_packed_bytes(&bytes);
         assert!(result.is_err());
     }

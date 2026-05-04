@@ -4,6 +4,8 @@ use crate::ast::{Condition, Value};
 use crate::error::LqlError;
 use crate::executor::Session;
 
+use super::{relation_filter_matches, string_condition};
+
 impl Session {
     pub(crate) fn exec_delete(
         &mut self,
@@ -39,26 +41,43 @@ impl Session {
                     None
                 }
             });
+        let relation_filter = string_condition(conditions, "relation");
 
-        // Collect deletions, then apply
-        let deletes: Vec<(usize, usize)>;
+        // Collect candidates with a readonly borrow before mutating the
+        // patch overlay, so relation predicates cannot be dropped silently.
+        let deletes = {
+            let (_path, _config, patched) = self.require_vindex()?;
+            let candidates: Vec<(usize, usize)> =
+                if let (Some(layer), Some(feature)) = (layer_filter, feature_filter) {
+                    vec![(layer, feature)]
+                } else {
+                    patched
+                        .base()
+                        .find_features(entity_filter, None, layer_filter)
+                };
+
+            let mut matches = Vec::new();
+            for (layer, feature) in candidates {
+                if relation_filter_matches(
+                    self.relation_classifier(),
+                    relation_filter,
+                    layer,
+                    feature,
+                )? {
+                    matches.push((layer, feature));
+                }
+            }
+            matches
+        };
+
+        if deletes.is_empty() {
+            return Ok(vec!["  (no matching features found)".into()]);
+        }
+
         {
             let (_path, _config, patched) = self.require_patched_mut()?;
-
-            if let (Some(layer), Some(feature)) = (layer_filter, feature_filter) {
+            for &(layer, feature) in &deletes {
                 patched.delete_feature(layer, feature);
-                deletes = vec![(layer, feature)];
-            } else {
-                let matches = patched
-                    .base()
-                    .find_features(entity_filter, None, layer_filter);
-                if matches.is_empty() {
-                    return Ok(vec!["  (no matching features found)".into()]);
-                }
-                for &(layer, feature) in &matches {
-                    patched.delete_feature(layer, feature);
-                }
-                deletes = matches;
             }
         }
 

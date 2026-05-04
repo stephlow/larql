@@ -14,6 +14,7 @@
 use larql_core::core::edge::Edge;
 use larql_core::core::enums::SourceType;
 use larql_core::core::graph::Graph;
+use larql_vindex::format::filenames::*;
 
 use super::utils::{count_threshold, decode_token, partial_top_k, top_entities};
 use super::weight_walker::{LayerResult, LayerStats, WalkCallbacks, WalkConfig};
@@ -50,9 +51,9 @@ pub struct AttentionWalker {
 impl AttentionWalker {
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = crate::model::load_model_dir(&model_path)?;
+        let weights = crate::model::load_model_dir_validated(&model_path)?;
 
-        let tokenizer_path = model_path.join("tokenizer.json");
+        let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {
             return Err(InferenceError::MissingTensor(
                 "tokenizer.json not found".into(),
@@ -61,10 +62,7 @@ impl AttentionWalker {
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| InferenceError::Parse(e.to_string()))?;
 
-        Ok(Self {
-            weights,
-            tokenizer,
-        })
+        Ok(Self { weights, tokenizer })
     }
 
     pub fn num_layers(&self) -> usize {

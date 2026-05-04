@@ -3,12 +3,15 @@
 //! High-level API: load a model, tokenize entities, run forward passes,
 //! write NDJSON output files compatible with vector-load and vindex builds.
 
+use std::borrow::Cow;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::error::InferenceError;
 use crate::forward::trace_forward;
-use crate::model::{load_model_dir, load_model_dir_walk_only, resolve_model_path, ModelWeights};
+use crate::model::{
+    load_model_dir_validated, load_model_dir_walk_only_validated, resolve_model_path, ModelWeights,
+};
 use crate::tokenizer::load_tokenizer;
 
 /// Configuration for residual/activation capture.
@@ -19,13 +22,16 @@ pub struct CaptureConfig {
     pub activation_top_k: usize,
 }
 
+pub const DEFAULT_ACTIVATION_TOP_K: usize = 50;
+pub const DEFAULT_RESIDUAL_TOP_K: usize = 10;
+
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            layers: vec![25],
+            layers: Vec::new(),
             prompt_template: None,
             capture_activations: false,
-            activation_top_k: 50,
+            activation_top_k: DEFAULT_ACTIVATION_TOP_K,
         }
     }
 }
@@ -68,7 +74,7 @@ impl InferenceModel {
     /// Load a model from a path or HuggingFace model ID.
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir(&model_path)?;
+        let weights = load_model_dir_validated(&model_path)?;
         let tokenizer = load_tokenizer(&model_path)?;
 
         Ok(Self {
@@ -85,7 +91,7 @@ impl InferenceModel {
     /// couldn't hold the full f32-decoded model in memory.
     pub fn load_walk_only(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir_walk_only(&model_path)?;
+        let weights = load_model_dir_walk_only_validated(&model_path)?;
         let tokenizer = load_tokenizer(&model_path)?;
         Ok(Self {
             weights,
@@ -104,6 +110,13 @@ impl InferenceModel {
 
     pub fn weights(&self) -> &ModelWeights {
         &self.weights
+    }
+
+    /// Mutable accessor — needed by the generate() entry point so the CPU
+    /// fallback can dequantise per-layer Q4K tensors into `weights.tensors`.
+    /// Metal-only callers can continue to use the shared `weights()`.
+    pub fn weights_mut(&mut self) -> &mut ModelWeights {
+        &mut self.weights
     }
 
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
@@ -148,6 +161,11 @@ impl InferenceModel {
         let total = entities.len();
         let mut res_count = 0;
         let mut act_count = 0;
+        let capture_layers: Cow<'_, [usize]> = if config.layers.is_empty() {
+            Cow::Owned(vec![self.weights.num_layers.saturating_sub(1)])
+        } else {
+            Cow::Borrowed(&config.layers)
+        };
 
         for (i, entity) in entities.iter().enumerate() {
             let start = std::time::Instant::now();
@@ -171,14 +189,19 @@ impl InferenceModel {
             let trace = trace_forward(
                 &self.weights,
                 &token_ids,
-                &config.layers,
+                &capture_layers,
                 config.capture_activations,
                 config.activation_top_k,
             );
 
             // Write residuals
             for (layer, vector) in &trace.residuals {
-                let top_k = project_to_vocab(&self.weights.embed, vector, 10, &self.tokenizer);
+                let top_k = project_to_vocab(
+                    &self.weights.embed,
+                    vector,
+                    DEFAULT_RESIDUAL_TOP_K,
+                    &self.tokenizer,
+                );
 
                 let (top_token, top_token_id, c_score) = if let Some(first) = top_k.first() {
                     (first.token.clone(), first.token_id, first.logit)

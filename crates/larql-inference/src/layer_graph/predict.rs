@@ -7,14 +7,14 @@
 
 use ndarray::Array2;
 
-use larql_compute::ComputeBackend;
+use super::{CachedLayerGraph, DenseLayerGraph, LayerGraph};
 use crate::model::ModelWeights;
-use super::{LayerGraph, DenseLayerGraph, CachedLayerGraph};
+use larql_compute::prelude::*;
 
 // Re-export moved functions for backward compatibility.
-pub use super::prefill::prefill_with_kv;
-pub use super::logits::finalize_logits;
 pub use super::generate::{generate, GenerateResult};
+pub use super::logits::finalize_logits;
+pub use super::prefill::prefill_with_kv;
 
 // Alias for internal callers.
 use super::prefill::prefill_kv_cache_cpu;
@@ -41,7 +41,8 @@ pub fn predict_with_graph_vindex_logits(
 
     // Final norm
     let norm_offset = weights.arch.norm_weight_offset();
-    let h_final = crate::forward::apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
+    let h_final =
+        crate::forward::apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
 
     // Vindex logits: KNN against lm_head mmap
     let last_row = h_final.row(seq_len - 1).to_owned();
@@ -54,26 +55,41 @@ pub fn predict_with_graph_vindex_logits(
     let hits = index.lm_head_knn(&last_row, top_k);
 
     // Apply scaling, softcap, softmax over top-K
-    let scaled: Vec<(u32, f32)> = hits.iter().map(|&(tid, score)| {
-        let mut logit = score * inv_scale;
-        if let Some(cap) = final_softcap {
-            logit = (logit / cap).tanh() * cap;
-        }
-        (tid, logit)
-    }).collect();
+    let scaled: Vec<(u32, f32)> = hits
+        .iter()
+        .map(|&(tid, score)| {
+            let mut logit = score * inv_scale;
+            if let Some(cap) = final_softcap {
+                logit = (logit / cap).tanh() * cap;
+            }
+            (tid, logit)
+        })
+        .collect();
 
-    let max_logit = scaled.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f64 = scaled.iter().map(|(_, l)| ((*l - max_logit) as f64).exp()).sum();
+    let max_logit = scaled
+        .iter()
+        .map(|(_, l)| *l)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f64 = scaled
+        .iter()
+        .map(|(_, l)| ((*l - max_logit) as f64).exp())
+        .sum();
 
-    let predictions = scaled.iter()
+    let predictions = scaled
+        .iter()
         .filter_map(|&(tid, logit)| {
             let prob = ((logit - max_logit) as f64).exp() / exp_sum;
-            tokenizer.decode(&[tid], true).ok()
+            tokenizer
+                .decode(&[tid], true)
+                .ok()
                 .map(|s| (s.trim().to_string(), prob))
         })
         .collect();
 
-    crate::forward::PredictResult { predictions, token_ids: Vec::new() }
+    crate::forward::PredictResult {
+        predictions,
+        token_ids: Vec::new(),
+    }
 }
 
 /// Run a full forward pass using a LayerGraph for per-layer routing.
@@ -176,16 +192,21 @@ pub fn predict_split_pass(
         if let Some(q4_mmap) = gate_index.interleaved_q4_mmap_ref() {
             let intermediate = gate_index.num_features(layer_range.start);
             if intermediate > 0 {
-                let q4_bytes_per_matrix = intermediate * hidden / 32 * 18;
+                let q4_bytes_per_matrix = larql_compute::QuantFormat::Q4_0
+                    .packed_matrix_bytes(intermediate, hidden)
+                    .expect("Q4_0 interleaved FFN format must have packed geometry");
                 let q4_bytes_per_layer = q4_bytes_per_matrix * 3;
 
                 // Collect Q4 data slices for all walk layers
-                let layers_q4: Vec<(&[u8], &[u8], &[u8])> = layer_range.clone()
+                let layers_q4: Vec<(&[u8], &[u8], &[u8])> = layer_range
+                    .clone()
                     .map(|layer| {
                         let start = layer * q4_bytes_per_layer;
                         let gate = &q4_mmap[start..start + q4_bytes_per_matrix];
-                        let up = &q4_mmap[start + q4_bytes_per_matrix..start + 2 * q4_bytes_per_matrix];
-                        let down = &q4_mmap[start + 2 * q4_bytes_per_matrix..start + 3 * q4_bytes_per_matrix];
+                        let up =
+                            &q4_mmap[start + q4_bytes_per_matrix..start + 2 * q4_bytes_per_matrix];
+                        let down = &q4_mmap
+                            [start + 2 * q4_bytes_per_matrix..start + 3 * q4_bytes_per_matrix];
                         (gate, up, down)
                     })
                     .collect();
@@ -229,8 +250,10 @@ pub fn predict_split_pass(
         let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
         for layer in layer_range.clone() {
             let dense = DenseLayerGraph {
-                ffn: &walk_ffn, backend: None,
-                capture_activation: false, capture_attention: false,
+                ffn: &walk_ffn,
+                backend: None,
+                capture_activation: false,
+                capture_attention: false,
             };
             if let Some(output) = dense.forward_layer(weights, &h, layer) {
                 h = output.residual;
@@ -239,7 +262,8 @@ pub fn predict_split_pass(
     }
 
     // Final norm + vindex logits
-    let h_final = crate::forward::apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
+    let h_final =
+        crate::forward::apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
     let last_row = h_final.row(seq_len - 1).to_owned();
 
     let logits_scale = weights.arch.logits_scaling();
@@ -247,25 +271,40 @@ pub fn predict_split_pass(
     let inv_scale = 1.0 / logits_scale;
 
     let hits = index.lm_head_knn(&last_row, top_k);
-    let scaled: Vec<(u32, f32)> = hits.iter().map(|&(tid, score)| {
-        let mut logit = score * inv_scale;
-        if let Some(cap) = final_softcap {
-            logit = (logit / cap).tanh() * cap;
-        }
-        (tid, logit)
-    }).collect();
+    let scaled: Vec<(u32, f32)> = hits
+        .iter()
+        .map(|&(tid, score)| {
+            let mut logit = score * inv_scale;
+            if let Some(cap) = final_softcap {
+                logit = (logit / cap).tanh() * cap;
+            }
+            (tid, logit)
+        })
+        .collect();
 
-    let max_logit = scaled.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f64 = scaled.iter().map(|(_, l)| ((*l - max_logit) as f64).exp()).sum();
-    let predictions = scaled.iter()
+    let max_logit = scaled
+        .iter()
+        .map(|(_, l)| *l)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f64 = scaled
+        .iter()
+        .map(|(_, l)| ((*l - max_logit) as f64).exp())
+        .sum();
+    let predictions = scaled
+        .iter()
         .filter_map(|&(tid, logit)| {
             let prob = ((logit - max_logit) as f64).exp() / exp_sum;
-            tokenizer.decode(&[tid], true).ok()
+            tokenizer
+                .decode(&[tid], true)
+                .ok()
                 .map(|s| (s.trim().to_string(), prob))
         })
         .collect();
 
-    crate::forward::PredictResult { predictions, token_ids: Vec::new() }
+    crate::forward::PredictResult {
+        predictions,
+        token_ids: Vec::new(),
+    }
 }
 
 /// Split pass using cached attention residuals — exact output at GPU speed.
@@ -288,7 +327,10 @@ pub fn predict_split_cached(
     // Zero-copy: borrow the cached residual, don't clone.
     // Final norm produces a new array (unavoidable), but the input is borrowed.
     let h_final = crate::forward::apply_norm(
-        weights, &attn_cache.final_residual, weights.arch.final_norm_key(), norm_offset,
+        weights,
+        &attn_cache.final_residual,
+        weights.arch.final_norm_key(),
+        norm_offset,
     );
     let seq_len = h_final.shape()[0];
     let last_row = h_final.row(seq_len - 1).to_owned();
@@ -300,25 +342,40 @@ pub fn predict_split_cached(
     let final_softcap = weights.arch.final_logit_softcapping();
     let inv_scale = 1.0 / logits_scale;
 
-    let scaled: Vec<(u32, f32)> = hits.iter().map(|&(tid, score)| {
-        let mut logit = score * inv_scale;
-        if let Some(cap) = final_softcap {
-            logit = (logit / cap).tanh() * cap;
-        }
-        (tid, logit)
-    }).collect();
+    let scaled: Vec<(u32, f32)> = hits
+        .iter()
+        .map(|&(tid, score)| {
+            let mut logit = score * inv_scale;
+            if let Some(cap) = final_softcap {
+                logit = (logit / cap).tanh() * cap;
+            }
+            (tid, logit)
+        })
+        .collect();
 
-    let max_logit = scaled.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f64 = scaled.iter().map(|(_, l)| ((*l - max_logit) as f64).exp()).sum();
-    let predictions = scaled.iter()
+    let max_logit = scaled
+        .iter()
+        .map(|(_, l)| *l)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f64 = scaled
+        .iter()
+        .map(|(_, l)| ((*l - max_logit) as f64).exp())
+        .sum();
+    let predictions = scaled
+        .iter()
         .filter_map(|&(tid, logit)| {
             let prob = ((logit - max_logit) as f64).exp() / exp_sum;
-            tokenizer.decode(&[tid], true).ok()
+            tokenizer
+                .decode(&[tid], true)
+                .ok()
                 .map(|s| (s.trim().to_string(), prob))
         })
         .collect();
 
-    crate::forward::PredictResult { predictions, token_ids: Vec::new() }
+    crate::forward::PredictResult {
+        predictions,
+        token_ids: Vec::new(),
+    }
 }
 
 /// Honest production pipeline: real computation, no over-caching.
@@ -367,26 +424,35 @@ pub fn predict_honest(
             let intermediate = gate_index.num_features(layer_range.start);
             let hidden = weights.hidden_size;
             if intermediate > 0 && (has_q4k || has_q8) {
-                // Q4_K (GGUF): 144B/256vals, Q4_0: 18B/32vals
-                let q4_ffn_per_matrix = if ffn_is_q4k {
-                    (intermediate * hidden).div_ceil(256) * 144
+                let ffn_format = if ffn_is_q4k {
+                    larql_compute::QuantFormat::Q4_K
                 } else {
-                    intermediate * hidden / 32 * 18
+                    larql_compute::QuantFormat::Q4_0
                 };
+                let q4_ffn_per_matrix = ffn_format
+                    .packed_matrix_bytes(intermediate, hidden)
+                    .expect("Q4 interleaved FFN format must have packed geometry");
                 // q4_ffn_per_layer computed inside build_pipeline_layers
-                let ffn_format = if ffn_is_q4k { larql_compute::QuantFormat::Q4_K } else { larql_compute::QuantFormat::Q4_0 };
                 let arch = &*weights.arch;
 
                 let layers = super::pipeline_layer::build_pipeline_layers(
-                    weights, index, layer_range.clone(),
-                    q4_ffn_mmap, q4_ffn_per_matrix, ffn_format,
+                    weights,
+                    index,
+                    layer_range.clone(),
+                    q4_ffn_mmap,
+                    q4_ffn_per_matrix,
+                    ffn_format,
                 );
 
-                // GPU pipeline uses uniform dims (sliding layer defaults). Models with
-                // per-layer variation (Gemma 4) route through CPU via has_post_norms().
-                let q_dim = weights.num_q_heads * weights.head_dim;
-                let kv_dim = weights.num_kv_heads * weights.head_dim;
-                let rope = arch.rope_base_for_layer(layer_range.start) as f32;
+                let attention = layers
+                    .first()
+                    .map(super::pipeline_layer::attention_geometry_for_pipeline_layer)
+                    .unwrap_or_else(|| {
+                        super::pipeline_layer::attention_geometry_for_arch_layer(
+                            weights,
+                            layer_range.start,
+                        )
+                    });
                 let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
                 let qk_norm = arch.attn_q_norm_key(layer_range.start).is_some();
 
@@ -395,23 +461,55 @@ pub fn predict_honest(
                     let x: Vec<f32> = h.row(0).to_vec();
 
                     if let Some(result) = backend.decode_token(
-                        &layers, &x, hidden, intermediate, q_dim, kv_dim,
-                        weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+                        &layers,
+                        &x,
+                        hidden,
+                        intermediate,
+                        attention.q_dim,
+                        attention.kv_dim,
+                        attention.num_q_heads,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        attention.rope_base,
                     ) {
                         let mut row = h.row_mut(0);
-                        for j in 0..hidden { row[j] = result[j]; }
-                        return finalize_logits(weights, tokenizer, &h, top_k, index, backend, norm_offset);
+                        for j in 0..hidden {
+                            row[j] = result[j];
+                        }
+                        return finalize_logits(
+                            weights,
+                            tokenizer,
+                            &h,
+                            top_k,
+                            index,
+                            backend,
+                            norm_offset,
+                        );
                     }
 
                     if let Some(result) = backend.full_pipeline_q4(
-                        &layers, &x, hidden, intermediate, q_dim, kv_dim,
-                        1, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
-                        rope, qk_norm, softcap,
+                        &layers,
+                        &x,
+                        hidden,
+                        intermediate,
+                        attention.q_dim,
+                        attention.kv_dim,
+                        1,
+                        attention.num_q_heads,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        attention.rope_base,
+                        qk_norm,
+                        softcap,
                     ) {
                         let mut row = h.row_mut(0);
-                        for j in 0..hidden { row[j] = result[j]; }
+                        for j in 0..hidden {
+                            row[j] = result[j];
+                        }
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 } else if !arch.has_post_norms() {
                     // Prefill path (seq>1): GPU Q4 pipeline for pre-norm models (Llama, Mistral)
                     // Post-norm models (Gemma3) fall through to CPU — prefill.rs post-norm
@@ -419,14 +517,26 @@ pub fn predict_honest(
                     let x: Vec<f32> = h.as_slice().unwrap_or(&[]).to_vec();
 
                     if let Some(result) = backend.prefill_q4(
-                        &layers, &x, hidden, intermediate, q_dim, kv_dim,
-                        seq_len, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
-                        rope, qk_norm, softcap,
+                        &layers,
+                        &x,
+                        hidden,
+                        intermediate,
+                        attention.q_dim,
+                        attention.kv_dim,
+                        seq_len,
+                        attention.num_q_heads,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        attention.rope_base,
+                        qk_norm,
+                        softcap,
                     ) {
                         // Copy result back to h matrix (all positions)
                         for s in 0..seq_len {
                             let mut row = h.row_mut(s);
-                            for j in 0..hidden { row[j] = result[s * hidden + j]; }
+                            for j in 0..hidden {
+                                row[j] = result[s * hidden + j];
+                            }
                         }
 
                         // Populate KV cache via CPU for subsequent decode
@@ -434,7 +544,9 @@ pub fn predict_honest(
                         prefill_kv_cache_cpu(weights, token_ids, index, backend, &layer_range);
 
                         true
-                    } else { false }
+                    } else {
+                        false
+                    }
                 } else {
                     // Post-norm models (Gemma3): CPU prefill (correct) → GPU logits (fast)
                     // CPU handles post-norms correctly. Use CPU hidden state, GPU for logits only.
@@ -445,37 +557,67 @@ pub fn predict_honest(
                     let mut h_cpu = h.clone();
                     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
                         let (h_post_attn, k_rope, v) =
-                            crate::attention::gpu::run_attention_with_kv_backend(weights, &h_cpu, abs_layer, Some(backend))
-                                .unwrap();
+                            crate::attention::gpu::run_attention_with_kv_backend(
+                                weights,
+                                &h_cpu,
+                                abs_layer,
+                                Some(backend),
+                            )
+                            .unwrap();
 
                         if backend.has_kv_cache() {
                             let k_flat = k_rope.as_slice().unwrap_or(&[]);
                             let v_flat = v.as_slice().unwrap_or(&[]);
-                            backend.populate_kv_layer(rel_idx, k_flat, v_flat,
-                                seq_len, weights.num_kv_heads, weights.head_dim);
+                            backend.populate_kv_layer(
+                                rel_idx,
+                                k_flat,
+                                v_flat,
+                                seq_len,
+                                weights.arch.num_kv_heads_for_layer(abs_layer),
+                                weights.arch.head_dim_for_layer(abs_layer),
+                            );
                         }
 
                         let (h_out, _) = crate::forward::run_ffn(
-                            weights, &h_post_attn, abs_layer, &walk_ffn, false);
+                            weights,
+                            &h_post_attn,
+                            abs_layer,
+                            &walk_ffn,
+                            false,
+                        );
                         h_cpu = h_out;
                     }
 
                     // Use correct CPU hidden state, finalize with GPU logits
                     h = h_cpu;
-                    return finalize_logits(weights, tokenizer, &h, top_k, index, backend, norm_offset);
+                    return finalize_logits(
+                        weights,
+                        tokenizer,
+                        &h,
+                        top_k,
+                        index,
+                        backend,
+                        norm_offset,
+                    );
                 }
-            } else { false }
-        } else { false }
-    } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     // CPU fallback: interleaved attention + FFN (for prefill or when GPU not available)
     if !used_gpu {
         let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
         for layer in layer_range {
             let (h_post_attn, _, _) =
-                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None)
-                    .unwrap();
-            let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None).unwrap();
+            let (h_out, _) =
+                crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
             h = h_out;
         }
     }
@@ -502,7 +644,9 @@ pub fn predict_pipeline(
     // Use vindex logits if lm_head is loaded
     if let Some(idx) = index {
         if idx.has_lm_head() {
-            return predict_with_graph_vindex_logits(weights, tokenizer, token_ids, top_k, graph, idx);
+            return predict_with_graph_vindex_logits(
+                weights, tokenizer, token_ids, top_k, graph, idx,
+            );
         }
     }
     // Fallback: full vocab matmul
@@ -535,7 +679,8 @@ pub fn trace_with_graph(
 
                     if let Some(act) = output.activation {
                         let act_row = act.row(seq_len - 1);
-                        let mut indexed: Vec<(usize, f32)> = act_row.iter().copied().enumerate().collect();
+                        let mut indexed: Vec<(usize, f32)> =
+                            act_row.iter().copied().enumerate().collect();
                         indexed.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
                         indexed.truncate(200);
                         activations.push((layer, indexed));
@@ -557,5 +702,183 @@ pub fn trace_with_graph(
         residuals: results,
         activations,
         attention: attention_captures,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::{
+        make_test_tokenizer, make_test_vindex, make_test_weights, TestFixtures,
+    };
+    use crate::model::ModelWeights;
+    use std::sync::OnceLock;
+
+    fn fx() -> &'static TestFixtures {
+        static F: OnceLock<TestFixtures> = OnceLock::new();
+        F.get_or_init(TestFixtures::build)
+    }
+    use crate::ffn::WeightFfn;
+    use crate::layer_graph::CachedLayerGraph;
+    use larql_compute::CpuBackend;
+
+    // ── predict_with_ffn ──────────────────────────────────────────────────────
+
+    #[test]
+    fn predict_with_ffn_returns_predictions() {
+        let f = fx();
+        let (weights, tokenizer) = (&f.weights, &f.tokenizer);
+        let ffn = WeightFfn { weights: &weights };
+        let result = crate::forward::predict_with_ffn(&weights, &tokenizer, &[0u32, 1], 3, &ffn);
+        assert!(result.token_ids.len() <= 3);
+        assert_eq!(result.predictions.len(), result.token_ids.len());
+        assert!(result
+            .token_ids
+            .iter()
+            .all(|&id| (id as usize) < weights.vocab_size));
+    }
+
+    #[test]
+    fn predict_with_ffn_single_token() {
+        let f = fx();
+        let (weights, tokenizer) = (&f.weights, &f.tokenizer);
+        let ffn = WeightFfn { weights: &weights };
+        let result = crate::forward::predict_with_ffn(&weights, &tokenizer, &[5u32], 1, &ffn);
+        assert!(result.token_ids.len() <= 1);
+    }
+
+    // ── predict_honest (CPU path via VectorIndex::new with no Q4K) ────────────
+
+    #[test]
+    fn predict_honest_runs_without_panic() {
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        // predict_honest falls through to CPU path (no Q4K data in synthetic vindex)
+        let result = predict_honest(
+            &weights,
+            &tokenizer,
+            &[0u32, 1, 2],
+            5,
+            &index,
+            &CpuBackend,
+            &cached,
+            0..num_layers,
+        );
+        // lm_head_knn is empty → predictions may be empty, but no panic
+        assert!(result.token_ids.len() <= 5);
+    }
+
+    #[test]
+    fn predict_honest_single_token_decode_path() {
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let num_layers = weights.num_layers;
+        let result = predict_honest(
+            &weights,
+            &tokenizer,
+            &[3u32],
+            3,
+            &index,
+            &CpuBackend,
+            &cached,
+            0..num_layers,
+        );
+        assert!(result.token_ids.len() <= 3);
+    }
+
+    #[test]
+    fn predict_honest_with_cached_layers() {
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let ffn = WeightFfn { weights: &weights };
+        // Pre-cache layer 0
+        let cached = CachedLayerGraph::build(&weights, &[0u32], &[0], &ffn);
+        let num_layers = weights.num_layers;
+        let result = predict_honest(
+            &weights,
+            &tokenizer,
+            &[0u32],
+            3,
+            &index,
+            &CpuBackend,
+            &cached,
+            0..num_layers,
+        );
+        assert!(result.token_ids.len() <= 3);
+    }
+
+    // ── DenseLayerGraph ───────────────────────────────────────────────��───────
+
+    #[test]
+    fn dense_layer_graph_forward_runs() {
+        use crate::layer_graph::{DenseLayerGraph, LayerGraph};
+        let weights = &fx().weights;
+        let ffn = WeightFfn { weights: &weights };
+        let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.1f32);
+        let g = DenseLayerGraph {
+            ffn: &ffn,
+            backend: None,
+            capture_activation: false,
+            capture_attention: false,
+        };
+        let out = g.forward_layer(&weights, &h, 0);
+        assert!(out.is_some(), "DenseLayerGraph should forward layer 0");
+        assert_eq!(out.unwrap().residual.shape(), &[2, weights.hidden_size]);
+    }
+
+    #[test]
+    fn dense_layer_graph_all_layers() {
+        use crate::layer_graph::{DenseLayerGraph, LayerGraph};
+        let weights = &fx().weights;
+        let ffn = WeightFfn { weights: &weights };
+        let h = ndarray::Array2::from_elem((1, weights.hidden_size), 0.5f32);
+        let g = DenseLayerGraph {
+            ffn: &ffn,
+            backend: None,
+            capture_activation: false,
+            capture_attention: false,
+        };
+        for layer in 0..weights.num_layers {
+            let out = g.forward_layer(&weights, &h, layer);
+            assert!(out.is_some(), "layer {layer} should succeed");
+        }
+    }
+
+    // ── WalkLayerGraph ────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_layer_graph_forward_runs() {
+        use crate::layer_graph::{LayerGraph, WalkLayerGraph};
+        let weights = &fx().weights;
+        let ffn = WeightFfn { weights: &weights };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let h = ndarray::Array2::from_elem((2, weights.hidden_size), 0.1f32);
+        let out = g.forward_layer(&weights, &h, 0);
+        assert!(out.is_some());
+        assert_eq!(out.unwrap().residual.shape(), &[2, weights.hidden_size]);
+    }
+
+    // ── predict_pipeline ─────────────────────────────────────────────────────
+
+    #[test]
+    fn predict_pipeline_runs() {
+        use crate::layer_graph::LayerGraph;
+        let f = fx();
+        let (weights, tokenizer, index) = (&f.weights, &f.tokenizer, &f.index);
+        let ffn = WeightFfn { weights: &weights };
+        let g = crate::layer_graph::WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let graph: &dyn LayerGraph = &g;
+        // predict_pipeline takes Option<&VectorIndex>
+        let result = predict_pipeline(&weights, &tokenizer, &[0u32, 1], 3, graph, Some(&index));
+        assert!(result.token_ids.len() <= 3);
     }
 }

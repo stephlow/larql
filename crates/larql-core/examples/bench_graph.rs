@@ -73,7 +73,8 @@ fn main() {
         let _ = graph.describe("Entity_42");
     });
 
-    bench("count(relation, None)", 100_000, || {
+    // count() scans the edge list, so keep iterations low on the 100K-edge graph.
+    bench("count(relation, None)", 100, || {
         let _ = graph.count(Some("rel_0"), None);
     });
 

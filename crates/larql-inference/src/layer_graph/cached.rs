@@ -1,8 +1,8 @@
 use ndarray::Array2;
 
+use super::{DenseLayerGraph, LayerGraph, LayerOutput, PerLayerGraph};
 use crate::ffn::FfnBackend;
 use crate::model::ModelWeights;
-use super::{LayerGraph, LayerOutput, DenseLayerGraph, PerLayerGraph};
 
 // ── Cached: precomputed layer output for fixed-routing regimes ──
 
@@ -30,7 +30,12 @@ impl CachedLayerGraph {
         let max_layer = *layers.iter().max().unwrap_or(&0);
 
         for layer in 0..=max_layer.min(weights.num_layers - 1) {
-            let graph = DenseLayerGraph { ffn, backend: None, capture_activation: false, capture_attention: false };
+            let graph = DenseLayerGraph {
+                ffn,
+                backend: None,
+                capture_activation: false,
+                capture_attention: false,
+            };
             if let Some(output) = graph.forward_layer(weights, &h, layer) {
                 h = output.residual;
                 if layers.contains(&layer) {
@@ -43,7 +48,9 @@ impl CachedLayerGraph {
 
     /// Build from an existing residual (e.g., from a previous forward pass).
     pub fn from_residuals(residuals: Vec<(usize, Array2<f32>)>) -> Self {
-        Self { cache: residuals.into_iter().collect() }
+        Self {
+            cache: residuals.into_iter().collect(),
+        }
     }
 
     pub fn has_layer(&self, layer: usize) -> bool {
@@ -63,10 +70,16 @@ impl LayerGraph for CachedLayerGraph {
         layer: usize,
     ) -> Option<LayerOutput> {
         let residual = self.cache.get(&layer)?.clone();
-        Some(LayerOutput { residual, activation: None, attention: None })
+        Some(LayerOutput {
+            residual,
+            activation: None,
+            attention: None,
+        })
     }
 
-    fn name(&self) -> &str { "cached" }
+    fn name(&self) -> &str {
+        "cached"
+    }
 }
 
 /// Build a PerLayerGraph with cached layers for a detected template.
@@ -130,8 +143,7 @@ impl AttentionCache {
         for layer in layer_range {
             // Attention (exact)
             let (h_post_attn, _, _) =
-                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None)
-                    .unwrap();
+                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None).unwrap();
 
             // Capture FFN-normed input (last token)
             let pre_ffn_key = if arch.has_post_norms() {
@@ -150,6 +162,82 @@ impl AttentionCache {
             h = h_out;
         }
 
-        AttentionCache { ffn_inputs, final_residual: h }
+        AttentionCache {
+            ffn_inputs,
+            final_residual: h,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::ffn::WeightFfn;
+    use ndarray::Array2;
+
+    #[test]
+    fn from_residuals_empty() {
+        let g = CachedLayerGraph::from_residuals(vec![]);
+        assert_eq!(g.num_cached(), 0);
+        assert!(!g.has_layer(0));
+    }
+
+    #[test]
+    fn from_residuals_single() {
+        let arr = Array2::zeros((3, 4));
+        let g = CachedLayerGraph::from_residuals(vec![(0, arr.clone())]);
+        assert_eq!(g.num_cached(), 1);
+        assert!(g.has_layer(0));
+        assert!(!g.has_layer(1));
+    }
+
+    #[test]
+    fn from_residuals_multiple() {
+        let arr = Array2::ones((2, 8));
+        let g =
+            CachedLayerGraph::from_residuals(vec![(0, arr.clone()), (3, arr.clone()), (5, arr)]);
+        assert_eq!(g.num_cached(), 3);
+        assert!(g.has_layer(0));
+        assert!(g.has_layer(3));
+        assert!(g.has_layer(5));
+        assert!(!g.has_layer(1));
+    }
+
+    #[test]
+    fn forward_layer_returns_cached() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((2, weights.hidden_size), 0.5f32);
+        let g = CachedLayerGraph::from_residuals(vec![(0, h.clone())]);
+        let out = g
+            .forward_layer(&weights, &h, 0)
+            .expect("should return cached");
+        assert_eq!(out.residual.shape(), &[2, weights.hidden_size]);
+    }
+
+    #[test]
+    fn forward_layer_none_for_uncached() {
+        let weights = make_test_weights();
+        let h = Array2::zeros((1, weights.hidden_size));
+        let g = CachedLayerGraph::from_residuals(vec![]);
+        assert!(
+            g.forward_layer(&weights, &h, 0).is_none(),
+            "uncached layer should return None"
+        );
+    }
+
+    #[test]
+    fn build_caches_specified_layers() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let g = CachedLayerGraph::build(&weights, &[0u32, 1], &[0], &ffn);
+        assert!(g.has_layer(0), "layer 0 should be cached");
+        assert!(!g.has_layer(1), "layer 1 was not in the build list");
+    }
+
+    #[test]
+    fn cached_layer_graph_name() {
+        let g = CachedLayerGraph::from_residuals(vec![]);
+        assert_eq!(g.name(), "cached");
     }
 }

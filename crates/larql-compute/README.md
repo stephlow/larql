@@ -6,6 +6,21 @@ Hardware-accelerated compute backends for LARQL. CPU (BLAS + NEON Q4), Metal GPU
 
 Provides a `ComputeBackend` trait that abstracts all hardware-specific matrix operations. Every LARQL crate (inference, vindex) uses this trait — the caller never knows whether the operation runs on CPU or GPU.
 
+The trait is split into four sub-traits, each with its own focus:
+
+| Sub-trait | What's there |
+|---|---|
+| [`MatMul`](src/backend/matmul.rs) | f32 / f16 matmul, `matmul_transb`, `f32_gemv`, `f16_gemv`, batch matmul |
+| [`QuantMatVec`](src/backend/quant_matvec.rs) | unified `quant_matvec(format, …)` + per-format pre-quantised fast paths |
+| [`DecodeBackend`](src/backend/decode.rs) | KV-cached decode + multi-position prefill + MoE hook |
+| (umbrella) `ComputeBackend` | `name`, `device_info`, `Capability`-based feature probe |
+
+Most callers stay typed against `&dyn ComputeBackend`; `use larql_compute::prelude::*;` brings every sub-trait in scope at once.
+
+## Adding a new quant format
+
+Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec::quant_matvec`'s default impl + one CPU kernel + one Metal shader. The Metal shader gets a `Kernel` marker (impl `metal::kernel::TiledKernel`) so its name + dispatch geometry travel with it — no separate constants importing.
+
 ## Backends
 
 | Backend | Feature flag | f32 matmul | Quantized ops | Pipeline |
@@ -14,25 +29,60 @@ Provides a `ComputeBackend` trait that abstracts all hardware-specific matrix op
 | **Metal** | `--features metal` | Tiled shaders | Simdgroup Q4/Q4_K/Q6_K/Q8 | One command buffer |
 | **CUDA** | (planned) | — | — | — |
 
-## Performance vs Ollama (M3 Max, Gemma 3 4B)
+## Performance vs Ollama
+
+Live `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b`
+on M3 Max (2026-05-02, post dispatch-geometry fix):
 
 ```
-LARQL Q4_KF (34 layers):       8.5ms/token = 117 tok/s (decode, KV cached)
-Ollama gemma3:4b:              10.3ms/token =  98 tok/s (decode, 34 layers)
-vs Ollama:                     0.83x (17% FASTER)
+  larql-metal  83–84 tok/s   11.9ms/tok   (GPU fwd ~11.16ms, lm_head ~1.85ms)
+  ollama       98.5–99.7 tok/s  10.0ms/tok
+  gap          1.18×          ~2.0ms/tok
 ```
 
-### Key Optimizations (2026-04-08 — 2026-04-09)
+Reproduce: `larql bench <vindex> --backends metal --ollama <tag>`.
+See `PERFORMANCE.md` for the full breakdown, the "Decision: lm_head dispatch
+order" decision-log entry, and ADR-015 for the diagnostic order rule
+("dispatch-geometry first, kernel second, reduction tree last") that drove
+the 2026-05-02 fix.
+
+### Key optimisations
+
+**2026-05-02 — dispatch geometry fix (+8 tok/s on Gemma 3 4B, +14 tok/s on Gemma 4 26B A4B)**
 
 | Optimization | Savings | Technique |
-|-------------|---------|-----------|
-| **Cooperative SIMD norms** | **~10ms** | **O(N²)→O(N) reads in rms_norm / residual_norm** |
-| Q4_KF FFN routing | ~8ms | llama.cpp-exact kernel (q4kf_proj) for FFN |
-| Q4_K matvec rewrite | ~3ms | uint4 loads, 8 rows/TG, multi-row (nr0=2) |
-| Buffer pre-allocation | ~2ms | Eliminate 550 Metal allocs per decode |
-| Fused gate+up kernels | ~1ms | q4k_ffn_gate_up + q4kf_ffn_gate_up |
-| Batched RoPE/V-norm | ~0.5ms | 16 per-head dispatches → 3 batched |
-| SIMD KV attention | ~1ms | simd_max/simd_sum, fewer barriers |
+|---|---|---|
+| `q4k_matvec` dispatch geometry from bound pipeline | **+7.7 tok/s on 4B / +14.3 tok/s on 26B** | Use `pipeline.rows_per_tg` / `threads_per_tg` instead of hardcoded 4sg shader-module constants; the 8sg pipeline (default since 2026-04-28) was being under-dispatched, leaving simdgroups 4..7 idle and half the rows unwritten. **Same family as 077884b's "81–84 tok/s on broken Q4_K dispatch"** — second confirmed instance. ADR-015 § "Lesson — diagnostic order for 'fast but wrong' results" |
+| Promoted `lm_head_knn_backend` (q4k_matvec first) to default | (within above) | Stride-32 was the workaround for the pre-fix argmax drift; production now goes through the now-correct, faster q4k_matvec → f16 → f32 chain. `LARQL_LM_HEAD_SKIP_Q4K=1` for diagnostic A/B |
+
+**Earlier optimisations (2026-04-25 → 2026-05-01)**
+
+| Optimization | Savings | Technique |
+|---|---|---|
+| `q6k_matvec` ROWS_PER_TG 4→2 | +1-2 tok/s | 2× concurrent TGs → better DRAM latency hiding |
+| `q6k_matvec` inter-superblock interleaving | +3 tok/s | Adjacent lanes read alternate superblocks; X preloaded; deferred scaling |
+| `q6k_matvec` 4-element batching | +7 tok/s | Compile-time hi2 shifts, preloaded scales |
+| Fused QK-norm Q+K (`qk_norm_qk`) | −0.17ms | One dispatch instead of two per layer |
+| Fused RoPE Q+K (`rope_at_pos_batched_qk`) | −0.17ms | One dispatch instead of two |
+| Fused residual+norm (`residual_norm_store`) | −0.17ms | Writes both normed and raw sum in one pass |
+| Fused norm+QKV (`q4k_q6k_qkv_proj_normed`) | −0.17ms | Norm computed cooperatively inside QKV TGs |
+| Cooperative SIMD norms | −10ms | O(N²)→O(N) reads (2026-04-09) |
+| Q4_KF FFN routing | −8ms | llama.cpp-exact kernel (2026-04-09) |
+| Buffer pre-allocation | −2ms | Eliminated 550 allocs/decode (2026-04-08) |
+
+### Bottleneck analysis (from `diag_shader_bench`, post 2026-05-02)
+
+| Kernel | Batched GB/s | ms/tok | Bound by |
+|---|---|---|---|
+| q6k_matvec (FFN down, K=10240) | ~312 GB/s | 2.35ms | bandwidth (84% of LPDDR5X peak) |
+| q4k_ffn_gate_up_8sg (gate+up, K=2560) | ~275 GB/s | 3.64ms | bandwidth (74% of peak) |
+| q4k_matvec (lm_head, 262K×2560) | (Q4_K, post fix) | 1.85ms | bandwidth + dequant |
+| f32_gemv (legacy lm_head fallback) | ~387 GB/s | — | bandwidth (at peak) |
+
+Both big FFN kernels are bandwidth-bound at 74–84% of LPDDR5X peak; no
+single-kernel headroom remains. The remaining 1.18× gap to ollama is
+distributed across dispatch overhead + the ~30 ms/tok of CPU-side ops
+(routing, KV append, sampling) — not a hot kernel waiting to be tuned.
 
 ### Architecture
 
@@ -40,22 +90,29 @@ Single command buffer + single global encoder for all 34 layers. Pre-allocated s
 buffers. Format-aware FFN: Q4_KF routes through llama.cpp kernel, Q4_K through fused
 gate+up, Q4_0 through legacy Q8 path. All norms use cooperative SIMD reduction.
 
-## Shaders (~48 Metal kernels)
+## Shaders
+
+Production kernels are in **bold**; the rest are either dispatched only by
+diagnostic / fallback paths or compiled-but-unwired (kept around because
+the shader source is small and the bench harness still exercises them).
 
 | Category | Kernels | Notes |
 |----------|---------|-------|
 | f32 matmul | sgemm, sgemm_transb | Tiled 32×32 |
-| Q4_0 matvec | v1, v2, v3, **v4** (prod), v5, sparse | v4: uint32 wide loads, 61 GB/s |
-| Q4_K/Q6_K | **q4k_matvec** (uint4, nr0=2), q4k_qkv_proj, **q4kf_qkv_proj/q4kf_proj**, q6k_matvec | llama.cpp-exact kernel for Q4_KF |
-| Q4_K fused FFN | **q4k_ffn_gate_up**, q4k_geglu_silu_down, q4k_geglu_gelu_tanh_down | Fused gate+up, shared input |
-| Q8 | q8_matvec, q8_qkv_proj, q8_proj_rope | Fused QKV, simdgroup reduction |
-| Attention | fused_attention (RoPE+GQA+softcap), causal, **kv_attention** (simd), kv_append | SIMD reductions, float4 dot |
-| Normalization | rms_norm, layer_norm (2), **v_norm**, **v_norm_batched** | Batched V-norm (1 dispatch) |
-| Activation | geglu_silu, geglu_gelu_tanh, silu, gelu_tanh | Gated + standalone |
-| Element-wise | residual_add, residual_inject, scale_vector, quantize_q8 | |
-| RoPE | rope_apply, rope_at_pos, **rope_at_pos_batched** | Batched all heads (1 dispatch) |
-| Fused ops | rms_norm_q8, residual_norm, residual_norm_q8 | Multi-op fusion |
-| Experimental | turboquant_encode/decode, graph_walk_knn | |
+| f32/f16 gemv | **f32_gemv**, **f16_gemv** | LM head (large vocab × hidden) |
+| Q4_0 matvec | **q4_matvec_v4** (prod), q4_f32_matvec, q4_vecmat | v4: uint32 wide loads, sub-block stride |
+| Q4_K / Q4_KF | **q4k_matvec**, **q4k_qkv_proj**, **q4k_q6k_qkv_proj**, **q4k_q6k_qkv_proj_normed**, **q4kf_qkv_proj**, **q4kf_proj** | `_normed` variant computes RMS norm inline (saves 1 dispatch) |
+| Q4_K fused FFN | **q4k_ffn_gate_up**, **q4kf_ffn_gate_up** | Fused gate+up with inter-superblock interleaving |
+| Q4_K GEGLU+down | **q4k_geglu_silu_down**, **q4k_geglu_gelu_tanh_down** | Fused activation+down for all-Q4_K models |
+| Q6_K | **q6k_matvec** | 2-way inter-superblock interleaving, X preload, deferred scaling |
+| Q8 | **q8_matvec**, **q8_qkv_proj**, **quantize_q8** | Fused QKV, simdgroup reduction |
+| Attention | **fused_attention** (RoPE+GQA+softcap), **kv_attention** (decode), **kv_cache_append** | SIMD reductions, float4 dot |
+| Normalization | **rms_norm**, **layer_norm** / **layer_norm_no_bias**, **v_norm_batched**, **qk_norm**, **qk_norm_qk** | `qk_norm_qk` fuses Q+K heads in one dispatch |
+| Activation | **geglu_silu**, **geglu_gelu_tanh**, **silu**, **gelu_tanh** | Gated + standalone |
+| Element-wise | **residual_add**, **scale_vector** | |
+| RoPE | **rope_apply** (prefill), **rope_at_pos** (single-head), **rope_at_pos_batched** (all heads), **rope_at_pos_batched_qk** (Q+K fused) | `_qk` saves 1 dispatch/layer |
+| Fused residual+norm | **rms_norm_q8**, **residual_norm**, **residual_norm_q8**, **residual_norm_store** | `_store` writes both normed output AND raw sum in one dispatch |
+| Experimental / unwired | causal_attention, q4_sparse_matvec, q6k_geglu_silu_down, q6k_geglu_gelu_tanh_down, v_norm (singleton), turboquant_encode/decode, graph_walk_knn | Kept compiled; not dispatched in production |
 
 ## Safe Buffer Access
 
@@ -69,7 +126,8 @@ pub fn read_buffer_f32(buf: &metal::Buffer, len: usize) -> Vec<f32>
 ## Quick Start
 
 ```rust
-use larql_compute::{ComputeBackend, default_backend};
+use larql_compute::prelude::*;
+use larql_compute::{default_backend, QuantFormat};
 
 let backend = default_backend();
 println!("Using: {} ({})", backend.name(), backend.device_info());
@@ -77,17 +135,38 @@ println!("Using: {} ({})", backend.name(), backend.device_info());
 // f32 matmul
 let c = backend.matmul_transb(a.view(), b.view());
 
-// Q4_K matvec (Ollama-compatible format)
-let scores = backend.q4k_matvec(&q4k_data, &x, rows, hidden);
+// Unified quant matvec — dispatches on format. Q4_K / Q4_KF / Q6_K
+// take f32 input directly; Q4_0 / Q8_0 internally re-quantise.
+let scores = backend.quant_matvec(QuantFormat::Q4_K, &q4k_data, &x, rows, hidden);
 
-// KV-cached decode (one token through all layers)
+// Pre-quantised fast path for hot decode loops (avoid re-quantising
+// the layer's input on every gate/up matvec):
+let scores = backend.q4_matvec(&q4_0_data, &q8_x, &q8_scales, rows, hidden);
+
+// Capability probe — branch on what the backend accelerates instead
+// of pattern-matching on `Option<…> = None`.
+if backend.supports(Capability::F32Gemv) {
+    let logits = backend.f32_gemv_force(lm_head.view(), &h_last);
+}
+
+// KV-cached decode (one token through all layers).
 let h = backend.decode_token(&layers, &x, hidden, inter, q_dim, kv_dim,
     num_q_heads, num_kv_heads, head_dim, rope_base);
 
-// GPU prefill (seq>1, populates KV cache)
+// GPU prefill (seq>1, populates KV cache).
 let h = backend.prefill_q4(&layers, &x, hidden, inter, q_dim, kv_dim,
     seq_len, num_q_heads, num_kv_heads, head_dim, rope_base, qk_norm, softcap);
 ```
+
+## KernelHandle and ShaderKernel: no raw strings at binding sites
+
+Two traits in `metal::kernel`:
+
+**`TiledKernel`** — for kernels dispatched with `dispatch_thread_groups` that need row geometry. Each shader file exports a `Kernel` marker implementing `TiledKernel { KERNEL_NAME, ROWS_PER_TG, THREADS_PER_TG }`. `KernelHandle::from_kernel::<…::Kernel>(device, library)` bundles the pipeline + geometry. Dispatchers read `kernel.rows_per_tg` — no parallel constants that can drift.
+
+**`ShaderKernel`** — for flat-dispatch kernels (`dispatch_threads` or fixed-geometry `dispatch_thread_groups`) that don't need row geometry. Each shader file exports a marker implementing `ShaderKernel { KERNEL_NAME }`. `get_shader_pipeline::<T>(device, library)` looks up the kernel by that constant. All 31 previously magic-string `library.get_function("...")` calls in `MetalBackend::new()` now go through one of these two typed paths — renaming a shader without updating its marker is a compile error, not a silent runtime `None`.
+
+Construction asserts `pipeline.maxTotalThreadsPerThreadgroup() >= threads_per_tg` (TiledKernel) so silent simdgroup drop is caught at startup. (See the `q4_matvec_v4` 75 %-row drop entry in `ROADMAP.md`.)
 
 ## Linear algebra primitives (`cpu/ops/linalg.rs`)
 
@@ -118,24 +197,48 @@ Demo:  `cargo run --release -p larql-compute --example demo_ridge_solve`
 
 ```
 src/
-  lib.rs              Re-exports from pipeline.rs and backend.rs
+  lib.rs              Re-exports + `prelude` module
   pipeline.rs         QuantFormat, QuantWeight, NormType, FfnType, Activation, FullPipelineLayer
-  backend.rs          ComputeBackend trait (15 methods)
+
+  backend/            (folder, one file per concern)
+    mod.rs            Umbrella `ComputeBackend` (name/device_info/supports)
+    matmul.rs         `MatMul` — f32 / f16 matmul + gemv
+    quant_matvec.rs   `QuantMatVec` — unified `quant_matvec(format, …)` + per-format helpers
+    decode.rs         `DecodeBackend` — KV-cached decode + prefill + MoE hook
+    capability.rs     `Capability` enum — what a backend accelerates
+    helpers.rs        `dot_proj_gpu` / `matmul_gpu` (free functions)
 
   cpu/
-    mod.rs            CpuBackend (BLAS f32 + C Q4 + Q4_K/Q6_K reference)
+    mod.rs            CpuBackend
     ops/              f32_matmul, q4_matvec, q4_vecmat, q4k_matvec, q6k_matvec,
                       q4_common (quantizers: Q4_0, Q4_K, Q4_KF, Q6_K, GGUF Q4_K),
-                      q8_matvec, vector, attention, geglu
+                      q8_matvec, vector, attention, geglu, linalg
 
   metal/              (feature-gated: --features metal)
-    mod.rs            MetalBackend (30 pipeline states, KV cache)
-    trait_impl.rs     ComputeBackend dispatch (Q4_K/Q8 dual-path)
-    decode.rs         KV-cached decode (norm→QKV→attend→O→FFN per layer)
+    mod.rs            MetalBackend (~30 pipeline handles + KV cache)
+    kernel/           `KernelHandle` + `TiledKernel` trait
+      handle.rs       Pipeline + geometry, bundled
+      traits.rs       The trait shader files implement to expose constants
+    trait_impl/       (one file per sub-trait)
+      mod.rs          Umbrella ComputeBackend impl + Capability mapping
+      matmul.rs       MatMul impl + f32_gemv / f16_gemv encoders
+      quant_matvec.rs QuantMatVec impl
+      decode.rs       DecodeBackend impl
+    decode/           KV-cached decode (norm→QKV→attend→O→FFN per layer)
+      mod.rs          decode_token + decode_token_with_moe_fn
+      encode_qkv.rs   Step 1 — input norm + format-aware fused QKV
+      encode_ffn.rs   Step 6 — format-aware FFN (Q4_KF / Q4_K / Q4_0)
+      moe_combine.rs  Hybrid-MoE outer combine (Gemma 4 26B A4B)
+      diag.rs         Per-stage / residual / NaN dump helpers
     prefill.rs        GPU prefill for seq>1
     buffers.rs        GPU buffer cache + read_buffer_f32
-    shaders/          44 Metal kernels across 32 shader files
+    shaders/          Metal kernel sources (one file per shader; each
+                      tiled shader has a `Kernel` marker for KernelHandle)
+    stages/           Reusable stage encoders (qkv_proj, rope, qk_norm,
+                      ffn, residual, layer_scalar, quant_matvec, …)
     ops/              GPU dispatch helpers
+      full_pipeline/  `dispatch_full_pipeline` + `LayerBuffers` + dump + kv_copy
+      …               kv_cache, q4_matvec, q4_batched, …
 
   csrc/q4_dot.c       ARM NEON Q4 kernel
 ```
@@ -143,54 +246,111 @@ src/
 ## Tests
 
 ```bash
-# CPU only (38 tests)
+# CPU only
 cargo test -p larql-compute
 
-# CPU + Metal (83 tests)
+# CPU + Metal (full kernel + cross-backend coverage)
 cargo test -p larql-compute --features metal
 ```
 
-83 tests covering: quantization round-trips, cross-backend correctness (Metal vs CPU with tolerance), shader compilation, fused attention, partial RoPE, KV cache, pipeline output verification, standalone activations (SiLU, GELU-tanh), LayerNorm (with/without bias), V-norm, scale_vector, per-layer eps verification.
+**241 tests** with `--features metal` across 18 test files:
+
+- `test_metal_shaders.rs` — compilation, Q4/Q6 matvec, fused attention smoke, LayerNorm, qk_norm, q4kf projection
+- `test_kernel_fused_ops_norms.rs` — rms_norm, residual ops, cooperative SIMD reduction, quantize_q8
+- `test_kernel_fused_attention.rs` — fused RoPE+GQA+softcap attention at production geometries
+- `test_kernel_new_fused_kernels.rs` — `residual_norm_store` and `q4k_q6k_qkv_proj_normed` parity tests
+- `test_kernel_vindex_integration.rs` — stage routing, qkv_proj, vindex regression, real Q4_K bytes
+- `test_kernel_qk_norm.rs` — includes `qk_norm_qk` (fused Q+K) parity vs two separate calls
+- `test_kernel_rope.rs` — includes `rope_at_pos_batched_qk` (fused Q+K) parity vs CPU reference
+- `test_kernel_{kv_attention,kv_cache_append,lm_head_gemv,q4k_ffn_gate_up,q4k/q6k_geglu_down,v_norm,rope_at_pos}` — per-kernel suites at Llama 2 / Gemma 3 4B / Gemma 4 31B geometries
+- `test_correctness.rs`, `test_q4_x86_correctness.rs` — CPU-only round-trips
+- `test_kernel_handle_contract.rs` — every `TiledKernel` marker verified to compile and dispatch correctly
+
+Every production-dispatched kernel has a dedicated parity test.
+
+The cross-backend / cross-stage parity layer lives in `larql-inference`:
+
+- `larql-inference/tests/test_cpu_metal_parity.rs` — full prefill,
+  CPU vs Metal at every layer, all four production architectures.
+- `larql-inference/tests/test_decode_consistency.rs` — Metal decode
+  vs CPU prefill at the same effective sequence length.
+- `larql-inference/tests/test_decode_stage_bisect.rs` — per-stage L0
+  divergence localiser (closed the Gemma 4 31B parity gap; ship log
+  2026-04-25).
+- `larql-inference/tests/test_logits_goldens.rs` — pinned top-5 +
+  top-1 logit per (architecture × backend) on a fixed prompt. Catches
+  *correlated* drift (CPU and Metal regressing in the same direction)
+  that the parity tests can't detect.
 
 ## Examples
 
-### Demos
+Nine examples in three groups — see [`examples/README.md`](examples/README.md) for a one-line description of each.
 
 ```bash
-# Architecture overview — guided tour of all major design decisions
-cargo run --release --features metal -p larql-compute --example demo_architecture
-
-# Basic usage — backend detection, matmul, Q4 dispatch
+# Demos (teach the API)
 cargo run --release --features metal -p larql-compute --example demo_basic
+cargo run --release --features metal -p larql-compute --example demo_architecture
+cargo run --release --features metal -p larql-compute --example demo_ridge_solve
+
+# Compares (full-pipeline benchmarks — distinct from kernel-level criterion suite)
+cargo run --release --features metal -p larql-compute --example compare_decode      # Q4_K decode latency
+cargo run --release --features metal -p larql-compute --example compare_formats     # Q4_KF vs Q4_K vs Q8
+cargo run --release --features metal -p larql-compute --example compare_generation  # End-to-end tok/s
+cargo run --release --features metal -p larql-compute --example compare_pipeline    # Q4_K fused vs Q8 fused
+cargo run --release --features metal -p larql-compute --example compare_ollama      # Head-to-head vs Ollama
+
+# Diagnostic
+cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
 ```
 
-### Benchmarks: Compare (us vs Ollama)
+The headline tok/s vs Ollama uses the CLI's `bench` subcommand against a real vindex:
 
 ```bash
-cargo run --release --features metal -p larql-compute --example compare_decode     # Q4_K vs Q8, KV cached
-cargo run --release --features metal -p larql-compute --example compare_generation  # Prefill + decode
-cargo run --release --features metal -p larql-compute --example compare_pipeline    # Attention + FFN breakdown
-cargo run --release --features metal -p larql-compute --example compare_formats     # Q4_KF vs Q4_K vs GGUF
+larql bench gemma3-4b-q4k-v2 --backends metal --tokens 50 --ollama gemma3:4b
 ```
 
-### Benchmarks: Profile (bottleneck analysis)
+## Benchmarks
+
+Three Criterion benches — see [`benches/README.md`](benches/README.md):
+
+| Bench | Surface |
+|---|---|
+| `quant_matvec` | Q4_0/Q4_K/Q4_KF/Q6_K × 3 shapes × cpu/metal — the regression-detector |
+| `matmul` | f32/f16 matmul + lm-head gemv at three shapes |
+| `linalg` | Cholesky + ridge solve |
 
 ```bash
-cargo run --release --features metal -p larql-compute --example profile_components   # Every op isolated over 34 layers
-cargo run --release --features metal -p larql-compute --example profile_operations   # CPU vs Metal per-operation
-cargo run --release --features metal -p larql-compute --example profile_kernels      # Q4 v1-v5, sparse, attention
-cargo run --release --features metal -p larql-compute --example profile_raw_dispatch # Pure kernel, zero overhead
-cargo run --release --features metal -p larql-compute --example profile_new_kernels  # New model-agnostic kernels
-cargo run --release --features metal -p larql-compute --example profile_kv_cache     # Attention vs cache length
-cargo run --release --features metal -p larql-compute --example profile_bandwidth    # Raw memory throughput
+make bench           # run all three
+make bench-save      # record a baseline named `main`
+make bench-check     # re-run; fail if any cell regressed
 ```
 
-### Benchmarks: Best Run
+The detector lives in `scripts/bench-regress.sh`; CI starter at
+`.github/workflows/bench-regress.yml`.
+
+## Diagnostics: parity bisect
+
+When a forward path drifts (CPU vs Metal, or Metal decode vs a fresh
+prefill), the per-stage bisect tool localises the divergence to a
+single sub-stage of a single layer. This is the diagnostic that
+closed the open Gemma 4 31B parity gap (2026-04-25 ship log) — every
+attention-side stage at L0 matched at `cos=1.0`, the first
+divergence appeared at `ffn_out_raw` / `down_out`, pointing at the
+`q4k_ffn_gate_up` shader.
 
 ```bash
-cargo run --release --features metal -p larql-compute --example best_pipeline       # Full pipeline, 1 cmd buffer
-cargo run --release --features metal -p larql-compute --example best_multi_layer     # Multi-layer batch
+# Per-layer end-of-layer diff: CPU prefill vs Metal prefill
+cargo run --release --features metal -p larql-inference \
+    --example residual_diff -- <vindex> "The capital of France is"
+
+# Per-stage L0 diff: CPU prefill vs Metal KV-cached decode
+cargo run --release --features metal -p larql-inference \
+    --example stage_bisect -- <vindex> "The capital of France is" 0
 ```
+
+`stage_bisect` exposes the public `larql_inference::residual_diff::stages`
+API; the same calls back the regression suite at
+`larql-inference/tests/test_decode_stage_bisect.rs`.
 
 ## Documentation
 
@@ -199,14 +359,14 @@ cargo run --release --features metal -p larql-compute --example best_multi_layer
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmark data, component profiling, optimization history |
 | [ROADMAP.md](ROADMAP.md) | Planned optimizations, performance targets |
 | [docs/adr/](docs/adr/) | 12 architectural decision records (design choices, algorithm origins, per-layer params, encoder merging) |
-| [docs/shaders.md](docs/shaders.md) | All 44 Metal kernels with origin, performance, parameters |
+| [docs/shaders.md](docs/shaders.md) | Metal kernels with origin, performance, parameters (may lag the source — see the Shaders table above for the current production set) |
 | [docs/quantization-formats.md](docs/quantization-formats.md) | Q4_0, Q4_K, Q4_KF, Q6_K, Q8_0 format specs |
 | [docs/decode-pipeline.md](docs/decode-pipeline.md) | Decode data flow, dual-path architecture, KV cache |
 
 ## Design Principles
 
 1. **Trait-based dispatch** — callers use `ComputeBackend` exclusively
-2. **One file per kernel** — 32 shader files, each containing related kernels
+2. **One file per kernel family** — ~38 shader files under `src/metal/shaders/`, each containing related kernels
 3. **Zero-copy mmap** — `newBufferWithBytesNoCopy` for weight buffers
 4. **Safe by default** — `read_buffer_f32` with bounds checking
 5. **Feature-gated** — Metal with `--features metal`, CPU always available

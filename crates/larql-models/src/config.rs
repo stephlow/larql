@@ -4,6 +4,8 @@
 //! describes *what the model is* — tensor key patterns, norm behavior,
 //! activation functions, scaling — without any compute dependencies.
 
+use crate::validation::ConfigValidationResult;
+
 /// Normalization type used by the model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NormType {
@@ -131,6 +133,16 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// Parsed model configuration.
     fn config(&self) -> &ModelConfig;
+
+    /// Validate parsed architecture dimensions and cross-field invariants.
+    ///
+    /// Detection is intentionally permissive so callers can inspect partially
+    /// specified configs. Call this before inference or extraction to fail
+    /// early on inconsistent head geometry, RoPE settings, per-layer metadata,
+    /// MoE routing, or other values that would otherwise surface later.
+    fn validate(&self) -> ConfigValidationResult {
+        crate::validation::validate_architecture(self)
+    }
 
     // ── Tensor key patterns ──
 
@@ -413,7 +425,10 @@ pub trait ModelArchitecture: Send + Sync {
     /// Key for the per-layer input gate projection [ple_dim, hidden].
     fn per_layer_input_gate_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {
-            Some(format!("{}per_layer_input_gate.weight", self.layer_prefix(layer)))
+            Some(format!(
+                "{}per_layer_input_gate.weight",
+                self.layer_prefix(layer)
+            ))
         } else {
             None
         }
@@ -422,7 +437,10 @@ pub trait ModelArchitecture: Send + Sync {
     /// Key for the per-layer output projection [hidden, ple_dim].
     fn per_layer_projection_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {
-            Some(format!("{}per_layer_projection.weight", self.layer_prefix(layer)))
+            Some(format!(
+                "{}per_layer_projection.weight",
+                self.layer_prefix(layer)
+            ))
         } else {
             None
         }
@@ -431,7 +449,10 @@ pub trait ModelArchitecture: Send + Sync {
     /// Key for the post-PLE norm weight.
     fn post_per_layer_input_norm_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {
-            Some(format!("{}post_per_layer_input_norm.weight", self.layer_prefix(layer)))
+            Some(format!(
+                "{}post_per_layer_input_norm.weight",
+                self.layer_prefix(layer)
+            ))
         } else {
             None
         }
@@ -533,13 +554,21 @@ pub trait ModelArchitecture: Send + Sync {
     // ── Packed expert keys (MXFP4 models) ──
 
     /// Packed gate+up projection blocks key (all experts fused, MXFP4).
-    fn packed_gate_up_blocks_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_gate_up_blocks_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// Packed gate+up projection scales key.
-    fn packed_gate_up_scales_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_gate_up_scales_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// Packed down projection blocks key.
-    fn packed_down_blocks_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_down_blocks_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// Packed down projection scales key.
-    fn packed_down_scales_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_down_scales_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
 
     /// Shared expert FFN gate weight key.
     fn shared_expert_gate_key(&self, _layer: usize) -> Option<String> {

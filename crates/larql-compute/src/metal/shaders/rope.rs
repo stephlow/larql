@@ -98,4 +98,60 @@ kernel void rope_at_pos_batched(
     x[base_idx + d]        = re * cos_a - im * sin_a;
     x[base_idx + d + hdim] = re * sin_a + im * cos_a;
 }
+
+// Fused Q+K batched RoPE — applies RoPE to all Q heads then all K heads
+// in one dispatch instead of two. Grid: (rotary_dim/2, num_q+num_kv, 1).
+// Saves one `dispatch_threads` call per layer × 34 = 34 saved dispatches/token.
+kernel void rope_at_pos_batched_qk(
+    device float*       Q          [[buffer(0)]],   // [num_q_heads * head_dim]
+    device float*       K          [[buffer(1)]],   // [num_kv_heads * head_dim]
+    constant uint&      head_dim   [[buffer(2)]],
+    constant float&     rope_base  [[buffer(3)]],
+    constant uint&      pos        [[buffer(4)]],
+    constant uint&      rotary_dim [[buffer(5)]],
+    constant uint&      num_q      [[buffer(6)]],   // q heads count
+    uint2 tid [[thread_position_in_grid]])
+{
+    uint d = tid.x;   // pair index
+    uint h = tid.y;   // global head index (0..num_q → Q, num_q.. → K)
+
+    uint rdim = (rotary_dim == 0u) ? head_dim : min(rotary_dim, head_dim);
+    uint hdim = rdim / 2u;
+    if (d >= hdim) return;
+
+    bool is_q = (h < num_q);
+    uint local_h = is_q ? h : (h - num_q);
+    device float* x = is_q ? Q : K;
+    uint base_idx = local_h * head_dim;
+
+    float freq  = 1.0f / pow(rope_base, float(2u * d) / float(rdim));
+    float angle = float(pos) * freq;
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    float re = x[base_idx + d];
+    float im = x[base_idx + d + hdim];
+    x[base_idx + d]        = re * cos_a - im * sin_a;
+    x[base_idx + d + hdim] = re * sin_a + im * cos_a;
+}
 "#;
+
+pub struct RopeApplyKernel;
+impl crate::metal::kernel::ShaderKernel for RopeApplyKernel {
+    const KERNEL_NAME: &'static str = "rope_apply";
+}
+
+pub struct RopeAtPosKernel;
+impl crate::metal::kernel::ShaderKernel for RopeAtPosKernel {
+    const KERNEL_NAME: &'static str = "rope_at_pos";
+}
+
+pub struct RopeAtPosBatchedKernel;
+impl crate::metal::kernel::ShaderKernel for RopeAtPosBatchedKernel {
+    const KERNEL_NAME: &'static str = "rope_at_pos_batched";
+}
+
+pub struct RopeAtPosBatchedQkKernel;
+impl crate::metal::kernel::ShaderKernel for RopeAtPosBatchedQkKernel {
+    const KERNEL_NAME: &'static str = "rope_at_pos_batched_qk";
+}

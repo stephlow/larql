@@ -19,8 +19,11 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use ndarray::Array2;
+use crate::extract::stage_labels::STAGE_RELATION_CLUSTERS;
+use crate::format::filenames::{FEATURE_CLUSTERS_JSONL, RELATION_CLUSTERS_JSON};
+
 use larql_models::ModelWeights;
+use ndarray::Array2;
 
 use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
@@ -44,7 +47,12 @@ pub(crate) fn chrono_now() -> String {
     let sec = secs % 60;
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        years_approx, months.min(12), day.min(31), hour, min, sec
+        years_approx,
+        months.min(12),
+        day.min(31),
+        hour,
+        min,
+        sec
     )
 }
 
@@ -63,7 +71,9 @@ pub(crate) fn build_whole_word_vocab(
         if let Ok(tok) = tokenizer.decode(&[id as u32], true) {
             let tok = tok.trim();
             if tok.len() >= 3
-                && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '\'')
+                && tok
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '\'')
             {
                 ww_ids.push(id);
             }
@@ -76,7 +86,10 @@ pub(crate) fn build_whole_word_vocab(
         ww_embed.row_mut(i).assign(&embed.row(id));
     }
 
-    eprintln!("    Whole-word vocab: {} tokens (of {})", ww_count, vocab_size);
+    eprintln!(
+        "    Whole-word vocab: {} tokens (of {})",
+        ww_count, vocab_size
+    );
     (ww_ids, ww_embed)
 }
 
@@ -104,7 +117,7 @@ pub(super) fn compute_gate_top_tokens(
         let gend = (gstart + gbatch).min(num_features);
         let chunk = w_gate.slice(ndarray::s![gstart..gend, ..]);
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::ComputeBackend;
+        use larql_compute::MatMul;
         let proj = cpu.matmul_transb(ww_embed.view(), chunk.view());
         for f in 0..(gend - gstart) {
             let col = proj.column(f);
@@ -207,7 +220,7 @@ pub(super) fn run_clustering_pipeline(
         return Ok(());
     }
 
-    callbacks.on_stage("relation_clusters");
+    callbacks.on_stage(STAGE_RELATION_CLUSTERS);
 
     let n_features = data.features.len();
     let matrix = ndarray::Array2::from_shape_vec((n_features, hidden_size), data.directions)
@@ -237,7 +250,10 @@ pub(super) fn run_clustering_pipeline(
     };
 
     let output_labeled = output_labels.iter().filter(|l| l.is_some()).count();
-    eprintln!("  Wikidata output matching: {}/{} clusters labeled", output_labeled, optimal_k);
+    eprintln!(
+        "  Wikidata output matching: {}/{} clusters labeled",
+        output_labeled, optimal_k
+    );
 
     // Tier 2+3: embedding projection + pattern detection
     let (embed_labels, top_tokens_per_cluster) =
@@ -277,10 +293,10 @@ pub(super) fn run_clustering_pipeline(
 
     let clusters_json = serde_json::to_string_pretty(&cluster_result)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(output_dir.join("relation_clusters.json"), clusters_json)?;
+    std::fs::write(output_dir.join(RELATION_CLUSTERS_JSON), clusters_json)?;
 
     // Write per-feature cluster assignments
-    let assign_path = output_dir.join("feature_clusters.jsonl");
+    let assign_path = output_dir.join(FEATURE_CLUSTERS_JSONL);
     let mut assign_file = BufWriter::new(std::fs::File::create(&assign_path)?);
     for (i, &(layer, feat)) in data.features.iter().enumerate() {
         let record = serde_json::json!({ "l": layer, "f": feat, "c": assignments[i] });
@@ -291,7 +307,10 @@ pub(super) fn run_clustering_pipeline(
     assign_file.flush()?;
 
     callbacks.on_stage_done(
-        &format!("relation_clusters (k={}, {} features)", optimal_k, n_features),
+        &format!(
+            "relation_clusters (k={}, {} features)",
+            optimal_k, n_features
+        ),
         0.0,
     );
 

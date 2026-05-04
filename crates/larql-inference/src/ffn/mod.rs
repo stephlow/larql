@@ -7,13 +7,14 @@
 //! comparison (see `examples/walk_correctness.rs`); they are not used in
 //! production dispatch.
 
-pub mod weight;
+pub mod graph_backend;
+pub mod moe_remote;
+pub mod remote;
 pub mod sparse;
 pub mod sparse_compute;
-pub mod remote;
-pub mod moe_remote;
 #[cfg(test)]
 mod tests;
+pub mod weight;
 
 use ndarray::Array2;
 
@@ -29,18 +30,31 @@ pub trait FfnBackend {
 
     /// Human-readable name for logging.
     fn name(&self) -> &str;
+
+    /// For hybrid MoE layers: receive `h_post_attn` (post-attention, pre-FFN,
+    /// unnormalized) and return the full layer output `h_out`. Returns `None`
+    /// to fall back to local dispatch.
+    fn forward_moe_full_layer(
+        &self,
+        _layer: usize,
+        _h_post_attn: &larql_vindex::ndarray::Array2<f32>,
+    ) -> Option<larql_vindex::ndarray::Array2<f32>> {
+        None
+    }
 }
 
 // ── Re-exports ──
 
-pub use weight::WeightFfn;
-pub use sparse::SparseFfn;
-pub use remote::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend, RemoteLatencyStats};
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
-pub use sparse_compute::{
-    sparse_ffn_forward, sparse_ffn_forward_with_overrides,
-    sparse_ffn_forward_with_full_overrides, FeatureSlotOverride,
+pub use remote::{
+    LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
 };
+pub use sparse::SparseFfn;
+pub use sparse_compute::{
+    sparse_ffn_forward, sparse_ffn_forward_with_full_overrides, sparse_ffn_forward_with_overrides,
+    FeatureSlotOverride,
+};
+pub use weight::{dense_ffn_forward_backend, BackendFfn, WeightFfn};
 
 // ── Per-layer backend selection ──
 
@@ -52,17 +66,26 @@ pub struct LayerFfnRouter<'a> {
 
 impl<'a> LayerFfnRouter<'a> {
     pub fn uniform(backend: &'a dyn FfnBackend, num_layers: usize) -> Self {
-        Self { backends: vec![backend; num_layers], num_layers }
+        Self {
+            backends: vec![backend; num_layers],
+            num_layers,
+        }
     }
 
     pub fn per_layer(backends: Vec<&'a dyn FfnBackend>) -> Self {
         let num_layers = backends.len();
-        Self { backends, num_layers }
+        Self {
+            backends,
+            num_layers,
+        }
     }
 
     pub fn get(&self, layer: usize) -> &dyn FfnBackend {
-        if layer < self.num_layers { self.backends[layer] }
-        else { self.backends[self.num_layers - 1] }
+        if layer < self.num_layers {
+            self.backends[layer]
+        } else {
+            self.backends[self.num_layers - 1]
+        }
     }
 }
 

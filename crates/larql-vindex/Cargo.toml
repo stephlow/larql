@@ -48,6 +48,7 @@ metal = ["larql-compute/metal"]
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [[bench]]
 name = "vindex_ops"
@@ -67,4 +68,16 @@ harness = false
 
 [[bench]]
 name = "q4k_vs_f32"
+harness = false
+
+[[bench]]
+name = "hnsw_decode"
+harness = false
+
+[[bench]]
+name = "q4k_cache"
+harness = false
+
+[[bench]]
+name = "cpu_vs_gpu"
 harness = false
