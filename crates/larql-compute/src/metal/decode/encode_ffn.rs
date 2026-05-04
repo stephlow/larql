@@ -346,7 +346,21 @@ impl MetalBackend {
                     metal::MTLSize::new(n_tgs, 1, 1),
                     metal::MTLSize::new(kh.threads_per_tg, 1, 1),
                 );
-            } else if layer.down.format == crate::QuantFormat::Q4_K {
+            } else if layer.down.format == crate::QuantFormat::Q4_K
+                && inter_padded <= 16384
+                && std::env::var("LARQL_FUSED_DOWN").map(|v| v != "0").unwrap_or(true)
+            {
+                // Fused GEGLU+down for small-to-medium intermediate sizes.
+                //
+                // Known data-dependent NaN: Gemma 4 31B (inter=21504) produces
+                // NaN in down_out at layer 11 despite clean gate/up inputs and
+                // no NaN in the weight scales. Root cause unresolved; guarded
+                // by inter_padded <= 16384 which keeps the optimisation for
+                // 4B (10240), 26B-A4B (2112), and similar models while falling
+                // back to the separate GEGLU+matvec path for 31B.
+                // Override: LARQL_FUSED_DOWN=0 disables for all sizes;
+                //           LARQL_FUSED_DOWN=1 with no size guard (for
+                //           investigation — add && inter_padded <= 99999).
                 self.encode_q4k_fused_geglu_down(
                     enc,
                     layer,

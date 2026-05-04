@@ -177,3 +177,8 @@ fn q4k_geglu_gelu_tanh_down_gemma3_4b_ffn() {
 fn q4k_geglu_silu_down_gemma4_31b_ffn() {
     assert_fused_geglu_down_matches_separated("gemma4-31b ffn (silu)", 5376, 21504, true);
 }
+
+#[test]
+fn q4k_geglu_gelu_tanh_down_gemma4_31b_ffn() {
+    assert_fused_geglu_down_matches_separated("gemma4-31b ffn (gelu_tanh)", 5376, 21504, false);
+}

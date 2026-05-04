@@ -141,7 +141,8 @@ pub fn q4k_ffn_forward_layer_q8k(
                 .expect("down cache shape");
             activation.dot(&w_down_t)
         } else {
-            let inter_padded = intermediate.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+            let inter_padded = intermediate
+                .div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
                 * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
             let w_down = if inter_padded != intermediate {
                 let w = dequantize_matrix(ffn[2].0, ffn[2].1, hidden, inter_padded);

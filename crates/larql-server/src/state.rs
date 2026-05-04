@@ -105,8 +105,7 @@ pub struct LoadedModel {
     /// `new_buffer_with_bytes_no_copy` for page-aligned mmap data).
     /// Only populated when the server has interleaved Q4K data loaded.
     #[cfg(feature = "metal-experts")]
-    pub metal_ffn_layer_bufs:
-        std::sync::OnceLock<Vec<[larql_compute::MetalBuffer; 3]>>,
+    pub metal_ffn_layer_bufs: std::sync::OnceLock<Vec<[larql_compute::MetalBuffer; 3]>>,
 }
 
 impl LoadedModel {

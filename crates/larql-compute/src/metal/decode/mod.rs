@@ -453,6 +453,25 @@ impl MetalBackend {
             h_buf = new_h;
             let _ = &scaled_scratch; // keep binding alive; no longer needed
 
+            // Per-layer NaN diagnostic (LARQL_DEBUG_NAN_LAYERS=1).
+            // Forces a commit+wait per layer — expensive, debug-only.
+            if std::env::var("LARQL_DEBUG_NAN_LAYERS").is_ok() {
+                if !encoder_ended {
+                    enc.end_encoding();
+                }
+                cmd.commit();
+                cmd.wait_until_completed();
+                let h = super::buffers::read_buffer_f32(h_buf, hidden);
+                let nans = h.iter().filter(|v| v.is_nan()).count();
+                eprintln!(
+                    "[nan-debug] layer {l}: {nans}/{hidden} NaN (head_dim={} kv_heads={})",
+                    layers[l].head_dim, layers[l].num_kv_heads
+                );
+                cmd = self.queue.new_command_buffer().to_owned();
+                enc = cmd.new_compute_command_encoder().to_owned();
+                encoder_ended = false;
+            }
+
             // CPU MoE interleave for hybrid MoE models (e.g. Gemma 4 26B A4B).
             // After the GPU dense-FFN pass, flush the encoder, run the expert block
             // on CPU (direct shared-memory access), then restart for the next layer.

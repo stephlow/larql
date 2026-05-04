@@ -127,6 +127,97 @@ pub(super) struct OraclePqArgs {
     #[arg(long, default_value = "majority")]
     address_code_substitution_to_codes: String,
 
+    /// Evaluate simultaneous behavioral class-collapse substitutions.
+    ///
+    /// Spec format:
+    ///   name=6+10+13:13
+    ///   name=6+10+13:13|7:10
+    /// Multiple specs are separated by semicolons.
+    #[arg(long)]
+    address_code_class_collapse_group_probe: bool,
+
+    /// Comma-separated PQ groups for --address-code-class-collapse-group-probe.
+    #[arg(long, default_value = "0")]
+    address_code_class_collapse_groups: String,
+
+    /// Semicolon-separated class-collapse specs.
+    #[arg(long, default_value = "")]
+    address_code_class_collapse_specs: String,
+
+    /// Probe position-local interactions for one prompt and one PQ group.
+    ///
+    /// This is a targeted diagnostic for quotient failures: selected primary
+    /// and secondary source codes are changed to one target code only within
+    /// the requested prompt, while all other positions/groups remain oracle.
+    #[arg(long)]
+    address_code_position_interaction_probe: bool,
+
+    /// Prompt id for --address-code-position-interaction-probe.
+    #[arg(long, default_value = "")]
+    address_code_position_prompt_id: String,
+
+    /// PQ group for --address-code-position-interaction-probe.
+    #[arg(long, default_value_t = 0)]
+    address_code_position_group: usize,
+
+    /// Primary source codes for --address-code-position-interaction-probe.
+    #[arg(long, default_value = "10")]
+    address_code_position_primary_codes: String,
+
+    /// Secondary source codes for --address-code-position-interaction-probe.
+    #[arg(long, default_value = "6")]
+    address_code_position_secondary_codes: String,
+
+    /// Target code for --address-code-position-interaction-probe.
+    #[arg(long, default_value_t = 13)]
+    address_code_position_target_code: usize,
+
+    /// Evaluate split-wide conditional quotient rules for one PQ group.
+    ///
+    /// Primary codes are mapped to the target unconditionally. Secondary codes
+    /// are mapped to the target except where a built-in guard preserves the
+    /// oracle code. This tests whether a quotient plus local exception guard
+    /// clears the held-out gate.
+    #[arg(long)]
+    address_code_conditional_quotient_group_probe: bool,
+
+    /// PQ group for --address-code-conditional-quotient-group-probe.
+    #[arg(long, default_value_t = 0)]
+    address_code_conditional_quotient_group: usize,
+
+    /// Primary source codes for the conditional quotient probe.
+    #[arg(long, default_value = "10")]
+    address_code_conditional_quotient_primary_codes: String,
+
+    /// Secondary source codes for the conditional quotient probe.
+    #[arg(long, default_value = "6")]
+    address_code_conditional_quotient_secondary_codes: String,
+
+    /// Target code for the conditional quotient probe.
+    #[arg(long, default_value_t = 13)]
+    address_code_conditional_quotient_target_code: usize,
+
+    /// Max early position guarded by early-prose conditional quotient variants.
+    #[arg(long, default_value_t = 1)]
+    address_code_conditional_quotient_early_position_max: usize,
+
+    /// Conditional quotient guards to evaluate.
+    ///
+    /// Supported: early_prose_position, early_prose_bos_prev, prose_bos_prev.
+    #[arg(
+        long,
+        default_value = "early_prose_position,early_prose_bos_prev,prose_bos_prev"
+    )]
+    address_code_conditional_quotient_guards: String,
+
+    /// Extra source:target mappings layered on top of the conditional quotient.
+    ///
+    /// Spec format matches class-collapse specs. Empty adds only the base
+    /// conditional quotient. Example:
+    ///   code4_to13=4:13;code7_to10=7:10
+    #[arg(long, default_value = "")]
+    address_code_conditional_quotient_extra_specs: String,
+
     /// Export per-position occurrences for selected PQ group codes.
     #[arg(long)]
     address_code_occurrences: bool,
@@ -525,6 +616,191 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                             config
                         )
                         .into());
+                    }
+                }
+            }
+        }
+    }
+    let mut code_class_collapse_groups =
+        parse_usize_list(&args.address_code_class_collapse_groups)?;
+    code_class_collapse_groups.sort_unstable();
+    code_class_collapse_groups.dedup();
+    let code_class_collapse_specs =
+        parse_code_class_collapse_specs(&args.address_code_class_collapse_specs)?;
+    if args.address_code_class_collapse_group_probe {
+        if code_class_collapse_groups.is_empty() {
+            return Err("--address-code-class-collapse-group-probe requires at least one --address-code-class-collapse-groups value".into());
+        }
+        if code_class_collapse_specs.is_empty() {
+            return Err(
+                "--address-code-class-collapse-specs must include at least one spec".into(),
+            );
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            for &group in &code_class_collapse_groups {
+                if group >= config.groups {
+                    return Err(format!(
+                        "--address-code-class-collapse-groups includes group {group}, but config {:?} has only {} groups",
+                        config, config.groups
+                    )
+                    .into());
+                }
+            }
+            for spec in &code_class_collapse_specs {
+                for mapping in &spec.mappings {
+                    if mapping.target >= levels {
+                        return Err(format!(
+                            "class-collapse spec {:?} targets code {}, but config {:?} has only {levels} levels",
+                            spec.name, mapping.target, config
+                        )
+                        .into());
+                    }
+                    for &source in &mapping.sources {
+                        if source >= levels {
+                            return Err(format!(
+                                "class-collapse spec {:?} includes source code {source}, but config {:?} has only {levels} levels",
+                                spec.name, config
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut code_position_primary_codes =
+        parse_usize_list(&args.address_code_position_primary_codes)?;
+    code_position_primary_codes.sort_unstable();
+    code_position_primary_codes.dedup();
+    let mut code_position_secondary_codes =
+        parse_usize_list(&args.address_code_position_secondary_codes)?;
+    code_position_secondary_codes.sort_unstable();
+    code_position_secondary_codes.dedup();
+    let code_position_prompt_id = args.address_code_position_prompt_id.trim().to_string();
+    if args.address_code_position_interaction_probe {
+        if code_position_prompt_id.is_empty() {
+            return Err("--address-code-position-interaction-probe requires --address-code-position-prompt-id".into());
+        }
+        if code_position_primary_codes.is_empty() {
+            return Err(
+                "--address-code-position-primary-codes must include at least one code".into(),
+            );
+        }
+        if code_position_secondary_codes.is_empty() {
+            return Err(
+                "--address-code-position-secondary-codes must include at least one code".into(),
+            );
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            if args.address_code_position_group >= config.groups {
+                return Err(format!(
+                    "--address-code-position-group is {}, but config {:?} has only {} groups",
+                    args.address_code_position_group, config, config.groups
+                )
+                .into());
+            }
+            if args.address_code_position_target_code >= levels {
+                return Err(format!(
+                    "--address-code-position-target-code is {}, but config {:?} has only {levels} levels",
+                    args.address_code_position_target_code, config
+                )
+                .into());
+            }
+            for &code in code_position_primary_codes
+                .iter()
+                .chain(code_position_secondary_codes.iter())
+            {
+                if code >= levels {
+                    return Err(format!(
+                        "--address-code-position primary/secondary code {code} exceeds config {:?} with {levels} levels",
+                        config
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let mut code_conditional_quotient_primary_codes =
+        parse_usize_list(&args.address_code_conditional_quotient_primary_codes)?;
+    code_conditional_quotient_primary_codes.sort_unstable();
+    code_conditional_quotient_primary_codes.dedup();
+    let mut code_conditional_quotient_secondary_codes =
+        parse_usize_list(&args.address_code_conditional_quotient_secondary_codes)?;
+    code_conditional_quotient_secondary_codes.sort_unstable();
+    code_conditional_quotient_secondary_codes.dedup();
+    let code_conditional_quotient_guards =
+        parse_conditional_quotient_guards(&args.address_code_conditional_quotient_guards)?;
+    let mut code_conditional_quotient_extra_specs =
+        parse_code_class_collapse_specs(&args.address_code_conditional_quotient_extra_specs)?;
+    code_conditional_quotient_extra_specs.insert(
+        0,
+        CodeClassCollapseSpec {
+            name: "base".to_string(),
+            mappings: Vec::new(),
+        },
+    );
+    if args.address_code_conditional_quotient_group_probe {
+        if code_conditional_quotient_primary_codes.is_empty() {
+            return Err(
+                "--address-code-conditional-quotient-primary-codes must include at least one code"
+                    .into(),
+            );
+        }
+        if code_conditional_quotient_secondary_codes.is_empty() {
+            return Err("--address-code-conditional-quotient-secondary-codes must include at least one code".into());
+        }
+        if code_conditional_quotient_guards.is_empty() {
+            return Err(
+                "--address-code-conditional-quotient-guards must include at least one guard".into(),
+            );
+        }
+        for config in &configs {
+            let levels = 1usize << config.bits_per_group;
+            if args.address_code_conditional_quotient_group >= config.groups {
+                return Err(format!(
+                    "--address-code-conditional-quotient-group is {}, but config {:?} has only {} groups",
+                    args.address_code_conditional_quotient_group, config, config.groups
+                )
+                .into());
+            }
+            if args.address_code_conditional_quotient_target_code >= levels {
+                return Err(format!(
+                    "--address-code-conditional-quotient-target-code is {}, but config {:?} has only {levels} levels",
+                    args.address_code_conditional_quotient_target_code, config
+                )
+                .into());
+            }
+            for &code in code_conditional_quotient_primary_codes
+                .iter()
+                .chain(code_conditional_quotient_secondary_codes.iter())
+            {
+                if code >= levels {
+                    return Err(format!(
+                        "--address-code-conditional-quotient primary/secondary code {code} exceeds config {:?} with {levels} levels",
+                        config
+                    )
+                    .into());
+                }
+            }
+            for spec in &code_conditional_quotient_extra_specs {
+                for mapping in &spec.mappings {
+                    if mapping.target >= levels {
+                        return Err(format!(
+                            "conditional quotient extra spec {:?} targets code {}, but config {:?} has only {levels} levels",
+                            spec.name, mapping.target, config
+                        )
+                        .into());
+                    }
+                    for &source in &mapping.sources {
+                        if source >= levels {
+                            return Err(format!(
+                                "conditional quotient extra spec {:?} includes source code {source}, but config {:?} has only {levels} levels",
+                                spec.name, config
+                            )
+                            .into());
+                        }
                     }
                 }
             }
@@ -1314,6 +1590,17 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
     if args.address_code_substitution_group_probe && !args.mode_d_check {
         return Err("--address-code-substitution-group-probe requires --mode-d-check".into());
     }
+    if args.address_code_class_collapse_group_probe && !args.mode_d_check {
+        return Err("--address-code-class-collapse-group-probe requires --mode-d-check".into());
+    }
+    if args.address_code_position_interaction_probe && !args.mode_d_check {
+        return Err("--address-code-position-interaction-probe requires --mode-d-check".into());
+    }
+    if args.address_code_conditional_quotient_group_probe && !args.mode_d_check {
+        return Err(
+            "--address-code-conditional-quotient-group-probe requires --mode-d-check".into(),
+        );
+    }
     if args.address_code7_bos_rule_group_probe && !args.mode_d_check {
         return Err("--address-code7-bos-rule-group-probe requires --mode-d-check".into());
     }
@@ -1328,6 +1615,9 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         || args.address_key_group_probe
         || args.address_majority_group_probe
         || args.address_code_substitution_group_probe
+        || args.address_code_class_collapse_group_probe
+        || args.address_code_position_interaction_probe
+        || args.address_code_conditional_quotient_group_probe
         || args.address_code7_bos_rule_group_probe
         || args.address_code7_oracle_binary_group_probe
         || args.address_prev_ffn_feature_group_probe
@@ -1781,6 +2071,316 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
                                         prompt_report,
                                     );
                             }
+                        }
+                    }
+                }
+
+                if args.address_code_class_collapse_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for code class-collapse probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    for collapse_spec in &code_class_collapse_specs {
+                        let predicted_codes_by_position = oracle_codes_by_position
+                            .iter()
+                            .map(|oracle_codes| {
+                                let mut codes = oracle_codes.clone();
+                                for &group in &code_class_collapse_groups {
+                                    for mapping in &collapse_spec.mappings {
+                                        if mapping.sources.contains(&oracle_codes[group]) {
+                                            codes[group] = mapping.target;
+                                            break;
+                                        }
+                                    }
+                                }
+                                codes
+                            })
+                            .collect::<Vec<_>>();
+                        let prompt_report = evaluate_predicted_address(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                            stratum,
+                            label,
+                            &baseline_logp,
+                            baseline_top1,
+                            &oracle_codes_by_position,
+                        )?;
+                        let selected_group_keys = (0..config.groups)
+                            .map(|group| {
+                                if code_class_collapse_groups.contains(&group) {
+                                    collapse_spec.mapping_label()
+                                } else {
+                                    "oracle".to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_probe(
+                                &format!(
+                                    "code_class_collapse_{}_groups_{:?}_oracle_rest",
+                                    collapse_spec.name, code_class_collapse_groups
+                                ),
+                                &selected_group_keys,
+                                prompt_report,
+                            );
+                    }
+                }
+
+                if args.address_code_position_interaction_probe
+                    && label == code_position_prompt_id.as_str()
+                {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for code position-interaction probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group = args.address_code_position_group;
+                    let target_code = args.address_code_position_target_code;
+                    let primary_positions = oracle_codes_by_position
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(pos, codes)| {
+                            code_position_primary_codes
+                                .contains(&codes[group])
+                                .then_some(pos)
+                        })
+                        .collect::<Vec<_>>();
+                    let secondary_positions = oracle_codes_by_position
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(pos, codes)| {
+                            code_position_secondary_codes
+                                .contains(&codes[group])
+                                .then_some(pos)
+                        })
+                        .collect::<Vec<_>>();
+
+                    let mut emit_position_variant =
+                        |variant_name: String,
+                         mut changed_positions: Vec<usize>|
+                         -> Result<(), Box<dyn std::error::Error>> {
+                            changed_positions.sort_unstable();
+                            changed_positions.dedup();
+                            if changed_positions.is_empty() {
+                                return Ok(());
+                            }
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let mut codes = oracle_codes.clone();
+                                    if changed_positions.binary_search(&pos).is_ok() {
+                                        codes[group] = target_code;
+                                    }
+                                    codes
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            let selected_group_keys = (0..config.groups)
+                                .map(|candidate_group| {
+                                    if candidate_group == group {
+                                        format!(
+                                            "{variant_name}_positions_{}",
+                                            changed_positions
+                                                .iter()
+                                                .map(ToString::to_string)
+                                                .collect::<Vec<_>>()
+                                                .join("+")
+                                        )
+                                    } else {
+                                        "oracle".to_string()
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_probe(
+                                &format!(
+                                    "pos_interaction_g{group}_{variant_name}_to{target_code}_oracle_rest"
+                                ),
+                                &selected_group_keys,
+                                prompt_report,
+                            );
+                            Ok(())
+                        };
+
+                    emit_position_variant("A0_all_primary".to_string(), primary_positions.clone())?;
+                    emit_position_variant(
+                        "A1_all_secondary".to_string(),
+                        secondary_positions.clone(),
+                    )?;
+                    let mut all_primary_secondary = primary_positions.clone();
+                    all_primary_secondary.extend(secondary_positions.iter().copied());
+                    emit_position_variant(
+                        "A2_all_primary_all_secondary".to_string(),
+                        all_primary_secondary,
+                    )?;
+                    for (idx, &secondary_pos) in secondary_positions.iter().enumerate() {
+                        let mut changed = primary_positions.clone();
+                        changed.push(secondary_pos);
+                        emit_position_variant(
+                            format!("A{}_all_primary_secondary_pos{secondary_pos}", idx + 3),
+                            changed,
+                        )?;
+                    }
+                    let leave_one_offset = 3 + secondary_positions.len();
+                    for (idx, &secondary_pos) in secondary_positions.iter().enumerate() {
+                        let mut changed = primary_positions.clone();
+                        changed.extend(
+                            secondary_positions
+                                .iter()
+                                .copied()
+                                .filter(|pos| *pos != secondary_pos),
+                        );
+                        emit_position_variant(
+                            format!(
+                                "A{}_all_primary_all_secondary_except_pos{secondary_pos}",
+                                leave_one_offset + idx
+                            ),
+                            changed,
+                        )?;
+                    }
+                    for &primary_pos in &primary_positions {
+                        let mut changed = secondary_positions.clone();
+                        changed.push(primary_pos);
+                        emit_position_variant(
+                            format!("all_secondary_primary_pos{primary_pos}"),
+                            changed,
+                        )?;
+                    }
+                    for &primary_pos in &primary_positions {
+                        let mut changed = secondary_positions.clone();
+                        changed.extend(
+                            primary_positions
+                                .iter()
+                                .copied()
+                                .filter(|pos| *pos != primary_pos),
+                        );
+                        emit_position_variant(
+                            format!("all_primary_except_pos{primary_pos}_all_secondary"),
+                            changed,
+                        )?;
+                    }
+                }
+
+                if args.address_code_conditional_quotient_group_probe {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for code conditional-quotient probe L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group = args.address_code_conditional_quotient_group;
+                    let target_code = args.address_code_conditional_quotient_target_code;
+                    let early_position_max =
+                        args.address_code_conditional_quotient_early_position_max;
+                    let attention_rows =
+                        capture_attention_relation_rows(&mut weights, &token_ids, &index, *head)?;
+                    for &guard in &code_conditional_quotient_guards {
+                        for extra_spec in &code_conditional_quotient_extra_specs {
+                            let predicted_codes_by_position = oracle_codes_by_position
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, oracle_codes)| {
+                                    let mut codes = oracle_codes.clone();
+                                    let group_code = oracle_codes[group];
+                                    if code_conditional_quotient_primary_codes.contains(&group_code)
+                                    {
+                                        codes[group] = target_code;
+                                    } else if code_conditional_quotient_secondary_codes
+                                        .contains(&group_code)
+                                        && !guard.keeps_secondary_oracle(
+                                            stratum,
+                                            pos,
+                                            early_position_max,
+                                            attention_rows
+                                                .get(pos)
+                                                .map(Vec::as_slice)
+                                                .unwrap_or(&[]),
+                                        )
+                                    {
+                                        codes[group] = target_code;
+                                    }
+                                    for mapping in &extra_spec.mappings {
+                                        if mapping.sources.contains(&group_code) {
+                                            codes[group] = mapping.target;
+                                            break;
+                                        }
+                                    }
+                                    codes
+                                })
+                                .collect::<Vec<_>>();
+                            let prompt_report = evaluate_predicted_address(
+                                &mut weights,
+                                &token_ids,
+                                &index,
+                                *head,
+                                mode_d_table,
+                                &predicted_codes_by_position,
+                                stratum,
+                                label,
+                                &baseline_logp,
+                                baseline_top1,
+                                &oracle_codes_by_position,
+                            )?;
+                            let selected_group_keys = (0..config.groups)
+                                .map(|candidate_group| {
+                                    if candidate_group == group {
+                                        format!(
+                                            "{}_primary{}_secondary{}_to{}_extra{}",
+                                            guard.label(),
+                                            code_conditional_quotient_primary_codes
+                                                .iter()
+                                                .map(ToString::to_string)
+                                                .collect::<Vec<_>>()
+                                                .join("+"),
+                                            code_conditional_quotient_secondary_codes
+                                                .iter()
+                                                .map(ToString::to_string)
+                                                .collect::<Vec<_>>()
+                                                .join("+"),
+                                            target_code,
+                                            extra_spec.mapping_label_or_base()
+                                        )
+                                    } else {
+                                        "oracle".to_string()
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            accumulators
+                                .get_mut(&(*head, config))
+                                .expect("oracle PQ accumulator missing")
+                                .add_address_probe(
+                                    &format!(
+                                        "code_conditional_quotient_g{group}_{}_extra{}_to{target_code}_oracle_rest",
+                                        guard.label(),
+                                        extra_spec.name
+                                    ),
+                                    &selected_group_keys,
+                                    prompt_report,
+                                );
                         }
                     }
                 }
@@ -2887,6 +3487,103 @@ pub(super) fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error
         } else {
             Vec::new()
         },
+        address_code_class_collapse_group_probe: args.address_code_class_collapse_group_probe,
+        address_code_class_collapse_groups: if args.address_code_class_collapse_group_probe {
+            code_class_collapse_groups
+        } else {
+            Vec::new()
+        },
+        address_code_class_collapse_specs: if args.address_code_class_collapse_group_probe {
+            code_class_collapse_specs
+                .iter()
+                .map(CodeClassCollapseSpec::label)
+                .collect()
+        } else {
+            Vec::new()
+        },
+        address_code_position_interaction_probe: args.address_code_position_interaction_probe,
+        address_code_position_prompt_id: if args.address_code_position_interaction_probe {
+            code_position_prompt_id
+        } else {
+            String::new()
+        },
+        address_code_position_group: if args.address_code_position_interaction_probe {
+            args.address_code_position_group
+        } else {
+            0
+        },
+        address_code_position_primary_codes: if args.address_code_position_interaction_probe {
+            code_position_primary_codes
+        } else {
+            Vec::new()
+        },
+        address_code_position_secondary_codes: if args.address_code_position_interaction_probe {
+            code_position_secondary_codes
+        } else {
+            Vec::new()
+        },
+        address_code_position_target_code: if args.address_code_position_interaction_probe {
+            args.address_code_position_target_code
+        } else {
+            0
+        },
+        address_code_conditional_quotient_group_probe: args
+            .address_code_conditional_quotient_group_probe,
+        address_code_conditional_quotient_group: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            args.address_code_conditional_quotient_group
+        } else {
+            0
+        },
+        address_code_conditional_quotient_primary_codes: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            code_conditional_quotient_primary_codes
+        } else {
+            Vec::new()
+        },
+        address_code_conditional_quotient_secondary_codes: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            code_conditional_quotient_secondary_codes
+        } else {
+            Vec::new()
+        },
+        address_code_conditional_quotient_target_code: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            args.address_code_conditional_quotient_target_code
+        } else {
+            0
+        },
+        address_code_conditional_quotient_early_position_max: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            args.address_code_conditional_quotient_early_position_max
+        } else {
+            0
+        },
+        address_code_conditional_quotient_guards: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            code_conditional_quotient_guards
+                .iter()
+                .map(|guard| guard.label().to_string())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        address_code_conditional_quotient_extra_specs: if args
+            .address_code_conditional_quotient_group_probe
+        {
+            code_conditional_quotient_extra_specs
+                .iter()
+                .map(CodeClassCollapseSpec::label)
+                .collect()
+        } else {
+            Vec::new()
+        },
         address_code7_bos_rule_group_probe: args.address_code7_bos_rule_group_probe,
         address_code7_bos_rule_groups: if args.address_code7_bos_rule_group_probe {
             code7_bos_rule_groups
@@ -3083,6 +3780,238 @@ fn oracle_mode_d_address_report(
         top1_agree,
         baseline_top1_in_predicted_top5,
     }
+}
+
+#[derive(Debug, Clone)]
+struct CodeClassCollapseSpec {
+    name: String,
+    mappings: Vec<CodeClassCollapseMapping>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalQuotientGuard {
+    EarlyProsePosition,
+    EarlyProseBosPrev,
+    ProseBosPrev,
+}
+
+impl ConditionalQuotientGuard {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "early_prose_position" | "E_early_prose_position_guard" => {
+                Some(ConditionalQuotientGuard::EarlyProsePosition)
+            }
+            "early_prose_bos_prev" | "F_early_prose_bos_prev_guard" => {
+                Some(ConditionalQuotientGuard::EarlyProseBosPrev)
+            }
+            "prose_bos_prev" | "G_prose_bos_prev_guard" => {
+                Some(ConditionalQuotientGuard::ProseBosPrev)
+            }
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ConditionalQuotientGuard::EarlyProsePosition => "E_early_prose_position_guard",
+            ConditionalQuotientGuard::EarlyProseBosPrev => "F_early_prose_bos_prev_guard",
+            ConditionalQuotientGuard::ProseBosPrev => "G_prose_bos_prev_guard",
+        }
+    }
+
+    fn keeps_secondary_oracle(
+        self,
+        stratum: &str,
+        pos: usize,
+        early_position_max: usize,
+        attention_weights: &[f32],
+    ) -> bool {
+        if stratum != "natural_prose" {
+            return false;
+        }
+        let is_early = pos <= early_position_max;
+        match self {
+            ConditionalQuotientGuard::EarlyProsePosition => is_early,
+            ConditionalQuotientGuard::EarlyProseBosPrev => {
+                is_early && is_bos_or_previous_attention(pos, attention_weights)
+            }
+            ConditionalQuotientGuard::ProseBosPrev => {
+                is_bos_or_previous_attention(pos, attention_weights)
+            }
+        }
+    }
+}
+
+fn is_bos_or_previous_attention(pos: usize, attention_weights: &[f32]) -> bool {
+    if attention_weights.is_empty() {
+        return false;
+    }
+    let source = attention_argmax(attention_weights, pos);
+    source == 0 || (pos > 0 && source + 1 == pos)
+}
+
+impl CodeClassCollapseSpec {
+    fn label(&self) -> String {
+        format!("{}={}", self.name, self.mapping_label())
+    }
+
+    fn mapping_label(&self) -> String {
+        self.mappings
+            .iter()
+            .map(|mapping| {
+                let sources = mapping
+                    .sources
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+");
+                format!("{sources}:{}", mapping.target)
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn mapping_label_or_base(&self) -> String {
+        if self.mappings.is_empty() {
+            "base".to_string()
+        } else {
+            self.mapping_label()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CodeClassCollapseMapping {
+    sources: Vec<usize>,
+    target: usize,
+}
+
+fn parse_code_class_collapse_specs(
+    spec: &str,
+) -> Result<Vec<CodeClassCollapseSpec>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    for (idx, raw_spec) in spec
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        let (raw_name, raw_mappings) = raw_spec
+            .split_once('=')
+            .map(|(name, mappings)| (name.trim(), mappings.trim()))
+            .unwrap_or(("", raw_spec));
+        let mappings = parse_code_class_collapse_mappings(raw_mappings)?;
+        let fallback_name = sanitize_probe_name(
+            &mappings
+                .iter()
+                .map(|mapping| {
+                    let sources = mapping
+                        .sources
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("+");
+                    format!("{sources}_to_{}", mapping.target)
+                })
+                .collect::<Vec<_>>()
+                .join("_and_"),
+        );
+        let name = if raw_name.is_empty() {
+            format!("collapse{idx}_{fallback_name}")
+        } else {
+            sanitize_probe_name(raw_name)
+        };
+        if name.is_empty() {
+            return Err(format!("invalid empty class-collapse name in spec {raw_spec:?}").into());
+        }
+        out.push(CodeClassCollapseSpec { name, mappings });
+    }
+    Ok(out)
+}
+
+fn parse_conditional_quotient_guards(
+    spec: &str,
+) -> Result<Vec<ConditionalQuotientGuard>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    for raw in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let guard = ConditionalQuotientGuard::parse(raw).ok_or_else(|| {
+            format!(
+                "unsupported conditional quotient guard {raw:?}; expected early_prose_position, early_prose_bos_prev, or prose_bos_prev"
+            )
+        })?;
+        if !out.contains(&guard) {
+            out.push(guard);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_code_class_collapse_mappings(
+    spec: &str,
+) -> Result<Vec<CodeClassCollapseMapping>, Box<dyn std::error::Error>> {
+    let mut mappings = Vec::new();
+    let mut seen_sources = Vec::new();
+    for raw_mapping in spec
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (raw_sources, raw_target) = raw_mapping.split_once(':').ok_or_else(|| {
+            format!("invalid class-collapse mapping {raw_mapping:?}; expected sources:target")
+        })?;
+        let mut sources = Vec::new();
+        for part in raw_sources
+            .split('+')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            sources
+                .push(part.parse::<usize>().map_err(|err| {
+                    format!("invalid class-collapse source code {part:?}: {err}")
+                })?);
+        }
+        sources.sort_unstable();
+        sources.dedup();
+        if sources.is_empty() {
+            return Err(format!("class-collapse mapping {raw_mapping:?} has no sources").into());
+        }
+        for &source in &sources {
+            if seen_sources.contains(&source) {
+                return Err(format!(
+                    "class-collapse source code {source} appears in more than one mapping"
+                )
+                .into());
+            }
+            seen_sources.push(source);
+        }
+        let target = raw_target.trim().parse::<usize>().map_err(|err| {
+            format!(
+                "invalid class-collapse target code {:?}: {err}",
+                raw_target.trim()
+            )
+        })?;
+        mappings.push(CodeClassCollapseMapping { sources, target });
+    }
+    if mappings.is_empty() {
+        return Err(format!("class-collapse spec {spec:?} has no mappings").into());
+    }
+    Ok(mappings)
+}
+
+fn sanitize_probe_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]

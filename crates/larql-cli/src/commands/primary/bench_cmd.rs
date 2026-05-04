@@ -317,8 +317,17 @@ fn run_larql(
     }
     let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)?;
+    // Apply chat template so IT models (Gemma 4 31B, etc.) get the same
+    // prompt shape as `larql run`. Falls back to raw prompt if wrapping fails
+    // (base models, non-IT vindexes without a chat template).
+    let wrapped_prompt = larql_inference::chat::render_user_prompt(
+        vindex_path,
+        weights.arch.family(),
+        args.prompt.as_str(),
+    )
+    .unwrap_or_else(|_| args.prompt.to_string());
     let token_ids: Vec<u32> =
-        larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
             .map_err(|e| format!("tokenize: {e}"))?;
 
     let backend: Box<dyn larql_compute::ComputeBackend> = if metal {

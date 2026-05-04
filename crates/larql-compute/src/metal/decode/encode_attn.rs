@@ -114,7 +114,14 @@ impl MetalBackend {
         // threadgroup array. Spans beyond that overflow it — global-attention
         // layers (window_size=0) grow unboundedly and must fall back to
         // encode_kv_attend, which auto-selects kv_attention_long past the threshold.
+        //
+        // Additionally, the kernel is designed for head_dim <= 256 (it dispatches
+        // exactly head_dim threads per group and assumes head_dim fits in a single
+        // simdgroup). Layers with head_dim > 256 (e.g. Gemma 4 31B global attention
+        // layers with head_dim=512) must use the unfused encode_kv_append +
+        // encode_kv_attend path which handles arbitrary head_dim.
         let use_fused_kv_aa = attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
+            && layer_head_dim <= 256
             && !matches!(
                 std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
                 Ok("0") | Ok("false") | Ok("off") | Ok("no")

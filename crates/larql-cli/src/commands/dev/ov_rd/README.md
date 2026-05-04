@@ -161,8 +161,8 @@ oracle_pq_address.rs
                   address-probe, previous-FFN feature-key, FFN-first feature-key,
                   attention-relation-key, full/reduced-QK attention-cluster-key,
                   code-substitution/coarsening controls, code-occurrence export,
-                  oracle binary code/default upper bounds, and majority-code
-                  fitting
+                  oracle binary code/default upper bounds, class-collapse
+                  behavioral quotient probes, and majority-code fitting
 oracle_pq_eval.rs  shared predicted-address evaluation helper
 oracle_pq_fit.rs   PQ codebook fitting
 oracle_pq_forward.rs

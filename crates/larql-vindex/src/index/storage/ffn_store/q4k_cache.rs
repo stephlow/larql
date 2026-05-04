@@ -218,11 +218,7 @@ impl VectorIndex {
     /// the layer index is out of range.  A `None` stored by `get_or_init`
     /// is permanent for this instance; callers must fall back to fresh
     /// dequant in that case.
-    pub fn q4k_ffn_layer_once(
-        &self,
-        layer: usize,
-        component: usize,
-    ) -> Option<Arc<Vec<f32>>> {
+    pub fn q4k_ffn_layer_once(&self, layer: usize, component: usize) -> Option<Arc<Vec<f32>>> {
         if component > 2 {
             return None;
         }
