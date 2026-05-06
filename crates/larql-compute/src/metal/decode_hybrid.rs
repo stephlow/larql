@@ -11,6 +11,7 @@
 //! replacing 13.6ms of GPU FFN with ~1ms/layer of mmap'd sparse accumulation.
 
 use super::*;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 impl MetalBackend {
     /// Run ONE layer of attention on GPU with KV cache, return post-attention hidden state.
@@ -119,7 +120,7 @@ impl MetalBackend {
         } else {
             // Q8 path
             let q8_buf = self.bufs.output(hidden as u64);
-            let q8s_buf = self.bufs.output((hidden / 32 * 4) as u64);
+            let q8s_buf = self.bufs.output((hidden / LEGACY_BLOCK_ELEMS * 4) as u64);
 
             enc_a.set_compute_pipeline_state(&self.rms_norm_q8_pipeline);
             enc_a.set_buffer(0, Some(&h_buf), 0);
@@ -334,11 +335,11 @@ impl MetalBackend {
         } else {
             // Q8 path: quantize attention → Q8 O proj → residual
             let o_q8 = self.bufs.output(layer_q_dim as u64);
-            let o_q8s = self.bufs.output((layer_q_dim / 32 * 4) as u64);
+            let o_q8s = self.bufs.output((layer_q_dim / LEGACY_BLOCK_ELEMS * 4) as u64);
             let o_out = self.bufs.output((hidden * 4) as u64);
 
             let dim_val = layer_q_dim as u32;
-            let blocks = (layer_q_dim / 32) as u32;
+            let blocks = (layer_q_dim / LEGACY_BLOCK_ELEMS) as u32;
             enc_c.set_compute_pipeline_state(&self.q8_quant_pipeline);
             enc_c.set_buffer(0, Some(&attn_out), 0);
             enc_c.set_buffer(1, Some(&o_q8), 0);

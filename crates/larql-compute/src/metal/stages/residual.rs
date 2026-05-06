@@ -15,6 +15,7 @@
 
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Post-attention residual + pre-FFN norm (+ optional Q8 quant).
 ///
@@ -108,7 +109,7 @@ pub fn encode_post_attn(
 
         // Q8-quantise ffn_norm_out when the FFN needs Q8 input (Q4_0 / Q8_0).
         if ffn_needs_q8 {
-            let blocks = (hidden as u64).div_ceil(32);
+            let blocks = (hidden as u64).div_ceil(LEGACY_BLOCK_ELEMS as u64);
             enc.set_compute_pipeline_state(q8_quant_pipeline);
             enc.set_buffer(0, Some(ffn_norm_out), h_off);
             enc.set_buffer(1, Some(ffn_q8_buf), q8_off);

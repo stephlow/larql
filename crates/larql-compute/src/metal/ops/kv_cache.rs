@@ -10,6 +10,16 @@ use crate::metal::buffers::BufferCache;
 
 pub const SHORT_ATTENTION_SPAN: u32 = 1024;
 
+/// Maximum head_dim supported by kernels that dispatch exactly one simdgroup
+/// per head (32 lanes × 8 elements = 256). Layers with head_dim above this
+/// must use the two-simdgroup path or the unfused fallback.
+pub const MAX_HEAD_DIM_SINGLE_SG: usize = 256;
+
+/// Maximum head_dim supported by the two-simdgroup kernel path (32 lanes × 16 = 512).
+/// Used as the tg_w ceiling when rounding up to the next power of two for
+/// kernels that can span two simdgroups.
+pub const MAX_HEAD_DIM_DOUBLE_SG: usize = 512;
+
 fn shape_pairs_have_mismatch(existing: &[(usize, usize)], expected: &[(usize, usize)]) -> bool {
     existing.iter().zip(expected.iter()).any(
         |(&(actual_num_kv, actual_head_dim), &(expected_num_kv, expected_head_dim))| {

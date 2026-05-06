@@ -110,6 +110,12 @@ LARQL-native pre-W_O attention capture and rate-distortion gating. Classifies
 heads as static, negligible, tableable, addressing-failed, or irreducible, then
 reports the byte/FLOP split needed for graph-walkable attention.
 
+### 39 — Shannon Machine Bit-Economy
+Tests whether compression, retrieval, in-context learning, prompt conditioning,
+and knowledge injection are commensurable as one bit economy. Starts with
+model-zoo amortisation curves, fact MDL sweeps, and linguistic bit-cost
+decomposition.
+
 ---
 
 ## Routing & Geometry

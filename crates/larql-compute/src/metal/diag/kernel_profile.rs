@@ -690,7 +690,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let k_rows_val = k_rows as u32;
         let v_val = v_rows as u32;
         let k_val = k as u32;
-        let eps = 1e-6f32;
+        let eps = crate::RMSNORM_EPSILON_DEFAULT;
         let offset = 1.0f32;
 
         let dispatch = |enc: &metal::ComputeCommandEncoderRef| {

@@ -2,11 +2,17 @@ use clap::{Args, Subcommand};
 
 use super::capture::{run_capture, CaptureArgs};
 use super::edit_catalog::{run_oracle_edit_catalog, OracleEditCatalogArgs};
+use super::eval_program::{run_eval_program, EvalProgramArgs};
+use super::induce_program::{run_induce_program, InduceProgramArgs};
+use super::normalize_program::{run_normalize_program, NormalizeProgramArgs};
+use super::program_cache::{run_build_program_cache, BuildProgramCacheArgs};
+use super::synthesize_program::{run_synthesize_program, SynthesizeProgramArgs};
 use super::oracle::{
     run_oracle_lowrank, run_oracle_roundtrip, OracleLowrankArgs, OracleRoundtripArgs,
 };
 use super::oracle_pq::{run_oracle_pq, OraclePqArgs};
 use super::pq_exception::{run_oracle_pq_exception, OraclePqExceptionArgs};
+use super::probe_program_class::{run_probe_program_class, ProbeProgramClassArgs};
 use super::sanity::{run_sanity_check, SanityCheckArgs};
 use super::static_replace::{run_static_replace, StaticReplaceArgs};
 use super::zero_ablate::{run_zero_ablate, ZeroAblateArgs};
@@ -45,6 +51,24 @@ enum OvRdCommand {
 
     /// Oracle RD: base PQ table plus oracle-addressed exception residuals.
     OraclePqException(OraclePqExceptionArgs),
+
+    /// AHORD: evaluate a behavioral rewrite program against oracle PQ codes.
+    EvalProgram(EvalProgramArgs),
+
+    /// AHORD: induce a behavioral rewrite program via pairwise merge proposals.
+    InduceProgram(InduceProgramArgs),
+
+    /// AHORD: normalize a program JSON (compute effective_map per stage).
+    NormalizeProgram(NormalizeProgramArgs),
+
+    /// AHORD: probe whether behavioral program classes are visible in residual/pre-W_O features.
+    ProbeProgramClass(ProbeProgramClassArgs),
+
+    /// AHORD: build program cache from existing variant measurements (zero forwards).
+    BuildProgramCache(BuildProgramCacheArgs),
+
+    /// AHORD: synthesize a program from the cache (zero forwards).
+    SynthesizeProgram(SynthesizeProgramArgs),
 }
 
 pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -58,5 +82,11 @@ pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
         OvRdCommand::OraclePq(pq) => run_oracle_pq(pq),
         OvRdCommand::OracleEditCatalog(edit_catalog) => run_oracle_edit_catalog(edit_catalog),
         OvRdCommand::OraclePqException(exception) => run_oracle_pq_exception(exception),
+        OvRdCommand::EvalProgram(eval_program) => run_eval_program(eval_program),
+        OvRdCommand::InduceProgram(induce) => run_induce_program(induce),
+        OvRdCommand::NormalizeProgram(norm) => run_normalize_program(norm),
+        OvRdCommand::ProbeProgramClass(probe) => run_probe_program_class(probe),
+        OvRdCommand::BuildProgramCache(cache) => run_build_program_cache(cache),
+        OvRdCommand::SynthesizeProgram(synth) => run_synthesize_program(synth),
     }
 }

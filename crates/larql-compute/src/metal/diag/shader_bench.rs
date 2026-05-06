@@ -900,7 +900,7 @@ fn bench_q4k_q6k_qkv(
     let k_rows = shape.kv_rows as u32;
     let v_rows = shape.kv_rows as u32;
     let hidden = shape.hidden as u32;
-    let eps = 1e-6f32;
+    let eps = crate::RMSNORM_EPSILON_DEFAULT;
     let offset = 0.0f32;
     let tgs = ((shape.q_rows + 2 * shape.kv_rows) as u64).div_ceil(kh.rows_per_tg);
 

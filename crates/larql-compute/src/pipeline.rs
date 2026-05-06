@@ -9,6 +9,15 @@
 /// Q4_K block shape but expands packed scale/min metadata for faster decode.
 pub const Q4_KF_BLOCK_BYTES: usize = 160;
 
+/// Default RoPE base frequency (Llama, Gemma sliding-window layers).
+pub const ROPE_BASE_DEFAULT: f32 = 10_000.0;
+
+/// Long-context RoPE base frequency (Gemma global-attention layers).
+pub const ROPE_BASE_GLOBAL: f32 = 1_000_000.0;
+
+/// Default RMSNorm epsilon. Prevents division by zero in normalization.
+pub const RMSNORM_EPSILON_DEFAULT: f32 = 1e-6;
+
 /// Quantization format for a weight tensor.
 /// Names match GGUF conventions (Q4_K, Q6_K, etc.).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -119,6 +128,29 @@ pub enum Activation {
     Silu,
     /// GELU with tanh approximation — Gemma, StarCoder2.
     GeluTanh,
+    /// Exact GELU (erf-based) — used in some GPT-2 variants.
+    GeluExact,
+    /// ReLU — legacy models (GPT-J, etc.).
+    ReLU,
+}
+
+/// Positional encoding strategy for attention.
+///
+/// Most transformer models use RoPE. Non-RoPE variants (ALiBi, absolute,
+/// none) are tracked here so future backends can guard on the type rather
+/// than assuming RoPE is always present.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PositionEncodingType {
+    /// Rotary position embedding. `base` and `rotary_dim` live in
+    /// [`FullPipelineLayer`] so the encoding is still fully per-layer.
+    RoPE,
+    /// Attention with Linear Biases (no learned embeddings).
+    ALiBi,
+    /// Fixed absolute sinusoidal or learned embeddings (injected at
+    /// the embedding layer, not per-attention-head).
+    Absolute,
+    /// No position encoding (e.g. some cross-attention blocks).
+    None,
 }
 
 /// Hybrid MoE (Mixture-of-Experts) weights for one layer.
@@ -316,7 +348,7 @@ impl Default for FullPipelineLayer<'_> {
             post_attn_norm_bias: None,
             norm_offset: 0.0,
             qk_norm_offset: 0.0,
-            eps: 1e-6,
+            eps: RMSNORM_EPSILON_DEFAULT,
             has_post_norms: false,
             norm_type: NormType::RmsNorm,
             ffn_type: FfnType::Gated,
@@ -325,7 +357,7 @@ impl Default for FullPipelineLayer<'_> {
             head_dim: 0,
             num_q_heads: 0,
             num_kv_heads: 0,
-            rope_base: 10000.0,
+            rope_base: ROPE_BASE_DEFAULT,
             rotary_dim: 0,
             sliding_window: 0,
             has_v_norm: false,
@@ -500,7 +532,7 @@ mod tests {
         };
 
         // Defaulted fields carry through.
-        assert_eq!(layer.eps, 1e-6);
+        assert_eq!(layer.eps, RMSNORM_EPSILON_DEFAULT);
         assert_eq!(layer.norm_type, NormType::RmsNorm);
         assert_eq!(layer.ffn_type, FfnType::Gated);
         assert_eq!(layer.activation, Activation::Silu);

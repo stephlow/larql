@@ -25,8 +25,10 @@
 use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
 use super::ops;
+use crate::metal::ops::kv_cache::{MAX_HEAD_DIM_DOUBLE_SG, MAX_HEAD_DIM_SINGLE_SG};
 use crate::metal::MetalBackend;
 use crate::FullPipelineLayer;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 pub(super) struct AttnBufs<'a> {
     /// Layer-input residual (read).
@@ -115,13 +117,12 @@ impl MetalBackend {
         // layers (window_size=0) grow unboundedly and must fall back to
         // encode_kv_attend, which auto-selects kv_attention_long past the threshold.
         //
-        // Additionally, the kernel is designed for head_dim <= 256 (it dispatches
-        // exactly head_dim threads per group and assumes head_dim fits in a single
-        // simdgroup). Layers with head_dim > 256 (e.g. Gemma 4 31B global attention
-        // layers with head_dim=512) must use the unfused encode_kv_append +
-        // encode_kv_attend path which handles arbitrary head_dim.
+        // Additionally, the kernel is designed for head_dim <= MAX_HEAD_DIM_SINGLE_SG
+        // (it dispatches exactly head_dim threads per group and assumes head_dim fits
+        // in a single simdgroup). Layers with larger head_dim must use the unfused
+        // encode_kv_append + encode_kv_attend path which handles arbitrary head_dim.
         let use_fused_kv_aa = attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
-            && layer_head_dim <= 256
+            && layer_head_dim <= MAX_HEAD_DIM_SINGLE_SG
             && !matches!(
                 std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
                 Ok("0") | Ok("false") | Ok("off") | Ok("no")
@@ -134,7 +135,7 @@ impl MetalBackend {
         // Path 1: full attention fusion. Skips both qk_norm_rope dispatch AND
         // kv_append_attend_fused dispatch — handles them in `attn_fused`.
         let did_fused_attn = use_fused_attn
-            && layer_head_dim <= 256
+            && layer_head_dim <= MAX_HEAD_DIM_SINGLE_SG
             && attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
             && layer.q_norm_weight.is_some()
             && layer.k_norm_weight.is_some()
@@ -154,7 +155,7 @@ impl MetalBackend {
             let qk_off = layer.qk_norm_offset;
             let rdim = layer_rotary_dim as u32;
             let mut tg_w: u64 = 1;
-            while tg_w < layer_head_dim as u64 && tg_w < 256 {
+            while tg_w < layer_head_dim as u64 && tg_w < MAX_HEAD_DIM_SINGLE_SG as u64 {
                 tg_w <<= 1;
             }
             enc.set_compute_pipeline_state(&self.attn_fused_pipeline);
@@ -196,7 +197,7 @@ impl MetalBackend {
             let qk_off = layer.qk_norm_offset;
             let rdim = layer_rotary_dim as u32;
             let mut tg_w: usize = 1;
-            while tg_w < layer_head_dim && tg_w < 512 {
+            while tg_w < layer_head_dim && tg_w < MAX_HEAD_DIM_DOUBLE_SG {
                 tg_w <<= 1;
             }
             let q_w_buf = self.bufs.get_f32(q_w);
@@ -228,7 +229,7 @@ impl MetalBackend {
                 let nq_val = layer_num_q_heads as u32;
                 let qk_off = layer.qk_norm_offset;
                 let mut tg_w: usize = 1;
-                while tg_w < layer_head_dim && tg_w < 512 {
+                while tg_w < layer_head_dim && tg_w < MAX_HEAD_DIM_DOUBLE_SG {
                     tg_w <<= 1;
                 }
                 let q_w_buf = self.bufs.get_f32(q_w);
@@ -273,12 +274,12 @@ impl MetalBackend {
             );
         }
 
-        // ── Step 3: V-norm batched (optional, Gemma 4) ──
+        // ── Step 3: V-norm batched (optional) ──
         if layer.has_v_norm {
             let hd_val = layer_head_dim as u32;
             let num_kv = layer_num_kv_heads as u32;
             let mut tg_w: u64 = 1;
-            while tg_w < layer_head_dim as u64 && tg_w < 512 {
+            while tg_w < layer_head_dim as u64 && tg_w < MAX_HEAD_DIM_DOUBLE_SG as u64 {
                 tg_w <<= 1;
             }
             enc.set_compute_pipeline_state(&self.v_norm_batched_pipeline);
@@ -378,7 +379,7 @@ impl MetalBackend {
             // stages::quant_matvec which uses `q4_matvec` for Q4_0/Q8_0 with
             // a different buffer layout). Inline.
             let dim_val = layer_q_dim as u32;
-            let blocks = (layer_q_dim / 32) as u32;
+            let blocks = (layer_q_dim / LEGACY_BLOCK_ELEMS) as u32;
             enc.set_compute_pipeline_state(&self.q8_quant_pipeline);
             enc.set_buffer(0, Some(bufs.attn_out_buf), 0);
             enc.set_buffer(1, Some(bufs.o_q8_scratch), 0);

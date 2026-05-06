@@ -3,6 +3,8 @@
 //! C FFI declarations for the vdotq_s32 kernel (csrc/q4_dot.c)
 //! and Q8 quantization helper.
 
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
+
 extern "C" {
     /// C kernel: Q4_0 × Q8_0 matrix-vector multiply with ARM vdotq_s32.
     pub fn q4_0_matvec_c(
@@ -26,17 +28,17 @@ extern "C" {
 
 /// Pre-quantize f32 vector to Q8_0 (int8 + per-block f32 scale).
 pub fn quantize_to_q8(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-    let n_blocks = x.len() / 32;
+    let n_blocks = x.len() / LEGACY_BLOCK_ELEMS;
     let mut q8 = vec![0i8; x.len()];
     let mut scales = vec![0.0f32; n_blocks];
     for (b, scale_out) in scales.iter_mut().enumerate().take(n_blocks) {
-        let off = b * 32;
-        let block = &x[off..off + 32];
+        let off = b * LEGACY_BLOCK_ELEMS;
+        let block = &x[off..off + LEGACY_BLOCK_ELEMS];
         let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = amax / 127.0;
         *scale_out = scale;
         let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-        for j in 0..32 {
+        for j in 0..LEGACY_BLOCK_ELEMS {
             q8[off + j] = (block[j] * inv).round().clamp(-128.0, 127.0) as i8;
         }
     }
@@ -49,10 +51,10 @@ pub fn quantize_to_q8(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
 /// Used for weight quantization in benchmarks, tests, and tooling.
 pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
     assert!(
-        data.len().is_multiple_of(32),
+        data.len().is_multiple_of(LEGACY_BLOCK_ELEMS),
         "data length must be a multiple of 32"
     );
-    let n_blocks = data.len() / 32;
+    let n_blocks = data.len() / LEGACY_BLOCK_ELEMS;
     let mut out = Vec::with_capacity(n_blocks * 18);
     for i in 0..n_blocks {
         let block = &data[i * 32..(i + 1) * 32];

@@ -17,6 +17,7 @@ use std::ffi::c_void;
 
 use crate::metal::buffers::BufferCache;
 use crate::metal::ops::q4_common::Q4Pipelines;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Weights for one transformer layer — ALL Q4 + norm weights.
 /// Matches `crate::FullPipelineLayer` but with borrowed Metal-friendly data.
@@ -484,7 +485,7 @@ pub fn dispatch_full_pipeline(
                 ffn_needs_q8,
                 (hidden * 4) as u64,
                 hidden as u64,
-                (hidden.div_ceil(32) * 4) as u64,
+                (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64,
             );
             enc.end_encoding();
         }
@@ -499,7 +500,7 @@ pub fn dispatch_full_pipeline(
             let h_stride = (hidden * 4) as u64;
             let inter_stride = (inter * 4) as u64;
             let q8_stride = hidden as u64;
-            let q8s_stride = (hidden.div_ceil(32) * 4) as u64;
+            let q8s_stride = (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64;
 
             let enc = cmd.new_compute_command_encoder();
             if layers[l].ffn_type == crate::FfnType::Standard {

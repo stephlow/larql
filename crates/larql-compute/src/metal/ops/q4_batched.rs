@@ -11,6 +11,7 @@ use std::ffi::c_void;
 
 use super::q4_common::{quantize_to_q8, Q4Pipelines};
 use crate::metal::buffers::BufferCache;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Batched gate+up for ALL seq positions in ONE GPU submission.
 /// Encodes 2×seq_len Q4 matvec dispatches in a single command buffer.
@@ -122,7 +123,7 @@ pub fn multi_layer_ffn(
     let kernel = &pipelines.matvec;
     let num_tgs = (inter as u64).div_ceil(kernel.rows_per_tg);
     let tg_size = MTLSize::new(kernel.threads_per_tg, 1, 1);
-    let n_blocks = (hidden / 32) as u32;
+    let n_blocks = (hidden / LEGACY_BLOCK_ELEMS) as u32;
 
     let (q8_init, q8s_init) = quantize_to_q8(x);
 
@@ -157,7 +158,7 @@ pub fn multi_layer_ffn(
         act_bufs_vec.push(bufs.output((inter * 4) as u64));
         down_outs.push(bufs.output((hidden * 4) as u64));
         q8_bufs.push(bufs.output(hidden as u64));
-        q8s_bufs.push(bufs.output((hidden / 32 * 4) as u64));
+        q8s_bufs.push(bufs.output((hidden / LEGACY_BLOCK_ELEMS * 4) as u64));
     }
 
     let cmd = queue.new_command_buffer();

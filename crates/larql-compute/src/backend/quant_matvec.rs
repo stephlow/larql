@@ -16,21 +16,22 @@
 //! `quant_matvec` + per-format helper for the fast path.
 
 use crate::QuantFormat;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Reverse the `quantize_to_q8` block layout: each 32-element block
 /// has one f32 scale, multiplied through to recover f32 values.
 fn dequantise_q8(q8_x: &[i8], q8_scales: &[f32]) -> Vec<f32> {
-    let n_blocks = q8_x.len() / 32;
+    let n_blocks = q8_x.len() / LEGACY_BLOCK_ELEMS;
     debug_assert!(q8_scales.len() >= n_blocks);
     let mut out = Vec::with_capacity(q8_x.len());
     for (b, &scale) in q8_scales.iter().take(n_blocks).enumerate() {
-        let off = b * 32;
-        for &q in &q8_x[off..off + 32] {
+        let off = b * LEGACY_BLOCK_ELEMS;
+        for &q in &q8_x[off..off + LEGACY_BLOCK_ELEMS] {
             out.push(q as f32 * scale);
         }
     }
-    // Tail (if `q8_x.len()` isn't a multiple of 32 — defensive).
-    for &q in &q8_x[n_blocks * 32..] {
+    // Tail (if `q8_x.len()` isn't a multiple of LEGACY_BLOCK_ELEMS — defensive).
+    for &q in &q8_x[n_blocks * LEGACY_BLOCK_ELEMS..] {
         out.push(q as f32);
     }
     out

@@ -11,6 +11,7 @@
 
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 use super::quant_matvec;
 
@@ -44,7 +45,7 @@ pub fn encode(
     if !is_f32_input {
         // Q4_0 / Q8_0: quantise attn_in[q_dim] → Q8 int8 + per-32 f16 scale.
         let dim_val = q_dim as u32;
-        let blocks = (q_dim as u64).div_ceil(32);
+        let blocks = (q_dim as u64).div_ceil(LEGACY_BLOCK_ELEMS as u64);
         enc.set_compute_pipeline_state(q8_quant_pipeline);
         enc.set_buffer(0, Some(attn_in), attn_in_off);
         enc.set_buffer(1, Some(q8_stage), q8_stage_off);

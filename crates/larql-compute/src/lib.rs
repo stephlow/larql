@@ -69,7 +69,8 @@ pub mod metal;
 // ── Re-exports: pipeline types ──
 
 pub use pipeline::{
-    Activation, FfnType, FullPipelineLayer, MoeLayerWeights, NormType, QuantFormat, QuantWeight,
+    Activation, FfnType, FullPipelineLayer, MoeLayerWeights, NormType, PositionEncodingType,
+    QuantFormat, QuantWeight, RMSNORM_EPSILON_DEFAULT, ROPE_BASE_DEFAULT, ROPE_BASE_GLOBAL,
 };
 
 // ── Re-exports: backend ──

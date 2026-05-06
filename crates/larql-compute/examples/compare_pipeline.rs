@@ -194,6 +194,7 @@ fn main() {
                 moe: None,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                ffn_is_remote: false,
             })
             .collect();
 
@@ -302,6 +303,7 @@ fn main() {
                 moe: None,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                ffn_is_remote: false,
             })
             .collect();
 
