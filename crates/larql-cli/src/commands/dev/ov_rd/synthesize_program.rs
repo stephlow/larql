@@ -25,8 +25,7 @@ pub(super) fn run_synthesize_program(
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.out)?;
 
-    let cache: ProgramCache =
-        serde_json::from_str(&std::fs::read_to_string(&args.cache)?)?;
+    let cache: ProgramCache = serde_json::from_str(&std::fs::read_to_string(&args.cache)?)?;
 
     eprintln!(
         "Synthesizing program for L{}H{} group {} (fingerprint {})",
@@ -49,11 +48,29 @@ pub(super) fn run_synthesize_program(
 
 #[derive(Debug)]
 enum SynthesisStep {
-    Pairwise { source: usize, target: usize, gate: String },
-    SetMerge { sources: Vec<usize>, target: usize, gate: String },
-    GuardFound { name: String, gate: String, mean_kl: f64, max_kl: f64 },
-    NeedsOracle { reason: String, suggested_program: String },
-    Fail { reason: String },
+    Pairwise {
+        source: usize,
+        target: usize,
+        gate: String,
+    },
+    SetMerge {
+        sources: Vec<usize>,
+        target: usize,
+        gate: String,
+    },
+    GuardFound {
+        name: String,
+        gate: String,
+        mean_kl: f64,
+        max_kl: f64,
+    },
+    NeedsOracle {
+        reason: String,
+        suggested_program: String,
+    },
+    Fail {
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -90,17 +107,25 @@ fn synthesize(cache: &ProgramCache) -> SynthesisResult {
     for &(src, tgt) in &pairs {
         let key = format!("{src}->{tgt}");
         if let Some(c) = cache.substitutions.get(&key) {
-            steps.push(SynthesisStep::Pairwise { source: src, target: tgt, gate: c.gate.clone() });
+            steps.push(SynthesisStep::Pairwise {
+                source: src,
+                target: tgt,
+                gate: c.gate.clone(),
+            });
         }
     }
 
     // Phase 2: find dominant sink and compatible merge clique.
     let sink = match cache.dominant_sink() {
         Some(s) => s,
-        None => return SynthesisResult {
-            steps,
-            outcome: SynthesisOutcome::Blocked { reason: "cannot determine dominant sink from pairwise edges".to_string() },
-        },
+        None => {
+            return SynthesisResult {
+                steps,
+                outcome: SynthesisOutcome::Blocked {
+                    reason: "cannot determine dominant sink from pairwise edges".to_string(),
+                },
+            }
+        }
     };
     let merge_candidates = cache.merge_candidates_for(sink);
     eprintln!("  dominant sink={sink}  merge candidates={merge_candidates:?}");
@@ -116,21 +141,30 @@ fn synthesize(cache: &ProgramCache) -> SynthesisResult {
     match cache.get_set_merge(&clique, sink) {
         Some(c) if c.passes_strict() => {
             steps.push(SynthesisStep::SetMerge {
-                sources: clique.clone(), target: sink, gate: c.gate.clone()
+                sources: clique.clone(),
+                target: sink,
+                gate: c.gate.clone(),
             });
             // Strict pass without guard — return this directly.
             let program_name = c.source.clone();
-            return SynthesisResult { steps, outcome: SynthesisOutcome::CacheHit { program_name } };
+            return SynthesisResult {
+                steps,
+                outcome: SynthesisOutcome::CacheHit { program_name },
+            };
         }
         Some(c) if c.passes_smoke() => {
             steps.push(SynthesisStep::SetMerge {
-                sources: clique.clone(), target: sink, gate: c.gate.clone()
+                sources: clique.clone(),
+                target: sink,
+                gate: c.gate.clone(),
             });
             // Smoke pass — need a guard. Try to find one in guarded_programs.
         }
         Some(c) => {
             steps.push(SynthesisStep::SetMerge {
-                sources: clique.clone(), target: sink, gate: c.gate.clone()
+                sources: clique.clone(),
+                target: sink,
+                gate: c.gate.clone(),
             });
             // Outright fail — may still need guard.
         }
@@ -159,9 +193,14 @@ fn synthesize(cache: &ProgramCache) -> SynthesisResult {
     }
 
     // Found a guarded program that passes.
-    let (best_name, best) = guarded.into_iter().min_by(|(_, a), (_, b)| {
-        a.mean_kl.partial_cmp(&b.mean_kl).unwrap_or(std::cmp::Ordering::Equal)
-    }).unwrap();
+    let (best_name, best) = guarded
+        .into_iter()
+        .min_by(|(_, a), (_, b)| {
+            a.mean_kl
+                .partial_cmp(&b.mean_kl)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap();
 
     steps.push(SynthesisStep::GuardFound {
         name: best_name.to_string(),
@@ -172,7 +211,9 @@ fn synthesize(cache: &ProgramCache) -> SynthesisResult {
 
     SynthesisResult {
         steps,
-        outcome: SynthesisOutcome::CacheHit { program_name: best_name.to_string() },
+        outcome: SynthesisOutcome::CacheHit {
+            program_name: best_name.to_string(),
+        },
     }
 }
 
@@ -180,25 +221,34 @@ fn print_synthesis_trace(result: &SynthesisResult) {
     eprintln!("\n=== Synthesis trace ===");
     for step in &result.steps {
         match step {
-            SynthesisStep::Pairwise { source, target, gate } =>
-                eprintln!("  pairwise {source}->{target}: {gate}"),
-            SynthesisStep::SetMerge { sources, target, gate } =>
-                eprintln!("  set-merge {sources:?}->{target}: {gate}"),
-            SynthesisStep::GuardFound { name, gate, mean_kl, max_kl } =>
-                eprintln!("  guard found: {name}  [{gate}]  mean={mean_kl:.6}  max={max_kl:.6}"),
-            SynthesisStep::NeedsOracle { reason, .. } =>
-                eprintln!("  → NEEDS ORACLE: {reason}"),
-            SynthesisStep::Fail { reason } =>
-                eprintln!("  → FAIL: {reason}"),
+            SynthesisStep::Pairwise {
+                source,
+                target,
+                gate,
+            } => eprintln!("  pairwise {source}->{target}: {gate}"),
+            SynthesisStep::SetMerge {
+                sources,
+                target,
+                gate,
+            } => eprintln!("  set-merge {sources:?}->{target}: {gate}"),
+            SynthesisStep::GuardFound {
+                name,
+                gate,
+                mean_kl,
+                max_kl,
+            } => eprintln!("  guard found: {name}  [{gate}]  mean={mean_kl:.6}  max={max_kl:.6}"),
+            SynthesisStep::NeedsOracle { reason, .. } => eprintln!("  → NEEDS ORACLE: {reason}"),
+            SynthesisStep::Fail { reason } => eprintln!("  → FAIL: {reason}"),
         }
     }
     match &result.outcome {
-        SynthesisOutcome::CacheHit { program_name } =>
-            eprintln!("\n✓ Cache hit: program '{program_name}' passes strict gate"),
-        SynthesisOutcome::NeedsVerification { reason } =>
-            eprintln!("\n→ Needs verification: {reason}"),
-        SynthesisOutcome::Blocked { reason } =>
-            eprintln!("\n✗ Blocked: {reason}"),
+        SynthesisOutcome::CacheHit { program_name } => {
+            eprintln!("\n✓ Cache hit: program '{program_name}' passes strict gate")
+        }
+        SynthesisOutcome::NeedsVerification { reason } => {
+            eprintln!("\n→ Needs verification: {reason}")
+        }
+        SynthesisOutcome::Blocked { reason } => eprintln!("\n✗ Blocked: {reason}"),
     }
 }
 

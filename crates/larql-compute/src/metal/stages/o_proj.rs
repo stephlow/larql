@@ -9,9 +9,9 @@
 //!
 //! Single-vector per position. Multi-position prefill loops.
 
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
-use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 use super::quant_matvec;
 

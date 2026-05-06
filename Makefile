@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-save bench-check coverage coverage-summary
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-wire bench-routing bench-grid bench-all bench-save bench-check coverage coverage-summary larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test
 
 # Build
 build:
@@ -33,6 +33,28 @@ test-models:
 	cargo test -p larql-inference --test test_constrained_dispatch -- --ignored --nocapture
 	cargo test -p larql-inference --test test_trie_dispatch -- --ignored --nocapture
 
+larql-models-test:
+	cargo test -p larql-models
+
+larql-models-fmt-check:
+	cargo fmt -p larql-models -- --check
+
+larql-models-lint:
+	cargo clippy -p larql-models --all-targets -- -D warnings
+
+larql-models-bench-test:
+	cargo test -p larql-models --benches
+
+larql-models-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-models --summary-only
+
+larql-models-ci: larql-models-fmt-check larql-models-lint larql-models-test larql-models-bench-test
+
 # Check (compile without building)
 check:
 	cargo check --workspace
@@ -64,6 +86,17 @@ clean:
 # PR time, not at goldens-fail time weeks later.
 bench:
 	cargo bench -p larql-compute --bench quant_matvec --features metal
+
+bench-wire:
+	cargo bench -p larql-inference --bench wire_codec
+
+bench-routing:
+	cargo bench -p larql-router --bench routing
+
+bench-grid:
+	./scripts/bench-grid-regress.sh $(MODEL)
+
+bench-all: bench bench-wire bench-routing
 
 bench-save:
 	bash scripts/bench-regress.sh save

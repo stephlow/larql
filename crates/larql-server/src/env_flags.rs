@@ -31,6 +31,11 @@ pub const DISABLE_Q4K_DIRECT: &str = "LARQL_DISABLE_Q4K_DIRECT";
 pub const METAL_VS_CPU_DEBUG: &str = "LARQL_METAL_VS_CPU_DEBUG";
 /// Override the auto-selected MoE batch dispatch mode.
 pub const MOE_BATCH_MODE: &str = "LARQL_MOE_BATCH_MODE";
+/// Opt-out of f16 wire format for grid traffic. Set to any value to force f32.
+/// Default (unset): f16 wire is used when the client advertises Accept: f16.
+pub const F16_WIRE_DISABLE: &str = "LARQL_F16_WIRE_DISABLE";
+/// Opt-in to i8 symmetric quantised residuals on the wire.
+pub const I8_WIRE: &str = "LARQL_I8_WIRE";
 
 // ── Cached presence ────────────────────────────────────────────────────────────
 //
@@ -112,6 +117,8 @@ mod tests {
             DISABLE_Q4K_DIRECT,
             METAL_VS_CPU_DEBUG,
             MOE_BATCH_MODE,
+            F16_WIRE_DISABLE,
+            I8_WIRE,
         ];
         for n in names {
             assert!(n.starts_with("LARQL_"), "{n} must be LARQL_-prefixed");

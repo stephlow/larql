@@ -335,6 +335,7 @@ pub fn load_single_vindex(
         weights: std::sync::OnceLock::new(),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
+        layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
         moe_remote: opts.moe_remote.clone(),
@@ -953,6 +954,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     ram_bytes: 0,
                     grid_key: cli.grid_key.clone(),
                     vindex_hash: vhash.clone(),
+                    latency_tracker: m.layer_latency_tracker.clone(),
                 });
             }
         }

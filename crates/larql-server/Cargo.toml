@@ -26,6 +26,7 @@ larql-router-protocol = { path = "../larql-router-protocol" }
 larql-compute = { path = "../larql-compute" }
 
 axum = { version = "0.8", features = ["ws"] }
+half = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

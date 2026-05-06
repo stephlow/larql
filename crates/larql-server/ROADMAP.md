@@ -560,6 +560,269 @@ logic in the request entry points.
 
 ## P0: Active
 
+### G-TRANSPORT. Wire format evolution + WebSocket streaming + QUIC (ADR-0009, ADR-0010)
+
+All work here is architecture-agnostic: no hardcoded layer counts, hidden
+sizes, or model-family assumptions. Sizes and dtypes are read from vindex
+config at runtime.
+
+#### GT1 — f16 wire default
+
+**Status**: Not started.
+
+**Spec**: ADR-0009 §Decision, §Wire Layout (f16).
+
+Wire format is currently f32-only (4 bytes/value). For a model with
+hidden_size=H and seq_len=1, one round-trip costs `H × 4 × 2` bytes
+(request + response). f16 halves this with no accuracy loss for all tested
+architectures.
+
+- Add `F16_WIRE = "LARQL_F16_WIRE"` to `env_flags.rs` (present = opt-out,
+  i.e. `LARQL_F16_WIRE=0` forces f32).
+- Add `F16_CT = "application/x-larql-ffn-f16"` to `wire.rs`.
+- In `routes/walk_ffn.rs`: inspect `Accept` header; if client sends
+  `Accept: application/x-larql-ffn-f16`, encode response as f16.
+- In `larql-inference/src/ffn/remote/http.rs`: set
+  `Accept: application/x-larql-ffn-f16` by default (opt-out via flag).
+- Accuracy gate: `larql bench <vindex> --wire f32,f16 --assert-topk-match 5`
+  must pass for each model family before enabling as default.
+
+**Acceptance**: `larql bench <vindex> --ffn URL --wire f32,f16` shows <1%
+tok/s difference and identical top-5 tokens. Wire bytes column shows 50% reduction.
+
+#### GT2 — i8 quantised residuals (opt-in)
+
+**Status**: Not started.
+
+**Spec**: ADR-0009 §Wire Layout (i8), §Negotiation Protocol.
+
+Per-position symmetric quantisation: `scale = max(|x|)/127`, `zero_point = 0`.
+Wire: `[scale f32 LE][zero_point f32 LE][data i8[] × hidden_size]` per position.
+
+- Add `I8_WIRE = "LARQL_I8_WIRE"` to `env_flags.rs` (opt-in, default off).
+- Add `I8_CT = "application/x-larql-ffn-i8"` to `wire.rs`.
+- Add `encode_i8_request`, `decode_i8_single/batch` to `ffn/remote/codec.rs`.
+- Add `encode_i8_output` to `routes/walk_ffn.rs`.
+- Accuracy gate: `--wire f32,i8 --assert-topk-match 1` must pass before
+  enabling i8 as opt-out on any model family.
+
+**Acceptance**: 75% bandwidth reduction vs f32; top-1 token identical on
+≥95% of decode steps across tested architectures.
+
+#### GT3 — Per-layer latency in HeartbeatMsg
+
+**Status**: Not started.
+
+**Spec**: ADR-0011 §HeartbeatMsg Extension.
+
+Current heartbeat sends `cpu_pct`, `ram_used`, `requests_in_flight` — all
+global. Router uses `requests_in_flight` for load balancing. This is blind to
+per-layer compute bottlenecks (e.g. a sparse MoE model where layer 15 is 3×
+slower than others due to expert placement).
+
+Proto change (`grid.proto`):
+```protobuf
+message LayerLatency {
+  uint32 layer  = 1;
+  float  avg_ms = 2;  // EMA α=0.1
+  float  p99_ms = 3;  // ring-buffer p99 over last 100 requests
+}
+message HeartbeatMsg {
+  // existing fields unchanged
+  repeated LayerLatency layer_stats = 4;
+}
+```
+
+Server changes:
+- `LayerLatencyTracker` struct in new `src/metrics.rs`: one EMA + `VecDeque`
+  per layer, updated in `routes/walk_ffn.rs` after each layer forward.
+- `announce.rs`: populate `layer_stats` in the heartbeat sender.
+
+Router change:
+- `grid.rs::update_heartbeat`: store `layer_stats` in `ServerEntry`.
+- `grid.rs::route`: prefer server with lowest `layer_stats[layer].avg_ms`
+  when multiple replicas cover the same layer.
+
+**Acceptance**: `larql serve --join ... --log-level debug` logs per-layer
+latency in each heartbeat. Router `/grid-status` response includes
+`layer_stats` per server.
+
+#### GT4 — WebSocket token streaming (Q1.10 completion + N0.1 SSE)
+
+**Status**: Not started. Supersedes Q1.10 deferral.
+
+`routes/stream.rs` has a working WebSocket handler for `describe` and `infer`
+commands but lacks a streaming token generation path. This is the missing
+piece for N0.1 slice 3 (SSE on `POST /v1/chat/completions`).
+
+- Complete `handle_stream_infer` in `routes/stream.rs`:
+  - Accept `{"type": "generate", "prompt": "..."}` WS message.
+  - Call `generate_streaming` (already exists in larql-inference).
+  - Emit one `{"type": "token", "text": "..."}` frame per token.
+  - Emit `{"type": "done", "tokens": N, "ms": M}` on completion.
+  - Handle `{"type": "cancel"}` to abort generation.
+- Add binary frame support: client can send
+  `{"type": "generate", "format": "binary"}` to receive token IDs as u32 LE
+  instead of JSON (lower overhead for embedding clients).
+- Wire SSE for N0.1: in `routes/chat.rs`, when `stream: true`, use
+  `axum::response::Sse` to wrap the same `generate_streaming` callback.
+  Emit OpenAI-format `data: {...}\n\n` chunks; terminate with `data: [DONE]\n\n`.
+
+**Acceptance**: `wscat -c ws://localhost:8080/v1/stream` receives one JSON
+frame per token. `curl -N -H "Accept: text/event-stream" \
+-d '{"model":"...","messages":[...],"stream":true}' \
+http://localhost:8080/v1/chat/completions` streams tokens in SSE format.
+
+#### GT7 — QUIC transport for grid
+
+**Status**: Not started.
+
+**Spec**: ADR-0010 (full spec).
+
+Feature-gated (`cargo build --features quic`). QUIC is opt-in; TCP gRPC
+remains the default and is never removed.
+
+- Add `quinn = "0.11"` as optional dep in `Cargo.toml` behind `quic` feature.
+- New `src/transport/` directory:
+  - `src/transport/quic.rs`: quinn endpoint setup, stream wrapper as
+    `AsyncRead + AsyncWrite`, tonic channel factory.
+  - `src/transport/mod.rs`: re-export; feature-gated.
+- `bootstrap.rs`: accept `--quic-port N`; generate self-signed TLS cert if
+  not provided; spawn QUIC listener.
+- `announce.rs`: parse `quic://` scheme in `--join`; use QUIC transport
+  instead of TCP for the GridService.Join stream.
+
+**Acceptance**: `larql serve --join quic://router:50053 --layers 0-14` appears
+in `larql-router` grid-status after connecting via QUIC. Measured RTT in
+grid-status is ≤ TCP RTT on LAN; lower on lossy WAN paths.
+
+---
+
+### G-MODEB. Self-assembling grid Mode B (ADR-0011)
+
+#### GT5 — Gap-fill assignment
+
+**Status**: Not started.
+
+**Spec**: ADR-0011 §Phase B1 Protocol.
+
+A server starts with no shard loaded:
+```bash
+larql serve --join grpc://router:50052 \
+            --available-ram 24GB \
+            --vindex-store /mnt/shards/
+```
+
+Router changes (`grid.rs`):
+- Add `available_servers: HashMap<String, AvailableEntry>` to `GridState`.
+- Add `pending_assignments: HashMap<String, AssignmentRecord>`.
+- On `AvailableMsg`: call `check_coverage_gaps()`, select gap, send `AssignMsg`.
+- Assignment timeout: 10 min default (configurable `--assignment-timeout`).
+
+Server changes:
+- `announce.rs`: handle `AssignMsg` → spawn `shard_loader::download_shard()`.
+- New `src/shard_loader.rs`:
+  - `async fn download_shard(origin_url, store_path, expected_hash, progress)`
+  - HTTP range requests (resumable); SHA-256 verify; atomic rename.
+- After successful load: send `ReadyMsg`; announce loop transitions to Mode A.
+- On failure: send `RefuseMsg(reason="download_failed")`; re-enter available state.
+
+New server endpoint: `GET /v1/shard/{model_id}/{layer_start}-{layer_end}` —
+streams the shard directory as a tar for peer-to-peer distribution.
+
+**Acceptance**: `larql serve --join grpc://router --available-ram 24GB`
+appears in `/grid-status` as "available"; after `AssignMsg`, transitions to
+"loading"; after `ReadyMsg`, appears as "serving" with correct layer range.
+
+#### GT6 — Dynamic rebalancing
+
+**Status**: Not started. Requires GT5.
+
+**Spec**: ADR-0011 §Phase B2 Protocol.
+
+New `crates/larql-router/src/rebalancer.rs`:
+- Background tokio task, 30s check interval (configurable).
+- Triggers when: `max(avg_layer_latency_ms) / min(avg_layer_latency_ms) > 2.0`
+  sustained over 60s, AND a spare `AvailableEntry` exists.
+- Action: send `UnassignMsg(reason="rebalancing")` to overloaded server.
+
+Server drain protocol (in `announce.rs`):
+- On `UnassignMsg`: set `draining = true` on the shard.
+- Wait up to 30s for in-flight requests to complete (tracked via atomic counter).
+- Unload shard weights from memory.
+- Send `DroppingMsg(reason="reassigned")`.
+- Re-enter `AvailableMsg` loop for new assignment.
+
+**Acceptance**: Two servers covering the same layer range with artificial load
+skew (one processing 5× more requests): rebalancer detects imbalance, drains
+the overloaded server, load re-equalises within 2 rebalance cycles.
+
+---
+
+### G-BENCH. Grid benchmarking (ADR-0012)
+
+#### GT8 — `larql bench` grid/wire/transport extensions
+
+**Status**: Not started.
+
+**Spec**: ADR-0012 §Layer 1.
+
+All benchmarks are architecture-agnostic: `hidden_size`, `num_layers`,
+`quant_format` are read from vindex config. No model-family constants
+in the bench code.
+
+New flags added to `bench_cmd.rs`:
+```
+--bench-grid          Shard-count scaling sweep
+--wire f32,f16,i8     Wire format comparison (requires --ffn)
+--transport http,quic Transport comparison (requires --join or --ffn)
+--concurrent N        Concurrent client simulation
+--output json         Machine-readable JSON
+--output-file PATH    JSON destination (default stdout)
+```
+
+New bench submodules (under `commands/primary/bench/`):
+- `grid.rs` — scaling sweep: 1..N shards, report tok/s + p50/p99/shard_efficiency
+- `wire.rs` — wire format comparison: encode/decode timing + bandwidth + parity check
+- `transport.rs` — TCP vs QUIC comparison
+
+JSON schema: `{timestamp, model, grid, wire, transport, concurrent, results{tok_per_s, ms_per_tok{mean,p50,p95,p99}, wire_bytes_per_tok, per_layer_rtt_ms[]}}`.
+
+**Acceptance**: `larql bench <vindex> --ffn URL --wire f32,f16 --output json`
+emits valid JSON with both wire format results; `wire_bytes_per_tok` for f16
+is within 2% of `wire_bytes_per_tok(f32) / 2`.
+
+#### GT9 — Criterion micro-benchmarks
+
+**Status**: Not started.
+
+**Spec**: ADR-0012 §Layer 2.
+
+- `crates/larql-inference/benches/wire_codec.rs`: encode/decode throughput
+  (MB/s) for f32/f16/i8 at hidden_size ∈ {2560, 4096, 5120}, seq_len ∈ {1, 32, 256}.
+  Parameters read as `criterion::BenchmarkId` — no hardcoded model names.
+- `crates/larql-router/benches/routing.rs`: `route()` hot path (ns/op at
+  1/10/100 servers), `rebuild_route_table()` cold path, `update_heartbeat()`.
+
+Run with: `make bench-wire` / `make bench-routing`.
+
+#### GT10 — CI regression gate
+
+**Status**: Not started. Requires GT8.
+
+**Spec**: ADR-0012 §Layer 3.
+
+- `scripts/bench-grid-regress.sh`: runs `larql bench --output json`, compares
+  against baseline in `bench/baselines/<model>.json`.
+- `scripts/bench_compare.py`: fails if tok/s drops >5% or p99 rises >10%.
+- Baselines committed to repo; updated explicitly after intentional improvements.
+- `Makefile` targets: `bench-wire`, `bench-routing`, `bench-grid`, `bench-all`.
+
+**Acceptance**: `make bench-grid MODEL=gemma3-4b-q4k` exits 0 on a clean run;
+exits 1 if a deliberate 10% regression is introduced.
+
+---
+
 ### F-COLLECT. Parallelize shard collection in `forward_moe_stream_collect_with_timing`
 
 **Status**: ✅ **Shipped 2026-05-02.** Both halves of the gRPC dispatch are

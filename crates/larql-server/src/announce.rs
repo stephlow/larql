@@ -8,10 +8,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use larql_router_protocol::{
     AnnounceMsg, DroppingMsg, GridServiceClient, HeartbeatMsg, RouterPayload, ServerMessage,
     ServerPayload,
 };
+
+use crate::metrics::LayerLatencyTracker;
 use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataValue;
 use tracing::{error, info, warn};
@@ -41,6 +45,8 @@ pub struct AnnounceConfig {
     pub grid_key: Option<String>,
     /// Stable identity hash of the vindex (model_id + num_layers).
     pub vindex_hash: String,
+    /// Per-layer latency tracker — populates HeartbeatMsg.layer_stats.
+    pub latency_tracker: Arc<LayerLatencyTracker>,
 }
 
 // ── Public entry point ─────────────────────────────────────────────────────────
@@ -105,12 +111,13 @@ fn announce_message(cfg: &AnnounceConfig) -> ServerMessage {
     }
 }
 
-fn heartbeat_message() -> ServerMessage {
+fn heartbeat_message(tracker: &LayerLatencyTracker) -> ServerMessage {
     ServerMessage {
         payload: Some(ServerPayload::Heartbeat(HeartbeatMsg {
             cpu_pct: 0.0,
             ram_used: 0,
             requests_in_flight: 0,
+            layer_stats: tracker.snapshot(),
         })),
     }
 }
@@ -155,11 +162,12 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
 
     // Spawn the heartbeat sender.
     let tx_hb = tx.clone();
+    let tracker = cfg.latency_tracker.clone();
     let hb_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
-            if tx_hb.send(heartbeat_message()).await.is_err() {
+            if tx_hb.send(heartbeat_message(&tracker)).await.is_err() {
                 break;
             }
         }
@@ -229,6 +237,7 @@ mod tests {
             ram_bytes: 42,
             grid_key: Some("secret".into()),
             vindex_hash: "abc123".into(),
+            latency_tracker: Arc::new(LayerLatencyTracker::new()),
         }
     }
 
@@ -267,13 +276,29 @@ mod tests {
 
     #[test]
     fn heartbeat_message_uses_zeroed_metrics() {
-        let msg = heartbeat_message();
+        let tracker = LayerLatencyTracker::new();
+        let msg = heartbeat_message(&tracker);
         let Some(ServerPayload::Heartbeat(heartbeat)) = msg.payload else {
             panic!("expected heartbeat payload");
         };
         assert_eq!(heartbeat.cpu_pct, 0.0);
         assert_eq!(heartbeat.ram_used, 0);
         assert_eq!(heartbeat.requests_in_flight, 0);
+        assert!(heartbeat.layer_stats.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_includes_layer_stats_after_recording() {
+        let tracker = LayerLatencyTracker::new();
+        tracker.record(5, 3.0);
+        tracker.record(5, 5.0);
+        let msg = heartbeat_message(&tracker);
+        let Some(ServerPayload::Heartbeat(hb)) = msg.payload else {
+            panic!("expected heartbeat");
+        };
+        assert_eq!(hb.layer_stats.len(), 1);
+        assert_eq!(hb.layer_stats[0].layer, 5);
+        assert!(hb.layer_stats[0].avg_ms > 0.0);
     }
 
     #[test]

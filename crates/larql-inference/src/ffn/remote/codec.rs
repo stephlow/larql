@@ -162,6 +162,167 @@ pub(crate) fn decode_binary_batch(body: &[u8]) -> Result<HashMap<usize, Vec<f32>
     Ok(out)
 }
 
+/// f16 content-type constant (ADR-0009).
+pub(crate) const F16_CT: &str = "application/x-larql-ffn-f16";
+
+/// Decode a binary single-layer f16 response into f32 output.
+pub(crate) fn decode_binary_single_f16(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
+    use half::f16;
+    if body.len() < 12 {
+        return Err(format!(
+            "f16 binary response too short: {} bytes",
+            body.len()
+        ));
+    }
+    let marker = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    if marker == BATCH_MARKER {
+        return Err("expected single-layer f16 response but got batch marker".into());
+    }
+    let layer = marker as usize;
+    let floats: Vec<f32> = body[12..]
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+        .collect();
+    Ok((layer, floats))
+}
+
+/// Decode a binary batch f16 response into f32 outputs.
+pub(crate) fn decode_binary_batch_f16(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, String> {
+    use half::f16;
+    if body.len() < 12 {
+        return Err(format!(
+            "f16 batch response too short: {} bytes",
+            body.len()
+        ));
+    }
+    let marker = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    if marker != BATCH_MARKER {
+        let (layer, floats) = decode_binary_single_f16(body)?;
+        let mut m = HashMap::new();
+        m.insert(layer, floats);
+        return Ok(m);
+    }
+    let num_results = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    let mut offset = 12usize;
+    let mut out = HashMap::with_capacity(num_results);
+    for _ in 0..num_results {
+        if body.len() < offset + 12 {
+            return Err("f16 batch: truncated result header".into());
+        }
+        let layer = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+        let num_floats =
+            u32::from_le_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        offset += 12;
+        let bytes_needed = num_floats * 2;
+        if body.len() < offset + bytes_needed {
+            return Err(format!(
+                "f16 batch: truncated output for layer {layer}: need {bytes_needed}, have {}",
+                body.len() - offset
+            ));
+        }
+        let floats: Vec<f32> = body[offset..offset + bytes_needed]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+            .collect();
+        offset += bytes_needed;
+        out.insert(layer, floats);
+    }
+    Ok(out)
+}
+
+/// i8 content-type constant (ADR-0009).
+pub(crate) const I8_CT: &str = "application/x-larql-ffn-i8";
+
+/// Decode one position from an i8 per-position block.
+/// Format: `[scale f32 LE][zero_point f32 LE (ignored)][data i8[hidden_size]]`
+fn decode_i8_position(
+    body: &[u8],
+    offset: usize,
+    hidden: usize,
+) -> Result<(Vec<f32>, usize), String> {
+    let needed = 8 + hidden;
+    if body.len() < offset + needed {
+        return Err(format!(
+            "i8: truncated position at offset {offset}: need {needed}"
+        ));
+    }
+    let scale = f32::from_le_bytes(body[offset..offset + 4].try_into().unwrap());
+    // zero_point at offset+4 is always 0.0 (symmetric), skip it
+    let floats: Vec<f32> = body[offset + 8..offset + 8 + hidden]
+        .iter()
+        .map(|&b| (b as i8) as f32 * scale)
+        .collect();
+    Ok((floats, offset + needed))
+}
+
+/// Decode a binary single-layer i8 response into f32 output.
+pub(crate) fn decode_binary_single_i8(
+    body: &[u8],
+    hidden_size: usize,
+) -> Result<(usize, Vec<f32>), String> {
+    if body.len() < 12 {
+        return Err(format!(
+            "i8 binary response too short: {} bytes",
+            body.len()
+        ));
+    }
+    let marker = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    if marker == BATCH_MARKER {
+        return Err("expected single-layer i8 response but got batch marker".into());
+    }
+    let layer = marker as usize;
+    let seq_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    let seq_len = seq_len.max(1);
+    let mut offset = 12usize;
+    let mut all_floats = Vec::with_capacity(seq_len * hidden_size);
+    for _ in 0..seq_len {
+        let (pos_floats, next_offset) = decode_i8_position(body, offset, hidden_size)?;
+        all_floats.extend(pos_floats);
+        offset = next_offset;
+    }
+    Ok((layer, all_floats))
+}
+
+/// Decode a binary batch i8 response into f32 outputs.
+pub(crate) fn decode_binary_batch_i8(
+    body: &[u8],
+    hidden_size: usize,
+) -> Result<HashMap<usize, Vec<f32>>, String> {
+    if body.len() < 12 {
+        return Err(format!("i8 batch response too short: {} bytes", body.len()));
+    }
+    let marker = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    if marker != BATCH_MARKER {
+        let (layer, floats) = decode_binary_single_i8(body, hidden_size)?;
+        let mut m = HashMap::new();
+        m.insert(layer, floats);
+        return Ok(m);
+    }
+    let num_results = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    let mut offset = 12usize;
+    let mut out = HashMap::with_capacity(num_results);
+    for _ in 0..num_results {
+        if body.len() < offset + 12 {
+            return Err("i8 batch: truncated result header".into());
+        }
+        let layer = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+        let seq_len = u32::from_le_bytes(body[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let seq_len = seq_len.max(1);
+        let num_floats =
+            u32::from_le_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        let hidden = num_floats / seq_len;
+        offset += 12;
+        let mut all_floats = Vec::with_capacity(num_floats);
+        for _ in 0..seq_len {
+            let (pos_floats, next_offset) = decode_i8_position(body, offset, hidden)?;
+            all_floats.extend(pos_floats);
+            offset = next_offset;
+        }
+        out.insert(layer, all_floats);
+    }
+    Ok(out)
+}
+
 /// Extract the `latency_ms` f32 embedded at bytes 8-11 of a binary response.
 /// Returns 0.0 if the body is too short or the value is non-finite.
 pub(super) fn extract_response_latency_ms(body: &[u8]) -> f64 {

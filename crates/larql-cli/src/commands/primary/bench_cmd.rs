@@ -915,24 +915,39 @@ fn run_remote_moe_bench(
     let iters = args.moe_predispatch_iters.max(1);
 
     // Warmup.
-    let run_once = |n: usize| -> Result<larql_inference::layer_graph::grid::GridGenerateResult, String> {
-        if is_batch {
-            generate_with_remote_moe_batch(
-                &weights, &tokenizer, prompt_ids.clone(), n,
-                &index, &remote, &*backend, &eos, iters,
-            ).map_err(|e| e.to_string())
-        } else {
-            generate_with_remote_moe(
-                &weights, &tokenizer, prompt_ids.clone(), n,
-                &index, &remote, &*backend, &eos,
-            ).map_err(|e| e.to_string())
-        }
-    };
+    let run_once =
+        |n: usize| -> Result<larql_inference::layer_graph::grid::GridGenerateResult, String> {
+            if is_batch {
+                generate_with_remote_moe_batch(
+                    &weights,
+                    &tokenizer,
+                    prompt_ids.clone(),
+                    n,
+                    &index,
+                    &remote,
+                    &*backend,
+                    &eos,
+                    iters,
+                )
+                .map_err(|e| e.to_string())
+            } else {
+                generate_with_remote_moe(
+                    &weights,
+                    &tokenizer,
+                    prompt_ids.clone(),
+                    n,
+                    &index,
+                    &remote,
+                    &*backend,
+                    &eos,
+                )
+                .map_err(|e| e.to_string())
+            }
+        };
 
     let _ = run_once(args.warmup.max(1));
 
-    let result = run_once(max_tokens)
-        .map_err(|e| format!("moe bench generate failed: {e}"))?;
+    let result = run_once(max_tokens).map_err(|e| format!("moe bench generate failed: {e}"))?;
 
     let n_warm = args.warmup.min(result.decode_ms.len());
     let measured = &result.decode_ms[n_warm..];

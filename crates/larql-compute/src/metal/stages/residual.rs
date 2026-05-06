@@ -13,9 +13,9 @@
 //! Pre-norm vs post-norm branching lives inside these helpers; callers
 //! pass `has_post_norms` and the appropriate weight buffers.
 
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
-use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Post-attention residual + pre-FFN norm (+ optional Q8 quant).
 ///

@@ -24,9 +24,13 @@ pub(super) struct CachedResult {
 
 impl CachedResult {
     fn from_metrics(metrics: &BehaviorMetrics, source: &str) -> Self {
-        let gate = if metrics.passes_strict() { "strict_pass" }
-            else if metrics.passes_smoke() { "smoke_pass" }
-            else { "fail" };
+        let gate = if metrics.passes_strict() {
+            "strict_pass"
+        } else if metrics.passes_smoke() {
+            "smoke_pass"
+        } else {
+            "fail"
+        };
         CachedResult {
             mean_kl: metrics.mean_kl,
             p95_kl: Some(metrics.p95_kl),
@@ -64,10 +68,7 @@ impl CachedResult {
 
     pub(super) fn passes_smoke(&self) -> bool {
         let p95 = self.p95_kl.unwrap_or(self.max_kl);
-        self.mean_kl <= 0.01
-            && p95 <= 0.05
-            && self.top1 >= 0.95
-            && self.top5 >= 0.98
+        self.mean_kl <= 0.01 && p95 <= 0.05 && self.top1 >= 0.95 && self.top5 >= 0.98
     }
 }
 
@@ -142,7 +143,11 @@ pub(super) fn set_merge_key(sources: &[usize], target: usize) -> String {
     sorted.sort_unstable();
     format!(
         "{{{}}}->{target}",
-        sorted.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+        sorted
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -170,13 +175,15 @@ pub(super) fn run_build_program_cache(
     args: BuildProgramCacheArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry_dir = args.registry.parent().unwrap_or(Path::new("."));
-    let registry: Value =
-        serde_json::from_str(&std::fs::read_to_string(&args.registry)?)?;
+    let registry: Value = serde_json::from_str(&std::fs::read_to_string(&args.registry)?)?;
 
     let head_layer = registry["head"]["layer"].as_u64().unwrap_or(0) as usize;
     let head_idx = registry["head"]["head"].as_u64().unwrap_or(0) as usize;
     let group = registry["group"].as_u64().unwrap_or(0) as usize;
-    let fp = registry["codebook_fingerprint"].as_str().unwrap_or("").to_string();
+    let fp = registry["codebook_fingerprint"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
     eprintln!("Building cache for L{head_layer}H{head_idx} group {group}  fp={fp}");
 
@@ -203,11 +210,17 @@ pub(super) fn run_build_program_cache(
 
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) => { eprintln!("  skip {name}: {e}"); continue; }
+            Err(e) => {
+                eprintln!("  skip {name}: {e}");
+                continue;
+            }
         };
         let program: Program = match serde_json::from_str(&text) {
             Ok(p) => p,
-            Err(e) => { eprintln!("  skip {name}: {e}"); continue; }
+            Err(e) => {
+                eprintln!("  skip {name}: {e}");
+                continue;
+            }
         };
 
         base_k = program.base_config.k;
@@ -216,7 +229,11 @@ pub(super) fn run_build_program_cache(
 
         // Use `metrics` if present; fall back to `reference_metrics` so that
         // manually-authored variants (where `metrics` is null) are still cached.
-        let raw = program.metrics.as_ref().map(|m| serde_json::to_value(m).ok()).flatten()
+        let raw = program
+            .metrics
+            .as_ref()
+            .map(|m| serde_json::to_value(m).ok())
+            .flatten()
             .or_else(|| program.reference_metrics.clone());
         // Replace null p95_kl with max_kl so variants without p95 still parse.
         let metrics_json = raw.map(|mut v| {
@@ -227,16 +244,25 @@ pub(super) fn run_build_program_cache(
             }
             v
         });
-        let metrics: BehaviorMetrics = match metrics_json.and_then(|v| serde_json::from_value(v).ok()) {
-            Some(m) => m,
-            None => { eprintln!("  skip {name}: no metrics or reference_metrics"); continue; }
-        };
+        let metrics: BehaviorMetrics =
+            match metrics_json.and_then(|v| serde_json::from_value(v).ok()) {
+                Some(m) => m,
+                None => {
+                    eprintln!("  skip {name}: no metrics or reference_metrics");
+                    continue;
+                }
+            };
         let cached = CachedResult::from_metrics(&metrics, name);
         eprintln!("  {name}: {}", cached.gate);
 
         classify_and_insert(
-            &program, cached, name,
-            &mut substitutions, &mut set_merges, &mut guarded_programs, &mut oracle_result,
+            &program,
+            cached,
+            name,
+            &mut substitutions,
+            &mut set_merges,
+            &mut guarded_programs,
+            &mut oracle_result,
         );
     }
 
@@ -251,7 +277,9 @@ pub(super) fn run_build_program_cache(
     });
 
     let cache = ProgramCache {
-        head_layer, head_idx, group,
+        head_layer,
+        head_idx,
+        group,
         base_config_k: base_k,
         base_config_groups: base_g,
         base_config_bits_per_group: base_b,
@@ -297,7 +325,9 @@ fn classify_and_insert(
         .collect();
 
     let has_guard = all_rules.iter().any(|r| r.is_guarded());
-    let has_set = all_rules.iter().any(|r| matches!(r, ProgramRule::MapSet { .. }));
+    let has_set = all_rules
+        .iter()
+        .any(|r| matches!(r, ProgramRule::MapSet { .. }));
 
     if has_guard {
         guarded_programs.insert(name.to_string(), cached);
@@ -339,5 +369,7 @@ fn infer_merge_key(program: &Program) -> String {
             }
         }
     }
-    target_opt.map(|t| set_merge_key(&sources, t)).unwrap_or_else(|| "unknown".to_string())
+    target_opt
+        .map(|t| set_merge_key(&sources, t))
+        .unwrap_or_else(|| "unknown".to_string())
 }

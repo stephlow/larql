@@ -53,16 +53,24 @@ pub(super) fn run_induce_program(
     let fit = build_fit_context(&args, &mut weights, &index, &tokenizer, head, config)?;
 
     eprintln!("\n=== Oracle Mode D baseline ===");
-    let (_, oracle_metrics) =
-        evaluate_program_fast(&mut weights, &index, &fit, &identity_program(head, args.group, &base_config))?;
+    let (_, oracle_metrics) = evaluate_program_fast(
+        &mut weights,
+        &index,
+        &fit,
+        &identity_program(head, args.group, &base_config),
+    )?;
     print_gate("oracle", &oracle_metrics);
 
     // Step 2: load cache if present.
     let cache_path = args.out.join("program_cache.json");
     let cache: Option<ProgramCache> = if cache_path.exists() {
         eprintln!("Loading cache from {}", cache_path.display());
-        Some(serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?)
-    } else { None };
+        Some(serde_json::from_str(&std::fs::read_to_string(
+            &cache_path,
+        )?)?)
+    } else {
+        None
+    };
 
     // Step 3: pairwise merge matrix — use cache for known pairs, eval the rest.
     eprintln!("\n=== Pairwise merge matrix ===");
@@ -71,7 +79,9 @@ pub(super) fn run_induce_program(
 
     for source in 0..num_codes {
         for target in 0..num_codes {
-            if source == target { continue; }
+            if source == target {
+                continue;
+            }
             let key = format!("{source}->{target}");
 
             if let Some(m) = cache.as_ref().and_then(|c| c.substitutions.get(&key)) {
@@ -91,19 +101,23 @@ pub(super) fn run_induce_program(
     }
 
     // Step 4: dominant sink + merge candidates.
-    let mut sink_votes: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
+    let mut sink_votes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &(_, t, _) in &strict_pairs {
         *sink_votes.entry(t).or_default() += 1;
     }
-    let sink = match sink_votes.into_iter().max_by_key(|&(_, v)| v).map(|(k, _)| k) {
+    let sink = match sink_votes
+        .into_iter()
+        .max_by_key(|&(_, v)| v)
+        .map(|(k, _)| k)
+    {
         Some(s) => s,
         None => {
             eprintln!("No strict-pass pairwise edges — cannot proceed");
             return Ok(());
         }
     };
-    let mut clique: Vec<usize> = strict_pairs.iter()
+    let mut clique: Vec<usize> = strict_pairs
+        .iter()
         .filter(|(_, t, _)| *t == sink)
         .map(|(s, _, _)| *s)
         .collect();
@@ -115,7 +129,11 @@ pub(super) fn run_induce_program(
     // Step 5: evaluate set merge of the clique.
     let set_merge = set_merge_program(head, args.group, &base_config, clique.clone(), sink);
     let (_, sm_metrics) = evaluate_program_fast(&mut weights, &index, &fit, &set_merge)?;
-    eprintln!("set-merge {clique:?}->{sink}: {}  [{}]", fmt_m(&sm_metrics), gate_label(&sm_metrics));
+    eprintln!(
+        "set-merge {clique:?}->{sink}: {}  [{}]",
+        fmt_m(&sm_metrics),
+        gate_label(&sm_metrics)
+    );
 
     if sm_metrics.passes_strict() {
         eprintln!("\n✓ Set merge passes strict — no guard needed");
@@ -143,15 +161,22 @@ pub(super) fn run_induce_program(
     // Step 8: one oracle call — evaluate the guarded program.
     eprintln!("\n=== Oracle call: guarded program ===");
     let guarded = build_guarded_program(
-        head, args.group, &base_config, sink,
+        head,
+        args.group,
+        &base_config,
+        sink,
         clique.iter().copied().filter(|&c| c != sink).collect(),
         loc.fragile_code,
         guard.predicate.clone(),
         &guard.label,
     );
     let (_, gm) = evaluate_program_fast(&mut weights, &index, &fit, &guarded)?;
-    eprintln!("guarded ({guard_label}): {metrics}  [{gate}]",
-        guard_label = guard.label, metrics = fmt_m(&gm), gate = gate_label(&gm));
+    eprintln!(
+        "guarded ({guard_label}): {metrics}  [{gate}]",
+        guard_label = guard.label,
+        metrics = fmt_m(&gm),
+        gate = gate_label(&gm)
+    );
 
     save_and_report(&guarded, &gm, &args.out)
 }
@@ -161,18 +186,31 @@ pub(super) fn run_induce_program(
 // ────────────────────────────────────────────────────────────────────────────
 
 fn gate_label(m: &BehaviorMetrics) -> &'static str {
-    if m.passes_strict() { "strict_pass" }
-    else if m.passes_smoke() { "smoke_pass" }
-    else { "fail" }
+    if m.passes_strict() {
+        "strict_pass"
+    } else if m.passes_smoke() {
+        "smoke_pass"
+    } else {
+        "fail"
+    }
 }
 
 fn fmt_m(m: &BehaviorMetrics) -> String {
-    format!("mean={:.6} max={:.6} top1={:.3}", m.mean_kl, m.max_kl, m.top1)
+    format!(
+        "mean={:.6} max={:.6} top1={:.3}",
+        m.mean_kl, m.max_kl, m.top1
+    )
 }
 
 fn print_gate(label: &str, m: &BehaviorMetrics) {
-    eprintln!("{label}: mean={:.6} p95={:.6} max={:.6} top1={:.4}  [{}]",
-        m.mean_kl, m.p95_kl, m.max_kl, m.top1, gate_label(m));
+    eprintln!(
+        "{label}: mean={:.6} p95={:.6} max={:.6} top1={:.4}  [{}]",
+        m.mean_kl,
+        m.p95_kl,
+        m.max_kl,
+        m.top1,
+        gate_label(m)
+    );
 }
 
 fn bm_from_cached(c: &super::program_cache::CachedResult) -> BehaviorMetrics {
@@ -200,12 +238,19 @@ fn build_guarded_program(
     let stage1_rules: Vec<ProgramRule> = if merge_sources.is_empty() {
         vec![]
     } else {
-        let non_guarded: Vec<usize> = merge_sources.iter()
+        let non_guarded: Vec<usize> = merge_sources
+            .iter()
             .copied()
             .filter(|&c| c != guarded_source)
             .collect();
-        if non_guarded.is_empty() { vec![] }
-        else { vec![ProgramRule::Map { source: non_guarded[0], target: sink }] }
+        if non_guarded.is_empty() {
+            vec![]
+        } else {
+            vec![ProgramRule::Map {
+                source: non_guarded[0],
+                target: sink,
+            }]
+        }
     };
 
     // Stage 2: guarded merge of the prose-boundary source.
@@ -241,11 +286,23 @@ fn build_guarded_program(
             },
         ],
         terminal_classes: vec![
-            TerminalClass { class: sink, construction_mode: ConstructionMode::Representative, representative_code: sink },
-            TerminalClass { class: guarded_source, construction_mode: ConstructionMode::Representative, representative_code: guarded_source },
+            TerminalClass {
+                class: sink,
+                construction_mode: ConstructionMode::Representative,
+                representative_code: sink,
+            },
+            TerminalClass {
+                class: guarded_source,
+                construction_mode: ConstructionMode::Representative,
+                representative_code: guarded_source,
+            },
         ],
-        metrics: None, reference_metrics: None, tolerance: None,
-        program_size: None, predicate_space_used: vec![], codebook_fingerprint: None,
+        metrics: None,
+        reference_metrics: None,
+        tolerance: None,
+        program_size: None,
+        predicate_space_used: vec![],
+        codebook_fingerprint: None,
     }
 }
 

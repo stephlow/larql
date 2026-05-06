@@ -1548,6 +1548,27 @@ fn get_packed_bytes_from_mmap_range_takes_precedence() {
 }
 
 #[test]
+fn get_packed_bytes_out_of_bounds_mmap_range_returns_none() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.bin");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&[10u8, 11, 12, 13]).unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let mut w = minimal_weights();
+    w.packed_mmaps.insert("packed.bin".into(), mmap);
+    w.packed_byte_ranges
+        .insert("tensor.key".into(), ("packed.bin".into(), 3, 4));
+
+    assert!(w.get_packed_bytes("tensor.key").is_none());
+}
+
+#[test]
 fn per_layer_ffn_bytes_detects_and_loads_entries() {
     let mut w = minimal_weights();
     w.raw_bytes.insert(

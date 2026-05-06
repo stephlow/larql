@@ -12,6 +12,7 @@ This file tracks the demo narrative, the critical path, and cross-crate sequenci
 | [larql-compute](crates/larql-compute/ROADMAP.md) | Metal GPU kernels, MoE prefill, platform expansion |
 | [larql-inference](crates/larql-inference/ROADMAP.md) | Forward pass, generation quality, KV engines |
 | [larql-server](crates/larql-server/ROADMAP.md) | HTTP API, gRPC grid, remote expert protocol |
+| [larql-router](crates/larql-router/ROADMAP.md) | Grid routing, self-balancing, QUIC transport |
 | [larql-cli](crates/larql-cli/ROADMAP.md) | CLI UX, sampling flags, streaming display |
 | [larql-lql](crates/larql-lql/ROADMAP.md) | LQL grammar, INSERT/SELECT/USE extensions |
 | [larql-core](crates/larql-core/ROADMAP.md) | Graph data model, algorithms, serialization |
@@ -123,6 +124,34 @@ Rule of thumb: engine code owns reusable capture/intervention/runtime
 primitives; `ov_rd` owns experiment orchestration, PQ variants, address
 probes, and report schemas until a runtime contract survives repeated
 experiments.
+
+---
+
+## P1 — Grid transport, self-balancing & benchmarking
+
+Driver: minimum latency across on-device/LAN/WAN; elastic scaling without
+manual shard pre-loading; reproducible, architecture-agnostic performance
+evidence. All work is model-family-neutral — no hardcoded layer counts,
+hidden sizes, or architecture assumptions.
+
+Spec: ADR-0009 (wire format), ADR-0010 (QUIC), ADR-0011 (self-balancing),
+ADR-0012 (benchmarking).
+
+| # | Item | Crates | Status |
+|---|------|--------|--------|
+| GT1 | f16 wire default for all grid traffic; `LARQL_F16_WIRE=0` opt-out; architecture-agnostic validation per model family | larql-server + larql-inference | planned |
+| GT2 | i8 symmetric quantised residuals on wire; `LARQL_I8_WIRE=1` opt-in; per-position scale | larql-server + larql-inference | planned |
+| GT3 | `LayerLatency` in `HeartbeatMsg` (proto + EMA tracker in server + per-layer routing in router) | larql-router-protocol + larql-server + larql-router | planned |
+| GT4 | WebSocket token streaming: complete Q1.10 state machine + SSE encoder for N0.1 chat completions | larql-server | planned |
+| GT5 | Mode B gap-fill: `AvailableMsg → AssignMsg → download → ReadyMsg`; new `shard_loader.rs` | larql-router + larql-server | planned |
+| GT6 | Dynamic rebalancing: `UnassignMsg` drain protocol + `rebalancer.rs` background task | larql-router + larql-server | planned |
+| GT7 | QUIC transport for grid (`quinn` feature-gated); 0-RTT reconnect; per-stream independence for expert fan-out | larql-router + larql-server | planned |
+| GT8 | `larql bench --bench-grid / --wire / --transport / --concurrent / --output json`; arch-agnostic from vindex config | larql-cli | planned |
+| GT9 | Criterion micro-benchmarks: wire codec (MB/s) + router hot-path (ns/op) | larql-inference + larql-router | planned |
+| GT10 | CI regression gate: `scripts/bench-grid-regress.sh` + `bench/baselines/` committed JSONs | scripts/ | planned |
+
+**Implementation order** (each step is a shippable increment):
+GT3 → GT1 → GT2 → GT4 → GT9 → GT5 → GT6 → GT8 → GT10 → GT7
 
 ---
 

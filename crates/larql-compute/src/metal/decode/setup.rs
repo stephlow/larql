@@ -25,9 +25,9 @@
 
 use crate::metal::buffers::BufferCache;
 use crate::FullPipelineLayer;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 use larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
 use metal::Buffer;
-use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 pub(super) struct DecodeScratch {
     // ── Per-layer weight buffer caches (length = num_layers) ──

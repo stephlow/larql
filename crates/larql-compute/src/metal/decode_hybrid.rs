@@ -335,7 +335,9 @@ impl MetalBackend {
         } else {
             // Q8 path: quantize attention → Q8 O proj → residual
             let o_q8 = self.bufs.output(layer_q_dim as u64);
-            let o_q8s = self.bufs.output((layer_q_dim / LEGACY_BLOCK_ELEMS * 4) as u64);
+            let o_q8s = self
+                .bufs
+                .output((layer_q_dim / LEGACY_BLOCK_ELEMS * 4) as u64);
             let o_out = self.bufs.output((hidden * 4) as u64);
 
             let dim_val = layer_q_dim as u32;

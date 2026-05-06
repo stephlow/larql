@@ -321,7 +321,10 @@ mod tests {
         let (q8_row_max, q8s_row_bytes) =
             q8_staging_size(&layers, HIDDEN_GEMMA3_4B, Q_DIM_LARGER_THAN_HIDDEN);
         assert_eq!(q8_row_max, Q_DIM_LARGER_THAN_HIDDEN);
-        assert_eq!(q8s_row_bytes, Q_DIM_LARGER_THAN_HIDDEN / LEGACY_BLOCK_ELEMS * 4); // 512
+        assert_eq!(
+            q8s_row_bytes,
+            Q_DIM_LARGER_THAN_HIDDEN / LEGACY_BLOCK_ELEMS * 4
+        ); // 512
     }
 
     /// Mixed sliding/global geometry (Gemma 4 31B): different layers

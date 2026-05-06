@@ -50,10 +50,12 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Remote FFN backend (RemoteWalkBackend → POST /v1/walk-ffn)
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+half = "2"
 
 # gRPC expert client (RemoteMoeBackend → ExpertService via tonic)
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 tonic = { version = "0.13", features = ["tls-ring", "tls-webpki-roots"] }
+prost = "0.13"
 larql-router-protocol = { path = "../larql-router-protocol" }
 async-stream = "0.3"
 futures = "0.3"
@@ -98,3 +100,8 @@ required-features = ["metal"]
 [dev-dependencies]
 assert_approx_eq = "1"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "wire_codec"
+harness = false

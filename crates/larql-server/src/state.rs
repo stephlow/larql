@@ -70,6 +70,9 @@ pub struct LoadedModel {
     pub probe_labels: HashMap<(usize, usize), String>,
     /// L2 FFN output cache — shared across all clients, persists for server lifetime.
     pub ffn_l2_cache: FfnL2Cache,
+    /// Per-layer latency tracker — records compute time per walk-ffn layer.
+    /// Snapshots are sent to the router in HeartbeatMsg.layer_stats (GT3).
+    pub layer_latency_tracker: std::sync::Arc<crate::metrics::LayerLatencyTracker>,
     /// Expert ID range this server owns (from `--experts START-END`).
     /// `None` = serve all experts. Used by the expert endpoint to reject
     /// requests for experts this shard doesn't hold.
@@ -380,6 +383,7 @@ mod loaded_model_tests {
             weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
+            layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,

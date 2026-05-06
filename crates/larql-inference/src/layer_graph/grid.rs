@@ -494,6 +494,9 @@ pub fn generate_with_remote_moe(
 
     let skip_moe = std::env::var("SKIP_MOE").is_ok();
     let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+    let bytes_enabled = crate::ffn::moe_remote::metrics::enabled();
+    let run_bytes_before = bytes_enabled.then(crate::ffn::moe_remote::metrics::snapshot);
+    let mut transport_tokens = 0usize;
     let mut per_token_timings: Vec<Vec<LayerTiming>> = Vec::new();
     let mut last_hidden_vec: Vec<f32> = vec![0.0f32; hidden];
     let mut current_ids = prompt_ids.clone();
@@ -510,6 +513,7 @@ pub fn generate_with_remote_moe(
     let suppress = build_special_suppress_set(tokenizer, eos);
 
     for (prefill_idx, &tok_id) in prompt_ids.iter().enumerate() {
+        let token_bytes_before = bytes_enabled.then(crate::ffn::moe_remote::metrics::snapshot);
         let tok_embed = embed_tokens_pub(weights, &[tok_id]);
         let x_tok: Vec<f32> = tok_embed.as_slice().unwrap_or(&[]).to_vec();
 
@@ -572,6 +576,10 @@ pub fn generate_with_remote_moe(
             print_token_breakdown("prefill", prefill_idx, &tok_timings);
             per_token_timings.push(tok_timings);
         }
+        if let Some(before) = token_bytes_before.as_ref() {
+            crate::ffn::moe_remote::metrics::print_delta("prefill", prefill_idx, before);
+        }
+        transport_tokens += 1;
     }
 
     // ── Decode loop ───────────────────────────────────────────────────────────
@@ -595,6 +603,9 @@ pub fn generate_with_remote_moe(
     tokens.push(first_tok);
     current_ids.push(first_id);
     if first_is_eos || tokens.len() >= max_tokens {
+        if let Some(before) = run_bytes_before.as_ref() {
+            crate::ffn::moe_remote::metrics::print_summary("generate", before, transport_tokens);
+        }
         return Ok(GridGenerateResult {
             tokens,
             decode_ms: vec![0.0],
@@ -603,6 +614,7 @@ pub fn generate_with_remote_moe(
     }
 
     for step in 0..max_tokens.saturating_sub(1) {
+        let token_bytes_before = bytes_enabled.then(crate::ffn::moe_remote::metrics::snapshot);
         let t0 = std::time::Instant::now();
         let next_input_id = *current_ids.last().unwrap();
 
@@ -804,6 +816,10 @@ pub fn generate_with_remote_moe(
             );
             per_token_timings.push(tok_timings);
         }
+        if let Some(before) = token_bytes_before.as_ref() {
+            crate::ffn::moe_remote::metrics::print_delta("decode", step, before);
+        }
+        transport_tokens += 1;
         let tok_str = detok.push(next_id);
         let is_eos = eos.is_eos_with_tokenizer(next_id, &tok_str, tokenizer);
         if debug_ids {
@@ -822,6 +838,9 @@ pub fn generate_with_remote_moe(
 
     if timing_enabled {
         print_run_summary("generate", &per_token_timings);
+    }
+    if let Some(before) = run_bytes_before.as_ref() {
+        crate::ffn::moe_remote::metrics::print_summary("generate", before, transport_tokens);
     }
 
     Ok(GridGenerateResult {
@@ -917,6 +936,9 @@ pub fn generate_with_remote_moe_batch(
     }
 
     let skip_moe = std::env::var("SKIP_MOE").is_ok();
+    let bytes_enabled = crate::ffn::moe_remote::metrics::enabled();
+    let run_bytes_before = bytes_enabled.then(crate::ffn::moe_remote::metrics::snapshot);
+    let mut transport_tokens = 0usize;
     let mut last_hidden_vec: Vec<f32> = vec![0.0f32; hidden];
     let mut current_ids = prompt_ids.clone();
 
@@ -925,7 +947,8 @@ pub fn generate_with_remote_moe_batch(
         .filter_map(|l| build_router(weights, arch, l))
         .collect();
 
-    for &tok_id in &prompt_ids {
+    for (prefill_idx, &tok_id) in prompt_ids.iter().enumerate() {
+        let token_bytes_before = bytes_enabled.then(crate::ffn::moe_remote::metrics::snapshot);
         let tok_embed = embed_tokens_pub(weights, &[tok_id]);
         let x_tok: Vec<f32> = tok_embed.as_slice().unwrap_or(&[]).to_vec();
         let kv_len = backend.kv_cache_len();
@@ -1018,6 +1041,10 @@ pub fn generate_with_remote_moe_batch(
         last_hidden_vec = h2_final.ok_or_else(|| {
             RemoteMoeError::BadResponse("decode returned None during prefill".into())
         })?;
+        transport_tokens += 1;
+        if let Some(before) = token_bytes_before.as_ref() {
+            crate::ffn::moe_remote::metrics::print_delta("prefill", prefill_idx, before);
+        }
     }
 
     // First token from prefill.
@@ -1042,6 +1069,9 @@ pub fn generate_with_remote_moe_batch(
     tokens.push(first_tok);
     current_ids.push(first_id);
     if first_eos || tokens.len() >= max_tokens {
+        if let Some(before) = run_bytes_before.as_ref() {
+            crate::ffn::moe_remote::metrics::print_summary("generate", before, transport_tokens);
+        }
         return Ok(GridGenerateResult {
             tokens,
             decode_ms: vec![0.0],
@@ -1063,7 +1093,8 @@ pub fn generate_with_remote_moe_batch(
     // Rolling back KV after every non-final pass ensures the KV cache advances
     // by exactly one position per token regardless of iteration count.
 
-    for _step in 0..max_tokens.saturating_sub(1) {
+    for step in 0..max_tokens.saturating_sub(1) {
+        let token_bytes_before = bytes_enabled.then(crate::ffn::moe_remote::metrics::snapshot);
         let t0 = std::time::Instant::now();
         let next_id = *current_ids.last().unwrap();
         let tok_embed = embed_tokens_pub(weights, &[next_id]);
@@ -1224,6 +1255,10 @@ pub fn generate_with_remote_moe_batch(
         );
 
         decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        transport_tokens += 1;
+        if let Some(before) = token_bytes_before.as_ref() {
+            crate::ffn::moe_remote::metrics::print_delta("decode", step, before);
+        }
         let tok_str = detok.push(next_tok_id);
         let is_eos = eos.is_eos_with_tokenizer(next_tok_id, &tok_str, tokenizer);
         tokens.push(tok_str);
@@ -1231,6 +1266,10 @@ pub fn generate_with_remote_moe_batch(
         if is_eos {
             break;
         }
+    }
+
+    if let Some(before) = run_bytes_before.as_ref() {
+        crate::ffn::moe_remote::metrics::print_summary("generate", before, transport_tokens);
     }
 
     Ok(GridGenerateResult {

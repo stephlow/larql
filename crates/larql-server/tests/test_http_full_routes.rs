@@ -46,8 +46,12 @@ fn model_functional_with_labels(id: &str) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: labels,
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
         expert_filter: None,
         unit_filter: None,
+        moe_remote: None,
     })
 }
 

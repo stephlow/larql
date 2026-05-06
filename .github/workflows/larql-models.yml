@@ -1,6 +1,6 @@
 # larql-models cross-platform CI
 #
-# Runs check + clippy + tests + bench test-mode on Linux, Windows, and macOS
+# Runs fmt + check + clippy + tests + bench test-mode on Linux, Windows, and macOS
 # for every change to the larql-models crate. Validates cross-platform compatibility:
 #   - Linux  (x86_64-unknown-linux-gnu)
 #   - Windows (x86_64-pc-windows-msvc) — HF cache path, mmap, path separators
@@ -42,7 +42,7 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v4
@@ -55,6 +55,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-models-
 
+      - name: Format check
+        run: cargo fmt -p larql-models -- --check
+
       - name: Check (all targets)
         run: cargo check -p larql-models --all-targets
 
@@ -66,3 +69,20 @@ jobs:
 
       - name: Test benches
         run: cargo test -p larql-models --benches
+
+  coverage:
+    name: coverage · ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage summary
+        run: cargo llvm-cov --package larql-models --summary-only

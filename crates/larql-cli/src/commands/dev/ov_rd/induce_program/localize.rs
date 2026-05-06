@@ -75,8 +75,13 @@ pub fn eval_leave_code_oracle(
             .collect();
 
         let h = forward_q4k_predicted_address_mode_d_head(
-            weights, &capture.token_ids, index,
-            fit.head, &fit.mode_d_table, &remapped, &capture.stratum,
+            weights,
+            &capture.token_ids,
+            index,
+            fit.head,
+            &fit.mode_d_table,
+            &remapped,
+            &capture.stratum,
         )?;
         let logits = final_logits(weights, &h);
         let logp = log_softmax(&logits);
@@ -84,8 +89,12 @@ pub fn eval_leave_code_oracle(
         let top5 = super::super::metrics::top_k_indices(&logits, 5);
 
         kls.push(kl_logp(&capture.baseline_logp, &logp));
-        if capture.baseline_top1 == top1 { top1_hits += 1; }
-        if top5.contains(&capture.baseline_top1) { top5_hits += 1; }
+        if capture.baseline_top1 == top1 {
+            top1_hits += 1;
+        }
+        if top5.contains(&capture.baseline_top1) {
+            top5_hits += 1;
+        }
     }
 
     let n = fit.captures.len().max(1) as f64;
@@ -131,8 +140,13 @@ pub fn eval_leave_position_oracle(
         .collect();
 
     let h = forward_q4k_predicted_address_mode_d_head(
-        weights, &capture.token_ids, index,
-        fit.head, &fit.mode_d_table, &remapped, &capture.stratum,
+        weights,
+        &capture.token_ids,
+        index,
+        fit.head,
+        &fit.mode_d_table,
+        &remapped,
+        &capture.stratum,
     )?;
     let logits = final_logits(weights, &h);
     let logp = log_softmax(&logits);
@@ -158,16 +172,27 @@ pub fn localize_failure(
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let remapped: Vec<Vec<usize>> = c.oracle_codes.iter().map(|codes| {
-                let mut r = codes.clone();
-                if merged_codes.contains(&codes[fit.group]) {
-                    r[fit.group] = target;
-                }
-                r
-            }).collect();
+            let remapped: Vec<Vec<usize>> = c
+                .oracle_codes
+                .iter()
+                .map(|codes| {
+                    let mut r = codes.clone();
+                    if merged_codes.contains(&codes[fit.group]) {
+                        r[fit.group] = target;
+                    }
+                    r
+                })
+                .collect();
             let kl = forward_q4k_predicted_address_mode_d_head(
-                weights, &c.token_ids, index, fit.head, &fit.mode_d_table, &remapped, &c.stratum,
-            ).ok()
+                weights,
+                &c.token_ids,
+                index,
+                fit.head,
+                &fit.mode_d_table,
+                &remapped,
+                &c.stratum,
+            )
+            .ok()
             .map(|h| kl_logp(&c.baseline_logp, &log_softmax(&final_logits(weights, &h))))
             .unwrap_or(0.0);
             (i, kl)
@@ -178,9 +203,7 @@ pub fn localize_failure(
     let worst_prompt = &fit.captures[worst_idx];
     let worst_prompt_id = worst_prompt.id.clone();
 
-    eprintln!(
-        "  worst prompt: {} KL={:.6}", worst_prompt_id, worst_kl
-    );
+    eprintln!("  worst prompt: {} KL={:.6}", worst_prompt_id, worst_kl);
 
     // Step 2: leave-code-oracle for each merged code.
     let strict_max = 0.03_f64;
@@ -191,11 +214,20 @@ pub fn localize_failure(
         eprint!("  leave-oracle code {code}: ");
         let m = eval_leave_code_oracle(weights, index, fit, merged_codes, target, Some(code))?;
         let clears = m.max_kl <= strict_max && m.p95_kl <= strict_max && m.top1 >= 0.99;
-        eprintln!("mean={:.6} max={:.6} [{}]", m.mean_kl, m.max_kl, if clears { "clears" } else { "still_fails" });
+        eprintln!(
+            "mean={:.6} max={:.6} [{}]",
+            m.mean_kl,
+            m.max_kl,
+            if clears { "clears" } else { "still_fails" }
+        );
         if clears {
             fragile_codes.push(code);
         }
-        leave_code_results.push(LeaveCodeResult { left_oracle: code, metrics: m, clears_failure: clears });
+        leave_code_results.push(LeaveCodeResult {
+            left_oracle: code,
+            metrics: m,
+            clears_failure: clears,
+        });
     }
 
     // Step 3: leave-position-oracle on worst prompt for fragile codes.
@@ -211,7 +243,8 @@ pub fn localize_failure(
 
     eprintln!(
         "  fragile code={fragile_code}, {} positions in '{}'",
-        fragile_pos_in_worst.len(), worst_prompt_id
+        fragile_pos_in_worst.len(),
+        worst_prompt_id
     );
 
     let mut leave_position_results = Vec::new();
@@ -219,10 +252,20 @@ pub fn localize_failure(
 
     for &pos in &fragile_pos_in_worst {
         let kl = eval_leave_position_oracle(
-            weights, index, fit, worst_prompt, merged_codes, target, fragile_code, Some(pos),
+            weights,
+            index,
+            fit,
+            worst_prompt,
+            merged_codes,
+            target,
+            fragile_code,
+            Some(pos),
         )?;
         let clears = kl <= strict_max;
-        eprintln!("    leave-oracle pos {pos}: KL={kl:.6} [{}]", if clears { "clears" } else { "fails" });
+        eprintln!(
+            "    leave-oracle pos {pos}: KL={kl:.6} [{}]",
+            if clears { "clears" } else { "fails" }
+        );
         if clears {
             minimal_fragile_positions.push(pos);
         }
@@ -234,7 +277,10 @@ pub fn localize_failure(
         });
     }
 
-    eprintln!("  minimal fragile positions: {:?}", minimal_fragile_positions);
+    eprintln!(
+        "  minimal fragile positions: {:?}",
+        minimal_fragile_positions
+    );
 
     Ok(LocalizeResult {
         fragile_codes,

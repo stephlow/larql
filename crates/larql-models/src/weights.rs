@@ -86,7 +86,8 @@ impl ModelWeights {
     pub fn get_packed_bytes(&self, key: &str) -> Option<&[u8]> {
         if let Some((file, offset, length)) = self.packed_byte_ranges.get(key) {
             if let Some(mmap) = self.packed_mmaps.get(file) {
-                return Some(&mmap[*offset..*offset + *length]);
+                let end = offset.checked_add(*length)?;
+                return mmap.get(*offset..end);
             }
         }
         self.raw_bytes.get(key).map(|v| v.as_slice())

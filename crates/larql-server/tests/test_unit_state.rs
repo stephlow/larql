@@ -94,8 +94,12 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
         expert_filter: None,
         unit_filter: None,
+        moe_remote: None,
     })
 }
 
@@ -170,8 +174,12 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
         expert_filter: None,
         unit_filter: None,
+        moe_remote: None,
     })
 }
 

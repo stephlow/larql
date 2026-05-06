@@ -116,6 +116,13 @@ and knowledge injection are commensurable as one bit economy. Starts with
 model-zoo amortisation curves, fact MDL sweeps, and linguistic bit-cost
 decomposition.
 
+### 41 — Residual Transport Grid
+Benchmarks current dense remote-FFN and MoE expert grid paths as residual /
+activation transport systems before protocol changes. Captures timing, raw
+stdout/stderr, and estimated activation bytes per token across f32, f16, Q8K,
+HTTP, UDS, and gRPC configurations. See
+`41_residual_transport_grid/REPORT.md` for the benchmark writeup.
+
 ---
 
 ## Routing & Geometry

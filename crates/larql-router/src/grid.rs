@@ -12,8 +12,9 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    AckMsg, AnnounceMsg, Gap, GridService, ModelCoverage, RejectMsg, RouterMessage, RouterPayload,
-    ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest, StatusResponse,
+    AckMsg, AnnounceMsg, Gap, GridService, LayerLatency, ModelCoverage, RejectMsg, RouterMessage,
+    RouterPayload, ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest,
+    StatusResponse,
 };
 
 // ── Per-server record ─────────────────────────────────────────────────────────
@@ -29,6 +30,9 @@ pub struct ServerEntry {
     pub ram_used: u64,
     pub requests_in_flight: u32,
     pub last_seen: Instant,
+    /// Per-layer EMA latency and p99, from HeartbeatMsg.layer_stats (GT3).
+    /// Key = layer index. Empty until the first heartbeat with layer data arrives.
+    pub layer_latencies: HashMap<u32, (f32, f32)>, // (avg_ms, p99_ms)
 }
 
 // ── Grid state ────────────────────────────────────────────────────────────────
@@ -75,17 +79,27 @@ impl GridState {
         cpu_pct: f32,
         ram_used: u64,
         requests_in_flight: u32,
+        layer_stats: Vec<LayerLatency>,
     ) {
         if let Some(entry) = self.servers.get_mut(server_id) {
             entry.cpu_pct = cpu_pct;
             entry.ram_used = ram_used;
             entry.requests_in_flight = requests_in_flight;
             entry.last_seen = Instant::now();
+            for ls in layer_stats {
+                entry
+                    .layer_latencies
+                    .insert(ls.layer, (ls.avg_ms, ls.p99_ms));
+            }
         }
         // Heartbeats don't change topology — no table rebuild needed.
     }
 
     /// Route one layer. O(1) table lookup + O(replicas) least-loaded scan.
+    ///
+    /// Replica selection (GT3): when per-layer latency data is available from
+    /// heartbeats, prefer the server with lowest avg_ms for this specific layer.
+    /// Falls back to requests_in_flight when no layer data exists yet.
     pub fn route(&self, model_id: Option<&str>, layer: u32) -> Option<String> {
         let ids = match model_id {
             Some(m) => self.route_table.get(&(m.to_owned(), layer)),
@@ -95,7 +109,20 @@ impl GridState {
             server_ids
                 .iter()
                 .filter_map(|id| self.servers.get(id))
-                .min_by_key(|s| s.requests_in_flight)
+                .min_by(|a, b| {
+                    let lat_a = a.layer_latencies.get(&layer).map(|(avg, _)| *avg);
+                    let lat_b = b.layer_latencies.get(&layer).map(|(avg, _)| *avg);
+                    match (lat_a, lat_b) {
+                        (Some(la), Some(lb)) => {
+                            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        // Prefer server with latency data over unknown.
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        // No latency data for either: fall back to requests_in_flight.
+                        (None, None) => a.requests_in_flight.cmp(&b.requests_in_flight),
+                    }
+                })
                 .map(|s| s.listen_url.clone())
         })
     }
@@ -223,17 +250,30 @@ impl GridState {
         let servers: Vec<ServerInfo> = self
             .servers
             .values()
-            .map(|e| ServerInfo {
-                server_id: e.server_id.clone(),
-                listen_url: e.listen_url.clone(),
-                state: "serving".into(),
-                model_id: e.model_id.clone(),
-                layer_start: e.layer_start,
-                layer_end: e.layer_end,
-                cpu_pct: e.cpu_pct,
-                ram_used: e.ram_used,
-                requests_in_flight: e.requests_in_flight,
-                rtt_ms: 0,
+            .map(|e| {
+                let mut layer_stats: Vec<LayerLatency> = e
+                    .layer_latencies
+                    .iter()
+                    .map(|(&layer, &(avg_ms, p99_ms))| LayerLatency {
+                        layer,
+                        avg_ms,
+                        p99_ms,
+                    })
+                    .collect();
+                layer_stats.sort_by_key(|l| l.layer);
+                ServerInfo {
+                    server_id: e.server_id.clone(),
+                    listen_url: e.listen_url.clone(),
+                    state: "serving".into(),
+                    model_id: e.model_id.clone(),
+                    layer_start: e.layer_start,
+                    layer_end: e.layer_end,
+                    cpu_pct: e.cpu_pct,
+                    ram_used: e.ram_used,
+                    requests_in_flight: e.requests_in_flight,
+                    rtt_ms: 0,
+                    layer_stats,
+                }
             })
             .collect();
 
@@ -335,6 +375,7 @@ impl GridService for GridServiceImpl {
                                 ram_used: ram_bytes,
                                 requests_in_flight: 0,
                                 last_seen: Instant::now(),
+                                layer_latencies: HashMap::new(),
                             };
                             state.write().await.register(entry);
                             registered_model = Some((model_id, layer_start, layer_end));
@@ -355,6 +396,7 @@ impl GridService for GridServiceImpl {
                                 hb.cpu_pct,
                                 hb.ram_used,
                                 hb.requests_in_flight,
+                                hb.layer_stats,
                             );
                         }
 
@@ -429,6 +471,7 @@ mod tests {
             ram_used: 1024,
             requests_in_flight: 0,
             last_seen: Instant::now(),
+            layer_latencies: HashMap::new(),
         }
     }
 
@@ -489,8 +532,8 @@ mod tests {
         state.register(entry("a", "http://a", "model-a", 0, 4));
         state.register(entry("b", "http://b", "model-a", 0, 4));
 
-        state.update_heartbeat("a", 80.0, 2048, 20);
-        state.update_heartbeat("b", 10.0, 1024, 0);
+        state.update_heartbeat("a", 80.0, 2048, 20, vec![]);
+        state.update_heartbeat("b", 10.0, 1024, 0, vec![]);
 
         assert_eq!(state.route(Some("model-a"), 2).as_deref(), Some("http://b"));
         let a = state.servers.get("a").unwrap();
@@ -524,5 +567,58 @@ mod tests {
         assert_eq!(model.gaps.len(), 1);
         assert_eq!(model.gaps[0].layer_start, 2);
         assert_eq!(model.gaps[0].layer_end, 2);
+    }
+
+    #[test]
+    fn route_prefers_lower_layer_latency_over_inflight() {
+        // slow has fewer requests_in_flight but higher per-layer latency.
+        // fast has more requests but lower layer latency.
+        // Router should route to fast.
+        let mut state = GridState::default();
+        let mut slow = entry("slow", "http://slow", "model-a", 0, 4);
+        slow.requests_in_flight = 2;
+        slow.layer_latencies.insert(2, (50.0, 80.0)); // 50 ms avg
+
+        let mut fast = entry("fast", "http://fast", "model-a", 0, 4);
+        fast.requests_in_flight = 8;
+        fast.layer_latencies.insert(2, (5.0, 9.0)); // 5 ms avg
+
+        state.register(slow);
+        state.register(fast);
+
+        assert_eq!(
+            state.route(Some("model-a"), 2).as_deref(),
+            Some("http://fast")
+        );
+    }
+
+    #[test]
+    fn heartbeat_stores_layer_latencies() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 4));
+
+        let stats = vec![LayerLatency {
+            layer: 2,
+            avg_ms: 3.5,
+            p99_ms: 7.0,
+        }];
+        state.update_heartbeat("a", 0.0, 0, 0, stats);
+
+        let entry = state.servers.get("a").unwrap();
+        assert_eq!(entry.layer_latencies.get(&2), Some(&(3.5, 7.0)));
+    }
+
+    #[test]
+    fn status_response_includes_layer_stats() {
+        let mut state = GridState::default();
+        let mut srv = entry("a", "http://a", "model-a", 0, 1);
+        srv.layer_latencies.insert(0, (2.1, 4.0));
+        state.register(srv);
+
+        let status = state.status_response();
+        let server = &status.servers[0];
+        assert_eq!(server.layer_stats.len(), 1);
+        assert_eq!(server.layer_stats[0].layer, 0);
+        assert!((server.layer_stats[0].avg_ms - 2.1).abs() < 0.001);
     }
 }

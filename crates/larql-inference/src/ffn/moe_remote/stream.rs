@@ -10,7 +10,7 @@ use super::error::RemoteMoeError;
 /// Opaque handle for a fire-and-collect MoE round trip on a stream.
 pub struct InflightMoe {
     pub(super) hidden: usize,
-    pub(super) n_streams: usize,
+    pub(super) active_stream_indices: Vec<usize>,
     pub(super) post_experts_norm: Vec<f32>,
     pub(super) norm_offset: f32,
     pub(super) eps: f32,

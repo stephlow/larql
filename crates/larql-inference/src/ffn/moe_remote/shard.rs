@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::config::ShardConfig;
 use super::error::RemoteMoeError;
+use super::metrics;
 use super::multi_layer_wire::{
     decode_multi_layer_response, encode_multi_layer_request, encode_multi_layer_request_q8k,
     MultiLayerResult, MultiLayerTask, MultiLayerTaskQ8K, MULTI_LAYER_BATCH_CONTENT_TYPE,
@@ -210,6 +212,7 @@ impl Shard {
                 // its wall-clock collect time into network vs server compute.
                 let (result_tx, result_rx) =
                     std::sync::mpsc::channel::<Result<(Vec<f32>, f32), RemoteMoeError>>();
+                let shard_url = self.config.url.clone();
 
                 // Open the gRPC stream + spawn the dispatch task in one block_on.
                 // This is the ONLY block_on — one-time stream setup, not per-layer.
@@ -235,6 +238,8 @@ impl Shard {
                     tokio::spawn(async move {
                         use futures::StreamExt;
                         while let Some(input) = work_rx.recv().await {
+                            let request_bytes = input.encoded_len();
+                            let active_experts = input.expert_ids.len();
                             // Forward input to gRPC stream.
                             if grpc_input_tx.send(input).is_err() {
                                 break;
@@ -242,6 +247,7 @@ impl Shard {
                             // Await server response (pure async, no block_on).
                             let result = match grpc_output.next().await {
                                 Some(Ok(out)) => {
+                                    let response_bytes = out.encoded_len();
                                     if out.h2.len() % 4 != 0 {
                                         Err(RemoteMoeError::BadResponse("h2 unaligned".into()))
                                     } else {
@@ -250,6 +256,12 @@ impl Shard {
                                             .chunks_exact(4)
                                             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                                             .collect();
+                                        metrics::record_call(
+                                            &shard_url,
+                                            request_bytes,
+                                            response_bytes,
+                                            active_experts,
+                                        );
                                         Ok((h2, out.compute_ms))
                                     }
                                 }
@@ -302,6 +314,7 @@ impl Shard {
                     .collect();
 
                 let grpc_req = larql_router_protocol::ExpertBatchRequest { items };
+                let request_bytes = grpc_req.encoded_len();
                 // Block on the async gRPC call from this sync context.
                 let mut client = grpc.client.clone();
                 let t_call = std::time::Instant::now();
@@ -313,6 +326,13 @@ impl Shard {
                         body: e.message().to_string(),
                     })?
                     .into_inner();
+                let response_bytes = resp.encoded_len();
+                metrics::record_call(
+                    &self.config.url,
+                    request_bytes,
+                    response_bytes,
+                    requests.len(),
+                );
 
                 eprintln!(
                     "[call_batch/grpc] n={} block_on={:.1}ms",
@@ -346,6 +366,7 @@ impl Shard {
                 // Binary HTTP fallback (application/x-larql-expert).
                 let url = format!("{}/v1/expert/batch", self.config.url);
                 let body = encode_expert_request(requests);
+                let request_bytes = body.len();
                 let resp = client
                     .post(&url)
                     .header("Content-Type", EXPERT_BINARY_CONTENT_TYPE)
@@ -367,6 +388,7 @@ impl Shard {
                 let bytes = resp
                     .bytes()
                     .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                metrics::record_call(&self.config.url, request_bytes, bytes.len(), requests.len());
                 decode_expert_response(&bytes)
                     .ok_or_else(|| RemoteMoeError::BadResponse("binary response truncated".into()))
             }
@@ -374,8 +396,15 @@ impl Shard {
                 // Same wire body as the HTTP path; UDS framing is identical
                 // to TCP HTTP/1.1 — only the transport differs.
                 let body = encode_expert_request(requests);
+                let request_bytes = body.len();
                 let resp_bytes =
                     uds_call(uds, "/v1/expert/batch", EXPERT_BINARY_CONTENT_TYPE, &body)?;
+                metrics::record_call(
+                    &self.config.url,
+                    request_bytes,
+                    resp_bytes.len(),
+                    requests.len(),
+                );
                 decode_expert_response(&resp_bytes).ok_or_else(|| {
                     RemoteMoeError::BadResponse("UDS expert/batch response truncated".into())
                 })
@@ -462,6 +491,7 @@ impl Shard {
                 } else {
                     encode_layer_batch_request(layer, residual, expert_ids, expert_weights)
                 };
+                let request_bytes = body.len();
                 let t_encode = t_encode_in.elapsed();
 
                 let t_send_in = std::time::Instant::now();
@@ -489,6 +519,12 @@ impl Shard {
                     .bytes()
                     .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
                 let t_recv = t_recv_in.elapsed();
+                metrics::record_call(
+                    &self.config.url,
+                    request_bytes,
+                    bytes.len(),
+                    expert_ids.len(),
+                );
 
                 let t_decode_in = std::time::Instant::now();
                 let out = if use_f16 {
@@ -547,11 +583,18 @@ impl Shard {
                 } else {
                     encode_layer_batch_request(layer, residual, expert_ids, expert_weights)
                 };
+                let request_bytes = body.len();
                 let t_encode = t_encode_in.elapsed();
 
                 let t_send_in = std::time::Instant::now();
                 let resp_bytes = uds_call(uds, path, ct, &body)?;
                 let t_send = t_send_in.elapsed();
+                metrics::record_call(
+                    &self.config.url,
+                    request_bytes,
+                    resp_bytes.len(),
+                    expert_ids.len(),
+                );
 
                 let t_decode_in = std::time::Instant::now();
                 let out = if use_f16 {
@@ -589,6 +632,8 @@ impl Shard {
         tasks: &[MultiLayerTask],
     ) -> Result<Vec<MultiLayerResult>, RemoteMoeError> {
         let body = encode_multi_layer_request(tasks);
+        let request_bytes = body.len();
+        let active_experts: usize = tasks.iter().map(|t| t.expert_ids.len()).sum();
         match &self.transport {
             ShardTransport::Http(client) => {
                 let url = format!("{}/v1/experts/multi-layer-batch", self.config.url);
@@ -611,6 +656,7 @@ impl Shard {
                 let bytes = resp
                     .bytes()
                     .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                metrics::record_call(&self.config.url, request_bytes, bytes.len(), active_experts);
                 decode_multi_layer_response(&bytes).ok_or_else(|| {
                     RemoteMoeError::BadResponse("multi-layer-batch response truncated".into())
                 })
@@ -622,6 +668,12 @@ impl Shard {
                     MULTI_LAYER_BATCH_CONTENT_TYPE,
                     &body,
                 )?;
+                metrics::record_call(
+                    &self.config.url,
+                    request_bytes,
+                    resp_bytes.len(),
+                    active_experts,
+                );
                 decode_multi_layer_response(&resp_bytes).ok_or_else(|| {
                     RemoteMoeError::BadResponse("UDS multi-layer-batch response truncated".into())
                 })
@@ -640,6 +692,8 @@ impl Shard {
         tasks: &[MultiLayerTaskQ8K],
     ) -> Result<Vec<MultiLayerResult>, RemoteMoeError> {
         let body = encode_multi_layer_request_q8k(tasks);
+        let request_bytes = body.len();
+        let active_experts: usize = tasks.iter().map(|t| t.expert_ids.len()).sum();
         match &self.transport {
             ShardTransport::Http(client) => {
                 let url = format!("{}/v1/experts/multi-layer-batch-q8k", self.config.url);
@@ -662,6 +716,7 @@ impl Shard {
                 let bytes = resp
                     .bytes()
                     .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
+                metrics::record_call(&self.config.url, request_bytes, bytes.len(), active_experts);
                 decode_multi_layer_response(&bytes).ok_or_else(|| {
                     RemoteMoeError::BadResponse("multi-layer-batch-q8k response truncated".into())
                 })
@@ -673,6 +728,12 @@ impl Shard {
                     MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
                     &body,
                 )?;
+                metrics::record_call(
+                    &self.config.url,
+                    request_bytes,
+                    resp_bytes.len(),
+                    active_experts,
+                );
                 decode_multi_layer_response(&resp_bytes).ok_or_else(|| {
                     RemoteMoeError::BadResponse(
                         "UDS multi-layer-batch-q8k response truncated".into(),

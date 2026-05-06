@@ -59,6 +59,8 @@ const TOKENIZER_MODEL: &str = "model";
 const TOKENIZER_VOCAB: &str = "vocab";
 
 const GGUF_OUTPUT_WEIGHT: &str = "output.weight";
+const DEFAULT_GGUF_VOCAB_SIZE: usize = 262_144;
+const GEMMA4_GGUF_HEAD_DIM: u32 = 256;
 
 const GGUF_TO_HF_KEY_REPLACEMENTS: &[(&str, &str)] = &[
     ("blk.", "layers."),
@@ -368,17 +370,28 @@ impl GgufFile {
             other => other,
         };
 
-        // Gemma 4's attention.key_length reports a different dimension than
-        // per-head dim; override with hidden_size / num_heads (standard formula)
         let hidden_size = get_arch_u32(GGUF_EMBEDDING_LENGTH);
         let num_heads = get_arch_u32(GGUF_ATTENTION_HEAD_COUNT);
+        let num_kv_heads = get_arch_u32(GGUF_ATTENTION_HEAD_COUNT_KV);
         let head_dim = if arch == "gemma4" && num_heads > 0 {
-            // Gemma 4: Q matrix rows = num_heads × head_dim where head_dim = hidden/num_heads × scale
-            // For gemma-4-e2b: 1536 / 8 = 192, but actual is 256. Use 2×(hidden/heads) as heuristic.
-            // Better: derive from known value 2048 Q rows / 8 heads = 256
-            256
+            // Gemma 4 GGUF metadata reports the global key length; known
+            // exports use 256 for the per-head dimension that the runtime
+            // architecture needs as its base layer head_dim.
+            GEMMA4_GGUF_HEAD_DIM
         } else {
-            get_arch_u32(GGUF_ATTENTION_KEY_LENGTH)
+            let key_length = get_arch_u32(GGUF_ATTENTION_KEY_LENGTH);
+            if key_length > 0 {
+                key_length
+            } else if num_heads > 0 {
+                hidden_size / num_heads
+            } else {
+                0
+            }
+        };
+        let num_kv_heads = if num_kv_heads > 0 {
+            num_kv_heads
+        } else {
+            num_heads
         };
 
         let mut config = serde_json::json!({
@@ -387,14 +400,14 @@ impl GgufFile {
             HF_NUM_HIDDEN_LAYERS: get_arch_u32(GGUF_BLOCK_COUNT),
             HF_INTERMEDIATE_SIZE: get_arch_u32(GGUF_FEED_FORWARD_LENGTH),
             HF_NUM_ATTENTION_HEADS: num_heads,
-            HF_NUM_KEY_VALUE_HEADS: get_arch_u32(GGUF_ATTENTION_HEAD_COUNT_KV),
+            HF_NUM_KEY_VALUE_HEADS: num_kv_heads,
             HF_HEAD_DIM: head_dim,
         });
 
         if let Some(rope_base) = get_arch_f64(GGUF_ROPE_FREQ_BASE) {
             config[HF_ROPE_THETA] = serde_json::json!(rope_base);
         }
-        if let Some(vocab_size) = get_arch_u32_opt(GGUF_VOCAB_SIZE) {
+        if let Some(vocab_size) = get_arch_u32_opt(GGUF_VOCAB_SIZE).filter(|&v| v > 0) {
             config[HF_VOCAB_SIZE] = serde_json::json!(vocab_size);
         }
 
@@ -452,14 +465,11 @@ pub(crate) fn load_gguf_filtered_with_validation(
         .get(embed_key)
         .ok_or_else(|| ModelError::MissingTensor(embed_key.into()))?
         .clone();
-    // GGUF stores embeddings as [hidden_size, vocab_size] but we need [vocab_size, hidden_size]
-    let embed = if embed_raw.shape()[0] < embed_raw.shape()[1] {
-        let mut out = ndarray::Array2::<f32>::zeros((embed_raw.shape()[1], embed_raw.shape()[0]));
-        out.assign(&embed_raw.t());
-        out.into_shared()
-    } else {
-        embed_raw
-    };
+    let cfg = arch.config();
+    let tokenizer_vocab_size = read_tokenizer_vocab_size(path);
+    let configured_vocab_size = cfg.vocab_size.filter(|&v| v > 0);
+    let expected_vocab_size = configured_vocab_size.or(tokenizer_vocab_size);
+    let embed = orient_embedding(embed_raw, cfg.hidden_size, expected_vocab_size);
 
     let lm_head = normalized_tensors
         .get("lm_head.weight")
@@ -467,23 +477,12 @@ pub(crate) fn load_gguf_filtered_with_validation(
         .cloned()
         .unwrap_or_else(|| embed.clone());
 
-    let cfg = arch.config();
-    // Gemma3 GGUF does not store vocab_size in arch metadata.
-    // Read it from tokenizer.json sitting next to the GGUF file.
-    let vocab_size = cfg.vocab_size.filter(|&v| v > 2560).unwrap_or_else(|| {
-        // Try to read vocab size from tokenizer.json
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let tok_path = parent.join(TOKENIZER_JSON);
-            if let Ok(data) = std::fs::read_to_string(&tok_path) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if let Some(v) = json[TOKENIZER_MODEL][TOKENIZER_VOCAB].as_object() {
-                        return v.len();
-                    }
-                }
-            }
-        }
-        262144 // Gemma3 default
-    });
+    // Prefer explicit metadata, then tokenizer.json, then the loaded embedding
+    // shape. The final constant is only for malformed files with an empty
+    // embedding; normal GGUFs should resolve from one of the first three.
+    let vocab_size = expected_vocab_size
+        .or_else(|| (embed.shape()[0] > 0).then_some(embed.shape()[0]))
+        .unwrap_or(DEFAULT_GGUF_VOCAB_SIZE);
 
     Ok(ModelWeights {
         tensors: normalized_tensors,
@@ -504,6 +503,38 @@ pub(crate) fn load_gguf_filtered_with_validation(
         rope_base: cfg.rope_base,
         arch,
     })
+}
+
+fn read_tokenizer_vocab_size(path: &Path) -> Option<usize> {
+    let parent = path.parent()?;
+    let tok_path = parent.join(TOKENIZER_JSON);
+    let data = std::fs::read_to_string(tok_path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&data).ok()?;
+    json[TOKENIZER_MODEL][TOKENIZER_VOCAB]
+        .as_object()
+        .map(|v| v.len())
+        .filter(|&v| v > 0)
+}
+
+fn orient_embedding(
+    embed: crate::WeightArray,
+    hidden_size: usize,
+    vocab_size: Option<usize>,
+) -> crate::WeightArray {
+    let shape = embed.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+
+    if cols == hidden_size || vocab_size.is_some_and(|vocab| rows == vocab) {
+        return embed;
+    }
+    if rows == hidden_size || vocab_size.is_some_and(|vocab| cols == vocab) {
+        let mut out = ndarray::Array2::<f32>::zeros((cols, rows));
+        out.assign(&embed.t());
+        return out.into_shared();
+    }
+
+    embed
 }
 
 // ═══════════════════════════════════════════════════════════════

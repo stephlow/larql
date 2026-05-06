@@ -28,7 +28,11 @@ struct PosFeatures {
 }
 
 fn extract_features(capture: &PromptCapture, pos: usize, head_idx: usize) -> PosFeatures {
-    let attn_row = capture.attention_rows.get(pos).map(Vec::as_slice).unwrap_or(&[]);
+    let attn_row = capture
+        .attention_rows
+        .get(pos)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let attn_argmax = attention_argmax(attn_row, pos);
     let _ = head_idx; // attention_rows are already for the target head
     PosFeatures {
@@ -66,9 +70,15 @@ fn eq_bool(field: &str, val: bool) -> Predicate {
     Predicate::Eq(vec![json!(field), json!(val)])
 }
 
-fn attends_bos_pred() -> Predicate   { eq_bool(fields::ATTENDS_BOS, true) }
-fn attends_prev_pred() -> Predicate  { eq_bool(fields::ATTENDS_PREV, true) }
-fn natural_prose_pred() -> Predicate { eq_stratum(strata::NATURAL_PROSE) }
+fn attends_bos_pred() -> Predicate {
+    eq_bool(fields::ATTENDS_BOS, true)
+}
+fn attends_prev_pred() -> Predicate {
+    eq_bool(fields::ATTENDS_PREV, true)
+}
+fn natural_prose_pred() -> Predicate {
+    eq_stratum(strata::NATURAL_PROSE)
+}
 
 fn attends_bos_or_prev() -> Predicate {
     Predicate::Or(vec![attends_bos_pred(), attends_prev_pred()])
@@ -84,13 +94,23 @@ fn evaluate_candidate(
     safe_features: &[PosFeatures],
 ) -> (f64, f64) {
     // coverage: fraction of fragile positions where predicate fires (we WANT these preserved)
-    let coverage = if fragile_features.is_empty() { 0.0 } else {
-        fragile_features.iter().filter(|f| predicate_fires(pred, f)).count() as f64
+    let coverage = if fragile_features.is_empty() {
+        0.0
+    } else {
+        fragile_features
+            .iter()
+            .filter(|f| predicate_fires(pred, f))
+            .count() as f64
             / fragile_features.len() as f64
     };
     // false_positive: fraction of safe positions where predicate fires (we DON'T want those preserved)
-    let fp = if safe_features.is_empty() { 0.0 } else {
-        safe_features.iter().filter(|f| predicate_fires(pred, f)).count() as f64
+    let fp = if safe_features.is_empty() {
+        0.0
+    } else {
+        safe_features
+            .iter()
+            .filter(|f| predicate_fires(pred, f))
+            .count() as f64
             / safe_features.len() as f64
     };
     (coverage, fp)
@@ -104,7 +124,13 @@ fn make_candidate(
 ) -> GuardCandidate {
     let complexity = pred.complexity();
     let (cov, fp) = evaluate_candidate(&pred, fragile, safe);
-    GuardCandidate { predicate: pred, complexity, fragile_coverage: cov, safe_false_positive: fp, label: label.to_string() }
+    GuardCandidate {
+        predicate: pred,
+        complexity,
+        fragile_coverage: cov,
+        safe_false_positive: fp,
+        label: label.to_string(),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -144,37 +170,68 @@ pub fn synthesize_guard(
     for capture in &fit.captures {
         for (pos, codes) in capture.oracle_codes.iter().enumerate() {
             let orig = codes[target_group];
-            if !merged_codes.contains(&orig) { continue; }
+            if !merged_codes.contains(&orig) {
+                continue;
+            }
             // Skip the fragile positions themselves.
-            let is_fragile = capture.id == localize.worst_prompt_id
-                && localize.fragile_positions.contains(&pos);
-            if is_fragile { continue; }
+            let is_fragile =
+                capture.id == localize.worst_prompt_id && localize.fragile_positions.contains(&pos);
+            if is_fragile {
+                continue;
+            }
             safe_features.push(extract_features(capture, pos, fit.head.head));
         }
     }
 
     eprintln!(
         "  guard synthesis: {} fragile features, {} safe features",
-        fragile_features.len(), safe_features.len()
+        fragile_features.len(),
+        safe_features.len()
     );
 
     // Generate candidates, depth 1 then depth 2.
     let mut candidates: Vec<GuardCandidate> = vec![
-        make_candidate(natural_prose_pred(), "natural_prose", &fragile_features, &safe_features),
-        make_candidate(attends_bos_pred(), "attends_bos", &fragile_features, &safe_features),
-        make_candidate(attends_prev_pred(), "attends_prev", &fragile_features, &safe_features),
-        make_candidate(attends_bos_or_prev(), "attends_bos_or_prev", &fragile_features, &safe_features),
+        make_candidate(
+            natural_prose_pred(),
+            "natural_prose",
+            &fragile_features,
+            &safe_features,
+        ),
+        make_candidate(
+            attends_bos_pred(),
+            "attends_bos",
+            &fragile_features,
+            &safe_features,
+        ),
+        make_candidate(
+            attends_prev_pred(),
+            "attends_prev",
+            &fragile_features,
+            &safe_features,
+        ),
+        make_candidate(
+            attends_bos_or_prev(),
+            "attends_bos_or_prev",
+            &fragile_features,
+            &safe_features,
+        ),
         make_candidate(
             Predicate::And(vec![natural_prose_pred(), attends_bos_pred()]),
-            "natural_prose&&attends_bos", &fragile_features, &safe_features,
+            "natural_prose&&attends_bos",
+            &fragile_features,
+            &safe_features,
         ),
         make_candidate(
             Predicate::And(vec![natural_prose_pred(), attends_prev_pred()]),
-            "natural_prose&&attends_prev", &fragile_features, &safe_features,
+            "natural_prose&&attends_prev",
+            &fragile_features,
+            &safe_features,
         ),
         make_candidate(
             Predicate::And(vec![natural_prose_pred(), attends_bos_or_prev()]),
-            "natural_prose&&(attends_bos||attends_prev)", &fragile_features, &safe_features,
+            "natural_prose&&(attends_bos||attends_prev)",
+            &fragile_features,
+            &safe_features,
         ),
     ];
 
@@ -187,8 +244,14 @@ pub fn synthesize_guard(
 
     // Select: highest coverage, then lowest false-positive, then lowest complexity.
     candidates.sort_by(|a, b| {
-        b.fragile_coverage.partial_cmp(&a.fragile_coverage).unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.safe_false_positive.partial_cmp(&b.safe_false_positive).unwrap_or(std::cmp::Ordering::Equal))
+        b.fragile_coverage
+            .partial_cmp(&a.fragile_coverage)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.safe_false_positive
+                    .partial_cmp(&b.safe_false_positive)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then(a.complexity.cmp(&b.complexity))
     });
 

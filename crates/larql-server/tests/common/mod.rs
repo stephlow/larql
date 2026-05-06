@@ -139,8 +139,12 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
         expert_filter: None,
         unit_filter: None,
+        moe_remote: None,
     })
 }
 
@@ -169,8 +173,12 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
         expert_filter: None,
         unit_filter: None,
+        moe_remote: None,
     })
 }
 
@@ -238,8 +246,12 @@ impl ModelBuilder {
             weights: std::sync::OnceLock::new(),
             probe_labels: self.probe_labels,
             ffn_l2_cache: FfnL2Cache::new(1),
+            layer_latency_tracker: std::sync::Arc::new(
+                larql_server::metrics::LayerLatencyTracker::new(),
+            ),
             expert_filter: None,
             unit_filter: None,
+            moe_remote: None,
         })
     }
 }

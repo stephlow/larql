@@ -10,8 +10,10 @@ use std::time::Duration;
 use ndarray::Array2;
 
 use super::codec::{
-    decode_binary_batch, decode_binary_single, encode_binary_request, extract_response_latency_ms,
-    RemoteLatencyStats, WalkFfnSingleResponse, BINARY_CT,
+    decode_binary_batch, decode_binary_batch_f16, decode_binary_batch_i8, decode_binary_single,
+    decode_binary_single_f16, decode_binary_single_i8, encode_binary_request,
+    extract_response_latency_ms, RemoteLatencyStats, WalkFfnSingleResponse, BINARY_CT, F16_CT,
+    I8_CT,
 };
 use super::q8k_wire::{decode_q8k_batch_response, encode_q8k_batch_request, Q8K_BATCH_CT};
 use crate::ffn::FfnBackend;
@@ -118,10 +120,14 @@ impl RemoteWalkBackend {
         let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
         let body = encode_binary_request(Some(layer), None, residual_flat, seq_len, true, 8092);
 
+        // Advertise both f16 and i8 (server picks best it supports).
+        // Accept priority: i8 (smallest) > f16 (half) > f32 (fallback).
+        let accept = format!("{I8_CT}, {F16_CT}, {BINARY_CT}");
         let resp = self
             .client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, BINARY_CT)
+            .header(reqwest::header::ACCEPT, accept)
             .body(body)
             .send()
             .map_err(|e| RemoteFfnError::Http {
@@ -146,7 +152,15 @@ impl RemoteWalkBackend {
             .bytes()
             .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
 
-        let output = if ct.starts_with(BINARY_CT) {
+        let output = if ct.starts_with(I8_CT) {
+            let (_, floats) = decode_binary_single_i8(&resp_bytes, self.hidden_size)
+                .map_err(RemoteFfnError::BadResponse)?;
+            floats
+        } else if ct.starts_with(F16_CT) {
+            let (_, floats) =
+                decode_binary_single_f16(&resp_bytes).map_err(RemoteFfnError::BadResponse)?;
+            floats
+        } else if ct.starts_with(BINARY_CT) {
             let (_, floats) =
                 decode_binary_single(&resp_bytes).map_err(RemoteFfnError::BadResponse)?;
             floats
@@ -182,10 +196,12 @@ impl RemoteWalkBackend {
         let url = format!("{}{WALK_FFN_PATH}", self.config.base_url);
         let body = encode_binary_request(None, Some(layers), residual_flat, seq_len, true, 8092);
 
+        let accept = format!("{I8_CT}, {F16_CT}, {BINARY_CT}");
         let resp = self
             .client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, BINARY_CT)
+            .header(reqwest::header::ACCEPT, accept)
             .body(body)
             .send()
             .map_err(|e| RemoteFfnError::Http {
@@ -210,7 +226,12 @@ impl RemoteWalkBackend {
             .bytes()
             .map_err(|e| RemoteFfnError::BadResponse(e.to_string()))?;
 
-        if ct.starts_with(BINARY_CT) {
+        if ct.starts_with(I8_CT) {
+            decode_binary_batch_i8(&resp_bytes, self.hidden_size)
+                .map_err(RemoteFfnError::BadResponse)
+        } else if ct.starts_with(F16_CT) {
+            decode_binary_batch_f16(&resp_bytes).map_err(RemoteFfnError::BadResponse)
+        } else if ct.starts_with(BINARY_CT) {
             decode_binary_batch(&resp_bytes).map_err(RemoteFfnError::BadResponse)
         } else {
             // Fallback: JSON batch response.

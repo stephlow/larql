@@ -5,6 +5,7 @@ use rayon::prelude::*;
 
 use super::config::ShardConfig;
 use super::error::RemoteMoeError;
+use super::metrics;
 use super::multi_layer_wire::{MultiLayerResult, MultiLayerTask, MultiLayerTaskQ8K};
 use super::router::{rms_norm, MoeRouterWeights};
 use super::shard::{Shard, ShardTransport};
@@ -127,6 +128,13 @@ impl RemoteMoeBackend {
             .filter(|(_, ids, _)| !ids.is_empty())
             .map(|(si, ids, ws)| (*si, ids, ws))
             .collect();
+        if metrics::enabled() {
+            for (si, ids, _) in &shard_calls {
+                if ids.is_empty() {
+                    metrics::record_skip(&shards[*si].config.url);
+                }
+            }
+        }
 
         let results_per_shard: Vec<Result<Vec<f32>, RemoteMoeError>> = non_empty
             .par_iter()
@@ -340,7 +348,7 @@ impl RemoteMoeBackend {
         if hidden == 0 || router.num_experts == 0 || router.top_k == 0 || streams.is_empty() {
             return Ok(InflightMoe {
                 hidden,
-                n_streams: 0,
+                active_stream_indices: Vec::new(),
                 post_experts_norm: Vec::new(),
                 norm_offset,
                 eps,
@@ -361,6 +369,7 @@ impl RemoteMoeBackend {
         // 3. Distribute expert_ids/weights across shards.
         let shards_guard = self.shards.read().unwrap();
         let num_shards = shards_guard.len();
+        let shard_urls: Vec<String> = shards_guard.iter().map(|s| s.config.url.clone()).collect();
         let mut shard_eids: Vec<Vec<u32>> = vec![Vec::new(); num_shards];
         let mut shard_ewts: Vec<Vec<f32>> = vec![Vec::new(); num_shards];
         for (&eid, &w) in expert_indices.iter().zip(expert_weights.iter()) {
@@ -372,6 +381,33 @@ impl RemoteMoeBackend {
             shard_ewts[si].push(w);
         }
         drop(shards_guard);
+        let active_stream_indices: Vec<usize> = shard_eids
+            .iter()
+            .enumerate()
+            .filter_map(|(si, ids)| (!ids.is_empty()).then_some(si))
+            .collect();
+        if metrics::enabled() {
+            for (si, url) in shard_urls.iter().enumerate() {
+                if shard_eids[si].is_empty() {
+                    metrics::record_skip(url);
+                }
+            }
+        }
+        if active_stream_indices.is_empty() {
+            return Ok(InflightMoe {
+                hidden,
+                active_stream_indices,
+                post_experts_norm: router.post_experts_norm.to_vec(),
+                norm_offset,
+                eps,
+            });
+        }
+        if active_stream_indices.iter().any(|&si| si >= streams.len()) {
+            return Err(RemoteMoeError::BadResponse(format!(
+                "stream map has {} streams for {num_shards} shards",
+                streams.len()
+            )));
+        }
 
         // 4. Fire one input per stream in parallel.
         //
@@ -387,22 +423,24 @@ impl RemoteMoeBackend {
         //
         // Single-shard fast path skips the rayon overhead — same shape as
         // the parallel-collect path.
-        if streams.len() == 1 {
+        if active_stream_indices.len() == 1 {
+            let si = active_stream_indices[0];
             let input = larql_router_protocol::ExpertLayerInput {
                 layer: layer as u32,
-                expert_ids: shard_eids[0].clone(),
-                expert_weights: shard_ewts[0].clone(),
+                expert_ids: shard_eids[si].clone(),
+                expert_weights: shard_ewts[si].clone(),
                 residual: residual_bytes.clone(),
                 post_experts_norm: post_norm_bytes.clone(),
                 norm_offset,
                 eps,
             };
-            streams[0].fire(input)?;
+            streams[si].fire(input)?;
         } else {
             let residual_ref: &[u8] = &residual_bytes;
             let post_norm_ref: &[u8] = &post_norm_bytes;
-            streams.par_iter().enumerate().try_for_each(
-                |(si, stream)| -> Result<(), RemoteMoeError> {
+            active_stream_indices
+                .par_iter()
+                .try_for_each(|&si| -> Result<(), RemoteMoeError> {
                     let input = larql_router_protocol::ExpertLayerInput {
                         layer: layer as u32,
                         expert_ids: shard_eids[si].clone(),
@@ -412,14 +450,13 @@ impl RemoteMoeBackend {
                         norm_offset,
                         eps,
                     };
-                    stream.fire(input)
-                },
-            )?;
+                    streams[si].fire(input)
+                })?;
         }
 
         Ok(InflightMoe {
             hidden,
-            n_streams: streams.len(),
+            active_stream_indices,
             post_experts_norm: router.post_experts_norm.to_vec(),
             norm_offset,
             eps,
@@ -454,11 +491,12 @@ impl RemoteMoeBackend {
     ) -> Result<(Vec<f32>, Vec<(f32, f32)>), RemoteMoeError> {
         let InflightMoe {
             hidden,
-            n_streams,
+            active_stream_indices,
             post_experts_norm,
             norm_offset,
             eps,
         } = inflight;
+        let n_streams = active_stream_indices.len();
 
         if hidden == 0 || n_streams == 0 {
             return Ok((vec![0.0f32; hidden], Vec::new()));
@@ -476,15 +514,19 @@ impl RemoteMoeBackend {
         // colocated bench where parallel and sequential are equivalent anyway.
         type CollectResult = (f32, Result<(Vec<f32>, f32), RemoteMoeError>);
         let results: Vec<CollectResult> = if n_streams == 1 {
+            let si = active_stream_indices[0];
             let t0 = std::time::Instant::now();
-            let res = streams[0].collect_with_timing();
+            let res = streams[si].collect_with_timing();
             let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
             vec![(wall_ms, res)]
         } else {
             std::thread::scope(|s| {
                 let handles: Vec<_> = streams
                     .iter()
-                    .take(n_streams)
+                    .enumerate()
+                    .filter_map(|(si, stream)| {
+                        active_stream_indices.contains(&si).then_some(stream)
+                    })
                     .map(|stream| {
                         s.spawn(move || -> CollectResult {
                             let t0 = std::time::Instant::now();
@@ -651,7 +693,14 @@ impl RemoteMoeBackend {
                         per_shard
                             .par_iter()
                             .enumerate()
-                            .filter(|(_, t)| !t.is_empty())
+                            .filter(|(si, t)| {
+                                if t.is_empty() {
+                                    metrics::record_skip(&shards_guard[*si].config.url);
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
                             .map(|(si, t)| (si, shards_guard[si].call_multi_layer_batch_q8k(t)))
                             .collect()
                     } else {
@@ -668,7 +717,14 @@ impl RemoteMoeBackend {
                         per_shard
                             .par_iter()
                             .enumerate()
-                            .filter(|(_, t)| !t.is_empty())
+                            .filter(|(si, t)| {
+                                if t.is_empty() {
+                                    metrics::record_skip(&shards_guard[*si].config.url);
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
                             .map(|(si, t)| (si, shards_guard[si].call_multi_layer_batch(t)))
                             .collect()
                     };

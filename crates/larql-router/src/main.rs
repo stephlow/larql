@@ -17,7 +17,7 @@
 //! is supported for JSON only; binary multi-shard requests are rejected with
 //! HTTP 400 (use the batched JSON format or route per-shard manually).
 
-mod grid;
+use larql_router::grid;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
