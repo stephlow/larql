@@ -354,10 +354,19 @@ fn run_larql(
             .map_err(|e| format!("tokenize: {e}"))?;
 
     let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        let b = larql_compute::metal::MetalBackend::new().ok_or(
-            "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
-        )?;
-        Box::new(b)
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let b = larql_compute::metal::MetalBackend::new().ok_or(
+                "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
+            )?;
+            Box::new(b)
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            return Err(
+                "Metal backend requires the `metal` feature on macOS".into(),
+            );
+        }
     } else {
         Box::new(larql_compute::CpuBackend)
     };
@@ -587,7 +596,7 @@ fn run_engine_q4k(
     backend: Box<dyn larql_inference::ComputeBackend>,
     args: &BenchArgs,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    use larql_inference::forward::hidden_to_raw_logits;
+    
 
     // We need two backend instances: one owned by the engine, one for Q4K calls.
     let want_metal_q4k = args.backends.contains("metal");
@@ -714,7 +723,7 @@ fn run_remote_ffn_bench(
     let backend = larql_compute::default_backend();
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
+    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
         .map_err(|e| format!("failed to load client weights: {e}"))?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
         .map_err(|e| format!("failed to load tokenizer: {e}"))?;

@@ -20,8 +20,9 @@ use larql_compute::cpu::ops::moe::{cpu_moe_forward, run_single_expert_with_norm}
 use larql_compute::cpu::ops::q4_common::dequantize_q4_k;
 use larql_compute::{Activation, MoeLayerWeights, QuantFormat};
 use larql_models::weights::{per_layer_ffn_key, PER_LAYER_FFN_DOWN, PER_LAYER_FFN_GATE_UP};
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_vindex::{load_model_weights_q4k, load_vindex_config, SilentLoadCallbacks};
-
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::commands::primary::cache;
 
 // ── Component / backend taxonomies ────────────────────────────────────────────
@@ -91,6 +92,16 @@ pub struct ParityArgs {
     pub verbose: bool,
 }
 
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub fn run(_args: ParityArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "`larql parity` requires the `metal` feature on macOS — Metal is the reference \
+         backend this command compares CPU output against."
+            .into(),
+    )
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn run(args: ParityArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !COMPONENTS.contains(&args.component.as_str()) {
         return Err(format!(
@@ -528,6 +539,7 @@ fn run_moe_block(
 // the full sequence). This is sufficient to locate the first diverging layer
 // but not to compute precise numeric agreement.
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_layer_diff(
     path: &std::path::Path,
     config: &larql_vindex::VindexConfig,
