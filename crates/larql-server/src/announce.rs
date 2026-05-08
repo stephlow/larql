@@ -25,6 +25,8 @@ use tracing::{error, info, warn};
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// Maximum time to wait for in-flight requests to drain before sending DroppingMsg (GT6).
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -47,6 +49,8 @@ pub struct AnnounceConfig {
     pub vindex_hash: String,
     /// Per-layer latency tracker — populates HeartbeatMsg.layer_stats.
     pub latency_tracker: Arc<LayerLatencyTracker>,
+    /// Active request counter — used for drain (GT6) and heartbeat.requests_in_flight.
+    pub requests_in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
 
 // ── Mode B config ──────────────────────────────────────────────────────────────
@@ -155,12 +159,16 @@ fn announce_message(cfg: &AnnounceConfig) -> ServerMessage {
     }
 }
 
-fn heartbeat_message(tracker: &LayerLatencyTracker) -> ServerMessage {
+fn heartbeat_message(
+    tracker: &LayerLatencyTracker,
+    requests_in_flight: &std::sync::atomic::AtomicU32,
+) -> ServerMessage {
+    use std::sync::atomic::Ordering;
     ServerMessage {
         payload: Some(ServerPayload::Heartbeat(HeartbeatMsg {
             cpu_pct: 0.0,
             ram_used: 0,
-            requests_in_flight: 0,
+            requests_in_flight: requests_in_flight.load(Ordering::Relaxed),
             layer_stats: tracker.snapshot(),
         })),
     }
@@ -174,6 +182,29 @@ fn dropping_message(model_id: String, layer_start: u32, layer_end: u32) -> Serve
             layer_end,
             reason: "reassigned".into(),
         })),
+    }
+}
+
+/// Wait until `counter` reaches zero or `timeout` expires.
+/// Polls every 100 ms. Used by GT6 drain to ensure no requests are
+/// mid-flight before sending DroppingMsg.
+async fn drain_requests(counter: &std::sync::atomic::AtomicU32, timeout: Duration) {
+    use std::sync::atomic::Ordering;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        if counter.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                "drain timeout ({:.0}s) elapsed with {} requests still in flight",
+                timeout.as_secs_f64(),
+                counter.load(Ordering::Relaxed)
+            );
+            return;
+        }
+        interval.tick().await;
     }
 }
 
@@ -207,11 +238,12 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
     // Spawn the heartbeat sender.
     let tx_hb = tx.clone();
     let tracker = cfg.latency_tracker.clone();
+    let rif = cfg.requests_in_flight.clone();
     let hb_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
-            if tx_hb.send(heartbeat_message(&tracker)).await.is_err() {
+            if tx_hb.send(heartbeat_message(&tracker, &rif)).await.is_err() {
                 break;
             }
         }
@@ -246,8 +278,11 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
                         model_id = %u.model_id,
                         layers = %format!("{}-{}", u.layer_start, u.layer_end),
                         reason = %u.reason,
-                        "Router unassigned shard"
+                        "Router unassigned shard — draining in-flight requests…"
                     );
+                    // GT6 drain: wait up to DRAIN_TIMEOUT for active requests
+                    // to finish before sending DroppingMsg.
+                    drain_requests(&cfg.requests_in_flight, DRAIN_TIMEOUT).await;
                     // Send dropping notice then let the stream close.
                     let _ = tx
                         .send(dropping_message(
@@ -394,6 +429,7 @@ mod tests {
             grid_key: Some("secret".into()),
             vindex_hash: "abc123".into(),
             latency_tracker: Arc::new(LayerLatencyTracker::new()),
+            requests_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -433,7 +469,8 @@ mod tests {
     #[test]
     fn heartbeat_message_uses_zeroed_metrics() {
         let tracker = LayerLatencyTracker::new();
-        let msg = heartbeat_message(&tracker);
+        let rif = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let msg = heartbeat_message(&tracker, &rif);
         let Some(ServerPayload::Heartbeat(heartbeat)) = msg.payload else {
             panic!("expected heartbeat payload");
         };
@@ -448,7 +485,8 @@ mod tests {
         let tracker = LayerLatencyTracker::new();
         tracker.record(5, 3.0);
         tracker.record(5, 5.0);
-        let msg = heartbeat_message(&tracker);
+        let rif = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let msg = heartbeat_message(&tracker, &rif);
         let Some(ServerPayload::Heartbeat(hb)) = msg.payload else {
             panic!("expected heartbeat");
         };

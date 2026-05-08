@@ -29,7 +29,7 @@
 //! `boundary_fragile` so callers can collect telemetry for Track A.
 //! Set `calibration_mode = false` only after Exp 44 ships fitted thresholds.
 
-use crate::frame::{BoundaryContract, FallbackPolicy};
+use crate::frame::{BoundaryAgreement, BoundaryContract, FallbackPolicy};
 use crate::metadata::BoundaryMetadata;
 
 /// Configuration for the per-boundary gate.
@@ -38,13 +38,26 @@ use crate::metadata::BoundaryMetadata;
 /// ships fitted values. Do not treat the defaults as authoritative.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BoundaryGateConfig {
-    /// Primary gate threshold in raw logit units.
+    /// Primary gate threshold in **log-probability margin units**.
     ///
-    /// Track A calibrates in log-prob units; convert before storing here.
-    /// **UNCALIBRATED default: 1.0 logit units.**
-    pub min_logit_margin: f32,
+    /// Compare against `BoundaryMetadata::raw_log_prob_margin`, which is
+    /// `log_softmax[top1] - log_softmax[top2]`. Do NOT use a raw-logit value
+    /// here — raw logit scales vary across positions and are not comparable.
+    ///
+    /// Calibrated by Exp 44 Track A: **2.16** for Gemma 3 4B (Frankenstein corpus,
+    /// 396 boundary positions, 90 continuation tests, 20 tokens each).
+    /// At 2.16: accept=68.9%, early-div=4.8%, total-div=19.8%, system=1.69×.
+    ///
+    /// **UNCALIBRATED default: 1.0** — safe but conservative. Set to 2.16 once
+    /// `calibration_mode = false` to use the fitted value.
+    pub min_log_prob_margin: f32,
 
     /// Secondary floor on the raw top-1 softmax probability.
+    ///
+    /// Used alongside `min_log_prob_margin`: a boundary with high margin but low
+    /// top-1 probability (flat distribution with a slight leader) is more fragile
+    /// than the margin alone suggests.
+    ///
     /// **UNCALIBRATED default: 0.5.**
     pub min_top1_prob: f32,
 
@@ -64,8 +77,8 @@ pub struct BoundaryGateConfig {
 impl Default for BoundaryGateConfig {
     fn default() -> Self {
         Self {
-            min_logit_margin: 1.0, // UNCALIBRATED
-            min_top1_prob: 0.5,    // UNCALIBRATED
+            min_log_prob_margin: 1.0, // conservative pre-calibration placeholder
+            min_top1_prob: 0.5,       // UNCALIBRATED
             require_compressed_agreement: true,
             fallback_policy: FallbackPolicy::Bf16Boundary,
             calibration_mode: true, // conservative default
@@ -119,7 +132,11 @@ pub fn apply(metadata: &mut BoundaryMetadata, config: &BoundaryGateConfig) -> Bo
 }
 
 fn is_fragile(meta: &BoundaryMetadata, config: &BoundaryGateConfig) -> bool {
-    meta.raw_logit_margin < config.min_logit_margin || meta.raw_top1_prob < config.min_top1_prob
+    // Compare log-prob margin against the log-prob threshold.
+    // Using raw_logit_margin here would be wrong — logit scales are not
+    // comparable across positions.
+    meta.raw_log_prob_margin < config.min_log_prob_margin
+        || meta.raw_top1_prob < config.min_top1_prob
 }
 
 fn to_fallback(config: &BoundaryGateConfig) -> BoundaryDecision {
@@ -181,7 +198,7 @@ mod tests {
     #[test]
     fn low_margin_is_boundary_fragile() {
         let mut config = live();
-        config.min_logit_margin = 2.0;
+        config.min_log_prob_margin = 2.0;
         let mut m = meta(0.5, 0.9, BoundaryAgreement::Agrees);
         let decision = apply(&mut m, &config);
         assert!(m.boundary_fragile, "expected boundary_fragile = true");

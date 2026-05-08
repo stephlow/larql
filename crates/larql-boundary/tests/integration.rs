@@ -80,7 +80,7 @@ fn gate_compresses_confident_boundary() {
     let mut meta = compute(&logits, Some(&logits));
     let config = BoundaryGateConfig {
         calibration_mode: false,
-        min_logit_margin: 1.0,
+        min_log_prob_margin: 1.0,
         min_top1_prob: 0.5,
         ..Default::default()
     };
@@ -189,7 +189,7 @@ fn full_pipeline_encode_metadata_gate() {
     // Phase 3: gate
     let config = BoundaryGateConfig {
         calibration_mode: false,
-        min_logit_margin: 1.0,
+        min_log_prob_margin: 1.0,
         min_top1_prob: 0.3,
         ..Default::default()
     };

@@ -3,7 +3,7 @@
 //! Compact, string-interned format optimized for fast loading of runtime graphs.
 //!
 //! Layout:
-//!   Header (40 bytes)
+//!   Header (32 bytes)
 //!   Edge records (28 bytes each, fixed-width)
 //!   Metadata section (variable-length JSON per edge)
 //!   String table (length-prefixed UTF-8 strings)
@@ -20,6 +20,13 @@ const MAGIC: [u8; 4] = *b"LARQ";
 const FORMAT_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 32;
 const EDGE_RECORD_SIZE: usize = 28;
+const INJECTION_BLOB_SIZE: usize = 8;
+const SOURCE_UNKNOWN: u8 = 0;
+const SOURCE_PARAMETRIC: u8 = 1;
+const SOURCE_DOCUMENT: u8 = 2;
+const SOURCE_INSTALLED: u8 = 3;
+const SOURCE_WIKIDATA: u8 = 4;
+const SOURCE_MANUAL: u8 = 5;
 
 // ── String table ──
 
@@ -97,23 +104,26 @@ impl StringTable {
 
 fn source_to_u8(s: &SourceType) -> u8 {
     match s {
-        SourceType::Unknown => 0,
-        SourceType::Parametric => 1,
-        SourceType::Document => 2,
-        SourceType::Installed => 3,
-        SourceType::Wikidata => 4,
-        SourceType::Manual => 5,
+        SourceType::Unknown => SOURCE_UNKNOWN,
+        SourceType::Parametric => SOURCE_PARAMETRIC,
+        SourceType::Document => SOURCE_DOCUMENT,
+        SourceType::Installed => SOURCE_INSTALLED,
+        SourceType::Wikidata => SOURCE_WIKIDATA,
+        SourceType::Manual => SOURCE_MANUAL,
     }
 }
 
-fn u8_to_source(v: u8) -> SourceType {
+fn u8_to_source(v: u8) -> Result<SourceType, GraphError> {
     match v {
-        1 => SourceType::Parametric,
-        2 => SourceType::Document,
-        3 => SourceType::Installed,
-        4 => SourceType::Wikidata,
-        5 => SourceType::Manual,
-        _ => SourceType::Unknown,
+        SOURCE_UNKNOWN => Ok(SourceType::Unknown),
+        SOURCE_PARAMETRIC => Ok(SourceType::Parametric),
+        SOURCE_DOCUMENT => Ok(SourceType::Document),
+        SOURCE_INSTALLED => Ok(SourceType::Installed),
+        SOURCE_WIKIDATA => Ok(SourceType::Wikidata),
+        SOURCE_MANUAL => Ok(SourceType::Manual),
+        _ => Err(GraphError::Deserialize(format!(
+            "invalid source tag in packed edge record: {v}"
+        ))),
     }
 }
 
@@ -193,7 +203,7 @@ pub fn to_packed_bytes(graph: &Graph) -> Result<Vec<u8>, GraphError> {
                 let layer = u32::try_from(layer).map_err(|_| {
                     GraphError::Deserialize(format!("injection layer {layer} exceeds u32 range"))
                 })?;
-                let mut buf = Vec::with_capacity(12);
+                let mut buf = Vec::with_capacity(INJECTION_BLOB_SIZE);
                 buf.extend_from_slice(&layer.to_le_bytes());
                 buf.extend_from_slice(&(score as f32).to_le_bytes());
                 Ok(buf)
@@ -357,7 +367,7 @@ pub fn from_packed_bytes(bytes: &[u8]) -> Result<Graph, GraphError> {
         let rel_idx = u32::from_le_bytes(rec[4..8].try_into().unwrap());
         let obj_idx = u32::from_le_bytes(rec[8..12].try_into().unwrap());
         let conf = f32::from_le_bytes(rec[12..16].try_into().unwrap());
-        let source = u8_to_source(rec[16]);
+        let source = u8_to_source(rec[16])?;
         let has_meta = rec[17] != 0;
         let has_inj = rec[18] != 0;
         let meta_offset = u32::from_le_bytes(rec[20..24].try_into().unwrap()) as usize;
@@ -386,8 +396,18 @@ pub fn from_packed_bytes(bytes: &[u8]) -> Result<Graph, GraphError> {
             .with_confidence(conf as f64)
             .with_source(source);
 
-        // Decode metadata + injection from blob
-        if meta_len > 0 {
+        if !has_meta && !has_inj {
+            if meta_len != 0 {
+                return Err(GraphError::Deserialize(format!(
+                    "metadata length set without metadata flags at edge index {i}"
+                )));
+            }
+        } else {
+            if meta_len == 0 {
+                return Err(GraphError::Deserialize(format!(
+                    "metadata flags set without payload at edge index {i}"
+                )));
+            }
             let meta_end = meta_offset.checked_add(meta_len).ok_or_else(|| {
                 GraphError::Deserialize(format!("metadata range overflow at edge index {i}"))
             })?;
@@ -399,31 +419,43 @@ pub fn from_packed_bytes(bytes: &[u8]) -> Result<Graph, GraphError> {
             }
             let blob = &meta_section[meta_offset..meta_offset + meta_len];
 
-            if has_meta && has_inj && blob.len() >= 8 {
-                // Last 8 bytes are injection (u32 layer + f32 score)
-                let meta_json_end = blob.len() - 8;
-                if let Ok(meta) = serde_json::from_slice::<HashMap<String, serde_json::Value>>(
-                    &blob[..meta_json_end],
-                ) {
-                    edge.metadata = Some(meta);
+            let (metadata_blob, injection_blob) = if has_inj {
+                if blob.len() < INJECTION_BLOB_SIZE {
+                    return Err(GraphError::Deserialize(format!(
+                        "injection payload is too short at edge index {i}: {} bytes",
+                        blob.len()
+                    )));
                 }
+                let metadata_end = blob.len() - INJECTION_BLOB_SIZE;
+                (&blob[..metadata_end], Some(&blob[metadata_end..]))
+            } else {
+                (blob, None)
+            };
+
+            if has_meta {
+                if metadata_blob.is_empty() {
+                    return Err(GraphError::Deserialize(format!(
+                        "metadata flag set with empty metadata JSON at edge index {i}"
+                    )));
+                }
+                edge.metadata = Some(
+                    serde_json::from_slice::<HashMap<String, serde_json::Value>>(metadata_blob)
+                        .map_err(|e| {
+                            GraphError::Deserialize(format!(
+                                "invalid metadata JSON at edge index {i}: {e}"
+                            ))
+                        })?,
+                );
+            } else if !metadata_blob.is_empty() {
+                return Err(GraphError::Deserialize(format!(
+                    "metadata bytes present without metadata flag at edge index {i}"
+                )));
+            }
+
+            if let Some(injection_blob) = injection_blob {
                 let inj_layer =
-                    u32::from_le_bytes(blob[meta_json_end..meta_json_end + 4].try_into().unwrap())
-                        as usize;
-                let inj_score = f32::from_le_bytes(
-                    blob[meta_json_end + 4..meta_json_end + 8]
-                        .try_into()
-                        .unwrap(),
-                ) as f64;
-                edge.injection = Some((inj_layer, inj_score));
-            } else if has_meta {
-                if let Ok(meta) = serde_json::from_slice::<HashMap<String, serde_json::Value>>(blob)
-                {
-                    edge.metadata = Some(meta);
-                }
-            } else if has_inj && blob.len() >= 8 {
-                let inj_layer = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
-                let inj_score = f32::from_le_bytes(blob[4..8].try_into().unwrap()) as f64;
+                    u32::from_le_bytes(injection_blob[0..4].try_into().unwrap()) as usize;
+                let inj_score = f32::from_le_bytes(injection_blob[4..8].try_into().unwrap()) as f64;
                 edge.injection = Some((inj_layer, inj_score));
             }
         }
@@ -646,6 +678,41 @@ mod tests {
         let mut bytes = to_packed_bytes(&graph).unwrap();
         let bad_len = u32::MAX.to_le_bytes();
         bytes[56..60].copy_from_slice(&bad_len);
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_source_tag_returns_error() {
+        let mut graph = Graph::new();
+        graph.add_edge(Edge::new("A", "rel", "B"));
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        bytes[48] = u8::MAX;
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_metadata_json_returns_error() {
+        let mut graph = Graph::new();
+        graph.add_edge(Edge::new("A", "rel", "B").with_metadata("key", serde_json::json!("v")));
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        bytes[60] = b'!';
+
+        let result = from_packed_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_short_injection_payload_returns_error() {
+        let mut graph = Graph::new();
+        let mut edge = Edge::new("A", "rel", "B");
+        edge.injection = Some((1, 0.5));
+        graph.add_edge(edge);
+        let mut bytes = to_packed_bytes(&graph).unwrap();
+        bytes[56..60].copy_from_slice(&4u32.to_le_bytes());
 
         let result = from_packed_bytes(&bytes);
         assert!(result.is_err());

@@ -17,6 +17,7 @@ use crate::format::filenames::*;
 use crate::index::FeatureMeta;
 
 const MAGIC: u32 = 0x444D4554; // "DMET"
+const LEGACY_LITERAL_MAGIC: u32 = 0x54454D44; // bytes written as b"DMET"
 const FORMAT_VERSION: u32 = 1;
 
 /// Write down_meta in binary format.
@@ -98,7 +99,7 @@ pub fn read_binary(
 
     // Header
     let magic = read_u32(&mut r)?;
-    if magic != MAGIC {
+    if magic != MAGIC && magic != LEGACY_LITERAL_MAGIC {
         return Err(VindexError::Parse(format!(
             "invalid down_meta.bin magic: expected 0x{MAGIC:08X}, got 0x{magic:08X}"
         )));
@@ -190,16 +191,24 @@ pub fn mmap_binary(
 
     // Read header
     let magic = u32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
-    if magic != MAGIC {
+    if magic != MAGIC && magic != LEGACY_LITERAL_MAGIC {
         return Err(VindexError::Parse(format!(
             "invalid down_meta.bin magic: 0x{magic:08X}"
         )));
     }
-    let _version = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]);
+    let version = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]);
+    if version != FORMAT_VERSION {
+        return Err(VindexError::Parse(format!(
+            "unsupported down_meta.bin version: {version}"
+        )));
+    }
     let num_layers = u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
     let top_k_count = u32::from_le_bytes([mmap[12], mmap[13], mmap[14], mmap[15]]) as usize;
 
-    let record_size = 8 + top_k_count * 8; // top_token_id(4) + c_score(4) + top_k*(tid(4)+logit(4))
+    let record_size = top_k_count
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(|| VindexError::Parse("down_meta.bin record size overflow".into()))?;
 
     // Build offset table by scanning per-layer num_features headers
     let mut layer_offsets = Vec::with_capacity(num_layers);
@@ -208,14 +217,28 @@ pub fn mmap_binary(
 
     for _ in 0..num_layers {
         if pos + 4 > mmap.len() {
-            break;
+            return Err(VindexError::Parse(
+                "truncated down_meta.bin layer header".into(),
+            ));
         }
         let nf =
             u32::from_le_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]) as usize;
         pos += 4; // skip num_features u32
         layer_offsets.push(pos); // records start here
         layer_num_features.push(nf);
-        pos += nf * record_size; // skip all records
+        let layer_bytes = nf
+            .checked_mul(record_size)
+            .ok_or_else(|| VindexError::Parse("down_meta.bin layer size overflow".into()))?;
+        let layer_end = pos
+            .checked_add(layer_bytes)
+            .ok_or_else(|| VindexError::Parse("down_meta.bin layer end overflow".into()))?;
+        if layer_end > mmap.len() {
+            return Err(VindexError::Parse(format!(
+                "truncated down_meta.bin records for layer {}",
+                layer_offsets.len() - 1
+            )));
+        }
+        pos = layer_end; // skip all records
     }
 
     Ok(crate::index::core::DownMetaMmap {

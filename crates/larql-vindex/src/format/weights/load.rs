@@ -326,6 +326,24 @@ pub fn load_model_weights_with_opts(
         }
     }
 
+    if config.extract_level.writes_ffn() && !opts.skip_ffn && !arch.is_moe() {
+        let mut missing = Vec::new();
+        for layer in 0..config.num_layers {
+            for key in [arch.ffn_up_key(layer), arch.ffn_down_key(layer)] {
+                if !tensors.contains_key(&key) {
+                    missing.push(key);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let sample = missing.into_iter().take(4).collect::<Vec<_>>().join(", ");
+            return Err(VindexError::Parse(format!(
+                "vindex is missing dense FFN tensors ({sample}); compact FFN vindexes are \
+                 supported by sparse WalkFfn paths, not load_model_weights/MEMIT"
+            )));
+        }
+    }
+
     // lm_head from lm_head_q4.bin (dequantise to f32) when the quantised
     // variant is present — the forward path expects an f32 lm_head for the
     // final logits projection. Falls through to embed-tied derivation below

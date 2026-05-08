@@ -117,19 +117,7 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
     let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
     let tokenizer = load_vindex_tokenizer(&args.index)?;
 
-    // Optionally initialize a Metal backend for GPU-accelerated evaluation.
-    let metal_backend: Option<Box<dyn larql_compute::ComputeBackend + Send + Sync>> =
-        if args.metal {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            {
-                match larql_compute::metal::MetalBackend::new() {
-                    Some(b) => { eprintln!("Metal backend: active"); Some(Box::new(b)) }
-                    None => { eprintln!("Metal backend: unavailable"); None }
-                }
-            }
-            #[cfg(not(all(feature = "metal", target_os = "macos")))]
-            { eprintln!("Metal backend: not compiled in"); None }
-        } else { None };
+    let metal_backend = super::metal_backend::init(args.metal);
 
     let mut all_records = load_prompts(&args.prompts, None)?;
     if args.max_per_stratum > 0 {
@@ -349,42 +337,36 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
             })
             .collect();
 
-        // Pass 5: program-mapped Mode D injection (Metal or CPU).
-        let program_h = if let Some(ref backend) = metal_backend {
-            // Metal: build flat replacement_delta, run GPU pass.
-            let mut delta_flat =
-                Vec::with_capacity(token_ids.len() * weights.hidden_size);
-            for (pos, codes) in remapped_codes.iter().enumerate() {
-                let d = mode_d_table.delta_for_position_codes_with_stratum(
-                    pos, codes, stratum,
-                );
-                delta_flat.extend_from_slice(&d);
+        // Pass 5: program-mapped Mode D injection — Metal if available, CPU fallback.
+        // Track which path ran so the report is self-describing.
+        let delta_flat = build_replacement_delta(
+            mode_d_table, &remapped_codes, stratum, weights.hidden_size,
+        );
+        let replacement_delta =
+            ndarray::Array2::from_shape_vec((token_ids.len(), weights.hidden_size), delta_flat)
+                .map_err(|e| format!("delta shape: {e}"))?;
+        let (program_h, used_metal) = if let Some(ref b) = metal_backend {
+            if let Some(h) = super::metal_backend::try_metal(
+                &weights, &token_ids, &index, head.layer, head.head, &replacement_delta, b,
+            ) {
+                (h, true)
+            } else {
+                let h = forward_q4k_predicted_address_mode_d_head(
+                    &mut weights, &token_ids, &index, head, mode_d_table, &remapped_codes, stratum,
+                )?;
+                (h, false)
             }
-            let replacement_delta =
-                ndarray::Array2::from_shape_vec((token_ids.len(), weights.hidden_size), delta_flat)
-                    .map_err(|e| format!("delta shape: {e}"))?;
-            larql_inference::vindex::predict_q4k_metal_with_replaced_head_residual_delta(
-                &weights,
-                &token_ids,
-                &index,
-                backend.as_ref(),
-                head.layer,
-                head.head,
-                &replacement_delta,
-            )
-            .ok_or_else(|| Box::<dyn std::error::Error>::from("Metal head replacement returned None"))?
         } else {
-            // CPU fallback.
-            forward_q4k_predicted_address_mode_d_head(
-                &mut weights,
-                &token_ids,
-                &index,
-                head,
-                mode_d_table,
-                &remapped_codes,
-                stratum,
-            )?
+            let h = forward_q4k_predicted_address_mode_d_head(
+                &mut weights, &token_ids, &index, head, mode_d_table, &remapped_codes, stratum,
+            )?;
+            (h, false)
         };
+        // Log once on the first prompt which backend was actually used.
+        if idx == 0 {
+            actual_intervention_backend = if used_metal { "metal" } else { "cpu_fallback" };
+            eprintln!("intervention_backend: {actual_intervention_backend}");
+        }
         let program_logits = final_logits(&weights, &program_h);
         let program_logp = log_softmax(&program_logits);
         let program_top1 = argmax(&program_logits);
@@ -587,4 +569,18 @@ fn print_summary(
     if let Some(detail) = metric_parity_failures {
         eprintln!("metric parity FAIL:\n{detail}");
     }
+}
+
+fn build_replacement_delta(
+    mode_d_table: &super::pq::ModeDTable,
+    remapped_codes: &[Vec<usize>],
+    stratum: &str,
+    hidden_size: usize,
+) -> Vec<f32> {
+    let mut delta = Vec::with_capacity(remapped_codes.len() * hidden_size);
+    for (pos, codes) in remapped_codes.iter().enumerate() {
+        let d = mode_d_table.delta_for_position_codes_with_stratum(pos, codes, stratum);
+        delta.extend_from_slice(&d);
+    }
+    delta
 }

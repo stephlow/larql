@@ -63,40 +63,28 @@ pub fn evaluate_program_fast(
             })
             .collect();
 
-        // Build the replacement_delta from the remapped Mode D codes.
-        let mut delta_flat: Vec<f32> =
-            Vec::with_capacity(capture.token_ids.len() * weights.hidden_size);
-        for (pos, codes) in remapped.iter().enumerate() {
-            let delta = fit.mode_d_table.delta_for_position_codes_with_stratum(
-                pos, codes, &capture.stratum,
-            );
-            delta_flat.extend_from_slice(&delta);
-        }
-        let replacement_delta =
-            Array2::from_shape_vec((capture.token_ids.len(), weights.hidden_size), delta_flat)
-                .map_err(|e| format!("replacement delta shape error: {e}"))?;
-
-        // Try Metal path first; fall back to CPU if Metal is not available.
-        let program_h: Array2<f32> = if let Some(ref backend) = fit.metal {
-            larql_inference::vindex::predict_q4k_metal_with_replaced_head_residual_delta(
-                weights,
-                &capture.token_ids,
-                index,
-                backend.as_ref(),
-                fit.head.layer,
-                fit.head.head,
-                &replacement_delta,
-            )
-            .ok_or("Metal head replacement returned None")?
+        let replacement_delta = {
+            let flat: Vec<f32> = (0..remapped.len()).flat_map(|pos| {
+                fit.mode_d_table
+                    .delta_for_position_codes_with_stratum(pos, &remapped[pos], &capture.stratum)
+            }).collect();
+            Array2::from_shape_vec((capture.token_ids.len(), weights.hidden_size), flat)
+                .map_err(|e| format!("delta shape: {e}"))?
+        };
+        let program_h = if let Some(ref b) = fit.metal {
+            if let Some(h) = super::super::metal_backend::try_metal(
+                weights, &capture.token_ids, index,
+                fit.head.layer, fit.head.head, &replacement_delta, b,
+            ) { h } else {
+                forward_q4k_predicted_address_mode_d_head(
+                    weights, &capture.token_ids, index, fit.head,
+                    &fit.mode_d_table, &remapped, &capture.stratum,
+                )?
+            }
         } else {
             forward_q4k_predicted_address_mode_d_head(
-                weights,
-                &capture.token_ids,
-                index,
-                fit.head,
-                &fit.mode_d_table,
-                &remapped,
-                &capture.stratum,
+                weights, &capture.token_ids, index, fit.head,
+                &fit.mode_d_table, &remapped, &capture.stratum,
             )?
         };
         let program_logits = final_logits(weights, &program_h);

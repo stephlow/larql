@@ -18,6 +18,7 @@
 //! HTTP 400 (use the batched JSON format or route per-shard manually).
 
 use larql_router::grid;
+use larql_router::rebalancer;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -84,6 +85,17 @@ struct Cli {
     /// If not set, the grid port is open to any server (development only).
     #[arg(long, env = "LARQL_GRID_KEY")]
     grid_key: Option<String>,
+
+    /// GT6: seconds between rebalancer checks (default: 30).
+    /// Set to 0 to disable dynamic rebalancing.
+    #[arg(long, default_value = "30")]
+    rebalance_interval: u64,
+
+    /// GT6: latency ratio threshold to trigger rebalancing (default: 2.0).
+    /// The slowest replica must be this many times slower than the fastest
+    /// for the same layer before the rebalancer acts.
+    #[arg(long, default_value = "2.0")]
+    rebalance_threshold: f32,
 }
 
 // ── Static shard map ───────────────────────────────────────────────────────────
@@ -555,6 +567,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tracing::error!("gRPC server error: {e}");
             }
         });
+
+        // GT6: spawn dynamic rebalancer (disabled when interval == 0).
+        if cli.rebalance_interval > 0 {
+            let rebalance_cfg = rebalancer::RebalancerConfig::from_cli(
+                cli.rebalance_interval,
+                cli.rebalance_threshold,
+            );
+            info!(
+                interval_s = cli.rebalance_interval,
+                threshold = cli.rebalance_threshold,
+                "Rebalancer: enabled"
+            );
+            rebalancer::spawn(state.clone(), rebalance_cfg);
+        }
     }
 
     let state = Arc::new(AppState {

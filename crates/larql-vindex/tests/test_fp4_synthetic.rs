@@ -130,17 +130,11 @@ fn build_minimal_vindex() -> (
     let tok_json =
         r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
-    // down_meta.bin header: magic "DMET" + version + num_layers + top_k, no feature records.
-    let mut down_meta = Vec::<u8>::new();
-    down_meta.extend_from_slice(b"DMET");
-    down_meta.extend_from_slice(&1u32.to_le_bytes()); // version
-    down_meta.extend_from_slice(&(per_layer_features.len() as u32).to_le_bytes());
-    down_meta.extend_from_slice(&1u32.to_le_bytes()); // top_k
-                                                      // Per-layer num_features counts.
-    for &n in &per_layer_features {
-        down_meta.extend_from_slice(&(n as u32).to_le_bytes());
-    }
-    std::fs::write(dir.join("down_meta.bin"), down_meta).unwrap();
+    let down_meta: Vec<Option<Vec<Option<larql_vindex::FeatureMeta>>>> = per_layer_features
+        .iter()
+        .map(|&n| Some(vec![None; n]))
+        .collect();
+    larql_vindex::down_meta::write_binary(&dir, &down_meta, 1).unwrap();
 
     // A zeroed embeddings.bin so any opportunistic embed reader doesn't
     // trip on a missing file. Size = vocab × hidden × 4.

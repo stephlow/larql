@@ -98,6 +98,19 @@ use serde::Deserialize;
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
+/// RAII guard that decrements the requests_in_flight counter on drop (GT6 drain).
+struct RifGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
+impl Drop for RifGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Saturating sub to avoid wrapping if something incremented 0 and dropped twice.
+        let prev = self.0.fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+        let _ = prev;
+    }
+}
+
 pub(crate) const BINARY_CT: &str = "application/x-larql-ffn";
 pub(crate) const BATCH_MARKER: u32 = 0xFFFF_FFFF;
 
@@ -797,6 +810,13 @@ pub async fn handle_walk_ffn(
     request: axum::extract::Request,
 ) -> Result<Response, ServerError> {
     state.bump_requests();
+
+    // Track active requests for GT6 drain.
+    let _rif_guard = state.models.first().map(|m| {
+        use std::sync::atomic::Ordering;
+        m.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        RifGuard(m.requests_in_flight.clone())
+    });
 
     let headers = request.headers();
     let is_binary = crate::wire::has_content_type(headers, BINARY_CT);

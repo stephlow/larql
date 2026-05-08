@@ -54,7 +54,7 @@ fn main() {
     let knowledge_layers = filter_graph(
         &graph,
         &FilterConfig {
-            min_layer: Some(20),
+            metadata: vec![MetadataPredicate::u64_min("layer", 20)],
             ..Default::default()
         },
     );
@@ -67,7 +67,7 @@ fn main() {
     let selective = filter_graph(
         &graph,
         &FilterConfig {
-            min_selectivity: Some(0.5),
+            metadata: vec![MetadataPredicate::f64_min("selectivity", 0.5)],
             ..Default::default()
         },
     );
@@ -111,8 +111,10 @@ fn main() {
         &graph,
         &FilterConfig {
             min_confidence: Some(0.8),
-            min_layer: Some(20),
-            min_selectivity: Some(0.7),
+            metadata: vec![
+                MetadataPredicate::u64_min("layer", 20),
+                MetadataPredicate::f64_min("selectivity", 0.7),
+            ],
             ..Default::default()
         },
     );

@@ -12,9 +12,8 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    AckMsg, AnnounceMsg, Gap, GridService, LayerLatency, ModelCoverage, RejectMsg, RouterMessage,
-    RouterPayload, ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest,
-    StatusResponse,
+    AckMsg, AnnounceMsg, Gap, GridService, LayerLatency, ModelCoverage, RouterMessage, RouterPayload,
+    ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest, StatusResponse,
 };
 
 // ── Per-server record ─────────────────────────────────────────────────────────
@@ -60,6 +59,10 @@ pub struct GridState {
     /// Mode B: servers that advertised capacity and are waiting for assignment.
     /// Key = server_id.
     available_servers: HashMap<String, AvailableEntry>,
+    /// Sender channels for currently-serving (Mode A) servers.
+    /// Used by the rebalancer to push UnassignMsg without holding a lock.
+    /// Key = server_id.
+    serving_senders: HashMap<String, mpsc::Sender<Result<RouterMessage, tonic::Status>>>,
 }
 
 impl GridState {
@@ -76,7 +79,19 @@ impl GridState {
         self.log_coverage();
     }
 
+    /// Register a server and store its sender for rebalancer-initiated UnassignMsg.
+    pub fn register_with_sender(
+        &mut self,
+        entry: ServerEntry,
+        sender: mpsc::Sender<Result<RouterMessage, tonic::Status>>,
+    ) {
+        self.serving_senders
+            .insert(entry.server_id.clone(), sender);
+        self.register(entry);
+    }
+
     pub fn deregister(&mut self, server_id: &str) {
+        self.serving_senders.remove(server_id);
         if let Some(entry) = self.servers.remove(server_id) {
             tracing::info!(
                 server_id = %server_id,
@@ -197,6 +212,24 @@ impl GridState {
                 "Grid coverage updated"
             );
         }
+    }
+
+    /// Accessor for all serving servers (for the rebalancer).
+    pub fn servers(&self) -> impl Iterator<Item = (&String, &ServerEntry)> {
+        self.servers.iter()
+    }
+
+    /// Returns true if there is at least one available server in the Mode B pool.
+    pub fn has_available_servers(&self) -> bool {
+        !self.available_servers.is_empty()
+    }
+
+    /// Get the sender channel for a serving server by ID (for UnassignMsg delivery).
+    pub fn serving_sender(
+        &self,
+        server_id: &str,
+    ) -> Option<mpsc::Sender<Result<RouterMessage, tonic::Status>>> {
+        self.serving_senders.get(server_id).cloned()
     }
 
     /// Register a Mode B available server. Returns the server_id.
@@ -504,7 +537,10 @@ impl GridService for GridServiceImpl {
                                 last_seen: Instant::now(),
                                 layer_latencies: HashMap::new(),
                             };
-                            state.write().await.register(entry);
+                            state
+                                .write()
+                                .await
+                                .register_with_sender(entry, tx.clone());
                             registered_model = Some((model_id, layer_start, layer_end));
 
                             let ack = RouterMessage {
@@ -587,7 +623,10 @@ impl GridService for GridServiceImpl {
                                 last_seen: std::time::Instant::now(),
                                 layer_latencies: HashMap::new(),
                             };
-                            state.write().await.register(entry);
+                            state
+                                .write()
+                                .await
+                                .register_with_sender(entry, tx.clone());
                             registered_model =
                                 Some((r.model_id.clone(), r.layer_start, r.layer_end));
                             is_available = false;
@@ -813,5 +852,43 @@ mod tests {
         assert_eq!(server.layer_stats.len(), 1);
         assert_eq!(server.layer_stats[0].layer, 0);
         assert!((server.layer_stats[0].avg_ms - 2.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn register_available_and_deregister() {
+        let mut state = GridState::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        state.register_available(
+            "avail-1".into(),
+            tx,
+            16 * 1024 * 1024 * 1024,
+            100 * 1024 * 1024 * 1024,
+            "/mnt/shards".into(),
+        );
+        assert!(state.available_servers.contains_key("avail-1"));
+        state.deregister_available("avail-1");
+        assert!(!state.available_servers.contains_key("avail-1"));
+    }
+
+    #[test]
+    fn coverage_gaps_finds_uncovered_range() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 1));
+        state.register(entry("b", "http://b", "model-a", 3, 4));
+
+        let gaps = state.coverage_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0], ("model-a".to_string(), 2, 2));
+    }
+
+    #[test]
+    fn coverage_gaps_empty_when_fully_covered() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 2));
+        state.register(entry("b", "http://b", "model-a", 3, 5));
+
+        // Only gap-between-shards; shards are contiguous here.
+        let gaps = state.coverage_gaps();
+        assert!(gaps.is_empty());
     }
 }

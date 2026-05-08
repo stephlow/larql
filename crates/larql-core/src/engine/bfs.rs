@@ -12,6 +12,9 @@ pub const DEFAULT_MAX_DEPTH: u32 = 3;
 pub const DEFAULT_MAX_ENTITIES: usize = 1000;
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.3;
 pub const DEFAULT_MAX_CHAIN_TOKENS: usize = 5;
+pub const DEFAULT_EDGE_SOURCE: SourceType = SourceType::Parametric;
+pub const DEFAULT_MAX_ENTITY_WORDS: usize = 4;
+pub const DEFAULT_SKIPPED_ENTITY_PREFIXES: &[&str] = &["the ", "a "];
 pub const METADATA_FORWARD_PASSES: &str = "forward_passes";
 pub const METADATA_MODEL: &str = "model";
 
@@ -21,6 +24,7 @@ pub struct BfsConfig {
     pub max_entities: usize,
     pub min_confidence: f64,
     pub max_chain_tokens: usize,
+    pub edge_source: SourceType,
     pub should_follow_entity: fn(&str) -> bool,
 }
 
@@ -31,6 +35,7 @@ impl Default for BfsConfig {
             max_entities: DEFAULT_MAX_ENTITIES,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             max_chain_tokens: DEFAULT_MAX_CHAIN_TOKENS,
+            edge_source: DEFAULT_EDGE_SOURCE,
             should_follow_entity: default_should_follow_entity,
         }
     }
@@ -107,7 +112,7 @@ pub fn extract_bfs(
             if !result.answer.is_empty() && result.avg_probability() >= config.min_confidence {
                 let edge = Edge::new(&entity, &template.relation, &result.answer)
                     .with_confidence(result.avg_probability())
-                    .with_source(SourceType::Parametric)
+                    .with_source(config.edge_source.clone())
                     .with_metadata(
                         METADATA_FORWARD_PASSES,
                         serde_json::Value::from(result.num_passes as u64),
@@ -170,12 +175,15 @@ pub fn default_should_follow_entity(text: &str) -> bool {
 
     // Skip articles
     let lower = clean.to_lowercase();
-    if lower.starts_with("the ") || lower.starts_with("a ") {
+    if DEFAULT_SKIPPED_ENTITY_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
         return false;
     }
 
     // Skip long phrases
-    if clean.split_whitespace().count() > 4 {
+    if clean.split_whitespace().count() > DEFAULT_MAX_ENTITY_WORDS {
         return false;
     }
 

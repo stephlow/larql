@@ -100,117 +100,22 @@ pub fn predict_q4k_metal(
     crate::forward::predict::logits_to_predictions_pub(weights, &h_last, tokenizer, top_k, 1.0)
 }
 
-/// Metal-accelerated version of `predict_q4k_hidden_with_replaced_head_residual_delta`.
+
+/// Metal-accelerated head-replacement forward pass.
 ///
-/// Uses `full_pipeline_q4_with_head_replacement` to run the full forward pass on
-/// Metal GPU while injecting `replacement_delta` for `target_head` at `target_layer`.
-/// This replaces the head's W_O contribution in the residual stream with the provided
-/// delta — the Mode D injection operation for AHORD program evaluation.
-///
-/// On Apple Silicon with unified memory, the CPU reads/writes to shared Metal buffers
-/// are zero-copy; each pass adds two command-buffer commit+wait points at the
-/// intervention layer.
-///
-/// Returns `None` if the Metal backend does not support the replacement path
-/// (the caller should fall back to the CPU implementation in that case).
+/// TODO: Currently returns `None` (CPU fallback) because `full_pipeline_q4`
+/// uses within-kernel RoPE only correct for seq_len=1. For multi-position
+/// inference (seq_len > 1, the AHORD use case) RoPE must be applied per-position
+/// before attention as in `prefill_q4`. Once a sequential `decode_token` loop
+/// with a per-layer intervention hook is implemented, this will be the fast path.
 pub fn predict_q4k_metal_with_replaced_head_residual_delta(
-    weights: &ModelWeights,
-    token_ids: &[u32],
-    index: &VectorIndex,
-    backend: &dyn larql_compute::ComputeBackend,
-    target_layer: usize,
-    target_head: usize,
-    replacement_delta: &Array2<f32>,
+    _weights: &ModelWeights,
+    _token_ids: &[u32],
+    _index: &VectorIndex,
+    _backend: &dyn larql_compute::ComputeBackend,
+    _target_layer: usize,
+    _target_head: usize,
+    _replacement_delta: &Array2<f32>,
 ) -> Option<Array2<f32>> {
-    use crate::layer_graph::pipeline_layer::{
-        attention_geometry_for_pipeline_layer, build_arch_params, resolve_attn_weights,
-    };
-    use larql_compute::QuantFormat;
-
-    let arch = &*weights.arch;
-    let num_layers = weights.num_layers;
-    let hidden = weights.hidden_size;
-    let embed_scale = arch.embed_scale();
-    let seq_len = token_ids.len();
-    if seq_len == 0 {
-        return None;
-    }
-
-    let layers: Vec<_> = (0..num_layers)
-        .map(|layer| {
-            let (wq, wk, wv, wo) =
-                resolve_attn_weights(index, layer).expect("attn Q4K slices missing");
-            let [(gate_bytes, gate_fmt), (up_bytes, up_fmt), (down_bytes, down_fmt)] = index
-                .interleaved_q4k_layer_data(layer)
-                .expect("ffn Q4K slices missing");
-            fn to_fmt(s: &str) -> QuantFormat {
-                match s {
-                    "Q4_K" => QuantFormat::Q4_K,
-                    "Q6_K" => QuantFormat::Q6_K,
-                    o => panic!("unknown quant format {o:?}"),
-                }
-            }
-            build_arch_params(
-                weights,
-                layer,
-                wq,
-                wk,
-                wv,
-                wo,
-                larql_compute::QuantWeight {
-                    data: gate_bytes,
-                    scales: None,
-                    format: to_fmt(gate_fmt),
-                },
-                larql_compute::QuantWeight {
-                    data: up_bytes,
-                    scales: None,
-                    format: to_fmt(up_fmt),
-                },
-                larql_compute::QuantWeight {
-                    data: down_bytes,
-                    scales: None,
-                    format: to_fmt(down_fmt),
-                },
-            )
-        })
-        .collect();
-
-    let attention = attention_geometry_for_pipeline_layer(&layers[0]);
-
-    // Build input: all token embeddings concatenated [seq_len × hidden].
-    let mut x_all: Vec<f32> = Vec::with_capacity(seq_len * hidden);
-    for &tok in token_ids {
-        let row = weights.embed.row(tok as usize);
-        x_all.extend(row.iter().map(|v| v * embed_scale));
-    }
-
-    // Build the flat replacement_delta [seq_len × hidden].
-    let delta_flat: Vec<f32> = replacement_delta.as_slice()?.to_vec();
-
-    // Determine head geometry at the target layer.
-    let layer_num_q_heads = layers[target_layer].num_q_heads;
-    let layer_head_dim = layers[target_layer].head_dim;
-
-    let result = backend.full_pipeline_q4_with_head_replacement(
-        &layers,
-        &x_all,
-        hidden,
-        weights.intermediate_size,
-        attention.q_dim,
-        attention.kv_dim,
-        seq_len,
-        attention.num_q_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
-        attention.rope_base,
-        arch.attn_q_norm_key(0).is_some(),
-        arch.attn_logit_softcapping().unwrap_or(0.0),
-        target_layer,
-        target_head,
-        &delta_flat,
-    )?;
-
-    // result is [seq_len × hidden] flat.
-    Array2::from_shape_vec((seq_len, hidden), result).ok()
+    None
 }

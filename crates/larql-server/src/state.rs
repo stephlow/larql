@@ -73,6 +73,10 @@ pub struct LoadedModel {
     /// Per-layer latency tracker — records compute time per walk-ffn layer.
     /// Snapshots are sent to the router in HeartbeatMsg.layer_stats (GT3).
     pub layer_latency_tracker: std::sync::Arc<crate::metrics::LayerLatencyTracker>,
+    /// Active walk-ffn request counter — incremented on request entry,
+    /// decremented on return. Used by GT6 drain to know when it is safe
+    /// to send DroppingMsg(reason="reassigned").
+    pub requests_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Expert ID range this server owns (from `--experts START-END`).
     /// `None` = serve all experts. Used by the expert endpoint to reject
     /// requests for experts this shard doesn't hold.
@@ -384,6 +388,7 @@ mod loaded_model_tests {
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+            requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,

@@ -54,9 +54,40 @@ runs the forward pass and passes logit slices in.
 ## Calibration mode
 
 `BoundaryGateConfig::default()` has `calibration_mode = true`, which
-overrides all thresholds and always falls back to bf16. This is the
-correct default until Exp 44 Track A ships fitted threshold values.
-Set `calibration_mode = false` only after calibration is complete.
+overrides all thresholds and always falls back to bf16.
+
+**Exp 44 Track A result** (396 boundary positions from Frankenstein, Gemma 3 4B):
+
+| Threshold (log-prob) | Accept rate | Early-div (≤5 steps) | Total div | System compression |
+|---------------------:|------------:|---------------------:|----------:|-------------------:|
+| 0.00 (all) | 100% | 10.0% | 21.1% | 2.00× |
+| 1.35 | 82.2% | 8.1% | 21.1% | 1.82× |
+| **2.16 (recommended)** | **68.9%** | **4.8%** | **19.8%** | **1.69×** |
+| 4.05 | 47.8% | 4.7% | 21.3% | 1.48× |
+| 6.75 | 14.4% | 0.0% | 5.8% | 1.14× |
+
+Recommended threshold 2.16 log-prob units meets: accept ≥ 50% and early_div < 5%.
+
+**What the contract actually guarantees at 2.16:**
+`ArgmaxNearEquivalentHighMargin` (D-@high) means the first ~5 generated tokens are safe
+at the 4.8% point-estimate level (95% CI ≈ 1.6%–10.7%, n=62 accepted boundaries). Total
+divergence over 20 tokens is ~19.8% — the same as lower thresholds. The early-div filter
+is what does the safety work; cascade compounds after the first wrong token. Use D-@high
+for LARQL's boundary-to-fresh-decode use case where the decoder quickly accumulates its
+own context; do not rely on it for long uninterrupted continuation from the boundary.
+
+To use calibrated thresholds:
+
+```rust
+let config = BoundaryGateConfig {
+    calibration_mode: false,
+    min_log_prob_margin: 2.16,  // fitted by Exp 44 Track A (log-prob units)
+    min_top1_prob: 0.5,
+    ..Default::default()
+};
+```
+
+See `experiments/44_boundary_gate_calibration/` for the full calibration run.
 
 ## Running examples
 

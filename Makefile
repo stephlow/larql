@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
 
 # Build
 build:
@@ -98,6 +98,49 @@ larql-models-coverage-summary:
 	cargo llvm-cov --package larql-models --summary-only
 
 larql-models-ci: larql-models-fmt-check larql-models-lint larql-models-test larql-models-bench-test
+
+# larql-vindex — vindex extraction, storage, load/save, patch overlays
+LARQL_VINDEX_COVERAGE_MIN ?= 80
+
+larql-vindex-test:
+	cargo test -p larql-vindex
+
+larql-vindex-fmt-check:
+	cargo fmt -p larql-vindex -- --check
+
+larql-vindex-lint:
+	cargo clippy -p larql-vindex --all-targets -- -D warnings
+
+larql-vindex-examples:
+	cargo check -p larql-vindex --examples
+
+larql-vindex-bench-test:
+	cargo test -p larql-vindex --benches
+
+larql-vindex-coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-vindex --fail-under-lines $(LARQL_VINDEX_COVERAGE_MIN)
+
+larql-vindex-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-vindex --summary-only --fail-under-lines $(LARQL_VINDEX_COVERAGE_MIN)
+
+larql-vindex-coverage-html:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; exit 1; \
+	fi
+	cargo llvm-cov --package larql-vindex --html --output-dir coverage/larql-vindex --fail-under-lines $(LARQL_VINDEX_COVERAGE_MIN)
+	@echo "Report: coverage/larql-vindex/html/index.html"
+
+larql-vindex-ci: larql-vindex-fmt-check larql-vindex-lint larql-vindex-test larql-vindex-examples larql-vindex-bench-test larql-vindex-coverage-summary
 
 # larql-boundary — confidence-gated BOUNDARY ref codec
 larql-boundary-test:

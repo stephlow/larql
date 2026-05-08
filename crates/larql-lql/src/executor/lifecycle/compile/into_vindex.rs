@@ -189,7 +189,7 @@ impl Session {
         // vectors into gate_vectors.bin (see comment further down).
         let baked = patched.base().clone();
         let layer_infos = baked
-            .save_gate_vectors(&output_dir)
+            .save_gate_vectors_with_config(&output_dir, config)
             .map_err(|e| LqlError::exec("failed to save gate vectors", e))?;
         // We hard-link down_meta.bin from source (in the unchanging-file
         // loop below) rather than calling save_down_meta, because the

@@ -40,14 +40,14 @@ fn main() {
 
     let config = BoundaryGateConfig {
         calibration_mode: false,
-        min_logit_margin: 1.0,
+        min_log_prob_margin: 1.0,
         min_top1_prob: 0.5,
         ..Default::default()
     };
 
     println!(
-        "Gate config: min_logit_margin={:.1}  min_top1_prob={:.1}",
-        config.min_logit_margin, config.min_top1_prob
+        "Gate config: min_log_prob_margin={:.1}  min_top1_prob={:.1}",
+        config.min_log_prob_margin, config.min_top1_prob
     );
     println!("(thresholds are UNCALIBRATED placeholders; Exp 44 Track A will fit real values)");
     println!();

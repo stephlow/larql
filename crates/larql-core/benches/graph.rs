@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use larql_core::*;
+use std::time::Duration;
 
 const SMALL_EDGE_COUNT: usize = 1_000;
 const LARGE_EDGE_COUNT: usize = 25_000;
@@ -7,6 +8,8 @@ const RELATION_MODULUS: usize = 8;
 const SUBJECT_BUCKET_SIZE: usize = 10;
 const BASE_CONFIDENCE: f64 = 0.5;
 const CONFIDENCE_STEPS: usize = 50;
+const SERIALIZATION_SAMPLE_SIZE: usize = 50;
+const SERIALIZATION_MEASUREMENT_SECS: u64 = 10;
 
 fn build_graph(edge_count: usize) -> Graph {
     let mut graph = Graph::new();
@@ -77,6 +80,9 @@ fn bench_algorithms(c: &mut Criterion) {
 
 fn bench_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("serialization");
+    group.sample_size(SERIALIZATION_SAMPLE_SIZE);
+    group.measurement_time(Duration::from_secs(SERIALIZATION_MEASUREMENT_SECS));
+
     for edge_count in [SMALL_EDGE_COUNT, LARGE_EDGE_COUNT] {
         let graph = build_graph(edge_count);
         let json = to_bytes(&graph, Format::Json).unwrap();

@@ -29,6 +29,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::index::core::VectorIndex;
 
+type Q4kFfnOnceSlot = std::sync::OnceLock<Option<Arc<Vec<f32>>>>;
+type Q4kFfnOnceLayer = [Q4kFfnOnceSlot; 3];
+
 mod down;
 mod fp4;
 mod gate_q4;
@@ -108,7 +111,7 @@ pub struct FfnStore {
     /// In practice only the down component (component=2) is fetched from
     /// this cache; gate/up use the NEON Q4K×Q8K kernel directly on mmap
     /// bytes and never populate their slots here.
-    pub q4k_ffn_once: Vec<[std::sync::OnceLock<Option<Arc<Vec<f32>>>>; 3]>,
+    pub q4k_ffn_once: Vec<Q4kFfnOnceLayer>,
     /// FP4 / FP8 FFN storage (exp 26).
     pub fp4_storage: Option<Arc<crate::index::fp4_storage::Fp4Storage>>,
 }

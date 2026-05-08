@@ -231,10 +231,8 @@ pub struct WriteWeightsOptions {
     pub level: crate::ExtractLevel,
 
     /// Skip writing `up_weights.bin` + `down_weights.bin`. The up/down
-    /// weights are expected to be available via feature-major
-    /// `up_features.bin` + `down_features.bin` — the loader
-    /// reconstructs the hidden-major tensors from those when the
-    /// manifest-referenced files are missing.
+    /// weights are expected to be available to sparse walk paths via
+    /// feature-major `up_features.bin` + `down_features.bin`.
     ///
     /// On a 4B f16 vindex this saves ~3.4 GB (1.7 GB per tensor). On a
     /// 31B vindex, proportionally ~14 GB. The cost is non-zero load
@@ -242,9 +240,10 @@ pub struct WriteWeightsOptions {
     /// up).
     ///
     /// Only take this option if `up_features.bin` and `down_features.bin`
-    /// are already in the output directory or will be produced
-    /// afterwards; otherwise downstream dense paths
-    /// (`WeightFfn::forward`, MEMIT) will panic on missing tensors.
+    /// are already in the output directory or will be produced afterwards.
+    /// Dense `load_model_weights` paths (`WeightFfn::forward`, MEMIT) do
+    /// not reconstruct hidden-major tensors from compact feature-major
+    /// files and will reject compact vindexes with a clear error.
     pub ffn_compact: bool,
 }
 

@@ -356,6 +356,7 @@ pub fn load_single_vindex(
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
         moe_remote: opts.moe_remote.clone(),
@@ -1025,6 +1026,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     grid_key: cli.grid_key.clone(),
                     vindex_hash: vhash.clone(),
                     latency_tracker: m.layer_latency_tracker.clone(),
+                    requests_in_flight: m.requests_in_flight.clone(),
                 });
             }
         }
@@ -1095,6 +1097,27 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ram_bytes_gb() {
+        assert_eq!(parse_ram_bytes("24GB").unwrap(), 24 * 1024 * 1024 * 1024);
+        assert_eq!(parse_ram_bytes("16gb").unwrap(), 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_ram_bytes_mb() {
+        assert_eq!(parse_ram_bytes("4096MB").unwrap(), 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_ram_bytes_raw() {
+        assert_eq!(parse_ram_bytes("1073741824").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_ram_bytes_invalid() {
+        assert!(parse_ram_bytes("notanumber").is_err());
+    }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();

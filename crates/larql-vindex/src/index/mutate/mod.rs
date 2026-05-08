@@ -252,9 +252,8 @@ impl VectorIndex {
     /// JSONL is no longer written — use `larql dump-meta` for human-readable output.
     /// Loading still falls back to JSONL for v1 compat if binary is absent.
     pub fn save_down_meta(&self, dir: &Path) -> Result<usize, VindexError> {
-        let max_top_k = self
-            .metadata
-            .down_meta
+        let down_meta = self.materialize_down_meta();
+        let max_top_k = down_meta
             .iter()
             .filter_map(|l| l.as_ref())
             .flat_map(|metas| metas.iter().filter_map(|m| m.as_ref()))
@@ -262,7 +261,39 @@ impl VectorIndex {
             .max()
             .unwrap_or(10);
 
-        crate::format::down_meta::write_binary(dir, &self.metadata.down_meta, max_top_k)
+        crate::format::down_meta::write_binary(dir, &down_meta, max_top_k)
+    }
+
+    fn materialize_down_meta(&self) -> Vec<Option<Vec<Option<FeatureMeta>>>> {
+        let mut out = Vec::with_capacity(self.num_layers);
+        for layer in 0..self.num_layers {
+            let heap_len = self
+                .metadata
+                .down_meta
+                .get(layer)
+                .and_then(|m| m.as_ref())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let mmap_len = self
+                .metadata
+                .down_meta_mmap
+                .as_ref()
+                .map(|dm| dm.num_features(layer))
+                .unwrap_or(0);
+            let gate_len = self.num_features(layer);
+            let num_features = heap_len.max(mmap_len).max(gate_len);
+            if num_features == 0 {
+                out.push(None);
+                continue;
+            }
+
+            let mut layer_meta = Vec::with_capacity(num_features);
+            for feature in 0..num_features {
+                layer_meta.push(self.feature_meta(layer, feature));
+            }
+            out.push(Some(layer_meta));
+        }
+        out
     }
 
     /// Write gate_vectors.bin back to disk and return updated layer info.
@@ -271,6 +302,30 @@ impl VectorIndex {
     pub fn save_gate_vectors(
         &self,
         dir: &Path,
+    ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
+        self.save_gate_vectors_with_dtype(dir, crate::config::dtype::StorageDtype::F32)
+    }
+
+    /// Write gate vectors using the dtype and per-layer metadata from config.
+    pub fn save_gate_vectors_with_config(
+        &self,
+        dir: &Path,
+        config: &crate::config::VindexConfig,
+    ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
+        let mut layer_infos = self.save_gate_vectors_with_dtype(dir, config.dtype)?;
+        for info in &mut layer_infos {
+            if let Some(existing) = config.layers.iter().find(|layer| layer.layer == info.layer) {
+                info.num_experts = existing.num_experts;
+                info.num_features_per_expert = existing.num_features_per_expert;
+            }
+        }
+        Ok(layer_infos)
+    }
+
+    fn save_gate_vectors_with_dtype(
+        &self,
+        dir: &Path,
+        dtype: crate::config::dtype::StorageDtype,
     ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
         let path = dir.join(GATE_VECTORS_BIN);
         let tmp_path = dir.join("gate_vectors.bin.tmp");
@@ -317,15 +372,8 @@ impl VectorIndex {
 
             if let Some(ref data) = data {
                 let num_features = data.len() / self.hidden_size;
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        data.as_ptr() as *const u8,
-                        data.len() * std::mem::size_of::<f32>(),
-                    )
-                };
-                writer.write_all(bytes)?;
+                let length = crate::config::dtype::write_floats(&mut writer, data, dtype)?;
 
-                let length = bytes.len() as u64;
                 layer_infos.push(crate::config::VindexLayerInfo {
                     layer,
                     num_features,
@@ -356,7 +404,7 @@ impl VectorIndex {
     /// Save the full vindex (gate_vectors.bin + down_meta.jsonl + index.json).
     /// Updates the config's layer info to match current state.
     pub fn save_vindex(&self, dir: &Path, config: &mut VindexConfig) -> Result<(), VindexError> {
-        let layer_infos = self.save_gate_vectors(dir)?;
+        let layer_infos = self.save_gate_vectors_with_config(dir, config)?;
         config.layers = layer_infos;
         self.save_down_meta(dir)?;
         Self::save_config(config, dir)?;

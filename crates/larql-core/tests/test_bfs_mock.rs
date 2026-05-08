@@ -302,6 +302,35 @@ fn test_bfs_edges_have_source_parametric() {
 }
 
 #[test]
+fn test_bfs_edges_use_configured_source() {
+    let provider = geo_provider();
+    let templates = geo_templates();
+    let seeds = vec!["France".to_string()];
+    let config = BfsConfig {
+        max_depth: 0,
+        max_entities: 100,
+        min_confidence: 0.3,
+        edge_source: SourceType::Document,
+        ..Default::default()
+    };
+
+    let mut graph = Graph::new();
+    let mut callbacks = larql_core::engine::bfs::SilentCallbacks;
+    extract_bfs(
+        &provider,
+        &templates,
+        &seeds,
+        &config,
+        &mut graph,
+        &mut callbacks,
+    );
+
+    for edge in graph.edges() {
+        assert_eq!(edge.source, SourceType::Document);
+    }
+}
+
+#[test]
 fn test_bfs_edges_have_metadata() {
     let provider = geo_provider();
     let templates = geo_templates();

@@ -142,6 +142,7 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         layer_latency_tracker: std::sync::Arc::new(
             larql_server::metrics::LayerLatencyTracker::new(),
         ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
@@ -182,6 +183,7 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         layer_latency_tracker: std::sync::Arc::new(
             larql_server::metrics::LayerLatencyTracker::new(),
         ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,

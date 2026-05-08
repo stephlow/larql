@@ -852,7 +852,7 @@ pub fn q6k_q8k_matvec_scalar(
     if rows == 0 || cols == 0 || w.len() < rows * row_bytes {
         return;
     }
-    for r in 0..rows {
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -866,9 +866,9 @@ pub fn q6k_q8k_matvec_scalar(
             let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
 
             let mut sum1: i32 = 0;
-            for g in 0..16usize {
+            for (g, scale_byte) in sc.iter().enumerate().take(16usize) {
                 // 16-element group g, using scale sc[g].
-                let scale = sc[g] as i8 as i32;
+                let scale = *scale_byte as i8 as i32;
                 let mut dot_g: i32 = 0;
                 for k in 0..16usize {
                     let i = g * 16 + k;
@@ -886,18 +886,19 @@ pub fn q6k_q8k_matvec_scalar(
             }
             acc += d_w * d_y * sum1 as f32;
         }
-        out[r] = acc;
+        *out_r = acc;
     }
 }
 
 /// NEON-accelerated Q6_K × Q8_K matvec for `aarch64`.
 ///
 /// Per 16-element scale group:
-///   1. Vectorised dequant: 8 ql bytes → lo4[16] via nibble-unpack + vzip.
-///                          4 qh bytes → hi2[16] via byte-replicate + vshlq_s8 + mask.
-///                          raw6 = lo4 | (hi2 << 4); signed = raw6 - 32 → int8.
-///   2. One SDOT over the 16 int8 weight × int8 activation products.
-///   3. scale * dot_g accumulated into sum1.
+/// 1. Vectorised dequant: 8 ql bytes → lo4[16] via nibble-unpack + vzip.
+///    4 qh bytes → hi2[16] via byte-replicate + vshlq_s8 + mask.
+///    raw6 = lo4 | (hi2 << 4); signed = raw6 - 32 → int8.
+/// 2. One SDOT over the 16 int8 weight × int8 activation products.
+/// 3. scale * dot_g accumulated into sum1.
+///
 /// Final: acc += d_w * d_y * sum1.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub fn q6k_q8k_matvec_neon(
@@ -927,7 +928,7 @@ pub fn q6k_q8k_matvec_neon(
     let mask_03 = unsafe { vdupq_n_u8(0x03) };
     let sub32 = unsafe { vdupq_n_s8(32) };
 
-    for r in 0..rows {
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -949,7 +950,7 @@ pub fn q6k_q8k_matvec_neon(
                 let ql_g = unsafe { ql_base.add(g * 8) };
                 let qh_g = unsafe { qh_base.add(g * 4) };
                 let q8_g = unsafe { q8_ptr.add(q8_base + g * 16) };
-                let scale = unsafe { *sc_base.add(g) as i8 as i32 };
+                let scale = unsafe { *sc_base.add(g) as i32 };
 
                 // ── Lo4 extraction (8 ql bytes → 16 uint4 values, in element order) ──
                 // ql_v[j] holds lo4 of element 2j (low nibble) and 2j+1 (high nibble).
@@ -1002,7 +1003,7 @@ pub fn q6k_q8k_matvec_neon(
 
             acc += d_w * d_y * sum1 as f32;
         }
-        out[r] = acc;
+        *out_r = acc;
     }
 }
 
