@@ -39,7 +39,7 @@ Gap          1.18×                ~2.0 ms/tok                 (was 1.30× befor
 
 larql-metal  gemma4-26B-A4B        19.0–19.8 tok/s ~52ms/tok  (post 2026-05-02 moe_dispatch geometry fix)
 larql-metal  gemma4-26B-A4B          5.1 tok/s   ~194ms/tok   (pre-fix; broken dispatch was masking ~3.8× perf AND degrading output)
-SKIP_MOE ceiling                   56.8 tok/s   ~15ms/tok    (attention + dense FFN only)
+LARQL_SKIP_MOE=1 ceiling           56.8 tok/s   ~15ms/tok    (attention + dense FFN only)
 ```
 
 Per-stage (Gemma 3 4B, 30-token run, 8 warmup, 2026-05-02 post dispatch fix):
@@ -276,7 +276,7 @@ Vindex: `gemma-4-26B-A4B-it.vindex` (30 layers, 128 experts/layer, top-K=8, inte
 | Batched MoE prefill | 3.9 | 246ms | +35% |
 | Q4K per-layer format + GPU expert dispatch | 5.1 | ~194ms | +75% from baseline |
 | **moe_dispatch geometry fix** (2026-05-02) | **~19.4** | **~52ms** | **+3.8× from prior** |
-| GPU-only ceiling (`SKIP_MOE=1`) | 56.8 | 15ms | theoretical max |
+| GPU-only ceiling (`LARQL_SKIP_MOE=1`) | 56.8 | 15ms | theoretical max |
 
 ### What the 2026-05-02 moe_dispatch fix changed
 
@@ -327,7 +327,7 @@ reading the same corrupted measurement.
 
 ### Remaining 26B headroom: 19.4 → 56.8 tok/s ceiling
 
-The SKIP_MOE ceiling (56.8 tok/s, 15 ms GPU fwd) is "attention + dense
+The `LARQL_SKIP_MOE=1` ceiling (56.8 tok/s, 15 ms GPU fwd) is "attention + dense
 FFN only" — what 26B would do if the experts cost zero. Current MoE
 overhead: 52 - 15 = **37 ms/tok of expert work** spread across 30
 layers × top_k=8 = 240 expert dispatches (~155 µs/dispatch) plus 30

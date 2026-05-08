@@ -30,9 +30,9 @@ End-to-end decode/generation throughput. Different surface from `benches/quant_m
 For kernel-level throughput regressions, use the criterion bench suite:
 
 ```
-make bench           # run all kernel benches
-make bench-save      # record baseline
-make bench-check     # fail if any cell regressed
+make bench-compute   # quant_matvec Criterion bench with Metal
+cargo bench -p larql-compute --bench matmul
+cargo bench -p larql-compute --bench linalg
 ```
 
 ## Diagnostics (`diag_*`) — investigate production issues
@@ -44,6 +44,7 @@ and a real vindex or production-shape synthetic data.
 | Example | Question it answers |
 |---|---|
 | `diag_profile_kernels` | **Where does GPU time go per kernel?** Measures each production kernel (q6k_matvec, q4k_ffn_gate_up, QKV, lm_head) in isolation and batched (34× in one command buffer). Reports GB/s vs theoretical peak, revealing compute-bound vs bandwidth-bound. |
+| `diag_shader_bench` | **Did a kernel performance change regress?** Runs smoke or Gemma-3-shaped shader microbenches, optionally writing/comparing JSON. |
 | `diag_decode_pipeline` | **Which layer/stage first diverges from CPU?** Per-stage buffer reads with `LARQL_METAL_DUMP_LAYERS=<dir>` for bisecting CPU/Metal divergence. |
 
 Usage:
@@ -51,6 +52,9 @@ Usage:
 ```bash
 # Per-kernel bandwidth profiler — runs 50 iterations per kernel, batched x34
 cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+
+# Shader benchmark inventory / JSON comparison
+cargo run --release --features metal -p larql-compute --example diag_shader_bench -- --profile smoke
 
 # Decode pipeline stage bisect — dumps per-stage f32 files for diffing
 LARQL_METAL_DUMP_LAYERS=/tmp/decode_dump \

@@ -154,7 +154,8 @@ mod tests {
                 // Vary content slightly so the allocator can't trivially reuse the slot,
                 // but the key guarantee is unique heap pointer per live Vec.
                 let data = vec![i as u8, 0x3Fu8, 0x00u8, 0x3Fu8]; // 2 BF16 values
-                let _ = cache::cached_dequant(&data, crate::QuantFormat::BF16, data.len() / 2);
+                let _ = cache::try_cached_dequant(&data, crate::QuantFormat::BF16, data.len() / 2)
+                    .unwrap();
                 data
             })
             .collect();
@@ -166,8 +167,8 @@ mod tests {
     fn cache_hit_returns_same_arc() {
         // Same byte slice pointer → second call hits the cache, no new allocation.
         let data = vec![0x80u8, 0x3Fu8, 0x80u8, 0x3Fu8]; // BF16 1.0 × 2
-        let first = cache::cached_dequant(&data, crate::QuantFormat::BF16, 2);
-        let second = cache::cached_dequant(&data, crate::QuantFormat::BF16, 2);
+        let first = cache::try_cached_dequant(&data, crate::QuantFormat::BF16, 2).unwrap();
+        let second = cache::try_cached_dequant(&data, crate::QuantFormat::BF16, 2).unwrap();
         // Both Arcs should point to the same allocation (same pointer).
         assert!(
             std::sync::Arc::ptr_eq(&first, &second),

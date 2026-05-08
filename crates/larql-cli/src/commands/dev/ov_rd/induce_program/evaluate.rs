@@ -1,5 +1,5 @@
-use ndarray::Array2;
 use larql_vindex::VectorIndex;
+use ndarray::Array2;
 
 use super::super::address::attention_argmax;
 use super::super::metrics::{
@@ -64,27 +64,49 @@ pub fn evaluate_program_fast(
             .collect();
 
         let replacement_delta = {
-            let flat: Vec<f32> = (0..remapped.len()).flat_map(|pos| {
-                fit.mode_d_table
-                    .delta_for_position_codes_with_stratum(pos, &remapped[pos], &capture.stratum)
-            }).collect();
+            let flat: Vec<f32> = (0..remapped.len())
+                .flat_map(|pos| {
+                    fit.mode_d_table.delta_for_position_codes_with_stratum(
+                        pos,
+                        &remapped[pos],
+                        &capture.stratum,
+                    )
+                })
+                .collect();
             Array2::from_shape_vec((capture.token_ids.len(), weights.hidden_size), flat)
                 .map_err(|e| format!("delta shape: {e}"))?
         };
         let program_h = if let Some(ref b) = fit.metal {
             if let Some(h) = super::super::metal_backend::try_metal(
-                weights, &capture.token_ids, index,
-                fit.head.layer, fit.head.head, &replacement_delta, b,
-            ) { h } else {
+                weights,
+                &capture.token_ids,
+                index,
+                fit.head.layer,
+                fit.head.head,
+                &replacement_delta,
+                b,
+            ) {
+                h
+            } else {
                 forward_q4k_predicted_address_mode_d_head(
-                    weights, &capture.token_ids, index, fit.head,
-                    &fit.mode_d_table, &remapped, &capture.stratum,
+                    weights,
+                    &capture.token_ids,
+                    index,
+                    fit.head,
+                    &fit.mode_d_table,
+                    &remapped,
+                    &capture.stratum,
                 )?
             }
         } else {
             forward_q4k_predicted_address_mode_d_head(
-                weights, &capture.token_ids, index, fit.head,
-                &fit.mode_d_table, &remapped, &capture.stratum,
+                weights,
+                &capture.token_ids,
+                index,
+                fit.head,
+                &fit.mode_d_table,
+                &remapped,
+                &capture.stratum,
             )?
         };
         let program_logits = final_logits(weights, &program_h);

@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `rope_at_pos` — the *single-head, single-vector*
 //! RoPE shader used by Metal prefill via `metal/stages/rope.rs`. Looped

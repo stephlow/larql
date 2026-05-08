@@ -1,9 +1,11 @@
 # Roadmap — larql-vindex
 
-## Current state (as of 2026-05-01)
+## Current state (as of 2026-05-08)
 
-- **493 tests passing** on `larql-vindex`. Workspace builds clean.
-  No new clippy warnings; `cargo fmt --check` clean.
+- **515 tests listed** on `larql-vindex` (`cargo test -p
+  larql-vindex -- --list`). Crate-local checks are wired through
+  `make larql-vindex-ci`: fmt, clippy `-D warnings`, tests, example
+  compile checks, bench compile/tests, and coverage policy.
 - **Folder layout decomposed**:
   - `index/{storage,compute,mutate}/` — substores, KNN dispatch, mutation
   - `index/compute/gate_knn/{mod,dispatch,scores_batch,hnsw_lifecycle}.rs`
@@ -25,7 +27,9 @@
 - **Filename literals centralised** in `format::filenames` (252+
   occurrences → one constant module). Round-2 added 8 missed
   constants (LM_HEAD_BIN + FP4 family + attn_q4/q8 manifests). Round-4
-  M1 closed the last gap (`UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN`).
+  M1 closed `UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN`; the 2026-05-08
+  pass added `ROUTER_WEIGHTS_BIN` and moved layer-weight paths through
+  `LAYERS_DIR` / `layer_weights_filename`.
 - **`DEFAULT_C_SCORE`** lifted on `index::types` so the patch overlay
   fallback and the vindexfile builder share one default (round-4 M3).
 - **`VectorIndex` god struct decomposed** into four typed substores
@@ -44,7 +48,15 @@
   phases auto-skip on a compatible checkpoint.
 - **Stage labels centralised** in `extract::stage_labels` (15 labels;
   typo at any site is now a compile error).
-- `make coverage` + `make coverage-summary` (cargo-llvm-cov).
+- `make larql-vindex-coverage-summary` + `make
+  larql-vindex-coverage-html` (cargo-llvm-cov) enforce both the
+  aggregate line floor and `coverage-policy.json`.
+- **Coverage ratchet**: aggregate floor is 68% lines from the
+  2026-05-08 baseline. Per-source-file default is 90%; files below
+  that are explicit debt baselines and should only move upward.
+- **Cross-platform CI**: `.github/workflows/larql-vindex.yml` runs
+  format, check, examples, clippy, tests, and bench compile/tests on
+  Linux, Windows, and macOS. Coverage policy runs on Ubuntu.
 - Bench rig daemon-aware (`make bench-vindex-scaling` refuses if
   `larql-server` / `larql-router` are running on the host).
 
@@ -355,6 +367,21 @@ Add new layers / features to an existing vindex without full rebuild.
 ---
 
 ## Completed
+
+### 2026-05-08 — vindex quality gate + coverage ratchet
+
+Closed the follow-up review for Makefile parity, cross-platform CI,
+coverage tracking, model-agnostic tests, and remaining filename/layout
+literals.
+
+| Item | Outcome |
+|------|---------|
+| `larql-vindex` Makefile parity | Added crate-local targets for test, fmt, clippy, examples, bench tests, `vindex_ops` bench, coverage summary, HTML coverage, and standalone policy checks. `make larql-vindex-ci` wires the full local gate. |
+| Cross-platform CI | Added `.github/workflows/larql-vindex.yml`; Linux, Windows, and macOS run format/check/examples/clippy/tests/bench compile-tests. Ubuntu runs the coverage policy. |
+| Coverage ratchet | Added `coverage-policy.json` and `scripts/check_coverage_policy.py`. Aggregate floor is 68% lines; source files default to 90% line coverage with explicit debt baselines for current under-covered files. |
+| Model-agnostic regression coverage | Added synthetic storage/compute regression tests for router weights, gate score batch paths, binary down_meta, and per-layer weight files. No HuggingFace downloads or architecture-specific fixtures. |
+| Filename/layout constants | Added `ROUTER_WEIGHTS_BIN`; routed layer-weight paths through `LAYERS_DIR` and `layer_weights_filename`; replaced anonymous byte sizes in down_meta/layer-weight parsing with named layout constants. |
+| Documentation | Updated root README, crate README, and this roadmap with the new Makefile targets, CI surface, coverage policy, and current test inventory. |
 
 ### 2026-05-01 — round-4 cleanup (magic strings, magic numbers, modularity)
 

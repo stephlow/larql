@@ -19,6 +19,12 @@ use crate::index::FeatureMeta;
 const MAGIC: u32 = 0x444D4554; // "DMET"
 const LEGACY_LITERAL_MAGIC: u32 = 0x54454D44; // bytes written as b"DMET"
 const FORMAT_VERSION: u32 = 1;
+const U32_BYTES: usize = std::mem::size_of::<u32>();
+const F32_BYTES: usize = std::mem::size_of::<f32>();
+const HEADER_FIELDS: usize = 4;
+const HEADER_BYTES: usize = HEADER_FIELDS * U32_BYTES;
+const RECORD_FIXED_BYTES: usize = U32_BYTES + F32_BYTES;
+const TOP_K_RECORD_BYTES: usize = U32_BYTES + F32_BYTES;
 
 /// Write down_meta in binary format.
 pub fn write_binary(
@@ -185,7 +191,7 @@ pub fn mmap_binary(
     let file = std::fs::File::open(&path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-    if mmap.len() < 16 {
+    if mmap.len() < HEADER_BYTES {
         return Err(VindexError::Parse("down_meta.bin too small".into()));
     }
 
@@ -206,24 +212,24 @@ pub fn mmap_binary(
     let top_k_count = u32::from_le_bytes([mmap[12], mmap[13], mmap[14], mmap[15]]) as usize;
 
     let record_size = top_k_count
-        .checked_mul(8)
-        .and_then(|n| n.checked_add(8))
+        .checked_mul(TOP_K_RECORD_BYTES)
+        .and_then(|n| n.checked_add(RECORD_FIXED_BYTES))
         .ok_or_else(|| VindexError::Parse("down_meta.bin record size overflow".into()))?;
 
     // Build offset table by scanning per-layer num_features headers
     let mut layer_offsets = Vec::with_capacity(num_layers);
     let mut layer_num_features = Vec::with_capacity(num_layers);
-    let mut pos = 16usize; // after header
+    let mut pos = HEADER_BYTES;
 
     for _ in 0..num_layers {
-        if pos + 4 > mmap.len() {
+        if pos + U32_BYTES > mmap.len() {
             return Err(VindexError::Parse(
                 "truncated down_meta.bin layer header".into(),
             ));
         }
         let nf =
             u32::from_le_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]) as usize;
-        pos += 4; // skip num_features u32
+        pos += U32_BYTES;
         layer_offsets.push(pos); // records start here
         layer_num_features.push(nf);
         let layer_bytes = nf

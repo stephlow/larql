@@ -420,7 +420,6 @@ impl MetalBackend {
                     gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::GateUp);
                     cmd = self.queue.new_command_buffer().to_owned();
                     enc = cmd.new_compute_command_encoder().to_owned();
-                    encoder_ended = false;
                     // Step 6b + 7: activation+down + post-FFN residual
                     self.encode_ffn_down_phase(&enc, layer, &ffn_bufs, ffn_dims, ffn_uses_q4k);
                     self.encode_post_ffn_residual(

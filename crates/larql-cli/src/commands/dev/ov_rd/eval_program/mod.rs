@@ -229,6 +229,7 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
 
     eprintln!("Evaluating program on {} prompts", eval_prompts.len());
     let mut prompt_reports: Vec<PromptReport> = Vec::new();
+    let mut actual_intervention_backend: &'static str = "cpu_fallback";
     let mut diag = Diagnostics::default();
     let target_group = program.group;
 
@@ -246,9 +247,16 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
         }
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
 
-        // Pass 1: baseline.
-        let baseline_h =
-            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+        // Pass 1: baseline — Metal if available, CPU fallback.
+        let baseline_h = if let Some(ref b) = metal_backend {
+            if let Some(h) = super::metal_backend::try_metal_baseline(
+                &weights, &token_ids, &index, b,
+            ) { h } else {
+                larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None)
+            }
+        } else {
+            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None)
+        };
         let baseline_logits = final_logits(&weights, &baseline_h);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
@@ -266,19 +274,25 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
             stratum,
         )?;
 
-        // Pass 3: oracle Mode D baseline.
-        let oracle_h = forward_q4k_oracle_pq_mode_d_head(
-            &mut weights,
-            &token_ids,
-            &index,
-            head,
-            basis,
-            pca_basis,
-            head_means,
-            codebook,
-            mode_d_table,
-            stratum,
-        )?;
+        // Pass 3: oracle Mode D baseline — Metal if available, CPU fallback.
+        let oracle_h = if let Some(ref b) = metal_backend {
+            let oracle_delta_flat = build_replacement_delta(
+                mode_d_table, &oracle_codes_by_position, stratum, weights.hidden_size,
+            );
+            let oracle_delta = ndarray::Array2::from_shape_vec(
+                (token_ids.len(), weights.hidden_size), oracle_delta_flat,
+            ).ok();
+            oracle_delta.and_then(|d| super::metal_backend::try_metal(
+                &weights, &token_ids, &index, head.layer, head.head, &d, b,
+            ))
+        } else { None };
+        let oracle_h = match oracle_h {
+            Some(h) => h,
+            None => forward_q4k_oracle_pq_mode_d_head(
+                &mut weights, &token_ids, &index, head, basis, pca_basis,
+                head_means, codebook, mode_d_table, stratum,
+            )?,
+        };
         let oracle_logp = log_softmax(&final_logits(&weights, &oracle_h));
         diag.oracle_mode_d_kls
             .push(kl_logp(&baseline_logp, &oracle_logp));
@@ -339,26 +353,43 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
 
         // Pass 5: program-mapped Mode D injection — Metal if available, CPU fallback.
         // Track which path ran so the report is self-describing.
-        let delta_flat = build_replacement_delta(
-            mode_d_table, &remapped_codes, stratum, weights.hidden_size,
-        );
+        let delta_flat =
+            build_replacement_delta(mode_d_table, &remapped_codes, stratum, weights.hidden_size);
         let replacement_delta =
             ndarray::Array2::from_shape_vec((token_ids.len(), weights.hidden_size), delta_flat)
                 .map_err(|e| format!("delta shape: {e}"))?;
         let (program_h, used_metal) = if let Some(ref b) = metal_backend {
             if let Some(h) = super::metal_backend::try_metal(
-                &weights, &token_ids, &index, head.layer, head.head, &replacement_delta, b,
+                &weights,
+                &token_ids,
+                &index,
+                head.layer,
+                head.head,
+                &replacement_delta,
+                b,
             ) {
                 (h, true)
             } else {
                 let h = forward_q4k_predicted_address_mode_d_head(
-                    &mut weights, &token_ids, &index, head, mode_d_table, &remapped_codes, stratum,
+                    &mut weights,
+                    &token_ids,
+                    &index,
+                    head,
+                    mode_d_table,
+                    &remapped_codes,
+                    stratum,
                 )?;
                 (h, false)
             }
         } else {
             let h = forward_q4k_predicted_address_mode_d_head(
-                &mut weights, &token_ids, &index, head, mode_d_table, &remapped_codes, stratum,
+                &mut weights,
+                &token_ids,
+                &index,
+                head,
+                mode_d_table,
+                &remapped_codes,
+                stratum,
             )?;
             (h, false)
         };
@@ -445,6 +476,7 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
         behavior_gate,
         metric_parity,
         metric_parity_failures,
+        intervention_backend: actual_intervention_backend,
         strata,
         per_prompt: prompt_reports,
     };

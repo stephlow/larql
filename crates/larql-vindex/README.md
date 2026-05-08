@@ -658,7 +658,18 @@ grid intentionally, set `LARQL_BENCH_ALLOW_DAEMONS=1`.
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 457 tests (306 unit + 151 integration; all green as of 2026-04-26)
+# Local CI gate, matching the crate-specific Makefile surface.
+make larql-vindex-ci                                                            # fmt, clippy, tests, examples, bench tests, coverage policy
+make larql-vindex-test                                                          # cargo test -p larql-vindex
+make larql-vindex-fmt-check                                                     # cargo fmt -p larql-vindex -- --check
+make larql-vindex-lint                                                          # cargo clippy -p larql-vindex --all-targets -- -D warnings
+make larql-vindex-examples                                                      # cargo check -p larql-vindex --examples
+make larql-vindex-bench-test                                                    # cargo test -p larql-vindex --benches
+make larql-vindex-bench                                                         # cargo bench -p larql-vindex --bench vindex_ops
+make larql-vindex-coverage-summary                                              # aggregate + per-file coverage policy
+make larql-vindex-coverage-html                                                 # HTML report plus the same coverage policy
+
+cargo test -p larql-vindex                                                      # 515 tests listed as of 2026-05-08
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -691,6 +702,30 @@ cargo run --release -p larql-vindex --example build_gate_q4 -- <vindex>         
 cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      # Q4 logits projection
 ```
 
+### Quality gates
+
+`larql-vindex` has a crate-specific Makefile block rather than relying
+only on the workspace-wide `make ci`. The local gate is:
+
+- format: `cargo fmt -p larql-vindex -- --check`
+- lint: `cargo clippy -p larql-vindex --all-targets -- -D warnings`
+- tests: `cargo test -p larql-vindex`
+- examples: `cargo check -p larql-vindex --examples`
+- benches: `cargo test -p larql-vindex --benches`
+- coverage: `cargo llvm-cov --package larql-vindex` plus
+  `scripts/check_coverage_policy.py`
+
+The coverage policy lives in `coverage-policy.json`. The aggregate
+line-coverage floor is currently 68% from the 2026-05-08 local
+baseline. Source files default to 90% line coverage; files below that
+have explicit debt baselines that should only ratchet upward. The
+current policy check covers 83 source files, with 39 already at the
+90% default and 44 tracked as debt.
+
+GitHub Actions runs the same model-agnostic surface on Linux, Windows,
+and macOS. The examples step is compile-only because several tools
+need an external vindex path; CI must stay synthetic and portable.
+
 ### Bench measurements (typical machine, synthetic Gemma-like fixture)
 
 | Bench | Operation | Time |
@@ -701,7 +736,7 @@ cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 
-Test coverage (328 tests):
+Test coverage (515 tests listed by `cargo test -p larql-vindex -- --list`):
 - Construction, dimensions, layer counts, feature counts
 - Gate KNN: brute-force, f32, Q4 via compute backend, top-K ordering
 - Gate walk: BLAS gemv path matches brute-force KNN
@@ -713,6 +748,10 @@ Test coverage (328 tests):
 - Patching: apply, revert, bake down
 - Binary serialization: checksums, dtype, config
 - MoE: expert-scoped queries, multiple experts per layer
+- Router weights: dense-model absence, incomplete files, top-k routing
+- Down metadata: binary read/write, mmap lookup, malformed header rejection
+- Layer weights: per-layer file headers, offsets, dense/MoE quant helpers
+- Gate-score batch paths: heap, f32 mmap, f16 mmap decode cache, backend GEMV
 - Streaming extraction: safetensors mmap, one layer at a time
 - Adaptive residency: pin/evict, budget enforcement, auto_pin, pin_range, adaptive dispatch
 

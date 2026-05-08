@@ -6,7 +6,7 @@
 //! - `q4k_q6k_qkv_proj_normed`: fused input-norm + QKV projection for
 //!   the Q4_K Q/K + Q6_K V mixed-format path (Gemma 3 4B production).
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

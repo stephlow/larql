@@ -104,9 +104,11 @@ impl Drop for RifGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         // Saturating sub to avoid wrapping if something incremented 0 and dropped twice.
-        let prev = self.0.fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(1))
-        });
+        let prev = self
+            .0
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         let _ = prev;
     }
 }

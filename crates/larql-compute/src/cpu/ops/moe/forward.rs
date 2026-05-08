@@ -15,10 +15,11 @@
 
 use crate::MoeLayerWeights;
 
-use super::cache::cached_dequant;
+use super::cache::try_cached_dequant;
 use super::expert::{run_single_expert_q4k_q8k_into, ExpertScratch};
 use super::math::{gelu_tanh, matmul_vec, rms_norm, rms_norm_no_weight, silu, softmax, top_k};
 use crate::cpu::ops::q4k_q8k_dot::quantize_x_to_q8k;
+use crate::options;
 
 /// Run the MoE expert block for one token.
 ///
@@ -35,7 +36,7 @@ pub fn cpu_moe_forward(
     // `LARQL_MOE_FWD_TIMING=1`.  Cached in TLS to avoid syscalls
     // per call on the hot path.
     thread_local! {
-        static FWD_TIMING: bool = std::env::var("LARQL_MOE_FWD_TIMING").is_ok();
+        static FWD_TIMING: bool = options::env_flag(options::ENV_MOE_FWD_TIMING);
     }
     let timing = FWD_TIMING.with(|t| *t);
     let t_start = std::time::Instant::now();
@@ -54,7 +55,7 @@ pub fn cpu_moe_forward(
     // Diagnostic: bypass the expert block entirely. Dense FFN alone flows
     // through the normal path; if this produces legible output, the MoE
     // block is the broken piece. If still garbage, look upstream.
-    if std::env::var("SKIP_MOE").is_ok() {
+    if options::skip_moe_enabled() {
         return vec![0.0f32; hidden];
     }
 
@@ -110,7 +111,7 @@ pub fn cpu_moe_forward(
 
     // Debug: print routing per layer if MOE_DEBUG=1
     static DEBUG_LAYER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if std::env::var("MOE_DEBUG").is_ok() {
+    if options::moe_debug_enabled() {
         let layer_n = DEBUG_LAYER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30;
         let h_rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
         let hn_rms = (h_norm.iter().map(|v| v * v).sum::<f32>() / h_norm.len() as f32).sqrt();
@@ -192,7 +193,7 @@ pub fn cpu_moe_forward(
     // fall back to the BLAS-on-cached-f32 path for kernel-debug A/B runs.
     let q4k_direct = matches!(format, crate::QuantFormat::Q4_K)
         && hidden.is_multiple_of(256)
-        && std::env::var("LARQL_DISABLE_Q4K_DIRECT").is_err();
+        && !options::env_flag(options::ENV_DISABLE_Q4K_DIRECT);
     let t_q8k_quant_start = std::time::Instant::now();
     let h_norm_q8k = q4k_direct.then(|| quantize_x_to_q8k(&h_norm));
     let t_q8k_quant = t_q8k_quant_start.elapsed();
@@ -257,7 +258,8 @@ pub fn cpu_moe_forward(
                     // f32 cache path.  Inlined here to avoid pulling the
                     // per-call rms_norm / format dispatch from the legacy
                     // `run_single_expert_into` that doesn't share scratch.
-                    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
+                    let gate_up_w = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
+                        .unwrap_or_else(|err| panic!("{err}"));
                     if gate_up_w.is_empty() {
                         return;
                     }
@@ -276,7 +278,8 @@ pub fn cpu_moe_forward(
                         };
                     }
 
-                    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
+                    let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
+                        .unwrap_or_else(|err| panic!("{err}"));
                     if down_w.is_empty() {
                         return;
                     }
@@ -321,7 +324,7 @@ pub fn cpu_moe_forward(
         );
     }
 
-    if std::env::var("MOE_DEBUG").is_ok() {
+    if options::moe_debug_enabled() {
         let pre_rms =
             (expert_out.iter().map(|v| v * v).sum::<f32>() / expert_out.len() as f32).sqrt();
         let post_rms = (result.iter().map(|v| v * v).sum::<f32>() / result.len() as f32).sqrt();

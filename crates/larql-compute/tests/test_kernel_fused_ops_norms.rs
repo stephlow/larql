@@ -5,7 +5,7 @@
 //!
 //! All tests compare Metal shader output to a CPU reference implementation.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

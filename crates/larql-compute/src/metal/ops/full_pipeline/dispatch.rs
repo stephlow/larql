@@ -381,7 +381,10 @@ pub fn dispatch_full_pipeline(
         );
 
         // ── 3b. Apply RoPE separately when populating KV cache ──
-        let use_separate_rope = kv_cache.is_some() && rope_at_pos_pipeline.is_some();
+        // Enable per-position RoPE whenever the pipeline is provided, regardless of
+        // KV cache. This makes `full_pipeline_q4` prefill-correct when
+        // rope_at_pos_pipeline is passed — needed for multi-position AHORD evaluation.
+        let use_separate_rope = rope_at_pos_pipeline.is_some();
         if use_separate_rope {
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::rope::encode(
@@ -488,6 +491,36 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
+        // ── Intervention hook B: add replacement_delta to o_outs[l] ──
+        //
+        // Must run AFTER O-projection (step 5) and BEFORE post-attn residual + norm
+        // (step 6). Adding to o_outs[l] (not h_post_attns) means step 6 computes
+        //   h_post_attn = h + norm(o_without_H + delta)   [post-norm model]
+        //   h_post_attn = h + o_without_H + delta         [pre-norm model]
+        // matching the CPU path which uses rms_norm(attn_projected_with_replacement).
+        // Doing this AFTER step 6 would add delta outside the norm — wrong for post-norm.
+        if let Some(iv) = intervention {
+            if l == iv.target_layer {
+                cmd.commit();
+                cmd.wait_until_completed();
+                debug_assert_eq!(
+                    iv.replacement_delta.len(),
+                    seq_len * hidden,
+                    "PipelineIntervention replacement_delta length mismatch"
+                );
+                // CPU-add replacement_delta to o_outs[l] via shared memory.
+                let o_ptr = o_outs[l].contents() as *mut f32;
+                for i in 0..(seq_len * hidden) {
+                    unsafe {
+                        *o_ptr.add(i) += iv.replacement_delta[i];
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                o_outs[l].did_modify_range(metal::NSRange::new(0, o_outs[l].length()));
+                cmd = queue.new_command_buffer().to_owned();
+            }
+        }
+
         // ── 6. Post-attention residual + pre-FFN norm (+ optional Q8 quant). ──
         //
         // Two output representations are needed here:
@@ -537,57 +570,6 @@ pub fn dispatch_full_pipeline(
                 (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64,
             );
             enc.end_encoding();
-        }
-
-        // ── Intervention hook B: add replacement_delta to h_post_attns[l] ──
-        //
-        // h_post_attns[l] = h + o_without_head_H  (head H was zeroed in hook A)
-        // After adding replacement_delta: h_post_attns[l] = h + o_no_H + delta
-        // Then re-run the pre-FFN norm per position (ffn_norm_outs[l] was
-        // computed from the stale h_post_attn before delta was added).
-        if let Some(iv) = intervention {
-            if l == iv.target_layer {
-                cmd.commit();
-                cmd.wait_until_completed();
-                // CPU-add replacement_delta to h_post_attns[l] via shared memory.
-                debug_assert_eq!(
-                    iv.replacement_delta.len(),
-                    seq_len * hidden,
-                    "PipelineIntervention replacement_delta length mismatch"
-                );
-                let h_ptr = h_post_attns[l].contents() as *mut f32;
-                for i in 0..(seq_len * hidden) {
-                    unsafe {
-                        *h_ptr.add(i) += iv.replacement_delta[i];
-                    }
-                }
-                #[cfg(target_os = "macos")]
-                h_post_attns[l].did_modify_range(metal::NSRange::new(0, h_post_attns[l].length()));
-                // Re-run the pre-FFN RMS norm per position on the corrected h_post_attn.
-                // Uses the same norm weight (pre_ffn_weight_buf) and pipeline as step 6.
-                cmd = queue.new_command_buffer().to_owned();
-                {
-                    let enc = cmd.new_compute_command_encoder();
-                    let hidden_u32 = hidden as u32;
-                    let tg_threads = 256.min(hidden as u64);
-                    let h_stride_bytes = (hidden * 4) as u64;
-                    for pos in 0..seq_len {
-                        let h_off = pos as u64 * h_stride_bytes;
-                        enc.set_compute_pipeline_state(rms_norm_pipeline);
-                        enc.set_buffer(0, Some(&h_post_attns[l]), h_off);
-                        enc.set_buffer(1, Some(pre_ffn_weight_buf), 0);
-                        enc.set_buffer(2, Some(&ffn_norm_outs[l]), h_off);
-                        enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const c_void);
-                        enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
-                        enc.set_bytes(5, 4, &norm_offset as *const f32 as *const c_void);
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(1, 1, 1),
-                            MTLSize::new(tg_threads, 1, 1),
-                        );
-                    }
-                    enc.end_encoding();
-                }
-            }
         }
 
         // ── 7-9. FFN: gate+up → activation → down. Format-aware per position. ──

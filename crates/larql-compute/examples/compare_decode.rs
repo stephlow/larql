@@ -6,12 +6,12 @@
 extern crate blas_src;
 
 fn main() {
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        println!("Run with --features metal");
+        println!("Run on macOS with --features metal");
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k, quantize_to_q8};
         use larql_compute::prelude::*;
@@ -179,7 +179,6 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
-                ffn_is_remote: false,
             })
             .collect();
 
@@ -287,7 +286,6 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
-                ffn_is_remote: false,
             })
             .collect();
 

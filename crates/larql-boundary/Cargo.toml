@@ -23,3 +23,6 @@ name = "encode_decode"
 
 [[example]]
 name = "gate_decision"
+
+[[example]]
+name = "accuracy"

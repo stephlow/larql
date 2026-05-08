@@ -101,9 +101,9 @@ fn bench_format(
 
     let cpu = CpuBackend;
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     let metal = larql_compute::metal::MetalBackend::new();
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     if let Some(ref m) = metal {
         m.set_flop_threshold(1);
     }
@@ -118,7 +118,7 @@ fn bench_format(
 
         add_cell(&mut group, &cpu, "cpu", format, shape, &weights, &x);
 
-        #[cfg(feature = "metal")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         if let Some(ref m) = metal {
             add_cell(&mut group, m, "metal", format, shape, &weights, &x);
         }

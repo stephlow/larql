@@ -3,12 +3,12 @@
 //!
 //! cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {
-    eprintln!("This example requires --features metal");
+    eprintln!("This example requires macOS and --features metal");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() {
     let metal = larql_compute::metal::MetalBackend::new().expect("need metal");
     let bufs = metal.bufs();
@@ -135,7 +135,6 @@ fn main() {
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
-        ffn_is_remote: false,
     };
 
     // Test 1: All-Q4_K (synthetic, matching formats)
@@ -304,7 +303,6 @@ fn main() {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
-            ffn_is_remote: false,
         };
         let mut kv4 = metal.create_kv_cache(1, 4096, num_kv, head_dim);
         let r = larql_compute::metal::MetalBackend::decode_token(
@@ -395,7 +393,6 @@ fn main() {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
-            ffn_is_remote: false,
         };
         let mut kv5 = metal.create_kv_cache(1, 4096, num_kv, head_dim);
         let r = larql_compute::metal::MetalBackend::decode_token(

@@ -289,4 +289,48 @@ pub trait DecodeBackend {
     ) -> Option<Vec<f32>> {
         None
     }
+
+    /// Like `prefill_q4` but replaces one attention head's residual contribution
+    /// at `target_layer` with `replacement_delta` — the AHORD Mode D injection path.
+    ///
+    /// Uses the same KV cache + per-position RoPE setup as `prefill_q4`, so positional
+    /// encodings are correct for all seq_len positions. Default returns `None`; the
+    /// Metal backend overrides with the intervention-aware dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_q4_with_head_replacement(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        use_qk_norm: bool,
+        softcap: f32,
+        target_layer: usize,
+        target_head: usize,
+        replacement_delta: &[f32],
+    ) -> Option<Vec<f32>> {
+        let _ = (target_layer, target_head, replacement_delta);
+        self.prefill_q4(
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            use_qk_norm,
+            softcap,
+        )
+    }
 }

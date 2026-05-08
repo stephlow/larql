@@ -16,7 +16,7 @@
 //! Fused: same expression in one dispatch with no intermediate
 //! `inter`-sized activation buffer write/read.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

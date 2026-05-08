@@ -531,9 +531,7 @@ fn run_larql(
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         {
-            return Err(
-                "Metal backend requires the `metal` feature on macOS".into(),
-            );
+            return Err("Metal backend requires the `metal` feature on macOS".into());
         }
     } else {
         Box::new(larql_compute::CpuBackend)
@@ -770,8 +768,6 @@ fn run_engine_q4k(
     backend: Box<dyn larql_inference::ComputeBackend>,
     args: &BenchArgs,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    
-
     // We need two backend instances: one owned by the engine, one for Q4K calls.
     let want_metal_q4k = args.backends.contains("metal");
     let backend_for_q4k: Box<dyn larql_inference::ComputeBackend> = if want_metal_q4k {

@@ -197,7 +197,10 @@ async fn send_unassign(
             tracing::warn!(server_id, "Rebalancer: failed to send UnassignMsg: {e}");
         }
     } else {
-        tracing::warn!(server_id, "Rebalancer: no sender for server — already disconnected?");
+        tracing::warn!(
+            server_id,
+            "Rebalancer: no sender for server — already disconnected?"
+        );
     }
 }
 

@@ -10,7 +10,7 @@
 //! mapping within each simdgroup, and reduction are all identical.
 //! The only difference is how many rows a single TG produces.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

@@ -24,7 +24,7 @@
 //! These are kernel-level invariants — they don't depend on a real
 //! vindex and run in milliseconds.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

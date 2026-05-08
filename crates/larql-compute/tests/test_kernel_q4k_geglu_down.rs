@@ -17,7 +17,7 @@
 //! Fused:
 //!   `out[r] = Σᵢ W_down[r,i] * activation(gate[i]) * up[i]`
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

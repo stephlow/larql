@@ -5,12 +5,13 @@
 //! shard. The BF16 expert weights are dequantized on demand so only the
 //! selected experts pay the conversion cost.
 
-use super::cache::{cached_dequant, ExpertF32};
+use super::cache::{try_cached_dequant, ExpertF32};
 use super::math::{gelu_tanh, matmul_vec, matmul_vec_into, rms_norm, silu};
 use crate::cpu::ops::q4_common::q4k_matvec_into;
 use crate::cpu::ops::q4k_q8k_dot::{
     q4k_q8k_matvec_into, quantize_x_to_q8k, quantize_x_to_q8k_into, Q8KActivation,
 };
+use crate::options;
 // `q4k_q8k_gate_up_into` exists for future kernel exploration but is not
 // wired into the hot path — see comment in `run_single_expert_q4k_q8k_into`.
 
@@ -116,7 +117,7 @@ pub fn run_single_expert(
     // (kernel-debug A/B).
     if matches!(format, crate::QuantFormat::Q4_K)
         && hidden.is_multiple_of(256)
-        && std::env::var("LARQL_DISABLE_Q4K_DIRECT").is_err()
+        && !options::env_flag(options::ENV_DISABLE_Q4K_DIRECT)
     {
         thread_local! {
             static SCRATCH: std::cell::RefCell<Option<ExpertScratch>> =
@@ -156,7 +157,8 @@ pub fn run_single_expert(
         });
     }
 
-    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
+    let gate_up_w = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
+        .unwrap_or_else(|err| panic!("{err}"));
     if gate_up_w.is_empty() {
         return vec![0.0f32; hidden];
     }
@@ -178,7 +180,8 @@ pub fn run_single_expert(
         };
     }
 
-    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
+    let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
+        .unwrap_or_else(|err| panic!("{err}"));
     if down_w.is_empty() {
         return vec![0.0f32; hidden];
     }
@@ -227,7 +230,7 @@ pub fn run_single_expert_into<'s>(
     // gate; the env-var check is cached in TLS to avoid a syscall per call.
     thread_local! {
         static EXPERT_TIMING: bool =
-            std::env::var("LARQL_MOE_EXPERT_TIMING").is_ok();
+            options::env_flag(options::ENV_MOE_EXPERT_TIMING);
     }
     let timing = EXPERT_TIMING.with(|t| *t);
     let mut t = std::time::Instant::now();
@@ -239,7 +242,7 @@ pub fn run_single_expert_into<'s>(
     // we ship a NEON-vectorized version.
     thread_local! {
         static Q4K_DIRECT: bool =
-            std::env::var("LARQL_Q4K_DIRECT").is_ok();
+            options::env_flag(options::ENV_Q4K_DIRECT);
     }
     let q4k_direct = Q4K_DIRECT.with(|v| *v);
     let q4k_path = q4k_direct && matches!(format, crate::QuantFormat::Q4_K);
@@ -252,7 +255,8 @@ pub fn run_single_expert_into<'s>(
     let gate_up_w_arc: Option<ExpertF32> = if q4k_path {
         None
     } else {
-        let v = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
+        let v = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
+            .unwrap_or_else(|err| panic!("{err}"));
         if v.is_empty() {
             for v in scratch.out.iter_mut() {
                 *v = 0.0;
@@ -351,7 +355,8 @@ pub fn run_single_expert_into<'s>(
         t = std::time::Instant::now();
     }
 
-    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
+    let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
+        .unwrap_or_else(|err| panic!("{err}"));
     if down_w.is_empty() {
         for v in scratch.out.iter_mut() {
             *v = 0.0;
@@ -429,7 +434,7 @@ pub fn run_single_expert_q4k_q8k_into<'s>(
     // Per-stage timing for kernel diagnosis.  Enable with
     // `LARQL_KERNEL_TIMING=1`.  Cached in TLS to avoid syscall per call.
     thread_local! {
-        static KERNEL_TIMING: bool = std::env::var("LARQL_KERNEL_TIMING").is_ok();
+        static KERNEL_TIMING: bool = options::env_flag(options::ENV_KERNEL_TIMING);
     }
     let timing = KERNEL_TIMING.with(|t| *t);
 

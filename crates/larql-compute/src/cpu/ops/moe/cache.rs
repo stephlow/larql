@@ -41,8 +41,27 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use crate::options;
+
 /// LRU cache entry: dequantised expert weights.
 pub(super) type ExpertF32 = Arc<Vec<f32>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DequantError {
+    UnsupportedFormat(crate::QuantFormat),
+}
+
+impl std::fmt::Display for DequantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedFormat(format) => {
+                write!(f, "CPU MoE dequant does not support {format:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DequantError {}
 
 /// Cache key — in production the byte slice's start pointer is stable across
 /// the lifetime of the mmap, so different experts in the same packed tensor get
@@ -122,10 +141,7 @@ fn cell() -> &'static RwLock<Inner> {
         // Default 256: covers one token's working set on Gemma 4 26B-A4B
         // (30 MoE layers × top_k=8 = 240 distinct experts per token).
         // Prior default of 64 thrashed at ~100% miss rate. See module doc.
-        let cap = std::env::var("LARQL_MOE_CACHE_ENTRIES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(256);
+        let cap = options::env_usize(options::ENV_MOE_CACHE_ENTRIES).unwrap_or(256);
         RwLock::new(Inner::new(cap))
     })
 }
@@ -138,16 +154,23 @@ fn cell() -> &'static RwLock<Inner> {
 /// Concurrency: the hot path (cache hit) takes a *read* lock so any number of
 /// rayon threads can clone their Arcs in parallel.  Misses take a brief write
 /// lock only at insert time; the dequant itself runs lock-free.
-pub(super) fn cached_dequant(
+pub(super) fn try_cached_dequant(
     bytes: &[u8],
     format: crate::QuantFormat,
     expected_floats: usize,
-) -> ExpertF32 {
+) -> Result<ExpertF32, DequantError> {
+    if !matches!(
+        format,
+        crate::QuantFormat::BF16 | crate::QuantFormat::Q4_K | crate::QuantFormat::F32
+    ) {
+        return Err(DequantError::UnsupportedFormat(format));
+    }
+
     let key = cache_key(bytes);
     // Fast path: shared read lock — concurrent hits don't contend.
     if let Ok(inner) = cell().read() {
         if let Some(hit) = inner.get(key) {
-            return hit;
+            return Ok(hit);
         }
     }
     // Miss: dequantise OUTSIDE any lock, then take the write lock to insert.
@@ -160,17 +183,13 @@ pub(super) fn cached_dequant(
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
-        _ => {
-            // Other formats not yet wired into the CPU MoE expert path.
-            // Empty fallback → caller treats as a skipped expert.
-            Vec::new()
-        }
+        _ => unreachable!("unsupported formats return before cache lookup"),
     };
     let arc = Arc::new(decoded);
     if let Ok(mut inner) = cell().write() {
         inner.insert(key, arc.clone());
     }
-    arc
+    Ok(arc)
 }
 
 #[cfg(test)]
@@ -183,7 +202,7 @@ mod cache_format_tests {
     fn bf16_dispatch_round_trip() {
         // 4 BF16 values of 1.0 (0x3F80 little-endian = [0x80, 0x3F]).
         let bytes = vec![0x80u8, 0x3F, 0x80, 0x3F, 0x80, 0x3F, 0x80, 0x3F];
-        let out = cached_dequant(&bytes, QuantFormat::BF16, 4);
+        let out = try_cached_dequant(&bytes, QuantFormat::BF16, 4).unwrap();
         assert_eq!(out.len(), 4);
         for v in out.iter() {
             assert!((v - 1.0).abs() < 1e-3, "BF16 1.0 round-trip got {v}");
@@ -199,7 +218,7 @@ mod cache_format_tests {
         let bytes = crate::cpu::ops::q4_common::quantize_q4_k(&data);
         assert_eq!(bytes.len(), 144);
 
-        let out = cached_dequant(&bytes, QuantFormat::Q4_K, 256);
+        let out = try_cached_dequant(&bytes, QuantFormat::Q4_K, 256).unwrap();
         assert_eq!(out.len(), 256);
         let max_err: f32 = data
             .iter()
@@ -215,29 +234,26 @@ mod cache_format_tests {
     fn f32_dispatch_passthrough() {
         let data: Vec<f32> = vec![1.0, -2.5, 3.125, 0.0];
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let out = cached_dequant(&bytes, QuantFormat::F32, data.len());
+        let out = try_cached_dequant(&bytes, QuantFormat::F32, data.len()).unwrap();
         assert_eq!(out.len(), data.len());
         for (a, b) in data.iter().zip(&*out) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
     }
 
-    /// Unsupported formats fall back to empty (caller treats as skipped expert).
+    /// Unsupported formats fail explicitly instead of looking like a skipped expert.
     #[test]
-    fn unsupported_format_returns_empty() {
+    fn unsupported_format_returns_error() {
         let bytes = vec![0u8; 18];
-        let out = cached_dequant(&bytes, QuantFormat::Q4_0, 32);
-        assert!(
-            out.is_empty(),
-            "Q4_0 not implemented for MoE → empty fallback"
-        );
+        let err = try_cached_dequant(&bytes, QuantFormat::Q4_0, 32).unwrap_err();
+        assert_eq!(err, DequantError::UnsupportedFormat(QuantFormat::Q4_0));
     }
 
     /// Out-of-bounds Q4_K input returns empty (no panic).
     #[test]
     fn q4k_truncated_input_returns_empty() {
         let bytes = vec![0u8; 100]; // 100 < 144 = one super-block
-        let out = cached_dequant(&bytes, QuantFormat::Q4_K, 256);
+        let out = try_cached_dequant(&bytes, QuantFormat::Q4_K, 256).unwrap();
         assert!(out.is_empty(), "truncated Q4_K → empty (caller skips)");
     }
 
@@ -245,7 +261,7 @@ mod cache_format_tests {
     #[test]
     fn q4k_misaligned_length_returns_empty() {
         let bytes = vec![0u8; 144];
-        let out = cached_dequant(&bytes, QuantFormat::Q4_K, 200);
+        let out = try_cached_dequant(&bytes, QuantFormat::Q4_K, 200).unwrap();
         assert!(out.is_empty(), "expected_floats not a 256 multiple → empty");
     }
 
@@ -267,7 +283,7 @@ mod cache_format_tests {
             })
             .collect();
         for e in &entries {
-            let _ = cached_dequant(e, QuantFormat::BF16, 4);
+            let _ = try_cached_dequant(e, QuantFormat::BF16, 4).unwrap();
         }
 
         // 16 threads × 1000 lookups each, all on the same 4 keys.
@@ -279,7 +295,7 @@ mod cache_format_tests {
                 handles.push(s.spawn(move || {
                     for i in 0..1000 {
                         let idx = (tid + i) & 3; // 0..=3
-                        let out = cached_dequant(&entries[idx], QuantFormat::BF16, 4);
+                        let out = try_cached_dequant(&entries[idx], QuantFormat::BF16, 4).unwrap();
                         let expected = (idx + 1) as f32;
                         assert!(
                             out.iter().all(|v| (v - expected).abs() < 1e-3),

@@ -4,7 +4,7 @@
 //! threadgroup geometry changes (256 threads / 8 simdgroups / 8
 //! rows/TG vs the production 128 / 4 / 4). Output must be bit-equal.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

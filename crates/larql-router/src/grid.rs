@@ -12,8 +12,9 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    AckMsg, AnnounceMsg, Gap, GridService, LayerLatency, ModelCoverage, RouterMessage, RouterPayload,
-    ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest, StatusResponse,
+    AckMsg, AnnounceMsg, Gap, GridService, LayerLatency, ModelCoverage, RouterMessage,
+    RouterPayload, ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest,
+    StatusResponse,
 };
 
 // ── Per-server record ─────────────────────────────────────────────────────────
@@ -85,8 +86,7 @@ impl GridState {
         entry: ServerEntry,
         sender: mpsc::Sender<Result<RouterMessage, tonic::Status>>,
     ) {
-        self.serving_senders
-            .insert(entry.server_id.clone(), sender);
+        self.serving_senders.insert(entry.server_id.clone(), sender);
         self.register(entry);
     }
 
@@ -537,10 +537,7 @@ impl GridService for GridServiceImpl {
                                 last_seen: Instant::now(),
                                 layer_latencies: HashMap::new(),
                             };
-                            state
-                                .write()
-                                .await
-                                .register_with_sender(entry, tx.clone());
+                            state.write().await.register_with_sender(entry, tx.clone());
                             registered_model = Some((model_id, layer_start, layer_end));
 
                             let ack = RouterMessage {
@@ -623,10 +620,7 @@ impl GridService for GridServiceImpl {
                                 last_seen: std::time::Instant::now(),
                                 layer_latencies: HashMap::new(),
                             };
-                            state
-                                .write()
-                                .await
-                                .register_with_sender(entry, tx.clone());
+                            state.write().await.register_with_sender(entry, tx.clone());
                             registered_model =
                                 Some((r.model_id.clone(), r.layer_start, r.layer_end));
                             is_available = false;

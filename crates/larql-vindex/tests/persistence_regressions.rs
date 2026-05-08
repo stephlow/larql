@@ -3,7 +3,10 @@
 //! These tests are synthetic and architecture-agnostic: they exercise storage
 //! contracts without downloading models or assuming a model family.
 
-use larql_vindex::{FeatureMeta, GateIndex, VectorIndex, VindexConfig, VindexLayerInfo};
+use larql_vindex::format::filenames::{
+    DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, TOKENIZER_JSON, WEIGHT_MANIFEST_JSON,
+};
+use larql_vindex::{FeatureMeta, VectorIndex, VindexConfig, VindexLayerInfo};
 use ndarray::{Array1, Array2};
 use tempfile::tempdir;
 
@@ -13,11 +16,31 @@ const FEATURES_PER_LAYER: usize = 3;
 const INTERMEDIATE_SIZE: usize = 3;
 const VOCAB_SIZE: usize = 100;
 const DOWN_TOP_K: usize = 1;
-const TOKENIZER_JSON: &str =
+const MODEL_NAME: &str = "test";
+const MODEL_FAMILY: &str = "test";
+const MINIMAL_TOKENIZER_JSON: &str =
     r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+const LEGACY_DOWN_META_JSONL: &str = "down_meta.jsonl";
 
+const GATE_STRONG: f32 = 1.0;
+const GATE_HALF: f32 = 0.5;
+const GATE_NEGATIVE: f32 = -1.0;
+
+const TOKEN_PARIS: &str = "Paris";
 const META_PARIS_ID: u32 = 100;
+const META_PARIS_SCORE: f32 = 0.95;
+const TOKEN_FRENCH: &str = "French";
+const META_FRENCH_ID: u32 = 101;
+const META_FRENCH_SCORE: f32 = 0.88;
+const TOKEN_EUROPE: &str = "Europe";
+const META_EUROPE_ID: u32 = 102;
+const META_EUROPE_SCORE: f32 = 0.75;
+const TOKEN_BERLIN: &str = "Berlin";
 const META_BERLIN_ID: u32 = 200;
+const META_BERLIN_SCORE: f32 = 0.90;
+const TOKEN_SPAIN: &str = "Spain";
+const META_SPAIN_ID: u32 = 202;
+const META_SPAIN_SCORE: f32 = 0.70;
 const LEGACY_JSONL_TOKEN: &str = "Lisbon";
 const LEGACY_JSONL_TOKEN_ID: u32 = 321;
 const LEGACY_JSONL_SCORE: f32 = 0.77;
@@ -36,7 +59,10 @@ const COMPACT_HIDDEN_SIZE: usize = 8;
 const COMPACT_INTERMEDIATE_SIZE: usize = 4;
 const COMPACT_VOCAB_SIZE: usize = 16;
 const COMPACT_MODEL_TYPE: &str = "llama";
+const COMPACT_MODEL_NAME: &str = "test/compact";
 const COMPACT_ERROR_FRAGMENT: &str = "compact FFN vindexes";
+const COMPACT_ROPE_BASE: f64 = 10000.0;
+const EMPTY_WEIGHT_MANIFEST_JSON: &str = "[]";
 
 fn make_top_k(token: &str, id: u32, logit: f32) -> larql_models::TopKEntry {
     larql_models::TopKEntry {
@@ -57,25 +83,25 @@ fn make_meta(token: &str, id: u32, score: f32) -> FeatureMeta {
 
 fn test_index() -> VectorIndex {
     let mut gate0 = Array2::<f32>::zeros((FEATURES_PER_LAYER, HIDDEN_SIZE));
-    gate0[[0, 0]] = 1.0;
-    gate0[[1, 1]] = 1.0;
-    gate0[[2, 2]] = 1.0;
+    gate0[[0, 0]] = GATE_STRONG;
+    gate0[[1, 1]] = GATE_STRONG;
+    gate0[[2, 2]] = GATE_STRONG;
 
     let mut gate1 = Array2::<f32>::zeros((FEATURES_PER_LAYER, HIDDEN_SIZE));
-    gate1[[0, 3]] = 1.0;
-    gate1[[1, 0]] = 0.5;
-    gate1[[1, 1]] = 0.5;
-    gate1[[2, 2]] = -1.0;
+    gate1[[0, 3]] = GATE_STRONG;
+    gate1[[1, 0]] = GATE_HALF;
+    gate1[[1, 1]] = GATE_HALF;
+    gate1[[2, 2]] = GATE_NEGATIVE;
 
     let meta0 = vec![
-        Some(make_meta("Paris", META_PARIS_ID, 0.95)),
-        Some(make_meta("French", 101, 0.88)),
-        Some(make_meta("Europe", 102, 0.75)),
+        Some(make_meta(TOKEN_PARIS, META_PARIS_ID, META_PARIS_SCORE)),
+        Some(make_meta(TOKEN_FRENCH, META_FRENCH_ID, META_FRENCH_SCORE)),
+        Some(make_meta(TOKEN_EUROPE, META_EUROPE_ID, META_EUROPE_SCORE)),
     ];
     let meta1 = vec![
-        Some(make_meta("Berlin", META_BERLIN_ID, 0.90)),
+        Some(make_meta(TOKEN_BERLIN, META_BERLIN_ID, META_BERLIN_SCORE)),
         None,
-        Some(make_meta("Spain", 202, 0.70)),
+        Some(make_meta(TOKEN_SPAIN, META_SPAIN_ID, META_SPAIN_SCORE)),
     ];
 
     VectorIndex::new(
@@ -87,14 +113,14 @@ fn test_index() -> VectorIndex {
 }
 
 fn write_minimal_tokenizer(dir: &std::path::Path) {
-    std::fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
+    std::fs::write(dir.join(TOKENIZER_JSON), MINIMAL_TOKENIZER_JSON).unwrap();
 }
 
 fn test_vindex_config(dtype: larql_vindex::StorageDtype) -> VindexConfig {
     VindexConfig {
         version: 2,
-        model: "test".into(),
-        family: "test".into(),
+        model: MODEL_NAME.into(),
+        family: MODEL_FAMILY.into(),
         num_layers: NUM_LAYERS,
         hidden_size: HIDDEN_SIZE,
         intermediate_size: INTERMEDIATE_SIZE,
@@ -119,12 +145,13 @@ fn gate_file_bytes(dtype_bytes: usize) -> u64 {
     (NUM_LAYERS * FEATURES_PER_LAYER * HIDDEN_SIZE * dtype_bytes) as u64
 }
 
-fn layer_info(
-    layer: usize,
-    offset: u64,
-    length: u64,
-    moe_fields: bool,
-) -> VindexLayerInfo {
+fn dim0_query() -> Array1<f32> {
+    let mut query = vec![0.0; HIDDEN_SIZE];
+    query[0] = GATE_STRONG;
+    Array1::from_vec(query)
+}
+
+fn layer_info(layer: usize, offset: u64, length: u64, moe_fields: bool) -> VindexLayerInfo {
     VindexLayerInfo {
         layer,
         num_features: FEATURES_PER_LAYER,
@@ -144,7 +171,7 @@ fn save_vindex_preserves_f16_gate_dtype() {
     let mut config = test_vindex_config(larql_vindex::StorageDtype::F16);
     idx.save_vindex(dir.path(), &mut config).unwrap();
 
-    let gate_size = std::fs::metadata(dir.path().join("gate_vectors.bin"))
+    let gate_size = std::fs::metadata(dir.path().join(GATE_VECTORS_BIN))
         .unwrap()
         .len();
     assert_eq!(gate_size, gate_file_bytes(F16_BYTES));
@@ -152,8 +179,8 @@ fn save_vindex_preserves_f16_gate_dtype() {
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let loaded = VectorIndex::load_vindex(dir.path(), &mut cb).unwrap();
-    let query = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
-    let hits = loaded.gate_knn(0, &query, 1);
+    let query = dim0_query();
+    let hits = loaded.gate_knn(0, &query, DOWN_TOP_K);
     assert_eq!(hits[0].0, 0);
 }
 
@@ -231,7 +258,7 @@ fn load_vindex_falls_back_to_legacy_down_meta_jsonl() {
         }],
     });
     std::fs::write(
-        dir.path().join("down_meta.jsonl"),
+        dir.path().join(LEGACY_DOWN_META_JSONL),
         serde_json::to_string(&legacy_record).unwrap(),
     )
     .unwrap();
@@ -260,7 +287,7 @@ fn load_vindex_rejects_truncated_down_meta_bin() {
     bytes.extend_from_slice(&(NUM_LAYERS as u32).to_le_bytes());
     bytes.extend_from_slice(&(DOWN_TOP_K as u32).to_le_bytes());
     bytes.extend_from_slice(&DOWN_META_TRUNCATED_FEATURES.to_le_bytes());
-    std::fs::write(dir.path().join("down_meta.bin"), bytes).unwrap();
+    std::fs::write(dir.path().join(DOWN_META_BIN), bytes).unwrap();
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let err = match VectorIndex::load_vindex(dir.path(), &mut cb) {
@@ -279,7 +306,7 @@ fn compact_model_config() -> larql_vindex::VindexModelConfig {
         head_dim: COMPACT_HIDDEN_SIZE,
         num_q_heads: 1,
         num_kv_heads: 1,
-        rope_base: 10000.0,
+        rope_base: COMPACT_ROPE_BASE,
         sliding_window: None,
         moe: None,
         global_head_dim: None,
@@ -301,7 +328,7 @@ fn load_model_weights_rejects_compact_missing_dense_ffn() {
     let dir = tempdir().unwrap();
     let mut config = VindexConfig {
         version: 2,
-        model: "test/compact".into(),
+        model: COMPACT_MODEL_NAME.into(),
         family: COMPACT_MODEL_TYPE.into(),
         source: None,
         dtype: larql_vindex::StorageDtype::F32,
@@ -325,7 +352,7 @@ fn load_model_weights_rejects_compact_missing_dense_ffn() {
     let gate = vec![0.0f32; COMPACT_NUM_LAYERS * COMPACT_INTERMEDIATE_SIZE * COMPACT_HIDDEN_SIZE];
     let gate_bytes =
         larql_vindex::config::dtype::encode_floats(&gate, larql_vindex::StorageDtype::F32);
-    std::fs::write(dir.path().join("gate_vectors.bin"), gate_bytes).unwrap();
+    std::fs::write(dir.path().join(GATE_VECTORS_BIN), gate_bytes).unwrap();
 
     let compact_layer_len = (COMPACT_INTERMEDIATE_SIZE * COMPACT_HIDDEN_SIZE * F32_BYTES) as u64;
     config.layers = vec![
@@ -351,8 +378,12 @@ fn load_model_weights_rejects_compact_missing_dense_ffn() {
     let embed = vec![0.0f32; COMPACT_VOCAB_SIZE * COMPACT_HIDDEN_SIZE];
     let embed_bytes =
         larql_vindex::config::dtype::encode_floats(&embed, larql_vindex::StorageDtype::F32);
-    std::fs::write(dir.path().join("embeddings.bin"), embed_bytes).unwrap();
-    std::fs::write(dir.path().join("weight_manifest.json"), "[]").unwrap();
+    std::fs::write(dir.path().join(EMBEDDINGS_BIN), embed_bytes).unwrap();
+    std::fs::write(
+        dir.path().join(WEIGHT_MANIFEST_JSON),
+        EMPTY_WEIGHT_MANIFEST_JSON,
+    )
+    .unwrap();
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let err = match larql_vindex::load_model_weights(dir.path(), &mut cb) {

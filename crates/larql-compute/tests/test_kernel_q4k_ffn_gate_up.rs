@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `q4k_ffn_gate_up` — the fused gate+up matvec
 //! that runs once per layer in production Q4_K decode.

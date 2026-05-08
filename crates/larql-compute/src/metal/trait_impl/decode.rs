@@ -138,14 +138,14 @@ impl DecodeBackend for MetalBackend {
             Some(&self.q4k_qkv_proj_pipeline.state),
             Some(&self.q4kf_qkv_proj_pipeline.state),
             Some(&self.q4kf_proj_pipeline.state),
-            None,
+            Some(&self.rope_at_pos_pipeline), // per-position RoPE — required for seq_len > 1
             Some(&self.qk_norm_pipeline),
             Some(&self.scale_vector_pipeline),
             Some(&self.q4k_geglu_silu_down_pipeline),
             Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
             Some(&self.q6k_geglu_silu_down_pipeline),
             Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
-            None, // no KV cache for prefill
+            None, // no KV cache — stateless prefill, each prompt independent
             layers,
             x,
             hidden,
@@ -210,8 +210,9 @@ impl DecodeBackend for MetalBackend {
         };
 
         // Concrete macro to avoid duplicating the 30-param dispatch call.
+        // Second parameter is the optional PipelineIntervention for head replacement.
         macro_rules! run_dispatch {
-            ($moe_fn:expr) => {
+            ($moe_fn:expr, $intervention:expr) => {
                 ops::full_pipeline::dispatch_full_pipeline(
                     &self.queue,
                     &self.bufs,
@@ -256,7 +257,7 @@ impl DecodeBackend for MetalBackend {
                     use_qk_norm,
                     softcap,
                     $moe_fn,
-                    None, // intervention: no head replacement in prefill path
+                    $intervention,
                 )
             };
         }
@@ -318,12 +319,121 @@ impl DecodeBackend for MetalBackend {
                     }
                 }
             };
-            return Some(run_dispatch!(Some(
-                &mut moe_closure as &mut dyn FnMut(usize, &[f32], &mut [f32])
-            )));
+            return Some(run_dispatch!(
+                Some(&mut moe_closure as &mut dyn FnMut(usize, &[f32], &mut [f32])),
+                None
+            ));
         }
 
-        Some(run_dispatch!(None))
+        Some(run_dispatch!(None, None))
+    }
+
+    fn prefill_q4_with_head_replacement(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        use_qk_norm: bool,
+        softcap: f32,
+        target_layer: usize,
+        target_head: usize,
+        replacement_delta: &[f32],
+    ) -> Option<Vec<f32>> {
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            crate::metal::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
+        let has_moe = layers.iter().any(|l| l.moe.is_some());
+        if has_moe {
+            // MoE + intervention not yet supported — fall back to non-intervention prefill.
+            drop(cache_guard);
+            return self.prefill_q4(
+                layers,
+                x,
+                hidden,
+                inter,
+                q_dim,
+                kv_dim,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                rope_base,
+                use_qk_norm,
+                softcap,
+            );
+        }
+        let geglu = if layers
+            .first()
+            .is_some_and(|l| l.activation == crate::Activation::GeluTanh)
+        {
+            &self.geglu_gelu_tanh_pipeline
+        } else {
+            &self.geglu_pipeline
+        };
+        let intervention = ops::full_pipeline::PipelineIntervention {
+            target_layer,
+            target_head,
+            head_dim,
+            num_q_heads,
+            replacement_delta,
+        };
+        Some(ops::full_pipeline::dispatch_full_pipeline(
+            &self.queue,
+            &self.bufs,
+            &self.q4,
+            geglu,
+            &self.geglu_gelu_tanh_pipeline,
+            &self.silu_pipeline,
+            &self.gelu_tanh_pipeline,
+            &self.q8_quant_pipeline,
+            Some(&self.fused_attn_pipeline),
+            &self.q8_matvec_pipeline.state,
+            &self.q8_qkv_proj_pipeline.state,
+            &self.q4k_matvec_pipeline,
+            Some(&self.q4k_matmul_pipeline),
+            &self.q6k_matvec_pipeline,
+            &self.rms_norm_pipeline,
+            &self.residual_add_pipeline,
+            &self.rms_norm_q8_pipeline,
+            &self.residual_norm_q8_pipeline,
+            Some(&self.q4k_qkv_proj_pipeline.state),
+            Some(&self.q4kf_qkv_proj_pipeline.state),
+            Some(&self.q4kf_proj_pipeline.state),
+            Some(&self.rope_at_pos_pipeline),
+            Some(&self.qk_norm_pipeline),
+            Some(&self.scale_vector_pipeline),
+            Some(&self.q4k_geglu_silu_down_pipeline),
+            Some(&self.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.q6k_geglu_silu_down_pipeline),
+            Some(&self.q6k_geglu_gelu_tanh_down_pipeline),
+            Some(kv),
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            use_qk_norm,
+            softcap,
+            None,                // no MoE callback
+            Some(&intervention), // head replacement
+        ))
     }
 
     fn has_kv_cache(&self) -> bool {

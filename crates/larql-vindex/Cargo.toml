@@ -39,8 +39,8 @@ memmap2 = "0.9"
 libc = "0.2"
 
 # HuggingFace Hub integration
-hf-hub = "0.5"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [features]
 default = []

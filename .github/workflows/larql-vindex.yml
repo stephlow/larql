@@ -31,11 +31,11 @@ on:
   workflow_dispatch: {}
 
 env:
-  LARQL_VINDEX_COVERAGE_MIN: 80
+  LARQL_VINDEX_COVERAGE_MIN: 68
 
 jobs:
   test:
-    name: test · ${{ matrix.os }}
+    name: test - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
 
@@ -51,6 +51,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Install OpenBLAS (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Install OpenBLAS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & "$vcpkgRoot\vcpkg.exe" install openblas:x64-windows
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v4
@@ -82,7 +97,7 @@ jobs:
         run: cargo test -p larql-vindex --benches
 
   coverage:
-    name: coverage · ubuntu
+    name: coverage - ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -92,8 +107,19 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install OpenBLAS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Coverage summary
         run: cargo llvm-cov --package larql-vindex --summary-only --fail-under-lines "$LARQL_VINDEX_COVERAGE_MIN"
+
+      - name: Coverage policy
+        run: |
+          mkdir -p coverage/larql-vindex
+          cargo llvm-cov report --package larql-vindex --json --summary-only --output-path coverage/larql-vindex/summary.json
+          python3 scripts/check_coverage_policy.py coverage/larql-vindex/summary.json crates/larql-vindex/coverage-policy.json

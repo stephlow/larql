@@ -32,6 +32,7 @@ pub const NORMS_BIN: &str = "norms.bin";
 // ── Gate vectors ───────────────────────────────────────────────────────
 pub const GATE_VECTORS_BIN: &str = "gate_vectors.bin";
 pub const GATE_VECTORS_Q4_BIN: &str = "gate_vectors_q4.bin";
+pub const ROUTER_WEIGHTS_BIN: &str = "router_weights.bin";
 
 // ── Down meta + feature-major projections ──────────────────────────────
 pub const DOWN_META_BIN: &str = "down_meta.bin";
@@ -149,6 +150,7 @@ mod tests {
             NORMS_BIN,
             GATE_VECTORS_BIN,
             GATE_VECTORS_Q4_BIN,
+            ROUTER_WEIGHTS_BIN,
             GATE_VECTORS_FP4_BIN,
             DOWN_META_BIN,
             DOWN_FEATURES_BIN,

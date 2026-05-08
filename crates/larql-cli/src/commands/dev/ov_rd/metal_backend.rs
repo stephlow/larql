@@ -35,6 +35,21 @@ pub(super) fn init(use_metal: bool) -> Option<Backend> {
     }
 }
 
+/// Run a full baseline forward pass on Metal — no intervention, all heads intact.
+///
+/// Returns the hidden state for ALL positions `[seq_len × hidden]`.
+/// Returns `None` if the backend does not support the path; callers fall back to CPU.
+pub(super) fn try_metal_baseline(
+    weights: &larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &larql_vindex::VectorIndex,
+    backend: &Backend,
+) -> Option<ndarray::Array2<f32>> {
+    larql_inference::vindex::predict_q4k_metal_hidden(
+        weights, token_ids, index, backend.as_ref(),
+    )
+}
+
 /// Run the Metal head-replacement forward pass.
 ///
 /// Returns `None` if the backend is not provided or the GPU path fails —

@@ -18,6 +18,7 @@ This file tracks the demo narrative, the critical path, and cross-crate sequenci
 | [larql-core](crates/larql-core/ROADMAP.md) | Graph data model, algorithms, serialization |
 | [larql-vindex](crates/larql-vindex/ROADMAP.md) | Vindex format, storage, extraction |
 | [larql-models](crates/larql-models/ROADMAP.md) | Architecture definitions, model loading |
+| larql-boundary | Confidence-gated BOUNDARY ref codec; cold-context residual storage |
 
 ---
 
@@ -37,6 +38,8 @@ This file tracks the demo narrative, the critical path, and cross-crate sequenci
 - **Criterion benchmarks** (2026-05-07): `make bench-wire` (wire codec encode/decode MB/s) and `make bench-routing` (route/heartbeat/rebuild ns/op). `larql-router` now has a library crate (`larql_router::grid`) for test/bench use.
 - **Dynamic rebalancing** (2026-05-08): `rebalancer.rs` background task with configurable threshold (--rebalance-interval, --rebalance-threshold). Router detects sustained per-layer latency imbalance and sends `UnassignMsg` to the slow shard; server drains in-flight requests (up to 30s), sends `DroppingMsg`, and re-enters available pool. Real `requests_in_flight` counter wired into heartbeats via `RifGuard` in walk_ffn handler.
 - **CI regression gate** (2026-05-08): `scripts/bench-grid-regress.sh` + `scripts/bench_compare.py` + `bench/baselines/`. First run auto-saves baseline; subsequent runs fail if tok/s drops >5% or p99 rises >10%.
+- **Shannon arc closed** (2026-05-08): Exps 42–44 prove cross-entropy is a real wire format (Exp 42: 2.0 bits/char vs 6.3 gzip), residual stream is compressible (Exp 43: int8-clip3σ, 98.7% top-1, KL=2.0 nats), gate calibrated at threshold=2.16 (Exp 44: accept=68.9%, early-div=4.8%).
+- **`larql-boundary` crate shipped** (2026-05-08): Phases 1–3 of BOUNDARY_REF_PROTOCOL. int8-clip3σ + bf16 codec, per-boundary confidence metadata, calibrated confidence gate. 100% function coverage, CI on Linux/Windows/macOS, 3 examples (encode_decode, gate_decision, accuracy). Phase 4 (server integration) not started.
 
 ---
 
@@ -242,11 +245,52 @@ Items in order. Each depends on the one above it.
 
 Items 1–2 are needed for Act 1. Item 3's MoE performance gate landed
 2026-05-02: 26B A4B Metal now runs at 19.4 tok/s (was 5.1, bug-locked
-under the dispatch-geometry mismatch in `moe_dispatch.rs`). SKIP_MOE
-ceiling 56.8 tok/s — remaining headroom is real expert-dispatch work,
-not allocation. Items 4–10 are needed for Act 2. See
+under the dispatch-geometry mismatch in `moe_dispatch.rs`).
+`LARQL_SKIP_MOE=1` ceiling 56.8 tok/s — remaining headroom is real
+expert-dispatch work, not allocation. Items 4–10 are needed for Act 2. See
 `larql-vindex/ROADMAP.md P0` and `larql-server/ROADMAP.md` (F-COLLECT,
 F-LOCAL-MOE, G-SCALE) for the next levers.
+
+---
+
+## P1 — Boundary refs and cold-context storage
+
+Driver: replace unbounded KV retention in long-context and multi-host scenarios
+with compact, contract-bearing residual checkpoints. Hot KV window stays bounded;
+older context is represented as 2564-byte compressed residual frames.
+
+```
+KV for the present. Residual boundaries for memory.
+```
+
+Foundation: `crates/larql-boundary/` (Phases 1–3 shipped).  
+Protocol spec: `experiments/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`.  
+Calibration data: `experiments/44_boundary_gate_calibration/`.
+
+The existing `BoundaryStore` in `larql-inference/src/trace/boundary.rs` stores raw
+bf16 residuals. `larql-boundary` adds the 2× compressed path on top of it. Phase 4
+connects them to the running server.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| BR1 | int8-clip3σ + bf16 codec (Phase 1) | larql-boundary | **shipped** |
+| BR2 | Per-boundary metadata + calibrated gate at threshold=2.16 (Phase 2–3) | larql-boundary | **shipped** |
+| BR3 | BoundaryFrame wire format + A/B/C/D/E contract taxonomy | larql-boundary | **shipped** |
+| BR4 | Phase 4: bounded KV eviction + durability-first capture (Option A) | larql-server + larql-inference | not started |
+| BR5 | Phase 4: boundary archive (disk/remote) + restore path | larql-server + larql-inference | not started |
+| BR6 | Phase 5: boundary frames over gRPC grid (protobuf schema defined) | larql-router + larql-server | not started |
+| BR7 | Track B: per-channel codec (int4 + outlier side-channel, ≤1024 bytes) | larql-boundary | not started |
+| BR8 | Gate calibration n≥300 to tighten 95% CI below 1.6%–10.7% | experiments/44 | not started |
+
+**What D-@high actually contracts:** first ~5 continuation tokens safe at 4.8%
+early-div (95% CI 1.6%–10.7%, n=62). Total 20-token divergence is ~20% regardless
+of threshold — cascade compounds past step 5. Use for boundary-to-fresh-decode; not
+for long uninterrupted continuation. See BOUNDARY_REF_PROTOCOL §6.
+
+**Immediate unblocking item:** BR4 (Phase 4 server integration). The eviction
+ordering decision (durability-first Option A: capture → gate → fsync → evict KV)
+is specified in the protocol; implementation in `larql-server` can start from it
+directly.
 
 ---
 

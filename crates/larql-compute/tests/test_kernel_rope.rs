@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for the three RoPE shader variants
 //! (`metal/shaders/rope.rs`):

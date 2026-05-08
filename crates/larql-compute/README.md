@@ -246,14 +246,26 @@ src/
 ## Tests
 
 ```bash
-# CPU only
-cargo test -p larql-compute
+# Fast inner loop: lib tests + backend API contract, no integration-binary crawl.
+make larql-compute-test-fast
 
-# CPU + Metal (full kernel + cross-backend coverage)
+# Heavy integration sweep: every test binary under crates/larql-compute/tests.
+make larql-compute-test-integration
+
+# CPU + Metal on macOS (full kernel + cross-backend coverage)
 cargo test -p larql-compute --features metal
+
+# Cross-platform compile checks used before CI handoff.
+cargo check -p larql-compute --all-targets
+cargo check -p larql-compute --all-targets --features metal  # macOS only
 ```
 
-**241 tests** with `--features metal` across 18 test files:
+`cargo test -p larql-compute` remains valid, but it walks every integration
+test binary. Prefer `make larql-compute-test-fast` while iterating on CPU
+MoE, backend traits, and quant dispatch.
+
+The integration suite currently has 28 test binaries plus a shared helper
+module under `tests/common`. With `--features metal`, it covers:
 
 - `test_metal_shaders.rs` — compilation, Q4/Q6 matvec, fused attention smoke, LayerNorm, qk_norm, q4kf projection
 - `test_kernel_fused_ops_norms.rs` — rms_norm, residual ops, cooperative SIMD reduction, quantize_q8
@@ -284,7 +296,7 @@ The cross-backend / cross-stage parity layer lives in `larql-inference`:
 
 ## Examples
 
-Nine examples in three groups — see [`examples/README.md`](examples/README.md) for a one-line description of each.
+Eleven examples in three groups — see [`examples/README.md`](examples/README.md) for a one-line description of each.
 
 ```bash
 # Demos (teach the API)
@@ -300,7 +312,9 @@ cargo run --release --features metal -p larql-compute --example compare_pipeline
 cargo run --release --features metal -p larql-compute --example compare_ollama      # Head-to-head vs Ollama
 
 # Diagnostic
-cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
+cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
+cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+cargo run --release --features metal -p larql-compute --example diag_shader_bench
 ```
 
 The headline tok/s vs Ollama uses the CLI's `bench` subcommand against a real vindex:
@@ -320,13 +334,10 @@ Three Criterion benches — see [`benches/README.md`](benches/README.md):
 | `linalg` | Cholesky + ridge solve |
 
 ```bash
-make bench           # run all three
-make bench-save      # record a baseline named `main`
-make bench-check     # re-run; fail if any cell regressed
+make bench-compute   # quant_matvec Criterion bench with Metal
+cargo bench -p larql-compute --bench matmul
+cargo bench -p larql-compute --bench linalg
 ```
-
-The detector lives in `scripts/bench-regress.sh`; CI starter at
-`.github/workflows/bench-regress.yml`.
 
 ## Diagnostics: parity bisect
 

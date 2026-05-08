@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `kv_cache_append` and the prefill→decode KV cache
 //! layout/stride hand-off.

@@ -565,7 +565,7 @@ Walk is **faster than dense** (517ms vs 535ms). GPU Q4K decode is **23× faster*
 | **Local Metal MoE** | **18.9** | Measured 2026-05-04; MoE experts on CPU NEON. |
 | 1-shard CPU/grid (loopback) | 18.3 | NEON Q4_K matvec on shard server, gRPC fan-in |
 | 2-shard CPU/grid (loopback) | 17.3 | Parallel collect + parallel fire (`std::thread::scope` + `rayon::par_iter`) |
-| SKIP_MOE ceiling | 56.8 | Attention + dense FFN only; theoretical max |
+| `LARQL_SKIP_MOE=1` ceiling | 56.8 | Attention + dense FFN only; theoretical max |
 
 **Wire format (2026-05-07)**: grid traffic uses f16 by default (50% bandwidth). Set `LARQL_I8_WIRE=1` for i8 symmetric quantisation (75% bandwidth, opt-in). Both are architecture-agnostic — `hidden_size` is read from vindex config at runtime. Per-layer latency is tracked via `HeartbeatMsg.layer_stats` (EMA + p99); the router uses it to route replicated layers to the lowest-latency server. Use `make bench-wire` to measure codec throughput and `make bench-routing` for routing hot-path.
 
@@ -736,7 +736,17 @@ cargo test                               # all tests across all crates
 cargo test -p larql-inference            # inference engine tests (109 tests)
 cargo test -p larql-inference --features metal  # + Metal GPU tests (115 tests)
 cargo test -p larql-lql                  # LQL parser + executor tests (272 tests)
-cargo test -p larql-vindex               # vindex storage + patch tests (104 tests)
+cargo test -p larql-vindex               # vindex storage + patch tests (515 tests as of 2026-05-08)
+
+# Crate-local CI shortcuts
+make larql-vindex-ci                     # fmt, clippy, tests, examples, benches, coverage policy
+make larql-vindex-test                   # cargo test -p larql-vindex
+make larql-vindex-fmt-check              # cargo fmt -p larql-vindex -- --check
+make larql-vindex-lint                   # cargo clippy -p larql-vindex --all-targets -- -D warnings
+make larql-vindex-examples               # cargo check -p larql-vindex --examples
+make larql-vindex-bench-test             # cargo test -p larql-vindex --benches
+make larql-vindex-coverage-summary       # aggregate + per-file coverage ratchet
+make larql-vindex-coverage-html          # HTML report plus the same policy gate
 
 # Inference engine examples
 cargo run --release -p larql-inference --example attention_demo    # fused attention demo
@@ -778,6 +788,7 @@ cargo bench -p larql-lql    --bench parser               # parse_single × 18 + 
 cargo bench -p larql-lql    --bench executor             # SELECT, SHOW, DELETE, UPDATE, patch lifecycle
 cargo bench -p larql-lql    --bench compile              # COMPILE INTO VINDEX bake cost
 cargo bench -p larql-vindex --bench vindex_ops           # KNN, walk, save/load, mutate, MoE
+make larql-vindex-bench                                  # shortcut for vindex_ops
 cargo bench -p larql-vindex --bench vindex_scaling       # production-dim KNN (Gemma/Llama/Mixtral)
 cargo bench -p larql-vindex --bench memit_solve          # ridge decomposition throughput
 cargo bench -p larql-vindex --bench extract_throughput   # streaming extract: f32 vs Q4K write-path

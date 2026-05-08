@@ -10,7 +10,7 @@
 //! backend is available (no-op skip otherwise so CI on non-macOS
 //! workflows doesn't false-fail).
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

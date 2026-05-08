@@ -31,7 +31,10 @@ pub use interventions::{
     predict_q4k_hidden_with_replaced_pre_o_head, predict_q4k_hidden_with_subtracted_pre_o_heads,
     predict_q4k_hidden_with_zeroed_pre_o_heads,
 };
-pub use metal::{predict_q4k_metal, predict_q4k_metal_with_replaced_head_residual_delta};
+pub use metal::{
+    predict_q4k_metal, predict_q4k_metal_hidden,
+    predict_q4k_metal_with_replaced_head_residual_delta,
+};
 pub use remote_ffn::{predict_q4k_hidden_with_ffn, predict_q4k_with_ffn};
 pub use tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
 pub use walk_ffn::{q4k_ffn_forward_layer, q4k_ffn_forward_layer_q8k};

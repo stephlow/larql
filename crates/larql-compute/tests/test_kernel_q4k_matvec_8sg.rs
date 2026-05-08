@@ -2,7 +2,7 @@
 //! identical to the production 4sg kernel; only TG geometry changes.
 //! Output must be bit-equal.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

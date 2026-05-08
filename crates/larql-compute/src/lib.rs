@@ -61,6 +61,7 @@ extern crate blas_src;
 
 pub mod backend;
 pub mod cpu;
+pub mod options;
 pub mod pipeline;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

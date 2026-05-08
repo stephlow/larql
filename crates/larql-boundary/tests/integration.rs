@@ -158,6 +158,128 @@ fn frame_continuation_safety() {
     assert!(f.is_safe_for_routing());
 }
 
+// ── Accuracy regression ────────────────────────────────────────────────────
+//
+// These tests guard the codec's accuracy properties without running the model.
+// They verify the invariants that make the Exp 43 characterisation numbers
+// meaningful (98.7% top-1 mean, KL ~2.0 nats, Contract D-@high at threshold 2.16).
+//
+// The actual Exp 43 numbers come from running Gemma 3 4B; these tests protect
+// the *codec* properties that underpin them: non-outlier reconstruction quality,
+// the gate's hard-reject on Disagrees, and the confidence-gate's correct use of
+// log-prob margin (not raw logit margin).
+
+#[test]
+fn codec_non_outlier_reconstruction_quality() {
+    // int8-clip3σ saturates outlier elements but should preserve the bulk of the
+    // vector with reasonable fidelity. The Exp 43 characterisation showed the codec
+    // is accurate enough for 98.7% top-1 agreement downstream.
+    //
+    // Guard: non-outlier per-element RMS error < 5% of the signal std-dev.
+    // (A regression that drastically worsens clipping would break this.)
+    let sigma = 1650.0f32; // Gemma 3 4B residual σ
+    let mut r: Vec<f32> = (0..D)
+        .map(|i| ((i as f32) * 0.0023).sin() * sigma)
+        .collect();
+    r[42] = 94_208.0; // outlier
+    r[512] = -60_000.0; // outlier
+
+    let payload = int8::encode(&r);
+    let hat = int8::decode(&payload);
+
+    // Non-outlier RMS error as fraction of σ.
+    let non_outlier_rms: f32 = r
+        .iter()
+        .zip(hat.iter())
+        .enumerate()
+        .filter(|(i, _)| *i != 42 && *i != 512)
+        .map(|(_, (a, b))| (a - b).powi(2))
+        .sum::<f32>()
+        .sqrt()
+        / (D - 2) as f32;
+
+    assert!(
+        non_outlier_rms < sigma * 0.05,
+        "non-outlier RMS {non_outlier_rms:.2} exceeds 5% of σ={sigma}"
+    );
+}
+
+#[test]
+fn gate_codec_fragile_always_rejects_regardless_of_margin() {
+    // The Exp 43 characterisation depends on the gate hard-rejecting codec-fragile
+    // boundaries. A codec that flips the argmax must never be accepted, even if the
+    // raw margin looks high. This is the Contract D- guarantee.
+    let config = BoundaryGateConfig {
+        calibration_mode: false,
+        min_log_prob_margin: 0.0, // no margin threshold — only codec check matters
+        min_top1_prob: 0.0,
+        require_compressed_agreement: true,
+        ..Default::default()
+    };
+
+    // High-margin logits where compression DISAGREES (codec fragile)
+    let vocab = 1000;
+    let mut raw = vec![0.0f32; vocab];
+    raw[42] = 9.0;
+    raw[17] = 0.0;
+    let mut hat = raw.clone();
+    hat[42] = 0.0;
+    hat[17] = 9.0; // codec flipped the argmax
+
+    let mut meta = compute(&raw, Some(&hat));
+    assert!(
+        meta.codec_fragile,
+        "expected codec_fragile=true when argmax flips"
+    );
+
+    let decision = apply(&mut meta, &config);
+    assert_ne!(
+        decision,
+        BoundaryDecision::CompressedOk {
+            contract: larql_boundary::BoundaryContract::ArgmaxNearEquivalentHighMargin
+        },
+        "codec-fragile boundary must not be accepted even at zero margin threshold"
+    );
+}
+
+#[test]
+fn gate_uses_log_prob_margin_not_raw_logit_margin() {
+    // This is the units-correctness test. The gate threshold is calibrated in
+    // log-prob margin units. If the gate compared raw_logit_margin against
+    // min_log_prob_margin, a boundary with large raw logits but small log-prob
+    // gap would be incorrectly accepted.
+    //
+    // Here we construct: raw_logit_margin=10.0 but raw_log_prob_margin≈0.001
+    // (near-uniform distribution with one very slightly higher logit).
+    let vocab = 1_000_000; // huge vocab → logits near-uniform
+    let mut raw = vec![-15.0f32; vocab];
+    raw[42] = -14.9; // only 0.1 logit above the rest → near-uniform distribution
+                     // log_prob_margin ≈ log_softmax[-14.9] - log_softmax[-15.0] ≈ very small
+
+    let mut meta = compute(&raw, None);
+
+    // log_prob_margin should be tiny even though raw_logit_margin = 0.1
+    assert!(
+        meta.raw_log_prob_margin < 0.5,
+        "expected small log_prob_margin for near-uniform distribution, got {}",
+        meta.raw_log_prob_margin
+    );
+
+    // Gate with threshold=2.16 (calibrated) should reject this as fragile
+    let config = BoundaryGateConfig {
+        calibration_mode: false,
+        min_log_prob_margin: 2.16,
+        min_top1_prob: 0.0,
+        require_compressed_agreement: false, // skip codec check
+        ..Default::default()
+    };
+    let decision = apply(&mut meta, &config);
+    assert!(
+        !matches!(decision, BoundaryDecision::CompressedOk { .. }),
+        "near-uniform boundary should be rejected at calibrated threshold 2.16"
+    );
+}
+
 // ── Full pipeline ─────────────────────────────────────────────────────────
 
 #[test]

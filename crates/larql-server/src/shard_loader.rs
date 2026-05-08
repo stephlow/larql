@@ -52,15 +52,14 @@ pub async fn download_and_load_shard(
         .build()?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "shard download failed: HTTP {} from {url}",
-            resp.status()
-        )
-        .into());
+        return Err(format!("shard download failed: HTTP {} from {url}", resp.status()).into());
     }
 
     let bytes = resp.bytes().await?;
-    info!(bytes = bytes.len(), "Mode B: download complete — verifying hash…");
+    info!(
+        bytes = bytes.len(),
+        "Mode B: download complete — verifying hash…"
+    );
 
     // Hash verification (skip if empty/placeholder hash).
     let skip_hash = expected_hash.is_empty()
@@ -72,10 +71,9 @@ pub async fn download_and_load_shard(
         hasher.update(&bytes);
         let got_hash = format!("{:x}", hasher.finalize());
         if got_hash != expected_hash {
-            return Err(format!(
-                "shard hash mismatch: expected {expected_hash}, got {got_hash}"
-            )
-            .into());
+            return Err(
+                format!("shard hash mismatch: expected {expected_hash}, got {got_hash}").into(),
+            );
         }
         info!("Mode B: hash verified ✓");
     } else {

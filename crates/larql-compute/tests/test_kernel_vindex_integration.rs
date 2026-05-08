@@ -10,7 +10,7 @@
 //! `quant_matvec::encode` helpers and compare against CPU references,
 //! pinning down composition bugs that individual shader tests miss.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

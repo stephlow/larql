@@ -414,7 +414,7 @@ fn moe_gelu_tanh_activation_in_forward() {
 // so they exercise the full `dispatch_full_pipeline` + `moe_fn` callback
 // chain without reaching into private internals.
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod moe_prefill_integration {
     use larql_compute::backend::DecodeBackend;
     use larql_compute::metal::MetalBackend;

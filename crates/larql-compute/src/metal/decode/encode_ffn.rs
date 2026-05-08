@@ -657,7 +657,6 @@ impl MetalBackend {
                 );
             }
         } else if ffn_uses_q4k {
-            use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
             let rows = self.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg;
             let tgs = self.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg;
             if layer.is_gated() {

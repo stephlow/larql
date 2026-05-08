@@ -15,7 +15,7 @@
 //! skip) since timing is system-load sensitive and not worth the 2-3
 //! seconds it adds to `cargo test`.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

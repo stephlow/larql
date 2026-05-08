@@ -1,5 +1,51 @@
 # Roadmap — larql-compute
 
+## Open: compute modularity and model-agnostic cleanup
+
+**Status**: Started 2026-05-08.
+
+Review focus: modularity, magic strings / magic numbers, and model-family
+agnosticity in `larql-compute`.
+
+Findings now tracked here so follow-up work does not live only in review notes:
+
+- [x] Centralize CPU MoE env-var names and parsing in `src/options.rs`, with
+  namespaced `LARQL_*` names and temporary compatibility for legacy
+  `SKIP_MOE` / `MOE_DEBUG`.
+- [x] Make unsupported CPU MoE dequant formats return a typed error internally
+  instead of silently becoming an empty expert vector.
+- [x] Add crate-specific fast and integration test targets:
+  `make larql-compute-test-fast` for inner-loop unit/API checks and
+  `make larql-compute-test-integration` for the heavier integration binaries.
+- [ ] Replace remaining direct `std::env::var` reads in Metal decode/stage
+  code with the same options surface, then thread explicit options through
+  backend construction for non-debug behavior.
+- [ ] Split `FullPipelineLayer` into smaller architecture and runtime specs:
+  `AttentionSpec`, `FfnSpec`, `MoeSpec`, `LayerWeights`, `LayerNorms`, and
+  remote-FFN settings. Keep the current struct as a compatibility wrapper
+  until inference/vindex call sites are migrated.
+- [ ] Promote Gemma-style MoE assumptions into an explicit `MoeRoutingPolicy`:
+  router input source, router norm policy, selected-weight renormalization,
+  per-expert scale policy, and softmax/top-k semantics.
+- [ ] Group `MetalBackend` kernel handles into cohesive registries
+  (`AttentionKernels`, `FfnKernels`, `NormKernels`, `QuantKernels`) and pass a
+  compact dispatch context into full-pipeline execution instead of large
+  positional argument lists.
+- [ ] Replace hard-coded QKV quant-format branches with a descriptor/table keyed
+  by `(q_format, k_format, v_format)` so new model-format combinations do not
+  add another inline conditional.
+- [ ] Align Metal FFN activation handling with public `pipeline::Activation`;
+  unsupported activations should fail explicitly or use a known fallback.
+- [ ] Name and validate remaining format/kernel constants (`256`, `144`, `210`,
+  `8192`, `16384`, debug layer modulo values) at the format or kernel-descriptor
+  boundary instead of scattering them through CPU/Metal paths.
+
+Acceptance: adding a new supported architecture or quant layout should require
+declaring its layer specs and format routes, not editing Gemma-specific branches
+inside hot-path execution code.
+
+---
+
 ## ✅ Metal GPU dense FFN server — `run_dense_ffn_q4k` (2026-05-04)
 
 **Status**: Shipped.
@@ -156,7 +202,7 @@ backend decode path.
 | **Gap** | LARQL is **~1.18×** slower | ~2.0ms/tok | per-stage decomposition below |
 | **LARQL Metal** (gemma4-26B-A4B, MoE Q4K, confirmed 2026-05-04) | **18.9** | ~53ms | MoE experts on CPU NEON; output coherent multilingual |
 | **LARQL Metal** (gemma4-26B-A4B, pre 2026-05-02) | 5.1 | ~194ms | bug-locked under dispatch-geometry mismatch; degraded output |
-| **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; remaining ~37ms expert work |
+| **LARQL Metal** (gemma4-26B-A4B, `LARQL_SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; remaining ~37ms expert work |
 | **Remote-FFN batch, Metal GPU server** (gemma4-31B Q4K, 2026-05-04) | **6.5** | 153ms | `run_dense_ffn_q4k`; 92ms attn local + 60ms FFN remote Metal GPU |
 | **Remote-FFN batch, CPU server** (gemma4-31B Q4K) | 1.6 | ~625ms | same HTTP path, server uses CPU NEON |
 | **Remote-FFN streaming** (gemma4-31B Q4K) | 0.6 | ~1670ms | Q8K wire via `/v1/walk-ffn-q8k`; 60 sequential HTTP round-trips |
@@ -1001,7 +1047,7 @@ buffer contents — no `bufs.output(...)` calls in the hot path.
   the dispatch-geometry mismatch in the same `moe_dispatch.rs` sites; the
   "Phase 1 shipped 5.1 tok/s" baseline was attributing the bug-locked
   number to Phase 1, which was wrong).
-- GPU-only ceiling (`SKIP_MOE=1`): **56.8 tok/s**.
+- GPU-only ceiling (`LARQL_SKIP_MOE=1`): **56.8 tok/s**.
 - Remaining headroom (19.4 → 56.8): genuine expert dispatch work
   (240/token = 8 experts × 30 layers × 1 fused gate+up + 1 GEGLU + 1 down)
   + 30 commit/wait syncs. Real shader/dispatch work, not allocation.
@@ -1146,13 +1192,15 @@ so platform users start with a competitive baseline.
 
 ### Linux support
 **Effort**: Medium  
-**Status**: Not started
+**Status**: In progress
 
-larql-compute is Metal-only. The `ComputeBackend` trait and CPU fallback
-already compile on Linux (no Metal dependency at the trait level). Gaps:
+larql-compute has a CPU baseline plus a macOS-only Metal backend. The
+`ComputeBackend` trait and CPU fallback compile without Metal at the trait
+level. Current guardrail: tests, examples, benches, and the exported
+`metal::` module are gated on `#[cfg(all(feature = "metal", target_os =
+"macos"))]`, so Linux `--all-features` checks do not try to import Metal.
+Gaps:
 
-- `larql-compute` feature-gates: `#[cfg(feature = "metal")]` guards the
-  entire `metal::` module; the CPU path is the Linux baseline today.
 - `larql-cli` / `larql-inference`: a small number of `metal`-feature
   entrypoints need `#[cfg(...)]` guards to build without Metal.
 - No build-system CI: add a GitHub Actions Linux matrix that builds all
