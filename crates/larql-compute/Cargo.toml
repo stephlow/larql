@@ -17,7 +17,7 @@ rayon = "1.10"
 # Tests/benches depend on it too — keep both lists in sync.
 larql-models = { path = "../larql-models" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
 openblas-src = { version = "0.10", features = ["system"] }
 
