@@ -61,7 +61,7 @@ impl MetalBackend {
         // Saves 1 dispatch per layer × num_layers (~7 µs each).
         if !layer.has_post_norms
             && prelayer_fusion.is_some()
-            && crate::options::env_opt_in(crate::options::ENV_FUSED_PRELAYER_NORM)
+            && self.decode_flags.fused_prelayer_norm
         {
             let fusion = prelayer_fusion.unwrap();
             let next_input_norm_buf = self.bufs.get_f32(fusion.next_input_norm);

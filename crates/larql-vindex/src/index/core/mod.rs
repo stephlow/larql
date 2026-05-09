@@ -12,12 +12,30 @@
 //! migration is mechanical: `self.gate_mmap_bytes` →
 //! `self.gate.gate_mmap_bytes`. A future PR can drop the redundant
 //! `gate_` / `q4k_ffn_` prefixes once all call sites move.
+//!
+//! ## File layout
+//!
+//! `mod.rs` keeps the struct definition, constructors (`empty`, `new`,
+//! `new_mmap`), small inherent helpers (`is_mmap`, `gate_heap_bytes`,
+//! `is_layer_owned`, `owned_layer_range`, `set_layer_range`), the
+//! `Clone` impl, and the cross-store regression tests. The five
+//! capability-trait impls — `GateLookup`, `PatchOverrides`,
+//! `NativeFfnAccess`, `QuantizedFfnAccess`, `Fp4FfnAccess` — each live
+//! in a sibling module. Adding a new capability is one new sibling
+//! plus one `mod` line here.
 
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 
-// Re-export all shared types from types.rs.
 use super::storage::{FfnStore, GateStore, MetadataStore, ProjectionStore};
+// Re-export all shared types from types.rs so external callers can
+// keep using `crate::index::core::{VectorIndex, FeatureMeta, …}` paths.
 pub use super::types::*;
+
+mod fp4_ffn;
+mod gate_lookup;
+mod native_ffn;
+mod patch_overrides;
+mod quantized_ffn;
 
 /// The full model as a local vector index.
 ///
@@ -144,279 +162,6 @@ impl VectorIndex {
     /// Set the owned layer range (used by `load_vindex_with_range`).
     pub(crate) fn set_layer_range(&mut self, range: (usize, usize)) {
         self.layer_range = Some(range);
-    }
-}
-
-// ══════════════════════════════════════════════════════════════
-// Capability-trait impls for VectorIndex
-//
-// These narrower surfaces let read-only graph queries, patch overlays,
-// and FFN walkers depend on only the capabilities they actually need.
-// The compatibility `GateIndex` trait is a blanket composition over
-// these impls, so existing `&dyn GateIndex` consumers continue to work.
-// ══════════════════════════════════════════════════════════════
-
-impl GateLookup for VectorIndex {
-    fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
-        self.gate_knn(layer, residual, top_k)
-    }
-
-    fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta> {
-        self.feature_meta(layer, feature)
-    }
-
-    fn num_features(&self, layer: usize) -> usize {
-        self.num_features(layer)
-    }
-
-    fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
-        self.gate_knn_batch(layer, x, top_k)
-    }
-
-    fn gate_knn_q4(
-        &self,
-        layer: usize,
-        residual: &ndarray::Array1<f32>,
-        top_k: usize,
-        backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> {
-        // Delegate to VectorIndex's existing gate_knn_q4 method
-        VectorIndex::gate_knn_q4(self, layer, residual, top_k, backend)
-    }
-
-    fn gate_scores_batch(&self, layer: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
-        self.gate_scores_batch(layer, x)
-    }
-
-    fn gate_scores_batch_backend(
-        &self,
-        layer: usize,
-        x: &Array2<f32>,
-        backend: Option<&dyn larql_compute::ComputeBackend>,
-    ) -> Option<Array2<f32>> {
-        self.gate_scores_batch_backend(layer, x, backend)
-    }
-}
-
-impl PatchOverrides for VectorIndex {
-    fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.metadata
-            .down_overrides
-            .get(&(layer, feature))
-            .map(|v| v.as_slice())
-    }
-
-    fn up_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.metadata
-            .up_overrides
-            .get(&(layer, feature))
-            .map(|v| v.as_slice())
-    }
-
-    fn has_overrides_at(&self, layer: usize) -> bool {
-        self.metadata
-            .down_overrides
-            .keys()
-            .any(|(l, _)| *l == layer)
-            || self.metadata.up_overrides.keys().any(|(l, _)| *l == layer)
-    }
-}
-
-impl NativeFfnAccess for VectorIndex {
-    fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.down_feature_vector(layer, feature)
-    }
-
-    fn has_down_features(&self) -> bool {
-        self.ffn.down_features_mmap.is_some()
-    }
-
-    fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.down_layer_matrix(layer)
-    }
-
-    fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.up_layer_matrix(layer)
-    }
-
-    fn has_full_mmap_ffn(&self) -> bool {
-        self.has_full_mmap_ffn()
-    }
-
-    fn has_interleaved(&self) -> bool {
-        self.has_interleaved()
-    }
-
-    fn interleaved_gate(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.interleaved_gate(layer)
-    }
-
-    fn interleaved_up(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.interleaved_up(layer)
-    }
-
-    fn interleaved_down(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.interleaved_down(layer)
-    }
-
-    fn prefetch_interleaved_layer(&self, layer: usize) {
-        self.prefetch_interleaved_layer(layer)
-    }
-}
-
-impl QuantizedFfnAccess for VectorIndex {
-    fn has_interleaved_q4(&self) -> bool {
-        self.has_interleaved_q4()
-    }
-
-    fn interleaved_q4_gate(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
-        self.interleaved_q4_gate(layer)
-    }
-
-    fn interleaved_q4_up(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
-        self.interleaved_q4_up(layer)
-    }
-
-    fn interleaved_q4_down(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
-        self.interleaved_q4_down(layer)
-    }
-
-    fn prefetch_interleaved_q4_layer(&self, layer: usize) {
-        self.prefetch_interleaved_q4_layer(layer)
-    }
-
-    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
-        self.ffn
-            .interleaved_q4_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
-    }
-
-    fn has_interleaved_q4k(&self) -> bool {
-        self.has_interleaved_q4k()
-    }
-
-    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
-        self.ffn
-            .interleaved_q4k_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
-    }
-
-    fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
-        self.prefetch_interleaved_q4k_layer(layer)
-    }
-
-    fn interleaved_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 3]> {
-        VectorIndex::interleaved_q4k_layer_data(self, layer)
-    }
-
-    fn q4k_ffn_layer(&self, layer: usize, component: usize) -> Option<std::sync::Arc<Vec<f32>>> {
-        VectorIndex::q4k_ffn_layer(self, layer, component)
-    }
-
-    fn q4k_ffn_row_into(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        out: &mut [f32],
-    ) -> bool {
-        VectorIndex::q4k_ffn_row_into(self, layer, component, feat, out)
-    }
-
-    fn q4k_ffn_row_dot(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        x: &[f32],
-    ) -> Option<f32> {
-        VectorIndex::q4k_ffn_row_dot(self, layer, component, feat, x)
-    }
-
-    fn q4k_ffn_row_scaled_add_via_cache(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        alpha: f32,
-        out: &mut [f32],
-    ) -> bool {
-        VectorIndex::q4k_ffn_row_scaled_add_via_cache(self, layer, component, feat, alpha, out)
-    }
-
-    fn has_down_features_q4k(&self) -> bool {
-        VectorIndex::has_down_features_q4k(self)
-    }
-
-    fn q4k_down_feature_scaled_add(
-        &self,
-        layer: usize,
-        feat: usize,
-        alpha: f32,
-        out: &mut [f32],
-    ) -> bool {
-        VectorIndex::q4k_down_feature_scaled_add(self, layer, feat, alpha, out)
-    }
-
-    fn q4k_ffn_row_scaled_add(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        alpha: f32,
-        out: &mut [f32],
-    ) -> bool {
-        VectorIndex::q4k_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
-    }
-
-    fn q4k_matmul_transb(
-        &self,
-        layer: usize,
-        component: usize,
-        x: &[f32],
-        x_rows: usize,
-        backend: Option<&dyn larql_compute::ComputeBackend>,
-    ) -> Option<Vec<f32>> {
-        VectorIndex::q4k_matmul_transb(self, layer, component, x, x_rows, backend)
-    }
-}
-
-impl Fp4FfnAccess for VectorIndex {
-    fn has_fp4_storage(&self) -> bool {
-        VectorIndex::has_fp4_storage(self)
-    }
-
-    fn fp4_ffn_row_dot(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        x: &[f32],
-    ) -> Option<f32> {
-        VectorIndex::fp4_ffn_row_dot(self, layer, component, feat, x)
-    }
-
-    fn fp4_ffn_row_scaled_add(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        alpha: f32,
-        out: &mut [f32],
-    ) -> bool {
-        VectorIndex::fp4_ffn_row_scaled_add(self, layer, component, feat, alpha, out)
-    }
-
-    fn fp4_ffn_row_into(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        out: &mut [f32],
-    ) -> bool {
-        VectorIndex::fp4_ffn_row_into(self, layer, component, feat, out)
     }
 }
 

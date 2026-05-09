@@ -1,5 +1,5 @@
-use larql_inference::walker::utils::*;
-use larql_inference::walker::weight_walker::ThresholdCounts;
+use larql_vindex::walker::utils::*;
+use larql_vindex::walker::weight_walker::ThresholdCounts;
 
 #[test]
 fn test_round4() {

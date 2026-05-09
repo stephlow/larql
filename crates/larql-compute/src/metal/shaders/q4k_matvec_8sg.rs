@@ -16,6 +16,16 @@
 //! even bigger win here, since Wo has the largest bandwidth headroom.
 //!
 //! Parity contract: bit-equal output to the 4sg kernel.
+//!
+//! ## Retention rationale (ADR-017)
+//!
+//! **Status**: production-active by default since 2026-04-28
+//! (`q4k_matvec_pipeline` resolves to this variant; `LARQL_Q4K_MATVEC_8SG=0`
+//! falls back to the 4sg twin in `q4k_matvec.rs`).
+//!
+//! Both 4sg and 8sg variants are kept: 8sg as the default (won the
+//! end-to-end A/B), 4sg as the explicit fallback for cross-hardware
+//! validation and diagnostic A/B.
 
 pub const SHADER: &str = r#"
 constant uint Q4K_8SG_ROWS_PER_TG = 8;

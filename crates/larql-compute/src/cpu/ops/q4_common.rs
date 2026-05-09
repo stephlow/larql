@@ -281,7 +281,6 @@ pub fn quantize_q6_k(data: &[f32]) -> Vec<u8> {
         // 32× too coarse.
         let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let d = amax / (31.0 * 127.0);
-        let _inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
 
         // Compute per-sub-block (16 values) int8 scales.
         let mut sub_scales = [0i8; 16];

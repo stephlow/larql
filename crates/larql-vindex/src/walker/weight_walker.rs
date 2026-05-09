@@ -10,11 +10,11 @@
 use larql_core::core::edge::Edge;
 use larql_core::core::enums::SourceType;
 use larql_core::core::graph::Graph;
-use larql_vindex::format::filenames::*;
+use larql_models::{load_model_dir_validated, resolve_model_path, ModelWeights};
 
 use super::utils::{count_threshold, decode_token, partial_top_k_column, top_entities};
-use crate::error::InferenceError;
-use crate::model::{load_model_dir_validated, resolve_model_path, ModelWeights};
+use crate::error::VindexError;
+use crate::format::filenames::*;
 
 /// Result of walking a single layer.
 #[derive(Debug, Clone)]
@@ -104,18 +104,18 @@ struct RawEdge {
 }
 
 impl WeightWalker {
-    pub fn load(model: &str) -> Result<Self, InferenceError> {
+    pub fn load(model: &str) -> Result<Self, VindexError> {
         let model_path = resolve_model_path(model)?;
         let weights = load_model_dir_validated(&model_path)?;
 
         let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {
-            return Err(InferenceError::MissingTensor(
+            return Err(VindexError::MissingTensor(
                 "tokenizer.json not found".into(),
             ));
         }
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| InferenceError::Parse(e.to_string()))?;
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
 
         Ok(Self { weights, tokenizer })
     }
@@ -136,7 +136,7 @@ impl WeightWalker {
         config: &WalkConfig,
         graph: &mut Graph,
         callbacks: &mut dyn WalkCallbacks,
-    ) -> Result<LayerResult, InferenceError> {
+    ) -> Result<LayerResult, VindexError> {
         let start = std::time::Instant::now();
 
         let prefix = format!("layers.{layer}.mlp.");
@@ -144,12 +144,12 @@ impl WeightWalker {
             .weights
             .tensors
             .get(&format!("{prefix}gate_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}gate_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}gate_proj.weight")))?;
         let w_down = self
             .weights
             .tensors
             .get(&format!("{prefix}down_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}down_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}down_proj.weight")))?;
 
         let n_features = w_down.shape()[1];
         callbacks.on_layer_start(layer, n_features);
@@ -343,7 +343,7 @@ pub fn walk_model(
     config: &WalkConfig,
     graph: &mut Graph,
     callbacks: &mut dyn WalkCallbacks,
-) -> Result<Vec<LayerResult>, InferenceError> {
+) -> Result<Vec<LayerResult>, VindexError> {
     let walker = WeightWalker::load(model)?;
 
     let layer_indices: Vec<usize> = match layers {

@@ -4,7 +4,11 @@ use super::weight_walker::ThresholdCounts;
 
 /// Decode a single token ID to a trimmed string.
 pub fn decode_token(tokenizer: &tokenizers::Tokenizer, id: u32) -> Option<String> {
-    crate::tokenizer::decode_token(tokenizer, id)
+    tokenizer
+        .decode(&[id], true)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Round to 4 decimal places.

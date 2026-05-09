@@ -10,14 +10,15 @@
 //!
 //! Zero forward passes. Pure matrix multiplication.
 
-use larql_vindex::format::filenames::*;
 use std::collections::HashSet;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use larql_models::{load_model_dir_validated, resolve_model_path, ModelWeights};
+
 use super::utils::{current_date, decode_token, partial_top_k, partial_top_k_column};
-use crate::error::InferenceError;
-use crate::model::{load_model_dir_validated, resolve_model_path, ModelWeights};
+use crate::error::VindexError;
+use crate::format::filenames::*;
 
 // Re-export shared vector types from larql-models.
 pub use larql_models::{
@@ -85,7 +86,7 @@ pub struct VectorWriter {
 
 impl VectorWriter {
     /// Create a new writer, truncating any existing file.
-    pub fn create(path: &Path) -> Result<Self, InferenceError> {
+    pub fn create(path: &Path) -> Result<Self, VindexError> {
         let file = std::fs::File::create(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
@@ -94,7 +95,7 @@ impl VectorWriter {
     }
 
     /// Open an existing file for appending and count existing records.
-    pub fn append(path: &Path) -> Result<(Self, usize), InferenceError> {
+    pub fn append(path: &Path) -> Result<(Self, usize), VindexError> {
         // Count existing lines (excluding header)
         let existing = if path.exists() {
             let file = std::fs::File::open(path)?;
@@ -123,23 +124,23 @@ impl VectorWriter {
     }
 
     /// Write the metadata header as the first line.
-    pub fn write_header(&mut self, header: &VectorFileHeader) -> Result<(), InferenceError> {
+    pub fn write_header(&mut self, header: &VectorFileHeader) -> Result<(), VindexError> {
         serde_json::to_writer(&mut self.writer, header)
-            .map_err(|e| InferenceError::Parse(e.to_string()))?;
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
         self.writer.write_all(b"\n")?;
         Ok(())
     }
 
     /// Write a single vector record as one NDJSON line.
-    pub fn write_record(&mut self, record: &VectorRecord) -> Result<(), InferenceError> {
+    pub fn write_record(&mut self, record: &VectorRecord) -> Result<(), VindexError> {
         serde_json::to_writer(&mut self.writer, record)
-            .map_err(|e| InferenceError::Parse(e.to_string()))?;
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
         self.writer.write_all(b"\n")?;
         self.count += 1;
         Ok(())
     }
 
-    pub fn flush(&mut self) -> Result<(), InferenceError> {
+    pub fn flush(&mut self) -> Result<(), VindexError> {
         self.writer.flush()?;
         Ok(())
     }
@@ -150,7 +151,7 @@ impl VectorWriter {
 }
 
 /// Scan an existing NDJSON file for completed layer numbers.
-pub fn scan_completed_layers(path: &Path) -> Result<HashSet<usize>, InferenceError> {
+pub fn scan_completed_layers(path: &Path) -> Result<HashSet<usize>, VindexError> {
     let mut layers = HashSet::new();
     if !path.exists() {
         return Ok(layers);
@@ -182,18 +183,18 @@ pub struct VectorExtractor {
 }
 
 impl VectorExtractor {
-    pub fn load(model: &str) -> Result<Self, InferenceError> {
+    pub fn load(model: &str) -> Result<Self, VindexError> {
         let model_path = resolve_model_path(model)?;
         let weights = load_model_dir_validated(&model_path)?;
 
         let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {
-            return Err(InferenceError::MissingTensor(
+            return Err(VindexError::MissingTensor(
                 "tokenizer.json not found".into(),
             ));
         }
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| InferenceError::Parse(e.to_string()))?;
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
 
         Ok(Self {
             weights,
@@ -225,13 +226,13 @@ impl VectorExtractor {
         config: &ExtractConfig,
         writer: &mut VectorWriter,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<usize, InferenceError> {
+    ) -> Result<usize, VindexError> {
         let prefix = format!("layers.{layer}.mlp.");
         let w_down = self
             .weights
             .tensors
             .get(&format!("{prefix}down_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}down_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}down_proj.weight")))?;
 
         // w_down shape: (hidden, intermediate)
         let n_features = w_down.shape()[1];
@@ -299,13 +300,13 @@ impl VectorExtractor {
         config: &ExtractConfig,
         writer: &mut VectorWriter,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<usize, InferenceError> {
+    ) -> Result<usize, VindexError> {
         let prefix = format!("layers.{layer}.mlp.");
         let w_gate = self
             .weights
             .tensors
             .get(&format!("{prefix}gate_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}gate_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}gate_proj.weight")))?;
 
         // w_gate shape: (intermediate, hidden)
         let n_features = w_gate.shape()[0];
@@ -370,13 +371,13 @@ impl VectorExtractor {
         config: &ExtractConfig,
         writer: &mut VectorWriter,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<usize, InferenceError> {
+    ) -> Result<usize, VindexError> {
         let prefix = format!("layers.{layer}.mlp.");
         let w_up = self
             .weights
             .tensors
             .get(&format!("{prefix}up_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}up_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}up_proj.weight")))?;
 
         let n_features = w_up.shape()[0];
         callbacks.on_layer_start(COMPONENT_FFN_UP, layer, n_features);
@@ -439,18 +440,18 @@ impl VectorExtractor {
         config: &ExtractConfig,
         writer: &mut VectorWriter,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<usize, InferenceError> {
+    ) -> Result<usize, VindexError> {
         let prefix = format!("layers.{layer}.self_attn.");
         let w_v = self
             .weights
             .tensors
             .get(&format!("{prefix}v_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}v_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}v_proj.weight")))?;
         let w_o = self
             .weights
             .tensors
             .get(&format!("{prefix}o_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}o_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}o_proj.weight")))?;
 
         let head_dim = self.weights.arch.head_dim_for_layer(layer);
         let hidden = self.weights.hidden_size;
@@ -534,18 +535,18 @@ impl VectorExtractor {
         _config: &ExtractConfig,
         writer: &mut VectorWriter,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<usize, InferenceError> {
+    ) -> Result<usize, VindexError> {
         let prefix = format!("layers.{layer}.self_attn.");
         let w_q = self
             .weights
             .tensors
             .get(&format!("{prefix}q_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}q_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}q_proj.weight")))?;
         let w_k = self
             .weights
             .tensors
             .get(&format!("{prefix}k_proj.weight"))
-            .ok_or_else(|| InferenceError::MissingTensor(format!("{prefix}k_proj.weight")))?;
+            .ok_or_else(|| VindexError::MissingTensor(format!("{prefix}k_proj.weight")))?;
 
         let head_dim = self.weights.arch.head_dim_for_layer(layer);
         let hidden = self.weights.hidden_size;
@@ -620,7 +621,7 @@ impl VectorExtractor {
         _config: &ExtractConfig,
         writer: &mut VectorWriter,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<usize, InferenceError> {
+    ) -> Result<usize, VindexError> {
         let vocab_size = self.weights.vocab_size;
         callbacks.on_layer_start(COMPONENT_EMBEDDINGS, 0, vocab_size);
 
@@ -665,7 +666,7 @@ impl VectorExtractor {
         output_dir: &Path,
         resume: bool,
         callbacks: &mut dyn ExtractCallbacks,
-    ) -> Result<ExtractSummary, InferenceError> {
+    ) -> Result<ExtractSummary, VindexError> {
         std::fs::create_dir_all(output_dir)?;
         let overall_start = std::time::Instant::now();
         let mut summaries = Vec::new();
@@ -799,5 +800,413 @@ impl VectorExtractor {
             total_vectors,
             elapsed_secs: overall_start.elapsed().as_secs_f64(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_fixture::create_mock_model;
+    use super::*;
+
+    fn fixture(slug: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("larql_vex_inline_{slug}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_mock_model(&dir);
+        dir
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn sample_header() -> VectorFileHeader {
+        VectorFileHeader {
+            _header: true,
+            component: "ffn_down".into(),
+            model: "test/mock".into(),
+            dimension: 4,
+            extraction_date: "2026-05-09".into(),
+        }
+    }
+
+    fn sample_record(layer: usize, feature: usize) -> VectorRecord {
+        VectorRecord {
+            id: format!("L{layer}_f{feature}"),
+            layer,
+            feature,
+            vector: vec![0.1, 0.2, 0.3, 0.4],
+            dim: 4,
+            top_token: "the".into(),
+            top_token_id: 0,
+            c_score: 0.5,
+            top_k: vec![TopKEntry {
+                token: "the".into(),
+                token_id: 0,
+                logit: 1.0,
+            }],
+        }
+    }
+
+    // ── ExtractConfig / SilentExtractCallbacks ──
+
+    #[test]
+    fn extract_config_default_targets_all_components() {
+        let cfg = ExtractConfig::default();
+        assert_eq!(cfg.components.len(), ALL_COMPONENTS.len());
+        assert!(cfg.layers.is_none());
+        assert!(cfg.top_k > 0);
+    }
+
+    #[test]
+    fn silent_extract_callbacks_is_zst() {
+        // Just exercise the trait — `SilentExtractCallbacks` is a no-op
+        // so each method should be callable without panicking.
+        let mut cb = SilentExtractCallbacks;
+        cb.on_layer_start(COMPONENT_FFN_DOWN, 0, 4);
+        cb.on_progress(COMPONENT_FFN_DOWN, 0, 1, 4);
+        cb.on_layer_done(COMPONENT_FFN_DOWN, 0, 4, 1.0);
+    }
+
+    // ── VectorWriter ──
+
+    #[test]
+    fn vector_writer_create_writes_header_and_records() {
+        let dir = std::env::temp_dir().join("larql_vex_writer_create");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut w = VectorWriter::create(&path).unwrap();
+        w.write_header(&sample_header()).unwrap();
+        w.write_record(&sample_record(0, 0)).unwrap();
+        w.write_record(&sample_record(0, 1)).unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.count(), 2);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("\"_header\":true"));
+        assert!(lines[1].contains("L0_f0"));
+        assert!(lines[2].contains("L0_f1"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_writer_append_to_missing_file_starts_at_zero() {
+        let dir = std::env::temp_dir().join("larql_vex_writer_append_missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let (writer, existing) = VectorWriter::append(&path).unwrap();
+        assert_eq!(existing, 0);
+        assert_eq!(writer.count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_writer_append_counts_existing_records() {
+        let dir = std::env::temp_dir().join("larql_vex_writer_append_count");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        // Seed with header + 3 records.
+        {
+            let mut w = VectorWriter::create(&path).unwrap();
+            w.write_header(&sample_header()).unwrap();
+            for f in 0..3 {
+                w.write_record(&sample_record(0, f)).unwrap();
+            }
+            w.flush().unwrap();
+        }
+
+        let (mut w, existing) = VectorWriter::append(&path).unwrap();
+        assert_eq!(existing, 3, "should subtract the header line");
+        assert_eq!(w.count(), 3);
+        w.write_record(&sample_record(0, 99)).unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.count(), 4);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── scan_completed_layers ──
+
+    #[test]
+    fn scan_completed_layers_missing_file_is_empty() {
+        let path = std::env::temp_dir().join("larql_vex_scan_missing.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let layers = scan_completed_layers(&path).unwrap();
+        assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn scan_completed_layers_collects_unique_layer_numbers() {
+        let dir = std::env::temp_dir().join("larql_vex_scan_collect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut w = VectorWriter::create(&path).unwrap();
+        w.write_header(&sample_header()).unwrap();
+        for layer in [0usize, 1, 1, 2, 0] {
+            w.write_record(&sample_record(layer, 0)).unwrap();
+        }
+        w.flush().unwrap();
+
+        let layers = scan_completed_layers(&path).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert!(layers.contains(&0));
+        assert!(layers.contains(&1));
+        assert!(layers.contains(&2));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_completed_layers_ignores_malformed_lines() {
+        let dir = std::env::temp_dir().join("larql_vex_scan_malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.jsonl");
+        std::fs::write(
+            &path,
+            "{\"_header\":true}\n\
+             {\"layer\":7,\"feature\":0}\n\
+             not-json-at-all\n\
+             {\"feature\":1}\n\
+             {\"layer\":42}\n",
+        )
+        .unwrap();
+
+        let layers = scan_completed_layers(&path).unwrap();
+        assert!(layers.contains(&7));
+        assert!(layers.contains(&42));
+        assert!(!layers.contains(&1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── VectorExtractor: load + getters ──
+
+    #[test]
+    fn extractor_load_and_getters() {
+        let dir = fixture("load_getters");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        assert_eq!(extractor.num_layers(), 2);
+        assert_eq!(extractor.hidden_size(), 8);
+        assert_eq!(extractor.model_name(), dir.to_str().unwrap());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extractor_load_missing_directory_errors() {
+        let r = VectorExtractor::load("/nonexistent/larql/vex/path");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn extractor_load_missing_tokenizer_errors() {
+        let dir = fixture("missing_tok");
+        std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        match VectorExtractor::load(dir.to_str().unwrap()) {
+            Err(VindexError::MissingTensor(msg)) => {
+                assert!(msg.contains("tokenizer"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected MissingTensor; got {other:?}"),
+            Ok(_) => panic!("expected MissingTensor; got Ok"),
+        }
+        cleanup(&dir);
+    }
+
+    // ── VectorExtractor: per-component extract_* ──
+
+    fn make_writer(path: &std::path::Path) -> VectorWriter {
+        let mut w = VectorWriter::create(path).unwrap();
+        w.write_header(&sample_header()).unwrap();
+        w
+    }
+
+    #[test]
+    fn extract_ffn_down_writes_intermediate_records() {
+        let dir = fixture("extract_down");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_FFN_DOWN.into()],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let path = dir.join("down.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        let n = extractor.extract_ffn_down(0, &cfg, &mut w, &mut cb).unwrap();
+        assert_eq!(n, 4); // intermediate_size
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extract_ffn_gate_writes_intermediate_records() {
+        let dir = fixture("extract_gate");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_FFN_GATE.into()],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let path = dir.join("gate.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        let n = extractor.extract_ffn_gate(0, &cfg, &mut w, &mut cb).unwrap();
+        assert_eq!(n, 4);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extract_ffn_up_writes_intermediate_records() {
+        let dir = fixture("extract_up");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_FFN_UP.into()],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let path = dir.join("up.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        let n = extractor.extract_ffn_up(0, &cfg, &mut w, &mut cb).unwrap();
+        assert_eq!(n, 4);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extract_attn_ov_writes_per_head_records() {
+        let dir = fixture("extract_ov");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_ATTN_OV.into()],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let path = dir.join("ov.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        let n = extractor.extract_attn_ov(0, &cfg, &mut w, &mut cb).unwrap();
+        // One record per KV head (2 heads in the fixture).
+        assert_eq!(n, 2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extract_attn_qk_writes_per_head_records() {
+        let dir = fixture("extract_qk");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_ATTN_QK.into()],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let path = dir.join("qk.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        let n = extractor.extract_attn_qk(0, &cfg, &mut w, &mut cb).unwrap();
+        assert!(n > 0);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extract_embeddings_writes_vocab_records() {
+        let dir = fixture("extract_emb");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_EMBEDDINGS.into()],
+            layers: None,
+            top_k: 2,
+        };
+        let path = dir.join("emb.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        let n = extractor.extract_embeddings(&cfg, &mut w, &mut cb).unwrap();
+        assert_eq!(n, 16); // vocab_size
+        cleanup(&dir);
+    }
+
+    // ── VectorExtractor::extract_all ──
+
+    #[test]
+    fn extract_all_returns_summary_per_component() {
+        let dir = fixture("extract_all");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let out = dir.join("output");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let cfg = ExtractConfig {
+            components: vec![
+                COMPONENT_FFN_DOWN.into(),
+                COMPONENT_EMBEDDINGS.into(),
+            ],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let mut cb = SilentExtractCallbacks;
+        let summary = extractor.extract_all(&cfg, &out, false, &mut cb).unwrap();
+
+        assert_eq!(summary.components.len(), 2);
+        assert!(summary.total_vectors >= 4 + 16);
+        assert!(out.join("ffn_down.vectors.jsonl").exists());
+        assert!(out.join("embeddings.vectors.jsonl").exists());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn extract_all_resume_skips_completed_layers() {
+        let dir = fixture("extract_resume");
+        let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        let out = dir.join("output");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_FFN_DOWN.into()],
+            layers: None, // both layers
+            top_k: 2,
+        };
+        let mut cb = SilentExtractCallbacks;
+        let first = extractor.extract_all(&cfg, &out, false, &mut cb).unwrap();
+        assert_eq!(first.total_vectors, 4 * 2);
+
+        // Re-run with resume=true; both layers should already be in
+        // the file, so total written should be zero.
+        let resumed = extractor.extract_all(&cfg, &out, true, &mut cb).unwrap();
+        assert_eq!(resumed.total_vectors, 0);
+        cleanup(&dir);
+    }
+
+    // ── error paths ──
+
+    #[test]
+    fn extract_ffn_down_missing_tensor_errors() {
+        let dir = fixture("missing_down");
+        let mut extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
+        extractor
+            .weights
+            .tensors
+            .remove("layers.0.mlp.down_proj.weight");
+        let cfg = ExtractConfig {
+            components: vec![COMPONENT_FFN_DOWN.into()],
+            layers: Some(vec![0]),
+            top_k: 2,
+        };
+        let path = dir.join("down.jsonl");
+        let mut w = make_writer(&path);
+        let mut cb = SilentExtractCallbacks;
+        match extractor.extract_ffn_down(0, &cfg, &mut w, &mut cb) {
+            Err(VindexError::MissingTensor(msg)) => {
+                assert!(msg.contains("down_proj.weight"), "msg: {msg}");
+            }
+            other => panic!("expected MissingTensor; got {other:?}"),
+        }
+        cleanup(&dir);
     }
 }

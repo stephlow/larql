@@ -36,6 +36,7 @@ pub mod index;
 pub mod patch;
 pub mod quant;
 pub mod trie;
+pub mod walker;
 // Back-compat alias — the top-level lifecycle dir was renamed
 // `storage/` → `engine/` in the 2026-04-25 round-2 cleanup. The name
 // `storage` was confusing because `index/storage/` held the actual
@@ -106,6 +107,16 @@ pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};
 
 // Trie probe (route classifier loaded from JSON)
 pub use trie::CascadeTrie;
+
+// Walker — build-time graph extraction (FFN + attention) and vector dump.
+// Full module surface is reachable via `larql_vindex::walker::*`.
+pub use walker::attention_walker::{AttentionLayerResult, AttentionWalker};
+pub use walker::vector_extractor::{
+    ExtractCallbacks, ExtractConfig, ExtractSummary, VectorExtractor,
+};
+pub use walker::weight_walker::{
+    walk_model, LayerResult, LayerStats, WalkCallbacks, WalkConfig, WeightWalker,
+};
 
 // Storage engine — `engine` (preferred); `storage` still available as alias.
 pub use engine::{

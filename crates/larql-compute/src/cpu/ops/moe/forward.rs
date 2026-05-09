@@ -122,7 +122,7 @@ pub fn cpu_moe_forward(
     // fall back to the BLAS-on-cached-f32 path for kernel-debug A/B runs.
     let q4k_direct = matches!(format, crate::QuantFormat::Q4_K)
         && hidden.is_multiple_of(256)
-        && !options::env_flag(options::ENV_DISABLE_Q4K_DIRECT);
+        && !super::q4k_direct_disabled();
     let t_q8k_quant_start = std::time::Instant::now();
     let expert_input_q8k = q4k_direct.then(|| quantize_x_to_q8k(&expert_input));
     let t_q8k_quant = t_q8k_quant_start.elapsed();

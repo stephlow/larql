@@ -90,7 +90,6 @@ pub mod residual_diff;
 pub mod tokenizer;
 pub mod trace;
 pub mod vindex;
-pub mod walker;
 
 // Re-export dependencies for downstream crates.
 pub use larql_models;
@@ -240,16 +239,14 @@ pub mod research {
         predict_with_ffn_attention, predict_with_ffn_trace, predict_with_graph,
         predict_with_graph_vindex_logits, predict_with_router, predict_with_strategy, run_memit,
         run_memit_with_target_opt, softmax, trace_decomposed, trace_forward, trace_forward_full,
-        trace_forward_with_ffn, trace_residuals, trace_with_graph, walk_model,
-        walk_trace_from_residuals, AnswerWaypoint, AttentionCache, AttentionLayerResult,
-        AttentionWalker, BoundaryStore, BoundaryWriter, ContextStore, ContextTier, ContextWriter,
-        ExtractCallbacks, ExtractConfig, ExtractSummary, HiddenAccuracy, InferPatchedResult,
-        InferenceWeights, KnnOverride, LayerAttentionCapture, LayerMode, LayerResult, LayerStats,
-        LayerSummary, MarkovResidualEngine, MemitFact, MemitFactResult, MemitResult, PredictResult,
-        PredictResultWithAttention, PredictResultWithResiduals, RawForward, ResidualTrace,
-        SpecCapture, TargetDelta, TargetDeltaOpts, TemplatePattern, TemplateUniverse, TraceNode,
-        TracePositions, TraceResult, TraceStore, TraceWriter, UnlimitedContextEngine,
-        VectorExtractor, WalkCallbacks, WalkConfig, WeightWalker, KNN_COSINE_THRESHOLD,
+        trace_forward_with_ffn, trace_residuals, trace_with_graph, walk_trace_from_residuals,
+        AnswerWaypoint, AttentionCache, BoundaryStore, BoundaryWriter, ContextStore, ContextTier,
+        ContextWriter, HiddenAccuracy, InferPatchedResult, InferenceWeights, KnnOverride,
+        LayerAttentionCapture, LayerMode, LayerSummary, MarkovResidualEngine, MemitFact,
+        MemitFactResult, MemitResult, PredictResult, PredictResultWithAttention,
+        PredictResultWithResiduals, RawForward, ResidualTrace, SpecCapture, TargetDelta,
+        TargetDeltaOpts, TemplatePattern, TemplateUniverse, TraceNode, TracePositions, TraceResult,
+        TraceStore, TraceWriter, UnlimitedContextEngine, KNN_COSINE_THRESHOLD,
     };
 }
 
@@ -261,11 +258,3 @@ pub use engines::markov_residual::MarkovResidualEngine;
 pub use engines::unlimited_context::UnlimitedContextEngine;
 pub use engines::{EngineInfo, EngineKind, KvEngine};
 
-// Walker re-exports.
-pub use walker::attention_walker::{AttentionLayerResult, AttentionWalker};
-pub use walker::vector_extractor::{
-    ExtractCallbacks, ExtractConfig, ExtractSummary, VectorExtractor,
-};
-pub use walker::weight_walker::{
-    walk_model, LayerResult, LayerStats, WalkCallbacks, WalkConfig, WeightWalker,
-};

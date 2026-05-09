@@ -98,11 +98,13 @@ impl MetalBackend {
         };
         let window_size = layer.sliding_window as u32;
 
-        // Env flags governing kernel-level fusion. Defaults preserve the
-        // proven-win May-2026 fusion wave; opts-out are diagnostic only.
-        let use_fused_attn = crate::options::env_opt_in(crate::options::ENV_FUSED_ATTN);
-        let use_fused_qkn_rope =
-            !crate::options::env_opt_out(crate::options::ENV_FUSED_QK_NORM_ROPE);
+        // Env flags governing kernel-level fusion. Cached at backend
+        // startup (see `metal::flags::DecodeFlags`) so the decode hot
+        // path doesn't pay 4× `getenv` per layer.  Defaults preserve
+        // the proven-win May-2026 fusion wave; opts-out are diagnostic
+        // only.
+        let use_fused_attn = self.decode_flags.fused_attn;
+        let use_fused_qkn_rope = self.decode_flags.fused_qk_norm_rope;
         let pos = kv_cache.layers[layer_idx].current_len as u32;
         let t_val = pos + 1;
         let attn_span = ops::kv_cache::attention_span(t_val, window_size);
@@ -118,9 +120,8 @@ impl MetalBackend {
         // encode_kv_append + encode_kv_attend path which handles arbitrary head_dim.
         let use_fused_kv_aa = attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
             && layer_head_dim <= MAX_HEAD_DIM_SINGLE_SG
-            && !crate::options::env_opt_out(crate::options::ENV_FUSED_KV_APPEND_ATTEND);
-        let use_fused_post_attn =
-            !crate::options::env_opt_out(crate::options::ENV_FUSED_POST_ATTN_NORM);
+            && self.decode_flags.fused_kv_append_attend;
+        let use_fused_post_attn = self.decode_flags.fused_post_attn_norm;
 
         // Path 1: full attention fusion. Skips both qk_norm_rope dispatch AND
         // kv_append_attend_fused dispatch — handles them in `attn_fused`.

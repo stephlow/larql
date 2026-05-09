@@ -28,9 +28,11 @@ mod decode_hybrid;
 pub mod diag;
 mod direct_ops;
 pub mod f32_ops;
+mod flags; // cached env-var-derived backend flags (DecodeFlags)
 pub mod kernel; // KernelHandle: pipeline + dispatch geometry, bundled
 mod moe_dispatch;
 pub use decode::profile::take_last_split_timings;
+pub use flags::DecodeFlags;
 pub use moe_dispatch::MoeScratch;
 pub mod ops; // modular: ops/mod.rs → one file per operation
 mod pipeline;
@@ -265,6 +267,11 @@ pub struct MetalBackend {
     /// lm_head would otherwise live as a 5.6 GB f32 clone on 31B.
     pub f16_gemv_pipeline: KernelHandle,
     flop_threshold: AtomicUsize,
+    /// Decode-path env-flag snapshot. Captured once at `new()` so the
+    /// hot path (encode_attn / encode_qkv / encode_ffn / encode_post_ffn /
+    /// decode/mod.rs) doesn't pay ~12 `getenv` syscalls per layer per
+    /// token. Construct a fresh backend to pick up flag changes.
+    pub decode_flags: DecodeFlags,
 }
 
 impl MetalBackend {
@@ -563,6 +570,7 @@ impl MetalBackend {
             f32_topk_partial_pipeline,
             f16_gemv_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),
+            decode_flags: DecodeFlags::from_env(),
         })
     }
 

@@ -22,6 +22,37 @@ pub fn dispatch_q8(
     num_rows: usize,
     hidden: usize,
 ) -> Vec<f32> {
+    // The C kernel assumes `hidden % 32 == 0` and reads exactly 18 bytes
+    // per Q4_0 block × `num_rows` rows. Validate at the FFI boundary so a
+    // malformed manifest fails on the Rust side with a clear message
+    // rather than reading OOB inside `q4_0_matvec_c`.
+    debug_assert_eq!(
+        hidden % 32,
+        0,
+        "q4_0 matvec requires hidden to be a multiple of 32 (got {hidden})"
+    );
+    let blocks = hidden / 32;
+    debug_assert_eq!(
+        q4_data.len(),
+        num_rows * blocks * 18,
+        "q4_0 matvec: q4_data is {} bytes; expected {} \
+         (num_rows={num_rows}, blocks={blocks}, 18 bytes/block)",
+        q4_data.len(),
+        num_rows * blocks * 18,
+    );
+    debug_assert_eq!(
+        q8_x.len(),
+        hidden,
+        "q4_0 matvec: q8_x len {} != hidden {hidden}",
+        q8_x.len()
+    );
+    debug_assert_eq!(
+        q8_scales.len(),
+        blocks,
+        "q4_0 matvec: q8_scales len {} != hidden/32 = {blocks}",
+        q8_scales.len()
+    );
+
     let mut scores = vec![0.0f32; num_rows];
     unsafe {
         q4_0_matvec_c(

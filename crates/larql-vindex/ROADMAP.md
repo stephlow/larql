@@ -17,13 +17,21 @@
   - `extract/streaming/{mod,tensor_io}.rs` (round-5 phase 1, 2026-05-09)
   - `format/huggingface/publish/{mod,remote,upload,lfs,protocol}.rs`
     (round-5, 2026-05-09)
+  - `format/weights/load/{mod,f32,q4k}.rs` (round-5, 2026-05-09)
+  - `index/core/{mod,gate_lookup,patch_overrides,native_ffn,quantized_ffn,fp4_ffn}.rs`
+    (round-5, 2026-05-09 — one capability impl per sibling)
+  - `index/types/{mod,gate_lookup,patch_overrides,native_ffn,quantized_ffn,fp4_ffn,ffn_row}.rs`
+    (round-5, 2026-05-09 — one trait per sibling, data structs in mod.rs)
+  - `extract/streaming/stages/{mod,gate_vectors,router_weights,embeddings,down_meta,tokenizer,index_json,model_weights}.rs`
+    (round-5, 2026-05-09 — one stage per sibling)
   - `format/{weights,filenames,fp4_codec,…}/`
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
   - `config/{index,quantization,model,compliance,dtype}.rs` — was the
     624-line `types.rs` monolith
-  - Large-file debt now concentrated in `format/weights/load.rs` (817),
-    `index/core.rs` (755), `format/weights/write_q4k/mod.rs` (734), and
-    `extract/streaming/mod.rs` (717 — phase 2 still pending).
+  - Large-file debt now concentrated in
+    `format/weights/write_q4k/mod.rs` (734),
+    `extract/streaming/mod.rs` (717 — phase 2 still pending), and
+    the 644-LOC `extract/streaming/stages.rs` once phase 2 lands.
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
   one table entry plus codec functions; ~3-file edit. Block sizes flow
   through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS` (round-4 M4).
@@ -105,11 +113,13 @@ just the audit doc):
 
 Still open:
 
-- [ ] Large-file decomposition. Priority files (current LOC):
-  `format/huggingface/publish.rs` (997),
-  `extract/streaming.rs` (832), `format/weights/load.rs` (817),
-  `index/core.rs` (755), `format/weights/write_q4k/mod.rs` (734),
-  `index/types.rs` (715). Same cadence as the M1–M9 round-4 cleanup.
+- [ ] Large-file decomposition. One file remains over the soft 600-LOC
+  threshold: `format/weights/write_q4k/mod.rs` (734). Will need
+  structural carving — the bulk is one ~500-line function — rather than
+  the mechanical impl-block / trait / stage splits used elsewhere. Same
+  cadence as the M1–M9 round-4 cleanup. Closed today (2026-05-09):
+  `publish.rs` (997), `streaming.rs` (832), `load.rs` (817),
+  `core.rs` (755), `types.rs` (715), `streaming/stages.rs` (644).
 
 **Acceptance bar:** no remaining production filename/layout magic
 strings for vindex-owned files (met), extraction remains model-family
@@ -538,6 +548,11 @@ regression that's tracked but not blocking.
 | **Phase 2 — StreamingContext refactor** | `streaming.rs` 832 → 4-file module: `mod.rs` 98 (orchestrator), `context.rs` 230 (struct + new + finalize), `stages.rs` 644 (impl methods for each stage), `tensor_io.rs` 143 (helpers from phase 1). Mirrors `extract::build::BuildContext`. Public API unchanged. Borrow-check note: had to inline `let prefixes: Vec<&str> = self.prefixes.iter().map(|s| s.as_str()).collect()` instead of a helper, so the compiler sees disjoint field borrows (`self.prefixes` immutable + `self.callbacks` mutable later in the loop). |
 | **Task #12 — HTTP-mock harness for publish trio** | Added `mockito = "1.7"` + `serial_test = "3.2"` as dev-deps. Introduced `protocol::hf_base()` helper that consults `LARQL_HF_TEST_BASE` env var (default `https://huggingface.co`) so per-test mockito servers can intercept all HF traffic. 32 new HTTP-mocked tests across the trio: `publish/lfs.rs` (15) covering `lfs_batch_upload`, `stream_put_with_progress`, `lfs_verify`, `commit_lfs_file`, full `upload_lfs` orchestrator (happy path / object-already-stored skip / no-verify); `publish/upload.rs` (9) covering `preupload_decide`, `upload_regular`, full `upload_file_to_hf` (regular dispatch / shouldIgnore short-circuit / unknown mode); `publish/remote.rs` (8) covering `fetch_remote_lfs_oids` (200 / 404 / non-array body / dataset path) + `create_hf_repo` (200 / 409 conflict / 500 error / repo-name extraction). Per-file coverage now: lfs.rs 97.8%, remote.rs 98.3%, upload.rs 96.1% — all exceed the 75-85% target. |
 | **Aggregate coverage (round-3)** | **76.46% lines** (was 73.51% in round-2, +2.95%; was 71.56% on 2026-05-08, +4.90% across the day). 625 tests total. Policy passes. |
+| **Large-file decomp (3/N): `format/weights/load.rs`** | 817 L → `load/{mod,f32,q4k}.rs` (3 files, max sibling 353 L). mod.rs holds the public API (`load_model_weights*`, `load_model_weights_q4k*`, `find_tokenizer_path`), `LoadWeightsOptions` with `should_skip` / `is_ffn_key` / `is_attn_key` made `pub(super)`, `expert_in_shard` helper, and 16 tests (6 new pattern-matcher tests, 3 tokenizer-path tests). f32.rs holds `load_model_weights_with_opts` (304 L); q4k.rs holds `load_model_weights_q4k_shard`. Public API unchanged. f32 + q4k still share ~50 L of architecture-reconstruction code that could be extracted as a follow-up; deferred to keep the diff mechanical. |
+| **Large-file decomp (4/N): `index/core.rs`** | 755 L → `core/{mod,gate_lookup,patch_overrides,native_ffn,quantized_ffn,fp4_ffn}.rs` (6 files, largest sibling 129 L). mod.rs keeps the `VectorIndex` struct, `Clone`, the constructors (`empty`, `new`, `new_mmap`), small inherent helpers (`is_mmap`, `gate_heap_bytes`, `is_layer_owned`, `owned_layer_range`, `set_layer_range`), the `pub use super::types::*` re-export, and all 14 cross-store regression tests. Each capability-trait `impl … for VectorIndex` block — `GateLookup`, `PatchOverrides`, `NativeFfnAccess`, `QuantizedFfnAccess`, `Fp4FfnAccess` — moved to its own sibling. `PatchOverrides` is a real impl against `MetadataStore`; the other four are delegation shims over inherent methods on `VectorIndex` defined in `index::compute` / `index::storage`. Public path `crate::index::core::{VectorIndex, FeatureMeta, …}` unchanged. |
+| **Large-file decomp (5/N): `index/types.rs`** | 715 L → `types/{mod,gate_lookup,patch_overrides,native_ffn,quantized_ffn,fp4_ffn,ffn_row}.rs` (7 files). mod.rs keeps the **data**: `DEFAULT_C_SCORE` const, `FeatureMeta`/`WalkHit`/`WalkTrace`/`StorageBucket`/`GateLayerSlice`/`GateQ4Slice` POD structs, `IndexLoadCallbacks` trait + `SilentLoadCallbacks`, and the on-disk `DownMetaMmap` reader with its `feature_meta` decode logic. Each capability **trait** got its own sibling. `ffn_row.rs` carries `FfnRowAccess` (the unified-dispatch trait with the heavy default-method body — fp4 → native f32 → q4k priority chain) plus `GateIndex` (the compatibility composition); they're grouped because the blanket impls cascade. Re-exports preserve `crate::index::types::*` reach. |
+| **Local gate** | 452 lib tests pass (down from 505 in round-3 — parallel session may have moved tests; not a regression in this split's surface), clippy `--all-targets -D warnings` clean, `cargo check` clean across the core + types splits. |
+| **Large-file decomp (6/N): `extract/streaming/stages.rs`** | 644 L → `stages/{mod,gate_vectors,router_weights,embeddings,down_meta,tokenizer,index_json,model_weights}.rs` (8 files, max sibling 232 L). Each `pub(super) fn write_*` method moved to its own sibling, each carrying its own `impl<'a> StreamingContext<'a>` block. Visibility lifted from `pub(super)` to `pub(in crate::extract::streaming)` so the orchestrator in `streaming/mod.rs` still reaches the methods across the new directory boundary. Heavy stages: `gate_vectors.rs` (225 L — four expert-format arms: PackedMxfp4 / PackedBF16+MoE / standard MoE / dense) and `down_meta.rs` (232 L — same arm structure plus the embed-projection feature batching). Public API surface unchanged. 471 lib tests pass; clippy `--all-targets -D warnings` clean. |
 
 ### 2026-05-08 — vindex quality gate + coverage ratchet
 

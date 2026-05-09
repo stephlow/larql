@@ -301,11 +301,16 @@ impl MetalBackend {
         let gate_half_bytes = (inter * row_bytes) as u64;
         let n_rows = inter as u32;
         let k_cols = hidden as u32;
-        let tgs_per_mat =
-            (inter as u64).div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        // Geometry travels with `q4k_ffn_gate_up_pipeline` — read it
+        // off the `KernelHandle` rather than re-importing shader-module
+        // constants, so a future bump of the field to a different
+        // simdgroup variant doesn't silently drop rows. Same dispatch-
+        // geometry-mismatch class as the q4_matvec_v4 ROADMAP entry.
+        let gate_up_kh = &self.q4k_ffn_gate_up_pipeline;
+        let tgs_per_mat = (inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
         for (e, (gate_up_buf, _)) in expert_bufs.iter().enumerate().take(valid_count) {
-            enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+            enc.set_compute_pipeline_state(&gate_up_kh.state);
             // Wg = gate (offset 0), Wu = up (offset gate_half_bytes) within the
             // same per-expert mmap-backed buffer.
             enc.set_buffer(0, Some(gate_up_buf), 0);
@@ -319,7 +324,7 @@ impl MetalBackend {
             enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(tgs_per_mat * 2, 1, 1),
-                MTLSize::new(crate::metal::shaders::q4k_ffn_gate_up::THREADS_PER_TG, 1, 1),
+                MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
             );
         }
 
@@ -506,12 +511,14 @@ impl MetalBackend {
         let enc = cmd.new_compute_command_encoder();
 
         // q4k_ffn_gate_up over all valid_count experts at once.
+        // Geometry travels with the `KernelHandle` (see `decode_hybrid.rs`
+        // ship-log entry on this bug class).
+        let gate_up_kh = &self.q4k_ffn_gate_up_pipeline;
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
-        let tgs = (valid_count as u64 * inter as u64)
-            .div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        let tgs = (valid_count as u64 * inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
-        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+        enc.set_compute_pipeline_state(&gate_up_kh.state);
         enc.set_buffer(0, Some(&scratch.gate_buf), 0);
         enc.set_buffer(1, Some(&scratch.up_buf), 0);
         enc.set_buffer(2, Some(&scratch.x_buf), 0);
@@ -521,7 +528,7 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(tgs * 2, 1, 1),
-            MTLSize::new(crate::metal::shaders::q4k_ffn_gate_up::THREADS_PER_TG, 1, 1),
+            MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
         );
 
         // GELU-tanh activation per expert (strided to inter_padded).
@@ -617,8 +624,6 @@ impl MetalBackend {
         inter: usize,
         inter_padded: usize,
     ) -> Vec<f32> {
-        use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
-
         if hidden == 0 || inter == 0 {
             return vec![0.0f32; hidden];
         }
@@ -636,10 +641,13 @@ impl MetalBackend {
         let enc = cmd.new_compute_command_encoder();
 
         // 1. q4k_ffn_gate_up_8sg — gate and up projections.
+        // Geometry pulled from the bound `KernelHandle` so a future
+        // pipeline swap can't drift from the dispatched TG shape.
+        let gate_up_kh = &self.q4k_ffn_gate_up_8sg_pipeline;
         let n_rows = inter as u32;
         let k_cols = hidden as u32;
-        let n_tgs = (inter as u64).div_ceil(q4k_gu_8sg::ROWS_PER_TG);
-        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_8sg_pipeline.state);
+        let n_tgs = (inter as u64).div_ceil(gate_up_kh.rows_per_tg);
+        enc.set_compute_pipeline_state(&gate_up_kh.state);
         enc.set_buffer(0, Some(gate_buf), 0);
         enc.set_buffer(1, Some(up_buf), 0);
         enc.set_buffer(2, Some(&x_buf), 0);
@@ -649,7 +657,7 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(n_tgs * 2, 1, 1),
-            MTLSize::new(q4k_gu_8sg::THREADS_PER_TG, 1, 1),
+            MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
         );
 
         // 2. geglu_gelu_tanh activation.
@@ -795,12 +803,14 @@ impl MetalBackend {
         let enc = cmd.new_compute_command_encoder();
 
         // ── 4. q4k_ffn_gate_up over all valid_count experts at once ──────
+        // Geometry travels with the `KernelHandle`; no shader-module
+        // ROWS_PER_TG/THREADS_PER_TG re-imports.
+        let gate_up_kh = &self.q4k_ffn_gate_up_pipeline;
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
-        let tgs = (valid_count as u64 * inter as u64)
-            .div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        let tgs = (valid_count as u64 * inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
-        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+        enc.set_compute_pipeline_state(&gate_up_kh.state);
         enc.set_buffer(0, Some(&scratch.gate_buf), 0);
         enc.set_buffer(1, Some(&scratch.up_buf), 0);
         enc.set_buffer(2, Some(&scratch.x_buf), 0);
@@ -810,7 +820,7 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(tgs * 2, 1, 1),
-            MTLSize::new(crate::metal::shaders::q4k_ffn_gate_up::THREADS_PER_TG, 1, 1),
+            MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
         );
 
         // ── 5. GELU-tanh activation per expert (strided to inter_padded) ──

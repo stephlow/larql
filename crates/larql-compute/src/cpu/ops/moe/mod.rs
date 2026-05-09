@@ -28,6 +28,22 @@ use crate::{
     MoeRouterNormPolicy, MoeTopKWeightPolicy,
 };
 
+/// Process-wide cached snapshot of `LARQL_DISABLE_Q4K_DIRECT`.
+///
+/// `cpu_moe_forward` (per layer) and `run_single_expert` (per expert
+/// per layer) used to read this env every call. On Gemma 4 26B-A4B
+/// (40 layers × top_k 4-8) that's ~120-300 `getenv` syscalls per token.
+/// Resolving once globally settles them all.
+///
+/// Trade-off: the env var is process-bound — flip it before the first
+/// MoE forward call, not at runtime. There is no production caller
+/// that toggles this mid-run; the var is a kernel-debug A/B switch.
+pub(crate) fn q4k_direct_disabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| crate::options::env_flag(crate::options::ENV_DISABLE_Q4K_DIRECT))
+}
+
 pub(crate) fn moe_expert_input(
     h: &[f32],
     moe: &MoeLayerWeights<'_>,

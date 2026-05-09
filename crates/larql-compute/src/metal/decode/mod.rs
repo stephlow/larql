@@ -283,7 +283,7 @@ impl MetalBackend {
             // `residual_norm_store` (only on the non-post-norms path).
             let prelayer_norm_active = l > 0
                 && !layers[l - 1].has_post_norms
-                && crate::options::env_opt_in(crate::options::ENV_FUSED_PRELAYER_NORM);
+                && self.decode_flags.fused_prelayer_norm;
 
             // ── Step 1: Input norm + Q/K/V projection ──
             // Format-aware: Q4_K family routes through fused QKV
@@ -408,8 +408,7 @@ impl MetalBackend {
                     inter,
                     inter_padded,
                 };
-                let use_fused_post_ffn =
-                    !crate::options::env_opt_out(crate::options::ENV_FUSED_POST_FFN_NORM);
+                let use_fused_post_ffn = self.decode_flags.fused_post_ffn_norm;
                 let post_ffn_bufs = encode_post_ffn::PostFfnBufs {
                     down_out: &down_out,
                     h_post_attn: &h_post_attn,
@@ -426,7 +425,7 @@ impl MetalBackend {
                 let next_layer = layers.get(l + 1);
                 let prelayer_fusion = if !layer.has_post_norms
                     && next_layer.is_some()
-                    && crate::options::env_opt_in(crate::options::ENV_FUSED_PRELAYER_NORM)
+                    && self.decode_flags.fused_prelayer_norm
                 {
                     Some(super::decode::encode_post_ffn::PreLayerNormFusion {
                         next_input_norm: next_layer.unwrap().input_norm,

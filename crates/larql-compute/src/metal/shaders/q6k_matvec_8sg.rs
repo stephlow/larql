@@ -20,6 +20,22 @@
 //! Parity contract: output must be bit-equal to the production kernel
 //! (same math, same lane→row mapping, only TG dispatch geometry
 //! changed). Tested by `q6k_matvec_8sg_matches_4sg` in the test file.
+//!
+//! ## Retention rationale (ADR-017)
+//!
+//! **Status**: opt-in via `LARQL_Q6K_8SG=1`. Default-OFF (4sg).
+//!
+//! Empirical 2026-04-28: 8sg kernel-isolated 1.96× speedup but
+//! end-to-end at parity (slightly worse on quiet GPU: 77.6 → 77.1
+//! tok/s, ≈0.08 ms/tok regression). q6k was already at 84% of
+//! LPDDR5X peak; the ALU/scheduling slack 8sg exposes is too small
+//! to translate end-to-end on M3 Max. Kept opt-in for callers
+//! retrying on different hardware (M4 Max, future Apple GPUs with
+//! larger shared cache or higher SM utilisation could reverse the
+//! null result).
+//!
+//! **Removal trigger**: if no positive end-to-end A/B result lands
+//! across the next two macOS / Apple-Silicon generations, demote.
 
 pub const SHADER: &str = r#"
 constant uint Q6K_8SG_ROWS_PER_TG = 8;

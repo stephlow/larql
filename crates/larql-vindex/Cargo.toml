@@ -9,6 +9,7 @@ keywords = ["transformer", "vindex", "knn", "interpretability"]
 categories = ["science"]
 
 [dependencies]
+larql-core = { path = "../larql-core", default-features = false }
 larql-models = { path = "../larql-models" }
 larql-compute = { path = "../larql-compute" }
 serde = { workspace = true }

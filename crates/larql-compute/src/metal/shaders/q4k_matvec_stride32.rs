@@ -19,9 +19,31 @@
 //!
 //! The f16-on-`embeddings.bin` workaround that ships in v4 fixes the
 //! correctness bug at the cost of reading 1.3 GB f16/tok instead of
-//! 330 MB Q4_K/tok — ~3 ms/tok lm_head regression, ~10 tok/s
-//! end-to-end. This kernel is the path to recovering that loss: same
-//! 330 MB Q4_K read, same numerical answer as f16's stable reduction.
+//! 330 MB Q4_K/tok. This kernel was originally framed as "the path to
+//! recovering that loss" by giving Q4_K a stable reduction tree.
+//!
+//! ## Retention rationale (ADR-017)
+//!
+//! **Status**: opt-in, not wired into production decode.
+//!
+//! **Empirical result (2026-05-09, `project_f16_gemv_wiring_todo.md`)**:
+//! the broader f16-on-Q4_K wiring story is dead — direct f16 LM head is
+//! 1.85 ms vs current Q4_K production at 3.88 ms, but only because the
+//! production already ships a fix. Stride-32 has not been A/B-validated
+//! end-to-end against the current Q4_K LM-head path; no decode-level
+//! tok/s improvement has been measured. The original "+10 tok/s recovery"
+//! framing is **stale** — it refers to a regression that was healed by a
+//! different path.
+//!
+//! **Why kept on disk**: the stride-32 reduction tree is bit-identical
+//! to f16_gemv's, so this remains the cheapest insurance kernel if a
+//! future Q4_K LM-head A/B reopens the close-call top-1 issue on a new
+//! arch family. Maintenance cost is one shader file plus a parity test;
+//! revival cost is one dispatch site.
+//!
+//! **Removal trigger**: if a year passes with no LM-head close-call
+//! regression on any production model AND no test references this
+//! shader outside its own kernel-parity test, demote and delete.
 //!
 //! **Reduction tree** (key bit):
 //!

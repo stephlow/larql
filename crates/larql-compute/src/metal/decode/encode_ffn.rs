@@ -216,9 +216,14 @@ impl MetalBackend {
             // `LARQL_GATE_UP_COOP=1`: cooperative scale-loading variant.
             // Tried 2026-05-01 — null end-to-end (kernel-isolated ALU
             // diagnosis was misleading). Kept opt-in.
-            let use_coop = crate::options::env_opt_in(crate::options::ENV_GATE_UP_COOP);
-            let use_4sg = crate::options::env_opt_out(crate::options::ENV_GATE_UP_8SG);
-            let use_f16 = crate::options::env_flag(crate::options::ENV_F16_ACC);
+            //
+            // Flags snapshot at `MetalBackend::new()` (see
+            // `metal::flags::DecodeFlags`) — the decode hot path is
+            // ~34 layers/tok and `getenv` per layer per flag was a
+            // measurable syscall tax.
+            let use_coop = self.decode_flags.gate_up_coop;
+            let use_4sg = self.decode_flags.gate_up_use_4sg;
+            let use_f16 = self.decode_flags.f16_acc;
             let (pipeline, rows_per_tg, threads_per_tg) = if use_coop {
                 // Cooperative wins over the other flags — it's the
                 // newest variant under measurement.
@@ -298,7 +303,7 @@ impl MetalBackend {
             // a no-op (keeps the kernel and pipeline registered as
             // dead code for the investigation in
             // `larql-inference/ROADMAP.md` G-3 follow-up).
-            let use_fused_q6k_down = crate::options::env_flag(crate::options::ENV_FUSED_Q6K_DOWN)
+            let use_fused_q6k_down = self.decode_flags.fused_q6k_down
                 && layer.down.format == crate::QuantFormat::Q6_K
                 && matches!(layer.activation, crate::Activation::GeluTanh);
             if use_fused_q6k_down {
@@ -323,7 +328,7 @@ impl MetalBackend {
                 );
             } else if layer.down.format == crate::QuantFormat::Q4_K
                 && inter_padded <= 16384
-                && crate::options::env_not_zero_or_default(crate::options::ENV_FUSED_DOWN, true)
+                && self.decode_flags.fused_down
             {
                 // Fused GEGLU+down for small-to-medium intermediate sizes.
                 //
@@ -525,26 +530,15 @@ impl MetalBackend {
         Self::dispatch_fused_geglu_down(enc, kernel, bufs, hidden, hidden_val, inter_padded_val);
     }
 
-    /// Twin of `encode_q4k_fused_geglu_down` for Q6_K down weights.
-    /// Not currently routed — see the encode_q4k_ffn comment for why
-    /// GELU-tanh fusion regresses on production Q6_K shapes.
-    #[allow(clippy::too_many_arguments, dead_code)]
-    fn encode_q6k_fused_geglu_down(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        layer: &FullPipelineLayer,
-        bufs: &FfnBufs<'_>,
-        hidden: usize,
-        _inter_padded: usize,
-        hidden_val: u32,
-        inter_padded_val: u32,
-    ) {
-        let kernel = match layer.activation {
-            crate::Activation::GeluTanh => &self.q6k_geglu_gelu_tanh_down_pipeline,
-            _ => &self.q6k_geglu_silu_down_pipeline,
-        };
-        Self::dispatch_fused_geglu_down(enc, kernel, bufs, hidden, hidden_val, inter_padded_val);
-    }
+    // Q6_K fused-geglu+down thunk previously lived here as
+    // `encode_q6k_fused_geglu_down` under `#[allow(dead_code)]`. Removed
+    // 2026-05-09: GELU-tanh fusion regresses on production Q6_K shapes
+    // (see `encode_q4k_ffn` block doc for the per-row tanh explosion).
+    // Production routes Q6_K down via the separated chain (GEGLU dispatch
+    // + format-aware matvec). The pipelines `q6k_geglu_silu_down_pipeline`
+    // and `q6k_geglu_gelu_tanh_down_cached_pipeline` are still built and
+    // available for opt-in benchmarking; reviving the thunk is a 16-line
+    // copy of `encode_q4k_fused_geglu_down`.
 
     /// Shared dispatch body for the Q4_K / Q6_K fused activation+down
     /// kernels. Both kernel families share the same buffer signature
@@ -733,7 +727,7 @@ impl MetalBackend {
             }
         } else if ffn_uses_q4k {
             if layer.is_gated() {
-                let use_fused_q6k = crate::options::env_flag(crate::options::ENV_FUSED_Q6K_DOWN)
+                let use_fused_q6k = self.decode_flags.fused_q6k_down
                     && layer.down.format == crate::QuantFormat::Q6_K
                     && matches!(layer.activation, crate::Activation::GeluTanh);
                 if layer.down.format == crate::QuantFormat::Q4_K {

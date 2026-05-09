@@ -31,6 +31,14 @@ use larql_compute::{
     QuantWeight,
 };
 
+/// Process-wide guard for tests that mutate env vars read by the decode
+/// hot path (e.g. `LARQL_FUSED_PRELAYER_NORM`, `LARQL_QKV_FUSED`). Cargo
+/// runs tests inside a binary in parallel by default; without this lock
+/// a parallel `decode_token` test races with the env-toggling test and
+/// observes the var in either state. Hold the guard for the entire
+/// duration of any backend creation + decode that depends on the env.
+static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Synthetic dims chosen to be Q4_K-compatible (multiples of 256) and
 /// small enough for a fast test. Q4_K super-blocks are 256 elements.
 const HIDDEN: usize = 256;
@@ -207,13 +215,11 @@ fn decode_token_single_layer_synthetic_q4k_smoke() {
 fn d_rms_fuse_phase1_produces_identical_output() {
     use std::env;
 
-    let metal = match larql_compute::metal::MetalBackend::new() {
-        Some(m) => m,
-        None => {
-            eprintln!("skip: no Metal device");
-            return;
-        }
-    };
+    // Hold the env lock for the whole test: both runs must observe the
+    // env state at the time we construct each backend, and we must not
+    // cross-pollute with the other env-mutating test
+    // (`decode_token_qkv_fused_opt_in_smoke`) running in parallel.
+    let _env_guard = ENV_TEST_LOCK.lock().expect("env lock poisoned");
 
     use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k};
 
@@ -235,11 +241,27 @@ fn d_rms_fuse_phase1_produces_identical_output() {
     let layers = [layer0, layer1];
     let x = synth_input(HIDDEN, 0.99);
 
-    // Run with fusion OFF (default).
+    // Decode flags are cached at `MetalBackend::new()`. The test must
+    // construct a fresh backend AFTER the env is in the desired state
+    // — the previous "set env then call decode on the existing backend"
+    // pattern silently no-ops with cached flags.
+    //
+    // Run with fusion OFF.
     env::remove_var("LARQL_FUSED_PRELAYER_NORM");
-    let mut kv_off = metal.create_kv_cache(2, 64, NUM_KV_HEADS, HEAD_DIM);
+    let metal_off = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+    assert!(
+        !metal_off.decode_flags.fused_prelayer_norm,
+        "expected fused_prelayer_norm=false in 'off' backend"
+    );
+    let mut kv_off = metal_off.create_kv_cache(2, 64, NUM_KV_HEADS, HEAD_DIM);
     let out_off = larql_compute::metal::MetalBackend::decode_token(
-        &metal,
+        &metal_off,
         &mut kv_off,
         &layers,
         &x,
@@ -253,11 +275,17 @@ fn d_rms_fuse_phase1_produces_identical_output() {
         10_000.0,
     );
 
-    // Run with fusion ON.
+    // Run with fusion ON — fresh backend that captures the env flip.
     env::set_var("LARQL_FUSED_PRELAYER_NORM", "1");
-    let mut kv_on = metal.create_kv_cache(2, 64, NUM_KV_HEADS, HEAD_DIM);
+    let metal_on = larql_compute::metal::MetalBackend::new()
+        .expect("Metal device available since metal_off succeeded");
+    assert!(
+        metal_on.decode_flags.fused_prelayer_norm,
+        "expected fused_prelayer_norm=true in 'on' backend"
+    );
+    let mut kv_on = metal_on.create_kv_cache(2, 64, NUM_KV_HEADS, HEAD_DIM);
     let out_on = larql_compute::metal::MetalBackend::decode_token(
-        &metal,
+        &metal_on,
         &mut kv_on,
         &layers,
         &x,
@@ -501,13 +529,11 @@ fn decode_token_multi_layer_synthetic_smoke() {
 fn decode_token_qkv_fused_opt_in_smoke() {
     use std::env;
 
-    let metal = match larql_compute::metal::MetalBackend::new() {
-        Some(m) => m,
-        None => {
-            eprintln!("skip: no Metal device");
-            return;
-        }
-    };
+    // Serialise against `d_rms_fuse_phase1_produces_identical_output`
+    // and any future env-mutating test in this binary. Decode flags
+    // are cached at backend construction; set the env BEFORE creating
+    // the backend.
+    let _env_guard = ENV_TEST_LOCK.lock().expect("env lock poisoned");
 
     use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 
@@ -593,7 +619,21 @@ fn decode_token_qkv_fused_opt_in_smoke() {
 
     let x = synth_input(HIDDEN, 2.9);
 
+    // Decode flags are cached at `MetalBackend::new()`; set env BEFORE
+    // construction so the fused QKV path is actually engaged.
     env::set_var("LARQL_QKV_FUSED", "1");
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            env::remove_var("LARQL_QKV_FUSED");
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+    assert!(
+        metal.decode_flags.qkv_fused,
+        "expected qkv_fused=true after setting env before backend construction"
+    );
     let mut kv = metal.create_kv_cache(1, 64, NUM_KV_HEADS, HEAD_DIM);
     let result = larql_compute::metal::MetalBackend::decode_token(
         &metal,
@@ -695,5 +735,85 @@ fn prefill_q4_seq4_synthetic_smoke() {
     assert!(
         max_abs < 1e6,
         "prefill_q4 output magnitude {max_abs} unreasonable"
+    );
+}
+
+/// Regression: dispatch geometry must travel with `KernelHandle`, not
+/// with shader-module re-exports. Pin the QKV projection pipelines'
+/// rows/threads against the shader-module constants so any drift fails
+/// at unit-test time, not at "decode emits garbage on this model" time.
+///
+/// This is the audit pair to `decode_attention_layer_q4k_writes_all_kv_rows`:
+/// that test catches the runtime symptom; this one catches the static
+/// invariant.
+#[test]
+fn qkv_pipeline_geometry_matches_shader_constants() {
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    use larql_compute::metal::shaders::{q4k_qkv_proj as q4k, q4kf_qkv_proj as q4kf};
+
+    assert_eq!(metal.q4k_qkv_proj_pipeline.rows_per_tg, q4k::ROWS_PER_TG);
+    assert_eq!(
+        metal.q4k_qkv_proj_pipeline.threads_per_tg,
+        q4k::THREADS_PER_TG
+    );
+    assert_eq!(metal.q4kf_qkv_proj_pipeline.rows_per_tg, q4kf::ROWS_PER_TG);
+    assert_eq!(
+        metal.q4kf_qkv_proj_pipeline.threads_per_tg,
+        q4kf::THREADS_PER_TG
+    );
+
+    // The two pipelines must have DIFFERENT geometry — that's the whole
+    // reason the bug existed. If they ever converge, delete this assert
+    // and document the consolidation.
+    assert!(
+        metal.q4k_qkv_proj_pipeline.rows_per_tg != metal.q4kf_qkv_proj_pipeline.rows_per_tg
+            || metal.q4k_qkv_proj_pipeline.threads_per_tg
+                != metal.q4kf_qkv_proj_pipeline.threads_per_tg,
+        "Q4_K and Q4_KF QKV pipelines now share geometry — \
+         the decode_hybrid bug class no longer applies"
+    );
+}
+
+/// Regression: MoE gate+up dispatch geometry must come from the bound
+/// `KernelHandle`, not from re-imported shader-module constants. The
+/// existing `q4k_ffn_gate_up_pipeline` is currently 4sg, but if it ever
+/// gets bumped to 8sg (mirroring `q4k_matvec_pipeline`'s 4→8sg flip
+/// from 2026-04-28), the `moe_dispatch.rs` paths must follow.
+#[test]
+fn moe_gate_up_pipeline_geometry_matches_shader_constants() {
+    let metal = match larql_compute::metal::MetalBackend::new() {
+        Some(m) => m,
+        None => {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    use larql_compute::metal::shaders::{
+        q4k_ffn_gate_up as q4k_gu, q4k_ffn_gate_up_8sg as q4k_gu_8sg,
+    };
+
+    assert_eq!(
+        metal.q4k_ffn_gate_up_pipeline.rows_per_tg,
+        q4k_gu::ROWS_PER_TG
+    );
+    assert_eq!(
+        metal.q4k_ffn_gate_up_pipeline.threads_per_tg,
+        q4k_gu::THREADS_PER_TG
+    );
+    assert_eq!(
+        metal.q4k_ffn_gate_up_8sg_pipeline.rows_per_tg,
+        q4k_gu_8sg::ROWS_PER_TG
+    );
+    assert_eq!(
+        metal.q4k_ffn_gate_up_8sg_pipeline.threads_per_tg,
+        q4k_gu_8sg::THREADS_PER_TG
     );
 }

@@ -106,6 +106,13 @@ pub use cpu::CpuBackend;
 /// gate+up / act+down averages into `StageTimings`.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal::take_last_split_timings as metal_take_last_split_timings;
+
+/// `MetalBackend` is the Metal-feature compute backend. `MoeScratch`
+/// is the pre-allocated per-shape MoE scratch struct that
+/// `decode_token_q4k_moe` reuses across calls so the per-token
+/// 15-buffer allocation cost (~120 ms on Gemma 4 26B-A4B M3 Max) is
+/// paid once at first use; downstream `larql-server` keeps a cache of
+/// these by shape.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal::{MetalBackend, MoeScratch};
 

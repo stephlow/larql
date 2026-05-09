@@ -78,7 +78,8 @@ impl MetalBackend {
             let mixed_q4k_q6k_v = layer.wq.format == crate::QuantFormat::Q4_K
                 && layer.wk.format == crate::QuantFormat::Q4_K
                 && layer.wv.format == crate::QuantFormat::Q6_K;
-            let use_fused = crate::options::env_opt_in(crate::options::ENV_QKV_FUSED);
+            // Cached at startup; see `metal::flags::DecodeFlags`.
+            let use_fused = self.decode_flags.qkv_fused;
             if mixed_q4k_q6k_v
                 && use_fused
                 && layer.norm_type == crate::NormType::RmsNorm

@@ -4,6 +4,38 @@
 //! string literals through hot paths. Most callers should eventually pass an
 //! explicit options struct; this module is the compatibility bridge while those
 //! APIs are split out.
+//!
+//! ## Helper taxonomy — pick the matching one for the flag's intended default
+//!
+//! Mixing these on the same env var is the bug class flagged in the
+//! larql-compute review (`stages/ffn.rs` reads `LARQL_FUSED_DOWN` with
+//! [`env_flag`] = default OFF, while `decode/encode_ffn.rs` reads it with
+//! [`env_not_zero_or_default(_, true)`] = default ON). When in doubt
+//! about a flag, prefer [`env_opt_in`] / [`env_opt_out`] — they ignore
+//! `set-but-empty`, which is a common shell-export footgun.
+//!
+//! | Helper                                  | Default | True when env is …                          | Best for                                  |
+//! |-----------------------------------------|---------|---------------------------------------------|-------------------------------------------|
+//! | [`env_flag`]                            | false   | set (any value, including empty)            | debug toggles, dump destinations          |
+//! | [`env_opt_in`]                          | false   | exactly `1` / `true` / `on` / `yes`         | opt-in experiments (cooperative kernels)  |
+//! | [`env_opt_out`]                         | false   | exactly `0` / `false` / `off` / `no`        | opt-OUT of a default-on path              |
+//! | `!env_opt_out(name)`                    | true    | env unset OR not in opt-out vocabulary      | default-on fusion paths                   |
+//! | [`env_not_zero_or_default`]`(name, d)`  | `d`     | env set AND not exactly `0`                 | "default true unless explicitly disabled" |
+//!
+//! ### Picking helpers for new flags
+//!
+//! - **Default-OFF, opt-in**: use [`env_opt_in`]. Setting `LARQL_X=` (empty)
+//!   stays OFF.  This is the right shape for new experiments where bare
+//!   shell-exports (`export LARQL_X` with no value) shouldn't accidentally
+//!   activate the path.
+//! - **Default-ON, opt-out**: use `!env_opt_out(name)`. Setting `LARQL_X=0`
+//!   disables; `LARQL_X=` (empty) keeps the default.
+//! - **Diagnostic toggle, presence-as-truth**: use [`env_flag`]. Convenient
+//!   for "set this var to anything, I just need to know it was requested".
+//!
+//! Cache hot-path env reads at backend construction (see
+//! `metal::flags::DecodeFlags`) — repeated `getenv` per layer per token
+//! costs measurable syscalls.
 
 /// Enable timing around the full CPU MoE forward pass.
 pub const ENV_MOE_FWD_TIMING: &str = "LARQL_MOE_FWD_TIMING";

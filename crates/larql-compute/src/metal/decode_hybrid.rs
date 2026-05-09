@@ -76,14 +76,12 @@ impl MetalBackend {
 
         if uses_q4k {
             use crate::metal::ops::full_pipeline::encode_rms_norm;
-            use crate::metal::shaders::q4kf_qkv_proj as qkv_sh;
             let norm_f32_buf = self.bufs.output((hidden * 4) as u64);
             let total_rows = (q_dim + kv_dim + kv_dim) as u32;
             let q_rows_val = q_dim as u32;
             let k_rows_val = kv_dim as u32;
             let v_rows_val = kv_dim as u32;
             let k_val = hidden as u32;
-            let num_tgs = (total_rows as u64).div_ceil(qkv_sh::ROWS_PER_TG);
 
             encode_rms_norm(
                 enc_a,
@@ -96,11 +94,19 @@ impl MetalBackend {
                 norm_offset,
             );
 
+            // Pull dispatch geometry from the chosen `KernelHandle`,
+            // not from a fixed shader-module constant. Q4_K and Q4_KF
+            // have different `(ROWS_PER_TG, THREADS_PER_TG)` (8/256
+            // vs 4/64) — using one shader's constants while binding
+            // the other's pipeline silently drops 75 % of QKV rows.
+            // Same dispatch-geometry-mismatch class as the q4_matvec_v4
+            // ROADMAP ship-log entry.
             let qkv_pipeline = if layer.wq.format == crate::QuantFormat::Q4_KF {
                 &self.q4kf_qkv_proj_pipeline
             } else {
                 &self.q4k_qkv_proj_pipeline
             };
+            let num_tgs = (total_rows as u64).div_ceil(qkv_pipeline.rows_per_tg);
             enc_a.set_compute_pipeline_state(&qkv_pipeline.state);
             enc_a.set_buffer(0, Some(&wq_buf), 0);
             enc_a.set_buffer(1, Some(&wk_buf), 0);
@@ -115,7 +121,7 @@ impl MetalBackend {
             enc_a.set_bytes(10, 4, &k_val as *const u32 as *const std::ffi::c_void);
             enc_a.dispatch_thread_groups(
                 MTLSize::new(num_tgs, 1, 1),
-                MTLSize::new(qkv_sh::THREADS_PER_TG, 1, 1),
+                MTLSize::new(qkv_pipeline.threads_per_tg, 1, 1),
             );
         } else {
             // Q8 path
@@ -169,8 +175,12 @@ impl MetalBackend {
                 &(hidden as u32) as *const u32 as *const std::ffi::c_void,
             );
             enc_a.dispatch_thread_groups(
-                MTLSize::new((total_rows as u64).div_ceil(8), 1, 1),
-                MTLSize::new(256, 1, 1),
+                MTLSize::new(
+                    (total_rows as u64).div_ceil(self.q8_qkv_proj_pipeline.rows_per_tg),
+                    1,
+                    1,
+                ),
+                MTLSize::new(self.q8_qkv_proj_pipeline.threads_per_tg, 1, 1),
             );
         }
 

@@ -117,7 +117,7 @@ pub fn run_single_expert(
     // (kernel-debug A/B).
     if matches!(format, crate::QuantFormat::Q4_K)
         && hidden.is_multiple_of(256)
-        && !options::env_flag(options::ENV_DISABLE_Q4K_DIRECT)
+        && !super::q4k_direct_disabled()
     {
         thread_local! {
             static SCRATCH: std::cell::RefCell<Option<ExpertScratch>> =
