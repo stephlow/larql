@@ -158,11 +158,6 @@ pub fn rms_norm_heads_eps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
-
-    fn row_l2(m: &Array2<f32>, row: usize) -> f32 {
-        m.row(row).iter().map(|v| v * v).sum::<f32>().sqrt()
-    }
 
     // ── rms_norm ──────────────────────────────────────────────────────────────
 

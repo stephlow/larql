@@ -1,13 +1,13 @@
 use std::sync::{Arc, RwLock};
 
 use super::backend::RemoteMoeBackend;
-use super::config::{parse_unit_manifest, ShardConfig, UnitManifest, UnitShard};
+use super::config::{parse_unit_manifest, ShardConfig, UnitManifest};
 use super::router::MoeRouterWeights;
 use super::shard::{Shard, ShardTransport};
 use super::wire::{
-    decode_layer_batch_request, decode_layer_batch_request_f16, decode_layer_batch_response,
-    decode_layer_batch_response_f16, encode_layer_batch_request, encode_layer_batch_request_f16,
-    encode_layer_batch_response, encode_layer_batch_response_f16, f16_bits_to_f32, f32_to_f16_bits,
+    decode_layer_batch_request_f16, decode_layer_batch_response_f16,
+    encode_layer_batch_request_f16, encode_layer_batch_response_f16, f16_bits_to_f32,
+    f32_to_f16_bits,
 };
 
 /// f32→f16→f32 round-trip should preserve normal-range residual values
@@ -145,28 +145,11 @@ fn shard_config_strips_trailing_slash() {
     assert_eq!(s.url, "http://a.example.com:8081");
 }
 
-#[test]
-fn shard_owns() {
-    fn make_shard(start: usize, end: usize) -> Shard {
-        let config = ShardConfig::new(start, end, "http://localhost:8080");
-        let transport = ShardTransport::Http(reqwest::blocking::Client::new());
-        Shard { config, transport }
-    }
-    let s = make_shard(0, 31);
-    assert!(s.owns(0));
-    assert!(s.owns(31));
-    assert!(!s.owns(32));
-    let s2 = make_shard(32, 63);
-    assert!(s2.owns(32));
-    assert!(s2.owns(63));
-    assert!(!s2.owns(31));
-}
-
 // ── Per-(layer, expert) ownership ────────────────────────────────────
 //
 // Verify that:
-//   1. A shard built with `with_units` ignores layer-uniform `owns(...)`
-//      so layer-aware `owns_unit(...)` is the only source of truth.
+//   1. A shard built with `with_units` honours the explicit `(layer, expert_id)`
+//      set via the layer-aware `owns_unit(...)` check.
 //   2. Layer-uniform shards keep working unchanged via `owns_unit`
 //      (legacy `--moe-shards "0-63=URL"` configs).
 //   3. The manifest parser round-trips JSON → `Vec<ShardConfig>` with
@@ -182,11 +165,6 @@ fn make_unit_shard(units: &[(usize, usize)]) -> Shard {
 #[test]
 fn shard_with_units_only_owns_via_layer_aware_check() {
     let s = make_unit_shard(&[(0, 5), (3, 17)]);
-    // Legacy owns must return false in unit-set mode (forces layer-aware
-    // routing at all call sites).
-    assert!(!s.owns(5));
-    assert!(!s.owns(17));
-    // Layer-aware owns_unit honours the explicit set.
     assert!(s.owns_unit(0, 5));
     assert!(s.owns_unit(3, 17));
     assert!(!s.owns_unit(1, 5)); // wrong layer

@@ -12,6 +12,8 @@
 //! - [`f32`] — `load_model_weights_with_opts`
 //! - [`q4k`] — `load_model_weights_q4k_shard`
 
+mod arch;
+mod embeddings;
 mod f32;
 mod q4k;
 

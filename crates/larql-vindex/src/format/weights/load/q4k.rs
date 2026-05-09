@@ -55,86 +55,15 @@ pub fn load_model_weights_q4k_shard(
         .as_ref()
         .ok_or_else(|| VindexError::Parse("vindex missing model_config in index.json".into()))?;
 
-    // Reconstruct architecture (same as load_model_weights — Gemma 4 per-layer
-    // geometry propagates through model_cfg).
-    let mut arch_obj = serde_json::json!({
-        "model_type": model_cfg.model_type,
-        "hidden_size": config.hidden_size,
-        "num_hidden_layers": config.num_layers,
-        "intermediate_size": config.intermediate_size,
-        "head_dim": model_cfg.head_dim,
-        "num_attention_heads": model_cfg.num_q_heads,
-        "num_key_value_heads": model_cfg.num_kv_heads,
-        "rope_theta": model_cfg.rope_base,
-        "sliding_window": model_cfg.sliding_window,
-        "vocab_size": config.vocab_size,
-    });
-    let obj = arch_obj.as_object_mut().unwrap();
-    if let Some(v) = model_cfg.global_head_dim {
-        obj.insert("global_head_dim".into(), v.into());
-    }
-    if let Some(v) = model_cfg.num_global_kv_heads {
-        obj.insert("num_global_key_value_heads".into(), v.into());
-    }
-    if let Some(v) = model_cfg.partial_rotary_factor {
-        obj.insert("partial_rotary_factor".into(), v.into());
-    }
-    if let Some(v) = model_cfg.sliding_window_pattern {
-        obj.insert("sliding_window_pattern".into(), v.into());
-    }
-    if let Some(ref v) = model_cfg.layer_types {
-        obj.insert(
-            "layer_types".into(),
-            serde_json::to_value(v).unwrap_or_default(),
-        );
-    }
-    if model_cfg.attention_k_eq_v {
-        obj.insert("attention_k_eq_v".into(), true.into());
-    }
-    if let Some(v) = model_cfg.num_kv_shared_layers {
-        obj.insert("num_kv_shared_layers".into(), v.into());
-    }
-    if let Some(v) = model_cfg.per_layer_embed_dim {
-        obj.insert("hidden_size_per_layer_input".into(), v.into());
-    }
-    if let Some(v) = model_cfg.rope_local_base {
-        obj.insert("rope_local_base_freq".into(), v.into());
-    }
-    if let Some(v) = model_cfg.query_pre_attn_scalar {
-        obj.insert("query_pre_attn_scalar".into(), v.into());
-    }
-    if let Some(v) = model_cfg.final_logit_softcapping {
-        obj.insert("final_logit_softcapping".into(), v.into());
-    }
-    if let Some(ref moe) = model_cfg.moe {
-        obj.insert("num_experts".into(), moe.num_experts.into());
-        obj.insert("top_k_experts".into(), moe.top_k.into());
-        if let Some(v) = moe.moe_intermediate_size {
-            obj.insert("moe_intermediate_size".into(), v.into());
-        }
-        if moe.hybrid {
-            obj.insert("enable_moe_block".into(), true.into());
-        }
-    }
+    // Reconstruct architecture (shared with the f32 loader — see
+    // `super::arch::build_arch_json`).
+    let arch_obj = super::arch::build_arch_json(&config, model_cfg);
     let arch = larql_models::detect_from_json(&arch_obj);
 
-    // Embeddings — required for token lookup at layer 0.
-    callbacks.on_file_start(
-        "embeddings",
-        &dir.join(EMBEDDINGS_BIN).display().to_string(),
-    );
-    let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
-    let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
-    let expected_f32 = config.vocab_size * config.hidden_size * 4;
-    let embed_dtype = if embed_mmap.len() == expected_f32 {
-        crate::config::dtype::StorageDtype::F32
-    } else {
-        crate::config::dtype::StorageDtype::F16
-    };
-    let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, embed_dtype);
-    let embed = Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
-    callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
+    // Embeddings — required for token lookup at layer 0. The Q4_K
+    // loader always loads them; only the f32 path has a `skip_embed`
+    // option for FFN-service workers.
+    let embed = super::embeddings::load_embeddings(dir, &config, callbacks)?;
 
     // norms.bin (f32) — loaded via weight_manifest.json, filtered to vector entries.
     let manifest_path = dir.join(WEIGHT_MANIFEST_JSON);

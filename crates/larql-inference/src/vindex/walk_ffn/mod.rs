@@ -418,7 +418,6 @@ mod dispatch_tests {
     use crate::model::ModelWeights;
     use larql_vindex::{
         FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,
-        WalkHit, WalkTrace,
     };
     use ndarray::{Array1, Array2};
     use std::sync::OnceLock;
@@ -434,7 +433,6 @@ mod dispatch_tests {
     /// WalkFfn routes through path 9 (last-resort sparse matmul against weights.tensors).
     struct MockGateIndex {
         n_features: usize,
-        hidden: usize,
     }
 
     impl GateLookup for MockGateIndex {
@@ -464,7 +462,6 @@ mod dispatch_tests {
     fn mock_index(weights: &ModelWeights) -> MockGateIndex {
         MockGateIndex {
             n_features: weights.intermediate_size,
-            hidden: weights.hidden_size,
         }
     }
 
@@ -564,10 +561,7 @@ mod dispatch_tests {
     fn walk_ffn_zero_features_falls_back_to_weight_ffn() {
         // When MockGateIndex returns 0 features, WalkFfn should fall back to WeightFfn.
         let weights = shared_weights();
-        let zero_idx = MockGateIndex {
-            n_features: 0,
-            hidden: weights.hidden_size,
-        };
+        let zero_idx = MockGateIndex { n_features: 0 };
         let ffn = WalkFfn::new_unlimited(&weights, &zero_idx);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);

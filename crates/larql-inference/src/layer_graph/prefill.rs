@@ -114,7 +114,7 @@ mod tests {
             w,
             &h.row(1)
                 .into_owned()
-                .into_shape((1, w.hidden_size))
+                .into_shape_with_order((1, w.hidden_size))
                 .unwrap(),
         );
         assert!(logits.iter().all(|v| v.is_finite()));

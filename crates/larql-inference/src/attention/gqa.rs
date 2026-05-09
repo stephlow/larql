@@ -259,9 +259,6 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
-    fn zeros(rows: usize, cols: usize) -> Array2<f32> {
-        Array2::zeros((rows, cols))
-    }
     fn ones(rows: usize, cols: usize) -> Array2<f32> {
         Array2::ones((rows, cols))
     }

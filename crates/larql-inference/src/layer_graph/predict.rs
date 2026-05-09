@@ -708,10 +708,7 @@ pub fn trace_with_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{
-        make_test_tokenizer, make_test_vindex, make_test_weights, TestFixtures,
-    };
-    use crate::model::ModelWeights;
+    use crate::engines::test_utils::TestFixtures;
     use std::sync::OnceLock;
 
     fn fx() -> &'static TestFixtures {

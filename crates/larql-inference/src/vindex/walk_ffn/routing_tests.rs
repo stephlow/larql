@@ -20,14 +20,13 @@ use larql_vindex::{
     FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,
 };
 
-use super::{DispatchEntry, WalkFfn};
+use super::DispatchEntry;
 
 /// Toggleable mock of GateIndex that reports whichever backends the
 /// test wants available. All walk methods return zero arrays — the
 /// tests only assert on the dispatch trace.
 pub(super) struct MockIndex {
     pub num_features: usize,
-    pub hidden_size: usize,
     pub has_overrides: bool,
     pub has_fp4: bool,
     pub has_q4_interleaved: bool,
@@ -41,10 +40,9 @@ pub(super) struct MockIndex {
 }
 
 impl MockIndex {
-    fn new(hidden: usize, num_features: usize) -> Self {
+    fn new(_hidden: usize, num_features: usize) -> Self {
         Self {
             num_features,
-            hidden_size: hidden,
             has_overrides: false,
             has_fp4: false,
             has_q4_interleaved: false,

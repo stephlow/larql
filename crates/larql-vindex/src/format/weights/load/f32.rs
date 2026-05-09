@@ -53,82 +53,18 @@ pub fn load_model_weights_with_opts(
         .as_ref()
         .ok_or_else(|| VindexError::Parse("vindex missing model_config in index.json".into()))?;
 
-    // Reconstruct full architecture config — includes per-layer geometry for Gemma 4.
-    let mut arch_obj = serde_json::json!({
-        "model_type": model_cfg.model_type,
-        "hidden_size": config.hidden_size,
-        "num_hidden_layers": config.num_layers,
-        "intermediate_size": config.intermediate_size,
-        "head_dim": model_cfg.head_dim,
-        "num_attention_heads": model_cfg.num_q_heads,
-        "num_key_value_heads": model_cfg.num_kv_heads,
-        "rope_theta": model_cfg.rope_base,
-        "sliding_window": model_cfg.sliding_window,
-        "vocab_size": config.vocab_size,
-    });
-    // Pass through Gemma 4 per-layer geometry fields (if present in vindex config).
-    let obj = arch_obj.as_object_mut().unwrap();
-    if let Some(v) = model_cfg.global_head_dim {
-        obj.insert("global_head_dim".into(), v.into());
-    }
-    if let Some(v) = model_cfg.num_global_kv_heads {
-        obj.insert("num_global_key_value_heads".into(), v.into());
-    }
-    if let Some(v) = model_cfg.partial_rotary_factor {
-        obj.insert("partial_rotary_factor".into(), v.into());
-    }
-    if let Some(v) = model_cfg.sliding_window_pattern {
-        obj.insert("sliding_window_pattern".into(), v.into());
-    }
-    if let Some(ref v) = model_cfg.layer_types {
-        obj.insert(
-            "layer_types".into(),
-            serde_json::to_value(v).unwrap_or_default(),
-        );
-    }
-    if model_cfg.attention_k_eq_v {
-        obj.insert("attention_k_eq_v".into(), true.into());
-    }
-    if let Some(v) = model_cfg.num_kv_shared_layers {
-        obj.insert("num_kv_shared_layers".into(), v.into());
-    }
-    if let Some(v) = model_cfg.per_layer_embed_dim {
-        obj.insert("hidden_size_per_layer_input".into(), v.into());
-    }
-    if let Some(v) = model_cfg.rope_local_base {
-        obj.insert("rope_local_base_freq".into(), v.into());
-    }
-    if let Some(v) = model_cfg.query_pre_attn_scalar {
-        obj.insert("query_pre_attn_scalar".into(), v.into());
-    }
-    if let Some(v) = model_cfg.final_logit_softcapping {
-        obj.insert("final_logit_softcapping".into(), v.into());
-    }
+    // Reconstruct full architecture (shared with the Q4_K loader — see
+    // `super::arch::build_arch_json`).
+    let arch_obj = super::arch::build_arch_json(&config, model_cfg);
     let arch = larql_models::detect_from_json(&arch_obj);
 
     // Embeddings — skippable for FFN-service servers that only handle
     // residual-vector requests and never see token IDs.
     let embed = if opts.skip_embed {
-        callbacks.on_file_start("embeddings (skipped)", "opts.skip_embed=true");
-        Array2::<f32>::zeros((0, 0))
+        super::embeddings::empty_embeddings(callbacks)
     } else {
-        callbacks.on_file_start(
-            "embeddings",
-            &dir.join(EMBEDDINGS_BIN).display().to_string(),
-        );
-        let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
-        let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
-        let expected_embed_f32 = config.vocab_size * config.hidden_size * 4;
-        let embed_dtype = if embed_mmap.len() == expected_embed_f32 {
-            crate::config::dtype::StorageDtype::F32
-        } else {
-            crate::config::dtype::StorageDtype::F16
-        };
-        let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, embed_dtype);
-        Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
-            .map_err(|e| VindexError::Parse(e.to_string()))?
+        super::embeddings::load_embeddings(dir, &config, callbacks)?
     };
-    callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
 
     let manifest_path = dir.join(WEIGHT_MANIFEST_JSON);
     if !manifest_path.exists() {

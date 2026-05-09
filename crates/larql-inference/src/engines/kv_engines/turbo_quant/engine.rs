@@ -403,7 +403,7 @@ impl TurboQuantEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::accuracy::{cosine_similarity, mse};
+    use crate::engines::accuracy::cosine_similarity;
 
     /// TurboQuant's codebooks are optimised for unit-norm vectors (the natural
     /// distribution of K/V heads after QK-norm). Using unit-norm inputs gives
@@ -426,18 +426,6 @@ mod tests {
         } else {
             raw
         }
-    }
-
-    fn random_vec(dim: usize, seed: u64) -> Vec<f32> {
-        let mut state = seed;
-        (0..dim)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
-            })
-            .collect()
     }
 
     // ── Codec roundtrip quality ───────────────────────────────────────────────
@@ -616,12 +604,18 @@ mod tests {
         let v = Array2::from_shape_vec((10, 256), v_data.clone()).unwrap();
         let cl = CompressedLayer::compress(&(k, v), &tq);
         let (k_dec, v_dec) = cl.decompress(&tq);
-        // Check last row cosine (most relevant for decode)
+        // Check last row cosine (most relevant for decode) on both K and V.
         let k_orig_last: Vec<f32> = k_data[9 * 256..10 * 256].to_vec();
         let k_dec_last: Vec<f32> = k_dec.row(9).to_vec();
         assert!(
             cosine_similarity(&k_orig_last, &k_dec_last) > 0.88,
             "K roundtrip cosine too low"
+        );
+        let v_orig_last: Vec<f32> = v_data[9 * 256..10 * 256].to_vec();
+        let v_dec_last: Vec<f32> = v_dec.row(9).to_vec();
+        assert!(
+            cosine_similarity(&v_orig_last, &v_dec_last) > 0.88,
+            "V roundtrip cosine too low"
         );
     }
 }

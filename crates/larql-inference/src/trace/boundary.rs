@@ -327,21 +327,6 @@ impl BoundaryWriter {
 mod tests {
     use super::*;
 
-    fn write_and_open(path: &std::path::Path, hidden: usize) -> (BoundaryWriter, BoundaryStore) {
-        let mut writer = BoundaryWriter::create(path, hidden, 200, 100).expect("create");
-        let residual: Vec<f32> = (0..hidden).map(|i| i as f32).collect();
-        writer.append(0, 200, &residual).expect("append 0");
-        writer
-            .append(200, 200, &vec![99.0f32; hidden])
-            .expect("append 1");
-        writer.finish().expect("finish");
-        let store = BoundaryStore::open(path).expect("open");
-        (
-            BoundaryWriter::create(path, hidden, 200, 100).unwrap(),
-            store,
-        )
-    }
-
     // ── BoundaryWriter + BoundaryStore ────────────────────────────────────────
 
     #[test]
