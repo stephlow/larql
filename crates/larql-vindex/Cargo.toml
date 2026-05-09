@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "cpu_vs_gpu"
 harness = false
+
+[[bench]]
+name = "walker_throughput"
+harness = false

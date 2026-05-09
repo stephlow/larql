@@ -48,3 +48,66 @@ impl NativeFfnAccess for VectorIndex {
         self.prefetch_interleaved_layer(layer)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Trait-impl shim coverage. Inherent methods are exercised by
+    //! `index/storage/ffn_store/*` integration tests; here we just pin
+    //! that the trait dispatch lines run.
+    use super::*;
+
+    fn fresh() -> VectorIndex {
+        VectorIndex::empty(2, 8)
+    }
+
+    #[test]
+    fn down_feature_vector_returns_none_on_empty_vindex() {
+        let v = fresh();
+        assert!(<VectorIndex as NativeFfnAccess>::down_feature_vector(&v, 0, 0).is_none());
+    }
+
+    #[test]
+    fn has_down_features_false_on_empty_vindex() {
+        let v = fresh();
+        assert!(!<VectorIndex as NativeFfnAccess>::has_down_features(&v));
+    }
+
+    #[test]
+    fn down_layer_matrix_none_on_empty() {
+        let v = fresh();
+        assert!(<VectorIndex as NativeFfnAccess>::down_layer_matrix(&v, 0).is_none());
+    }
+
+    #[test]
+    fn up_layer_matrix_none_on_empty() {
+        let v = fresh();
+        assert!(<VectorIndex as NativeFfnAccess>::up_layer_matrix(&v, 0).is_none());
+    }
+
+    #[test]
+    fn has_full_mmap_ffn_false_on_empty() {
+        let v = fresh();
+        assert!(!<VectorIndex as NativeFfnAccess>::has_full_mmap_ffn(&v));
+    }
+
+    #[test]
+    fn has_interleaved_false_on_empty() {
+        let v = fresh();
+        assert!(!<VectorIndex as NativeFfnAccess>::has_interleaved(&v));
+    }
+
+    #[test]
+    fn interleaved_gate_up_down_none_on_empty() {
+        let v = fresh();
+        assert!(<VectorIndex as NativeFfnAccess>::interleaved_gate(&v, 0).is_none());
+        assert!(<VectorIndex as NativeFfnAccess>::interleaved_up(&v, 0).is_none());
+        assert!(<VectorIndex as NativeFfnAccess>::interleaved_down(&v, 0).is_none());
+    }
+
+    #[test]
+    fn prefetch_interleaved_layer_is_safe_on_empty() {
+        let v = fresh();
+        // No mmap → no madvise; must not panic.
+        <VectorIndex as NativeFfnAccess>::prefetch_interleaved_layer(&v, 0);
+    }
+}

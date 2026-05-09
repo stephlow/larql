@@ -282,6 +282,13 @@ mod tests {
         gate: Option<Array2<f32>>,
         up: Option<Array2<f32>>,
         down: Option<Array2<f32>>,
+        // Alternate native arms (the dispatch chain tries
+        // `interleaved_*` first, then falls through to `*_layer_matrix`).
+        up_layer: Option<Array2<f32>>,
+        down_layer: Option<Array2<f32>>,
+        // Per-feature down vectors (preferred over interleaved_down in
+        // the component=2 chain).
+        down_feature: Option<Vec<f32>>,
         // FP4 — when set, `fp4_ffn_row_*` returns predetermined sentinels
         // so dispatch routing is observable.
         fp4_dot: Option<f32>,
@@ -298,6 +305,12 @@ mod tests {
         fn has_interleaved(&self) -> bool {
             self.gate.is_some() || self.up.is_some() || self.down.is_some()
         }
+        fn has_full_mmap_ffn(&self) -> bool {
+            self.up_layer.is_some() || self.down_layer.is_some()
+        }
+        fn has_down_features(&self) -> bool {
+            self.down_feature.is_some()
+        }
         fn interleaved_gate(&self, _: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
             self.gate.as_ref().map(|m| m.view())
         }
@@ -306,6 +319,15 @@ mod tests {
         }
         fn interleaved_down(&self, _: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
             self.down.as_ref().map(|m| m.view())
+        }
+        fn up_layer_matrix(&self, _: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+            self.up_layer.as_ref().map(|m| m.view())
+        }
+        fn down_layer_matrix(&self, _: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+            self.down_layer.as_ref().map(|m| m.view())
+        }
+        fn down_feature_vector(&self, _: usize, _: usize) -> Option<&[f32]> {
+            self.down_feature.as_deref()
         }
     }
 
@@ -637,5 +659,246 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.primary_storage_bucket(), StorageBucket::Fp4);
+    }
+
+    // ── ffn_row_dot — additional native arms ─────────────────────
+
+    #[test]
+    fn dot_component_1_falls_through_to_up_layer_matrix() {
+        // No interleaved_up, but up_layer_matrix is present — second
+        // native arm in the component=1 chain.
+        let s = Stub {
+            up_layer: Some(one_row(&[3.0, 3.0])),
+            ..Default::default()
+        };
+        assert_eq!(s.ffn_row_dot(0, 1, 0, &[1.0, 2.0]), Some(9.0));
+    }
+
+    #[test]
+    fn dot_component_2_uses_down_feature_vector_first() {
+        // First native arm for component=2: per-feature down vectors.
+        let s = Stub {
+            down_feature: Some(vec![2.0, 3.0]),
+            // Both lower-priority arms set — must NOT be selected.
+            down: Some(one_row(&[99.0, 99.0])),
+            down_layer: Some(one_row(&[88.0, 88.0])),
+            ..Default::default()
+        };
+        assert_eq!(s.ffn_row_dot(0, 2, 0, &[1.0, 1.0]), Some(5.0));
+    }
+
+    #[test]
+    fn dot_component_2_falls_through_to_down_layer_matrix() {
+        // No down_feature, no interleaved_down — third arm wins.
+        let s = Stub {
+            down_layer: Some(one_row(&[4.0, 4.0])),
+            ..Default::default()
+        };
+        assert_eq!(s.ffn_row_dot(0, 2, 0, &[1.0, 0.5]), Some(6.0));
+    }
+
+    #[test]
+    fn dot_component_2_skips_down_feature_on_shape_mismatch() {
+        // down_feature width != x width → that arm declines, fall through
+        // to interleaved_down.
+        let s = Stub {
+            down_feature: Some(vec![1.0, 2.0, 3.0]), // 3-wide
+            down: Some(one_row(&[5.0, 5.0])),         // 2-wide
+            ..Default::default()
+        };
+        assert_eq!(s.ffn_row_dot(0, 2, 0, &[1.0, 2.0]), Some(15.0));
+    }
+
+    // ── ffn_row_scaled_add — additional native arms ──────────────
+
+    #[test]
+    fn scaled_add_component_1_via_up_layer_matrix() {
+        let s = Stub {
+            up_layer: Some(one_row(&[1.0, 2.0])),
+            ..Default::default()
+        };
+        let mut out = [10.0_f32, 10.0];
+        assert!(s.ffn_row_scaled_add(0, 1, 0, 2.0, &mut out));
+        assert_eq!(out, [12.0, 14.0]);
+    }
+
+    #[test]
+    fn scaled_add_component_2_via_down_feature_vector() {
+        let s = Stub {
+            down_feature: Some(vec![3.0, 4.0]),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 2];
+        assert!(s.ffn_row_scaled_add(0, 2, 0, 1.0, &mut out));
+        assert_eq!(out, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn scaled_add_component_2_via_down_layer_matrix() {
+        let s = Stub {
+            down_layer: Some(one_row(&[1.0, 1.0])),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 2];
+        assert!(s.ffn_row_scaled_add(0, 2, 0, 0.5, &mut out));
+        assert_eq!(out, [0.5, 0.5]);
+    }
+
+    // ── ffn_row_into — additional native arms ────────────────────
+
+    #[test]
+    fn into_component_1_via_up_layer_matrix() {
+        let s = Stub {
+            up_layer: Some(one_row(&[7.0, 8.0])),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 2];
+        assert!(s.ffn_row_into(0, 1, 0, &mut out));
+        assert_eq!(out, [7.0, 8.0]);
+    }
+
+    #[test]
+    fn into_component_2_via_down_feature_vector() {
+        let s = Stub {
+            down_feature: Some(vec![1.5, 2.5, 3.5]),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 3];
+        assert!(s.ffn_row_into(0, 2, 0, &mut out));
+        assert_eq!(out, [1.5, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn into_component_2_via_interleaved_down() {
+        let s = Stub {
+            down: Some(one_row(&[9.0, 9.0])),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 2];
+        assert!(s.ffn_row_into(0, 2, 0, &mut out));
+        assert_eq!(out, [9.0, 9.0]);
+    }
+
+    #[test]
+    fn into_component_2_via_down_layer_matrix() {
+        let s = Stub {
+            down_layer: Some(one_row(&[2.0, 4.0])),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 2];
+        assert!(s.ffn_row_into(0, 2, 0, &mut out));
+        assert_eq!(out, [2.0, 4.0]);
+    }
+
+    #[test]
+    fn into_invalid_component_returns_false() {
+        let s = Stub {
+            gate: Some(one_row(&[1.0])),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 1];
+        assert!(!s.ffn_row_into(0, 99, 0, &mut out));
+    }
+
+    // ── primary_storage_bucket — additional native triggers ──────
+
+    #[test]
+    fn bucket_exact_when_full_mmap_ffn_only() {
+        let s = Stub {
+            up_layer: Some(one_row(&[1.0])),
+            ..Default::default()
+        };
+        assert_eq!(s.primary_storage_bucket(), StorageBucket::Exact);
+    }
+
+    #[test]
+    fn bucket_exact_when_down_features_only() {
+        let s = Stub {
+            down_feature: Some(vec![1.0]),
+            ..Default::default()
+        };
+        assert_eq!(s.primary_storage_bucket(), StorageBucket::Exact);
+    }
+
+    #[test]
+    fn bucket_quantized_when_only_q4_legacy() {
+        // QuantizedFfnAccess::has_interleaved_q4 default is false; we
+        // can't trigger it via the Stub since we only override q4k.
+        // Instead exercise the q4_default-true path through a wrapper
+        // type that overrides only `has_interleaved_q4`.
+        struct OnlyQ4;
+        impl NativeFfnAccess for OnlyQ4 {}
+        impl QuantizedFfnAccess for OnlyQ4 {
+            fn has_interleaved_q4(&self) -> bool {
+                true
+            }
+        }
+        impl Fp4FfnAccess for OnlyQ4 {}
+        assert_eq!(OnlyQ4.primary_storage_bucket(), StorageBucket::Quantized);
+    }
+
+    // ── Q4_K fallback for non-down components ────────────────────
+
+    #[test]
+    fn scaled_add_component_0_falls_through_to_q4k() {
+        // No native gate, but Q4_K reports success — the
+        // non-component-2 branch of the q4k tail should run.
+        let s = Stub {
+            q4k_scaled_add_returns: true,
+            q4k_dot: Some(0.0), // make has_interleaved_q4k = true
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 4];
+        assert!(s.ffn_row_scaled_add(0, 0, 0, 1.0, &mut out));
+    }
+
+    #[test]
+    fn scaled_add_component_1_falls_through_to_q4k() {
+        let s = Stub {
+            q4k_scaled_add_returns: true,
+            q4k_dot: Some(0.0),
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 4];
+        assert!(s.ffn_row_scaled_add(0, 1, 0, 1.0, &mut out));
+    }
+
+    #[test]
+    fn dot_component_1_native_shape_mismatch_falls_through_to_q4k() {
+        // interleaved_up exists but cols != x.len() — must fall through.
+        let s = Stub {
+            up: Some(one_row(&[1.0, 1.0, 1.0])), // 3 cols
+            q4k_dot: Some(77.0),
+            ..Default::default()
+        };
+        assert_eq!(s.ffn_row_dot(0, 1, 0, &[1.0, 1.0]), Some(77.0));
+    }
+
+    #[test]
+    fn dot_component_2_all_native_shape_mismatch_falls_through_to_q4k() {
+        // Every component=2 native arm has a shape mismatch — final
+        // fall-through hits q4k.
+        let s = Stub {
+            down_feature: Some(vec![1.0, 2.0, 3.0]), // 3-wide
+            down: Some(one_row(&[1.0, 1.0, 1.0])),    // 3-wide
+            down_layer: Some(one_row(&[1.0, 1.0, 1.0])),
+            q4k_dot: Some(55.0),
+            ..Default::default()
+        };
+        assert_eq!(s.ffn_row_dot(0, 2, 0, &[1.0, 2.0]), Some(55.0));
+    }
+
+    #[test]
+    fn into_feat_out_of_range_falls_through_to_q4k() {
+        // feat >= nrows of interleaved_up → the inner if-let block
+        // doesn't return; the function continues to up_layer_matrix
+        // and finally to q4k.
+        let s = Stub {
+            up: Some(one_row(&[1.0])),
+            q4k_into_returns: true,
+            ..Default::default()
+        };
+        let mut out = [0.0_f32; 1];
+        assert!(s.ffn_row_into(0, 1, 99, &mut out));
     }
 }

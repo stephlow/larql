@@ -362,7 +362,19 @@ pub fn walk_model(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_fixture::create_mock_model;
     use super::*;
+
+    fn fixture(slug: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("larql_ww_inline_{slug}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_mock_model(&dir);
+        dir
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     // ── ThresholdCounts ───────────────────────────────────────────────────────
 
@@ -396,5 +408,203 @@ mod tests {
         assert_eq!(s.self_loop_pct, 0.0);
         assert!(s.top_subjects.is_empty());
         assert!(s.top_objects.is_empty());
+    }
+
+    // ── SilentWalkCallbacks (no-op trait impl) ───────────────────────────────
+
+    #[test]
+    fn silent_walk_callbacks_no_op() {
+        let mut cb = SilentWalkCallbacks;
+        cb.on_layer_start(0, 4);
+        cb.on_progress(0, 1, 4);
+        let dummy_result = LayerResult {
+            layer: 0,
+            features_scanned: 4,
+            edges_found: 1,
+            elapsed_ms: 0.0,
+            stats: LayerStats::default(),
+        };
+        cb.on_layer_done(&dummy_result);
+        let mut g = Graph::new();
+        cb.on_checkpoint(&mut g);
+    }
+
+    // ── WeightWalker::load ────────────────────────────────────────────────────
+
+    #[test]
+    fn load_returns_expected_num_layers() {
+        let dir = fixture("ww_load_layers");
+        let walker = WeightWalker::load(dir.to_str().unwrap()).unwrap();
+        assert_eq!(walker.num_layers(), 2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_missing_directory_errors() {
+        assert!(WeightWalker::load("/nonexistent/larql/ww/path").is_err());
+    }
+
+    #[test]
+    fn load_missing_tokenizer_errors() {
+        let dir = fixture("ww_missing_tok");
+        std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        match WeightWalker::load(dir.to_str().unwrap()) {
+            Err(VindexError::MissingTensor(msg)) => {
+                assert!(msg.contains("tokenizer"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected MissingTensor; got {other:?}"),
+            Ok(_) => panic!("expected MissingTensor; got Ok"),
+        }
+        cleanup(&dir);
+    }
+
+    // ── walk_layer ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_layer_extracts_edges_and_stats() {
+        let dir = fixture("ww_edges");
+        let walker = WeightWalker::load(dir.to_str().unwrap()).unwrap();
+        let cfg = WalkConfig {
+            top_k: 3,
+            min_score: 0.0,
+        };
+        let mut g = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        let r = walker.walk_layer(0, &cfg, &mut g, &mut cb).unwrap();
+
+        assert_eq!(r.layer, 0);
+        assert_eq!(r.features_scanned, 4);
+        assert!(r.edges_found > 0);
+        assert!(r.elapsed_ms >= 0.0);
+        for edge in g.edges() {
+            assert_eq!(edge.source, SourceType::Parametric);
+            assert!(edge.confidence >= 0.0 && edge.confidence <= 1.0);
+            let m = edge.metadata.as_ref().unwrap();
+            assert!(m.contains_key("layer"));
+            assert!(m.contains_key("feature"));
+            assert!(m.contains_key("c_in"));
+            assert!(m.contains_key("c_out"));
+            assert!(m.contains_key("selectivity"));
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn walk_layer_min_score_drops_low_confidence_edges() {
+        let dir = fixture("ww_min_score");
+        let walker = WeightWalker::load(dir.to_str().unwrap()).unwrap();
+        let permissive = WalkConfig {
+            top_k: 3,
+            min_score: 0.0,
+        };
+        let strict = WalkConfig {
+            top_k: 3,
+            min_score: f32::INFINITY,
+        };
+        let mut g_p = Graph::new();
+        let mut g_s = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        let r_p = walker.walk_layer(0, &permissive, &mut g_p, &mut cb).unwrap();
+        let r_s = walker.walk_layer(0, &strict, &mut g_s, &mut cb).unwrap();
+        assert!(r_p.edges_found > 0);
+        assert_eq!(r_s.edges_found, 0);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn walk_layer_missing_gate_proj_errors() {
+        let dir = fixture("ww_no_gate");
+        let mut walker = WeightWalker::load(dir.to_str().unwrap()).unwrap();
+        walker
+            .weights
+            .tensors
+            .remove("layers.0.mlp.gate_proj.weight");
+        let cfg = WalkConfig {
+            top_k: 2,
+            min_score: 0.0,
+        };
+        let mut g = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        match walker.walk_layer(0, &cfg, &mut g, &mut cb) {
+            Err(VindexError::MissingTensor(msg)) => {
+                assert!(msg.contains("gate_proj.weight"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected MissingTensor; got {other:?}"),
+            Ok(_) => panic!("expected MissingTensor; got Ok"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn walk_layer_missing_down_proj_errors() {
+        let dir = fixture("ww_no_down");
+        let mut walker = WeightWalker::load(dir.to_str().unwrap()).unwrap();
+        walker
+            .weights
+            .tensors
+            .remove("layers.0.mlp.down_proj.weight");
+        let cfg = WalkConfig {
+            top_k: 2,
+            min_score: 0.0,
+        };
+        let mut g = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        match walker.walk_layer(0, &cfg, &mut g, &mut cb) {
+            Err(VindexError::MissingTensor(msg)) => {
+                assert!(msg.contains("down_proj.weight"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected MissingTensor; got {other:?}"),
+            Ok(_) => panic!("expected MissingTensor; got Ok"),
+        }
+        cleanup(&dir);
+    }
+
+    // ── walk_model ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_model_default_layers_walks_all() {
+        let dir = fixture("ww_walk_all");
+        let cfg = WalkConfig {
+            top_k: 2,
+            min_score: 0.0,
+        };
+        let mut g = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        let results = walk_model(dir.to_str().unwrap(), None, &cfg, &mut g, &mut cb).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].layer, 0);
+        assert_eq!(results[1].layer, 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn walk_model_layer_filter_walks_only_specified() {
+        let dir = fixture("ww_walk_filter");
+        let cfg = WalkConfig {
+            top_k: 2,
+            min_score: 0.0,
+        };
+        let mut g = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        let results =
+            walk_model(dir.to_str().unwrap(), Some(&[1]), &cfg, &mut g, &mut cb).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].layer, 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn walk_model_propagates_load_error() {
+        let cfg = WalkConfig::default();
+        let mut g = Graph::new();
+        let mut cb = SilentWalkCallbacks;
+        let r = walk_model(
+            "/nonexistent/larql/ww/walk_model",
+            None,
+            &cfg,
+            &mut g,
+            &mut cb,
+        );
+        assert!(r.is_err());
     }
 }

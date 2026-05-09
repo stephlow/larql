@@ -204,4 +204,48 @@ mod tests {
         let r = Array1::<f32>::zeros(4);
         assert!(n.gate_walk(0, &r, 4).is_none());
     }
+
+    // ── Cover the StubGate body so unused helper lines don't drag
+    // coverage down. These tests pin the stub's behaviour, but the real
+    // value is keeping the file fully exercised under llvm-cov so a
+    // later failure on the real backend is caught against a known-good
+    // stub baseline.
+
+    #[test]
+    fn stub_feature_meta_is_synthesised() {
+        let stub = StubGate { per_row: vec![] };
+        let meta = stub.feature_meta(0, 7).expect("stub returns Some");
+        assert_eq!(meta.top_token, "feat_7");
+        assert_eq!(meta.top_token_id, 7);
+        assert!((meta.c_score - 0.5).abs() < 1e-6);
+        assert_eq!(meta.top_k.len(), 1);
+    }
+
+    #[test]
+    fn stub_num_features_reflects_per_row_len() {
+        let stub = StubGate {
+            per_row: vec![vec![1], vec![2], vec![3, 4]],
+        };
+        assert_eq!(stub.num_features(0), 3);
+        // Layer index is ignored by the stub by design.
+        assert_eq!(stub.num_features(99), 3);
+    }
+
+    #[test]
+    fn stub_gate_knn_returns_empty_for_out_of_range_row() {
+        // Residual[0] selects the row; passing an index past per_row
+        // length should return empty.
+        let stub = StubGate { per_row: vec![vec![1]] };
+        let r = Array1::from_vec(vec![5.0_f32; 4]); // index 5, only 1 row
+        assert!(stub.gate_knn(0, &r, 4).is_empty());
+    }
+
+    #[test]
+    fn noop_gate_methods_return_empty() {
+        let n = NoOpGate;
+        let r = Array1::<f32>::zeros(4);
+        assert!(n.gate_knn(0, &r, 4).is_empty());
+        assert!(n.feature_meta(0, 0).is_none());
+        assert_eq!(n.num_features(0), 0);
+    }
 }

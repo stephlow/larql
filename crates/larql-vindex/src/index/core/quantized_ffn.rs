@@ -127,3 +127,100 @@ impl QuantizedFfnAccess for VectorIndex {
         VectorIndex::q4k_matmul_transb(self, layer, component, x, x_rows, backend)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Trait-impl shim coverage. Inherent Q4_K methods are exercised by
+    //! the dedicated `q4k_*` integration tests + benches; here we just
+    //! confirm each trait line runs and falls through to the inherent
+    //! method's "no Q4_K data" guard.
+    use super::*;
+
+    fn fresh() -> VectorIndex {
+        VectorIndex::empty(2, 8)
+    }
+
+    #[test]
+    fn flag_methods_false_on_empty() {
+        let v = fresh();
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_q4(&v));
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_q4k(&v));
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_down_features_q4k(&v));
+    }
+
+    #[test]
+    fn matrix_methods_none_on_empty() {
+        let v = fresh();
+        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4_gate(&v, 0).is_none());
+        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4_up(&v, 0).is_none());
+        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4_down(&v, 0).is_none());
+    }
+
+    #[test]
+    fn mmap_refs_none_on_empty() {
+        let v = fresh();
+        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4_mmap_ref(&v).is_none());
+        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4k_mmap_ref(&v).is_none());
+        assert!(
+            <VectorIndex as QuantizedFfnAccess>::interleaved_q4k_layer_data(&v, 0).is_none()
+        );
+    }
+
+    #[test]
+    fn q4k_ffn_layer_none_on_empty() {
+        let v = fresh();
+        assert!(<VectorIndex as QuantizedFfnAccess>::q4k_ffn_layer(&v, 0, 0).is_none());
+    }
+
+    #[test]
+    fn row_dispatch_methods_falsy_on_empty() {
+        let v = fresh();
+        let x = [1.0_f32; 8];
+        let mut out = [0.0_f32; 8];
+        assert!(<VectorIndex as QuantizedFfnAccess>::q4k_ffn_row_dot(&v, 0, 0, 0, &x).is_none());
+        assert!(!<VectorIndex as QuantizedFfnAccess>::q4k_ffn_row_into(
+            &v, 0, 0, 0, &mut out
+        ));
+        assert!(
+            !<VectorIndex as QuantizedFfnAccess>::q4k_ffn_row_scaled_add_via_cache(
+                &v, 0, 0, 0, 1.0, &mut out
+            )
+        );
+        assert!(!<VectorIndex as QuantizedFfnAccess>::q4k_ffn_row_scaled_add(
+            &v, 0, 0, 0, 1.0, &mut out
+        ));
+        assert!(
+            !<VectorIndex as QuantizedFfnAccess>::q4k_down_feature_scaled_add(
+                &v, 0, 0, 1.0, &mut out
+            )
+        );
+    }
+
+    #[test]
+    fn q4k_matmul_transb_none_on_empty() {
+        let v = fresh();
+        let x = [1.0_f32; 8];
+        let backend = larql_compute::CpuBackend;
+        assert!(<VectorIndex as QuantizedFfnAccess>::q4k_matmul_transb(
+            &v,
+            0,
+            0,
+            &x,
+            1,
+            Some(&backend)
+        )
+        .is_none());
+        // Backend=None path also covered.
+        assert!(
+            <VectorIndex as QuantizedFfnAccess>::q4k_matmul_transb(&v, 0, 0, &x, 1, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prefetch_methods_safe_on_empty() {
+        let v = fresh();
+        <VectorIndex as QuantizedFfnAccess>::prefetch_interleaved_q4_layer(&v, 0);
+        <VectorIndex as QuantizedFfnAccess>::prefetch_interleaved_q4k_layer(&v, 0);
+    }
+}
