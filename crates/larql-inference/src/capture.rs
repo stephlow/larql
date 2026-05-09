@@ -337,3 +337,96 @@ fn current_date() -> String {
 fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convert epoch seconds to a YYYY-MM-DD string. Mirrors `current_date` but
+    /// takes the timestamp as a parameter so it's deterministic.
+    fn date_from_epoch_secs(secs: u64) -> String {
+        let mut days = (secs / 86400) as i64;
+        let mut year: i64 = 1970;
+        loop {
+            let n = if is_leap_year(year) { 366 } else { 365 };
+            if days < n {
+                break;
+            }
+            days -= n;
+            year += 1;
+        }
+        let month_lens: [i64; 12] = if is_leap_year(year) {
+            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        } else {
+            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        };
+        let mut month = 1;
+        for n in month_lens {
+            if days < n {
+                break;
+            }
+            days -= n;
+            month += 1;
+        }
+        let day = days + 1;
+        format!("{year}-{month:02}-{day:02}")
+    }
+
+    #[test]
+    fn epoch_zero_is_1970_01_01() {
+        assert_eq!(date_from_epoch_secs(0), "1970-01-01");
+    }
+
+    #[test]
+    fn end_of_2024_is_leap_year_aware() {
+        // 2024-12-31 23:59:59 UTC = 1735689599 secs since epoch.
+        assert_eq!(date_from_epoch_secs(1_735_689_599), "2024-12-31");
+        // 2025-01-01 00:00:00 UTC = 1735689600 secs.
+        assert_eq!(date_from_epoch_secs(1_735_689_600), "2025-01-01");
+    }
+
+    #[test]
+    fn march_first_after_feb_29_in_leap_year() {
+        // 2024 is leap. 2024-03-01 00:00:00 UTC = 1709251200.
+        assert_eq!(date_from_epoch_secs(1_709_251_200), "2024-03-01");
+        // 2024-02-29 = 1709164800.
+        assert_eq!(date_from_epoch_secs(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn march_first_in_non_leap_year() {
+        // 2023-03-01 00:00:00 UTC = 1677628800.
+        assert_eq!(date_from_epoch_secs(1_677_628_800), "2023-03-01");
+        // 2023 has no Feb 29: 2023-02-28 = 1677542400.
+        assert_eq!(date_from_epoch_secs(1_677_542_400), "2023-02-28");
+    }
+
+    #[test]
+    fn century_boundary_2000_is_leap() {
+        // 2000-02-29 = 951782400 (divisible by 400 → leap).
+        assert_eq!(date_from_epoch_secs(951_782_400), "2000-02-29");
+    }
+
+    #[test]
+    fn current_date_returns_well_formed_string() {
+        let s = current_date();
+        // Format YYYY-MM-DD with zero-padded month/day.
+        let parts: Vec<&str> = s.split('-').collect();
+        assert_eq!(parts.len(), 3, "expected YYYY-MM-DD, got {s:?}");
+        let year: i32 = parts[0].parse().unwrap();
+        let month: u32 = parts[1].parse().unwrap();
+        let day: u32 = parts[2].parse().unwrap();
+        assert!(year >= 2025, "year too small: {year}");
+        assert!((1..=12).contains(&month), "bad month: {month}");
+        assert!((1..=31).contains(&day), "bad day: {day}");
+    }
+
+    #[test]
+    fn leap_year_rules() {
+        assert!(is_leap_year(2000)); // /400
+        assert!(!is_leap_year(1900)); // /100 not /400
+        assert!(is_leap_year(2024)); // /4
+        assert!(!is_leap_year(2023));
+        assert!(!is_leap_year(2100)); // /100 not /400
+    }
+}
