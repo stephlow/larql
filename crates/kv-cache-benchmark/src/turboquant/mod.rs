@@ -1,4 +1,4 @@
-//! TurboQuant — re-exported from `larql_inference::engines::turbo_quant`.
+//! TurboQuant — re-exported from `larql_kv::turbo_quant`.
 //!
 //! Algorithm modules still live here for the benchmark's KvStrategy impl;
 //! the KvEngine integration lives in larql-inference.
@@ -8,7 +8,7 @@ pub mod lloyd_max;
 pub mod packing;
 pub mod rotation;
 
-pub use larql_inference::engines::turbo_quant::TurboQuant;
+pub use larql_kv::turbo_quant::TurboQuant;
 
 use crate::{model_config::ModelConfig, KvStrategy};
 

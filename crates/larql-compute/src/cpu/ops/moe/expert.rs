@@ -271,7 +271,8 @@ pub fn run_single_expert_into<'s>(
     }
 
     if q4k_path {
-        let row_block_bytes = (hidden / 256) * 144;
+        let row_block_bytes = (hidden / larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
+            * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
         let half = inter * row_block_bytes;
         let gate_bytes = &gate_up_bytes[..half];
         let up_bytes = &gate_up_bytes[half..2 * half];
@@ -446,10 +447,10 @@ pub fn run_single_expert_q4k_q8k_into<'s>(
         return &scratch.out;
     }
 
-    // Q4_K weight stride (in bytes) per row: ceil(hidden / 256) * 144.
+    // Q4_K weight stride (in bytes) per row: ceil(hidden / Q4_K_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES.
     let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
     let inter_padded = inter.div_ceil(block) * block;
-    let row_block_bytes = (hidden / 256) * 144;
+    let row_block_bytes = (hidden / block) * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
     let half = inter * row_block_bytes;
     if gate_up_bytes.len() < 2 * half {
         for v in scratch.out.iter_mut() {

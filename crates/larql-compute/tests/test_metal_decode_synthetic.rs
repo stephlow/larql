@@ -738,6 +738,52 @@ fn prefill_q4_seq4_synthetic_smoke() {
     );
 }
 
+/// `MetalBackend::with_options` honours its `BackendOptions` argument —
+/// in particular, env vars must NOT override an explicit option. Pre-M1
+/// the constructor read env directly; the field-driven build path makes
+/// programmatic configuration trustworthy regardless of process env.
+#[test]
+fn with_options_honours_explicit_decode_flags_over_env() {
+    use std::env;
+
+    // Serialise against the env-toggling tests in this binary.
+    let _env_guard = ENV_TEST_LOCK.lock().expect("env lock poisoned");
+
+    // Set the env var to "on", then construct a backend with the option
+    // explicitly OFF. The backend must reflect the explicit choice.
+    env::set_var("LARQL_QKV_FUSED", "1");
+
+    let mut opts = larql_compute::BackendOptions::default();
+    opts.decode_flags.qkv_fused = false;
+
+    let metal = match larql_compute::metal::MetalBackend::with_options(opts) {
+        Some(m) => m,
+        None => {
+            env::remove_var("LARQL_QKV_FUSED");
+            eprintln!("skip: no Metal device");
+            return;
+        }
+    };
+
+    assert!(
+        !metal.decode_flags.qkv_fused,
+        "with_options must override env: explicit qkv_fused=false but \
+         backend resolved to {}",
+        metal.decode_flags.qkv_fused
+    );
+
+    // And the inverse: env unset, explicit option ON.
+    env::remove_var("LARQL_QKV_FUSED");
+    let mut opts_on = larql_compute::BackendOptions::default();
+    opts_on.decode_flags.qkv_fused = true;
+    let metal_on = larql_compute::metal::MetalBackend::with_options(opts_on)
+        .expect("Metal device available since first construction succeeded");
+    assert!(
+        metal_on.decode_flags.qkv_fused,
+        "with_options must honour explicit qkv_fused=true even with env unset"
+    );
+}
+
 /// Regression: dispatch geometry must travel with `KernelHandle`, not
 /// with shader-module re-exports. Pin the QKV projection pipelines'
 /// rows/threads against the shader-module constants so any drift fails

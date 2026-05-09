@@ -32,11 +32,12 @@
 //! only the inner i8×i8 → i32 dot differs.
 
 use crate::cpu::ops::q4_common::f16_to_f32;
+use larql_models::quant::ggml::{Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS};
 
 /// Q4_K super-block layout: 144 bytes per 256 values.
-const BLOCK_BYTES: usize = 144;
+const BLOCK_BYTES: usize = Q4_K_BLOCK_BYTES;
 /// Number of f32 / i8 elements per Q4_K (and Q8_K) super-block.
-const ELEMS_PER_BLOCK: usize = 256;
+const ELEMS_PER_BLOCK: usize = Q4_K_BLOCK_ELEMS;
 /// Number of 32-element sub-blocks per super-block.
 const SUBBLOCKS_PER_BLOCK: usize = 8;
 /// Sub-block size (matches Q4_K's per-32 nibble groups).
@@ -205,7 +206,9 @@ pub fn q4k_q8k_matvec_scalar(
             let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
             let (scales, mins) = unpack_scales_mins(&block[4..16]);
-            let quants = &block[16..144];
+            // 16 = 2 (d) + 2 (dmin) + 12 (packed scales/mins).
+            // The remaining BLOCK_BYTES-16 = 128 bytes are nibble-packed quants.
+            let quants = &block[16..BLOCK_BYTES];
 
             let q8_base = sb * ELEMS_PER_BLOCK;
             let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
@@ -597,7 +600,9 @@ unsafe fn q4k_q8k_matvec_avx2(
             let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
             let (scales, mins) = unpack_scales_mins(&block[4..16]);
-            let quants = &block[16..144];
+            // 16 = 2 (d) + 2 (dmin) + 12 (packed scales/mins).
+            // The remaining BLOCK_BYTES-16 = 128 bytes are nibble-packed quants.
+            let quants = &block[16..BLOCK_BYTES];
             let q8_base = sb * ELEMS_PER_BLOCK;
             let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
             let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
@@ -831,8 +836,8 @@ pub fn q4k_q8k_gate_up_neon(
 // The -(raw6 - 32) sign matches llama.cpp's `ggml_vec_dot_q6_K_q8_K`.
 // No `mins` term (Q6_K doesn't have per-group mins — it's symmetric around 32).
 
-/// Q6_K super-block size in bytes.
-const Q6K_BLOCK_BYTES: usize = 210;
+/// Q6_K super-block size in bytes (re-export of the wire-format constant).
+const Q6K_BLOCK_BYTES: usize = larql_models::quant::ggml::Q6_K_BLOCK_BYTES;
 
 /// Scalar reference: Q6_K weights × Q8_K activation matvec.
 /// Correctness oracle for the NEON implementation below.

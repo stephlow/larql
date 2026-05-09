@@ -455,7 +455,7 @@ fn gather_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use ndarray::Array2;
 
     fn input(seq: usize, hidden: usize) -> Array2<f32> {

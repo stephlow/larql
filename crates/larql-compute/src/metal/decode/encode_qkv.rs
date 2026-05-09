@@ -75,11 +75,18 @@ impl MetalBackend {
             // the per-kernel diag) exceeds the dispatch saving. Measured
             // end-to-end on Gemma 3 4B: +1.6 tok/s, −0.30 ms/tok GPU fwd
             // by defusing. `LARQL_QKV_FUSED=1` opts back in.
-            let mixed_q4k_q6k_v = layer.wq.format == crate::QuantFormat::Q4_K
-                && layer.wk.format == crate::QuantFormat::Q4_K
-                && layer.wv.format == crate::QuantFormat::Q6_K;
             // Cached at startup; see `metal::flags::DecodeFlags`.
             let use_fused = self.decode_flags.qkv_fused;
+            // Route descriptor — replaces the inline `(q, k, v)`
+            // boolean conjunction. The normed-QKV opt-in fires only on
+            // the mixed-Q4K-Q6K-V route today, but reading it through
+            // the descriptor means a future "uniform Q4_K with normed
+            // kernel" variant (or any other (q, k, v) triple supported
+            // by `q4k_q6k_qkv_proj_normed`) lands as one match arm
+            // here, not a new boolean.
+            use crate::metal::stages::qkv_proj::{pick_qkv_route, QkvFormatRoute};
+            let route = pick_qkv_route(layer.wq.format, layer.wk.format, layer.wv.format);
+            let mixed_q4k_q6k_v = matches!(route, QkvFormatRoute::MixedQ4kQ6kV);
             if mixed_q4k_q6k_v
                 && use_fused
                 && layer.norm_type == crate::NormType::RmsNorm
@@ -128,7 +135,7 @@ impl MetalBackend {
             let len_val = hidden as u32;
             if let Some(bias) = bufs.input_norm_bias {
                 let bias_buf = self.bufs.get_f32(bias);
-                enc.set_compute_pipeline_state(&self.layer_norm_pipeline);
+                enc.set_compute_pipeline_state(&self.norms.layer_norm_pipeline);
                 enc.set_buffer(0, Some(bufs.h_in), 0);
                 enc.set_buffer(1, Some(bufs.input_norm), 0);
                 enc.set_buffer(2, Some(&bias_buf), 0);
@@ -137,7 +144,7 @@ impl MetalBackend {
                 enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
                 enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
             } else {
-                enc.set_compute_pipeline_state(&self.layer_norm_no_bias_pipeline);
+                enc.set_compute_pipeline_state(&self.norms.layer_norm_no_bias_pipeline);
                 enc.set_buffer(0, Some(bufs.h_in), 0);
                 enc.set_buffer(1, Some(bufs.input_norm), 0);
                 enc.set_buffer(2, Some(bufs.norm_out), 0);
@@ -152,7 +159,7 @@ impl MetalBackend {
         } else {
             encode_rms_norm(
                 enc,
-                &self.rms_norm_pipeline,
+                &self.norms.rms_norm_pipeline,
                 bufs.h_in,
                 bufs.input_norm,
                 bufs.norm_out,
@@ -177,115 +184,121 @@ impl MetalBackend {
             ..
         } = dims;
 
-        // Three paths, in priority order: uniform Q4_K/Q4_KF → fused
-        // single shader; mixed Q4_K Q/K + Q6_K V → dedicated shader;
-        // anything else → per-projection fallback.
-        let uniform_q4k = layer.wq.format == layer.wk.format
-            && layer.wk.format == layer.wv.format
-            && layer.wq.format != crate::QuantFormat::Q6_K;
-        let mixed_q4k_q6k_v = layer.wq.format == crate::QuantFormat::Q4_K
-            && layer.wk.format == crate::QuantFormat::Q4_K
-            && layer.wv.format == crate::QuantFormat::Q6_K;
+        // Format-route descriptor — single source of truth for how a
+        // `(q, k, v)` triple maps to a fused QKV pipeline. See
+        // `metal::stages::qkv_proj::pick_qkv_route` for the table.
+        use crate::metal::stages::qkv_proj::{pick_qkv_route, QkvFormatRoute};
+        let route = pick_qkv_route(layer.wq.format, layer.wk.format, layer.wv.format);
 
-        if uniform_q4k {
-            use crate::metal::stages::qkv_proj::FusedQkvKernel;
-            let (fused_pipe, fused_kernel) = if layer.wq.format == crate::QuantFormat::Q4_KF {
-                (&self.q4kf_qkv_proj_pipeline, FusedQkvKernel::Q4kf)
-            } else {
-                (&self.q4k_qkv_proj_pipeline, FusedQkvKernel::Q4k)
-            };
-            crate::metal::stages::qkv_proj::encode_fused_f32(
-                enc,
-                &fused_pipe.state,
-                fused_kernel,
-                bufs.wq,
-                bufs.wk,
-                bufs.wv,
-                bufs.norm_out,
-                0,
-                bufs.q_out,
-                0,
-                bufs.k_out,
-                0,
-                bufs.v_out,
-                0,
-                layer_q_dim,
-                layer_kv_dim,
-                hidden,
-            );
-        } else if mixed_q4k_q6k_v {
-            use crate::metal::shaders::q4k_q6k_qkv_proj as sh;
-            let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u64;
-            let num_tgs = total_rows.div_ceil(sh::ROWS_PER_TG);
-            let q_rows_u = layer_q_dim as u32;
-            let k_rows_u = layer_kv_dim as u32;
-            let v_rows_u = layer_kv_dim as u32;
-            let k_u = hidden as u32;
-            enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_pipeline.state);
-            enc.set_buffer(0, Some(bufs.wq), 0);
-            enc.set_buffer(1, Some(bufs.wk), 0);
-            enc.set_buffer(2, Some(bufs.wv), 0);
-            enc.set_buffer(3, Some(bufs.norm_out), 0);
-            enc.set_buffer(4, Some(bufs.q_out), 0);
-            enc.set_buffer(5, Some(bufs.k_out), 0);
-            enc.set_buffer(6, Some(bufs.v_out), 0);
-            enc.set_bytes(7, 4, &q_rows_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(8, 4, &k_rows_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(9, 4, &v_rows_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(10, 4, &k_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_tgs, 1, 1),
-                MTLSize::new(sh::THREADS_PER_TG, 1, 1),
-            );
-        } else {
-            // Mixed-but-unsupported (e.g. Q4_KF + Q6_K, or Q4_0 legacy):
-            // per-projection dispatch through the format-aware helper.
-            use crate::metal::stages::qkv_proj::{self, Proj};
-            use crate::metal::stages::quant_matvec::Pipelines;
-            let pipes = Pipelines {
-                q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                q6k_matvec: &self.q6k_matvec_pipeline,
-                q4_matvec: &self.q4.matvec,
-                // Decode is seq=1; matmul amortisation has nothing to amortise.
-                q4k_matmul: None,
-            };
-            qkv_proj::encode_per_proj(
-                enc,
-                &pipes,
-                bufs.norm_out,
-                0,
-                // Q8 bufs unused for f32-input formats — pass norm as a
-                // harmless placeholder.
-                bufs.norm_out,
-                0,
-                bufs.norm_out,
-                0,
-                [
-                    Proj {
-                        format: layer.wq.format,
-                        w_buf: bufs.wq,
-                        out_buf: bufs.q_out,
-                        out_off: 0,
-                        rows: layer_q_dim,
-                    },
-                    Proj {
-                        format: layer.wk.format,
-                        w_buf: bufs.wk,
-                        out_buf: bufs.k_out,
-                        out_off: 0,
-                        rows: layer_kv_dim,
-                    },
-                    Proj {
-                        format: layer.wv.format,
-                        w_buf: bufs.wv,
-                        out_buf: bufs.v_out,
-                        out_off: 0,
-                        rows: layer_kv_dim,
-                    },
-                ],
-                hidden,
-            );
+        match route {
+            QkvFormatRoute::UniformQ4K | QkvFormatRoute::UniformQ4Kf => {
+                use crate::metal::stages::qkv_proj::FusedQkvKernel;
+                let (fused_pipe, fused_kernel) = match route {
+                    QkvFormatRoute::UniformQ4Kf => {
+                        (&self.q4kf_qkv_proj_pipeline, FusedQkvKernel::Q4kf)
+                    }
+                    QkvFormatRoute::UniformQ4K => {
+                        (&self.q4k_qkv_proj_pipeline, FusedQkvKernel::Q4k)
+                    }
+                    _ => unreachable!("outer match restricts to Uniform*"),
+                };
+                crate::metal::stages::qkv_proj::encode_fused_f32(
+                    enc,
+                    &fused_pipe.state,
+                    fused_kernel,
+                    bufs.wq,
+                    bufs.wk,
+                    bufs.wv,
+                    bufs.norm_out,
+                    0,
+                    bufs.q_out,
+                    0,
+                    bufs.k_out,
+                    0,
+                    bufs.v_out,
+                    0,
+                    layer_q_dim,
+                    layer_kv_dim,
+                    hidden,
+                );
+            }
+            QkvFormatRoute::MixedQ4kQ6kV => {
+                // Geometry travels with the bound `KernelHandle` (mirrors the
+                // decode_hybrid Q4_K geometry-fix pattern).
+                let kh = &self.q4k_q6k_qkv_proj_pipeline;
+                let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u64;
+                let num_tgs = total_rows.div_ceil(kh.rows_per_tg);
+                let q_rows_u = layer_q_dim as u32;
+                let k_rows_u = layer_kv_dim as u32;
+                let v_rows_u = layer_kv_dim as u32;
+                let k_u = hidden as u32;
+                enc.set_compute_pipeline_state(&kh.state);
+                enc.set_buffer(0, Some(bufs.wq), 0);
+                enc.set_buffer(1, Some(bufs.wk), 0);
+                enc.set_buffer(2, Some(bufs.wv), 0);
+                enc.set_buffer(3, Some(bufs.norm_out), 0);
+                enc.set_buffer(4, Some(bufs.q_out), 0);
+                enc.set_buffer(5, Some(bufs.k_out), 0);
+                enc.set_buffer(6, Some(bufs.v_out), 0);
+                enc.set_bytes(7, 4, &q_rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &k_rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(9, 4, &v_rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(10, 4, &k_u as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tgs, 1, 1),
+                    MTLSize::new(kh.threads_per_tg, 1, 1),
+                );
+            }
+            QkvFormatRoute::PerProjection => {
+                // Mixed-but-unsupported (e.g. Q4_KF + Q6_K, or Q4_0 legacy):
+                // per-projection dispatch through the format-aware helper.
+                use crate::metal::stages::qkv_proj::{self, Proj};
+                use crate::metal::stages::quant_matvec::Pipelines;
+                let pipes = Pipelines {
+                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                    q4k_matvec_fallback: &self.q4k_matvec_pipeline,
+                    q6k_matvec: &self.q6k_matvec_pipeline,
+                    q4_matvec: &self.q4.matvec,
+                    // Decode is seq=1; matmul amortisation has nothing to amortise.
+                    q4k_matmul: None,
+                };
+                qkv_proj::encode_per_proj(
+                    enc,
+                    &pipes,
+                    bufs.norm_out,
+                    0,
+                    // Q8 bufs unused for f32-input formats — pass norm as a
+                    // harmless placeholder.
+                    bufs.norm_out,
+                    0,
+                    bufs.norm_out,
+                    0,
+                    [
+                        Proj {
+                            format: layer.wq.format,
+                            w_buf: bufs.wq,
+                            out_buf: bufs.q_out,
+                            out_off: 0,
+                            rows: layer_q_dim,
+                        },
+                        Proj {
+                            format: layer.wk.format,
+                            w_buf: bufs.wk,
+                            out_buf: bufs.k_out,
+                            out_off: 0,
+                            rows: layer_kv_dim,
+                        },
+                        Proj {
+                            format: layer.wv.format,
+                            w_buf: bufs.wv,
+                            out_buf: bufs.v_out,
+                            out_off: 0,
+                            rows: layer_kv_dim,
+                        },
+                    ],
+                    hidden,
+                );
+            }
         }
     }
 
@@ -309,7 +322,7 @@ impl MetalBackend {
 
         // Fused norm + Q8 quantize (in-place into the FFN scratch
         // buffers — they're re-quantised before the FFN dispatch).
-        enc.set_compute_pipeline_state(&self.rms_norm_q8_pipeline);
+        enc.set_compute_pipeline_state(&self.norms.rms_norm_q8_pipeline);
         enc.set_buffer(0, Some(bufs.h_in), 0);
         enc.set_buffer(1, Some(bufs.input_norm), 0);
         enc.set_buffer(2, Some(bufs.ffn_q8), 0);

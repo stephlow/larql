@@ -103,10 +103,10 @@ impl MetalBackend {
             &self.q4k_matvec_pipeline,
             Some(&self.q4k_matmul_pipeline),
             &self.q6k_matvec_pipeline,
-            &self.rms_norm_pipeline,
-            &self.residual_add_pipeline,
-            &self.rms_norm_q8_pipeline,
-            &self.residual_norm_q8_pipeline,
+            &self.norms.rms_norm_pipeline,
+            &self.norms.residual_add_pipeline,
+            &self.norms.rms_norm_q8_pipeline,
+            &self.norms.residual_norm_q8_pipeline,
             None, // no q4k_qkv_proj (legacy 148-byte)
             None,
             None, // no q4kf_qkv_proj / q4kf_proj (legacy benchmark path)

@@ -1,4 +1,4 @@
-//! Pluggable KV-cache engines.
+//! Pluggable KV-cache engines for larql-inference.
 //!
 //! Each engine implements the full prefill + autoregressive decode loop but
 //! manages its persistent inference state differently. Engines are selected
@@ -6,27 +6,24 @@
 //!
 //! Correctness contract: `prefill` and `decode_step` return the pre-lm_head
 //! hidden state (shape `[1, hidden_dim]`). The caller applies `final_norm +
-//! lm_head` to get logits — see `crate::forward::hidden_to_raw_logits`.
+//! lm_head` to get logits — see `larql_inference::forward::hidden_to_raw_logits`.
+
+extern crate blas_src;
 
 pub mod accuracy;
-pub mod kv_engines;
+pub mod engines;
 pub mod profiler;
-/// Synthetic-weight fixtures (`make_test_weights`, `make_test_vindex`,
-/// `make_test_tokenizer`, `TestFixtures`). Used by unit tests, integration
-/// tests, and the `mech_interp_demo` example so they don't need a vindex
-/// on disk. Released as part of the public API because mech-interp tooling
-/// downstream of this crate (chuk-mcp-lazarus and similar) wants the same
-/// fixtures for self-contained regression tests.
-pub mod test_utils;
 
-// Convenience re-exports so existing `engines::markov_residual::*` paths keep working.
-pub use kv_engines::apollo;
-pub use kv_engines::markov_residual;
-pub use kv_engines::turbo_quant;
-pub use kv_engines::unlimited_context;
+pub use engines::apollo;
+pub use engines::markov_residual;
+pub use engines::turbo_quant;
+pub use engines::unlimited_context;
 
-use crate::model::ModelWeights;
+pub use engines::markov_residual::MarkovResidualEngine;
+pub use engines::unlimited_context::UnlimitedContextEngine;
+
 use larql_compute::ComputeBackend;
+use larql_inference::ModelWeights;
 use ndarray::Array2;
 
 // ─── EngineInfo ───────────────────────────────────────────────────────────────
@@ -103,7 +100,7 @@ pub trait KvEngine: Send {
     /// cost; subsequent decode steps reuse the cached tensors).
     fn prefill_q4k(
         &mut self,
-        weights: &mut crate::model::ModelWeights,
+        weights: &mut ModelWeights,
         index: &larql_vindex::VectorIndex,
         token_ids: &[u32],
         backend: &dyn larql_compute::ComputeBackend,
@@ -118,7 +115,7 @@ pub trait KvEngine: Send {
     /// when available, f32 fallback otherwise.
     fn decode_step_q4k(
         &mut self,
-        weights: &mut crate::model::ModelWeights,
+        weights: &mut ModelWeights,
         index: &larql_vindex::VectorIndex,
         token_id: u32,
         backend: &dyn larql_compute::ComputeBackend,
@@ -288,24 +285,20 @@ mod tests {
 
     #[test]
     fn engine_kind_from_name_with_params() {
-        // window param
         match EngineKind::from_name("markov-rs:window=1024") {
             Some(EngineKind::MarkovResidual {
                 window_size: Some(1024),
             }) => {}
             other => panic!("expected MarkovResidual{{window=1024}}, got {other:?}"),
         }
-        // unlimited window
         match EngineKind::from_name("unlimited-context:window=256") {
             Some(EngineKind::UnlimitedContext { window_size: 256 }) => {}
             other => panic!("expected UnlimitedContext{{window=256}}, got {other:?}"),
         }
-        // turbo-quant bits
         match EngineKind::from_name("turbo-quant:bits=3") {
             Some(EngineKind::TurboQuant { bits: 3 }) => {}
             other => panic!("expected TurboQuant{{bits=3}}, got {other:?}"),
         }
-        // apollo params
         match EngineKind::from_name("apollo:layer=25,coef=8.0,top_k=12") {
             Some(EngineKind::Apollo {
                 injection_layer: 25,
@@ -314,7 +307,6 @@ mod tests {
             }) => {}
             other => panic!("expected Apollo{{layer=25,top_k=12}}, got {other:?}"),
         }
-        // unknown param is silently ignored, defaults apply
         match EngineKind::from_name("markov-rs:unknown=999") {
             Some(EngineKind::MarkovResidual { window_size: None }) => {}
             other => panic!("expected MarkovResidual{{window=None}}, got {other:?}"),

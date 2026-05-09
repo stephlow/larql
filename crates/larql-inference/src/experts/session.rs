@@ -637,4 +637,94 @@ mod mock_tests {
         assert_eq!(args["nested"]["k"], serde_json::json!([1, 2, 3]));
         assert_eq!(args["s"], serde_json::json!("日本語"));
     }
+
+    // ── ExpertSession accessors ───────────────────────────────────────────────
+
+    #[test]
+    fn registry_mut_grants_inner_access() {
+        let mock = MockDispatcher::new(&[("foo", &["x"])]);
+        let mut session = ExpertSession::new(mock);
+        // registry_mut returns &mut D; calling op_specs through it covers
+        // the accessor and verifies the inner state is reachable.
+        let specs = session.registry_mut().op_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "foo");
+    }
+
+    #[test]
+    fn into_registry_returns_owned_dispatcher() {
+        let mock = MockDispatcher::new(&[("foo", &["x"])]);
+        let session = ExpertSession::new(mock);
+        let recovered = session.into_registry();
+        // Recovered dispatcher still functions as expected.
+        assert_eq!(recovered.op_specs().len(), 1);
+    }
+
+    // ── Box<dyn Dispatcher> forward impl ─────────────────────────────────────
+
+    #[test]
+    fn boxed_dispatcher_forwards_op_specs_and_call() {
+        // Cover the `impl Dispatcher for Box<dyn Dispatcher>` forwarding
+        // path used by the CLI to swap raw vs filtered dispatchers at runtime.
+        let mock =
+            MockDispatcher::new(&[("ping", &[])]).with_response("ping", serde_json::json!("pong"));
+        let mut boxed: Box<dyn Dispatcher> = Box::new(mock);
+        assert_eq!(boxed.op_specs().len(), 1);
+        let res = boxed
+            .call("ping", &serde_json::json!({}))
+            .expect("ping should dispatch");
+        assert_eq!(res.value, serde_json::json!("pong"));
+    }
+
+    // ── FilteredDispatcher ────────────────────────────────────────────────────
+
+    #[test]
+    fn filtered_dispatcher_op_specs_show_only_allowed() {
+        let mock = MockDispatcher::new(&[("a", &[]), ("b", &[]), ("c", &[])]);
+        let filtered = FilteredDispatcher::new(mock, ["a", "c"]);
+        let specs = filtered.op_specs();
+        let names: std::collections::HashSet<String> =
+            specs.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("a") && names.contains("c"));
+        assert!(!names.contains("b"));
+    }
+
+    #[test]
+    fn filtered_dispatcher_call_short_circuits_disallowed_ops() {
+        // Disallowed ops must not reach the inner dispatcher.
+        let mock = MockDispatcher::new(&[("a", &[]), ("b", &[])])
+            .with_response("a", serde_json::json!(1))
+            .with_response("b", serde_json::json!(2));
+        let mut filtered = FilteredDispatcher::new(mock, ["a"]);
+        // Allowed op flows through.
+        let allowed = filtered.call("a", &serde_json::json!({}));
+        assert_eq!(allowed.unwrap().value, serde_json::json!(1));
+        // Disallowed op short-circuits to None.
+        let disallowed = filtered.call("b", &serde_json::json!({}));
+        assert!(disallowed.is_none(), "disallowed op should return None");
+    }
+
+    #[test]
+    fn filtered_dispatcher_silently_ignores_unknown_op_in_allowed_set() {
+        // Allowed names that aren't advertised by the inner dispatcher
+        // are silently ignored — only the intersection is exposed.
+        let mock = MockDispatcher::new(&[("a", &[])]);
+        let filtered = FilteredDispatcher::new(mock, ["a", "ghost"]);
+        let names: Vec<String> = filtered.op_specs().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["a"]);
+    }
+
+    #[test]
+    fn filtered_dispatcher_through_session_lists_only_allowed_in_prompt() {
+        // End-to-end: filtering composes with system_prompt rendering.
+        let mock = MockDispatcher::new(&[("alpha", &[]), ("beta", &[]), ("gamma", &[])]);
+        let filtered = FilteredDispatcher::new(mock, ["beta"]);
+        let session = ExpertSession::new(filtered);
+        let p = session.system_prompt();
+        let ops_line = p.lines().find(|l| l.starts_with("ops: ")).unwrap();
+        assert!(ops_line.contains("beta"));
+        assert!(!ops_line.contains("alpha"));
+        assert!(!ops_line.contains("gamma"));
+    }
 }

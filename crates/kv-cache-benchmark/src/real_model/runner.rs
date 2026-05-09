@@ -14,9 +14,9 @@
 //!  4. Graph Walk       — vindex FFN walk; no forward pass for factual queries.
 
 use larql_compute::ComputeBackend;
-use larql_inference::engines::accuracy::compare_hidden;
-use larql_inference::engines::markov_residual::kv_memory_bytes_for_seq;
-use larql_inference::engines::{EngineKind, KvEngine};
+use larql_kv::accuracy::compare_hidden;
+use larql_kv::markov_residual::kv_memory_bytes_for_seq;
+use larql_kv::{EngineKind, KvEngine};
 use larql_inference::forward::{hidden_to_raw_logits, logits_to_predictions_pub};
 use larql_inference::model::ModelWeights;
 use larql_vindex::VectorIndex;

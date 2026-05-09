@@ -20,6 +20,18 @@ use metal::{ComputeCommandEncoderRef, MTLSize};
 use crate::metal::MetalBackend;
 use crate::FullPipelineLayer;
 
+/// Max `inter_padded` for which the fused Q4_K GEGLU+down kernel is
+/// known to be NaN-free.
+///
+/// Set after Gemma 4 31B (`inter = 21504`) hit a data-dependent NaN at
+/// layer 11 despite clean gate/up inputs and finite weight scales (see
+/// the block doc on the dispatch site below). 16384 covers Gemma 3 4B
+/// (`inter = 10240`), Gemma 4 26B-A4B (`inter = 2112`), Llama 2 7B
+/// (`inter = 11008`), Mistral 7B (`inter = 14336`); larger intermediate
+/// sizes fall through to the separated GEGLU + matvec path until the
+/// fused-kernel NaN root cause is found.
+const MAX_FUSED_GEGLU_DOWN_INTER: usize = 16384;
+
 /// Buffer references the FFN block reads or writes. The encoder is
 /// passed separately so the method can also borrow `&self`.
 pub(super) struct FfnBufs<'a> {
@@ -327,20 +339,16 @@ impl MetalBackend {
                     metal::MTLSize::new(kh.threads_per_tg, 1, 1),
                 );
             } else if layer.down.format == crate::QuantFormat::Q4_K
-                && inter_padded <= 16384
+                && inter_padded <= MAX_FUSED_GEGLU_DOWN_INTER
                 && self.decode_flags.fused_down
             {
                 // Fused GEGLU+down for small-to-medium intermediate sizes.
                 //
-                // Known data-dependent NaN: Gemma 4 31B (inter=21504) produces
-                // NaN in down_out at layer 11 despite clean gate/up inputs and
-                // no NaN in the weight scales. Root cause unresolved; guarded
-                // by inter_padded <= 16384 which keeps the optimisation for
-                // 4B (10240), 26B-A4B (2112), and similar models while falling
-                // back to the separate GEGLU+matvec path for 31B.
+                // Guard rationale and revival trigger documented on
+                // `MAX_FUSED_GEGLU_DOWN_INTER` at the top of this file.
                 // Override: LARQL_FUSED_DOWN=0 disables for all sizes;
-                //           LARQL_FUSED_DOWN=1 with no size guard (for
-                //           investigation — add && inter_padded <= 99999).
+                //           LARQL_FUSED_DOWN=1 with the guard temporarily
+                //           raised (for investigation only).
                 self.encode_q4k_fused_geglu_down(
                     enc,
                     layer,

@@ -82,7 +82,7 @@ fn apply_norm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     #[test]
     fn vec_norm_known_value() {

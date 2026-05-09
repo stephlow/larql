@@ -34,16 +34,16 @@ The rungs are not interchangeable — they answer different questions:
 
 ## Implementation status
 
-All engines now live in `larql_inference::engines::kv_engines/`. This crate
+All engines now live in the `larql-kv` crate. This crate
 re-exports from there; the implementations are no longer duplicated here.
 
 | Strategy | Lives in | End-to-end real | Synthetic |
 |---|---|---|---|
 | Standard KV | `real_model::kv_capture` | ✓ | ✓ `standard_kv` |
-| TurboQuant | `larql_inference::engines::kv_engines::turbo_quant` | ✓ (~95 tok/s Metal) | ✓ |
-| Markov RS | `larql_inference::engines::kv_engines::markov_residual` | ✓ (~95 tok/s Metal, bit-perfect) | ✓ |
-| UnlimitedContext | `larql_inference::engines::kv_engines::unlimited_context` | ✓ (~94 tok/s Metal) | ✓ |
-| ApolloEngine | `larql_inference::engines::kv_engines::apollo` | ✓ (compressed path via `forward_from_layer`) | ✓ |
+| TurboQuant | `larql_kv::engines::turbo_quant` | ✓ (~95 tok/s Metal) | ✓ |
+| Markov RS | `larql_kv::engines::markov_residual` | ✓ (~95 tok/s Metal, bit-perfect) | ✓ |
+| UnlimitedContext | `larql_kv::engines::unlimited_context` | ✓ (~94 tok/s Metal) | ✓ |
+| ApolloEngine | `larql_kv::engines::apollo` | ✓ (compressed path via `forward_from_layer`) | ✓ |
 | Graph Walk | `graph_walk::GraphWalk` (memory accounting only) | partial | — |
 
 ### Speed (Gemma 3 4B, Metal Q4K, 2026-04-26)

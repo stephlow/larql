@@ -85,7 +85,7 @@ impl MetalBackend {
 
             encode_rms_norm(
                 enc_a,
-                &self.rms_norm_pipeline,
+                &self.norms.rms_norm_pipeline,
                 &h_buf,
                 &input_norm_buf,
                 &norm_f32_buf,
@@ -128,7 +128,7 @@ impl MetalBackend {
             let q8_buf = self.bufs.output(hidden as u64);
             let q8s_buf = self.bufs.output((hidden / LEGACY_BLOCK_ELEMS * 4) as u64);
 
-            enc_a.set_compute_pipeline_state(&self.rms_norm_q8_pipeline);
+            enc_a.set_compute_pipeline_state(&self.norms.rms_norm_q8_pipeline);
             enc_a.set_buffer(0, Some(&h_buf), 0);
             enc_a.set_buffer(1, Some(&input_norm_buf), 0);
             enc_a.set_buffer(2, Some(&q8_buf), 0);
@@ -232,7 +232,7 @@ impl MetalBackend {
             for kvh in 0..layer_num_kv_heads {
                 let offset = (kvh * layer_head_dim * 4) as u64;
                 let hd_val = layer_head_dim as u32;
-                enc_a.set_compute_pipeline_state(&self.v_norm_pipeline);
+                enc_a.set_compute_pipeline_state(&self.norms.v_norm_pipeline);
                 enc_a.set_buffer(0, Some(&v_out), offset);
                 enc_a.set_buffer(1, Some(&v_out), offset);
                 enc_a.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);
@@ -313,7 +313,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_rms_norm;
                 encode_rms_norm(
                     enc_c,
-                    &self.rms_norm_pipeline,
+                    &self.norms.rms_norm_pipeline,
                     &o_out,
                     &post_attn_norm_buf,
                     &normed_o,
@@ -324,7 +324,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_residual_add;
                 encode_residual_add(
                     enc_c,
-                    &self.residual_add_pipeline,
+                    &self.norms.residual_add_pipeline,
                     &h_buf,
                     &normed_o,
                     &h_post_attn,
@@ -335,7 +335,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_residual_add;
                 encode_residual_add(
                     enc_c,
-                    &self.residual_add_pipeline,
+                    &self.norms.residual_add_pipeline,
                     &h_buf,
                     &o_out,
                     &h_post_attn,
@@ -383,7 +383,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_rms_norm;
                 encode_rms_norm(
                     enc_c,
-                    &self.rms_norm_pipeline,
+                    &self.norms.rms_norm_pipeline,
                     &o_out,
                     &post_attn_norm_buf,
                     &normed_o,
@@ -394,7 +394,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_residual_add;
                 encode_residual_add(
                     enc_c,
-                    &self.residual_add_pipeline,
+                    &self.norms.residual_add_pipeline,
                     &h_buf,
                     &normed_o,
                     &h_post_attn,
@@ -404,7 +404,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_residual_add;
                 encode_residual_add(
                     enc_c,
-                    &self.residual_add_pipeline,
+                    &self.norms.residual_add_pipeline,
                     &h_buf,
                     &o_out,
                     &h_post_attn,

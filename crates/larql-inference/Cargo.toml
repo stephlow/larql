@@ -101,6 +101,7 @@ required-features = ["metal"]
 assert_approx_eq = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+larql-kv = { path = "../larql-kv" }
 
 [[bench]]
 name = "wire_codec"

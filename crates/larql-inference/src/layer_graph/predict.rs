@@ -708,7 +708,7 @@ pub fn trace_with_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::TestFixtures;
+    use crate::test_utils::TestFixtures;
     use std::sync::OnceLock;
 
     fn fx() -> &'static TestFixtures {

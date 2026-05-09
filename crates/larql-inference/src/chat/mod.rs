@@ -18,6 +18,17 @@
 //! **Fallbacks.** Any failure path (no template found, render error,
 //! unknown family) returns the raw prompt unchanged with an explanatory
 //! `note` on [`ChatWrap`]. A broken template must never brick generation.
+//!
+//! ## Sibling chat-template machinery
+//!
+//! - [`crate::prompt`] — heuristic enum (no vindex required); for callers
+//!   that only have a model id / family string at hand.
+//! - [`crate::layer_graph::TurnRenderer`] — incremental per-turn rendering
+//!   used by [`ChatSession`](crate::layer_graph::ChatSession).
+//!
+//! All three serve different needs; this module is the canonical path when
+//! a vindex directory is available because it renders the model's *own*
+//! Jinja template rather than a hand-coded approximation.
 
 pub(crate) mod fallback;
 pub(crate) mod render;

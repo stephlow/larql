@@ -1,6 +1,6 @@
 //! KV-cache engine implementations.
 //!
-//! Each engine implements [`crate::engines::KvEngine`] — a common interface
+//! Each engine implements [`crate::KvEngine`] — a common interface
 //! for prefill + autoregressive decode that manages inference state differently:
 //!
 //! ## Engine ladder (Gemma 3 4B @ 370K tokens)
@@ -21,7 +21,7 @@
 //! larql bench gemma3-4b-q4k --engine apollo:layer=25,coef=8.0
 //! ```
 //!
-//! See [`crate::engines::EngineKind::from_name`] for the full parameter syntax.
+//! See [`crate::EngineKind::from_name`] for the full parameter syntax.
 //!
 //! ## Architecture notes
 //!

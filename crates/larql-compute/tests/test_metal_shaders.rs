@@ -1578,7 +1578,7 @@ fn layer_norm_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.layer_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.layer_norm_pipeline);
     enc.set_buffer(0, Some(&x_buf), 0);
     enc.set_buffer(1, Some(&w_buf), 0);
     enc.set_buffer(2, Some(&b_buf), 0);
@@ -1622,7 +1622,7 @@ fn layer_norm_no_bias_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.layer_norm_no_bias_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.layer_norm_no_bias_pipeline);
     enc.set_buffer(0, Some(&x_buf), 0);
     enc.set_buffer(1, Some(&w_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -1663,7 +1663,7 @@ fn v_norm_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.v_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.v_norm_pipeline);
     enc.set_buffer(0, Some(&x_buf), 0);
     enc.set_buffer(1, Some(&out_buf), 0);
     enc.set_bytes(2, 4, &n_val as *const u32 as *const std::ffi::c_void);
@@ -1695,7 +1695,7 @@ fn scale_vector_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.scale_vector_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.scale_vector_pipeline);
     enc.set_buffer(0, Some(&input_buf), 0);
     enc.set_buffer(1, Some(&out_buf), 0);
     enc.set_bytes(2, 4, &n_val as *const u32 as *const std::ffi::c_void);
@@ -1732,7 +1732,7 @@ fn rms_norm_with_different_eps() {
     {
         let cmd = metal.queue().new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&metal.rms_norm_pipeline);
+        enc.set_compute_pipeline_state(&metal.norms.rms_norm_pipeline);
         enc.set_buffer(0, Some(&x_buf), 0);
         enc.set_buffer(1, Some(&w_buf), 0);
         enc.set_buffer(2, Some(&out1), 0);
@@ -1754,7 +1754,7 @@ fn rms_norm_with_different_eps() {
     {
         let cmd = metal.queue().new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&metal.rms_norm_pipeline);
+        enc.set_compute_pipeline_state(&metal.norms.rms_norm_pipeline);
         enc.set_buffer(0, Some(&x_buf), 0);
         enc.set_buffer(1, Some(&w_buf), 0);
         enc.set_buffer(2, Some(&out2), 0);
@@ -2349,7 +2349,7 @@ fn qk_norm_matches_cpu_reference() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.qk_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.qk_norm_pipeline);
     enc.set_buffer(0, Some(&in_buf), 0);
     enc.set_buffer(1, Some(&out_buf), 0);
     enc.set_buffer(2, Some(&w_buf), 0);

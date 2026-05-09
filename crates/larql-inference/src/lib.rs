@@ -45,7 +45,6 @@ extern crate blas_src;
 pub mod attention;
 pub mod capture;
 pub mod chat;
-pub mod engines;
 pub mod error;
 pub mod experts;
 pub mod ffn;
@@ -55,6 +54,7 @@ pub mod model;
 pub mod prompt;
 pub mod residual;
 pub mod residual_diff;
+pub mod test_utils;
 pub mod tokenizer;
 pub mod trace;
 pub mod vindex;
@@ -66,17 +66,12 @@ pub use ndarray;
 pub use safetensors;
 pub use tokenizers;
 
-// Backend re-exports (from larql-compute).
-pub use larql_compute::cpu::ops::moe::{
-    cpu_moe_forward, run_single_expert, run_single_expert_with_norm,
-};
-pub use larql_compute::Activation as ComputeActivation;
-pub use larql_compute::CpuBackend;
-pub use larql_compute::MoeLayerWeights;
+// Backend re-exports — only the names with external consumers via
+// `larql_inference::*`. Callers wanting other compute types should
+// `use larql_compute::...` directly.
+pub use larql_compute::cpu::ops::moe::{run_single_expert, run_single_expert_with_norm};
 pub use larql_compute::QuantFormat;
-pub use larql_compute::{
-    cpu_backend, default_backend, dot_proj_gpu, matmul_gpu, ComputeBackend, MatMulOp,
-};
+pub use larql_compute::{cpu_backend, default_backend, ComputeBackend};
 
 /// Map a model's activation function to the compute-layer `Activation` enum.
 pub fn activation_from_arch(
@@ -87,8 +82,6 @@ pub fn activation_from_arch(
         _ => larql_compute::Activation::Silu,
     }
 }
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub use larql_compute::MetalBackend;
 
 // Re-export essentials at crate root.
 pub use attention::AttentionWeights;
@@ -185,10 +178,11 @@ pub mod prelude {
         default_backend, generate, generate_streaming, generate_with_sampling, load_model_dir,
         load_tokenizer, open_inference_vindex, predict, predict_q4k, resolve_model_path,
         try_generate, try_generate_streaming, try_generate_with_sampling, wrap_chat_prompt,
-        wrap_prompt_raw, wrap_with_vindex_template, ChatWrap, ComputeBackend, CpuBackend,
-        Detokenizer, EosConfig, GenerateError, GenerateResult, InferenceError, ModelWeights,
-        Sampler, SamplingConfig, WalkFfn, WalkFfnConfig,
+        wrap_prompt_raw, wrap_with_vindex_template, ChatWrap, ComputeBackend, Detokenizer,
+        EosConfig, GenerateError, GenerateResult, InferenceError, ModelWeights, Sampler,
+        SamplingConfig, WalkFfn, WalkFfnConfig,
     };
+    pub use larql_compute::CpuBackend;
 }
 
 /// Mechanistic-interpretability and research-facing imports.
@@ -196,33 +190,29 @@ pub mod prelude {
 /// These APIs are intentionally more experimental than [`prelude`]. Grouping
 /// them here makes that boundary visible without breaking existing crate-root
 /// users in one large move.
+///
+/// KV-cache engines (`MarkovResidualEngine`, `UnlimitedContextEngine`,
+/// `EngineKind`, `KvEngine`) and accuracy helpers (`compare_hidden`,
+/// `cosine_similarity`, `kl_divergence`, …) now live in the `larql-kv`
+/// crate — depend on it directly.
 pub mod research {
     pub use crate::{
         apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,
-        capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals, compare_hidden,
-        cosine_similarity, estimate_ffn_covariance, forward_from_layer, forward_raw_logits,
-        forward_to_layer, generate_cached_constrained, hidden_to_raw_logits, infer_patched,
-        infer_patched_q4k, js_divergence, kl_divergence, logit_lens_top1, mse, predict_from_hidden,
-        predict_from_hidden_with_ffn, predict_honest, predict_pipeline, predict_with_ffn,
-        predict_with_ffn_attention, predict_with_ffn_trace, predict_with_graph,
-        predict_with_graph_vindex_logits, predict_with_router, predict_with_strategy, run_memit,
-        run_memit_with_target_opt, softmax, trace_decomposed, trace_forward, trace_forward_full,
-        trace_forward_with_ffn, trace_residuals, trace_with_graph, walk_trace_from_residuals,
-        AnswerWaypoint, AttentionCache, BoundaryStore, BoundaryWriter, ContextStore, ContextTier,
-        ContextWriter, HiddenAccuracy, InferPatchedResult, InferenceWeights, KnnOverride,
-        LayerAttentionCapture, LayerMode, LayerSummary, MarkovResidualEngine, MemitFact,
-        MemitFactResult, MemitResult, PredictResult, PredictResultWithAttention,
-        PredictResultWithResiduals, RawForward, ResidualTrace, SpecCapture, TargetDelta,
-        TargetDeltaOpts, TemplatePattern, TemplateUniverse, TraceNode, TracePositions, TraceResult,
-        TraceStore, TraceWriter, UnlimitedContextEngine, KNN_COSINE_THRESHOLD,
+        capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals,
+        estimate_ffn_covariance, forward_from_layer, forward_raw_logits, forward_to_layer,
+        generate_cached_constrained, hidden_to_raw_logits, infer_patched, infer_patched_q4k,
+        logit_lens_top1, predict_from_hidden, predict_from_hidden_with_ffn, predict_honest,
+        predict_pipeline, predict_with_ffn, predict_with_ffn_attention, predict_with_ffn_trace,
+        predict_with_graph, predict_with_graph_vindex_logits, predict_with_router,
+        predict_with_strategy, run_memit, run_memit_with_target_opt, trace_decomposed,
+        trace_forward, trace_forward_full, trace_forward_with_ffn, trace_residuals,
+        trace_with_graph, walk_trace_from_residuals, AnswerWaypoint, AttentionCache,
+        BoundaryStore, BoundaryWriter, ContextStore, ContextTier, ContextWriter,
+        InferPatchedResult, InferenceWeights, KnnOverride, LayerAttentionCapture, LayerMode,
+        LayerSummary, MemitFact, MemitFactResult, MemitResult, PredictResult,
+        PredictResultWithAttention, PredictResultWithResiduals, RawForward, ResidualTrace,
+        SpecCapture, TargetDelta, TargetDeltaOpts, TemplatePattern, TemplateUniverse, TraceNode,
+        TracePositions, TraceResult, TraceStore, TraceWriter, KNN_COSINE_THRESHOLD,
     };
 }
-
-// Engine re-exports.
-pub use engines::accuracy::{
-    compare_hidden, cosine_similarity, js_divergence, kl_divergence, mse, softmax, HiddenAccuracy,
-};
-pub use engines::markov_residual::MarkovResidualEngine;
-pub use engines::unlimited_context::UnlimitedContextEngine;
-pub use engines::{EngineInfo, EngineKind, KvEngine};
 

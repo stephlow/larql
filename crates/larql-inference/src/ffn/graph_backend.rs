@@ -432,7 +432,7 @@ impl GateIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     const TOP_TOKENS: usize = 3;
     const FEATURES_PER_TOK: usize = 4;

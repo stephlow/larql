@@ -3,7 +3,7 @@
 //! Each checkpoint is the K,V at the last position of a closed window — one
 //! (K, V) pair per layer. Bytes per checkpoint on Gemma 3 4B ≈ 278 KB (f32).
 
-use crate::attention::SharedKV;
+use larql_inference::attention::SharedKV;
 use std::collections::HashMap;
 
 #[derive(Default)]

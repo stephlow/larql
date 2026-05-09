@@ -37,7 +37,7 @@ pub fn mse(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Softmax of a logit vector. Numerically stable (subtract max).
-pub use crate::forward::softmax;
+pub use larql_inference::forward::softmax;
 
 /// KL divergence D_KL(p || q). Returns 0.0 for identical distributions.
 /// `p` and `q` must be valid probability distributions (sum to ~1, all ≥ 0).

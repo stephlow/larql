@@ -24,11 +24,11 @@ use super::extend::{
     empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_q4k,
 };
 use super::token_archive::TokenArchive;
-use crate::attention::SharedKV;
+use larql_inference::attention::SharedKV;
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
-use crate::engines::{EngineInfo, KvEngine};
-use crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
-use crate::model::ModelWeights;
+use crate::{EngineInfo, KvEngine};
+use larql_inference::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
+use larql_inference::model::ModelWeights;
 
 // ─── EngineStats ─────────────────────────────────────────────────────────────
 
@@ -399,7 +399,7 @@ pub(crate) fn q4k_prefill_metal(
     token_ids: &[u32],
     backend: &dyn ComputeBackend,
 ) -> Option<Array2<f32>> {
-    use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+    use larql_inference::layer_graph::pipeline_layer::build_pipeline_layers;
     use larql_vindex::GateIndex;
 
     if !backend.has_q4() {
@@ -440,7 +440,7 @@ pub(crate) fn q4k_prefill_metal(
         ffn_format,
     );
 
-    let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
+    let h_embed = larql_inference::forward::embed_tokens_pub(weights, token_ids);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
 
     let q_dim = weights.num_q_heads * weights.head_dim;
@@ -487,7 +487,7 @@ pub(crate) fn q4k_decode_token(
     token_id: u32,
     backend: &dyn ComputeBackend,
 ) -> Option<Array2<f32>> {
-    use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+    use larql_inference::layer_graph::pipeline_layer::build_pipeline_layers;
     use larql_vindex::GateIndex;
 
     let gate_index: &dyn GateIndex = index;
@@ -520,7 +520,7 @@ pub(crate) fn q4k_decode_token(
         ffn_format,
     );
 
-    let h_tok = crate::forward::embed_tokens_pub(weights, &[token_id]);
+    let h_tok = larql_inference::forward::embed_tokens_pub(weights, &[token_id]);
     let x_dec: Vec<f32> = h_tok.row(0).to_vec();
 
     let q_dim = weights.num_q_heads * weights.head_dim;
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn prefill_returns_hidden_state() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(512);
         let h = engine
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn decode_step_returns_hidden_state() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(512);
         engine.prefill(&weights, &[0u32]).expect("prefill");
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn window_auto_closes_when_full() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let window_size = 3usize;
         let mut engine = UnlimitedContextEngine::new(window_size);
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn two_full_windows_archives_two() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(2);
 
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn partial_window_after_process() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(4);
 
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn flush_closes_partial_window() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(4);
         engine.process(&weights, &[0u32, 1]).expect("process");
@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn cold_bytes_grow_after_window_close() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(2);
         assert_eq!(engine.cold_bytes(), 0);
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn memory_bytes_nonzero_after_prefill() {
-        use crate::engines::test_utils::make_test_weights;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(512);
         assert_eq!(engine.memory_bytes(), 0);
@@ -702,8 +702,8 @@ mod tests {
 
     #[test]
     fn logits_from_unlimited_context_are_finite() {
-        use crate::engines::test_utils::make_test_weights;
-        use crate::forward::hidden_to_raw_logits;
+        use larql_inference::test_utils::make_test_weights;
+        use larql_inference::forward::hidden_to_raw_logits;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(512);
         let h = engine.prefill(&weights, &[0u32, 1]).expect("prefill");

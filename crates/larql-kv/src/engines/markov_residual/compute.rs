@@ -4,15 +4,15 @@ use larql_compute::{dot_proj_gpu, ComputeBackend};
 use ndarray::{s, Array2};
 
 use super::store::RsStore;
-use crate::attention::SharedKV;
-use crate::attention::{
+use larql_inference::attention::SharedKV;
+use larql_inference::attention::{
     apply_rope_partial_at, run_attention_block_decode_step_backend, run_attention_with_kv_backend,
 };
-use crate::engines::profiler::EngineProfiler;
-use crate::ffn::BackendFfn;
-use crate::forward::{add_bias, apply_norm, embed_tokens_pub, run_ffn};
-use crate::model::ModelWeights;
-use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
+use crate::profiler::EngineProfiler;
+use larql_inference::ffn::BackendFfn;
+use larql_inference::forward::{add_bias, apply_norm, embed_tokens_pub, run_ffn};
+use larql_inference::model::ModelWeights;
+use larql_inference::residual::{rms_norm_heads, rms_norm_heads_no_weight};
 
 pub struct RsPrefillResult {
     pub hidden: Array2<f32>,
@@ -350,7 +350,7 @@ pub(super) fn last_row(h: &Array2<f32>) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use larql_inference::test_utils::make_test_weights;
     use larql_compute::CpuBackend;
 
     // ── recompute_kv ──────────────────────────────────────────────────────────

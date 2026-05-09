@@ -17,14 +17,14 @@ use larql_vindex::VectorIndex;
 use ndarray::{s, Array2};
 
 use super::{codebooks, lloyd_max, packing, rotation};
-use crate::attention::SharedKV;
-use crate::attention::{run_attention_block_decode_step_backend, run_attention_with_kv_backend};
+use larql_inference::attention::SharedKV;
+use larql_inference::attention::{run_attention_block_decode_step_backend, run_attention_with_kv_backend};
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
-use crate::engines::{EngineInfo, KvEngine};
-use crate::ffn::BackendFfn;
-use crate::forward::{embed_tokens_pub, run_ffn};
-use crate::model::ModelWeights;
-use crate::vindex::{WalkFfn, WalkFfnConfig};
+use crate::{EngineInfo, KvEngine};
+use larql_inference::ffn::BackendFfn;
+use larql_inference::forward::{embed_tokens_pub, run_ffn};
+use larql_inference::model::ModelWeights;
+use larql_inference::vindex::{WalkFfn, WalkFfnConfig};
 
 // ─── TurboQuant codec ────────────────────────────────────────────────────────
 
@@ -403,7 +403,7 @@ impl TurboQuantEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::accuracy::cosine_similarity;
+    use crate::accuracy::cosine_similarity;
 
     /// TurboQuant's codebooks are optimised for unit-norm vectors (the natural
     /// distribution of K/V heads after QK-norm). Using unit-norm inputs gives
@@ -625,8 +625,8 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
-    use crate::forward::hidden_to_raw_logits;
+    use larql_inference::test_utils::make_test_weights;
+    use larql_inference::forward::hidden_to_raw_logits;
 
     #[test]
     fn prefill_compresses_kv_for_all_layers() {

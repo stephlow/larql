@@ -78,14 +78,18 @@ LM-head path resolution (which kernel fires per next-token):
 |--------|---------|
 | `attention/` | BLAS-fused GQA attention: block, GQA, GPU dispatch, RoPE |
 | `forward/` | Forward pass: embed, layer, predict, PLE (per-layer embeddings), trace |
-| `ffn/` | FFN evaluation: dense, sparse, highway, route-guided (experimental backends deprecated) |
-| `layer_graph/` | Layer graphs + generation: `pipeline_layer`, `predict`, `prefill`, plus `generate/` (eos, detok, sampling, chat_session, gpu/cpu loops, lm_head, types) |
+| `ffn/` | FFN evaluation: `WeightFfn`, `SparseFfn`, plus `remote/` (HTTP single-shard) and `moe_remote/` (gRPC expert grid) |
+| `layer_graph/` | Layer graphs + generation: `pipeline_layer`, `predict`, `prefill`, plus `generate/` (eos, detok, sampling, chat_session, gpu/cpu loops, lm_head, types) and `grid/` (remote MoE/FFN orchestration) |
 | `residual.rs` | RMS norm, layer norm |
 | `trace/` | Residual stream decomposition and tiered storage |
-| `vindex/` | `open_inference_vindex` (strict loader) + `WalkFfn` (mmap'd FFN, faster than dense at 517ms vs 535ms) |
-| `capture.rs` | Residual stream vector capture for probing |
-| `walker/` | Weight-level graph walkers (no forward pass) |
+| `vindex/` | `open_inference_vindex` (strict loader) + `WalkFfn` (mmap'd FFN) + `q4k_forward/` |
+| `engines/` | KV-cache engines: `MarkovResidualEngine`, `UnlimitedContextEngine`, `Apollo`, `TurboQuant` (behind the `KvEngine` trait) |
+| `experts/` | WASM expert dispatcher and registry |
+| `chat/` | Jinja-driven chat templates loaded from vindex |
+| `capture.rs` | Residual-stream vector capture for probing |
 | `model.rs` | Model loading (re-exports from larql-models) |
+
+> Weight-level graph walkers live in the `larql-vindex` crate (`walker/`), not here.
 
 ## Compute Backend
 

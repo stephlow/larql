@@ -218,4 +218,89 @@ mod tests {
         let err = render_chat_template("{% for x in", &empty_cfg(), "x").unwrap_err();
         assert!(err.to_string().contains("syntax"), "err={err}");
     }
+
+    // ── render_chat_template_multi ────────────────────────────────────────────
+
+    fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(r, c)| ((*r).to_owned(), (*c).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn multi_renders_all_messages_in_order() {
+        let tmpl =
+            "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}\
+             {% if add_generation_prompt %}{{ '<go>' }}{% endif %}";
+        let out = render_chat_template_multi(
+            tmpl,
+            &empty_cfg(),
+            &msgs(&[("system", "S"), ("user", "U"), ("assistant", "A")]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, "[system:S][user:U][assistant:A]<go>");
+    }
+
+    #[test]
+    fn multi_threads_enable_thinking_flag() {
+        let tmpl = "{% if enable_thinking %}think{% else %}plain{% endif %}";
+        let on = render_chat_template_multi(tmpl, &empty_cfg(), &msgs(&[("user", "x")]), true)
+            .unwrap();
+        let off = render_chat_template_multi(tmpl, &empty_cfg(), &msgs(&[("user", "x")]), false)
+            .unwrap();
+        assert_eq!(on, "think");
+        assert_eq!(off, "plain");
+    }
+
+    #[test]
+    fn multi_passes_bos_eos_from_cfg() {
+        let cfg: Value =
+            serde_json::from_str(r#"{"bos_token": "<s>", "eos_token": "</s>"}"#).unwrap();
+        let tmpl = "{{ bos_token }}/{{ messages[0].content }}/{{ eos_token }}";
+        let out = render_chat_template_multi(tmpl, &cfg, &msgs(&[("user", "U")]), false).unwrap();
+        assert_eq!(out, "<s>/U/</s>");
+    }
+
+    #[test]
+    fn multi_surfaces_syntax_errors_as_string() {
+        let err = render_chat_template_multi("{% for", &empty_cfg(), &msgs(&[("user", "x")]), false)
+            .unwrap_err();
+        assert!(err.contains("syntax"), "err={err}");
+    }
+
+    #[test]
+    fn multi_surfaces_render_error_as_string() {
+        // raise_exception → ErrorKind::InvalidOperation, surfaces via
+        // `tmpl.render(..).map_err(|e| e.to_string())`.
+        let err = render_chat_template_multi(
+            "{{ raise_exception('boom') }}",
+            &empty_cfg(),
+            &msgs(&[("user", "x")]),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("boom"), "err={err}");
+    }
+
+    // ── cfg_string_field ──────────────────────────────────────────────────────
+
+    #[test]
+    fn cfg_string_field_returns_none_for_array() {
+        // Neither string nor object: as_str() fails, then as_object() fails.
+        let cfg: Value = serde_json::from_str(r#"{"bos_token": ["a", "b"]}"#).unwrap();
+        let tmpl = "[{{ bos_token }}]";
+        let out = render_chat_template(tmpl, &cfg, "x").unwrap();
+        // Empty fallback (`unwrap_or_default()`).
+        assert_eq!(out, "[]");
+    }
+
+    #[test]
+    fn cfg_string_field_returns_none_when_object_missing_content() {
+        let cfg: Value = serde_json::from_str(r#"{"bos_token": {"lstrip": false}}"#).unwrap();
+        let tmpl = "[{{ bos_token }}]";
+        let out = render_chat_template(tmpl, &cfg, "x").unwrap();
+        assert_eq!(out, "[]");
+    }
 }

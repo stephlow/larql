@@ -71,7 +71,7 @@ fn bench_memory_sweep(c: &mut Criterion) {
 /// hidden-state correctness (cosine, KL, softmax). Useful for understanding
 /// how much the correctness checks add to a real-model test run.
 fn bench_accuracy_metrics(c: &mut Criterion) {
-    use larql_inference::engines::accuracy::{
+    use larql_kv::accuracy::{
         cosine_similarity, js_divergence, kl_divergence, mse, softmax,
     };
 
@@ -114,7 +114,7 @@ fn bench_accuracy_metrics(c: &mut Criterion) {
 /// EngineKind dispatch overhead — construction, parsing, and engine creation.
 /// Measures the metadata / dispatch path without a forward pass.
 fn bench_engine_kind(c: &mut Criterion) {
-    use larql_inference::engines::EngineKind;
+    use larql_kv::EngineKind;
 
     let mut group = c.benchmark_group("engine_kind");
 

@@ -206,3 +206,123 @@ fn resolve_vindexfile_path(
         Ok(p)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── resolve_vindexfile_path ────────────────────────────────────
+
+    #[test]
+    fn resolve_local_path_relative_to_working_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("base.vindex");
+        std::fs::create_dir(&target).unwrap();
+        let resolved = resolve_vindexfile_path("base.vindex", tmp.path()).unwrap();
+        assert_eq!(resolved, target);
+    }
+
+    #[test]
+    fn resolve_local_path_errors_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_vindexfile_path("nope.vindex", tmp.path()).expect_err("missing path");
+        assert!(err.to_string().contains("path not found"));
+    }
+
+    #[test]
+    fn resolve_https_url_is_not_yet_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err =
+            resolve_vindexfile_path("https://example.com/vindex", tmp.path()).expect_err("not implemented");
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn resolve_http_url_is_not_yet_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_vindexfile_path("http://example.com/v", tmp.path()).expect_err("not implemented");
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn resolve_hf_path_dispatches_to_hf_resolver() {
+        // hf:// path with no real network — the hf resolver will error
+        // out, but we verify the function dispatches there (different
+        // error message than "path not found" or "not yet implemented").
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_vindexfile_path("hf://owner/repo", tmp.path())
+            .err()
+            .expect("hf:// will fail without network");
+        let msg = err.to_string();
+        // Crucially NOT the local-path or https errors:
+        assert!(!msg.contains("path not found"), "got: {msg}");
+        assert!(!msg.contains("not yet implemented"), "got: {msg}");
+    }
+
+    // ── build_from_vindexfile ──────────────────────────────────────
+
+    #[test]
+    fn build_errors_when_from_directive_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vf = Vindexfile {
+            directives: vec![],
+            stages: vec![],
+        };
+        let result = build_from_vindexfile(&vf, None, tmp.path());
+        let err = result.err().expect("missing FROM errors");
+        assert!(err.to_string().contains("FROM"));
+    }
+
+    #[test]
+    fn build_errors_when_named_stage_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vf = Vindexfile {
+            directives: vec![VindexfileDirective::From("./irrelevant".into())],
+            stages: vec![VindexfileStage {
+                name: "production".into(),
+                directives: vec![],
+            }],
+        };
+        let result = build_from_vindexfile(&vf, Some("dev"), tmp.path());
+        let err = result.err().expect("unknown stage errors");
+        assert!(err.to_string().contains("stage not found: dev"));
+    }
+
+    #[test]
+    fn build_errors_when_base_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vf = Vindexfile {
+            directives: vec![VindexfileDirective::From("./missing.vindex".into())],
+            stages: vec![],
+        };
+        let result = build_from_vindexfile(&vf, None, tmp.path());
+        let err = result.err().expect("base missing errors");
+        // Either the path-resolution error or the load error fires; both
+        // mention either "path not found" or the missing config file.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path not found") || msg.contains("missing.vindex"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_with_stage_selects_combined_directives() {
+        // Stage path is exercised even when the base lookup fails —
+        // directive selection happens before path resolution.
+        let tmp = tempfile::tempdir().unwrap();
+        let vf = Vindexfile {
+            directives: vec![VindexfileDirective::Labels("base-labels".into())],
+            stages: vec![VindexfileStage {
+                name: "prod".into(),
+                directives: vec![VindexfileDirective::From("./missing".into())],
+            }],
+        };
+        // FROM lives in the stage; passing stage="prod" makes the
+        // combined directive list include it. The FROM resolution
+        // then fails on the missing path — but only because we got
+        // past the stage-merge step, which is what we're pinning.
+        let result = build_from_vindexfile(&vf, Some("prod"), tmp.path());
+        assert!(result.is_err(), "missing local path errors");
+    }
+}

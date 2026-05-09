@@ -194,7 +194,7 @@ impl MetalBackend {
             let q_w_buf = self.bufs.get_f32(q_w);
             let k_w_buf = self.bufs.get_f32(k_w);
             let total_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
-            enc.set_compute_pipeline_state(&self.qk_norm_rope_fused_pipeline);
+            enc.set_compute_pipeline_state(&self.norms.qk_norm_rope_fused_pipeline);
             enc.set_buffer(0, Some(bufs.q_out), 0);
             enc.set_buffer(1, Some(bufs.k_out), 0);
             enc.set_buffer(2, Some(&q_w_buf), 0);
@@ -226,7 +226,7 @@ impl MetalBackend {
                 let q_w_buf = self.bufs.get_f32(q_w);
                 let k_w_buf = self.bufs.get_f32(k_w);
                 let total_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
-                enc.set_compute_pipeline_state(&self.qk_norm_qk_pipeline);
+                enc.set_compute_pipeline_state(&self.norms.qk_norm_qk_pipeline);
                 enc.set_buffer(0, Some(bufs.q_out), 0);
                 enc.set_buffer(1, Some(bufs.k_out), 0);
                 enc.set_buffer(2, Some(&q_w_buf), 0);
@@ -273,7 +273,7 @@ impl MetalBackend {
             while tg_w < layer_head_dim as u64 && tg_w < MAX_HEAD_DIM_DOUBLE_SG as u64 {
                 tg_w <<= 1;
             }
-            enc.set_compute_pipeline_state(&self.v_norm_batched_pipeline);
+            enc.set_compute_pipeline_state(&self.norms.v_norm_batched_pipeline);
             enc.set_buffer(0, Some(bufs.v_out), 0);
             enc.set_buffer(1, Some(bufs.v_out), 0);
             enc.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);
@@ -408,7 +408,7 @@ impl MetalBackend {
             if use_fused_post_attn && ffn_uses_q4k {
                 // Triple-fused: post_attn_norm + residual_norm + h_post_attn
                 // store in ONE dispatch.
-                enc.set_compute_pipeline_state(&self.post_attn_residual_norm_store_pipeline);
+                enc.set_compute_pipeline_state(&self.norms.post_attn_residual_norm_store_pipeline);
                 enc.set_buffer(0, Some(bufs.h_buf), 0);
                 enc.set_buffer(1, Some(bufs.o_out_buf), 0);
                 enc.set_buffer(2, Some(bufs.post_attn_norm), 0);
@@ -426,7 +426,7 @@ impl MetalBackend {
                 use crate::metal::ops::full_pipeline::encode_rms_norm;
                 encode_rms_norm(
                     enc,
-                    &self.rms_norm_pipeline,
+                    &self.norms.rms_norm_pipeline,
                     bufs.o_out_buf,
                     bufs.post_attn_norm,
                     bufs.normed_scratch,
@@ -435,7 +435,7 @@ impl MetalBackend {
                     norm_offset,
                 );
                 if ffn_uses_q4k {
-                    enc.set_compute_pipeline_state(&self.residual_norm_store_pipeline);
+                    enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
                     enc.set_buffer(0, Some(bufs.h_buf), 0);
                     enc.set_buffer(1, Some(bufs.normed_scratch), 0);
                     enc.set_buffer(2, Some(&pre_ffn_buf), 0);
@@ -449,7 +449,7 @@ impl MetalBackend {
                         MTLSize::new(256.min(hidden as u64), 1, 1),
                     );
                 } else {
-                    enc.set_compute_pipeline_state(&self.residual_norm_q8_pipeline);
+                    enc.set_compute_pipeline_state(&self.norms.residual_norm_q8_pipeline);
                     enc.set_buffer(0, Some(bufs.h_buf), 0);
                     enc.set_buffer(1, Some(bufs.normed_scratch), 0);
                     enc.set_buffer(2, Some(&pre_ffn_buf), 0);
@@ -466,7 +466,7 @@ impl MetalBackend {
                 }
             }
         } else if ffn_uses_q4k {
-            enc.set_compute_pipeline_state(&self.residual_norm_store_pipeline);
+            enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
             enc.set_buffer(0, Some(bufs.h_buf), 0);
             enc.set_buffer(1, Some(bufs.o_out_buf), 0);
             enc.set_buffer(2, Some(bufs.post_attn_norm), 0);
@@ -480,7 +480,7 @@ impl MetalBackend {
                 MTLSize::new(256.min(hidden as u64), 1, 1),
             );
         } else {
-            enc.set_compute_pipeline_state(&self.residual_norm_q8_pipeline);
+            enc.set_compute_pipeline_state(&self.norms.residual_norm_q8_pipeline);
             enc.set_buffer(0, Some(bufs.h_buf), 0);
             enc.set_buffer(1, Some(bufs.o_out_buf), 0);
             enc.set_buffer(2, Some(bufs.post_attn_norm), 0);

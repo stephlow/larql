@@ -549,7 +549,7 @@ impl MetalBackend {
                 if layer.layer_scalar != 0.0 {
                     crate::metal::stages::layer_scalar::encode(
                         &enc,
-                        &self.scale_vector_pipeline,
+                        &self.norms.scale_vector_pipeline,
                         new_h,
                         1,
                         hidden,

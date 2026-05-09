@@ -15,8 +15,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use larql_inference::engines::apollo::{npy, ApolloStore};
 use larql_inference::{forward_from_layer, hidden_to_raw_logits, InferenceModel};
+use larql_kv::apollo::{npy, ApolloStore};
 use ndarray::s;
 use serde::{Deserialize, Serialize};
 

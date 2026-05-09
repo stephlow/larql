@@ -68,7 +68,7 @@ impl MetalBackend {
             let hidden_val = hidden as u32;
             let eps = layer.eps;
             let norm_offset = layer.norm_offset;
-            enc.set_compute_pipeline_state(&self.residual_norm_store_pipeline);
+            enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
             enc.set_buffer(0, Some(bufs.h_post_attn), 0); // a (residual base)
             enc.set_buffer(1, Some(bufs.down_out), 0); // b (FFN output)
             enc.set_buffer(2, Some(&next_input_norm_buf), 0); // weight = next layer's input_norm
@@ -91,7 +91,7 @@ impl MetalBackend {
                     let hidden_val = hidden as u32;
                     let eps = layer.eps;
                     let norm_offset = layer.norm_offset;
-                    enc.set_compute_pipeline_state(&self.post_ffn_norm_residual_add_pipeline);
+                    enc.set_compute_pipeline_state(&self.norms.post_ffn_norm_residual_add_pipeline);
                     enc.set_buffer(0, Some(bufs.down_out), 0);
                     enc.set_buffer(1, Some(bufs.h_post_attn), 0);
                     enc.set_buffer(2, Some(&post_ffn_buf), 0);
@@ -106,7 +106,7 @@ impl MetalBackend {
                 } else {
                     encode_rms_norm(
                         enc,
-                        &self.rms_norm_pipeline,
+                        &self.norms.rms_norm_pipeline,
                         bufs.down_out,
                         &post_ffn_buf,
                         bufs.normed_scratch,
@@ -116,7 +116,7 @@ impl MetalBackend {
                     );
                     encode_residual_add(
                         enc,
-                        &self.residual_add_pipeline,
+                        &self.norms.residual_add_pipeline,
                         bufs.h_post_attn,
                         bufs.normed_scratch,
                         bufs.new_h,
@@ -126,7 +126,7 @@ impl MetalBackend {
             } else {
                 encode_residual_add(
                     enc,
-                    &self.residual_add_pipeline,
+                    &self.norms.residual_add_pipeline,
                     bufs.h_post_attn,
                     bufs.down_out,
                     bufs.new_h,
@@ -136,7 +136,7 @@ impl MetalBackend {
         } else {
             encode_residual_add(
                 enc,
-                &self.residual_add_pipeline,
+                &self.norms.residual_add_pipeline,
                 bufs.h_post_attn,
                 bufs.down_out,
                 bufs.new_h,

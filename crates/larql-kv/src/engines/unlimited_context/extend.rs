@@ -7,11 +7,11 @@ use larql_compute::ComputeBackend;
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
 
-use crate::attention::{run_attention_block_decode_step_backend, SharedKV};
-use crate::ffn::BackendFfn;
-use crate::forward::{embed_tokens_pub, run_ffn};
-use crate::model::ModelWeights;
-use crate::vindex::{WalkFfn, WalkFfnConfig};
+use larql_inference::attention::{run_attention_block_decode_step_backend, SharedKV};
+use larql_inference::ffn::BackendFfn;
+use larql_inference::forward::{embed_tokens_pub, run_ffn};
+use larql_inference::model::ModelWeights;
+use larql_inference::vindex::{WalkFfn, WalkFfnConfig};
 
 pub struct ExtendOutput {
     /// Hidden state at the last processed token, shape (1, hidden).
@@ -197,8 +197,8 @@ pub fn empty_prior(weights: &ModelWeights) -> Vec<SharedKV> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
-    use crate::forward::hidden_to_raw_logits;
+    use larql_inference::test_utils::make_test_weights;
+    use larql_inference::forward::hidden_to_raw_logits;
 
     // ── empty_prior ───────────────────────────────────────────────────────────
 

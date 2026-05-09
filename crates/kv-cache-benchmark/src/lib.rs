@@ -15,7 +15,7 @@ pub mod turboquant;
 #[cfg(feature = "real-model")]
 pub mod real_model;
 
-// unlimited_context re-exports from larql_inference::engines — always available.
+// unlimited_context re-exports from larql_kv — always available.
 pub mod unlimited_context;
 
 #[cfg(feature = "real-model")]

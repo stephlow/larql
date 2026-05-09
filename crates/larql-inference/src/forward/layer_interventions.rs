@@ -258,7 +258,7 @@ pub fn run_layer_with_replaced_head_residual_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
     use crate::forward::run_layer_with_ffn;
     use ndarray::Array2;

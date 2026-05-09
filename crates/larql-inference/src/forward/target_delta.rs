@@ -573,7 +573,7 @@ fn softmax_1d(logits: &Array1<f32>) -> Array1<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use ndarray::arr1;
     use ndarray::arr2;
     use ndarray::Array2;

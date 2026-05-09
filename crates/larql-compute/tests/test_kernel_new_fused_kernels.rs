@@ -55,7 +55,7 @@ fn residual_norm_store_matches_residual_norm_and_raw_sum() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.residual_norm_store_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.residual_norm_store_pipeline);
     enc.set_buffer(0, Some(&buf_a), 0);
     enc.set_buffer(1, Some(&buf_b), 0);
     enc.set_buffer(2, Some(&buf_w), 0);

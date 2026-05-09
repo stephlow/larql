@@ -1470,8 +1470,8 @@ inconsistent.
 `MarkovResidualEngine` and `UnlimitedContextEngine` are re-exported; the other
 two engines are not. Either export all four or none.
 
-**`walker/` and `experts/` have no module-level docs**  
-Add `//!` headers explaining purpose and entry points.
+**`experts/` has no module-level docs**  
+Add a `//!` header explaining purpose and entry points. (Walkers live in `larql-vindex`, not here.)
 
 **`vindex/` module doc is vague**  
 "Vindex integration" says nothing to a new reader. Expand to explain what the

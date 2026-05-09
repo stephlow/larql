@@ -9,7 +9,7 @@ use larql_compute::{
     FullPipelineLayer, MoeLayerWeights, MoeRoutingPolicy, MoeWeightLayout, QuantFormat, QuantWeight,
 };
 
-pub(crate) const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;
+pub const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AttentionGeometry {
@@ -551,7 +551,7 @@ fn moe_routing_policy(router_type: &str) -> MoeRoutingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{make_test_vindex, make_test_weights};
+    use crate::test_utils::{make_test_vindex, make_test_weights};
     use larql_models::ModelWeights;
     use std::sync::OnceLock;
 

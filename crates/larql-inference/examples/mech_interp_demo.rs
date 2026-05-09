@@ -25,11 +25,11 @@
 //! language model. The point is to exercise every primitive end-to-end so
 //! you can see the API shapes and copy them into real workflows.
 //!
-//! [`make_test_weights`]: larql_inference::engines::test_utils::make_test_weights
+//! [`make_test_weights`]: larql_inference::test_utils::make_test_weights
 
 use ndarray::Array1;
 
-use larql_inference::engines::test_utils::{make_test_tokenizer, make_test_weights};
+use larql_inference::test_utils::{make_test_tokenizer, make_test_weights};
 use larql_inference::ffn::WeightFfn;
 use larql_inference::forward::{
     capture_donor_state, embedding_neighbors, embedding_row, generate_cached,

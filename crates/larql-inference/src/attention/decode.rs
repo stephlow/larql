@@ -432,7 +432,7 @@ pub fn run_attention_block_decode_step_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use ndarray::Array2;
 
     // ── KvCache ───────────────────────────────────────────────────────────────

@@ -186,7 +186,7 @@ fn predict_hybrid_metal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{make_test_tokenizer, make_test_vindex, make_test_weights};
+    use crate::test_utils::{make_test_tokenizer, make_test_vindex, make_test_weights};
     use crate::layer_graph::CachedLayerGraph;
     use larql_compute::CpuBackend;
 

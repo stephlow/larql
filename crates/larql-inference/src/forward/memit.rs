@@ -468,7 +468,7 @@ fn memit_solve_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     #[test]
     fn test_memit_fact_creation() {
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn run_memit_empty_facts_returns_empty() {
-        use crate::engines::test_utils::make_test_tokenizer;
+        use crate::test_utils::make_test_tokenizer;
         let weights = make_test_weights();
         // by_layer is empty → run_memit_inner returns before touching the tokenizer.
         // Pass a real tokenizer so the test doesn't rely on pointer provenance.

@@ -27,7 +27,7 @@ pub fn embed_tokens_pub(weights: &ModelWeights, token_ids: &[u32]) -> Array2<f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     #[test]
     fn embed_tokens_shape() {

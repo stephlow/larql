@@ -6,11 +6,11 @@ use ndarray::Array2;
 
 use super::compute::{last_row, recompute_kv, RsPrefillResult};
 use super::store::RsStore;
-use crate::attention::run_attention_with_kv_backend;
-use crate::attention::SharedKV;
-use crate::forward::{embed_tokens_pub, run_ffn};
-use crate::model::ModelWeights;
-use crate::vindex::{WalkFfn, WalkFfnConfig};
+use larql_inference::attention::run_attention_with_kv_backend;
+use larql_inference::attention::SharedKV;
+use larql_inference::forward::{embed_tokens_pub, run_ffn};
+use larql_inference::model::ModelWeights;
+use larql_inference::vindex::{WalkFfn, WalkFfnConfig};
 
 /// Dequantise attention Q4K weights (Q, K, V, O) for all layers into
 /// `weights.tensors`. Idempotent — skips layers already present.
@@ -167,7 +167,7 @@ pub(super) fn rs_decode_step_walk(
 
         new_stored.push(h_new.clone());
 
-        let (h_post_attn, _new_kv) = crate::attention::run_attention_block_decode_step_backend(
+        let (h_post_attn, _new_kv) = larql_inference::attention::run_attention_block_decode_step_backend(
             weights,
             &h_new,
             layer,

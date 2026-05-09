@@ -172,7 +172,7 @@ impl AttentionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
     use ndarray::Array2;
 

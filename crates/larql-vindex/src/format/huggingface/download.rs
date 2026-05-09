@@ -725,4 +725,221 @@ mod tests {
         assert!(ds.to_string_lossy().contains("datasets--"));
         assert!(md.to_string_lossy().contains("models--"));
     }
+
+    // ─── hf_hub-bound functions: not-an-hf-path early return ────────────
+    //
+    // These four functions all share the same `hf://` strip_prefix +
+    // `@revision` parsing + `Api::new()` setup head. Pin the early-return
+    // path that fires when the input doesn't start with `hf://`. No HTTP
+    // mocking needed — the error fires before any network call.
+
+    #[test]
+    fn resolve_hf_vindex_rejects_non_hf_path() {
+        let err = resolve_hf_vindex("/local/path").expect_err("must reject local paths");
+        assert!(err.to_string().contains("not an hf://"));
+    }
+
+    #[test]
+    fn resolve_hf_vindex_rejects_https_url() {
+        let err = resolve_hf_vindex("https://huggingface.co/owner/repo").expect_err("must reject");
+        assert!(err.to_string().contains("not an hf://"));
+    }
+
+    #[test]
+    fn download_hf_weights_rejects_non_hf_path() {
+        let err = download_hf_weights("./relative").expect_err("must reject");
+        assert!(err.to_string().contains("not an hf://"));
+    }
+
+    #[test]
+    fn download_hf_weights_rejects_empty_string() {
+        let err = download_hf_weights("").expect_err("must reject empty");
+        assert!(err.to_string().contains("not an hf://"));
+    }
+
+    /// Stub `DownloadProgress` for the *_with_progress tests. We only need
+    /// the trait to exist so the function type-checks; the stub is never
+    /// invoked because we hit the early-return path.
+    struct NoOpProgress;
+    impl DownloadProgress for NoOpProgress {
+        fn init(&mut self, _size: usize, _filename: &str) {}
+        fn update(&mut self, _size: usize) {}
+        fn finish(&mut self) {}
+    }
+
+    #[test]
+    fn resolve_hf_vindex_with_progress_rejects_non_hf_path() {
+        let err = resolve_hf_vindex_with_progress("/tmp/foo", |_| NoOpProgress)
+            .expect_err("must reject");
+        assert!(err.to_string().contains("not an hf://"));
+    }
+
+    #[test]
+    fn resolve_hf_model_with_progress_rejects_non_hf_path() {
+        let err =
+            resolve_hf_model_with_progress("./local-model", |_| NoOpProgress).expect_err("must reject");
+        assert!(err.to_string().contains("not an hf://"));
+    }
+
+    // ─── hf_hub-bound: revision parsing covered by error path ──────────
+    //
+    // The `@revision` split happens after the `hf://` prefix strip but
+    // before any network call. The functions then do `Api::new()` which
+    // (with HF_ENDPOINT pointing at a non-existent server) fails fast.
+    // That path covers the revision-vs-no-revision branches.
+
+    /// RAII guard for HF_ENDPOINT + HF_HOME + a tempdir cache.
+    /// Restores prior values on drop.
+    struct HfTestEnv {
+        prev_endpoint: Option<String>,
+        prev_home: Option<String>,
+        prev_hub: Option<String>,
+        prev_token: Option<String>,
+        // Hold the tempdir so it lives as long as the guard.
+        _tmp: tempfile::TempDir,
+    }
+    impl HfTestEnv {
+        fn new(endpoint: &str) -> Self {
+            let prev_endpoint = std::env::var("HF_ENDPOINT").ok();
+            let prev_home = std::env::var("HF_HOME").ok();
+            let prev_hub = std::env::var("HUGGINGFACE_HUB_CACHE").ok();
+            let prev_token = std::env::var("HF_TOKEN").ok();
+
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("HF_ENDPOINT", endpoint);
+            std::env::set_var("HF_HOME", tmp.path());
+            // Clear HUGGINGFACE_HUB_CACHE so HF_HOME wins; clear token
+            // so we don't accidentally hit a real auth header.
+            std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+            std::env::remove_var("HF_TOKEN");
+
+            Self {
+                prev_endpoint,
+                prev_home,
+                prev_hub,
+                prev_token,
+                _tmp: tmp,
+            }
+        }
+    }
+    impl Drop for HfTestEnv {
+        fn drop(&mut self) {
+            for (k, prev) in [
+                ("HF_ENDPOINT", self.prev_endpoint.take()),
+                ("HF_HOME", self.prev_home.take()),
+                ("HUGGINGFACE_HUB_CACHE", self.prev_hub.take()),
+                ("HF_TOKEN", self.prev_token.take()),
+            ] {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_vindex_errors_on_404_index_json() {
+        // mockito returns 404 for /datasets/owner/repo/resolve/main/index.json
+        // → repo.get(INDEX_JSON) errors → resolve_hf_vindex returns
+        // the wrapped "failed to download index.json" error. Exercises:
+        // hf:// strip, no-revision branch, Api::new(), repo.get error path.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/datasets/owner/repo/resolve/.*/index\.json".into()),
+            )
+            .with_status(404)
+            .create();
+
+        let err = resolve_hf_vindex("hf://owner/repo").expect_err("404 must error");
+        assert!(
+            err.to_string().contains("failed to download index.json"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_vindex_errors_with_revision_pinned() {
+        // Same as above but with `@v2.0` revision. The split path takes
+        // a different `repo` constructor (with_revision) — verify both
+        // branches by exercising them with the same 404 mock.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/datasets/owner/repo/resolve/v2\.0/index\.json".into()),
+            )
+            .with_status(404)
+            .create();
+
+        let err = resolve_hf_vindex("hf://owner/repo@v2.0").expect_err("404 must error");
+        assert!(
+            err.to_string().contains("owner/repo"),
+            "error must mention repo: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn download_hf_weights_silently_skips_missing_files() {
+        // download_hf_weights iterates VINDEX_WEIGHT_FILES with `let _ =
+        // repo.get(filename)` — every miss is silenced. Pin that contract:
+        // even when every file 404s, the function returns Ok(()).
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create();
+
+        download_hf_weights("hf://owner/repo").expect("missing files are non-fatal");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_model_with_progress_errors_when_info_fails() {
+        // The model-side variant calls `repo.info()` first (which hits
+        // /api/models/{repo}/revision/{rev}). A 500 there propagates as
+        // `HF info failed for {hf_path}`.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/models/owner/repo.*".into()),
+            )
+            .with_status(500)
+            .with_body(r#"{"error": "boom"}"#)
+            .create();
+
+        let err = resolve_hf_model_with_progress("hf://owner/repo", |_| NoOpProgress)
+            .expect_err("info failure must surface");
+        assert!(
+            err.to_string().contains("HF info failed"),
+            "expected 'HF info failed' wrapper, got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_vindex_with_progress_errors_when_index_json_404s() {
+        // The progress variant fetches index.json first; when it's
+        // missing the `ok_or_else` clause produces a clear error.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create();
+
+        let err = resolve_hf_vindex_with_progress("hf://owner/repo", |_| NoOpProgress)
+            .expect_err("404 on index.json must error");
+        assert!(err.to_string().contains("failed to fetch index.json"));
+    }
 }

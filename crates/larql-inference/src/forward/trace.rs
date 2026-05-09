@@ -426,7 +426,7 @@ pub fn calibrate_scalar_gains(weights: &ModelWeights, token_ids: &[u32]) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use crate::model::ModelWeights;
     use std::sync::OnceLock;
 

@@ -572,7 +572,7 @@ fn run_attention_block_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use ndarray::Array2;
 
     fn hidden(rows: usize, hidden: usize) -> Array2<f32> {

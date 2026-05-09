@@ -23,7 +23,7 @@
 use std::time::Instant;
 
 use clap::Args;
-use larql_inference::engines::EngineKind;
+use larql_kv::EngineKind;
 
 use crate::commands::primary::cache;
 
@@ -292,7 +292,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
+            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
                 &weights,
                 token_ids.len(),
             );
@@ -332,7 +332,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
+            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
                 &weights,
                 token_ids.len(),
             );

@@ -414,7 +414,7 @@ impl<'a> FfnBackend for WalkFfn<'a> {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
     use crate::model::ModelWeights;
     use larql_vindex::{
         FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,

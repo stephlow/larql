@@ -230,7 +230,7 @@ mod cache_format_tests {
         // 256-element ramp [-1, 1] — same fixture used by q4_common tests.
         let data: Vec<f32> = (0..256).map(|i| (i as f32 / 255.0) * 2.0 - 1.0).collect();
         let bytes = crate::cpu::ops::q4_common::quantize_q4_k(&data);
-        assert_eq!(bytes.len(), 144);
+        assert_eq!(bytes.len(), larql_models::quant::ggml::Q4_K_BLOCK_BYTES);
 
         let out = try_cached_dequant(&bytes, QuantFormat::Q4_K, 256).unwrap();
         assert_eq!(out.len(), 256);
@@ -291,7 +291,7 @@ mod cache_format_tests {
     /// Q4_K with non-multiple-of-256 expected_floats returns empty.
     #[test]
     fn q4k_misaligned_length_returns_empty() {
-        let bytes = vec![0u8; 144];
+        let bytes = vec![0u8; larql_models::quant::ggml::Q4_K_BLOCK_BYTES];
         let out = try_cached_dequant(&bytes, QuantFormat::Q4_K, 200).unwrap();
         assert!(out.is_empty(), "expected_floats not a 256 multiple → empty");
     }

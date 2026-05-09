@@ -252,6 +252,61 @@ fn parse_unit_manifest_reports_path_on_missing_file() {
 }
 
 #[test]
+fn parse_unit_manifest_round_trips_from_file() {
+    // Happy path: write a manifest to a tempfile, parse it back into shards.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("units.json");
+    let json = r#"{
+        "shards": [
+            {"url": "grpc://h:9081", "layer_experts": {"0": [[0,3]]}}
+        ]
+    }"#;
+    std::fs::write(&path, json).unwrap();
+    let configs = parse_unit_manifest(&path).unwrap();
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].url, "grpc://h:9081");
+    let units = configs[0].unit_set.as_ref().unwrap();
+    assert_eq!(units.len(), 4);
+}
+
+#[test]
+fn parse_unit_manifest_reports_path_on_invalid_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("garbage.json");
+    std::fs::write(&path, b"not-json").unwrap();
+    let err = parse_unit_manifest(&path).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("parse"), "msg should mention parse: {msg}");
+    assert!(
+        msg.contains(path.to_str().unwrap()),
+        "msg should name path: {msg}"
+    );
+}
+
+#[test]
+fn shard_config_with_timeout_overrides_default() {
+    let s = ShardConfig::new(0, 31, "http://h:8081")
+        .with_timeout(std::time::Duration::from_millis(500));
+    assert_eq!(s.timeout, std::time::Duration::from_millis(500));
+}
+
+#[test]
+fn shard_config_with_units_empty_set_yields_zero_range() {
+    // Diagnostic min/max default to (0, 0) when the unit set is empty.
+    let empty: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let s = ShardConfig::with_units("http://h:9000", empty);
+    assert_eq!(s.start, 0);
+    assert_eq!(s.end, 0);
+    assert!(s.unit_set.unwrap().is_empty());
+}
+
+#[test]
+fn parse_range_missing_dash_returns_none() {
+    // "5" splits as a single part — second `parts.next()?` short-circuits.
+    assert_eq!(ShardConfig::parse_range("5"), None);
+}
+
+#[test]
 fn route_softmax_sums_to_one() {
     let num_experts = 8;
     let hidden = 4;

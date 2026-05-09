@@ -7,9 +7,9 @@ use ndarray::Array2;
 use super::compute::{rs_decode_step, rs_decode_step_profiled, rs_prefill};
 use super::q4k::{ensure_attn_tensors_dequantised, rs_decode_step_walk, rs_prefill_walk};
 use super::store::RsStore;
-use crate::engines::profiler::{DecodeStageSummary, EngineProfiler};
-use crate::engines::{EngineInfo, KvEngine};
-use crate::model::ModelWeights;
+use crate::profiler::{DecodeStageSummary, EngineProfiler};
+use crate::{EngineInfo, KvEngine};
+use larql_inference::model::ModelWeights;
 
 pub struct MarkovResidualEngine {
     window_size: Option<usize>,
@@ -156,9 +156,9 @@ impl KvEngine for MarkovResidualEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
-    use crate::engines::KvEngine;
-    use crate::forward::hidden_to_raw_logits;
+    use larql_inference::test_utils::make_test_weights;
+    use crate::KvEngine;
+    use larql_inference::forward::hidden_to_raw_logits;
 
     // ── Construction ──────────────────────────────────────────────────────────
 

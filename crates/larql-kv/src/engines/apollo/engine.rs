@@ -24,9 +24,9 @@ use thiserror::Error;
 use super::entry::{InjectionConfig, VecInjectEntry};
 use super::routing::{RoutingIndex, RoutingQuery};
 use super::store::ApolloStore;
-use crate::engines::{EngineInfo, KvEngine};
-use crate::forward::{embed_tokens_pub, forward_from_layer, forward_raw_logits};
-use crate::model::ModelWeights;
+use crate::{EngineInfo, KvEngine};
+use larql_inference::forward::{embed_tokens_pub, forward_from_layer, forward_raw_logits};
+use larql_inference::model::ModelWeights;
 
 /// (context_tokens, injection_delta, boundary_residual, crystal_layer)
 type InjectionPrep = (Vec<u32>, ndarray::Array1<f32>, Option<Vec<f32>>, usize);
@@ -298,7 +298,7 @@ impl ApolloEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::kv_engines::apollo::store::{ArchConfig, StoreManifest};
+    use crate::engines::apollo::store::{ArchConfig, StoreManifest};
 
     /// Build a minimal in-memory ApolloStore with synthetic data.
     fn mk_store(windows: usize, window_size: usize, hidden: usize) -> ApolloStore {

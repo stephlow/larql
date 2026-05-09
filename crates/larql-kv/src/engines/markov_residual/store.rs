@@ -1,6 +1,6 @@
 //! RsStore — per-layer residual buffer for MarkovResidualEngine.
 
-use crate::attention::SharedKV;
+use larql_inference::attention::SharedKV;
 use ndarray::{s, Array2};
 
 /// Per-layer pre-attention residuals for all stored positions.
