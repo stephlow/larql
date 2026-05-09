@@ -1,5 +1,41 @@
 //! Q4_K fused gate+up with **f16 inner accumulators** — experimental variant.
 //!
+//! ## Retention rationale (post 2026-05-09 model-agnosticity audit)
+//!
+//! - **Tried**: 2026-04-28 on Gemma 3 4B (K=2560, M3 Max). Result:
+//!   kernel-isolated **1.79× speedup** (0.607 → 0.340 ms iso); end-to-end
+//!   **at parity** on quiet GPU. Initial +23% measurement was thermal-
+//!   throttle artifact. Pinned as ADR-015 instance #1.
+//! - **Status**: Opt-in via `LARQL_F16_ACC=1`. Not deleted despite Gemma
+//!   end-to-end null because:
+//!   - **M5+/A19 hardware could win**: the production kernel is
+//!     bandwidth-bound at ~74% LPDDR5X peak. If future Apple silicon
+//!     widens the DRAM bus or shifts the ALU/bandwidth balance, the f16
+//!     inner-FMA throughput advantage could materialise end-to-end.
+//!   - **Sustained-load thermal scenarios**: the f16 path uses fewer ALU
+//!     cycles per FMA, generating less thermal pressure. Long-running
+//!     workloads where the GPU is at sustained TDP may see this kernel
+//!     stay closer to peak frequency than the f32 variant.
+//!   - **Larger-K models could win**: K=2560 (Gemma 3 4B) gives the
+//!     bandwidth path the smallest footprint for f16-acc to help; larger
+//!     K (Llama 3 70B at K=8192) shifts the dequant amortisation.
+//! - **Re-validation gate**: A/B on quiet hardware with `--warmup 8 -n
+//!   30 --profile`; promote if batched-diag improves AND end-to-end shows
+//!   ≥ 5% tok/s gain with correct output (Paris ✓ on smoke test).
+//! - **Deletion criterion**: if a multi-hardware multi-K bench (M3 +
+//!   M5/A19 + Llama 70B + Gemma 4 31B) all show null, can be deleted.
+//!   No such bench has been run yet.
+//!
+//! Numerical parity validated against f32 reference: 10-prompt corpus
+//! greedy-decode bit-identical on Gemma 3 4B. The f16-acc variant is
+//! correct, just not faster on this specific Gemma + hardware combo.
+//!
+//! See `docs/shader-inventory.md` for the retention framework and
+//! `docs/adr/015-isolated-vs-batched-kernel-perf.md` for the iso-vs-batched
+//! lesson this kernel pinned.
+//!
+//! ## Original kernel description
+//!
 //! Hypothesis: Apple Silicon GPUs run f16 FMA at 2× f32 throughput. The
 //! inner per-superblock dot loop (16 FMAs across `nib × xl`) is a clean
 //! candidate to drop into half precision provided the partial sum stays

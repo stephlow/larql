@@ -92,7 +92,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use larql_vindex::GateIndex as _;
+use larql_vindex::{PatchOverrides, QuantizedFfnAccess};
 use serde::Deserialize;
 
 use crate::error::ServerError;

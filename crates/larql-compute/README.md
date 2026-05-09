@@ -246,7 +246,7 @@ src/
 ## Tests
 
 ```bash
-# Fast inner loop: lib tests + backend API contract, no integration-binary crawl.
+# Fast inner loop: library/unit tests only, no integration-binary crawl.
 make larql-compute-test-fast
 
 # Heavy integration sweep: every test binary under crates/larql-compute/tests.
@@ -260,9 +260,11 @@ cargo check -p larql-compute --all-targets
 cargo check -p larql-compute --all-targets --features metal  # macOS only
 ```
 
-`cargo test -p larql-compute` remains valid, but it walks every integration
-test binary. Prefer `make larql-compute-test-fast` while iterating on CPU
-MoE, backend traits, and quant dispatch.
+`cargo test -p larql-compute` remains valid, but it still compiles and walks
+every integration test binary, including Metal-gated harnesses with zero
+runnable tests on default-feature builds. Prefer
+`make larql-compute-test-fast` while iterating on CPU MoE, backend traits,
+and quant dispatch.
 
 The integration suite currently has 28 test binaries plus a shared helper
 module under `tests/common`. With `--features metal`, it covers:

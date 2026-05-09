@@ -191,6 +191,36 @@ pub const THREADS_PER_TG: u64 = 128;
 /// Takes raw `H` (un-normalised hidden state) + `norm_weight` instead of
 /// pre-normalised `X`, computing the norm cooperatively within each TG.
 /// Eliminates the separate `rms_norm` dispatch (saves 34 dispatches/token).
+///
+/// ## Retention rationale (post 2026-05-09 model-agnosticity audit)
+///
+/// - **Defused 2026-05-09** as production default (see [ADR-016](../../docs/adr/016-defused-rms-norm-qkv.md)).
+///   End-to-end A/B showed −0.30 ms/tok GPU fwd vs the defused path:
+///   the fused kernel rereads H+norm_w 3× per TG (4 simdgroups, different
+///   stride patterns for Q4_K Q/K vs Q6_K V) which dropped the per-kernel
+///   batched throughput from 287 → 199 GB/s. The 1.46 ms/tok kernel cost
+///   exceeded the 0.24 ms/tok dispatch saving.
+/// - **Status**: Opt-in via `LARQL_QKV_FUSED=1`. Not deleted despite the
+///   Gemma A/B loss because:
+///   - **Different ALU/bandwidth balance** on M5+/A19 silicon could shift
+///     the trade. The dispatch-overhead cost is fixed (~7 µs/dispatch);
+///     the kernel-side bandwidth penalty depends on cache hierarchy.
+///   - **Architectures with smaller H size could win**: at smaller hidden,
+///     the H+norm_w reread cost shrinks while the dispatch saving stays
+///     constant. The trade reverses in our favour.
+///   - **Models with single-arch attention** (no Q4_K Q/K + Q6_K V mix —
+///     all Q4_K or all Q6_K) wouldn't have the stride-pattern conflict
+///     that drives the operand reread, so the kernel could be retuned
+///     for those archs and re-validated.
+/// - **Re-validation gate**: A/B with `LARQL_QKV_FUSED=1` on a vindex
+///   with smaller hidden (Gemma 4 E2B at hidden=1536) or non-mixed-quant
+///   layout. Promote if batched-diag improves AND end-to-end shows
+///   ≥ 1% tok/s gain.
+/// - **Deletion criterion**: ADR-016 explicitly retains this kernel as
+///   opt-in fallback. Don't delete without superseding ADR-016.
+///
+/// See `docs/shader-inventory.md` for the retention framework and
+/// `docs/adr/016-defused-rms-norm-qkv.md` for the defuse decision.
 pub const NORMED_SHADER: &str = r#"
 
 kernel void q4k_q6k_qkv_proj_normed(

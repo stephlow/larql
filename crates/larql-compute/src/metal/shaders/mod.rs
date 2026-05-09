@@ -43,7 +43,6 @@ pub mod q4k_matvec_8sg;
 pub mod q4k_matvec_stride32;
 pub mod q4k_q6k_qkv_proj;
 pub mod q4k_qkv_proj;
-pub mod q4k_qkv_proj_v2;
 pub mod q4kf_ffn_gate_up;
 pub mod q4kf_qkv_proj;
 pub mod q6k_geglu_down;
@@ -102,7 +101,6 @@ pub fn all_shaders() -> String {
     src.push_str(q4k_matvec_stride32::SHADER);
     src.push_str(q4k_matmul::SHADER);
     src.push_str(q4k_qkv_proj::SHADER);
-    src.push_str(q4k_qkv_proj_v2::SHADER);
     src.push_str(q4k_q6k_qkv_proj::SHADER);
     src.push_str(q4kf_qkv_proj::SHADER);
     src.push_str(q4k_ffn_gate_up::SHADER);

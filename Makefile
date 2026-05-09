@@ -177,15 +177,16 @@ LARQL_COMPUTE_COVERAGE_REPORT ?= coverage/larql-compute/summary.json
 
 larql-compute-test: larql-compute-test-fast
 
-# Default fast path. Plain `cargo test -p larql-compute` matches this
-# now that the slow non-Metal suites are gated behind the `heavy_tests`
-# feature; this target is the canonical invocation.
+# Default fast path: library/unit tests only. This deliberately avoids
+# compiling every integration-test binary, including Metal-gated harnesses
+# that have zero runnable tests on default-feature builds.
 larql-compute-test-fast:
-	cargo test -p larql-compute
+	cargo test -p larql-compute --lib
 
 # Full integration suite — turns on `heavy_tests` for the slow non-Metal
-# correctness/parity suites. Adds ~85 s of compile time on top of fast.
-# Add `--features metal` to also build the Metal kernel tests on macOS.
+# correctness/parity suites and walks every integration binary under
+# crates/larql-compute/tests. Add `--features metal` to also build the
+# Metal kernel tests on macOS.
 larql-compute-test-integration:
 	cargo test -p larql-compute --features heavy_tests --tests
 

@@ -230,6 +230,8 @@ shader-module constants while the bound pipeline has different geometry.
 
 **No headroom in any single kernel.** The remaining ~1.17× decode gap to ollama is distributed across dispatch overhead + sustained-clock effects + the cumulative inefficiency of running fewer-fused kernels than llama.cpp. (Was 1.30× before the 2026-05-02 dispatch-geometry fix and 2026-05-09 QKV defuse; both moved larql closer to its hardware ceiling.)
 
+**Architecture gap to llama.cpp** is documented in [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md): three concrete kernel differences (flash attention, `simdgroup_matrix` prefill matmul, scalar-op RMS-norm pre-fusion) explain the remaining decode gap and the entire 4–14× prefill gap. All three are kernel-research projects (ROADMAP D-ATTN-MTG, D-PREFILL-MM2, D-RMS-FUSE).
+
 **Promotion rule (2026-05-02):** isolated kernel speedups are not promotion
 evidence for decode. Promote only when production-batched GB/s improves AND
 `larql bench --warmup 8 -n 30 --profile` improves with correct output. False

@@ -18,9 +18,9 @@
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
   - `config/{index,quantization,model,compliance,dtype}.rs` — was the
     624-line `types.rs` monolith
-  - Large-file debt is now concentrated in `extract/build.rs` and
-    `format/huggingface/publish.rs`; other former monoliths have been
-    split into focused modules.
+  - Large-file debt is now concentrated in `format/huggingface/publish.rs`,
+    `extract/streaming.rs`, and `format/weights/load.rs`; other former
+    monoliths have been split into focused modules.
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
   one table entry plus codec functions; ~3-file edit. Block sizes flow
   through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS` (round-4 M4).
@@ -84,9 +84,9 @@ The remaining cleanup is concentrated in a few production paths:
 - Lift algorithm parameters into named constants/config structs:
   extraction batch sizes, relation-cluster cap, k-means iterations, and
   HNSW graph construction parameters.
-- Continue large-file decomposition. Priority files: `extract/build.rs`,
+- Continue large-file decomposition. Priority files:
   `format/huggingface/publish.rs`, `extract/streaming.rs`,
-  `format/weights/write_q4k/mod.rs`, `format/weights/load.rs`,
+  `format/weights/load.rs`, `format/weights/write_q4k/mod.rs`,
   `index/core.rs`, and `index/types.rs`.
 - 2026-05-09: `GateIndex` split into narrower capability traits
   (`GateLookup`, `PatchOverrides`, `NativeFfnAccess`,
@@ -402,6 +402,21 @@ Add new layers / features to an existing vindex without full rebuild.
 ---
 
 ## Completed
+
+### 2026-05-09 — extract/build.rs re-split (M8)
+
+The 2026-05-01 M8 entry claimed `extract/build.rs` had been split into
+`build/{mod,down_meta,index_json,resume}.rs`, but that split never reached
+`main` — the file was deleted on d3a8bc6 (no replacement in the same
+commit) and then restored as a single 1,113-line file by 505434d. This
+re-lands the split as actually committed code, plus one production literal
+fix that surfaced during the audit.
+
+| Item | Outcome |
+|------|---------|
+| Re-split `extract/build.rs` | Created `extract/build/{mod,down_meta,index_json,resume}.rs`. `BuildContext` + small stages (gate_vectors, embeddings, clustering, tokenizer) + `build_vindex` + tests live in `mod.rs`; `write_down_meta_and_clusters` in `down_meta.rs`; `write_index_json` in `index_json.rs`; `build_vindex_resume` in `resume.rs`. **371 lib tests pass**, clippy clean. |
+| `.gitignore` exception for Rust `build/` modules | Added `!crates/*/src/**/build/` so the Python-wheel `build/` rule doesn't swallow Rust source modules named `build/`. |
+| `router_weights.bin` literal in `extract/streaming.rs` | Routed through `ROUTER_WEIGHTS_BIN` constant. Last remaining production literal that the 2026-05-08 sweep missed. |
 
 ### 2026-05-08 — vindex quality gate + coverage ratchet
 

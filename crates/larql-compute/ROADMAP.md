@@ -15,8 +15,9 @@ Findings now tracked here so follow-up work does not live only in review notes:
 - [x] Make unsupported CPU MoE dequant formats return a typed error internally
   instead of silently becoming an empty expert vector.
 - [x] Add crate-specific fast and integration test targets:
-  `make larql-compute-test-fast` for inner-loop unit/API checks and
-  `make larql-compute-test-integration` for the heavier integration binaries.
+  `make larql-compute-test-fast` now runs library/unit tests only for the
+  inner loop, while `make larql-compute-test-integration` walks the heavier
+  integration binaries explicitly.
 - [x] Harden cross-platform Metal gates in compute, inference, vindex benches,
   and CLI call sites so non-macOS `--all-features` builds do not import the
   macOS-only `metal::` module.
@@ -39,9 +40,10 @@ Findings now tracked here so follow-up work does not live only in review notes:
   `LayerWeights`, `LayerNorms`, and remote-FFN settings; remaining work is to
   migrate inference/vindex/backend call sites off the flat field bag and then
   make the wrapper private or narrower.
-- [ ] Promote Gemma-style MoE assumptions into an explicit `MoeRoutingPolicy`:
+- [x] Promote Gemma-style MoE assumptions into an explicit `MoeRoutingPolicy`:
   router input source, router norm policy, selected-weight renormalization,
-  per-expert scale policy, and softmax/top-k semantics.
+  per-expert scale policy, post-expert norm policy, softmax/top-k semantics,
+  and expert down-padding layout.
 - [ ] Group `MetalBackend` kernel handles into cohesive registries
   (`AttentionKernels`, `FfnKernels`, `NormKernels`, `QuantKernels`) and pass a
   compact dispatch context into full-pipeline execution instead of large
@@ -354,17 +356,24 @@ without `simdgroup_matrix`.
 | **D-ATTN-MTG** | Multi-TG `attn_fused` retry — preserve 12 TGs while fusing qk_norm_rope + kv_append + attend | 0.2–0.4 ms/tok within the 3.48 ms attention bucket | Open. First attempt regressed −1.45 ms because the merge collapsed TG count 12→8; the multi-TG-per-head variant (split QKV+attend across 2 TGs/head, total ≥12) is untried. ADR-015 § "Lesson — diagnostic order" applies. | `metal/shaders/attn_fused.rs` rewrite; gated on `LARQL_FUSED_ATTN=1` until verified |
 | **D-FFN-PROFILE** | Split `encode_ffn` profiler boundary (gate_up vs activation+down) | Diagnostic, not perf. | **SHIPPED 2026-05-04.** `LARQL_PROFILE_SPLIT=1` + `--profile` bench now shows three separate GPU buckets per step. Measured on Gemma 3 4B (10-token steady state): **attn=3.3ms (34%), gate+up=3.5ms (36%), act+down=2.8ms (29%)** — all three roughly equal thirds. Gate+up is the largest single kernel. See `metal/decode/encode_ffn.rs` (split helpers) + `profile.rs` (GateUp/Down stages) + `bench_cmd.rs` (sub-rows). | `metal/decode/encode_ffn.rs` + `metal/decode/profile.rs` |
 | **D-FFN-FUSE** | Q6_K geglu+down fusion with cheaper-activation variant | ~0.2 ms/tok | **BLOCKED — all-NaN bug with production weights.** Kernel passes unit parity tests (synthetic data, production geometry). On real vindex decode: `down_out` = all 2560 NaN even in a fresh encoder with valid gate/up inputs (max±12). Metal API validation reports no errors. Bug not found by static analysis. Possible cause: interaction between production Q6_K block values and the fused kernel's inner-loop accumulation. Needs Metal shader debugger. Wired behind `LARQL_FUSED_Q6K_DOWN=1` (opt-in, broken). | `metal/shaders/q6k_geglu_down.rs` + `encode_ffn.rs` |
-| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | Was estimated 3–4× prefill speedup. **FALSIFIED twice end-to-end.** | **CLOSED 2026-05-09.** Wiring tried at O-proj (2026-04-28: −10% on long prompts), at FFN gate+up (2026-04-28: 2933 → 3268 ms on 340 tokens), and re-validated FFN gate+up under post-defuse state (2026-05-09: 5–7% regression at 10/50/150-token prompts). Diagnosis: the `q4k_matmul` kernel is bandwidth-bound; the [seq_len × hidden] X working set thrashes GPU L1 on long prompts and the dequant amortisation gain is paid back in DRAM↔L1 traffic. **Closing the prefill gap requires a different matmul kernel** (K-dim tiling, or Apple `simdgroup_matrix` intrinsics) — multi-day kernel research, not wiring. The current `q4k_matmul` shader + `MetalBackend::q4k_matmul` method + parity tests stay shipped for re-validation on future hardware; production prefill stays per-position matvec. | (closed) |
+| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | Was estimated 3–4× prefill speedup. **FALSIFIED twice end-to-end.** | **CLOSED 2026-05-09.** Wiring tried at O-proj (2026-04-28: −10% on long prompts), at FFN gate+up (2026-04-28: 2933 → 3268 ms on 340 tokens), and re-validated FFN gate+up under post-defuse state (2026-05-09: 5–7% regression at 10/50/150-token prompts). Diagnosis: the `q4k_matmul` kernel is bandwidth-bound; the [seq_len × hidden] X working set thrashes GPU L1 on long prompts and the dequant amortisation gain is paid back in DRAM↔L1 traffic. See **D-PREFILL-MM2** below for the kernel-rewrite track. The current `q4k_matmul` shader + `MetalBackend::q4k_matmul` method + parity tests stay shipped for re-validation on future hardware; production prefill stays per-position matvec. | (closed) |
+| **D-PREFILL-MM2** | Rewrite `q4k_matmul` using Apple `simdgroup_matrix` intrinsics (mirrors llama.cpp's `kernel_mul_mm_*`) | Closes the 4–14× prefill gap to ollama (per [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §2). | **Open.** Confirmed via dylib-symbol diff that llama.cpp's prefill matmul uses `simdgroup_matrix` 8×8 register-tile fused-multiply-add — the same hardware feature that's load-bearing for their flash-attn. Our scalar-accumulator `q4k_matmul` can't hold the working set in registers on long prompts. M3 Max satisfies the `MTLGPUFamilyMetal3` device-family check; this is purely a kernel-implementation gap. **Multi-day kernel research project.** | New shader `metal/shaders/q4k_matmul_simdgroup.rs`; gated on `LARQL_PREFILL_MATMUL2=1` until verified; existing `q4k_matmul` retained as fallback |
+| **D-RMS-FUSE** | RMS-norm pre-fusion with surrounding scalar mul/add (mirrors llama.cpp's `kernel_rms_norm_mul_f32` / `kernel_rms_norm_mul_add_f32`) | ~0.1 ms decode | Open. Smaller follow-up. Different fusion direction from the `q4k_q6k_qkv_proj_normed` we defused 2026-05-09 (ADR-016) — that one fused norm into matmul (operand-reread loss); this fuses norm into the *next* scalar op, no operand reread. | New shader; ~half day. See [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §3 |
 
 **Sequencing rationale (updated 2026-05-09)**: D-FFN-PROFILE shipped; data
 shows all three buckets roughly equal thirds (~34/36/29%). Gate+up is the
 largest but already bandwidth-bound at 74% LPDDR5X peak — no headroom left.
 D-FFN-FUSE targets act+down (~0.24 ms from GEGLU dispatch overhead) but is
 blocked by an unexplained production NaN. D-PREFILL-MM is closed (twice-
-falsified). **Only unblocked lever: D-ATTN-MTG** (attention bucket,
-0.2–0.4 ms decode, requires TG-count-preserving multi-TG-per-head fusion).
-~2-day kernel project. Beyond that, closing the remaining prefill gap to
-ollama needs a fundamentally different matmul kernel — out of scope for
+falsified) and superseded by D-PREFILL-MM2. The 2026-05-09 dylib-symbol
+diff against llama.cpp ([llama-cpp-comparison.md](docs/llama-cpp-comparison.md))
+confirms three concrete kernel-architecture gaps: flash attention (covered
+by D-ATTN-MTG), `simdgroup_matrix` prefill matmul (D-PREFILL-MM2), and
+scalar-op RMS-norm pre-fusion (D-RMS-FUSE). **Open levers ordered by
+leverage**: D-PREFILL-MM2 (closes 4–14× prefill gap, biggest end-to-end
+impact for real chat workloads), D-ATTN-MTG (0.2–0.4 ms decode, +5–8 tok/s),
+D-RMS-FUSE (~0.1 ms decode). All three are kernel-research projects, not
+wiring tasks.
 session-bounded work.
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)

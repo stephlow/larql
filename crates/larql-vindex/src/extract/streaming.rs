@@ -364,7 +364,7 @@ pub fn build_vindex_streaming(
     // ── 1b. Router weights (MoE models only) ──
     if is_moe {
         callbacks.on_stage(STAGE_ROUTER_WEIGHTS);
-        let router_path = output_dir.join("router_weights.bin");
+        let router_path = output_dir.join(ROUTER_WEIGHTS_BIN);
         let mut router_file = BufWriter::new(std::fs::File::create(&router_path)?);
 
         for layer in 0..num_layers {

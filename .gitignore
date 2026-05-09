@@ -14,6 +14,8 @@ __pycache__/
 dist/
 build/
 *.whl
+# Don't ignore Rust source modules named `build/`
+!crates/*/src/**/build/
 
 # IDE
 .idea/

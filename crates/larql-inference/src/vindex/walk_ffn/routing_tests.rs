@@ -16,7 +16,9 @@
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Mutex;
 
-use larql_vindex::{FeatureMeta, GateIndex};
+use larql_vindex::{
+    FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,
+};
 
 use super::{DispatchEntry, WalkFfn};
 
@@ -56,7 +58,7 @@ impl MockIndex {
     }
 }
 
-impl GateIndex for MockIndex {
+impl GateLookup for MockIndex {
     fn gate_knn(&self, _layer: usize, _residual: &Array1<f32>, _top_k: usize) -> Vec<(usize, f32)> {
         vec![]
     }
@@ -67,10 +69,18 @@ impl GateIndex for MockIndex {
         self.num_features
     }
 
+    fn gate_knn_batch(&self, _l: usize, _x: &Array2<f32>, _k: usize) -> Vec<usize> {
+        vec![]
+    }
+}
+
+impl PatchOverrides for MockIndex {
     fn has_overrides_at(&self, _layer: usize) -> bool {
         self.has_overrides
     }
+}
 
+impl Fp4FfnAccess for MockIndex {
     fn has_fp4_storage(&self) -> bool {
         self.has_fp4
     }
@@ -91,7 +101,9 @@ impl GateIndex for MockIndex {
     ) -> bool {
         self.has_fp4
     }
+}
 
+impl QuantizedFfnAccess for MockIndex {
     fn has_interleaved_q4(&self) -> bool {
         self.has_q4_interleaved
     }
@@ -101,6 +113,12 @@ impl GateIndex for MockIndex {
         None
     }
 
+    fn has_interleaved_q4k(&self) -> bool {
+        self.has_q4k
+    }
+}
+
+impl NativeFfnAccess for MockIndex {
     fn has_interleaved(&self) -> bool {
         self.has_interleaved
     }
@@ -124,19 +142,11 @@ impl GateIndex for MockIndex {
         self.native_down.as_ref().map(|m| m.view())
     }
 
-    fn has_interleaved_q4k(&self) -> bool {
-        self.has_q4k
-    }
-
     fn has_down_features(&self) -> bool {
         self.has_down_features
     }
     fn down_feature_vector(&self, _l: usize, _f: usize) -> Option<&[f32]> {
         None
-    }
-
-    fn gate_knn_batch(&self, _l: usize, _x: &Array2<f32>, _k: usize) -> Vec<usize> {
-        vec![]
     }
 }
 
