@@ -323,6 +323,21 @@ bench-routing:
 bench-grid:
 	./scripts/bench-grid-regress.sh $(MODEL)
 
+# Cross-architecture decode bench — runs `larql bench` on Gemma 3 4B,
+# Gemma 4 31B dense, Llama 2 7B, Mistral 7B, Gemma 4 26B A4B in
+# sequence and prints per-arch tok/s. Operationalises ADR-017
+# model-agnosticity check: any A/B promoted on Gemma 3 4B alone should
+# be re-bench'd here before landing. Also surfaces thermal artifacts:
+# if every arch regresses simultaneously vs baseline, suspect thermal.
+#
+#   make bench-cross-arch                     # report current numbers
+#   make bench-cross-arch ARGS=--save-baseline  # save current as baseline
+#   make bench-cross-arch ARGS=--compare        # diff vs saved baseline
+#
+# Bench params via env: LARQL_BENCH_TOKENS, LARQL_BENCH_WARMUP, LARQL_BENCH_PROMPT.
+bench-cross-arch:
+	./scripts/bench-cross-arch.sh $(ARGS)
+
 bench-all: bench-core bench-inference bench-compute bench-wire bench-routing
 
 # Vindex micro-benches — synthetic, fast, safe under load.

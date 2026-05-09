@@ -64,6 +64,7 @@ impl MetalBackend {
         bufs: QkvBufs<'_>,
         dims: QkvDims,
         uses_q4k: bool,
+        input_already_normed: bool,
     ) {
         if uses_q4k {
             // Default path (since 2026-05-09): separate `rms_norm` dispatch
@@ -83,12 +84,24 @@ impl MetalBackend {
                 && layer.norm_type == crate::NormType::RmsNorm
                 && layer.input_norm_bias.is_none()
             {
+                // Fused norm+QKV path always recomputes norm internally;
+                // `input_already_normed` is ignored here.
                 self.encode_normed_q4k_q6k_qkv(enc, layer, &bufs, dims);
             } else {
-                self.encode_q4k_input_norm(enc, layer, &bufs, dims);
+                // D-RMS-FUSE Phase 1: the previous layer's
+                // `encode_post_ffn_residual` may have pre-written
+                // `bufs.norm_out` via `residual_norm_store` using THIS
+                // layer's input_norm weight. When `input_already_normed`
+                // is true, skip the redundant rms_norm dispatch.
+                if !input_already_normed {
+                    self.encode_q4k_input_norm(enc, layer, &bufs, dims);
+                }
                 self.encode_q4k_qkv(enc, layer, &bufs, dims);
             }
         } else {
+            // D-RMS-FUSE Phase 1 doesn't apply to the Q4_0 path yet —
+            // run the standard norm+qkv chain.
+            let _ = input_already_normed;
             self.encode_q4_0_norm_and_qkv(enc, layer, &bufs, dims);
         }
     }

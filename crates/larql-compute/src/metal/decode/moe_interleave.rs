@@ -126,6 +126,8 @@ impl MetalBackend {
             );
 
             // Always unfused here: this preserves the previous split-MoE path.
+            // D-RMS-FUSE Phase 1 not applied: split-MoE path commits per-layer
+            // boundaries that don't match the cross-layer fusion pattern.
             self.encode_post_ffn_residual(
                 ffn_enc,
                 layer,
@@ -137,6 +139,7 @@ impl MetalBackend {
                 },
                 ctx.hidden,
                 false,
+                None,
             );
             ffn_enc.end_encoding();
             state.cmd.commit();

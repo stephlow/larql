@@ -47,12 +47,12 @@ Work items:
 | H4 | Stop discarding `EosConfig` in constrained generation and CPU fallbacks; use caller-supplied EOS IDs and stop strings instead of only `vindex::is_end_of_turn` | shipped 2026-05-09 |
 | H5 | Convert `optimise_target_delta` invalid inputs (`target_id >= vocab`, empty prompt, unsupported shapes) from panics into early `Err` results | shipped 2026-05-09 |
 | H6 | Harden remote FFN/Q8K wire decoders against untrusted length fields with checked arithmetic and bounded allocation | shipped 2026-05-09 |
-| H7 | Replace ad hoc `Result<_, String>` / silent empty `GenerateResult` failures in generation paths with typed errors where public callers need to distinguish unsupported backend vs. empty output | partial 2026-05-09 — `GenerateResult.error` added; typed enum still planned |
-| H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | planned |
-| H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | planned |
+| H7 | Replace ad hoc `Result<_, String>` / silent empty `GenerateResult` failures in generation paths with typed errors where public callers need to distinguish unsupported backend vs. empty output | shipped 2026-05-09 — `GenerateError` variants added with fallible `try_generate*` wrappers |
+| H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | partial 2026-05-09 — generation/grid token, profiling, LM-head, and MoE runtime env reads now route through typed policy/config structs |
+| H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | partial 2026-05-09 — added explicit `prelude` and `research` grouped surfaces; crate-root compatibility retained |
 | H10 | Remove backend-name probes and concrete `MetalBackend` downcasts from generic generation dispatch; replace with explicit compute-backend capability methods | shipped 2026-05-09 for generation dispatch |
 | H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | partial 2026-05-09 — token suppression moved to generation policy; PLE tensor keys moved to architecture trait; chat default policy isolated |
-| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial 2026-05-09 — token selection policy extracted |
+| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial 2026-05-09 — token selection policy, GPU setup/prefill helpers, constrained generation, and grid config/timing/setup/remote-MoE/remote-FFN modules extracted |
 
 Acceptance:
 

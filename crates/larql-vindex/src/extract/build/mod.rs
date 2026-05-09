@@ -1,8 +1,10 @@
 //! Build a .vindex from model weights — the extraction/clustering pipeline.
 //!
-//! Two entry points: `build_vindex` (full pipeline from weights) and
-//! `build_vindex_resume` (skip the heavy stages, rebuild clustering +
-//! tokenizer + index.json from existing partial output).
+//! Single entry point: `build_vindex` (full pipeline from weights). For
+//! mid-run resume, see the streaming pipeline's checkpoint mechanism in
+//! `extract::streaming` — the older `build_vindex_resume` path was
+//! removed 2026-05-09 (it read the legacy `down_meta.jsonl` format that
+//! nothing produces any more).
 //!
 //! `build_vindex` is structured around a `BuildContext` that holds the
 //! shared inputs + accumulator state across the stages:
@@ -14,15 +16,11 @@
 //!   5. `write_tokenizer`
 //!   6. `write_index_json`              — config + provenance + checksums
 //!
-//! Stage 3 lives in [`down_meta`], stage 6 in [`index_json`], and the
-//! resume-only entry point in [`resume`]. Discrete helpers live in
-//! `super::build_helpers`.
+//! Stage 3 lives in [`down_meta`], stage 6 in [`index_json`].
+//! Discrete helpers live in `super::build_helpers`.
 
 mod down_meta;
 mod index_json;
-mod resume;
-
-pub use resume::build_vindex_resume;
 
 use crate::extract::stage_labels::*;
 use std::io::BufWriter;

@@ -3,22 +3,18 @@
 use super::detok::Detokenizer;
 use super::eos::EosConfig;
 use super::sampling::{Sampler, SamplingConfig};
-use super::types::{GenerateResult, StageTimings};
-use crate::layer_graph::pipeline_layer::{
-    attention_geometry_for_arch_layer, kv_cache_shapes_for_arch, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
-};
+use super::types::{GenerateError, GenerateResult, StageTimings};
+use crate::layer_graph::pipeline_layer::attention_geometry_for_arch_layer;
 use crate::layer_graph::CachedLayerGraph;
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
-use super::cpu::{
-    backend_supports_fused_q4_pipeline, generate_constrained_via_cpu_q4k,
-    generate_constrained_via_cpu_q4k_streaming_sampled, generate_via_cpu_q4k,
+use super::cpu::{backend_supports_fused_q4_pipeline, generate_via_cpu_q4k};
+use super::gpu_setup::{
+    build_gpu_decode_setup, ensure_prompt_fits, prefill_q4_prompt, reset_and_preallocate_kv_cache,
 };
-use super::lm_head::{
-    backend_lm_head_scores, cpu_lm_head_topk, lm_head_topk, pick_next_token_masked,
-    pick_next_token_masked_sampled,
-};
+use super::lm_head::{cpu_lm_head_topk, lm_head_topk_with_policy};
+use super::policy::GenerationRuntimeConfig;
 
 /// LM-head top-K size when running greedy decode. Matches the historical
 /// behaviour preserved by [`generate`].
@@ -122,33 +118,25 @@ where
     let attention = attention_geometry_for_arch_layer(weights, 0);
 
     let prefill_start = std::time::Instant::now();
-    backend.reset_kv_cache();
-    {
-        let kv_shapes = kv_cache_shapes_for_arch(weights);
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
-    }
+    reset_and_preallocate_kv_cache(weights, backend);
 
     let h_embed = crate::forward::embed_tokens_pub(weights, &[first_token]);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
     let softcap_val = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm_val = weights.arch.attn_q_norm_key(0).is_some();
-    let h_vec = backend
-        .prefill_q4(
-            &layers,
-            &x,
-            hidden,
-            intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            1,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
-            qk_norm_val,
-            softcap_val,
-        )
-        .ok_or_else(|| "Q4 prefill failed".to_string())?;
+    let h_vec = prefill_q4_prompt(
+        backend,
+        &layers,
+        &x,
+        hidden,
+        intermediate,
+        attention,
+        1,
+        qk_norm_val,
+        softcap_val,
+        "Q4 prefill failed",
+    )
+    .map_err(|err| err.to_string())?;
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let mut h_1d = final_norm_row(weights, &h_vec, hidden, norm_offset)?;
 
@@ -277,6 +265,31 @@ pub fn generate(
     )
 }
 
+/// Fallible variant of [`generate`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+) -> Result<GenerateResult, GenerateError> {
+    generate(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+    )
+    .into_result()
+}
+
 /// Multi-token generation with explicit sampling and EOS configuration.
 /// Identical to [`generate_streaming`] but with no per-token callback.
 #[allow(clippy::too_many_arguments)]
@@ -305,6 +318,35 @@ pub fn generate_with_sampling(
         eos,
         |_, _, _| {},
     )
+}
+
+/// Fallible variant of [`generate_with_sampling`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_with_sampling(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> Result<GenerateResult, GenerateError> {
+    generate_with_sampling(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        sampling,
+        eos,
+    )
+    .into_result()
 }
 
 /// Streaming multi-token generation. Fires `on_token(id, text, prob)` for
@@ -347,13 +389,7 @@ where
     F: FnMut(u32, &str, f64),
 {
     if max_tokens == 0 {
-        return GenerateResult {
-            tokens: Vec::new(),
-            prefill_ms: 0.0,
-            decode_ms: Vec::new(),
-            stage_timings: StageTimings::default(),
-            error: None,
-        };
+        return GenerateResult::empty_success();
     }
 
     // Backends that don't implement the fused Q4 prefill (today: CpuBackend)
@@ -374,75 +410,32 @@ where
         return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index, eos);
     }
 
-    let norm_offset = weights.arch.norm_weight_offset();
     let arch = &*weights.arch;
-    let hidden = weights.hidden_size;
-    let gate_index: &dyn larql_vindex::GateIndex = index;
-
-    // Build layer descriptors
-    let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
-        (Some(mmap), true)
-    } else {
-        (gate_index.interleaved_q4_mmap_ref(), false)
+    let norm_offset = arch.norm_weight_offset();
+    let setup = match build_gpu_decode_setup(weights, index, backend, layer_range, false) {
+        Ok(setup) => setup,
+        Err(err) => {
+            let _ = cached_layers;
+            return GenerateResult::empty_error(err);
+        }
     };
-    let has_q4k = index.attn_q4k_layer_data(layer_range.start).is_some();
-    let has_q8 = index.attn_q8_layer_data(layer_range.start).is_some();
-
-    if !backend.has_q4() || q4_ffn.is_none() {
-        let _ = (tokenizer, cached_layers, layer_range);
-        return GenerateResult::empty_error(
-            "GPU generation requires backend Q4 support and interleaved Q4 FFN weights",
-        );
-    }
-
-    let q4_ffn_mmap = q4_ffn.unwrap();
-    let intermediate = gate_index.num_features(layer_range.start);
-    if intermediate == 0 || (!has_q4k && !has_q8) {
-        let _ = cached_layers;
-        return GenerateResult::empty_error(
-            "GPU generation requires non-empty FFN features and Q4/Q8 attention weights",
-        );
-    }
-
-    let ffn_format = if ffn_is_q4k {
-        larql_compute::QuantFormat::Q4_K
-    } else {
-        larql_compute::QuantFormat::Q4_0
-    };
-    let q4_ffn_per_matrix = ffn_format
-        .packed_matrix_bytes(intermediate, hidden)
-        .expect("Q4 interleaved FFN format must have packed geometry");
-
-    let num_layers = weights.num_layers;
-    let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
-        weights,
-        index,
-        0..num_layers,
-        q4_ffn_mmap,
-        q4_ffn_per_matrix,
-        ffn_format,
-    );
-
-    let attention = attention_geometry_for_arch_layer(weights, layer_range.start);
+    let layers = setup.layers;
+    let attention = setup.attention;
+    let hidden = setup.hidden;
+    let intermediate = setup.intermediate;
 
     // ── Phase 1: GPU prefill ──
     let prefill_start = std::time::Instant::now();
     let seq_len = token_ids.len();
-    if seq_len > DEFAULT_GPU_KV_CACHE_MAX_SEQ {
-        return GenerateResult::empty_error(format!(
-            "prompt length {seq_len} exceeds GPU KV cache capacity {DEFAULT_GPU_KV_CACHE_MAX_SEQ}"
-        ));
+    if let Err(err) = ensure_prompt_fits(seq_len) {
+        return GenerateResult::empty_error(err);
     }
-    backend.reset_kv_cache();
 
     // Pre-allocate per-layer KV cache for models with asymmetric attention geometry
     // (e.g. Gemma 4 26B: sliding layers use 8×256, global layers use 2×512).
     // Without this, the lazy uniform allocation uses the first layer's dims for all layers,
     // causing global layers to read/write off the end of under-sized KV buffers.
-    {
-        let kv_shapes = kv_cache_shapes_for_arch(weights);
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
-    }
+    reset_and_preallocate_kv_cache(weights, backend);
 
     let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
@@ -456,9 +449,9 @@ where
     // KV cache identically to the batched prefill.
     let h_vec = if weights.has_per_layer_ffn() {
         if !backend.supports(Capability::DecodeQ4KMoe) {
-            return GenerateResult::empty_error(
+            return GenerateResult::empty_error(GenerateError::unsupported_backend(
                 "per-layer Q4K expert generation requires backend Q4K MoE decode support",
-            );
+            ));
         }
         let norm_eps = weights.arch.norm_eps();
         let mut last_h = vec![0.0f32; hidden];
@@ -488,30 +481,27 @@ where
         out[(seq_len - 1) * hidden..].copy_from_slice(&last_h);
         out
     } else {
-        match backend.prefill_q4(
+        match prefill_q4_prompt(
+            backend,
             &layers,
             &x,
             hidden,
             intermediate,
-            attention.q_dim,
-            attention.kv_dim,
+            attention,
             seq_len,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
             qk_norm_val,
             softcap_val,
+            "GPU Q4 prefill returned no output",
         ) {
-            Some(v) => v,
-            None => return GenerateResult::empty_error("GPU Q4 prefill returned no output"),
+            Ok(v) => v,
+            Err(err) => return GenerateResult::empty_error(err),
         }
     };
 
     let h_metal = ndarray::Array2::from_shape_vec((seq_len, hidden), h_vec.clone())
         .unwrap_or_else(|_| h_embed.clone());
 
-    let compare = std::env::var("LARQL_METAL_COMPARE_CPU").is_ok();
+    let runtime = GenerationRuntimeConfig::from_env();
 
     let h = h_metal;
     let h_1d = {
@@ -525,7 +515,7 @@ where
     // the top-5 predicted tokens against the Metal path. Purpose: isolate
     // whether wrong-token output is from the compute path or from the
     // lm_head / logits-sampling layer.
-    if compare {
+    if runtime.compare_cpu {
         let metal_hits_vindex = index.lm_head_knn_backend(&h_1d, 5, backend);
         let metal_hits_cpu_lm = cpu_lm_head_topk(weights, &h_1d, 5);
         let as_toks = |hits: &[(u32, f32)]| -> Vec<String> {
@@ -576,7 +566,8 @@ where
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
 
     let knn_k = lmhead_k_for_sampling(&sampling);
-    let first_hits = lm_head_topk(index, weights, &h_1d, knn_k, backend);
+    let first_hits =
+        lm_head_topk_with_policy(index, weights, &h_1d, knn_k, backend, &runtime.lm_head);
     let first_pick = sampler.sample_from_topk_with_history(&first_hits, &generated_ids);
     if let Some(picked_id) = first_pick {
         // Detokenizer.push emits the cumulative-decode delta — handles HF
@@ -614,8 +605,8 @@ where
     // Per-stage decode profiling. Set LARQL_PROFILE_DECODE=1 to log a
     // one-line per-step breakdown of embed / GPU forward / final norm /
     // lm_head / detokenize, plus a summary at the end.
-    let profile = std::env::var("LARQL_PROFILE_DECODE").is_ok();
-    let profile_split = std::env::var("LARQL_PROFILE_SPLIT").is_ok();
+    let profile = runtime.profile_decode;
+    let profile_split = runtime.profile_split;
     let mut t_embed = 0.0f64;
     let mut t_gpu = 0.0f64;
     let mut t_gate_up = 0.0f64;
@@ -754,7 +745,8 @@ where
             let norm_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
             let t3 = std::time::Instant::now();
-            let hits = lm_head_topk(index, weights, &h_1d, knn_k, backend);
+            let hits =
+                lm_head_topk_with_policy(index, weights, &h_1d, knn_k, backend, &runtime.lm_head);
             let lmhead_ms = t3.elapsed().as_secs_f64() * 1000.0;
             if profile && _step <= 2 {
                 let h_nan = h_1d.iter().filter(|v| v.is_nan()).count();
@@ -872,24 +864,9 @@ where
     }
 }
 
-/// Constrained variant of [`generate`] for grammar-controlled decoding.
-///
-/// Differs from `generate` in two places only:
-///
-///   1. The LM-head step uses a **dense** vocabulary score vector
-///      ([`backend_lm_head_scores`]) rather than the sparse vindex KNN.
-///      Required because an arbitrary mask can disqualify tokens that
-///      would otherwise have fallen outside the top-K.
-///   2. After scoring, `mask_fn(generated_ids, &mut logits)` runs and the
-///      next token is the masked argmax.
-///
-/// Per-token cost is slightly higher than unconstrained `generate` (full
-/// 2.68 GB tied LM-head gemv vs. KNN over the 5-NN partial), but on Metal
-/// it's still ~3-5 ms — acceptable for grammar-constrained dispatch.
-///
-/// Stops on EOS / common end-of-turn markers or when `max_tokens` is hit.
+/// Fallible variant of [`generate_streaming`].
 #[allow(clippy::too_many_arguments)]
-pub fn generate_constrained<M>(
+pub fn try_generate_streaming<F>(
     weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
@@ -898,326 +875,25 @@ pub fn generate_constrained<M>(
     backend: &dyn ComputeBackend,
     cached_layers: &CachedLayerGraph,
     layer_range: std::ops::Range<usize>,
-    mask_fn: M,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-{
-    generate_constrained_streaming(
-        weights,
-        tokenizer,
-        token_ids,
-        max_tokens,
-        index,
-        backend,
-        cached_layers,
-        layer_range,
-        mask_fn,
-        |_, _, _| {},
-    )
-}
-
-/// Streaming variant of [`generate_constrained`] — fires
-/// `on_token(id, text, prob)` after each masked-argmax pick so SSE
-/// callers can flush JSON / structured-output chunks as they're
-/// produced. Greedy under the mask; for sampling under mask see
-/// [`generate_constrained_streaming_sampled`].
-#[allow(clippy::too_many_arguments)]
-pub fn generate_constrained_streaming<M, F>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    backend: &dyn ComputeBackend,
-    cached_layers: &CachedLayerGraph,
-    layer_range: std::ops::Range<usize>,
-    mask_fn: M,
-    on_token: F,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-    F: FnMut(u32, &str, f64),
-{
-    generate_constrained_streaming_sampled(
-        weights,
-        tokenizer,
-        token_ids,
-        max_tokens,
-        index,
-        backend,
-        cached_layers,
-        layer_range,
-        mask_fn,
-        on_token,
-        SamplingConfig::greedy(),
-        &EosConfig::builtin(),
-    )
-}
-
-/// Streaming + sampling-aware constrained decode. Drives token
-/// selection through the supplied [`SamplingConfig`] (temperature,
-/// top_p, top_k, seed, repetition penalties) over the *masked* logits.
-/// Pass `SamplingConfig::greedy()` for the existing argmax behaviour
-/// (which is what most JSON / tools modes want today).
-///
-/// `eos` is consulted on top of the built-in end-of-turn detection so
-/// the caller can extend the stop set with user-supplied stop strings.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_constrained_streaming_sampled<M, F>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    backend: &dyn ComputeBackend,
-    cached_layers: &CachedLayerGraph,
-    layer_range: std::ops::Range<usize>,
-    mut mask_fn: M,
-    mut on_token: F,
     sampling: SamplingConfig,
     eos: &EosConfig,
-) -> GenerateResult
+    on_token: F,
+) -> Result<GenerateResult, GenerateError>
 where
-    M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
-    if max_tokens == 0 {
-        return GenerateResult {
-            tokens: Vec::new(),
-            prefill_ms: 0.0,
-            decode_ms: Vec::new(),
-            stage_timings: StageTimings::default(),
-            error: None,
-        };
-    }
-
-    let mut sampler = Sampler::new(sampling);
-    // Same PLE delegation as `generate_streaming` — the Metal pipeline
-    // doesn't implement Gemma 4 E2B's per-layer-input gate.
-    let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
-    if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
-        return generate_constrained_via_cpu_q4k_streaming_sampled(
-            weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling, eos,
-        );
-    }
-
-    let arch = &*weights.arch;
-    let norm_offset = arch.norm_weight_offset();
-    let hidden = weights.hidden_size;
-    let gate_index: &dyn larql_vindex::GateIndex = index;
-
-    let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
-        (Some(mmap), true)
-    } else {
-        (gate_index.interleaved_q4_mmap_ref(), false)
-    };
-    let has_q4k = index.attn_q4k_layer_data(layer_range.start).is_some();
-    let has_q8 = index.attn_q8_layer_data(layer_range.start).is_some();
-
-    // Constrained mode requires the GPU prefill + Q4 path to be available.
-    if !backend.has_q4() || q4_ffn.is_none() {
-        let _ = (tokenizer, cached_layers, layer_range);
-        return GenerateResult::empty_error(
-            "constrained GPU generation requires backend Q4 support and interleaved Q4 FFN weights",
-        );
-    }
-    let q4_ffn_mmap = q4_ffn.unwrap();
-    let intermediate = gate_index.num_features(layer_range.start);
-    if intermediate == 0 || (!has_q4k && !has_q8) {
-        let _ = cached_layers;
-        return GenerateResult::empty_error(
-            "constrained GPU generation requires non-empty FFN features and Q4/Q8 attention weights",
-        );
-    }
-
-    let ffn_format = if ffn_is_q4k {
-        larql_compute::QuantFormat::Q4_K
-    } else {
-        larql_compute::QuantFormat::Q4_0
-    };
-    let q4_ffn_per_matrix = ffn_format
-        .packed_matrix_bytes(intermediate, hidden)
-        .expect("Q4 interleaved FFN format must have packed geometry");
-
-    let num_layers = weights.num_layers;
-    let layers = crate::layer_graph::pipeline_layer::build_pipeline_layers(
+    generate_streaming(
         weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
         index,
-        0..num_layers,
-        q4_ffn_mmap,
-        q4_ffn_per_matrix,
-        ffn_format,
-    );
-
-    let attention = attention_geometry_for_arch_layer(weights, layer_range.start);
-
-    // ── Phase 1: GPU prefill ──
-    let prefill_start = std::time::Instant::now();
-    let seq_len = token_ids.len();
-    if seq_len > DEFAULT_GPU_KV_CACHE_MAX_SEQ {
-        return GenerateResult::empty_error(format!(
-            "prompt length {seq_len} exceeds GPU KV cache capacity {DEFAULT_GPU_KV_CACHE_MAX_SEQ}"
-        ));
-    }
-    backend.reset_kv_cache();
-    {
-        let kv_shapes = kv_cache_shapes_for_arch(weights);
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
-    }
-    let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
-    let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
-    let softcap_val = arch.attn_logit_softcapping().unwrap_or(0.0);
-    let qk_norm_val = arch.attn_q_norm_key(0).is_some();
-
-    // Constrained-path prefill: CPU-only backends delegate at the top of the
-    // function, so `prefill_q4` should succeed. If it returns None, bail out
-    // with no tokens rather than taking the removed dense-tensor panic path.
-    let h_vec = match backend.prefill_q4(
-        &layers,
-        &x,
-        hidden,
-        intermediate,
-        attention.q_dim,
-        attention.kv_dim,
-        seq_len,
-        attention.num_q_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
-        attention.rope_base,
-        qk_norm_val,
-        softcap_val,
-    ) {
-        Some(v) => v,
-        None => {
-            return GenerateResult::empty_error("constrained GPU Q4 prefill returned no output");
-        }
-    };
-
-    let h_metal = ndarray::Array2::from_shape_vec((seq_len, hidden), h_vec.clone())
-        .unwrap_or_else(|_| h_embed.clone());
-    let h_1d = {
-        let h_final = crate::forward::apply_norm(
-            weights,
-            &h_metal,
-            weights.arch.final_norm_key(),
-            norm_offset,
-        );
-        h_final.row(seq_len - 1).to_owned()
-    };
-    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-
-    // ── First token: dense LM-head + mask + argmax ──
-    let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
-    let mut decode_ms = Vec::with_capacity(max_tokens);
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    let first = pick_next_token_masked_sampled(
-        weights,
-        &h_1d,
-        &generated,
         backend,
-        &mut mask_fn,
-        &mut sampler,
-    );
-    let mut current_token_id = match first {
-        Some((tid, _)) => {
-            let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
-            let is_eos = eos.is_eos_with_tokenizer(tid, &tok_str, tokenizer);
-            on_token(tid, &tok_str, 1.0);
-            tokens.push((tok_str, 1.0));
-            generated.push(tid);
-            if is_eos {
-                return GenerateResult {
-                    tokens,
-                    prefill_ms,
-                    decode_ms,
-                    stage_timings: StageTimings::default(),
-                    error: None,
-                };
-            }
-            tid
-        }
-        None => {
-            return GenerateResult {
-                tokens,
-                prefill_ms,
-                decode_ms,
-                stage_timings: StageTimings::default(),
-                error: Some(
-                    "constrained generation mask rejected every first-token candidate".to_string(),
-                ),
-            }
-        }
-    };
-
-    // ── Phase 2: GPU decode loop ──
-    for _step in 1..max_tokens {
-        let decode_start = std::time::Instant::now();
-
-        let h_tok = crate::forward::embed_tokens_pub(weights, &[current_token_id]);
-        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
-
-        let result = backend.decode_token(
-            &layers,
-            &x_dec,
-            hidden,
-            intermediate,
-            attention.q_dim,
-            attention.kv_dim,
-            attention.num_q_heads,
-            attention.num_kv_heads,
-            attention.head_dim,
-            attention.rope_base,
-        );
-
-        let h_1d = if let Some(h_out) = result {
-            let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_out).unwrap();
-            let h_final = crate::forward::apply_norm(
-                weights,
-                &h_arr,
-                weights.arch.final_norm_key(),
-                norm_offset,
-            );
-            h_final.row(0).to_owned()
-        } else {
-            // GPU returned None mid-decode. Stop rather than re-run a long
-            // O(N²) CPU Q4K path (CPU-only backends already delegate at the
-            // top of the function, so this is reachable only via a GPU fault).
-            break;
-        };
-
-        let pick = pick_next_token_masked_sampled(
-            weights,
-            &h_1d,
-            &generated,
-            backend,
-            &mut mask_fn,
-            &mut sampler,
-        );
-        decode_ms.push(decode_start.elapsed().as_secs_f64() * 1000.0);
-
-        match pick {
-            Some((tid, _)) => {
-                let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
-                let is_eos = eos.is_eos_with_tokenizer(tid, &tok_str, tokenizer);
-                on_token(tid, &tok_str, 1.0);
-                tokens.push((tok_str, 1.0));
-                generated.push(tid);
-                current_token_id = tid;
-                if is_eos {
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-
-    GenerateResult {
-        tokens,
-        prefill_ms,
-        decode_ms,
-        stage_timings: StageTimings::default(),
-        error: None,
-    }
+        cached_layers,
+        layer_range,
+        sampling,
+        eos,
+        on_token,
+    )
+    .into_result()
 }

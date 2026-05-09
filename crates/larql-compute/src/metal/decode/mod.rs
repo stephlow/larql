@@ -276,6 +276,15 @@ impl MetalBackend {
             let layer_q_dim = layer_num_q_heads * layer_head_dim;
             let layer_kv_dim = layer_num_kv_heads * layer_head_dim;
 
+            // D-RMS-FUSE Phase 1: skip the input rms_norm dispatch when
+            // `LARQL_FUSED_PRELAYER_NORM=1` AND we're not the first layer
+            // AND the previous layer's `encode_post_ffn_residual` wrote
+            // the pre-normalized data into `norm_f32_buf` via
+            // `residual_norm_store` (only on the non-post-norms path).
+            let prelayer_norm_active = l > 0
+                && !layers[l - 1].has_post_norms
+                && crate::options::env_opt_in(crate::options::ENV_FUSED_PRELAYER_NORM);
+
             // ── Step 1: Input norm + Q/K/V projection ──
             // Format-aware: Q4_K family routes through fused QKV
             // shaders (uniform / mixed Q4K+Q6K-V / per-projection
@@ -309,6 +318,7 @@ impl MetalBackend {
                     norm_offset,
                 },
                 uses_q4k,
+                prelayer_norm_active,
             );
 
             // ── Steps 1.5–5: attention block ──
@@ -407,6 +417,25 @@ impl MetalBackend {
                     normed_scratch: &normed_scratch,
                 };
 
+                // D-RMS-FUSE Phase 1: when env var on AND non-Gemma path
+                // (no post_norms) AND there's a next layer, hand the next
+                // layer's input_norm weight + the shared norm_f32_buf to
+                // `encode_post_ffn_residual` so it can fuse the residual
+                // add with the next layer's input rms_norm in one
+                // `residual_norm_store` dispatch. Saves 1 dispatch/layer.
+                let next_layer = layers.get(l + 1);
+                let prelayer_fusion = if !layer.has_post_norms
+                    && next_layer.is_some()
+                    && crate::options::env_opt_in(crate::options::ENV_FUSED_PRELAYER_NORM)
+                {
+                    Some(super::decode::encode_post_ffn::PreLayerNormFusion {
+                        next_input_norm: next_layer.unwrap().input_norm,
+                        next_norm_out: &norm_f32_buf,
+                    })
+                } else {
+                    None
+                };
+
                 if stage_timing_split && !has_moe {
                     // Fine split: gate+up in one CB, act+down+residual in another.
                     // Step 6a: gate+up
@@ -425,6 +454,7 @@ impl MetalBackend {
                         post_ffn_bufs,
                         hidden,
                         use_fused_post_ffn,
+                        prelayer_fusion.as_ref(),
                     );
                     enc.end_encoding();
                     cmd.commit();
@@ -442,6 +472,7 @@ impl MetalBackend {
                         post_ffn_bufs,
                         hidden,
                         use_fused_post_ffn,
+                        prelayer_fusion.as_ref(),
                     );
                 }
             }

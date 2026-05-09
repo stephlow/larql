@@ -6,10 +6,12 @@
 //! - [`sampling`]: greedy / temperature / top-k / top-p sampler.
 
 pub mod chat_session;
+mod constrained;
 mod cpu;
 pub mod detok;
 pub mod eos;
 mod gpu;
+mod gpu_setup;
 mod lm_head;
 pub(crate) mod policy;
 pub mod sampling;
@@ -18,16 +20,20 @@ mod types;
 pub use chat_session::{
     ChatMLRenderer, ChatSession, GemmaRenderer, Llama3Renderer, TurnRenderer, DEFAULT_MAX_CONTEXT,
 };
+pub use constrained::{
+    generate_constrained, generate_constrained_streaming, generate_constrained_streaming_sampled,
+    try_generate_constrained, try_generate_constrained_streaming,
+    try_generate_constrained_streaming_sampled,
+};
 pub use detok::Detokenizer;
 pub use eos::{EosConfig, BUILTIN_STOP_STRINGS, GENERATION_CONFIG_FILENAME};
 pub use gpu::{
-    generate, generate_constrained, generate_constrained_streaming,
-    generate_constrained_streaming_sampled, generate_streaming, generate_with_sampling,
-    stream_forced_full_logits, ForcedLogitsResult,
+    generate, generate_streaming, generate_with_sampling, stream_forced_full_logits, try_generate,
+    try_generate_streaming, try_generate_with_sampling, ForcedLogitsResult,
 };
 pub use lm_head::lm_head_topk;
 pub use sampling::{Sampler, SamplingConfig};
-pub use types::{GenerateResult, StageTimings};
+pub use types::{GenerateError, GenerateResult, StageTimings};
 
 #[cfg(test)]
 mod tests {

@@ -111,3 +111,34 @@ pub fn encode_v_norm(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tg_width` rounds up to a power of two, capped at 512.
+    /// Production head_dims (256 / 512 in Gemma 3 / 4) hit the 512 cap on
+    /// global layers; sliding layers hit 256. Powers of 2 stay exact.
+    #[test]
+    fn tg_width_rounds_up_to_power_of_two() {
+        assert_eq!(tg_width(1), 1);
+        assert_eq!(tg_width(2), 2);
+        assert_eq!(tg_width(3), 4);
+        assert_eq!(tg_width(64), 64);
+        assert_eq!(tg_width(65), 128);
+        assert_eq!(tg_width(128), 128);
+        assert_eq!(tg_width(256), 256); // Gemma 3 sliding head_dim
+        assert_eq!(tg_width(512), 512); // Gemma 4 global head_dim
+    }
+
+    /// Cap at 512 for head_dims larger than the shader supports. The
+    /// kernel uses cooperative simdgroup reduction with a 512-thread
+    /// upper bound; bigger head_dims would have to split across multiple
+    /// dispatches (no current model needs it).
+    #[test]
+    fn tg_width_caps_at_512() {
+        assert_eq!(tg_width(513), 512);
+        assert_eq!(tg_width(1024), 512);
+        assert_eq!(tg_width(8192), 512);
+    }
+}

@@ -31,6 +31,19 @@ pub(super) struct PostFfnBufs<'a> {
     pub normed_scratch: &'a Buffer,
 }
 
+/// D-RMS-FUSE Phase 1 hint: when present + `LARQL_FUSED_PRELAYER_NORM=1`,
+/// the non-post-norms branch dispatches `residual_norm_store` instead of
+/// plain `residual_add`, fusing the next layer's input rms_norm into the
+/// same kernel call. The next layer's `encode_q4k_input_norm` then skips
+/// its own dispatch (the data is already in the shared `norm_f32_buf`).
+pub(super) struct PreLayerNormFusion<'a> {
+    /// Next layer's `input_norm` weight slice.
+    pub next_input_norm: &'a [f32],
+    /// Shared `norm_f32_buf` (= next layer's `bufs.norm_out`) — written by
+    /// the fused `residual_norm_store` dispatch.
+    pub next_norm_out: &'a Buffer,
+}
+
 impl MetalBackend {
     pub(super) fn encode_post_ffn_residual(
         &self,
@@ -39,7 +52,38 @@ impl MetalBackend {
         bufs: PostFfnBufs<'_>,
         hidden: usize,
         use_fused: bool,
+        prelayer_fusion: Option<&PreLayerNormFusion<'_>>,
     ) {
+        // D-RMS-FUSE Phase 1: on the non-post-norms path (Llama / Mistral /
+        // Qwen / etc.), if the caller passed in next-layer info AND the
+        // env var is on, dispatch `residual_norm_store` to fuse the
+        // residual-add with the next layer's input rms_norm in one kernel.
+        // Saves 1 dispatch per layer × num_layers (~7 µs each).
+        if !layer.has_post_norms
+            && prelayer_fusion.is_some()
+            && crate::options::env_opt_in(crate::options::ENV_FUSED_PRELAYER_NORM)
+        {
+            let fusion = prelayer_fusion.unwrap();
+            let next_input_norm_buf = self.bufs.get_f32(fusion.next_input_norm);
+            let hidden_val = hidden as u32;
+            let eps = layer.eps;
+            let norm_offset = layer.norm_offset;
+            enc.set_compute_pipeline_state(&self.residual_norm_store_pipeline);
+            enc.set_buffer(0, Some(bufs.h_post_attn), 0); // a (residual base)
+            enc.set_buffer(1, Some(bufs.down_out), 0); // b (FFN output)
+            enc.set_buffer(2, Some(&next_input_norm_buf), 0); // weight = next layer's input_norm
+            enc.set_buffer(3, Some(fusion.next_norm_out), 0); // norm_out (next layer's normed input)
+            enc.set_buffer(4, Some(bufs.new_h), 0); // sum_out (raw new_h for residual)
+            enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(1, 1, 1),
+                MTLSize::new(256.min(hidden as u64), 1, 1),
+            );
+            return;
+        }
+
         if layer.has_post_norms {
             if let Some(post_ffn) = layer.post_ffn_norm {
                 let post_ffn_buf = self.bufs.get_f32(post_ffn);

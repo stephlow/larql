@@ -41,6 +41,12 @@ pub const ENV_FUSED_KV_APPEND_ATTEND: &str = "LARQL_FUSED_KV_APPEND_ATTEND";
 pub const ENV_FUSED_POST_ATTN_NORM: &str = "LARQL_FUSED_POST_ATTN_NORM";
 /// Disable fused post-FFN norm when set to a false value.
 pub const ENV_FUSED_POST_FFN_NORM: &str = "LARQL_FUSED_POST_FFN_NORM";
+/// Opt in to fusing the post-FFN residual_add (non-Gemma archs) with the
+/// NEXT layer's input rms_norm in one `residual_norm_store` dispatch.
+/// Saves 1 rms_norm dispatch per layer × num_layers on Llama / Mistral /
+/// Qwen / etc. (Gemma 3/4 already use the post_norms triple-fusion path,
+/// so this is a no-op there.) D-RMS-FUSE Phase 1.
+pub const ENV_FUSED_PRELAYER_NORM: &str = "LARQL_FUSED_PRELAYER_NORM";
 /// Opt in to the cooperative gate+up kernel variant.
 pub const ENV_GATE_UP_COOP: &str = "LARQL_GATE_UP_COOP";
 /// Opt back in to the fused `q4k_q6k_qkv_proj_normed` shader (RMS norm

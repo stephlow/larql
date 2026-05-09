@@ -170,6 +170,9 @@ pub use layer_graph::{
     predict_with_graph,
     predict_with_graph_vindex_logits,
     trace_with_graph,
+    try_generate,
+    try_generate_streaming,
+    try_generate_with_sampling,
     AttentionCache,
     CachedLayerGraph,
     // Multi-turn chat session
@@ -180,6 +183,7 @@ pub use layer_graph::{
     Detokenizer,
     EosConfig,
     GemmaRenderer,
+    GenerateError,
     GenerateResult,
     GuidedWalkLayerGraph,
     // Production
@@ -204,6 +208,51 @@ pub use trace::{
     TracePositions, TraceStore, TraceWriter,
 };
 pub use vindex::{open_inference_vindex, predict_q4k, FfnL1Cache, WalkFfn, WalkFfnConfig};
+
+/// Stable, application-facing inference imports.
+///
+/// New downstream code should prefer this module over broad crate-root
+/// glob imports. The crate root remains source-compatible while the public
+/// surface is gradually narrowed.
+pub mod prelude {
+    pub use crate::{
+        default_backend, generate, generate_streaming, generate_with_sampling, load_model_dir,
+        load_tokenizer, open_inference_vindex, predict, predict_q4k, resolve_model_path,
+        try_generate, try_generate_streaming, try_generate_with_sampling, wrap_chat_prompt,
+        wrap_prompt_raw, wrap_with_vindex_template, ChatWrap, ComputeBackend, CpuBackend,
+        Detokenizer, EosConfig, GenerateError, GenerateResult, InferenceError, ModelWeights,
+        Sampler, SamplingConfig, WalkFfn, WalkFfnConfig,
+    };
+}
+
+/// Mechanistic-interpretability and research-facing imports.
+///
+/// These APIs are intentionally more experimental than [`prelude`]. Grouping
+/// them here makes that boundary visible without breaking existing crate-root
+/// users in one large move.
+pub mod research {
+    pub use crate::{
+        apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,
+        capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals, compare_hidden,
+        cosine_similarity, estimate_ffn_covariance, forward_from_layer, forward_raw_logits,
+        forward_to_layer, generate_cached_constrained, hidden_to_raw_logits, infer_patched,
+        infer_patched_q4k, js_divergence, kl_divergence, logit_lens_top1, mse, predict_from_hidden,
+        predict_from_hidden_with_ffn, predict_honest, predict_pipeline, predict_with_ffn,
+        predict_with_ffn_attention, predict_with_ffn_trace, predict_with_graph,
+        predict_with_graph_vindex_logits, predict_with_router, predict_with_strategy, run_memit,
+        run_memit_with_target_opt, softmax, trace_decomposed, trace_forward, trace_forward_full,
+        trace_forward_with_ffn, trace_residuals, trace_with_graph, walk_model,
+        walk_trace_from_residuals, AnswerWaypoint, AttentionCache, AttentionLayerResult,
+        AttentionWalker, BoundaryStore, BoundaryWriter, ContextStore, ContextTier, ContextWriter,
+        ExtractCallbacks, ExtractConfig, ExtractSummary, HiddenAccuracy, InferPatchedResult,
+        InferenceWeights, KnnOverride, LayerAttentionCapture, LayerMode, LayerResult, LayerStats,
+        LayerSummary, MarkovResidualEngine, MemitFact, MemitFactResult, MemitResult, PredictResult,
+        PredictResultWithAttention, PredictResultWithResiduals, RawForward, ResidualTrace,
+        SpecCapture, TargetDelta, TargetDeltaOpts, TemplatePattern, TemplateUniverse, TraceNode,
+        TracePositions, TraceResult, TraceStore, TraceWriter, UnlimitedContextEngine,
+        VectorExtractor, WalkCallbacks, WalkConfig, WeightWalker, KNN_COSINE_THRESHOLD,
+    };
+}
 
 // Engine re-exports.
 pub use engines::accuracy::{

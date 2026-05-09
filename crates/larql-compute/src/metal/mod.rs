@@ -34,7 +34,6 @@ pub use decode::profile::take_last_split_timings;
 pub use moe_dispatch::MoeScratch;
 pub mod ops; // modular: ops/mod.rs → one file per operation
 mod pipeline;
-mod prefill;
 pub mod shaders; // modular: shaders/mod.rs → one file per shader
 pub mod stages; // modular: stages/mod.rs → one file per pipeline stage
 mod trait_impl;

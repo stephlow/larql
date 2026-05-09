@@ -3,6 +3,28 @@
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
+const ENV_LM_HEAD_SKIP_Q4K: &str = "LARQL_LM_HEAD_SKIP_Q4K";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LmHeadPolicy {
+    pub skip_q4k: bool,
+}
+
+impl LmHeadPolicy {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            skip_q4k: env_bool(ENV_LM_HEAD_SKIP_Q4K),
+        }
+    }
+}
+
+fn env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
 /// Top-K logits lookup that transparently handles models with tied
 /// input/output embeddings (Gemma 2/3/4) whose vindex has no dedicated
 /// `lm_head.bin` / `lm_head_q4.bin`.
@@ -25,6 +47,24 @@ pub fn lm_head_topk(
     top_k: usize,
     backend: &dyn ComputeBackend,
 ) -> Vec<(u32, f32)> {
+    lm_head_topk_with_policy(
+        index,
+        weights,
+        query,
+        top_k,
+        backend,
+        &LmHeadPolicy::from_env(),
+    )
+}
+
+pub(crate) fn lm_head_topk_with_policy(
+    index: &larql_vindex::VectorIndex,
+    weights: &ModelWeights,
+    query: &ndarray::Array1<f32>,
+    top_k: usize,
+    backend: &dyn ComputeBackend,
+    policy: &LmHeadPolicy,
+) -> Vec<(u32, f32)> {
     // Default route: `lm_head_knn_backend` — Metal `q4k_matvec` first
     // (1.85 ms/tok on Gemma 3 4B, was 2.95 ms via the stride-32 workaround
     // before the 2026-05-02 dispatch-geometry fix), f16 GEMV fallback for
@@ -34,11 +74,7 @@ pub fn lm_head_topk(
     // (stride-32 Q4_K → f16 → f32) for diagnostic A/B against the Q4_K
     // path. See `crates/larql-compute/PERFORMANCE.md` "Decision: lm_head
     // dispatch order" for the full root-cause history.
-    let skip_q4k = matches!(
-        std::env::var("LARQL_LM_HEAD_SKIP_Q4K").as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-    );
-    if skip_q4k && backend.supports(Capability::F32Gemv) {
+    if policy.skip_q4k && backend.supports(Capability::F32Gemv) {
         // Diagnostic path: skip the Q4_K accelerated matvec and use stride-32
         // Q4_K (or f16 GEMV / f32 BLAS) instead. Useful for verifying
         // top-1 stability against a known-stable reduction tree, or for

@@ -3,7 +3,7 @@
 
 use super::{
     eos::EosConfig,
-    types::{GenerateResult, StageTimings},
+    types::{GenerateError, GenerateResult, StageTimings},
 };
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
@@ -36,13 +36,7 @@ pub(super) fn generate_via_cpu_q4k(
     eos: &EosConfig,
 ) -> GenerateResult {
     if max_tokens == 0 {
-        return GenerateResult {
-            tokens: Vec::new(),
-            prefill_ms: 0.0,
-            decode_ms: Vec::new(),
-            stage_timings: StageTimings::default(),
-            error: None,
-        };
+        return GenerateResult::empty_success();
     }
 
     let prefill_start = std::time::Instant::now();
@@ -75,7 +69,9 @@ pub(super) fn generate_via_cpu_q4k(
             prefill_ms,
             decode_ms,
             stage_timings: StageTimings::default(),
-            error: Some("CPU Q4K generation produced no first token".to_string()),
+            error: Some(GenerateError::empty_output(
+                "CPU Q4K generation produced no first token",
+            )),
         };
     }
 
@@ -197,13 +193,7 @@ where
     F: FnMut(u32, &str, f64),
 {
     if max_tokens == 0 {
-        return GenerateResult {
-            tokens: Vec::new(),
-            prefill_ms: 0.0,
-            decode_ms: Vec::new(),
-            stage_timings: StageTimings::default(),
-            error: None,
-        };
+        return GenerateResult::empty_success();
     }
 
     let prefill_start = std::time::Instant::now();
