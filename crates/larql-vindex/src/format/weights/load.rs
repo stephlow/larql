@@ -394,6 +394,7 @@ pub fn load_model_weights_with_opts(
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        position_embed: None,
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
@@ -651,7 +652,7 @@ pub fn load_model_weights_q4k_shard(
     // Loaded when index.json carries `ffn_layout: "per_layer"`. For each
     // layer file: mmap it, parse the header + offset table, record per-entry
     // byte ranges keyed as `"layers/{layer}/{entry}/gate_up"` and `"layers/{layer}/{entry}/down"`.
-    if config.ffn_layout.as_deref() == Some("per_layer") {
+    if config.ffn_layout == Some(crate::config::FfnLayout::PerLayer) {
         use super::write_layers::parse_layer_weights_header;
         use crate::format::filenames::layer_weights_filename;
         for l in 0..config.num_layers {
@@ -733,6 +734,7 @@ pub fn load_model_weights_q4k_shard(
         packed_byte_ranges,
         embed,
         lm_head,
+        position_embed: None,
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,

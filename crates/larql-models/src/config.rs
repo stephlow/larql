@@ -162,6 +162,15 @@ pub trait ModelArchitecture: Send + Sync {
         "embed_tokens.weight"
     }
 
+    /// Learned positional-embedding tensor key, when the architecture uses
+    /// absolute learned position embeddings added to the token embedding at
+    /// the input (GPT-2). Architectures that use rotary or no positional
+    /// signal return `None` (the default). When `Some`, the loader populates
+    /// `ModelWeights::position_embed`.
+    fn position_embed_key(&self) -> Option<&str> {
+        None
+    }
+
     /// Final norm weight key.
     fn final_norm_key(&self) -> &str {
         "norm.weight"
@@ -179,6 +188,20 @@ pub trait ModelArchitecture: Send + Sync {
     }
     fn attn_o_key(&self, layer: usize) -> String {
         format!("{}self_attn.o_proj.weight", self.layer_prefix(layer))
+    }
+
+    /// Tensor key for a fused Q/K/V projection, when the architecture packs
+    /// all three into a single matrix (Conv1D-style: GPT-2). The loader splits
+    /// the fused tensor into the per-projection keys returned by
+    /// `attn_q_key` / `attn_k_key` / `attn_v_key` after loading. Default: None.
+    fn fused_qkv_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Tensor key for a fused Q/K/V bias vector, paired with `fused_qkv_key`.
+    /// Default: None.
+    fn fused_qkv_bias_key(&self, _layer: usize) -> Option<String> {
+        None
     }
 
     /// Attention bias keys (None if model doesn't use attention bias).

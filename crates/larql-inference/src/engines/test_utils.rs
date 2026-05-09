@@ -89,6 +89,7 @@ pub fn make_test_weights() -> ModelWeights {
         packed_byte_ranges: HashMap::new(),
         embed,
         lm_head,
+        position_embed: None,
         arch,
         num_layers: NUM_LAYERS,
         hidden_size: HIDDEN,

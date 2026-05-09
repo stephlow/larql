@@ -201,6 +201,86 @@ pub struct MoeLayerWeights<'a> {
     pub activation: Activation,
 }
 
+/// Attention projection weights for one layer.
+#[derive(Clone, Copy)]
+pub struct AttentionWeights<'a> {
+    pub wq: QuantWeight<'a>,
+    pub wk: QuantWeight<'a>,
+    pub wv: QuantWeight<'a>,
+    pub wo: QuantWeight<'a>,
+}
+
+/// Dense FFN projection weights for one layer.
+#[derive(Clone, Copy)]
+pub struct FfnWeights<'a> {
+    /// Gate projection. Used only when [`FfnSpec::ffn_type`] is [`FfnType::Gated`].
+    pub gate: QuantWeight<'a>,
+    pub up: QuantWeight<'a>,
+    pub down: QuantWeight<'a>,
+}
+
+/// Grouped weight view for one layer.
+#[derive(Clone, Copy)]
+pub struct LayerWeights<'a> {
+    pub attention: AttentionWeights<'a>,
+    pub ffn: FfnWeights<'a>,
+}
+
+/// Norm weights, biases, and scalar norm behavior for one layer.
+#[derive(Clone, Copy)]
+pub struct LayerNorms<'a> {
+    pub input_norm: &'a [f32],
+    pub post_attn_norm: &'a [f32],
+    pub pre_ffn_norm: Option<&'a [f32]>,
+    pub post_ffn_norm: Option<&'a [f32]>,
+    pub input_norm_bias: Option<&'a [f32]>,
+    pub post_attn_norm_bias: Option<&'a [f32]>,
+    pub norm_offset: f32,
+    pub qk_norm_offset: f32,
+    pub eps: f32,
+    pub has_post_norms: bool,
+    pub norm_type: NormType,
+}
+
+/// Per-layer attention geometry and position-encoding behavior.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttentionSpec {
+    pub attn_scale: f32,
+    pub head_dim: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub rope_base: f32,
+    pub rotary_dim: usize,
+    pub sliding_window: usize,
+    pub has_v_norm: bool,
+    pub q_norm_enabled: bool,
+    pub k_norm_enabled: bool,
+    pub position_encoding: PositionEncodingType,
+}
+
+/// Dense FFN architecture behavior for one layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FfnSpec {
+    pub ffn_type: FfnType,
+    pub activation: Activation,
+}
+
+/// Hybrid MoE behavior for one layer. The expert tensors remain in
+/// [`MoeLayerWeights`]; this view captures how the dense and expert branches
+/// are combined.
+#[derive(Clone, Copy)]
+pub struct MoeSpec<'layer, 'data> {
+    pub weights: Option<&'layer MoeLayerWeights<'data>>,
+    pub combined_output_norm: bool,
+    pub outer_post_norm: Option<&'data [f32]>,
+}
+
+/// Remote FFN dispatch behavior for one layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteFfnSpec {
+    pub is_remote: bool,
+}
+
 /// Per-layer quantized weights for the full pipeline.
 ///
 /// Carries all architecture-specific behavior per-layer — no model
@@ -297,6 +377,81 @@ pub struct FullPipelineLayer<'a> {
 }
 
 impl<'a> FullPipelineLayer<'a> {
+    /// Group the layer's quantized attention and FFN weights.
+    pub fn weights(&self) -> LayerWeights<'a> {
+        LayerWeights {
+            attention: AttentionWeights {
+                wq: self.wq,
+                wk: self.wk,
+                wv: self.wv,
+                wo: self.wo,
+            },
+            ffn: FfnWeights {
+                gate: self.gate,
+                up: self.up,
+                down: self.down,
+            },
+        }
+    }
+
+    /// Group the layer's norm weights, biases, and norm scalar behavior.
+    pub fn norms(&self) -> LayerNorms<'a> {
+        LayerNorms {
+            input_norm: self.input_norm,
+            post_attn_norm: self.post_attn_norm,
+            pre_ffn_norm: self.pre_ffn_norm,
+            post_ffn_norm: self.post_ffn_norm,
+            input_norm_bias: self.input_norm_bias,
+            post_attn_norm_bias: self.post_attn_norm_bias,
+            norm_offset: self.norm_offset,
+            qk_norm_offset: self.qk_norm_offset,
+            eps: self.eps,
+            has_post_norms: self.has_post_norms,
+            norm_type: self.norm_type,
+        }
+    }
+
+    /// Return the layer's attention shape, RoPE, and attention-normalization behavior.
+    pub fn attention_spec(&self) -> AttentionSpec {
+        AttentionSpec {
+            attn_scale: self.attn_scale,
+            head_dim: self.head_dim,
+            num_q_heads: self.num_q_heads,
+            num_kv_heads: self.num_kv_heads,
+            rope_base: self.rope_base,
+            rotary_dim: self.rotary_dim,
+            sliding_window: self.sliding_window,
+            has_v_norm: self.has_v_norm,
+            q_norm_enabled: self.q_norm_weight.is_some(),
+            k_norm_enabled: self.k_norm_weight.is_some(),
+            position_encoding: PositionEncodingType::RoPE,
+        }
+    }
+
+    /// Return the layer's dense FFN architecture behavior.
+    pub fn ffn_spec(&self) -> FfnSpec {
+        FfnSpec {
+            ffn_type: self.ffn_type,
+            activation: self.activation,
+        }
+    }
+
+    /// Return the layer's hybrid-MoE behavior.
+    pub fn moe_spec(&self) -> MoeSpec<'_, 'a> {
+        MoeSpec {
+            weights: self.moe.as_ref(),
+            combined_output_norm: self.moe_combined_output_norm,
+            outer_post_norm: self.moe_outer_post_norm,
+        }
+    }
+
+    /// Return the layer's remote-FFN dispatch behavior.
+    pub fn remote_ffn_spec(&self) -> RemoteFfnSpec {
+        RemoteFfnSpec {
+            is_remote: self.ffn_is_remote,
+        }
+    }
+
     /// Whether this layer uses gated FFN (gate + up → GEGLU → down).
     pub fn is_gated(&self) -> bool {
         self.ffn_type == FfnType::Gated
@@ -543,5 +698,74 @@ mod tests {
         assert_eq!(layer.input_norm.len(), 4);
         assert_eq!(layer.wq.data.len(), 3);
         assert_eq!(layer.head_dim, 4);
+    }
+
+    #[test]
+    fn layer_spec_views_preserve_flat_field_values() {
+        let data: Vec<u8> = vec![0, 1, 2, 3];
+        let norms: Vec<f32> = vec![1.0; 8];
+        let q_norm: Vec<f32> = vec![0.5; 4];
+
+        let qw = QuantWeight {
+            data: &data,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        let layer = FullPipelineLayer {
+            wq: qw,
+            wk: qw,
+            wv: qw,
+            wo: qw,
+            gate: qw,
+            up: qw,
+            down: qw,
+            input_norm: &norms,
+            post_attn_norm: &norms,
+            norm_offset: 1.0,
+            qk_norm_offset: 0.25,
+            eps: 1e-5,
+            has_post_norms: true,
+            activation: Activation::GeluTanh,
+            attn_scale: 0.125,
+            head_dim: 4,
+            num_q_heads: 2,
+            num_kv_heads: 1,
+            rope_base: ROPE_BASE_GLOBAL,
+            rotary_dim: 2,
+            sliding_window: 32,
+            has_v_norm: true,
+            q_norm_weight: Some(&q_norm),
+            ffn_is_remote: true,
+            moe_combined_output_norm: true,
+            moe_outer_post_norm: Some(&norms),
+            ..FullPipelineLayer::default()
+        };
+
+        let weights = layer.weights();
+        assert_eq!(weights.attention.wq.format, QuantFormat::Q4_K);
+        assert_eq!(weights.ffn.down.data.len(), data.len());
+
+        let norms_view = layer.norms();
+        assert_eq!(norms_view.input_norm.len(), norms.len());
+        assert_eq!(norms_view.norm_offset, 1.0);
+        assert_eq!(norms_view.qk_norm_offset, 0.25);
+        assert_eq!(norms_view.eps, 1e-5);
+        assert!(norms_view.has_post_norms);
+
+        let attn = layer.attention_spec();
+        assert_eq!(attn.head_dim, 4);
+        assert_eq!(attn.num_q_heads, 2);
+        assert_eq!(attn.num_kv_heads, 1);
+        assert_eq!(attn.rope_base, ROPE_BASE_GLOBAL);
+        assert_eq!(attn.rotary_dim, 2);
+        assert_eq!(attn.sliding_window, 32);
+        assert!(attn.has_v_norm);
+        assert!(attn.q_norm_enabled);
+        assert!(!attn.k_norm_enabled);
+
+        assert_eq!(layer.ffn_spec().activation, Activation::GeluTanh);
+        assert!(layer.remote_ffn_spec().is_remote);
+        assert!(layer.moe_spec().combined_output_norm);
+        assert_eq!(layer.moe_spec().outer_post_norm.unwrap().len(), norms.len());
     }
 }

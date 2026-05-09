@@ -244,6 +244,7 @@ fn make_loaded_model(
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
         lm_head: embed,
+        position_embed: None,
         arch: Box::new(TestMoeArch::new()),
         num_layers: 1,
         hidden_size: HIDDEN,
@@ -281,11 +282,11 @@ fn make_loaded_model(
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         moe_scratches: std::sync::Mutex::new(HashMap::new()),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     }
 }

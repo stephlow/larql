@@ -50,6 +50,23 @@ pub(super) fn try_metal_baseline(
     )
 }
 
+/// Capture the target head's pre-W_O output at `target_layer` using GPU,
+/// stopping after that layer. Returns `[seq_len × head_dim]` f32.
+///
+/// ~34× faster than CPU oracle PQ for target_layer=0 (only runs 1/34 GPU layers).
+pub(super) fn try_metal_capture_pre_wo(
+    weights: &larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &larql_vindex::VectorIndex,
+    target_layer: usize,
+    target_head: usize,
+    backend: &Backend,
+) -> Option<Vec<f32>> {
+    larql_inference::vindex::predict_q4k_metal_capture_pre_wo(
+        weights, token_ids, index, backend.as_ref(), target_layer, target_head,
+    )
+}
+
 /// Run the Metal head-replacement forward pass.
 ///
 /// Returns `None` if the backend is not provided or the GPU path fails —

@@ -669,7 +669,7 @@ make larql-vindex-bench                                                         
 make larql-vindex-coverage-summary                                              # aggregate + per-file coverage policy
 make larql-vindex-coverage-html                                                 # HTML report plus the same coverage policy
 
-cargo test -p larql-vindex                                                      # 515 tests listed as of 2026-05-08
+cargo test -p larql-vindex                                                      # 525 tests listed as of 2026-05-08
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -716,11 +716,11 @@ only on the workspace-wide `make ci`. The local gate is:
   `scripts/check_coverage_policy.py`
 
 The coverage policy lives in `coverage-policy.json`. The aggregate
-line-coverage floor is currently 68% from the 2026-05-08 local
-baseline. Source files default to 90% line coverage; files below that
-have explicit debt baselines that should only ratchet upward. The
-current policy check covers 83 source files, with 39 already at the
-90% default and 44 tracked as debt.
+line-coverage floor is currently 71% from the 2026-05-08 local
+baseline of 71.56%. Source files default to 90% line coverage; files
+below that have explicit debt baselines that should only ratchet
+upward. The current policy check covers 83 source files, with 41
+already at the 90% default and 42 tracked as debt.
 
 GitHub Actions runs the same model-agnostic surface on Linux, Windows,
 and macOS. The examples step is compile-only because several tools
@@ -736,7 +736,7 @@ need an external vindex path; CI must stay synthetic and portable.
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 
-Test coverage (515 tests listed by `cargo test -p larql-vindex -- --list`):
+Test coverage (525 tests listed by `cargo test -p larql-vindex -- --list`):
 - Construction, dimensions, layer counts, feature counts
 - Gate KNN: brute-force, f32, Q4 via compute backend, top-K ordering
 - Gate walk: BLAS gemv path matches brute-force KNN

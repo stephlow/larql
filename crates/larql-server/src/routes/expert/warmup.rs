@@ -89,7 +89,7 @@ pub fn warmup_hnsw_unit_cache(model: &LoadedModel) -> Result<(usize, usize, usiz
 ///
 /// Skipped when `LARQL_NO_WARMUP=1` (useful in low-RSS dev setups; warmup
 /// allocates ~10MB × experts_owned × num_layers of Metal-resident memory).
-#[cfg(feature = "metal-experts")]
+#[cfg(all(feature = "metal-experts", target_os = "macos"))]
 pub fn warmup_metal_expert_cache(model: &LoadedModel) -> Result<usize, String> {
     use larql_compute::MetalBackend;
 

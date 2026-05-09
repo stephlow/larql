@@ -32,7 +32,7 @@ pub use interventions::{
     predict_q4k_hidden_with_zeroed_pre_o_heads,
 };
 pub use metal::{
-    predict_q4k_metal, predict_q4k_metal_hidden,
+    predict_q4k_metal, predict_q4k_metal_capture_pre_wo, predict_q4k_metal_hidden,
     predict_q4k_metal_with_replaced_head_residual_delta,
 };
 pub use remote_ffn::{predict_q4k_hidden_with_ffn, predict_q4k_with_ffn};

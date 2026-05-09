@@ -148,18 +148,15 @@ impl VectorIndex {
 }
 
 // ══════════════════════════════════════════════════════════════
-// `impl GateIndex for VectorIndex`
+// Capability-trait impls for VectorIndex
 //
-// The trait surface that lets `VectorIndex` plug into anything that
-// takes `&dyn GateIndex` (also implemented by `PatchedVindex` in
-// `crate::patch::overlay_gate_trait`). Each method here is identity
-// forwarding to the `impl VectorIndex { … }` block of the same name —
-// the trait exists for type-erasure, not for behavioural override.
-// Inlined from the former `gate_trait.rs` in the 2026-04-25 round-2
-// cleanup.
+// These narrower surfaces let read-only graph queries, patch overlays,
+// and FFN walkers depend on only the capabilities they actually need.
+// The compatibility `GateIndex` trait is a blanket composition over
+// these impls, so existing `&dyn GateIndex` consumers continue to work.
 // ══════════════════════════════════════════════════════════════
 
-impl GateIndex for VectorIndex {
+impl GateLookup for VectorIndex {
     fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
         self.gate_knn(layer, residual, top_k)
     }
@@ -172,6 +169,36 @@ impl GateIndex for VectorIndex {
         self.num_features(layer)
     }
 
+    fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
+        self.gate_knn_batch(layer, x, top_k)
+    }
+
+    fn gate_knn_q4(
+        &self,
+        layer: usize,
+        residual: &ndarray::Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Vec<(usize, f32)>> {
+        // Delegate to VectorIndex's existing gate_knn_q4 method
+        VectorIndex::gate_knn_q4(self, layer, residual, top_k, backend)
+    }
+
+    fn gate_scores_batch(&self, layer: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
+        self.gate_scores_batch(layer, x)
+    }
+
+    fn gate_scores_batch_backend(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+        backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> Option<Array2<f32>> {
+        self.gate_scores_batch_backend(layer, x, backend)
+    }
+}
+
+impl PatchOverrides for VectorIndex {
     fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
         self.metadata
             .down_overrides
@@ -193,11 +220,9 @@ impl GateIndex for VectorIndex {
             .any(|(l, _)| *l == layer)
             || self.metadata.up_overrides.keys().any(|(l, _)| *l == layer)
     }
+}
 
-    fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
-        self.gate_knn_batch(layer, x, top_k)
-    }
-
+impl NativeFfnAccess for VectorIndex {
     fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
         self.down_feature_vector(layer, feature)
     }
@@ -206,32 +231,8 @@ impl GateIndex for VectorIndex {
         self.ffn.down_features_mmap.is_some()
     }
 
-    fn gate_knn_q4(
-        &self,
-        layer: usize,
-        residual: &ndarray::Array1<f32>,
-        top_k: usize,
-        backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> {
-        // Delegate to VectorIndex's existing gate_knn_q4 method
-        VectorIndex::gate_knn_q4(self, layer, residual, top_k, backend)
-    }
-
     fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
         self.down_layer_matrix(layer)
-    }
-
-    fn gate_scores_batch(&self, layer: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
-        self.gate_scores_batch(layer, x)
-    }
-
-    fn gate_scores_batch_backend(
-        &self,
-        layer: usize,
-        x: &Array2<f32>,
-        backend: Option<&dyn larql_compute::ComputeBackend>,
-    ) -> Option<Array2<f32>> {
-        self.gate_scores_batch_backend(layer, x, backend)
     }
 
     fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
@@ -261,7 +262,9 @@ impl GateIndex for VectorIndex {
     fn prefetch_interleaved_layer(&self, layer: usize) {
         self.prefetch_interleaved_layer(layer)
     }
+}
 
+impl QuantizedFfnAccess for VectorIndex {
     fn has_interleaved_q4(&self) -> bool {
         self.has_interleaved_q4()
     }
@@ -378,9 +381,9 @@ impl GateIndex for VectorIndex {
     ) -> Option<Vec<f32>> {
         VectorIndex::q4k_matmul_transb(self, layer, component, x, x_rows, backend)
     }
+}
 
-    // ── FP4 / FP8 FFN storage (exp 26) ─────────────────────────────────────
-
+impl Fp4FfnAccess for VectorIndex {
     fn has_fp4_storage(&self) -> bool {
         VectorIndex::has_fp4_storage(self)
     }

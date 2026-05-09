@@ -16,7 +16,7 @@ use std::path::Path;
 use larql_models::quant::fp4_block::BLOCK_ELEMENTS;
 use larql_vindex::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 use larql_vindex::{
-    ExtractLevel, Fp4Config, GateIndex, SilentLoadCallbacks, StorageDtype, VectorIndex,
+    ExtractLevel, FfnRowAccess, Fp4Config, SilentLoadCallbacks, StorageDtype, VectorIndex,
     VindexConfig, VindexLayerInfo,
 };
 
@@ -323,7 +323,7 @@ fn synthetic_num_features_never_zero_on_fp4_vindex() {
     let index = load_minimal(&dir);
 
     for (layer, &expected) in per_layer_features.iter().enumerate() {
-        let got = larql_vindex::GateIndex::num_features(&index, layer);
+        let got = larql_vindex::GateLookup::num_features(&index, layer);
         assert_eq!(
             got, expected,
             "layer {layer}: num_features returned {got}, expected {expected} — \

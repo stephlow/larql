@@ -1029,7 +1029,7 @@ pub fn q6k_q8k_matvec_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::ops::q4_common::{q4k_matvec_into, quantize_q4_k};
+    use crate::cpu::ops::q4_common::{q4k_matvec_into, quantize_q4_k, quantize_q6_k};
 
     /// Q8_K round-trip should reconstruct within 0.5% of absmax (1 LSB on
     /// the 127-step scale).  Sums must equal the literal i32 sums of the
@@ -1315,6 +1315,67 @@ mod tests {
         let mut out = vec![1.0f32; rows];
         q4k_q8k_matvec_scalar(&mut out, &q, &w, rows, cols);
         assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q6k_q8k_matvec_matches_q6k_f32_dispatch_within_noise() {
+        let cols = 512;
+        let rows = 5;
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin() * 1.5).collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.006).cos() * 0.7)
+            .collect();
+        let w_q6 = quantize_q6_k(&w_f32);
+
+        let f32_path = crate::cpu::ops::q6k_matvec::dispatch(&w_q6, &x, rows, cols);
+        let q8 = quantize_x_to_q8k(&x);
+        let mut q8_path = vec![0.0f32; rows];
+        q6k_q8k_matvec_scalar(&mut q8_path, &q8, &w_q6, rows, cols);
+
+        for r in 0..rows {
+            let diff = (f32_path[r] - q8_path[r]).abs();
+            assert!(
+                diff < 1.2e-1,
+                "row {r}: f32={} q8={} diff={diff}",
+                f32_path[r],
+                q8_path[r]
+            );
+        }
+    }
+
+    #[test]
+    fn q6k_q8k_public_entrypoint_matches_scalar() {
+        let cols = 256;
+        let rows = 3;
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.031).cos()).collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.011).sin() * 0.4)
+            .collect();
+        let w_q6 = quantize_q6_k(&w_f32);
+        let q8 = quantize_x_to_q8k(&x);
+        let mut scalar = vec![0.0f32; rows];
+        let mut dispatched = vec![0.0f32; rows];
+
+        q6k_q8k_matvec_scalar(&mut scalar, &q8, &w_q6, rows, cols);
+        q6k_q8k_matvec_into(&mut dispatched, &q8, &w_q6, rows, cols);
+
+        for (a, b) in scalar.iter().zip(dispatched.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn q6k_q8k_zero_dims_and_short_weights_zero_output() {
+        let q = Q8KActivation::with_capacity(0);
+        let mut out = vec![1.0f32; 4];
+        q6k_q8k_matvec_scalar(&mut out, &q, &[], 4, 0);
+        assert_eq!(out, vec![0.0f32; 4]);
+
+        let x = vec![1.0f32; 256];
+        let q = quantize_x_to_q8k(&x);
+        let mut out = vec![1.0f32; 2];
+        q6k_q8k_matvec_scalar(&mut out, &q, &vec![0u8; 210], 2, 256);
+        assert_eq!(out, vec![0.0f32; 2]);
     }
 
     /// AVX2 must produce bit-identical output to the scalar reference.

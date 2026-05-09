@@ -29,7 +29,7 @@ pub(crate) const VINDEX_CORE_FILES: &[&str] = &[
     GATE_VECTORS_BIN,
     EMBEDDINGS_BIN,
     DOWN_META_BIN,
-    "down_meta.jsonl",
+    DOWN_META_JSONL,
     RELATION_CLUSTERS_JSON,
     FEATURE_LABELS_JSON,
 ];

@@ -115,6 +115,13 @@ pub struct PipelineIntervention<'a> {
     pub num_q_heads: usize,
     /// Replacement residual delta, shape `[seq_len × hidden_size]`.
     pub replacement_delta: &'a [f32],
+    /// Capture the target head's pre-W_O output BEFORE hook A zeros it.
+    /// Filled with `[seq_len × head_dim]` floats. Initialize to empty Vec.
+    pub pre_wo_capture: std::cell::RefCell<Vec<f32>>,
+    /// If true, stop dispatch immediately after capture (before O-proj).
+    /// Used for oracle code computation — caller only needs pre_wo_capture.
+    /// The returned Vec<f32> from dispatch will be empty when true.
+    pub stop_after_capture: bool,
 }
 
 /// supplied, QK-norm is applied **before** RoPE (matching `decode_token` and
@@ -232,7 +239,7 @@ pub fn dispatch_full_pipeline(
     let needs_per_layer_commit = moe_fn.is_some() && layers.iter().any(|l| l.moe.is_some());
 
     let mut cmd = queue.new_command_buffer().to_owned();
-    let dump_path = std::env::var("LARQL_METAL_DUMP_LAYERS").ok();
+    let dump_path = crate::options::env_value(crate::options::ENV_METAL_DUMP_LAYERS);
     super::dump::dump_h_embed(dump_path.as_deref(), &lb, seq_len, hidden);
 
     for l in 0..num_layers {
@@ -430,19 +437,36 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
-        // ── Intervention hook A: zero target head in attn_outs[l] ──
+        // ── Intervention hook A: capture + zero target head in attn_outs[l] ──
         //
-        // Must run AFTER attention, BEFORE O-projection. Commit the current
-        // command buffer to ensure attention results are visible, then zero
-        // head H's slice in attn_outs[l] from CPU (shared memory on Apple
-        // Silicon — no copy). This makes the O-projection exclude head H's
-        // contribution from o_outs[l].
+        // Commit+wait for fused attention. Then:
+        //   A.1 Capture pre-W_O output for oracle code computation (before zeroing).
+        //   A.2 Zero head H's slice so O-projection excludes head H.
+        //   A.3 If stop_after_capture, return early (pre_wo filled, no O-proj needed).
         if let Some(iv) = intervention {
             if l == iv.target_layer {
                 cmd.commit();
                 cmd.wait_until_completed();
-                // attn_outs[l] layout: [seq_len × (num_q_heads × head_dim)] f32
                 let q_dim = iv.num_q_heads * iv.head_dim;
+
+                // A.1: Capture pre-W_O for oracle code computation.
+                {
+                    let attn_ro = attn_outs[l].contents() as *const f32;
+                    let mut cap = iv.pre_wo_capture.borrow_mut();
+                    cap.clear();
+                    cap.reserve(seq_len * iv.head_dim);
+                    for pos in 0..seq_len {
+                        let head_start = pos * q_dim + iv.target_head * iv.head_dim;
+                        unsafe {
+                            cap.extend_from_slice(std::slice::from_raw_parts(
+                                attn_ro.add(head_start),
+                                iv.head_dim,
+                            ));
+                        }
+                    }
+                }
+
+                // A.2: Zero head H's slice.
                 let attn_ptr = attn_outs[l].contents() as *mut f32;
                 for pos in 0..seq_len {
                     let head_start = pos * q_dim + iv.target_head * iv.head_dim;
@@ -452,6 +476,12 @@ pub fn dispatch_full_pipeline(
                 }
                 #[cfg(target_os = "macos")]
                 attn_outs[l].did_modify_range(metal::NSRange::new(0, attn_outs[l].length()));
+
+                // A.3: Early return for oracle capture (stop before O-proj + FFN + remaining layers).
+                if iv.stop_after_capture {
+                    return vec![];
+                }
+
                 cmd = queue.new_command_buffer().to_owned();
             }
         }

@@ -736,7 +736,7 @@ cargo test                               # all tests across all crates
 cargo test -p larql-inference            # inference engine tests (109 tests)
 cargo test -p larql-inference --features metal  # + Metal GPU tests (115 tests)
 cargo test -p larql-lql                  # LQL parser + executor tests (272 tests)
-cargo test -p larql-vindex               # vindex storage + patch tests (515 tests as of 2026-05-08)
+cargo test -p larql-vindex               # vindex storage + patch tests (525 tests as of 2026-05-08)
 
 # Crate-local CI shortcuts
 make larql-vindex-ci                     # fmt, clippy, tests, examples, benches, coverage policy

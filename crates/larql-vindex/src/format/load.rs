@@ -9,8 +9,9 @@ use ndarray::Array2;
 use crate::config::VindexConfig;
 use crate::error::VindexError;
 use crate::format::filenames::{
-    DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON, INTERLEAVED_Q4K_BIN,
-    INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN, TOKENIZER_JSON,
+    DOWN_META_BIN, DOWN_META_JSONL, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON,
+    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
+    TOKENIZER_JSON,
 };
 use crate::index::{IndexLoadCallbacks, VectorIndex};
 
@@ -167,7 +168,7 @@ impl VectorIndex {
         }
 
         if !has_binary_down_meta {
-            let legacy_path = dir.join("down_meta.jsonl");
+            let legacy_path = dir.join(DOWN_META_JSONL);
             if legacy_path.exists() {
                 index.load_down_meta(&legacy_path, callbacks)?;
             }
@@ -509,7 +510,7 @@ mod tests {
 {"l":0,"f":1,"t":"French"}
 {"l":1,"f":0,"t":"Berlin"}
 "#;
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels.len(), 3);
@@ -523,7 +524,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let jsonl = r#"{"layer":2,"feature":5,"top_token":"Spain"}
 "#;
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels[&(2, 5)], "Spain");
@@ -535,7 +536,7 @@ mod tests {
         let jsonl = r#"{"_header":true,"version":1}
 {"l":0,"f":0,"t":"Rome"}
 "#;
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels.len(), 1);
@@ -546,7 +547,7 @@ mod tests {
     fn load_feature_labels_skips_blank_lines() {
         let dir = TempDir::new().unwrap();
         let jsonl = "  \n{\"l\":0,\"f\":0,\"t\":\"Tokyo\"}\n\n";
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels.len(), 1);

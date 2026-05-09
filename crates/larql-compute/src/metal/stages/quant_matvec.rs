@@ -149,7 +149,7 @@ pub fn encode(
             // misinterprets the format (Q4_KF uses pre-baked half-scales)
             // and gets the threadgroup geometry wrong (4 rows / 64 threads),
             // leaving ~75% of output rows unwritten.
-            if std::env::var("LARQL_DBG_QM").is_ok() {
+            if crate::options::env_flag(crate::options::ENV_DBG_QM) {
                 eprintln!(
                     "[quant_matvec] Q4_K path — kh.rows_per_tg={} kh.threads_per_tg={} n={} k={}",
                     pipes.q4k_matvec_fallback.rows_per_tg,

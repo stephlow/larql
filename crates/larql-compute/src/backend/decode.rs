@@ -290,6 +290,34 @@ pub trait DecodeBackend {
         None
     }
 
+    /// Capture the target head's pre-W_O output at `target_layer` via GPU,
+    /// then stop. Returns `[seq_len × head_dim]` f32 — the raw attention output
+    /// for `target_head` before W_O projection.
+    ///
+    /// For AHORD oracle code computation: runs only layers 0..=target_layer on GPU
+    /// (not all 34 layers), giving ~34× speedup for target_layer=0 over CPU.
+    #[allow(clippy::too_many_arguments)]
+    fn full_pipeline_q4_capture_pre_wo(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        _q_dim: usize,
+        _kv_dim: usize,
+        _seq_len: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        _use_qk_norm: bool,
+        _softcap: f32,
+        _target_layer: usize,
+        _target_head: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Like `prefill_q4` but replaces one attention head's residual contribution
     /// at `target_layer` with `replacement_delta` — the AHORD Mode D injection path.
     ///

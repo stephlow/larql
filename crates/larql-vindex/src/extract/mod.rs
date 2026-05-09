@@ -5,6 +5,7 @@ pub mod build_from_vectors;
 pub mod build_helpers;
 pub mod callbacks;
 pub mod checkpoint;
+pub mod constants;
 pub mod metadata;
 pub mod stage_labels;
 pub mod streaming;

@@ -17,13 +17,28 @@ Findings now tracked here so follow-up work does not live only in review notes:
 - [x] Add crate-specific fast and integration test targets:
   `make larql-compute-test-fast` for inner-loop unit/API checks and
   `make larql-compute-test-integration` for the heavier integration binaries.
-- [ ] Replace remaining direct `std::env::var` reads in Metal decode/stage
-  code with the same options surface, then thread explicit options through
-  backend construction for non-debug behavior.
-- [ ] Split `FullPipelineLayer` into smaller architecture and runtime specs:
-  `AttentionSpec`, `FfnSpec`, `MoeSpec`, `LayerWeights`, `LayerNorms`, and
-  remote-FFN settings. Keep the current struct as a compatibility wrapper
-  until inference/vindex call sites are migrated.
+- [x] Harden cross-platform Metal gates in compute, inference, vindex benches,
+  and CLI call sites so non-macOS `--all-features` builds do not import the
+  macOS-only `metal::` module.
+- [x] Add `.github/workflows/larql-compute.yml` for Linux, Windows, and macOS
+  fast compute checks, including non-macOS `--all-features` coverage and macOS
+  `--features metal` coverage.
+- [x] Add compute coverage targets and a 90%-default per-file policy with
+  current debt baselines in `crates/larql-compute/coverage-policy.json`.
+- [x] Raise default-feature line coverage from 56.76% to 67.72% with targeted
+  tests for backend default contracts, compute option parsing, Q4K kernels, and
+  MoE helpers. Remaining per-file debt is still concentrated in the
+  instrumented backend trait defaults and MoE/Q4K paths.
+- [x] Replace remaining direct `std::env::var` reads in Metal decode/stage
+  code with the same options surface, so env names and parsing live in
+  `src/options.rs`.
+- [ ] Thread explicit options through backend construction for non-debug
+  behavior, keeping env-backed debug toggles as a compatibility bridge.
+- [ ] Split `FullPipelineLayer` into smaller architecture and runtime specs.
+  Compatibility views now exist for `AttentionSpec`, `FfnSpec`, `MoeSpec`,
+  `LayerWeights`, `LayerNorms`, and remote-FFN settings; remaining work is to
+  migrate inference/vindex/backend call sites off the flat field bag and then
+  make the wrapper private or narrower.
 - [ ] Promote Gemma-style MoE assumptions into an explicit `MoeRoutingPolicy`:
   router input source, router norm policy, selected-weight renormalization,
   per-expert scale policy, and softmax/top-k semantics.
@@ -1192,33 +1207,34 @@ so platform users start with a competitive baseline.
 
 ### Linux support
 **Effort**: Medium  
-**Status**: In progress
+**Status**: In progress — compute crate CI added; downstream crate CI still open.
 
 larql-compute has a CPU baseline plus a macOS-only Metal backend. The
 `ComputeBackend` trait and CPU fallback compile without Metal at the trait
 level. Current guardrail: tests, examples, benches, and the exported
 `metal::` module are gated on `#[cfg(all(feature = "metal", target_os =
 "macos"))]`, so Linux `--all-features` checks do not try to import Metal.
-Gaps:
+Done for `larql-compute`: Linux CI installs OpenBLAS, checks default and
+all-feature builds, runs clippy, and runs the fast compute test split. Gaps:
 
 - `larql-cli` / `larql-inference`: a small number of `metal`-feature
-  entrypoints need `#[cfg(...)]` guards to build without Metal.
-- No build-system CI: add a GitHub Actions Linux matrix that builds all
-  crates without `--features metal` and runs the CPU test suite.
+  entrypoints have been guarded, but they still need native Linux CI coverage.
+- Add build-system CI for the downstream CPU stack (`larql-inference`,
+  `larql-cli`) once the OpenBLAS setup is proven stable in compute CI.
 
 Expected result: `cargo build -p larql-cli` (no features) works on
 Ubuntu 22.04 / 24.04 x86_64 and aarch64, with CPU-only decode.
 
 ### Windows support
 **Effort**: Medium  
-**Status**: Not started
+**Status**: In progress — compute crate CI added; full CLI/inference support still open.
 
 Similar to Linux plus:
 - Path handling: a small number of `std::fs::File::create` /
   `PathBuf::join` calls use `/tmp/` or Unix paths — audit and fix.
 - Symbol visibility: `extern "C"` symbols from BLAS need checked on
-  MSVC (MKL) and MinGW (OpenBLAS).
-- CI: Windows matrix in GitHub Actions using `windows-2022`.
+  MSVC with vcpkg OpenBLAS. `larql-compute` CI now exercises this first.
+- Extend Windows CI beyond compute after native OpenBLAS linking is confirmed.
 
 Expected result: `cargo build -p larql-cli` works on Windows 11
 x86_64 (MSVC toolchain) with CPU-only decode.

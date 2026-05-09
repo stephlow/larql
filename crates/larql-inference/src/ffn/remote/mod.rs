@@ -55,7 +55,7 @@
 //!   12    M×4   output (f32[] LE)
 //! ```
 
-pub(crate) mod codec;
+pub mod codec;
 mod http;
 pub mod q8k_wire;
 pub mod sharded;

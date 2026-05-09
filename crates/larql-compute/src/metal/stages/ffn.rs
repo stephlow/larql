@@ -143,7 +143,7 @@ pub fn encode_gated(
     // produces correct, generative output for the same weights, so default
     // is now SEPARATED. Set `LARQL_FUSED_DOWN=1` to re-enable the fused
     // path for benchmarking once the kernel is fixed.
-    let use_fused = std::env::var("LARQL_FUSED_DOWN").is_ok();
+    let use_fused = crate::options::env_flag(crate::options::ENV_FUSED_DOWN);
     let fused_kernel = if use_fused {
         match (down_format, activation) {
             (crate::QuantFormat::Q4_K, Activation::SiLU) => fused_down.q4k_silu,

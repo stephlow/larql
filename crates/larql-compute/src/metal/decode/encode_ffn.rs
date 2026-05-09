@@ -221,22 +221,13 @@ impl MetalBackend {
             // = 47% peak on production). Opt-in while perf is being
             // measured; wins if A/B vs default (8sg) shows tok/s
             // improvement without breaking arch_golden parity.
-            let use_nr2 = matches!(
-                std::env::var("LARQL_GATE_UP_NR2").as_deref(),
-                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-            );
+            let use_nr2 = crate::options::env_opt_in(crate::options::ENV_GATE_UP_NR2);
             // `LARQL_GATE_UP_COOP=1`: cooperative scale-loading variant.
             // Tried 2026-05-01 — null end-to-end (kernel-isolated ALU
             // diagnosis was misleading). Kept opt-in.
-            let use_coop = matches!(
-                std::env::var("LARQL_GATE_UP_COOP").as_deref(),
-                Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-            );
-            let use_4sg = matches!(
-                std::env::var("LARQL_GATE_UP_8SG").as_deref(),
-                Ok("0") | Ok("false") | Ok("off") | Ok("no")
-            );
-            let use_f16 = std::env::var("LARQL_F16_ACC").is_ok();
+            let use_coop = crate::options::env_opt_in(crate::options::ENV_GATE_UP_COOP);
+            let use_4sg = crate::options::env_opt_out(crate::options::ENV_GATE_UP_8SG);
+            let use_f16 = crate::options::env_flag(crate::options::ENV_F16_ACC);
             let (pipeline, rows_per_tg, threads_per_tg) = if use_nr2 {
                 // NR0=2 wins over coop / 4sg / 8sg — newest under test.
                 (
@@ -323,7 +314,7 @@ impl MetalBackend {
             // a no-op (keeps the kernel and pipeline registered as
             // dead code for the investigation in
             // `larql-inference/ROADMAP.md` G-3 follow-up).
-            let use_fused_q6k_down = std::env::var("LARQL_FUSED_Q6K_DOWN").is_ok()
+            let use_fused_q6k_down = crate::options::env_flag(crate::options::ENV_FUSED_Q6K_DOWN)
                 && layer.down.format == crate::QuantFormat::Q6_K
                 && matches!(layer.activation, crate::Activation::GeluTanh);
             if use_fused_q6k_down {
@@ -348,9 +339,7 @@ impl MetalBackend {
                 );
             } else if layer.down.format == crate::QuantFormat::Q4_K
                 && inter_padded <= 16384
-                && std::env::var("LARQL_FUSED_DOWN")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
+                && crate::options::env_not_zero_or_default(crate::options::ENV_FUSED_DOWN, true)
             {
                 // Fused GEGLU+down for small-to-medium intermediate sizes.
                 //
@@ -760,7 +749,7 @@ impl MetalBackend {
             }
         } else if ffn_uses_q4k {
             if layer.is_gated() {
-                let use_fused_q6k = std::env::var("LARQL_FUSED_Q6K_DOWN").is_ok()
+                let use_fused_q6k = crate::options::env_flag(crate::options::ENV_FUSED_Q6K_DOWN)
                     && layer.down.format == crate::QuantFormat::Q6_K
                     && matches!(layer.activation, crate::Activation::GeluTanh);
                 if layer.down.format == crate::QuantFormat::Q4_K {

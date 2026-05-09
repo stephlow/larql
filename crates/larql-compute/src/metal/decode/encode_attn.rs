@@ -100,14 +100,9 @@ impl MetalBackend {
 
         // Env flags governing kernel-level fusion. Defaults preserve the
         // proven-win May-2026 fusion wave; opts-out are diagnostic only.
-        let use_fused_attn = matches!(
-            std::env::var("LARQL_FUSED_ATTN").as_deref(),
-            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-        );
-        let use_fused_qkn_rope = !matches!(
-            std::env::var("LARQL_FUSED_QK_NORM_ROPE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
+        let use_fused_attn = crate::options::env_opt_in(crate::options::ENV_FUSED_ATTN);
+        let use_fused_qkn_rope =
+            !crate::options::env_opt_out(crate::options::ENV_FUSED_QK_NORM_ROPE);
         let pos = kv_cache.layers[layer_idx].current_len as u32;
         let t_val = pos + 1;
         let attn_span = ops::kv_cache::attention_span(t_val, window_size);
@@ -123,14 +118,9 @@ impl MetalBackend {
         // encode_kv_append + encode_kv_attend path which handles arbitrary head_dim.
         let use_fused_kv_aa = attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
             && layer_head_dim <= MAX_HEAD_DIM_SINGLE_SG
-            && !matches!(
-                std::env::var("LARQL_FUSED_KV_APPEND_ATTEND").as_deref(),
-                Ok("0") | Ok("false") | Ok("off") | Ok("no")
-            );
-        let use_fused_post_attn = !matches!(
-            std::env::var("LARQL_FUSED_POST_ATTN_NORM").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
+            && !crate::options::env_opt_out(crate::options::ENV_FUSED_KV_APPEND_ATTEND);
+        let use_fused_post_attn =
+            !crate::options::env_opt_out(crate::options::ENV_FUSED_POST_ATTN_NORM);
 
         // Path 1: full attention fusion. Skips both qk_norm_rope dispatch AND
         // kv_append_attend_fused dispatch — handles them in `attn_fused`.

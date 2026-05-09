@@ -25,6 +25,60 @@ pub const ENV_SKIP_MOE_LEGACY: &str = "SKIP_MOE";
 pub const ENV_MOE_DEBUG: &str = "LARQL_MOE_DEBUG";
 /// Legacy MoE route/debug output toggle. Prefer [`ENV_MOE_DEBUG`].
 pub const ENV_MOE_DEBUG_LEGACY: &str = "MOE_DEBUG";
+/// Enable Metal MoE dispatch timing.
+pub const ENV_METAL_MOE_TIMING: &str = "LARQL_MOE_TIMING";
+/// Select the 8-simdgroup Q4_K matvec kernel; set to a false value to opt out.
+pub const ENV_Q4K_MATVEC_8SG: &str = "LARQL_Q4K_MATVEC_8SG";
+/// Opt in to the 8-simdgroup Q6_K matvec kernel.
+pub const ENV_Q6K_8SG: &str = "LARQL_Q6K_8SG";
+/// Opt in to fused attention.
+pub const ENV_FUSED_ATTN: &str = "LARQL_FUSED_ATTN";
+/// Disable fused QK-norm + RoPE when set to a false value.
+pub const ENV_FUSED_QK_NORM_ROPE: &str = "LARQL_FUSED_QK_NORM_ROPE";
+/// Disable fused KV append + attend when set to a false value.
+pub const ENV_FUSED_KV_APPEND_ATTEND: &str = "LARQL_FUSED_KV_APPEND_ATTEND";
+/// Disable fused post-attention norm when set to a false value.
+pub const ENV_FUSED_POST_ATTN_NORM: &str = "LARQL_FUSED_POST_ATTN_NORM";
+/// Disable fused post-FFN norm when set to a false value.
+pub const ENV_FUSED_POST_FFN_NORM: &str = "LARQL_FUSED_POST_FFN_NORM";
+/// Opt in to the NR2 gate+up kernel variant.
+pub const ENV_GATE_UP_NR2: &str = "LARQL_GATE_UP_NR2";
+/// Opt in to the cooperative gate+up kernel variant.
+pub const ENV_GATE_UP_COOP: &str = "LARQL_GATE_UP_COOP";
+/// Select the 8-simdgroup gate+up kernel; set to a false value to opt out.
+pub const ENV_GATE_UP_8SG: &str = "LARQL_GATE_UP_8SG";
+/// Opt in to f16 accumulation for the legacy gate+up kernel.
+pub const ENV_F16_ACC: &str = "LARQL_F16_ACC";
+/// Opt in to experimental fused Q6_K down routing.
+pub const ENV_FUSED_Q6K_DOWN: &str = "LARQL_FUSED_Q6K_DOWN";
+/// Fused Q4_K down routing toggle. Existing decode code only treats `0` as off.
+pub const ENV_FUSED_DOWN: &str = "LARQL_FUSED_DOWN";
+/// Print the Q4_K quant-matvec dispatch route.
+pub const ENV_DBG_QM: &str = "LARQL_DBG_QM";
+/// One-line summary for the first few Metal decode calls.
+pub const ENV_DECODE_DEBUG: &str = "DECODE_DEBUG";
+/// Dump per-layer residuals to a binary file.
+pub const ENV_DUMP_RESIDUALS: &str = "LARQL_DUMP_RESIDUALS";
+/// Stop Metal decode at this layer and dump intermediate buffers.
+pub const ENV_DECODE_DIAG_LAYER: &str = "LARQL_DECODE_DIAG_LAYER";
+/// Dump Gemma-4-MoE layer-0 intermediates.
+pub const ENV_DUMP_L0: &str = "LARQL_DUMP_L0";
+/// Force per-layer NaN diagnostics in Metal decode.
+pub const ENV_DEBUG_NAN_LAYERS: &str = "LARQL_DEBUG_NAN_LAYERS";
+/// Dump Metal decode layer outputs.
+pub const ENV_DECODE_DUMP_LAYERS: &str = "LARQL_DECODE_DUMP_LAYERS";
+/// Dump Metal full-pipeline layer outputs.
+pub const ENV_METAL_DUMP_LAYERS: &str = "LARQL_METAL_DUMP_LAYERS";
+/// Layer index for stage-level dump helpers.
+pub const ENV_STAGE_DUMP_LAYER: &str = "LARQL_STAGE_DUMP_LAYER";
+/// Print GPU-side command-buffer timing.
+pub const ENV_GPU_TIMING: &str = "LARQL_GPU_TIMING";
+/// Request paired commit/wait decode stage profiling.
+pub const ENV_PROFILE_SPLIT: &str = "LARQL_PROFILE_SPLIT";
+/// Legacy alias for [`ENV_PROFILE_SPLIT`].
+pub const ENV_DECODE_STAGE_TIMING: &str = "LARQL_DECODE_STAGE_TIMING";
+/// Debug-only outer norm bypass in Metal MoE combine.
+pub const ENV_SKIP_OUTER_NORM: &str = "SKIP_OUTER_NORM";
 
 pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some()
@@ -38,10 +92,161 @@ pub(crate) fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse().ok()
 }
 
+#[allow(dead_code)]
+pub(crate) fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+#[allow(dead_code)]
+pub(crate) fn env_nonempty_value(name: &str) -> Option<String> {
+    env_value(name).filter(|value| !value.is_empty())
+}
+
+#[allow(dead_code)]
+pub(crate) fn env_opt_in(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn env_opt_out(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn env_not_zero_or_default(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|value| value != "0")
+        .unwrap_or(default)
+}
+
 pub(crate) fn moe_debug_enabled() -> bool {
     env_flag_any(&[ENV_MOE_DEBUG, ENV_MOE_DEBUG_LEGACY])
 }
 
 pub(crate) fn skip_moe_enabled() -> bool {
     env_flag_any(&[ENV_SKIP_MOE, ENV_SKIP_MOE_LEGACY])
+}
+
+#[allow(dead_code)]
+pub(crate) fn split_profile_requested() -> bool {
+    env_flag_any(&[ENV_PROFILE_SPLIT, ENV_DECODE_STAGE_TIMING])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_vars<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env test mutex poisoned");
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let result = f();
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        result
+    }
+
+    fn with_env<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        with_env_vars(&[(name, value)], f)
+    }
+
+    #[test]
+    fn env_flag_and_value_helpers_read_presence_and_content() {
+        with_env(ENV_GPU_TIMING, Some("1"), || {
+            assert!(env_flag(ENV_GPU_TIMING));
+            assert_eq!(env_value(ENV_GPU_TIMING).as_deref(), Some("1"));
+            assert_eq!(env_nonempty_value(ENV_GPU_TIMING).as_deref(), Some("1"));
+        });
+
+        with_env(ENV_GPU_TIMING, Some(""), || {
+            assert!(env_flag(ENV_GPU_TIMING));
+            assert_eq!(env_value(ENV_GPU_TIMING).as_deref(), Some(""));
+            assert!(env_nonempty_value(ENV_GPU_TIMING).is_none());
+        });
+
+        with_env(ENV_GPU_TIMING, None, || {
+            assert!(!env_flag(ENV_GPU_TIMING));
+            assert!(env_value(ENV_GPU_TIMING).is_none());
+        });
+    }
+
+    #[test]
+    fn env_numeric_and_boolean_helpers_parse_expected_forms() {
+        with_env(ENV_STAGE_DUMP_LAYER, Some("7"), || {
+            assert_eq!(env_usize(ENV_STAGE_DUMP_LAYER), Some(7));
+        });
+        with_env(ENV_STAGE_DUMP_LAYER, Some("not-a-number"), || {
+            assert_eq!(env_usize(ENV_STAGE_DUMP_LAYER), None);
+        });
+
+        for value in ["1", "true", "on", "yes"] {
+            with_env(ENV_FUSED_ATTN, Some(value), || {
+                assert!(env_opt_in(ENV_FUSED_ATTN));
+                assert!(!env_opt_out(ENV_FUSED_ATTN));
+            });
+        }
+
+        for value in ["0", "false", "off", "no"] {
+            with_env(ENV_FUSED_ATTN, Some(value), || {
+                assert!(!env_opt_in(ENV_FUSED_ATTN));
+                assert!(env_opt_out(ENV_FUSED_ATTN));
+            });
+        }
+
+        with_env(ENV_FUSED_DOWN, None, || {
+            assert!(env_not_zero_or_default(ENV_FUSED_DOWN, true));
+            assert!(!env_not_zero_or_default(ENV_FUSED_DOWN, false));
+        });
+        with_env(ENV_FUSED_DOWN, Some("0"), || {
+            assert!(!env_not_zero_or_default(ENV_FUSED_DOWN, true));
+        });
+        with_env(ENV_FUSED_DOWN, Some("1"), || {
+            assert!(env_not_zero_or_default(ENV_FUSED_DOWN, false));
+        });
+    }
+
+    #[test]
+    fn legacy_alias_helpers_still_work() {
+        with_env_vars(
+            &[(ENV_SKIP_MOE, None), (ENV_SKIP_MOE_LEGACY, Some("1"))],
+            || {
+                assert!(skip_moe_enabled());
+            },
+        );
+        with_env_vars(
+            &[(ENV_MOE_DEBUG, Some("1")), (ENV_MOE_DEBUG_LEGACY, None)],
+            || {
+                assert!(moe_debug_enabled());
+            },
+        );
+        with_env_vars(
+            &[
+                (ENV_PROFILE_SPLIT, None),
+                (ENV_DECODE_STAGE_TIMING, Some("1")),
+            ],
+            || {
+                assert!(split_profile_requested());
+            },
+        );
+    }
 }

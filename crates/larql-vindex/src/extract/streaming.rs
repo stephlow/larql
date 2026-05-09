@@ -18,6 +18,7 @@ use crate::config::types::QuantFormat;
 use crate::config::{VindexConfig, VindexLayerInfo, VindexModelConfig};
 use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
+use crate::extract::constants::FEATURE_PROJECTION_BATCH;
 use crate::format::filenames::*;
 
 /// Mmap'd safetensors file — kept alive for the duration of extraction.
@@ -511,7 +512,7 @@ pub fn build_vindex_streaming(
         let mut feature_offset = 0usize;
         for w_down in &down_matrices {
             let num_features = w_down.shape()[1];
-            let batch_size = 1024;
+            let batch_size = FEATURE_PROJECTION_BATCH;
 
             for batch_start in (0..num_features).step_by(batch_size) {
                 let batch_end = (batch_start + batch_size).min(num_features);

@@ -1,4 +1,4 @@
-.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-fmt-check larql-compute-lint larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
+.PHONY: build release test test-fast test-full test-integration test-models check clean fmt lint demos bench bench-core bench-inference bench-compute bench-wire bench-routing bench-grid bench-all bench-vindex bench-vindex-scaling bench-save bench-check coverage coverage-summary larql-core-ci larql-core-test larql-core-fmt-check larql-core-lint larql-core-feature-test larql-core-bench-test larql-core-bench larql-core-examples larql-core-coverage larql-core-coverage-html larql-models-ci larql-models-test larql-models-fmt-check larql-models-lint larql-models-coverage-summary larql-models-bench-test larql-vindex-ci larql-vindex-test larql-vindex-fmt-check larql-vindex-lint larql-vindex-examples larql-vindex-bench-test larql-vindex-bench larql-vindex-coverage larql-vindex-coverage-summary larql-vindex-coverage-html larql-vindex-coverage-policy larql-compute-test larql-compute-test-fast larql-compute-test-integration larql-compute-fmt-check larql-compute-lint larql-compute-coverage larql-compute-coverage-summary larql-compute-coverage-html larql-compute-coverage-policy larql-compute-ci larql-boundary-ci larql-boundary-test larql-boundary-fmt-check larql-boundary-lint larql-boundary-bench-test larql-boundary-examples
 
 # Build
 build:
@@ -101,9 +101,9 @@ larql-models-ci: larql-models-fmt-check larql-models-lint larql-models-test larq
 
 # larql-vindex - vindex extraction, storage, load/save, patch overlays
 #
-# Current local baseline: 68.18% line coverage from cargo-llvm-cov.
+# Current local baseline: 71.56% line coverage from cargo-llvm-cov.
 # Keep this as a ratchet: raise it when new coverage lands.
-LARQL_VINDEX_COVERAGE_MIN ?= 68
+LARQL_VINDEX_COVERAGE_MIN ?= 71
 LARQL_VINDEX_COVERAGE_POLICY ?= crates/larql-vindex/coverage-policy.json
 LARQL_VINDEX_COVERAGE_REPORT ?= coverage/larql-vindex/summary.json
 
@@ -167,11 +167,20 @@ larql-vindex-coverage-html:
 larql-vindex-ci: larql-vindex-fmt-check larql-vindex-lint larql-vindex-test larql-vindex-examples larql-vindex-bench-test larql-vindex-coverage-summary
 
 # larql-compute — CPU/Metal kernels and backend contracts
+#
+# Current local default-feature baseline: 67.72% line coverage from
+# cargo-llvm-cov. Keep this as a ratchet and raise it as per-file debt
+# baselines move toward the 90% default policy.
+LARQL_COMPUTE_COVERAGE_MIN ?= 67
+LARQL_COMPUTE_COVERAGE_POLICY ?= crates/larql-compute/coverage-policy.json
+LARQL_COMPUTE_COVERAGE_REPORT ?= coverage/larql-compute/summary.json
+
 larql-compute-test: larql-compute-test-fast
 
 larql-compute-test-fast:
 	cargo test -p larql-compute --lib
 	cargo test -p larql-compute --test test_backend_matmul_quant
+	cargo test -p larql-compute --test test_pipeline_and_moe
 
 larql-compute-test-integration:
 	cargo test -p larql-compute --tests
@@ -181,6 +190,45 @@ larql-compute-fmt-check:
 
 larql-compute-lint:
 	cargo clippy -p larql-compute --all-targets -- -D warnings
+
+larql-compute-coverage-policy:
+	@if [ ! -f "$(LARQL_COMPUTE_COVERAGE_REPORT)" ]; then \
+		echo "Coverage report not found: $(LARQL_COMPUTE_COVERAGE_REPORT)"; \
+		echo "Run: make larql-compute-coverage-summary"; \
+		exit 1; \
+	fi
+	python3 scripts/check_coverage_policy.py $(LARQL_COMPUTE_COVERAGE_REPORT) $(LARQL_COMPUTE_COVERAGE_POLICY)
+
+larql-compute-coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-compute --fail-under-lines $(LARQL_COMPUTE_COVERAGE_MIN)
+	@mkdir -p coverage/larql-compute
+	cargo llvm-cov report --package larql-compute --json --summary-only --output-path $(LARQL_COMPUTE_COVERAGE_REPORT)
+	$(MAKE) larql-compute-coverage-policy
+
+larql-compute-coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package larql-compute --summary-only --fail-under-lines $(LARQL_COMPUTE_COVERAGE_MIN)
+	@mkdir -p coverage/larql-compute
+	cargo llvm-cov report --package larql-compute --json --summary-only --output-path $(LARQL_COMPUTE_COVERAGE_REPORT)
+	$(MAKE) larql-compute-coverage-policy
+
+larql-compute-coverage-html:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; exit 1; \
+	fi
+	cargo llvm-cov --package larql-compute --html --output-dir coverage/larql-compute --fail-under-lines $(LARQL_COMPUTE_COVERAGE_MIN)
+	cargo llvm-cov report --package larql-compute --json --summary-only --output-path $(LARQL_COMPUTE_COVERAGE_REPORT)
+	$(MAKE) larql-compute-coverage-policy
+	@echo "Report: coverage/larql-compute/html/index.html"
 
 larql-compute-ci: larql-compute-fmt-check larql-compute-lint larql-compute-test-fast
 

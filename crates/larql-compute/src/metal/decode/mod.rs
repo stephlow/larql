@@ -245,9 +245,8 @@ impl MetalBackend {
         // Diagnostic: run only up to (and including) the specified layer,
         // then dump intermediates and exit. Pinpoints which sub-stage in
         // which layer first produces NaN on real-vindex decode.
-        let diag_stop_layer: Option<usize> = std::env::var("LARQL_DECODE_DIAG_LAYER")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+        let diag_stop_layer: Option<usize> =
+            crate::options::env_usize(crate::options::ENV_DECODE_DIAG_LAYER);
 
         for l in 0..num_layers {
             let layer = &layers[l];
@@ -263,7 +262,7 @@ impl MetalBackend {
                 None
             };
             let dump_l0_dir = if l == 0 {
-                std::env::var("LARQL_DUMP_L0").ok()
+                crate::options::env_value(crate::options::ENV_DUMP_L0)
             } else {
                 None
             };
@@ -399,10 +398,8 @@ impl MetalBackend {
                     inter,
                     inter_padded,
                 };
-                let use_fused_post_ffn = !matches!(
-                    std::env::var("LARQL_FUSED_POST_FFN_NORM").as_deref(),
-                    Ok("0") | Ok("false") | Ok("off") | Ok("no")
-                );
+                let use_fused_post_ffn =
+                    !crate::options::env_opt_out(crate::options::ENV_FUSED_POST_FFN_NORM);
                 let post_ffn_bufs = encode_post_ffn::PostFfnBufs {
                     down_out: &down_out,
                     h_post_attn: &h_post_attn,
@@ -454,7 +451,7 @@ impl MetalBackend {
 
             // Per-layer NaN diagnostic (LARQL_DEBUG_NAN_LAYERS=1).
             // Forces a commit+wait per layer — expensive, debug-only.
-            if std::env::var("LARQL_DEBUG_NAN_LAYERS").is_ok() {
+            if crate::options::env_flag(crate::options::ENV_DEBUG_NAN_LAYERS) {
                 if !encoder_ended {
                     enc.end_encoding();
                 }
@@ -547,7 +544,7 @@ impl MetalBackend {
             // commit above is what makes these reads consistent — the
             // scratch buffers persist across layers, so without the
             // per-layer flush we'd be reading the *last* layer's value.
-            if let Ok(dir) = std::env::var("LARQL_DECODE_DUMP_LAYERS") {
+            if let Some(dir) = crate::options::env_value(crate::options::ENV_DECODE_DUMP_LAYERS) {
                 if !encoder_ended {
                     enc.end_encoding();
                     cmd.commit();
@@ -565,10 +562,8 @@ impl MetalBackend {
                 // `LARQL_STAGE_DUMP_LAYER` (default 0). Helper lives in
                 // `diag.rs`; the bundle of references is the same one
                 // the early-exit diag mode uses.
-                let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+                let stage_layer =
+                    crate::options::env_usize(crate::options::ENV_STAGE_DUMP_LAYER).unwrap_or(0);
                 if l == stage_layer {
                     let bufs = diag::LayerDiagBufs {
                         norm_f32_buf: &norm_f32_buf,

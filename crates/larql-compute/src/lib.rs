@@ -70,8 +70,10 @@ pub mod metal;
 // ── Re-exports: pipeline types ──
 
 pub use pipeline::{
-    Activation, FfnType, FullPipelineLayer, MoeLayerWeights, NormType, PositionEncodingType,
-    QuantFormat, QuantWeight, RMSNORM_EPSILON_DEFAULT, ROPE_BASE_DEFAULT, ROPE_BASE_GLOBAL,
+    Activation, AttentionSpec, AttentionWeights, FfnSpec, FfnType, FfnWeights, FullPipelineLayer,
+    LayerNorms, LayerWeights, MoeLayerWeights, MoeSpec, NormType, PositionEncodingType,
+    QuantFormat, QuantWeight, RemoteFfnSpec, RMSNORM_EPSILON_DEFAULT, ROPE_BASE_DEFAULT,
+    ROPE_BASE_GLOBAL,
 };
 
 // ── Re-exports: backend ──
@@ -141,4 +143,28 @@ pub fn default_backend() -> Box<dyn ComputeBackend> {
 /// CPU vs GPU paths.
 pub fn cpu_backend() -> Box<dyn ComputeBackend> {
     Box::new(cpu::CpuBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_backend_exposes_cpu_backend_capabilities() {
+        let backend = cpu_backend();
+
+        assert!(backend.name().starts_with("cpu"));
+        assert!(!backend.device_info().is_empty());
+        assert!(backend.supports(Capability::QuantMatVec));
+    }
+
+    #[test]
+    fn default_backend_is_usable_through_prelude_traits() {
+        fn assert_compute_backend<T: prelude::ComputeBackend + ?Sized>(backend: &T) {
+            assert!(backend.supports(prelude::Capability::QuantMatVec));
+        }
+
+        let backend = default_backend();
+        assert_compute_backend(backend.as_ref());
+    }
 }

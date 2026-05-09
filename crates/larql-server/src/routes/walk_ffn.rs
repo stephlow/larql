@@ -965,7 +965,7 @@ pub async fn handle_walk_ffn_q8k(
         let start = std::time::Instant::now();
 
         // ── Metal GPU dispatch path ───────────────────────────────────────
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         {
             let backend_opt = model
                 .metal_backend

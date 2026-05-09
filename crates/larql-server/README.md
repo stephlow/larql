@@ -1474,7 +1474,7 @@ larql-server/
         │   │                   (POST /v1/experts/layer-batch[-f16])
         │   ├── cpu.rs          run_experts_cpu_batch (rayon CPU dispatch)
         │   ├── metal.rs        run_experts_metal_batch
-        │   │                   (#[cfg(feature = "metal-experts")])
+        │   │                   (#[cfg(all(feature = "metal-experts", target_os = "macos"))])
         │   └── warmup.rs       warmup_hnsw_unit_cache,
         │                       warmup_metal_expert_cache
         ├── topology.rs         GET /v1/expert/topology (shard advertisement)

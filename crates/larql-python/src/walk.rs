@@ -266,6 +266,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        position_embed: None,
         num_layers: config.num_layers,
         hidden_size: config.hidden_size,
         intermediate_size: config.intermediate_size,

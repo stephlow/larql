@@ -703,10 +703,12 @@ mod tests {
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+            metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         })
     }
 

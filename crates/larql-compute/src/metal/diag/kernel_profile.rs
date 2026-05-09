@@ -152,7 +152,7 @@ fn measure_single_cmdbuf_batched(
 ///
 /// Returns one `KernelResult` per kernel. Prints a formatted table to stdout.
 /// Pass `n_layers=34` for Gemma 3 4B, `warmup=5`, `iters=50` for reliable numbers.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelResult> {
     use crate::{
         cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k},

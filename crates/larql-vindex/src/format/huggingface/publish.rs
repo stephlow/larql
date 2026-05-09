@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use crate::error::VindexError;
 use crate::format::filenames::*;
 
+const HF_PREUPLOAD_SAMPLE_BYTES: usize = 512;
+
 /// Options controlling [`publish_vindex_with_opts`]. Kept as a struct so
 /// the signature can grow without breaking callers.
 #[derive(Clone, Debug)]
@@ -397,9 +399,9 @@ fn preupload_decide(
     use base64::Engine;
     use std::io::Read;
 
-    // Read up to 512 bytes for the format-sniff sample. HF accepts a
+    // Read up to the configured byte count for the format-sniff sample. HF accepts a
     // smaller sample for small files without complaint.
-    let mut sample_buf = vec![0u8; 512.min(size as usize)];
+    let mut sample_buf = vec![0u8; HF_PREUPLOAD_SAMPLE_BYTES.min(size as usize)];
     if !sample_buf.is_empty() {
         let mut file = std::fs::File::open(local_path)?;
         file.read_exact(&mut sample_buf)?;

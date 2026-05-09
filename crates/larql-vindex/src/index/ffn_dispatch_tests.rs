@@ -11,7 +11,10 @@
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Mutex;
 
-use super::types::{FeatureMeta, GateIndex};
+use super::types::{
+    FeatureMeta, FfnRowAccess, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides,
+    QuantizedFfnAccess,
+};
 
 /// Test-only GateIndex implementation. Each backend flag controls
 /// whether that layer fires; `last` tracks the dispatch trail.
@@ -48,7 +51,7 @@ impl Mock {
     }
 }
 
-impl GateIndex for Mock {
+impl GateLookup for Mock {
     fn gate_knn(&self, _layer: usize, _residual: &Array1<f32>, _top_k: usize) -> Vec<(usize, f32)> {
         vec![]
     }
@@ -58,7 +61,11 @@ impl GateIndex for Mock {
     fn num_features(&self, _layer: usize) -> usize {
         8
     }
+}
 
+impl PatchOverrides for Mock {}
+
+impl Fp4FfnAccess for Mock {
     fn has_fp4_storage(&self) -> bool {
         self.fp4_on
     }
@@ -94,7 +101,9 @@ impl GateIndex for Mock {
         out.fill(42.0);
         true
     }
+}
 
+impl NativeFfnAccess for Mock {
     fn up_layer_matrix(&self, _layer: usize) -> Option<ArrayView2<'_, f32>> {
         self.native_up.as_ref().map(|m| m.view())
     }
@@ -107,7 +116,9 @@ impl GateIndex for Mock {
             .filter(|m| feat < m.nrows())
             .and_then(|m| m.row(feat).to_slice())
     }
+}
 
+impl QuantizedFfnAccess for Mock {
     fn has_interleaved_q4k(&self) -> bool {
         self.q4k_on
     }

@@ -360,11 +360,11 @@ pub fn load_single_vindex(
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
         moe_remote: opts.moe_remote.clone(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     })
 }
@@ -866,7 +866,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     }
 
     // Metal expert cache warmup (cfg=metal-experts only).
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     for m in &state.models {
         if m.expert_filter.is_none() {
             continue;

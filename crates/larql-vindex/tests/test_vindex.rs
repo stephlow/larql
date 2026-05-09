@@ -1,7 +1,9 @@
 //! Tests for the larql-vindex crate.
 
 use larql_vindex::format::filenames::*;
-use larql_vindex::{FeatureMeta, GateIndex, VectorIndex, VindexConfig, VindexLayerInfo};
+use larql_vindex::{
+    FeatureMeta, GateIndex, PatchOverrides, VectorIndex, VindexConfig, VindexLayerInfo,
+};
 use ndarray::{ArcArray2, Array1, Array2};
 
 fn make_top_k(token: &str, id: u32, logit: f32) -> larql_models::TopKEntry {
@@ -283,7 +285,6 @@ fn down_overrides_starts_empty() {
 
 #[test]
 fn set_down_vector_records_override() {
-    use larql_vindex::GateIndex;
     let mut idx = test_index();
     let v = vec![0.1, 0.2, 0.3, 0.4];
     idx.set_down_vector(0, 1, v.clone());
@@ -1915,6 +1916,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        position_embed: None,
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,

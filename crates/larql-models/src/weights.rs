@@ -66,6 +66,10 @@ pub struct ModelWeights {
     /// Output projection matrix. Same as embed if tie_word_embeddings=true,
     /// separate lm_head.weight otherwise.
     pub lm_head: WeightArray,
+    /// Learned absolute positional embeddings, when the architecture uses
+    /// them (GPT-2 / `wpe`). `None` for rotary or no-positional models.
+    /// Indexed by token position; columns are hidden_size.
+    pub position_embed: Option<WeightArray>,
     pub arch: Box<dyn ModelArchitecture>,
     // Cached from arch.config() for convenience — these are hot-path values.
     pub num_layers: usize,

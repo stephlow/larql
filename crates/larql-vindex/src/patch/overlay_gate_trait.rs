@@ -1,7 +1,8 @@
-//! `impl GateIndex for PatchedVindex` — the trait conformance that
-//! lets the patch overlay slot in wherever a `GateIndex` is expected
-//! (also implemented by `VectorIndex`). Pulled out of `overlay.rs` so
-//! the file holding `PatchedVindex`'s own API stays focused.
+//! Capability-trait conformance for `PatchedVindex`, letting the patch
+//! overlay slot in wherever `GateLookup`, `PatchOverrides`, FFN access
+//! traits, or compatibility `GateIndex` are expected. Pulled out of
+//! `overlay.rs` so the file holding `PatchedVindex`'s own API stays
+//! focused.
 //!
 //! Most methods forward to the inherent `PatchedVindex` impl;
 //! `gate_override` reads from the patch overlay (not the base) and
@@ -10,11 +11,13 @@
 
 use ndarray::Array1;
 
-use crate::index::{FeatureMeta, GateIndex};
+use crate::index::{
+    FeatureMeta, Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess,
+};
 
 use super::overlay::PatchedVindex;
 
-impl GateIndex for PatchedVindex {
+impl GateLookup for PatchedVindex {
     fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
         self.gate_knn(layer, residual, top_k)
     }
@@ -27,6 +30,48 @@ impl GateIndex for PatchedVindex {
         self.num_features(layer)
     }
 
+    fn gate_scores_batch(
+        &self,
+        layer: usize,
+        x: &ndarray::Array2<f32>,
+    ) -> Option<ndarray::Array2<f32>> {
+        self.base.gate_scores_batch(layer, x)
+    }
+
+    fn gate_scores_batch_backend(
+        &self,
+        layer: usize,
+        x: &ndarray::Array2<f32>,
+        backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> Option<ndarray::Array2<f32>> {
+        self.base.gate_scores_batch_backend(layer, x, backend)
+    }
+
+    fn gate_knn_batch(&self, layer: usize, x: &ndarray::Array2<f32>, top_k: usize) -> Vec<usize> {
+        // The base impl runs a BLAS gemm against the disk-side gate
+        // matrix and ignores the patch overlay — so any feature with
+        // an overridden gate (e.g. an INSERT slot) wouldn't be in the
+        // candidate set. Re-rank per row using the per-row `gate_knn`
+        // path, which `PatchedVindex::gate_knn` overrides correctly.
+        // Returns the union of selected feature indices across all
+        // rows, deduplicated.
+        if self.overrides_gate.iter().all(|((l, _), _)| *l != layer) {
+            // No overrides at this layer — base path is correct.
+            return self.base.gate_knn_batch(layer, x, top_k);
+        }
+        let mut selected = std::collections::BTreeSet::<usize>::new();
+        for s in 0..x.shape()[0] {
+            let row = x.row(s).to_owned();
+            let hits = self.gate_knn(layer, &row, top_k);
+            for (feat, _) in hits {
+                selected.insert(feat);
+            }
+        }
+        selected.into_iter().collect()
+    }
+}
+
+impl PatchOverrides for PatchedVindex {
     fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
         self.base.down_override(layer, feature)
     }
@@ -47,7 +92,9 @@ impl GateIndex for PatchedVindex {
     fn has_overrides_at(&self, layer: usize) -> bool {
         self.overrides_gate.keys().any(|(l, _)| *l == layer) || self.base.has_overrides_at(layer)
     }
+}
 
+impl NativeFfnAccess for PatchedVindex {
     fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
         self.base.down_feature_vector(layer, feature)
     }
@@ -58,23 +105,6 @@ impl GateIndex for PatchedVindex {
 
     fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
         self.base.down_layer_matrix(layer)
-    }
-
-    fn gate_scores_batch(
-        &self,
-        layer: usize,
-        x: &ndarray::Array2<f32>,
-    ) -> Option<ndarray::Array2<f32>> {
-        self.base.gate_scores_batch(layer, x)
-    }
-
-    fn gate_scores_batch_backend(
-        &self,
-        layer: usize,
-        x: &ndarray::Array2<f32>,
-        backend: Option<&dyn larql_compute::ComputeBackend>,
-    ) -> Option<ndarray::Array2<f32>> {
-        self.base.gate_scores_batch_backend(layer, x, backend)
     }
 
     fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
@@ -100,7 +130,9 @@ impl GateIndex for PatchedVindex {
     fn interleaved_down(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
         self.base.interleaved_down(layer)
     }
+}
 
+impl QuantizedFfnAccess for PatchedVindex {
     fn has_interleaved_q4(&self) -> bool {
         self.base.has_interleaved_q4()
     }
@@ -195,9 +227,9 @@ impl GateIndex for PatchedVindex {
         self.base
             .q4k_matmul_transb(layer, component, x, x_rows, backend)
     }
+}
 
-    // ── FP4 / FP8 FFN storage (exp 26) ─────────────────────────────────────
-
+impl Fp4FfnAccess for PatchedVindex {
     fn has_fp4_storage(&self) -> bool {
         self.base.has_fp4_storage()
     }
@@ -232,33 +264,5 @@ impl GateIndex for PatchedVindex {
         out: &mut [f32],
     ) -> bool {
         self.base.fp4_ffn_row_into(layer, component, feat, out)
-    }
-
-    // The unified `ffn_row_*` methods use the default dispatch impl in
-    // GateIndex. PatchedVindex never intercepts them directly; overrides
-    // land through `up_override` / `down_override` in the walk kernel and
-    // through the underlying backend accessors above.
-
-    fn gate_knn_batch(&self, layer: usize, x: &ndarray::Array2<f32>, top_k: usize) -> Vec<usize> {
-        // The base impl runs a BLAS gemm against the disk-side gate
-        // matrix and ignores the patch overlay — so any feature with
-        // an overridden gate (e.g. an INSERT slot) wouldn't be in the
-        // candidate set. Re-rank per row using the per-row `gate_knn`
-        // path, which `PatchedVindex::gate_knn` overrides correctly.
-        // Returns the union of selected feature indices across all
-        // rows, deduplicated.
-        if self.overrides_gate.iter().all(|((l, _), _)| *l != layer) {
-            // No overrides at this layer — base path is correct.
-            return self.base.gate_knn_batch(layer, x, top_k);
-        }
-        let mut selected = std::collections::BTreeSet::<usize>::new();
-        for s in 0..x.shape()[0] {
-            let row = x.row(s).to_owned();
-            let hits = self.gate_knn(layer, &row, top_k);
-            for (feat, _) in hits {
-                selected.insert(feat);
-            }
-        }
-        selected.into_iter().collect()
     }
 }

@@ -11,8 +11,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use larql_inference::ffn::remote::codec::{
-    decode_binary_batch, decode_binary_batch_f16, decode_binary_single, decode_binary_single_f16,
-    encode_binary_request,
+    decode_binary_single, decode_binary_single_f16, encode_binary_request,
 };
 
 // Hidden sizes from real models (architecture-agnostic labelling).

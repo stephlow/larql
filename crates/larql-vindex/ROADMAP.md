@@ -2,7 +2,7 @@
 
 ## Current state (as of 2026-05-08)
 
-- **515 tests listed** on `larql-vindex` (`cargo test -p
+- **525 tests listed** on `larql-vindex` (`cargo test -p
   larql-vindex -- --list`). Crate-local checks are wired through
   `make larql-vindex-ci`: fmt, clippy `-D warnings`, tests, example
   compile checks, bench compile/tests, and coverage policy.
@@ -18,7 +18,9 @@
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
   - `config/{index,quantization,model,compliance,dtype}.rs` — was the
     624-line `types.rs` monolith
-  - No non-test `.rs` file > 600 lines (down from 1366 monolith).
+  - Large-file debt is now concentrated in `extract/build.rs` and
+    `format/huggingface/publish.rs`; other former monoliths have been
+    split into focused modules.
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
   one table entry plus codec functions; ~3-file edit. Block sizes flow
   through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS` (round-4 M4).
@@ -51,9 +53,10 @@
 - `make larql-vindex-coverage-summary` + `make
   larql-vindex-coverage-html` (cargo-llvm-cov) enforce both the
   aggregate line floor and `coverage-policy.json`.
-- **Coverage ratchet**: aggregate floor is 68% lines from the
-  2026-05-08 baseline. Per-source-file default is 90%; files below
-  that are explicit debt baselines and should only move upward.
+- **Coverage ratchet**: aggregate floor is 71% lines from the
+  2026-05-08 baseline of 71.56%. Per-source-file default is 90%;
+  files below that are explicit debt baselines and should only move
+  upward.
 - **Cross-platform CI**: `.github/workflows/larql-vindex.yml` runs
   format, check, examples, clippy, tests, and bench compile/tests on
   Linux, Windows, and macOS. Coverage policy runs on Ubuntu.
@@ -63,6 +66,38 @@
 ---
 
 ## P0: Active
+
+### Modularity + magic-literal debt
+
+**Status**: Active from the 2026-05-09 review.
+
+The remaining cleanup is concentrated in a few production paths:
+
+- Replace architecture-specific extraction literals with existing model
+  policy. Dense clustering must use `LayerBands::for_family(...).knowledge`
+  instead of hard-coded layer ranges.
+- Keep vindex file layout literals in `format::filenames`; remaining
+  `down_meta.jsonl` and PLE weight-file call sites should route through
+  constants.
+- Replace stringly typed config fields such as `ffn_layout:
+  "per_layer"` with serde enums.
+- Lift algorithm parameters into named constants/config structs:
+  extraction batch sizes, relation-cluster cap, k-means iterations, and
+  HNSW graph construction parameters.
+- Continue large-file decomposition. Priority files: `extract/build.rs`,
+  `format/huggingface/publish.rs`, `extract/streaming.rs`,
+  `format/weights/write_q4k/mod.rs`, `format/weights/load.rs`,
+  `index/core.rs`, and `index/types.rs`.
+- 2026-05-09: `GateIndex` split into narrower capability traits
+  (`GateLookup`, `PatchOverrides`, `NativeFfnAccess`,
+  `QuantizedFfnAccess`, `Fp4FfnAccess`, `FfnRowAccess`) while keeping
+  `GateIndex` as the compatibility composition for existing trait-object
+  consumers.
+
+**Acceptance bar:** no remaining production filename/layout magic
+strings for vindex-owned files, extraction remains model-family
+agnostic, `GateIndex` is split into narrower capability traits, and no
+new module grows past the current large-file debt without a split plan.
 
 ### Per-layer FFN weight format (`layers/`) — unified dense + MoE
 
@@ -378,8 +413,8 @@ literals.
 |------|---------|
 | `larql-vindex` Makefile parity | Added crate-local targets for test, fmt, clippy, examples, bench tests, `vindex_ops` bench, coverage summary, HTML coverage, and standalone policy checks. `make larql-vindex-ci` wires the full local gate. |
 | Cross-platform CI | Added `.github/workflows/larql-vindex.yml`; Linux, Windows, and macOS run format/check/examples/clippy/tests/bench compile-tests. Ubuntu runs the coverage policy. |
-| Coverage ratchet | Added `coverage-policy.json` and `scripts/check_coverage_policy.py`. Aggregate floor is 68% lines; source files default to 90% line coverage with explicit debt baselines for current under-covered files. |
-| Model-agnostic regression coverage | Added synthetic storage/compute regression tests for router weights, gate score batch paths, binary down_meta, and per-layer weight files. No HuggingFace downloads or architecture-specific fixtures. |
+| Coverage ratchet | Added `coverage-policy.json` and `scripts/check_coverage_policy.py`. Aggregate floor is 71% lines from a 71.56% local baseline; source files default to 90% line coverage with explicit debt baselines for current under-covered files. |
+| Model-agnostic regression coverage | Added synthetic storage/compute regression tests for router weights, gate score batch paths, binary down_meta, per-layer weight files, build-from-vectors output, GateIndex default dispatch, and patch-overlay trait forwarding. No HuggingFace downloads or architecture-specific fixtures. |
 | Filename/layout constants | Added `ROUTER_WEIGHTS_BIN`; routed layer-weight paths through `LAYERS_DIR` and `layer_weights_filename`; replaced anonymous byte sizes in down_meta/layer-weight parsing with named layout constants. |
 | Documentation | Updated root README, crate README, and this roadmap with the new Makefile targets, CI surface, coverage policy, and current test inventory. |
 

@@ -277,7 +277,7 @@ impl MetalBackend {
             return vec![0.0f32; hidden];
         }
 
-        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let timing_enabled = crate::options::env_flag(crate::options::ENV_METAL_MOE_TIMING);
         let t_start = std::time::Instant::now();
 
         let valid_count = expert_bufs.len().min(scratch.top_k);
@@ -430,7 +430,7 @@ impl MetalBackend {
             return vec![0.0f32; hidden];
         }
 
-        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let timing_enabled = crate::options::env_flag(crate::options::ENV_METAL_MOE_TIMING);
         let t_start = std::time::Instant::now();
 
         // ── Stage expert weight bytes into pre-allocated Metal buffers ─────

@@ -315,6 +315,9 @@ fn load_model_dir_filtered_with_validation(
         .get("lm_head.weight")
         .cloned()
         .unwrap_or_else(|| embed.clone());
+    let position_embed = arch
+        .position_embed_key()
+        .and_then(|key| tensors.get(key).cloned());
 
     let vocab_size = lm_head.shape()[0];
     let cfg = arch.config();
@@ -328,6 +331,7 @@ fn load_model_dir_filtered_with_validation(
         packed_byte_ranges,
         embed,
         lm_head,
+        position_embed,
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,

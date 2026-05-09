@@ -20,11 +20,14 @@ use crate::extract::stage_labels::*;
 use std::io::BufWriter;
 use std::path::Path;
 
-use larql_models::{ModelWeights, TopKEntry, WeightArray};
+use larql_models::{FfnType, ModelWeights, TopKEntry, WeightArray};
 
 use crate::config::dtype::{write_floats, StorageDtype};
 use crate::config::{VindexConfig, VindexLayerInfo, VindexModelConfig};
 use crate::error::VindexError;
+use crate::extract::constants::{
+    DEFAULT_DOWN_TOP_K, FEATURE_PROJECTION_BATCH, FIRST_CONTENT_TOKEN_ID,
+};
 use crate::format::filenames::*;
 
 use super::build_helpers::{
@@ -33,6 +36,14 @@ use super::build_helpers::{
 };
 
 pub use crate::extract::callbacks::IndexBuildCallbacks;
+
+fn knowledge_layer_range(family: &str, num_layers: usize) -> Option<(usize, usize)> {
+    crate::LayerBands::for_family(family, num_layers).map(|bands| {
+        let start = bands.knowledge.0.min(num_layers);
+        let end = bands.knowledge.1.saturating_add(1).min(num_layers);
+        (start, end)
+    })
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // BuildContext — shared state across pipeline stages
@@ -158,8 +169,13 @@ impl<'a> BuildContext<'a> {
                     offset += layer_bytes;
                 }
             } else {
-                // Dense: single gate matrix per layer
-                let gate_key = self.weights.arch.ffn_gate_key(layer);
+                // Dense: single feature-input-direction matrix per layer.
+                // Gated FFN routes through `ffn_gate`; non-gated FFN (GPT-2,
+                // StarCoder2) reuses `ffn_up` for the same role.
+                let gate_key = match self.weights.arch.ffn_type() {
+                    FfnType::Gated => self.weights.arch.ffn_gate_key(layer),
+                    FfnType::Standard => self.weights.arch.ffn_up_key(layer),
+                };
                 let w_gate = match self.weights.tensors.get(&gate_key) {
                     Some(w) => w,
                     None => continue,
@@ -208,8 +224,7 @@ impl<'a> BuildContext<'a> {
         let mut all_down_meta: Vec<Option<Vec<Option<crate::FeatureMeta>>>> =
             vec![None; self.num_layers];
 
-        let cluster_layer_min = 14.min(self.num_layers);
-        let cluster_layer_max = 28.min(self.num_layers);
+        let knowledge_layers = knowledge_layer_range(self.weights.arch.family(), self.num_layers);
 
         // Build whole-word vocab once, shared across layers
         let (ww_ids_shared, ww_embed_shared) = build_whole_word_vocab(
@@ -258,7 +273,9 @@ impl<'a> BuildContext<'a> {
 
             let total_features_this_layer: usize =
                 down_matrices.iter().map(|(w, _)| w.shape()[1]).sum();
-            let is_knowledge_layer = layer >= cluster_layer_min && layer < cluster_layer_max;
+            let is_knowledge_layer = knowledge_layers
+                .map(|(start, end)| layer >= start && layer < end)
+                .unwrap_or(false);
 
             // Dense models: pre-compute gate top tokens for clustering.
             // (MoE: skip — too many features.)
@@ -279,7 +296,7 @@ impl<'a> BuildContext<'a> {
             let mut feature_offset = 0usize;
             for (w_down, _expert_id) in &down_matrices {
                 let num_features = w_down.shape()[1];
-                let batch_size = 1024;
+                let batch_size = FEATURE_PROJECTION_BATCH;
 
                 for batch_start in (0..num_features).step_by(batch_size) {
                     let batch_end = (batch_start + batch_size).min(num_features);
@@ -341,7 +358,10 @@ impl<'a> BuildContext<'a> {
                         // the RELATION between what activates the feature (entity)
                         // and what it outputs (target). France→Paris and
                         // Germany→Berlin share the same offset = "capital-of".
-                        if is_knowledge_layer && top_token_id > 0 && !gate_top_tokens.is_empty() {
+                        if is_knowledge_layer
+                            && (top_token_id as usize) >= FIRST_CONTENT_TOKEN_ID
+                            && !gate_top_tokens.is_empty()
+                        {
                             let gate_tok = &gate_top_tokens[feat];
                             if let Some(offset) = compute_offset_direction(
                                 gate_tok,
@@ -592,9 +612,10 @@ pub fn build_vindex_resume(
         gate_size as f64 / 1e9
     );
 
-    // Read down_meta.jsonl to collect cluster directions (L14-28)
-    let cluster_layer_min = 14.min(num_layers);
-    let cluster_layer_max = 28.min(num_layers);
+    // Read down_meta.jsonl to collect cluster directions for the model's
+    // knowledge band.
+    let family = weights.arch.family().to_string();
+    let knowledge_layers = knowledge_layer_range(&family, num_layers);
     let mut cluster_directions: Vec<f32> = Vec::new();
     let mut cluster_features: Vec<(usize, usize)> = Vec::new();
     let mut cluster_top_tokens: Vec<String> = Vec::new();
@@ -605,29 +626,33 @@ pub fn build_vindex_resume(
     let (ww_ids, ww_embed) =
         build_whole_word_vocab(tokenizer, &weights.embed, vocab_size, hidden_size);
 
-    eprintln!(
-        "  Computing gate input tokens for L{}-{}...",
-        cluster_layer_min,
-        cluster_layer_max - 1
-    );
     let mut gate_top_tokens_per_layer: std::collections::HashMap<usize, Vec<String>> =
         std::collections::HashMap::new();
-    for layer in cluster_layer_min..cluster_layer_max {
-        let layer_start = std::time::Instant::now();
-        let tokens = compute_gate_top_tokens(
-            weights,
-            tokenizer,
-            layer,
-            intermediate_size,
-            &ww_ids,
-            &ww_embed,
-        );
-        gate_top_tokens_per_layer.insert(layer, tokens);
+    if let Some((cluster_layer_min, cluster_layer_max)) = knowledge_layers {
         eprintln!(
-            "    gate L{:2}: {:.1}s",
-            layer,
-            layer_start.elapsed().as_secs_f64()
+            "  Computing gate input tokens for L{}-{}...",
+            cluster_layer_min,
+            cluster_layer_max.saturating_sub(1)
         );
+        for layer in cluster_layer_min..cluster_layer_max {
+            let layer_start = std::time::Instant::now();
+            let tokens = compute_gate_top_tokens(
+                weights,
+                tokenizer,
+                layer,
+                intermediate_size,
+                &ww_ids,
+                &ww_embed,
+            );
+            gate_top_tokens_per_layer.insert(layer, tokens);
+            eprintln!(
+                "    gate L{:2}: {:.1}s",
+                layer,
+                layer_start.elapsed().as_secs_f64()
+            );
+        }
+    } else {
+        eprintln!("  Skipping relation clustering: no knowledge band for this model");
     }
     eprintln!(
         "  Gate input tokens computed for {} layers",
@@ -635,7 +660,7 @@ pub fn build_vindex_resume(
     );
 
     eprintln!("  Reading down_meta.jsonl for offset directions...");
-    let down_path = output_dir.join("down_meta.jsonl");
+    let down_path = output_dir.join(DOWN_META_JSONL);
     let down_file = std::fs::File::open(&down_path)?;
     let reader = std::io::BufReader::new(down_file);
     let mut count = 0usize;
@@ -655,10 +680,10 @@ pub fn build_vindex_resume(
         let feat = obj.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let top_token_id = obj.get("i").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-        if layer >= cluster_layer_min
-            && layer < cluster_layer_max
-            && top_token_id > 2
-            && top_token_id < vocab_size
+        let is_knowledge_layer = knowledge_layers
+            .map(|(start, end)| layer >= start && layer < end)
+            .unwrap_or(false);
+        if is_knowledge_layer && top_token_id >= FIRST_CONTENT_TOKEN_ID && top_token_id < vocab_size
         {
             if let Some(gate_tokens) = gate_top_tokens_per_layer.get(&layer) {
                 if feat < gate_tokens.len() {
@@ -729,8 +754,7 @@ pub fn build_vindex_resume(
     std::fs::write(output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
     callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
 
-    let down_top_k = 10; // default
-    let family = weights.arch.family().to_string();
+    let down_top_k = DEFAULT_DOWN_TOP_K;
     let mut config = VindexConfig {
         version: 2,
         model: model_name.to_string(),
@@ -742,7 +766,7 @@ pub fn build_vindex_resume(
         embed_scale,
         layers: layer_infos,
         down_top_k,
-        has_model_weights: output_dir.join("model_weights.bin").exists(),
+        has_model_weights: output_dir.join(MODEL_WEIGHTS_BIN).exists(),
         source: Some(crate::VindexSource {
             huggingface_repo: Some(model_name.to_string()),
             huggingface_revision: None,
@@ -812,7 +836,7 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    use super::build_vindex;
+    use super::{build_vindex, knowledge_layer_range};
     use crate::{
         ExtractLevel, SilentBuildCallbacks, SilentLoadCallbacks, StorageDtype, VectorIndex,
     };
@@ -823,6 +847,13 @@ mod tests {
     const HIDDEN: usize = 8;
     const INTERMEDIATE: usize = 4;
     const VOCAB: usize = 16;
+
+    #[test]
+    fn knowledge_layer_range_uses_model_band_policy() {
+        assert_eq!(knowledge_layer_range("llama", 32), Some((13, 26)));
+        assert_eq!(knowledge_layer_range("gemma3", 34), Some((14, 28)));
+        assert_eq!(knowledge_layer_range("tiny", 4), None);
+    }
 
     fn make_weights() -> larql_models::ModelWeights {
         let mut tensors: HashMap<String, ArcArray2<f32>> = HashMap::new();
@@ -904,6 +935,7 @@ mod tests {
             packed_byte_ranges: HashMap::new(),
             embed,
             lm_head,
+            position_embed: None,
             num_layers: NUM_LAYERS,
             hidden_size: HIDDEN,
             intermediate_size: INTERMEDIATE,

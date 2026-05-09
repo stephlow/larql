@@ -36,8 +36,10 @@ pub const ROUTER_WEIGHTS_BIN: &str = "router_weights.bin";
 
 // ── Down meta + feature-major projections ──────────────────────────────
 pub const DOWN_META_BIN: &str = "down_meta.bin";
+pub const DOWN_META_JSONL: &str = "down_meta.jsonl";
 pub const DOWN_FEATURES_BIN: &str = "down_features.bin";
 pub const UP_FEATURES_BIN: &str = "up_features.bin";
+pub const PLE_WEIGHTS_BIN: &str = "ple_weights.bin";
 
 // ── Layer-major FFN weight files (PyTorch `nn.Linear` orientation) ────
 //
@@ -153,6 +155,7 @@ mod tests {
             ROUTER_WEIGHTS_BIN,
             GATE_VECTORS_FP4_BIN,
             DOWN_META_BIN,
+            DOWN_META_JSONL,
             DOWN_FEATURES_BIN,
             DOWN_FEATURES_FP8_BIN,
             DOWN_FEATURES_Q4K_BIN,
@@ -161,6 +164,7 @@ mod tests {
             UP_FEATURES_BIN,
             UP_FEATURES_FP4_BIN,
             UP_WEIGHTS_BIN,
+            PLE_WEIGHTS_BIN,
             INTERLEAVED_BIN,
             INTERLEAVED_Q4_BIN,
             INTERLEAVED_Q4K_BIN,

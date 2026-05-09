@@ -876,6 +876,25 @@ mod tests {
     }
 
     #[test]
+    fn q4k_matvec_zero_dims_and_short_weights_zero_output() {
+        let mut out = vec![1.0f32; 3];
+        q4k_matvec_into(&mut out, &[], &[], 3, 0);
+        assert_eq!(out, vec![0.0f32; 3]);
+
+        let mut out = vec![1.0f32; 2];
+        let x = vec![0.5f32; 256];
+        let short_w = vec![0u8; 144];
+        q4k_matvec_into(&mut out, &x, &short_w, 2, 256);
+        assert_eq!(out, vec![0.0f32; 2]);
+    }
+
+    #[test]
+    fn dequantize_q4k_rejects_misaligned_or_truncated_input() {
+        assert!(dequantize_q4_k(&[0u8; 144], 255).is_empty());
+        assert!(dequantize_q4_k(&[0u8; 143], 256).is_empty());
+    }
+
+    #[test]
     #[should_panic(expected = "multiple of 32")]
     fn q4_rejects_non_aligned() {
         let data = vec![1.0f32; 33];
@@ -1031,6 +1050,24 @@ mod tests {
         assert_eq!(q4k.len(), rows * 144);
     }
 
+    #[test]
+    fn q4k_to_q4kf_multi_superblock_rows() {
+        let hidden = 512usize;
+        let rows = 3usize;
+        let weights: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.004).cos() * 0.25)
+            .collect();
+        let q4k = quantize_q4_k(&weights);
+        let q4kf = q4k_to_q4kf(&q4k, rows, hidden);
+
+        assert_eq!(q4k.len(), rows * 2 * 144);
+        assert_eq!(q4kf.len(), rows * 2 * 160);
+        assert!(
+            q4kf.iter().any(|v| *v != 0),
+            "converted Q4_KF should retain nonzero scales or nibbles"
+        );
+    }
+
     // ── f32_to_f16 edge cases ──
 
     #[test]
@@ -1179,5 +1216,11 @@ mod tests {
         // f16 super-block scale at bytes [208..210] should be zero.
         let d_bits = u16::from_le_bytes([q6k[208], q6k[209]]);
         assert_eq!(d_bits, 0, "all-zero data should produce d=0 (f16 zero)");
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 256")]
+    fn quantize_q6k_rejects_non_aligned() {
+        let _ = quantize_q6_k(&vec![1.0f32; 255]);
     }
 }

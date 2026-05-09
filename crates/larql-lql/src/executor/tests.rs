@@ -423,6 +423,7 @@ fn make_test_weights() -> larql_inference::ModelWeights {
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        position_embed: None,
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,

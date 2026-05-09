@@ -261,18 +261,36 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
 
-        // Pass 2: oracle PQ codes.
-        let (_, _, oracle_codes_by_position) = forward_q4k_oracle_pq_head(
-            &mut weights,
-            &token_ids,
-            &index,
-            head,
-            basis,
-            pca_basis,
-            head_means,
-            codebook,
-            stratum,
-        )?;
+        // Pass 2: oracle PQ codes — Metal capture if available, CPU fallback.
+        // Metal: runs only layers 0..=target_layer on GPU, captures pre-W_O output,
+        // then computes PQ codes on CPU. ~34× faster than full CPU forward pass for L0.
+        let oracle_codes_by_position: Vec<Vec<usize>> = if let Some(ref b) = metal_backend {
+            if let Some(pre_wo) = super::metal_backend::try_metal_capture_pre_wo(
+                &weights, &token_ids, &index, head.layer, head.head, b,
+            ) {
+                // pre_wo: [seq_len × head_dim] f32 captured from attn_outs[target_layer]
+                let head_dim = pre_wo.len() / token_ids.len();
+                (0..token_ids.len()).map(|pos| {
+                    let values = &pre_wo[pos * head_dim .. (pos + 1) * head_dim];
+                    let base = head_means.positions.get(pos).unwrap_or(&head_means.global);
+                    let residual: Vec<f32> = values.iter().zip(base).map(|(yi, bi)| yi - bi).collect();
+                    let z = basis.residual_to_z(&residual);
+                    let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
+                    codebook.quantize_indices_for_stratum(&coords, stratum)
+                }).collect()
+            } else {
+                // Fall back to CPU oracle PQ
+                let (_, _, codes) = forward_q4k_oracle_pq_head(
+                    &mut weights, &token_ids, &index, head, basis, pca_basis, head_means, codebook, stratum,
+                )?;
+                codes
+            }
+        } else {
+            let (_, _, codes) = forward_q4k_oracle_pq_head(
+                &mut weights, &token_ids, &index, head, basis, pca_basis, head_means, codebook, stratum,
+            )?;
+            codes
+        };
 
         // Pass 3: oracle Mode D baseline — Metal if available, CPU fallback.
         let oracle_h = if let Some(ref b) = metal_backend {

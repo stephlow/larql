@@ -39,7 +39,7 @@
 //! Skip semantics mirror the golden / parity tests: missing vindexes
 //! return Ok with a skip note.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::path::PathBuf;
 

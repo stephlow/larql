@@ -1040,7 +1040,7 @@ tree. Highlights for spec readers:
   `batch_legacy.rs`, `layer_batch.rs`, `cpu.rs`, `metal.rs`,
   `warmup.rs`, plus a `mod.rs` that re-exports the historical public
   surface (`run_expert`, `run_experts_cpu_batch`, `handle_*`,
-  `warmup_*`). `metal.rs` is `#[cfg(feature = "metal-experts")]`.
+  `warmup_*`). `metal.rs` is `#[cfg(all(feature = "metal-experts", target_os = "macos"))]`.
 - `http.rs` carries shared protocol constants:
   `BINARY_FFN_CONTENT_TYPE`, `JSON_CONTENT_TYPE`,
   `REQUEST_BODY_LIMIT_BYTES` (64 MB), `REQUEST_BODY_LIMIT_LARGE_BYTES`

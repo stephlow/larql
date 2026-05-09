@@ -24,6 +24,8 @@
 use metal::CommandBufferRef;
 use objc::{msg_send, sel, sel_impl};
 
+use crate::options;
+
 /// Returns `(gpu_start_time, gpu_end_time)` in seconds (CFTimeInterval).
 /// Subtract for the GPU-side wall window. Caller MUST have already
 /// called `wait_until_completed` on the buffer; values for an
@@ -119,9 +121,8 @@ impl TokenGpuTime {
     /// `LARQL_PROFILE_SPLIT=1` (or the legacy alias
     /// `LARQL_DECODE_STAGE_TIMING=1`) is set.
     pub fn print_if_enabled(&self, wall_ms: f64) {
-        let gpu_timing = std::env::var("LARQL_GPU_TIMING").is_ok();
-        let stage_timing = std::env::var("LARQL_PROFILE_SPLIT").is_ok()
-            || std::env::var("LARQL_DECODE_STAGE_TIMING").is_ok();
+        let gpu_timing = options::env_flag(options::ENV_GPU_TIMING);
+        let stage_timing = options::split_profile_requested();
         if !gpu_timing && !stage_timing {
             return;
         }

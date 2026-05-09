@@ -96,13 +96,13 @@ pub struct LoadedModel {
     /// `Some(Some(backend))` = initialised, available; `Some(None)` =
     /// initialised, Metal not available; `None` = not yet initialised.
     /// Only present under `--features metal-experts`.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_backend: std::sync::OnceLock<Option<larql_compute::MetalBackend>>,
     /// Cached MoE scratch per `(top_k, hidden, inter)` shape — one entry
     /// per architecture in practice.  `MoeScratch` contains mutable Metal
     /// staging buffers, so Metal expert dispatch holds this mutex while
     /// using a scratch entry.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub moe_scratches: std::sync::Mutex<
         std::collections::HashMap<(usize, usize, usize), Arc<larql_compute::MoeScratch>>,
     >,
@@ -111,7 +111,7 @@ pub struct LoadedModel {
     /// Metal FFN request from the interleaved Q4K mmap (zero-copy via
     /// `new_buffer_with_bytes_no_copy` for page-aligned mmap data).
     /// Only populated when the server has interleaved Q4K data loaded.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_ffn_layer_bufs: std::sync::OnceLock<Vec<[larql_compute::MetalBuffer; 3]>>,
 }
 
@@ -392,11 +392,11 @@ mod loaded_model_tests {
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             moe_scratches: std::sync::Mutex::new(HashMap::new()),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         }
     }

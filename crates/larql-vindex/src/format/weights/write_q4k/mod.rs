@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{VindexConfig, VindexModelConfig};
+use crate::config::{FfnLayout, VindexConfig, VindexModelConfig};
 use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::format::filenames::*;
@@ -502,7 +502,7 @@ pub fn write_model_weights_q4k_with_opts(
     // the big lookup on E2B) and preserves enough precision for accurate
     // per-token PLE retrieval.
     if arch.has_per_layer_embeddings() {
-        let ple_path = dir.join("ple_weights.bin");
+        let ple_path = dir.join(PLE_WEIGHTS_BIN);
         let mut ple_file = BufWriter::new(std::fs::File::create(&ple_path)?);
         let mut ple_offset: u64 = 0;
         let ple_dtype = crate::config::dtype::StorageDtype::F16;
@@ -522,7 +522,7 @@ pub fn write_model_weights_q4k_with_opts(
                     shape: vec![rows, cols],
                     offset: *offset,
                     length: bytes.len() as u64,
-                    file: "ple_weights.bin".into(),
+                    file: PLE_WEIGHTS_BIN.into(),
                 });
                 *offset += bytes.len() as u64;
             }
@@ -609,7 +609,7 @@ pub fn write_model_weights_q4k_with_opts(
     config.has_model_weights = true;
     config.quant = crate::QuantFormat::Q4K;
     if arch.is_hybrid_moe() {
-        config.ffn_layout = Some("per_layer".into());
+        config.ffn_layout = Some(FfnLayout::PerLayer);
     }
 
     let cfg = arch.config();

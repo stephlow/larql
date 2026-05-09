@@ -350,10 +350,7 @@ impl MetalBackend {
             KernelHandle::from_kernel::<shaders::q4k_matvec_8sg::Kernel>(&device, &library)?;
         let q4k_matvec_stride32_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_matvec_stride32::Kernel>(&device, &library)?;
-        let q4k_matvec_use_4sg = matches!(
-            std::env::var("LARQL_Q4K_MATVEC_8SG").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
+        let q4k_matvec_use_4sg = crate::options::env_opt_out(crate::options::ENV_Q4K_MATVEC_8SG);
         let q4k_matvec_pipeline = if q4k_matvec_use_4sg {
             q4k_matvec_4sg_pipeline.clone()
         } else {
@@ -374,10 +371,7 @@ impl MetalBackend {
             KernelHandle::from_kernel::<shaders::q6k_matvec::Kernel>(&device, &library)?;
         let q6k_matvec_8sg_pipeline =
             KernelHandle::from_kernel::<shaders::q6k_matvec_8sg::Kernel>(&device, &library)?;
-        let q6k_use_8sg = matches!(
-            std::env::var("LARQL_Q6K_8SG").as_deref(),
-            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-        );
+        let q6k_use_8sg = crate::options::env_opt_in(crate::options::ENV_Q6K_8SG);
         let q6k_matvec_pipeline = if q6k_use_8sg {
             q6k_matvec_8sg_pipeline.clone()
         } else {

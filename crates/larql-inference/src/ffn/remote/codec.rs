@@ -62,7 +62,7 @@ impl std::fmt::Display for RemoteLatencyStats {
 
 /// Encode a request as binary.
 /// `layer` and `layers` are mutually exclusive; pass `None` for the unused one.
-pub(crate) fn encode_binary_request(
+pub fn encode_binary_request(
     layer: Option<usize>,
     layers: Option<&[usize]>,
     residual: &[f32],
@@ -94,7 +94,7 @@ pub(crate) fn encode_binary_request(
 
 /// Decode a binary single-layer full_output response.
 /// Returns `(layer, output_floats)`.
-pub(crate) fn decode_binary_single(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
+pub fn decode_binary_single(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
     if body.len() < 12 {
         return Err(format!("binary response too short: {} bytes", body.len()));
     }
@@ -114,7 +114,7 @@ pub(crate) fn decode_binary_single(body: &[u8]) -> Result<(usize, Vec<f32>), Str
 
 /// Decode a binary batch full_output response.
 /// Returns a map from layer → output floats.
-pub(crate) fn decode_binary_batch(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, String> {
+pub fn decode_binary_batch(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, String> {
     if body.len() < 12 {
         return Err(format!(
             "binary batch response too short: {} bytes",
@@ -166,7 +166,7 @@ pub(crate) fn decode_binary_batch(body: &[u8]) -> Result<HashMap<usize, Vec<f32>
 pub(crate) const F16_CT: &str = "application/x-larql-ffn-f16";
 
 /// Decode a binary single-layer f16 response into f32 output.
-pub(crate) fn decode_binary_single_f16(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
+pub fn decode_binary_single_f16(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
     use half::f16;
     if body.len() < 12 {
         return Err(format!(
@@ -187,7 +187,7 @@ pub(crate) fn decode_binary_single_f16(body: &[u8]) -> Result<(usize, Vec<f32>),
 }
 
 /// Decode a binary batch f16 response into f32 outputs.
-pub(crate) fn decode_binary_batch_f16(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, String> {
+pub fn decode_binary_batch_f16(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, String> {
     use half::f16;
     if body.len() < 12 {
         return Err(format!(

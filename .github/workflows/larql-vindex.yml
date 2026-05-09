@@ -31,7 +31,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  LARQL_VINDEX_COVERAGE_MIN: 68
+  LARQL_VINDEX_COVERAGE_MIN: 71
 
 jobs:
   test:

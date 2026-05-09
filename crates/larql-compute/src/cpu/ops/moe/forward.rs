@@ -338,3 +338,187 @@ pub fn cpu_moe_forward(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::ops::q4_common::quantize_q4_k;
+    use crate::{Activation, QuantFormat};
+
+    fn bf16_fill(len: usize, val: f32) -> Vec<u8> {
+        let b = ((val.to_bits() >> 16) as u16).to_le_bytes();
+        let mut bytes = vec![0u8; len * 2];
+        for i in 0..len {
+            bytes[i * 2] = b[0];
+            bytes[i * 2 + 1] = b[1];
+        }
+        bytes
+    }
+
+    fn one_expert_moe<'a>(
+        _hidden: usize,
+        inter: usize,
+        experts_gate_up: Vec<&'a [u8]>,
+        experts_down: Vec<&'a [u8]>,
+        router: &'a [f32],
+        format: QuantFormat,
+    ) -> MoeLayerWeights<'a> {
+        MoeLayerWeights {
+            experts_gate_up,
+            experts_down,
+            router_proj: router,
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts: 1,
+            top_k: 1,
+            intermediate_size: inter,
+            activation: Activation::Silu,
+            expert_data_format: format,
+        }
+    }
+
+    #[test]
+    fn empty_selected_expert_weight_slices_are_skipped() {
+        let hidden = 8;
+        let inter = 2;
+        let router = vec![1.0f32; hidden];
+        let h = vec![1.0f32; hidden];
+        let gate_up = bf16_fill(2 * inter * hidden, 1.0);
+        let down = bf16_fill(hidden * inter, 1.0);
+
+        let missing_gate_up = one_expert_moe(
+            hidden,
+            inter,
+            vec![&[]],
+            vec![down.as_slice()],
+            &router,
+            QuantFormat::BF16,
+        );
+        assert_eq!(
+            cpu_moe_forward(&h, &missing_gate_up, 0.0, 1e-6),
+            vec![0.0; hidden]
+        );
+
+        let missing_down = one_expert_moe(
+            hidden,
+            inter,
+            vec![gate_up.as_slice()],
+            vec![&[]],
+            &router,
+            QuantFormat::BF16,
+        );
+        assert_eq!(
+            cpu_moe_forward(&h, &missing_down, 0.0, 1e-6),
+            vec![0.0; hidden]
+        );
+    }
+
+    #[test]
+    fn selected_expert_with_missing_down_table_is_skipped() {
+        let hidden = 8;
+        let inter = 2;
+        let num_experts = 4;
+        let gate_up = bf16_fill(2 * inter * hidden, 1.0);
+        let down = bf16_fill(hidden * inter, 1.0);
+        let experts_gate_up = vec![
+            gate_up.as_slice(),
+            gate_up.as_slice(),
+            gate_up.as_slice(),
+            gate_up.as_slice(),
+        ];
+        let experts_down = vec![down.as_slice()];
+        let mut router = vec![0.0f32; num_experts * hidden];
+        router[3 * hidden..4 * hidden].fill(10.0);
+        let moe = MoeLayerWeights {
+            experts_gate_up,
+            experts_down,
+            router_proj: &router,
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts,
+            top_k: 1,
+            intermediate_size: inter,
+            activation: Activation::Silu,
+            expert_data_format: QuantFormat::BF16,
+        };
+
+        assert_eq!(
+            cpu_moe_forward(&vec![1.0; hidden], &moe, 0.0, 1e-6),
+            vec![0.0; hidden]
+        );
+    }
+
+    #[test]
+    fn q4k_cached_dequant_fallback_runs_for_non_256_hidden() {
+        let hidden = 128;
+        let inter = 1;
+        let inter_padded = 256;
+        let gate_up_f32: Vec<f32> = (0..2 * inter * hidden)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+            .collect();
+        let down_f32: Vec<f32> = (0..hidden * inter_padded)
+            .map(|i| {
+                if i % inter_padded == 0 {
+                    ((i / inter_padded) as f32 % 13.0 - 6.0) * 0.01
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let gate_up = quantize_q4_k(&gate_up_f32);
+        let down = quantize_q4_k(&down_f32);
+        let router = vec![1.0f32; hidden];
+        let h: Vec<f32> = (0..hidden).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+        let moe = one_expert_moe(
+            hidden,
+            inter,
+            vec![gate_up.as_slice()],
+            vec![down.as_slice()],
+            &router,
+            QuantFormat::Q4_K,
+        );
+
+        let out = cpu_moe_forward(&h, &moe, 0.0, 1e-6);
+
+        assert_eq!(out.len(), hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn zero_per_expert_scale_filters_selected_expert() {
+        let hidden = 8;
+        let inter = 2;
+        let gate_up = bf16_fill(2 * inter * hidden, 1.0);
+        let down = bf16_fill(hidden * inter, 1.0);
+        let router = vec![1.0f32; hidden];
+        let zero_scale = [0.0f32];
+        let moe = MoeLayerWeights {
+            router_per_expert_scale: &zero_scale,
+            ..one_expert_moe(
+                hidden,
+                inter,
+                vec![gate_up.as_slice()],
+                vec![down.as_slice()],
+                &router,
+                QuantFormat::BF16,
+            )
+        };
+
+        assert_eq!(
+            cpu_moe_forward(&vec![1.0; hidden], &moe, 0.0, 1e-6),
+            vec![0.0; hidden]
+        );
+    }
+}

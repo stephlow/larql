@@ -19,10 +19,13 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::extract::constants::{
+    FIRST_CONTENT_TOKEN_ID, GATE_TOP_TOKEN_BATCH, MAX_RELATION_CLUSTERS, RELATION_KMEANS_ITERS,
+};
 use crate::extract::stage_labels::STAGE_RELATION_CLUSTERS;
 use crate::format::filenames::{FEATURE_CLUSTERS_JSONL, RELATION_CLUSTERS_JSON};
 
-use larql_models::ModelWeights;
+use larql_models::{FfnType, ModelWeights};
 use ndarray::Array2;
 
 use crate::error::VindexError;
@@ -105,14 +108,19 @@ pub(super) fn compute_gate_top_tokens(
     ww_ids: &[usize],
     ww_embed: &Array2<f32>,
 ) -> Vec<String> {
-    let gate_key = weights.arch.ffn_gate_key(layer);
+    // Gated FFN routes through `ffn_gate`; non-gated FFN (GPT-2, StarCoder2)
+    // reuses `ffn_up` for the same per-feature input direction.
+    let gate_key = match weights.arch.ffn_type() {
+        FfnType::Gated => weights.arch.ffn_gate_key(layer),
+        FfnType::Standard => weights.arch.ffn_up_key(layer),
+    };
     let w_gate = match weights.tensors.get(&gate_key) {
         Some(w) => w,
         None => return vec![String::new(); num_features],
     };
 
     let mut tokens = vec![String::new(); num_features];
-    let gbatch = 1024;
+    let gbatch = GATE_TOP_TOKEN_BATCH;
     for gstart in (0..num_features).step_by(gbatch) {
         let gend = (gstart + gbatch).min(num_features);
         let chunk = w_gate.slice(ndarray::s![gstart..gend, ..]);
@@ -152,7 +160,10 @@ pub(super) fn compute_offset_direction(
     hidden_size: usize,
     vocab_size: usize,
 ) -> Option<Vec<f32>> {
-    if gate_token.is_empty() || output_token_id <= 2 || output_token_id >= vocab_size {
+    if gate_token.is_empty()
+        || output_token_id < FIRST_CONTENT_TOKEN_ID
+        || output_token_id >= vocab_size
+    {
         return None;
     }
 
@@ -161,7 +172,7 @@ pub(super) fn compute_offset_direction(
     let ids = enc.get_ids();
     let valid: Vec<usize> = ids
         .iter()
-        .filter(|&&id| id > 2)
+        .filter(|&&id| id as usize >= FIRST_CONTENT_TOKEN_ID)
         .map(|&id| id as usize)
         .filter(|&id| id < vocab_size)
         .collect();
@@ -226,9 +237,10 @@ pub(super) fn run_clustering_pipeline(
     let matrix = ndarray::Array2::from_shape_vec((n_features, hidden_size), data.directions)
         .map_err(|e| VindexError::Parse(format!("cluster data shape: {e}")))?;
 
-    let optimal_k = 512.min(n_features);
+    let optimal_k = MAX_RELATION_CLUSTERS.min(n_features);
 
-    let (centres, assignments, _distances) = crate::clustering::kmeans(&matrix, optimal_k, 50);
+    let (centres, assignments, _distances) =
+        crate::clustering::kmeans(&matrix, optimal_k, RELATION_KMEANS_ITERS);
 
     // Load reference databases
     let ref_dbs = crate::clustering::load_reference_databases();

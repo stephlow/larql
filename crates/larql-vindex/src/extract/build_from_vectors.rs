@@ -222,7 +222,7 @@ pub fn build_vindex_from_vectors(
     callbacks.on_stage(STAGE_DOWN_META);
     let start = std::time::Instant::now();
 
-    let down_meta_path = output_dir.join("down_meta.jsonl");
+    let down_meta_path = output_dir.join(DOWN_META_JSONL);
     let mut down_out = BufWriter::new(std::fs::File::create(&down_meta_path)?);
 
     let down_file = std::fs::File::open(&down_path)?;

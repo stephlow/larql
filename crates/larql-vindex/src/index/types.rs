@@ -38,7 +38,7 @@ pub struct WalkTrace {
 /// Walk-path equivalence audits and downstream tooling use this to bucket
 /// paths by the precision of the data they walk against, without having
 /// to re-derive the right grouping from the `has_*` flags. New storage
-/// formats should update [`GateIndex::primary_storage_bucket`]'s default
+/// formats should update [`FfnRowAccess::primary_storage_bucket`]'s default
 /// impl so consumers automatically pick up the right bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageBucket {
@@ -53,15 +53,73 @@ pub enum StorageBucket {
     Fp4,
 }
 
-/// Trait for gate-based feature lookup.
+/// Gate KNN and feature metadata lookup.
 ///
-/// Both `VectorIndex` (base, readonly) and `PatchedVindex` (with overlay)
-/// implement this trait, allowing `WalkFfn` and other consumers to work
-/// transparently with patched or unpatched indexes.
-pub trait GateIndex: Send + Sync {
+/// This is the minimal read-only surface needed by graph browsing and
+/// DESCRIBE-style operations. Consumers that do not need FFN storage or
+/// patch overlay access should depend on this trait rather than `GateIndex`.
+pub trait GateLookup: Send + Sync {
     fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)>;
     fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta>;
     fn num_features(&self, layer: usize) -> usize;
+
+    fn gate_scores_batch(&self, _layer: usize, _x: &Array2<f32>) -> Option<Array2<f32>> {
+        None
+    }
+    /// Backend-aware variant of `gate_scores_batch`. When `backend` is a
+    /// Metal `ComputeBackend` and `x` is a single row, implementations
+    /// can dispatch `f32_gemv` instead of CPU BLAS — the gate matmul is
+    /// the dominant per-layer cost on 31B decode (60 % of token time).
+    /// Default implementation ignores the backend and calls the legacy
+    /// method.
+    fn gate_scores_batch_backend(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+        _backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> Option<Array2<f32>> {
+        self.gate_scores_batch(layer, x)
+    }
+
+    /// Gate KNN via Q4 matvec — scored by a ComputeBackend.
+    /// Returns None if Q4 gate data isn't loaded or backend doesn't support Q4.
+    fn gate_knn_q4(
+        &self,
+        _layer: usize,
+        _residual: &Array1<f32>,
+        _top_k: usize,
+        _backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Vec<(usize, f32)>> {
+        None
+    }
+
+    /// Per-feature gate scoring: iterate all features, dot product each one.
+    /// No matrix multiplication — each feature scored individually.
+    /// Returns (feature_index, score) sorted by absolute score descending.
+    fn gate_walk(
+        &self,
+        _layer: usize,
+        _residual: &Array1<f32>,
+        _top_k: usize,
+    ) -> Option<Vec<(usize, f32)>> {
+        None
+    }
+
+    fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
+        let seq_len = x.shape()[0];
+        let mut all = std::collections::BTreeSet::new();
+        for s in 0..seq_len {
+            let row = x.row(s).to_owned();
+            for (feat, _) in self.gate_knn(layer, &row, top_k) {
+                all.insert(feat);
+            }
+        }
+        all.into_iter().collect()
+    }
+}
+
+/// Patch overlay vectors installed above a readonly base vindex.
+pub trait PatchOverrides: Send + Sync {
     fn down_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> {
         None
     }
@@ -84,6 +142,10 @@ pub trait GateIndex: Send + Sync {
     fn has_overrides_at(&self, _layer: usize) -> bool {
         false
     }
+}
+
+/// Native f32/f16 FFN storage access.
+pub trait NativeFfnAccess: Send + Sync {
     fn down_feature_vector(&self, _layer: usize, _feature: usize) -> Option<&[f32]> {
         None
     }
@@ -92,23 +154,6 @@ pub trait GateIndex: Send + Sync {
     }
     fn down_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
         None
-    }
-    fn gate_scores_batch(&self, _layer: usize, _x: &Array2<f32>) -> Option<Array2<f32>> {
-        None
-    }
-    /// Backend-aware variant of `gate_scores_batch`. When `backend` is a
-    /// Metal `ComputeBackend` and `x` is a single row, implementations
-    /// can dispatch `f32_gemv` instead of CPU BLAS — the gate matmul is
-    /// the dominant per-layer cost on 31B decode (60 % of token time).
-    /// Default implementation ignores the backend and calls the legacy
-    /// method.
-    fn gate_scores_batch_backend(
-        &self,
-        layer: usize,
-        x: &Array2<f32>,
-        _backend: Option<&dyn larql_compute::ComputeBackend>,
-    ) -> Option<Array2<f32>> {
-        self.gate_scores_batch(layer, x)
     }
     fn up_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
         None
@@ -129,6 +174,10 @@ pub trait GateIndex: Send + Sync {
         None
     }
     fn prefetch_interleaved_layer(&self, _layer: usize) {}
+}
+
+/// Q4_0/Q4_K/Q6_K FFN storage access.
+pub trait QuantizedFfnAccess: Send + Sync {
     fn has_interleaved_q4(&self) -> bool {
         false
     }
@@ -242,10 +291,27 @@ pub trait GateIndex: Send + Sync {
         false
     }
 
+    /// Direct Q4K/Q6K matmul — `Y = X @ W.T` against the layer's Q4K bytes.
+    /// See `VectorIndex::q4k_matmul_transb`. `x` is `[x_rows, w_cols]`.
+    /// `backend` (when provided) routes through Metal/CPU-SIMD kernels.
+    fn q4k_matmul_transb(
+        &self,
+        _layer: usize,
+        _component: usize,
+        _x: &[f32],
+        _x_rows: usize,
+        _backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+}
+
+/// FP4 / FP8 FFN storage access (exp 26).
+pub trait Fp4FfnAccess: Send + Sync {
     // ── FP4 / FP8 FFN storage (exp 26) ─────────────────────────────────────
     //
     // These mirror the `q4k_ffn_row_*` family for the FP4 block format. All
-    // default to "no data" so overlays / GateIndex impls that don't carry
+    // default to "no data" so overlays / FFN impls that don't carry
     // FP4 storage work unchanged.
 
     /// Whether this index has FP4/FP8 FFN storage attached.
@@ -286,7 +352,10 @@ pub trait GateIndex: Send + Sync {
     ) -> bool {
         false
     }
+}
 
+/// Unified FFN row operations over native, Q4K/Q6K, and FP4/FP8 storage.
+pub trait FfnRowAccess: NativeFfnAccess + QuantizedFfnAccess + Fp4FfnAccess {
     // ── Unified FFN row access ─────────────────────────────────────────────
     //
     // One entry point per operation; the walk kernel calls these and
@@ -498,56 +567,6 @@ pub trait GateIndex: Send + Sync {
         false
     }
 
-    /// Direct Q4K/Q6K matmul — `Y = X @ W.T` against the layer's Q4K bytes.
-    /// See `VectorIndex::q4k_matmul_transb`. `x` is `[x_rows, w_cols]`.
-    /// `backend` (when provided) routes through Metal/CPU-SIMD kernels.
-    fn q4k_matmul_transb(
-        &self,
-        _layer: usize,
-        _component: usize,
-        _x: &[f32],
-        _x_rows: usize,
-        _backend: Option<&dyn larql_compute::ComputeBackend>,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    /// Gate KNN via Q4 matvec — scored by a ComputeBackend.
-    /// Returns None if Q4 gate data isn't loaded or backend doesn't support Q4.
-    fn gate_knn_q4(
-        &self,
-        _layer: usize,
-        _residual: &Array1<f32>,
-        _top_k: usize,
-        _backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> {
-        None
-    }
-
-    /// Per-feature gate scoring: iterate all features, dot product each one.
-    /// No matrix multiplication — each feature scored individually.
-    /// Returns (feature_index, score) sorted by absolute score descending.
-    fn gate_walk(
-        &self,
-        _layer: usize,
-        _residual: &Array1<f32>,
-        _top_k: usize,
-    ) -> Option<Vec<(usize, f32)>> {
-        None // Override in VectorIndex to use mmap
-    }
-
-    fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
-        let seq_len = x.shape()[0];
-        let mut all = std::collections::BTreeSet::new();
-        for s in 0..seq_len {
-            let row = x.row(s).to_owned();
-            for (feat, _) in self.gate_knn(layer, &row, top_k) {
-                all.insert(feat);
-            }
-        }
-        all.into_iter().collect()
-    }
-
     /// Bucket the index's primary FFN storage falls into. Encapsulates the
     /// `has_*`-flag logic so audits and tooling (e.g. `walk_path_audit`)
     /// don't scatter flag-checks across their bucketing logic.
@@ -575,6 +594,18 @@ pub trait GateIndex: Send + Sync {
         }
     }
 }
+
+impl<T> FfnRowAccess for T where T: NativeFfnAccess + QuantizedFfnAccess + Fp4FfnAccess + ?Sized {}
+
+/// Compatibility trait for consumers that need the whole vindex surface.
+///
+/// New code should prefer the narrower traits above (`GateLookup`,
+/// `PatchOverrides`, `NativeFfnAccess`, `QuantizedFfnAccess`,
+/// `Fp4FfnAccess`, or `FfnRowAccess`) when it does not need the full
+/// combined API.
+pub trait GateIndex: GateLookup + PatchOverrides + FfnRowAccess {}
+
+impl<T> GateIndex for T where T: GateLookup + PatchOverrides + FfnRowAccess + ?Sized {}
 
 /// Progress callbacks for index loading.
 pub trait IndexLoadCallbacks {

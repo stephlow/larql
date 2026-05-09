@@ -265,6 +265,51 @@ mod cache_format_tests {
         assert!(out.is_empty(), "expected_floats not a 256 multiple → empty");
     }
 
+    #[test]
+    fn inner_zero_capacity_drops_inserts() {
+        let mut inner = Inner::new(0);
+        let bytes = vec![1u8, 2, 3, 4];
+        let key = cache_key(&bytes);
+
+        inner.insert(key, Arc::new(vec![42.0]));
+
+        assert!(inner.get(key).is_none());
+        assert!(inner.order.is_empty());
+    }
+
+    #[test]
+    fn inner_fifo_eviction_removes_oldest_entry() {
+        let mut inner = Inner::new(2);
+        let a = vec![1u8];
+        let b = vec![2u8];
+        let c = vec![3u8];
+        let ka = cache_key(&a);
+        let kb = cache_key(&b);
+        let kc = cache_key(&c);
+
+        inner.insert(ka, Arc::new(vec![1.0]));
+        inner.insert(kb, Arc::new(vec![2.0]));
+        inner.insert(kc, Arc::new(vec![3.0]));
+
+        assert!(inner.get(ka).is_none());
+        assert_eq!(&*inner.get(kb).unwrap(), &[2.0]);
+        assert_eq!(&*inner.get(kc).unwrap(), &[3.0]);
+        assert_eq!(inner.order.len(), 2);
+    }
+
+    #[test]
+    fn inner_duplicate_insert_keeps_original_value_and_order() {
+        let mut inner = Inner::new(2);
+        let bytes = vec![9u8];
+        let key = cache_key(&bytes);
+
+        inner.insert(key, Arc::new(vec![1.0]));
+        inner.insert(key, Arc::new(vec![2.0]));
+
+        assert_eq!(&*inner.get(key).unwrap(), &[1.0]);
+        assert_eq!(inner.order.len(), 1);
+    }
+
     /// Parallel cache hits don't deadlock or corrupt — exercises the
     /// `RwLock` read-side under contention.  Many threads request the same
     /// few keys; the cache must stably return the same `Arc` content for

@@ -20,22 +20,22 @@
 //! and the head-to-head timing, which is what "diagnose perf + accuracy"
 //! usually means in practice.
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 extern crate blas_src;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use std::path::PathBuf;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use std::time::Instant;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_inference::layer_graph::generate::generate;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_inference::layer_graph::CachedLayerGraph;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_inference::wrap_chat_prompt;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
@@ -216,7 +216,7 @@ fn shared_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {
     eprintln!("cpu_gpu_diag requires `--features metal`.");
 }
