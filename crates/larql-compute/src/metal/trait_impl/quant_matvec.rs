@@ -163,13 +163,13 @@ impl QuantMatVec for MetalBackend {
         let buf_out = self.bufs.output((num_rows * 4) as u64);
         let n = num_rows as u32;
         let k = hidden as u32;
-        let rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let num_tgs = (num_rows as u64).div_ceil(rows_per_tg);
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+        enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
         enc.set_buffer(0, Some(&buf_w), 0);
         enc.set_buffer(1, Some(&buf_x), 0);
         enc.set_buffer(2, Some(&buf_out), 0);
@@ -221,7 +221,7 @@ impl QuantMatVec for MetalBackend {
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.q4k_matmul_pipeline.state);
+        enc.set_compute_pipeline_state(&self.quant.q4k_matmul_pipeline.state);
         enc.set_buffer(0, Some(&buf_w), 0);
         enc.set_buffer(1, Some(&buf_x), 0);
         enc.set_buffer(2, Some(&buf_out), 0);
@@ -259,7 +259,7 @@ impl QuantMatVec for MetalBackend {
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.q6k_matvec_pipeline.state);
+        enc.set_compute_pipeline_state(&self.quant.q6k_matvec_pipeline.state);
         enc.set_buffer(0, Some(&buf_w), 0);
         enc.set_buffer(1, Some(&buf_x), 0);
         enc.set_buffer(2, Some(&buf_out), 0);

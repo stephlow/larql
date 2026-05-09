@@ -290,9 +290,9 @@ impl MetalBackend {
             let o_pipeline = if layer.wo.format == crate::QuantFormat::Q4_KF {
                 &self.q4kf_proj_pipeline
             } else if layer.wo.format == crate::QuantFormat::Q6_K {
-                &self.q6k_matvec_pipeline
+                &self.quant.q6k_matvec_pipeline
             } else {
-                &self.q4k_matvec_pipeline
+                &self.quant.q4k_matvec_pipeline
             };
             let num_tgs = (hidden as u64).div_ceil(o_pipeline.rows_per_tg);
             enc_c.set_compute_pipeline_state(&o_pipeline.state);
@@ -352,7 +352,7 @@ impl MetalBackend {
 
             let dim_val = layer_q_dim as u32;
             let blocks = (layer_q_dim / LEGACY_BLOCK_ELEMS) as u32;
-            enc_c.set_compute_pipeline_state(&self.q8_quant_pipeline);
+            enc_c.set_compute_pipeline_state(&self.quant.q8_quant_pipeline);
             enc_c.set_buffer(0, Some(&attn_out), 0);
             enc_c.set_buffer(1, Some(&o_q8), 0);
             enc_c.set_buffer(2, Some(&o_q8s), 0);
@@ -364,7 +364,7 @@ impl MetalBackend {
 
             let o_rows = hidden as u32;
             let o_k = layer_q_dim as u32;
-            enc_c.set_compute_pipeline_state(&self.q8_matvec_pipeline.state);
+            enc_c.set_compute_pipeline_state(&self.quant.q8_matvec_pipeline.state);
             enc_c.set_buffer(0, Some(&wo_buf), 0);
             enc_c.set_buffer(1, Some(&o_q8), 0);
             enc_c.set_buffer(2, Some(&wo_scale_buf), 0);

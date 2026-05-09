@@ -215,7 +215,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let wb = metal.bufs().get_bytes(&w);
         let xb = metal.bufs().transient_from_f32(&x);
         let ob = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q6k_matvec_pipeline;
+        let kh = &metal.quant.q6k_matvec_pipeline;
         let n_tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;
@@ -458,7 +458,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let wb = metal.bufs().get_bytes(&w);
         let xb = metal.bufs().transient_from_f32(&x);
         let ob = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q4k_matvec_pipeline;
+        let kh = &metal.quant.q4k_matvec_pipeline;
         let n_tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;

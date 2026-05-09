@@ -271,7 +271,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_active",
         "q4k-matvec",
-        &metal.q4k_matvec_pipeline,
+        &metal.quant.q4k_matvec_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -283,7 +283,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_4sg",
         "q4k-matvec",
-        &metal.q4k_matvec_4sg_pipeline,
+        &metal.quant.q4k_matvec_4sg_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -295,7 +295,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_8sg",
         "q4k-matvec",
-        &metal.q4k_matvec_8sg_pipeline,
+        &metal.quant.q4k_matvec_8sg_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -307,7 +307,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_stride32",
         "q4k-matvec",
-        &metal.q4k_matvec_stride32_pipeline,
+        &metal.quant.q4k_matvec_stride32_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -319,7 +319,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q6k_matvec_active",
         "q6k-matvec",
-        &metal.q6k_matvec_pipeline,
+        &metal.quant.q6k_matvec_pipeline,
         &q6k_w,
         shape.hidden,
         shape.inter,
@@ -331,7 +331,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q6k_matvec_4sg",
         "q6k-matvec",
-        &metal.q6k_matvec_4sg_pipeline,
+        &metal.quant.q6k_matvec_4sg_pipeline,
         &q6k_w,
         shape.hidden,
         shape.inter,
@@ -343,7 +343,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q6k_matvec_8sg",
         "q6k-matvec",
-        &metal.q6k_matvec_8sg_pipeline,
+        &metal.quant.q6k_matvec_8sg_pipeline,
         &q6k_w,
         shape.hidden,
         shape.inter,
@@ -414,7 +414,7 @@ fn bench_q8_matvec(metal: &MetalBackend, cfg: &Config, shape: Shape) -> BenchRes
     let xb = bufs.transient_from_i8(&x_q8);
     let xsb = bufs.transient_from_f32(&x_scales);
     let ob = bufs.output((n * 4) as u64);
-    let kh = &metal.q8_matvec_pipeline;
+    let kh = &metal.quant.q8_matvec_pipeline;
     let n_val = n as u32;
     let k_val = k as u32;
     let tgs = (n as u64).div_ceil(kh.rows_per_tg);

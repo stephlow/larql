@@ -354,13 +354,13 @@ impl MetalBackend {
         // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
         // only writes rows 0..3 of each TG's 8-row range. See the matching
         // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
         for (e, (_, down_buf)) in expert_bufs.iter().enumerate().take(valid_count) {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(down_buf), 0);
             enc.set_buffer(1, Some(&scratch.act_buf), act_offset);
             enc.set_buffer(2, Some(&scratch.expert_outs), out_offset);
@@ -557,14 +557,14 @@ impl MetalBackend {
         // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
         // only writes rows 0..3 of each TG's 8-row range. See the matching
         // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
 
         for e in 0..valid_count {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(&scratch.down_bufs[e]), 0);
             enc.set_buffer(1, Some(&scratch.act_buf), act_offset);
             enc.set_buffer(2, Some(&scratch.expert_outs), out_offset);
@@ -677,10 +677,10 @@ impl MetalBackend {
         // the 4sg-vs-8sg dispatch geometry mismatch bug documented in ROADMAP.
         let n_out = hidden as u32;
         let k_in = inter_padded as u32;
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
-        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+        enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
         enc.set_buffer(0, Some(down_buf), 0);
         enc.set_buffer(1, Some(&act_buf), 0);
         enc.set_buffer(2, Some(&out_buf), 0);
@@ -853,14 +853,14 @@ impl MetalBackend {
         // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
         // only writes rows 0..3 of each TG's 8-row range. See the matching
         // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
 
         for e in 0..valid_count {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(&scratch.down_bufs[e]), 0);
             enc.set_buffer(1, Some(&scratch.act_buf), act_offset);
             enc.set_buffer(2, Some(&scratch.expert_outs), out_offset);

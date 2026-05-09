@@ -609,26 +609,24 @@ mod tests {
     #[test]
     fn open_unsupported_version_returns_error() {
         let path = std::env::temp_dir().join("larql_trace_test_bad_version.trac");
-        // Forge a header with the right magic but wrong version. Need at
-        // least HEADER_SIZE bytes so the size check passes first.
-        let mut header = TraceHeader {
+        // Forge a header with the right magic but wrong version. Header
+        // is exactly HEADER_SIZE bytes, which matches expected_file_len
+        // when n_tokens=0, so the length check passes first.
+        let header = TraceHeader {
             magic: MAGIC,
             version: VERSION + 99,
             hidden_size: 4,
             n_layers: 2,
             n_tokens: 0,
             _reserved: [0; 44],
-        }
-        .to_bytes();
-        // Pad to HEADER_SIZE (already that size from to_bytes — sanity).
-        assert_eq!(header.len(), HEADER_SIZE);
-        // Pad with zeros so the file matches expected_file_len for n_tokens=0.
-        let mut payload = Vec::new();
-        payload.append(&mut header);
-        std::fs::write(&path, &payload).expect("write");
+        };
+        std::fs::write(&path, &header.to_bytes()).expect("write");
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "unsupported version must error");
-        let err = result.unwrap_err();
+        let err = match result {
+            Ok(_) => unreachable!("unsupported version must error"),
+            Err(e) => e,
+        };
         assert!(
             err.to_string().contains("version"),
             "error should mention version: {err}"

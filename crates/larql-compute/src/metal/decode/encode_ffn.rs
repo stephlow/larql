@@ -201,8 +201,8 @@ impl MetalBackend {
         // default since 2026-04-28) leaves rows 4..7 of each TG unwritten.
         // Same fix as `trait_impl/quant_matvec.rs::q4k_matvec` and
         // `moe_dispatch.rs`.
-        let q4k_matvec_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let q4k_matvec_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let q4k_matvec_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let q4k_matvec_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let n_tgs_down = (hidden as u64).div_ceil(q4k_matvec_rows_per_tg);
 
         if layer.is_gated() {
@@ -363,8 +363,8 @@ impl MetalBackend {
                 use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
                 let pipes = Pipelines {
                     q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                    q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                    q6k_matvec: &self.q6k_matvec_pipeline,
+                    q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
+                    q6k_matvec: &self.quant.q6k_matvec_pipeline,
                     q4_matvec: &self.q4.matvec,
                     q4k_matmul: None,
                 };
@@ -388,7 +388,7 @@ impl MetalBackend {
             let _ = n_tgs_down;
         } else {
             let n_tgs_up = (inter as u64).div_ceil(q4k_matvec_rows_per_tg);
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(bufs.up_w), 0);
             enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
             enc.set_buffer(2, Some(bufs.up_out), 0);
@@ -408,7 +408,7 @@ impl MetalBackend {
                 inter as u64,
             );
 
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(bufs.down_w), 0);
             enc.set_buffer(1, Some(bufs.act_buf), 0);
             enc.set_buffer(2, Some(bufs.down_out), 0);
@@ -657,10 +657,10 @@ impl MetalBackend {
                 enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(MTLSize::new(n * 2, 1, 1), MTLSize::new(tgs, 1, 1));
             } else {
-                let rpt = self.q4k_matvec_pipeline.rows_per_tg;
-                let tpt = self.q4k_matvec_pipeline.threads_per_tg;
+                let rpt = self.quant.q4k_matvec_pipeline.rows_per_tg;
+                let tpt = self.quant.q4k_matvec_pipeline.threads_per_tg;
                 let n = (inter as u64).div_ceil(rpt);
-                enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+                enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
                 enc.set_buffer(0, Some(bufs.up_w), 0);
                 enc.set_buffer(1, Some(bufs.ffn_norm_out), 0);
                 enc.set_buffer(2, Some(bufs.up_out), 0);
@@ -786,10 +786,10 @@ impl MetalBackend {
                     inter_val,
                     inter as u64,
                 );
-                let rpt = self.q4k_matvec_pipeline.rows_per_tg;
-                let tpt = self.q4k_matvec_pipeline.threads_per_tg;
+                let rpt = self.quant.q4k_matvec_pipeline.rows_per_tg;
+                let tpt = self.quant.q4k_matvec_pipeline.threads_per_tg;
                 let n = (hidden as u64).div_ceil(rpt);
-                enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+                enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
                 enc.set_buffer(0, Some(bufs.down_w), 0);
                 enc.set_buffer(1, Some(bufs.act_buf), 0);
                 enc.set_buffer(2, Some(bufs.down_out), 0);
@@ -861,8 +861,8 @@ impl MetalBackend {
         use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
         let pipes = Pipelines {
             q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-            q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-            q6k_matvec: &self.q6k_matvec_pipeline,
+            q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
+            q6k_matvec: &self.quant.q6k_matvec_pipeline,
             q4_matvec: &self.q4.matvec,
             q4k_matmul: None,
         };

@@ -469,7 +469,7 @@ impl MetalBackend {
         if hidden == 0 || !hidden.is_multiple_of(256) {
             return None;
         }
-        let kh = &self.q4k_matvec_stride32_pipeline;
+        let kh = &self.quant.q4k_matvec_stride32_pipeline;
         let buf_w = self.bufs.get_bytes(q4k_data);
         let buf_x = self.bufs.transient_from_f32(x);
         let buf_out = self.bufs.output((num_rows * 4) as u64);

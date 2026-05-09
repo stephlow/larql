@@ -361,6 +361,22 @@ mod tests {
     }
 
     #[test]
+    fn capture_donor_skips_unrecorded_layer() {
+        // When a coord requests a layer that's beyond the model's depth,
+        // RecordHook never receives a callback for it — the post-trace
+        // pickup loop's `record.post_layer.get(&layer)` returns None
+        // and the coord is silently dropped (the `continue` branch).
+        let weights = shared_weights();
+        let coords = vec![
+            (0usize, 0usize),                // valid
+            (weights.num_layers + 9, 0),     // beyond model depth — None branch
+        ];
+        let donor = capture_donor_state(weights, &[0u32, 1], &coords);
+        assert!(donor.records.contains_key(&(0, 0)));
+        assert!(!donor.records.contains_key(&(weights.num_layers + 9, 0)));
+    }
+
+    #[test]
     fn capture_donor_drops_layer_above_max() {
         // Coords request layer N+1 (above the model's last layer). The
         // `layer > max_layer` guard never fires here (layer == max_layer),

@@ -442,11 +442,16 @@ mod tests {
     }
 
     #[test]
-    fn lm_head_knn_top_k_zero_returns_empty() {
+    fn lm_head_knn_top_k_zero_returns_full_unsorted_pairs() {
+        // The truncate guard requires k > 0; with k = 0 we return the
+        // full indexed set sorted by score (no truncation). This pins
+        // the actual contract — callers passing top_k=0 should treat
+        // it as "give me everything".
         let lm_head: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
         let v = vindex_with_lm_head(2, 2, &lm_head);
         let q = Array1::from_vec(vec![1.0_f32, 0.0]);
-        assert!(v.lm_head_knn(&q, 0).is_empty());
+        let hits = v.lm_head_knn(&q, 0);
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]
@@ -485,12 +490,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn stride32_mode_unset_falls_back() {
         let _g = EnvSet::set(None);
         assert_eq!(lm_head_stride32_mode(), Stride32Mode::Fallback);
     }
 
     #[test]
+    #[serial_test::serial]
     fn stride32_mode_truthy_values_select_first() {
         for val in ["1", "true", "on", "yes"] {
             let _g = EnvSet::set(Some(val));
@@ -499,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn stride32_mode_falsy_values_select_disabled() {
         for val in ["0", "false", "off", "no"] {
             let _g = EnvSet::set(Some(val));
@@ -507,6 +515,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn stride32_mode_unknown_value_falls_back() {
         let _g = EnvSet::set(Some("maybe"));
         assert_eq!(lm_head_stride32_mode(), Stride32Mode::Fallback);

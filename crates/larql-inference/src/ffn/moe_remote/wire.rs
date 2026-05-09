@@ -437,4 +437,135 @@ mod tests {
         body.extend_from_slice(&0.0f32.to_le_bytes());
         assert!(decode_expert_response(&body).is_none());
     }
+
+    #[test]
+    fn layer_batch_response_round_trips() {
+        let weighted = vec![0.1f32, -0.5, 1.25, 3.0];
+        let body = encode_layer_batch_response(&weighted, 7.5);
+        let decoded = decode_layer_batch_response(&body).unwrap();
+        assert_eq!(decoded, weighted);
+    }
+
+    #[test]
+    fn decode_layer_batch_response_returns_none_on_truncation() {
+        // Header says hidden=4 (16 bytes), but only 8 bytes after header.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&[0u8; 8]); // need 16, have 8
+        assert!(decode_layer_batch_response(&body).is_none());
+    }
+
+    #[test]
+    fn decode_layer_batch_response_returns_none_on_short_header() {
+        // < 8 bytes total — truncation before hidden+latency header.
+        assert!(decode_layer_batch_response(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn decode_layer_batch_request_returns_none_on_truncation() {
+        // Header advertises hidden=2 (8 bytes residual), K=1 (8 bytes for
+        // expert id+weight) → 12 + 8 + 8 = 28 bytes. Provide only 16.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // layer
+        body.extend_from_slice(&2u32.to_le_bytes()); // hidden
+        body.extend_from_slice(&1u32.to_le_bytes()); // K
+        body.extend_from_slice(&[0u8; 4]); // partial residual
+        assert!(decode_layer_batch_request(&body).is_none());
+    }
+
+    #[test]
+    fn decode_layer_batch_request_returns_none_on_short_header() {
+        // < 12 bytes total (no full layer/hidden/K header).
+        assert!(decode_layer_batch_request(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn expert_response_round_trips() {
+        // Drives `encode_expert_response` and the happy path of
+        // `decode_expert_response` (the existing test only covers the
+        // overflow-guard early return).
+        let items = vec![
+            ExpertResultItem {
+                layer: 5,
+                expert_id: 11,
+                output: vec![1.0, 2.0, 3.0],
+            },
+            ExpertResultItem {
+                layer: 6,
+                expert_id: 12,
+                output: vec![4.0, 5.0, 6.0],
+            },
+        ];
+        let body = encode_expert_response(&items, 0.5);
+        let decoded = decode_expert_response(&body).expect("decode should succeed");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].layer, 5);
+        assert_eq!(decoded[0].expert_id, 11);
+        assert_eq!(decoded[0].output, vec![1.0, 2.0, 3.0]);
+        assert_eq!(decoded[1].output, vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn decode_expert_response_short_header_returns_none() {
+        // < 12 bytes (no full n+hidden+latency header).
+        assert!(decode_expert_response(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn decode_expert_request_short_header_returns_none() {
+        // < 8 bytes header.
+        assert!(decode_expert_request(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn decode_expert_request_returns_none_on_truncated_payload() {
+        // Header n=1, hidden=2: per item = 8 + 8 = 16 bytes. Body has 0.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // n
+        body.extend_from_slice(&2u32.to_le_bytes()); // hidden
+        // Missing the 16-byte item.
+        assert!(decode_expert_request(&body).is_none());
+    }
+
+    #[test]
+    fn decode_layer_batch_request_f16_short_header_returns_none() {
+        assert!(decode_layer_batch_request_f16(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn decode_layer_batch_request_f16_truncated_payload_returns_none() {
+        // hidden=4 (8 bytes f16), K=1 (8 bytes); need 12 + 16 = 28 total.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0u8; 4]); // partial
+        assert!(decode_layer_batch_request_f16(&body).is_none());
+    }
+
+    #[test]
+    fn encode_layer_batch_response_writes_expected_byte_count() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        let body = encode_layer_batch_response(&v, 0.0);
+        // 4 (hidden) + 4 (latency) + 3*4 (f32 payload) = 20 bytes.
+        assert_eq!(body.len(), 4 + 4 + 3 * 4);
+    }
+
+    #[test]
+    fn encode_expert_response_handles_empty_batch() {
+        // n=0 still emits the full 12-byte header.
+        let body = encode_expert_response(&[], 1.0);
+        assert_eq!(body.len(), 12);
+        let decoded = decode_expert_response(&body).expect("empty batch round-trips");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn encode_expert_request_handles_empty_batch() {
+        let body = encode_expert_request(&[]);
+        assert_eq!(body.len(), 8); // 4 + 4 header only
+        let decoded = decode_expert_request(&body).expect("empty batch decode");
+        assert!(decoded.is_empty());
+    }
 }

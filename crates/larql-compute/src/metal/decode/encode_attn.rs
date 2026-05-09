@@ -343,15 +343,15 @@ impl MetalBackend {
             use crate::metal::stages::quant_matvec::Pipelines;
             let pipes = Pipelines {
                 q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                q4k_matvec_fallback: &self.q4k_matvec_pipeline,
-                q6k_matvec: &self.q6k_matvec_pipeline,
+                q4k_matvec_fallback: &self.quant.q4k_matvec_pipeline,
+                q6k_matvec: &self.quant.q6k_matvec_pipeline,
                 q4_matvec: &self.q4.matvec,
                 q4k_matmul: None,
             };
             crate::metal::stages::o_proj::encode(
                 enc,
                 &pipes,
-                &self.q8_quant_pipeline,
+                &self.quant.q8_quant_pipeline,
                 layer.wo.format,
                 bufs.wo,
                 bufs.attn_out_buf,
@@ -371,7 +371,7 @@ impl MetalBackend {
             // a different buffer layout). Inline.
             let dim_val = layer_q_dim as u32;
             let blocks = (layer_q_dim / LEGACY_BLOCK_ELEMS) as u32;
-            enc.set_compute_pipeline_state(&self.q8_quant_pipeline);
+            enc.set_compute_pipeline_state(&self.quant.q8_quant_pipeline);
             enc.set_buffer(0, Some(bufs.attn_out_buf), 0);
             enc.set_buffer(1, Some(bufs.o_q8_scratch), 0);
             enc.set_buffer(2, Some(bufs.o_q8s_scratch), 0);
@@ -383,7 +383,7 @@ impl MetalBackend {
 
             let o_rows = hidden as u32;
             let o_k = layer_q_dim as u32;
-            enc.set_compute_pipeline_state(&self.q8_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q8_matvec_pipeline.state);
             enc.set_buffer(0, Some(bufs.wo), 0);
             enc.set_buffer(1, Some(bufs.o_q8_scratch), 0);
             enc.set_buffer(2, Some(bufs.wo_scales), 0);

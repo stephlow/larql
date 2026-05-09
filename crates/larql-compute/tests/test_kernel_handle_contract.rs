@@ -100,27 +100,27 @@ fn q4_pipelines_handle_contract() {
 fn k_matvec_handle_contract() {
     let metal = get_metal();
     assert_q4k_selected_handle_matches_active_marker(
-        &metal.q4k_matvec_pipeline,
+        &metal.quant.q4k_matvec_pipeline,
         "q4k_matvec_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_matvec::Kernel>(
-        &metal.q4k_matvec_4sg_pipeline,
+        &metal.quant.q4k_matvec_4sg_pipeline,
         "q4k_matvec_4sg_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_matvec_8sg::Kernel>(
-        &metal.q4k_matvec_8sg_pipeline,
+        &metal.quant.q4k_matvec_8sg_pipeline,
         "q4k_matvec_8sg_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_matvec_stride32::Kernel>(
-        &metal.q4k_matvec_stride32_pipeline,
+        &metal.quant.q4k_matvec_stride32_pipeline,
         "q4k_matvec_stride32_pipeline",
     );
     assert_handle_matches_marker::<shaders::q6k_matvec::Kernel>(
-        &metal.q6k_matvec_pipeline,
+        &metal.quant.q6k_matvec_pipeline,
         "q6k_matvec_pipeline",
     );
     assert_handle_matches_marker::<shaders::q8_matvec::Kernel>(
-        &metal.q8_matvec_pipeline,
+        &metal.quant.q8_matvec_pipeline,
         "q8_matvec_pipeline",
     );
 }
