@@ -1,6 +1,6 @@
 //! Apollo boundary residual R(D) backend.
 //!
-//! Contract with `experiments/40_boundary_state_rate_distortion/kl_eval.py`:
+//! Contract with `~/chris-source/chris-experiments/shannon/40_boundary_state_rate_distortion/kl_eval.py`:
 //!
 //! ```text
 //! cargo run --release -p larql-inference --example apollo_rd_backend -- \

@@ -1,23 +1,17 @@
 //! Full MoE block forward pass: router → top-k → weighted sum of expert outputs.
 //!
-//! Flow (matching HF Gemma 4, with fallbacks for architectures that omit
-//! some weights):
-//!
-//! 1. `pre_experts_norm(h)` — input for the expert matmuls.
-//! 2. `router_norm(h) * router_scale * router_input_scalar` — input for the
-//!    router projection. Falls back to the experts' pre-norm when the router
-//!    has no dedicated norm weight.
-//! 3. Softmax over all experts → top-k → renormalize weights to sum to 1 →
-//!    multiply by `per_expert_scale`.
-//! 4. For each selected expert: `down_proj(act(gate_proj(h_norm)) * up_proj(h_norm))`
-//!    weighted by the router probability, accumulated into `expert_out`.
-//! 5. `post_experts_norm(expert_out)` — matches HF's `post_feedforward_layernorm_2`.
+//! Flow is controlled by `MoeLayerWeights::routing_policy` and
+//! `weight_layout`, so Gemma-style hybrid MoE choices are metadata rather
+//! than hidden branches in the hot path.
 
 use crate::MoeLayerWeights;
 
 use super::cache::try_cached_dequant;
 use super::expert::{run_single_expert_q4k_q8k_into, ExpertScratch};
-use super::math::{gelu_tanh, matmul_vec, rms_norm, rms_norm_no_weight, silu, softmax, top_k};
+use super::math::{gelu_tanh, matmul_vec, silu, softmax};
+use super::{
+    moe_expert_input, moe_post_expert_output, moe_route_from_router_input, moe_router_input,
+};
 use crate::cpu::ops::q4k_q8k_dot::quantize_x_to_q8k;
 use crate::options;
 
@@ -59,62 +53,24 @@ pub fn cpu_moe_forward(
         return vec![0.0f32; hidden];
     }
 
-    // 1. Pre-experts norm — input for the expert matmuls.
-    //
-    //    The router norm composes ON TOP of this. Empirically the trained
-    //    Gemma 4 26B-A4B weights expect router input = pre_experts_norm(h),
-    //    not raw h, even though HF's modeling_gemma4.py reads the raw
-    //    residual. Switching to the HF convention degrades generation to
-    //    token repetition; this matches Metal's `gpu_moe_dispatch`
-    //    convention so all backends agree.
-    let h_norm = rms_norm(h, moe.pre_experts_norm, eps, norm_offset);
-
-    // 2. Router input norm. Resolution order:
-    //      1. learned router_norm weight (architectures that ship one),
-    //      2. parameter-free RMSNorm (HF Gemma 4 — `Gemma4RMSNorm(with_scale=False)`),
-    //      3. fallback: just use the pre-experts-norm output directly.
-    //    All three apply on top of h_norm so the routing matches Metal.
-    let router_in_normed: Vec<f32> = if !moe.router_norm.is_empty() {
-        rms_norm(&h_norm, moe.router_norm, eps, norm_offset)
-    } else if moe.router_norm_parameter_free {
-        rms_norm_no_weight(&h_norm, eps)
+    let expert_input = moe_expert_input(h, moe, norm_offset, eps);
+    let router_in = moe_router_input(h, &expert_input, moe, norm_offset, eps);
+    let (expert_indices, expert_weights) = moe_route_from_router_input(&router_in, moe);
+    let debug_logits = if options::moe_debug_enabled() {
+        let mut logits = matmul_vec(&router_in, moe.router_proj, num_experts, hidden);
+        softmax(&mut logits);
+        Some(logits)
     } else {
-        h_norm.clone()
+        None
     };
-
-    // 3. Router scale (learned per-hidden-dim vector) + optional scalar
-    //    (Gemma 4: `scalar_root_size = hidden_size^-0.5`). Applied after the
-    //    router norm, before the projection.
-    let mut router_in: Vec<f32> = if !moe.router_scale.is_empty() {
-        router_in_normed
-            .iter()
-            .zip(moe.router_scale.iter())
-            .map(|(a, b)| a * b)
-            .collect()
-    } else {
-        router_in_normed
-    };
-    if moe.router_input_scalar != 1.0 && moe.router_input_scalar != 0.0 {
-        for v in router_in.iter_mut() {
-            *v *= moe.router_input_scalar;
-        }
-    }
-
-    // 4. Router projection: [hidden] → [num_experts]
-    let mut logits = matmul_vec(&router_in, moe.router_proj, num_experts, hidden);
-
-    // 5. Softmax
-    softmax(&mut logits);
-
-    // 6. Top-k selection
-    let (expert_indices, mut expert_weights) = top_k(&logits, top_k_val);
 
     // Debug: print routing per layer if MOE_DEBUG=1
     static DEBUG_LAYER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if options::moe_debug_enabled() {
+    if let Some(logits) = debug_logits.as_ref() {
         let layer_n = DEBUG_LAYER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30;
         let h_rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
-        let hn_rms = (h_norm.iter().map(|v| v * v).sum::<f32>() / h_norm.len() as f32).sqrt();
+        let hn_rms =
+            (expert_input.iter().map(|v| v * v).sum::<f32>() / expert_input.len() as f32).sqrt();
         let ri_rms =
             (router_in.iter().map(|v| v * v).sum::<f32>() / router_in.len().max(1) as f32).sqrt();
         let logit_max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -131,29 +87,8 @@ pub fn cpu_moe_forward(
         eprintln!("[L{layer_n:02}] h_rms={h_rms:.2} hn_rms={hn_rms:.2} router_in_rms={ri_rms:.2} | pnorm_rms={pnorm_rms:.2} rnorm_rms={rnorm_rms:.2} rscale_rms={rscale_rms:.2} scalar={:.4} | logits [{logit_min:.3}..{logit_max:.3}] | experts:{expert_indices:?}", moe.router_input_scalar);
     }
 
-    // 7. Renormalize selected weights to sum to 1 (Gemma 4 gemma4_top_k_softmax).
-    // After softmax over all 128 experts, the selected top-8 weights sum to
-    // ~0.5-0.7, not 1.0.  Renormalising ensures the expert block contributes
-    // at the correct scale.  Without this the expert residual is undersized
-    // every layer and the model output is garbage.
-    let weight_sum: f32 = expert_weights.iter().sum();
-    if weight_sum > 0.0 {
-        for w in &mut expert_weights {
-            *w /= weight_sum;
-        }
-    }
-
-    // 8. Per-expert output scale (Gemma 4 learned per-expert scale)
-    if !moe.router_per_expert_scale.is_empty() {
-        for (i, &ei) in expert_indices.iter().enumerate() {
-            if ei < moe.router_per_expert_scale.len() {
-                expert_weights[i] *= moe.router_per_expert_scale[ei];
-            }
-        }
-    }
-
-    // 9. Run each selected expert's gated FFN (BF16 dequant on demand).
-    //    Experts are independent — their only shared input is `h_norm` and
+    // Run each selected expert's gated FFN (BF16 dequant on demand).
+    //    Experts are independent — their only shared input is `expert_input` and
     //    their outputs are summed. Parallelise across the top-K experts with
     //    rayon so BLAS-accelerated gemv on each core overlaps. `moe.activation`
     //    is a plain enum (Copy), and `cached_dequant` hands out shared
@@ -175,17 +110,11 @@ pub fn cpu_moe_forward(
     // dequant down at the padded width, zero-pad the hidden_state so
     // the matmul reads `inter_padded` columns with the padding
     // contributing zero.
-    let inter_padded = match format {
-        crate::QuantFormat::Q4_K => {
-            let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
-            inter.div_ceil(block) * block
-        }
-        _ => inter,
-    };
+    let inter_padded = moe.inter_padded();
 
     let t_pre_par = t_start.elapsed();
 
-    // Q4_K direct-from-mmap path: quantise h_norm to Q8_K once per layer
+    // Q4_K direct-from-mmap path: quantise expert_input to Q8_K once per layer
     // (shared across all K active experts) and use the SDOT-based integer
     // matvec.  Bypasses the f32 dequant cache entirely — at Gemma 4 26B-A4B
     // sizes the f32 cache is 5.7 GB walked per token and DRAM-bandwidth
@@ -195,7 +124,7 @@ pub fn cpu_moe_forward(
         && hidden.is_multiple_of(256)
         && !options::env_flag(options::ENV_DISABLE_Q4K_DIRECT);
     let t_q8k_quant_start = std::time::Instant::now();
-    let h_norm_q8k = q4k_direct.then(|| quantize_x_to_q8k(&h_norm));
+    let expert_input_q8k = q4k_direct.then(|| quantize_x_to_q8k(&expert_input));
     let t_q8k_quant = t_q8k_quant_start.elapsed();
     let t_par_start = std::time::Instant::now();
 
@@ -236,7 +165,7 @@ pub fn cpu_moe_forward(
                         *scratch = ExpertScratch::new(hidden, inter, inter_padded);
                     }
 
-                    if let Some(q8k) = h_norm_q8k.as_ref() {
+                    if let Some(q8k) = expert_input_q8k.as_ref() {
                         // Q4_K direct path — single source of truth in
                         // `expert::run_single_expert_q4k_q8k_into`.  Reuses
                         // the scratch's act_q8k buffer too.
@@ -266,8 +195,8 @@ pub fn cpu_moe_forward(
                     let gate_w = &gate_up_w[..inter * hidden];
                     let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
 
-                    let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
-                    let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
+                    let gate_out = matmul_vec(&expert_input, gate_w, inter, hidden);
+                    let up_out = matmul_vec(&expert_input, up_w, inter, hidden);
 
                     for j in 0..inter {
                         let g = gate_out[j];
@@ -305,9 +234,9 @@ pub fn cpu_moe_forward(
     let t_par = t_par_start.elapsed();
     let t_sum = std::time::Duration::ZERO;
 
-    // 10. Post-experts norm (HF `post_feedforward_layernorm_2`)
+    // Post-experts output policy (Gemma 4: `post_feedforward_layernorm_2`)
     let t_post_start = std::time::Instant::now();
-    let result = rms_norm(&expert_out, moe.post_experts_norm, eps, norm_offset);
+    let result = moe_post_expert_output(&expert_out, moe, norm_offset, eps);
     let t_post = t_post_start.elapsed();
 
     if timing {
@@ -366,6 +295,8 @@ mod tests {
         MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
             router_proj: router,
             router_scale: &[],
             router_per_expert_scale: &[],
@@ -438,6 +369,8 @@ mod tests {
         let moe = MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
             router_proj: &router,
             router_scale: &[],
             router_per_expert_scale: &[],

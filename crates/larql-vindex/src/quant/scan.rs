@@ -18,7 +18,7 @@
 //!   multiple tiles per feature (closer to DeepSeek's 128×128).
 //!
 //! See `docs/specs/fp4-format-spec.md` §5 for the byte layout these
-//! scales correspond to, and `experiments/26_fp4_quantisation/SPEC.md`
+//! scales correspond to, and `~/chris-source/chris-experiments/routing/26_fp4_quantisation/SPEC.md`
 //! for the theoretical framing.
 
 use std::path::Path;

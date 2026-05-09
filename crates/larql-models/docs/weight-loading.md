@@ -186,12 +186,41 @@ GGUF uses different key patterns than safetensors:
 | GGUF key | Safetensors equivalent |
 |----------|----------------------|
 | `blk.0.attn_q.weight` | `layers.0.self_attn.q_proj.weight` |
+| `blk.0.attn_qkv.weight` | `layers.0.self_attn.qkv_proj.weight` (split into q/k/v post-load) |
 | `blk.0.ffn_gate.weight` | `layers.0.mlp.gate_proj.weight` |
 | `token_embd.weight` | `embed_tokens.weight` |
+| `position_embd.weight` | `wpe.weight` (lookup via `arch.position_embed_key()`) |
 | `output_norm.weight` | `norm.weight` |
 
 The replacement table is centralized in `loading/gguf.rs`; add new GGUF key
 forms there rather than scattering ad-hoc rewrites through loading code.
+
+### 5. Canonical-orientation pass
+
+After key translation, `load_gguf_filtered_with_validation` runs three
+post-load normalisation passes so all downstream consumers see a single
+shape:
+
+- `orient_ffn_tensors` — for each layer, transposes `ffn_gate`, `ffn_up`,
+  `ffn_down`, MoE per-expert variants, and shared-expert variants when their
+  loaded shape matches the inverse of the canonical Linear layout (gate/up:
+  `(intermediate, hidden)`, down: `(hidden, intermediate)`).
+- `orient_attention_tensors` — same idea for `q_proj`/`k_proj`/`v_proj`/
+  `o_proj` plus the fused `qkv_proj` `(q + 2*kv, hidden)` shape. No-op when
+  rows == cols (orientation can't be inferred from shape alone).
+- `split_fused_qkv` — for architectures that declare `fused_qkv_key`, slices
+  the fused `qkv_proj` rows into per-projection `q_proj`/`k_proj`/`v_proj`
+  tensors at the trait's standard keys, plus matching biases from the fused
+  bias vector. After this pass downstream code never sees `qkv_proj`.
+
+These passes are driven by trait methods + `ModelConfig` dimensions — no
+family-specific branching. Architectures that don't need them are no-ops.
+
+The motivation is real-world non-canonical GGUFs: some GPT-2 converters
+don't transpose Conv1D weights, leaving FFN tensors shaped `(intermediate,
+hidden)` instead of the Linear `(hidden, intermediate)`. The orient passes
+detect and fix this; the split pass unfuses GPT-2's `c_attn` matrix into
+the per-projection layout the rest of the stack already speaks.
 
 ## ModelWeights Struct
 
@@ -205,6 +234,7 @@ pub struct ModelWeights {
     pub packed_byte_ranges: HashMap<String, (String, usize, usize)>, // key → (file, offset, len)
     pub embed: WeightArray,                       // Embedding matrix [vocab, hidden]
     pub lm_head: WeightArray,                     // Output projection (may be tied to embed)
+    pub position_embed: Option<WeightArray>,       // Learned wpe (GPT-2); None for rotary models
     pub arch: Box<dyn ModelArchitecture>,          // Detected architecture
     // Cached config values for hot-path access:
     pub num_layers: usize,

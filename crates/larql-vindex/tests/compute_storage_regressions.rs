@@ -474,7 +474,8 @@ fn layer_weight_quant_helpers_cover_dense_and_moe_shapes() {
         2,
         2,
         LayerWeightFormat::F32,
-    );
+    )
+    .unwrap();
     assert_eq!(dense.gate_up.len(), 8 * F32_BYTES);
     assert_eq!(
         dense.down.len(),
@@ -490,9 +491,27 @@ fn layer_weight_quant_helpers_cover_dense_and_moe_shapes() {
         1,
         LAYER_HIDDEN,
         LayerWeightFormat::F32,
-    );
+    )
+    .unwrap();
     assert_eq!(moe.len(), NUM_EXPERTS);
     assert_eq!(moe[0].gate_up.len(), 2 * LAYER_HIDDEN * F32_BYTES);
+}
+
+#[test]
+fn layer_weight_quant_helpers_reject_unimplemented_formats() {
+    let err = match quantize_dense_entry(
+        &[1.0, 2.0],
+        &[3.0, 4.0],
+        &[5.0, 6.0],
+        1,
+        2,
+        LayerWeightFormat::FP4,
+    ) {
+        Ok(_) => panic!("FP4 per-layer quantization should be rejected until implemented"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("FP4"), "{err}");
+    assert!(err.contains("does not implement"), "{err}");
 }
 
 #[test]

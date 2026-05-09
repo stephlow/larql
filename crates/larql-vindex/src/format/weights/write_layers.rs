@@ -135,22 +135,24 @@ pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Quantize an f32 slice to the specified format.
-/// Returns the quantized byte Vec.
-///
-/// The `block_width` is the number of columns (used for padding to the
-/// nearest block boundary when required by the format).
-pub fn quantize_f32(data: &[f32], format: LayerWeightFormat) -> Vec<u8> {
-    match format {
+/// Returns an error for declared-but-unimplemented formats instead of
+/// silently writing Q4_K bytes under the wrong header tag.
+pub fn quantize_f32(data: &[f32], format: LayerWeightFormat) -> Result<Vec<u8>, VindexError> {
+    let bytes = match format {
         LayerWeightFormat::Q4_K => quantize_q4_k(data),
         LayerWeightFormat::Q6_K => quantize_q6_k(data),
         LayerWeightFormat::F32 => bytemuck_f32_to_bytes(data),
-        LayerWeightFormat::F16 | LayerWeightFormat::BF16 => {
-            // Store as f32 — f16/bf16 conversion not yet implemented here.
-            // Caller should use F32 format for now.
-            bytemuck_f32_to_bytes(data)
+        LayerWeightFormat::F16
+        | LayerWeightFormat::BF16
+        | LayerWeightFormat::Q4_0
+        | LayerWeightFormat::Q8_0
+        | LayerWeightFormat::FP4 => {
+            return Err(VindexError::Parse(format!(
+                "per-layer FFN writer does not implement quantization for {format:?}"
+            )));
         }
-        _ => quantize_q4_k(data), // fallback: Q4_K for unimplemented formats
-    }
+    };
+    Ok(bytes)
 }
 
 fn bytemuck_f32_to_bytes(data: &[f32]) -> Vec<u8> {
@@ -185,18 +187,18 @@ pub fn quantize_dense_entry(
     inter: usize,
     hidden: usize,
     format: LayerWeightFormat,
-) -> LayerEntry {
+) -> Result<LayerEntry, VindexError> {
     // gate+up interleaved: [gate rows, up rows] = [2*inter, hidden]
     let mut gate_up_f32 = Vec::with_capacity(2 * inter * hidden);
     gate_up_f32.extend_from_slice(gate_f32);
     gate_up_f32.extend_from_slice(up_f32);
-    let gate_up = quantize_f32(&gate_up_f32, format);
+    let gate_up = quantize_f32(&gate_up_f32, format)?;
 
     // down: [hidden, inter] padded to 256-element column boundary
     let (down_padded, _) = pad_cols_to_256(down_f32, hidden, inter);
-    let down = quantize_f32(&down_padded, format);
+    let down = quantize_f32(&down_padded, format)?;
 
-    LayerEntry { gate_up, down }
+    Ok(LayerEntry { gate_up, down })
 }
 
 /// Build quantized entries for one MoE layer from BF16-packed expert tensors.
@@ -211,7 +213,7 @@ pub fn quantize_moe_entries(
     moe_inter: usize,
     hidden: usize,
     format: LayerWeightFormat,
-) -> Vec<LayerEntry> {
+) -> Result<Vec<LayerEntry>, VindexError> {
     let gate_up_stride = 2 * moe_inter * hidden * BF16_BYTES; // bytes per expert
     let down_stride = hidden * moe_inter * BF16_BYTES; // bytes per expert
 
@@ -219,15 +221,15 @@ pub fn quantize_moe_entries(
         .map(|e| {
             let gu_bytes = &gate_up_bf16[e * gate_up_stride..(e + 1) * gate_up_stride];
             let gate_up_f32 = bf16_bytes_to_f32(gu_bytes);
-            let gate_up = quantize_f32(&gate_up_f32, format);
+            let gate_up = quantize_f32(&gate_up_f32, format)?;
 
             let dn_bytes = &down_bf16[e * down_stride..(e + 1) * down_stride];
             let down_f32_src = bf16_bytes_to_f32(dn_bytes);
             // Pad inter → 256-element boundary (required for block formats like Q4_K)
             let (down_padded, _) = pad_cols_to_256(&down_f32_src, hidden, moe_inter);
-            let down = quantize_f32(&down_padded, format);
+            let down = quantize_f32(&down_padded, format)?;
 
-            LayerEntry { gate_up, down }
+            Ok(LayerEntry { gate_up, down })
         })
         .collect()
 }

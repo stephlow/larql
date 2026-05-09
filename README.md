@@ -511,9 +511,17 @@ Input formats: **safetensors** (HuggingFace), **GGUF** (llama.cpp, dequantized t
 | Phi | Phi 2/3 (2.7B-14B) | Gated |
 | DeepSeek | DeepSeek V2/V3 | MoE (shared + routed) |
 | GPT-OSS | GPT-OSS-120B | MoE (128 experts, MXFP4) |
-| GPT-2 | GPT-2 (117M-1.5B) | Dense (GELU) |
+| GPT-2 | GPT-2 (117M-1.5B) | Standard (GELU-tanh, vindex extraction only) |
 
 Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFER). MXFP4-quantized MoE models (GPT-OSS) can be extracted and served but DESCRIBE/WALK produce noisy results due to 4-bit weight precision — use INFER for accurate knowledge queries. See [operations spec](docs/specs/vindex-operations-spec.md) for details.
+
+GPT-2 status: GGUF conversion (`larql convert gguf-to-vindex`) lands canonical
+weights — the loader transparently re-orients non-standard FFN layouts, splits
+the fused `attn_qkv` projection into per-head q/k/v, and surfaces learned
+`wpe` positional embeddings on `ModelWeights::position_embed`. Forward-pass
+inference still requires wiring `position_embed` into the residual init and
+the LayerNorm-with-bias / FFN-with-bias paths through the run-time stack;
+extraction-only flows (DESCRIBE, KNN, vindex publish) work today.
 
 ## Benchmarks
 

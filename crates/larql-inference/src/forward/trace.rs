@@ -178,7 +178,7 @@ pub fn capture_ffn_activation_matrix(
 /// the covariance sidecar (`down_weights_covariance.bin`) that the
 /// MEMIT weight-edit solve needs. Sampling a few thousand token
 /// positions across a handful of diverse prompts is enough —
-/// experiments/15_v11_model/vindex_compile_rome_v11.py §20.3 shows
+/// ~/chris-source/chris-experiments/compilation/15_v11_model/vindex_compile_rome_v11.py §20.3 shows
 /// ~14K samples giving condition ~1e9, which is numerically stable.
 ///
 /// Stable under accumulation: this is a true streaming implementation

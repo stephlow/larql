@@ -19,7 +19,7 @@
 //!
 //! Validated in Python: 200/200 (100%) at N=200 with multi-layer
 //! distribution across L8-L12 on v11 TinyStories 115M. See
-//! `experiments/15_v11_model/RESULTS.md §20`.
+//! `~/chris-source/chris-experiments/compilation/15_v11_model/RESULTS.md §20`.
 
 use super::trace::{capture_ffn_activation_matrix, estimate_ffn_covariance};
 use crate::model::ModelWeights;

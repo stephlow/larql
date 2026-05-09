@@ -27,6 +27,21 @@ build/
 # Checkpoints / temp
 *.checkpoint
 
+# Weights and binary model files — never commit these
+*.npz
+*.npy
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.pkl
+*.h5
+*.hdf5
+*.vindex
+
 # Nix
 result
 result-*

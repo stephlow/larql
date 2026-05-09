@@ -1005,6 +1005,146 @@ mod tests {
         assert_eq!(after[[3, 3]], 15.0);
     }
 
+    /// Build a minimal Gpt2-shaped ModelConfig for orientation/split tests.
+    fn synth_gpt2_config(
+        num_layers: usize,
+        hidden: usize,
+        head_dim: usize,
+        n_heads: usize,
+    ) -> crate::config::ModelConfig {
+        crate::config::ModelConfig {
+            model_type: "gpt2".into(),
+            num_layers,
+            hidden_size: hidden,
+            intermediate_size: 4 * hidden,
+            head_dim,
+            num_q_heads: n_heads,
+            num_kv_heads: n_heads,
+            vocab_size: Some(8),
+            rope_base: 10_000.0,
+            rope_local_base: None,
+            sliding_window: None,
+            num_experts: None,
+            num_experts_per_token: None,
+            num_shared_experts: None,
+            enable_moe_block: false,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+            kv_lora_rank: None,
+            q_lora_rank: None,
+            rope_scaling: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            embedding_multiplier: None,
+            residual_multiplier: None,
+            attention_multiplier: None,
+            logits_scaling: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            partial_rotary_factor: None,
+            sliding_window_pattern: None,
+            layer_types: None,
+            attention_k_eq_v: false,
+            per_layer_embed_dim: None,
+            num_kv_shared_layers: None,
+        }
+    }
+
+    #[test]
+    fn test_orient_attention_tensors_fixes_inverse_fused_qkv_layout() {
+        use ndarray::Array2;
+
+        // hidden=4, head_dim=2, n_heads=2 → q_dim=kv_dim=4, total=12.
+        let cfg = synth_gpt2_config(1, 4, 2, 2);
+        let arch = crate::architectures::gpt2::Gpt2Arch::from_config(cfg);
+
+        let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
+        // Inverse layout: stored (hidden=4, total=12) instead of (12, 4).
+        let inverse = Array2::<f32>::zeros((4, 12)).into_shared();
+        tensors.insert("layers.0.self_attn.qkv_proj.weight".into(), inverse);
+
+        orient_attention_tensors(&mut tensors, &arch);
+
+        let oriented = tensors.get("layers.0.self_attn.qkv_proj.weight").unwrap();
+        assert_eq!(oriented.shape(), &[12, 4]);
+    }
+
+    #[test]
+    fn test_split_fused_qkv_materialises_per_projection_tensors_and_biases() {
+        use ndarray::Array2;
+
+        // hidden=4, head_dim=2, n_heads=2 → q_dim=kv_dim=4, total=12.
+        let cfg = synth_gpt2_config(1, 4, 2, 2);
+        let arch = crate::architectures::gpt2::Gpt2Arch::from_config(cfg);
+
+        let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+        // Fused weight: row r has constant value r so we can verify slices.
+        let mut data = Vec::with_capacity(12 * 4);
+        for r in 0..12 {
+            for _c in 0..4 {
+                data.push(r as f32);
+            }
+        }
+        let fused_w = Array2::from_shape_vec((12, 4), data).unwrap().into_shared();
+        tensors.insert("layers.0.self_attn.qkv_proj.weight".into(), fused_w);
+
+        // Fused bias: 12 distinct values.
+        let fused_b: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
+        vectors.insert("layers.0.self_attn.qkv_proj.bias".into(), fused_b);
+
+        split_fused_qkv(&mut tensors, &mut vectors, &arch);
+
+        // Fused tensor + bias removed.
+        assert!(!tensors.contains_key("layers.0.self_attn.qkv_proj.weight"));
+        assert!(!vectors.contains_key("layers.0.self_attn.qkv_proj.bias"));
+
+        let q = tensors.get("layers.0.self_attn.q_proj.weight").unwrap();
+        let k = tensors.get("layers.0.self_attn.k_proj.weight").unwrap();
+        let v = tensors.get("layers.0.self_attn.v_proj.weight").unwrap();
+        assert_eq!(q.shape(), &[4, 4]);
+        assert_eq!(k.shape(), &[4, 4]);
+        assert_eq!(v.shape(), &[4, 4]);
+        // Row r maps to constant r in the fused layout. q rows 0..4, k 4..8, v 8..12.
+        assert_eq!(q[[0, 0]], 0.0);
+        assert_eq!(q[[3, 3]], 3.0);
+        assert_eq!(k[[0, 0]], 4.0);
+        assert_eq!(k[[3, 3]], 7.0);
+        assert_eq!(v[[0, 0]], 8.0);
+        assert_eq!(v[[3, 3]], 11.0);
+
+        let qb = vectors.get("layers.0.self_attn.q_proj.bias").unwrap();
+        let kb = vectors.get("layers.0.self_attn.k_proj.bias").unwrap();
+        let vb = vectors.get("layers.0.self_attn.v_proj.bias").unwrap();
+        assert_eq!(qb.len(), 4);
+        assert_eq!(kb.len(), 4);
+        assert_eq!(vb.len(), 4);
+        assert!((qb[0] - 0.0).abs() < 1e-6);
+        assert!((kb[0] - 0.4).abs() < 1e-6);
+        assert!((vb[0] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_split_fused_qkv_no_op_when_arch_has_no_fused_key() {
+        use ndarray::Array2;
+
+        // Llama-style arch — no fused QKV.
+        let cfg = synth_gpt2_config(1, 4, 2, 2);
+        let arch = crate::architectures::llama::LlamaArch::from_config(cfg);
+
+        let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+        let q = Array2::<f32>::zeros((4, 4)).into_shared();
+        tensors.insert("layers.0.self_attn.q_proj.weight".into(), q);
+
+        split_fused_qkv(&mut tensors, &mut vectors, &arch);
+
+        // Untouched.
+        assert!(tensors.contains_key("layers.0.self_attn.q_proj.weight"));
+    }
+
     #[test]
     fn test_orient_ffn_tensors_fixes_gpt2_style_inverse_layout() {
         use crate::config::ModelConfig;

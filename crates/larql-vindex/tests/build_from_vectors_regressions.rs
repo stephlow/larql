@@ -16,6 +16,7 @@ const HIDDEN_SIZE: usize = 2;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const GEMMA_MODEL: &str = "gemma-test";
 const LLAMA_MODEL: &str = "llama-test";
+const AMBIGUOUS_MODEL: &str = "gemma-llama-brand-name";
 const MINIMAL_TOKENIZER_JSON: &str =
     r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
 
@@ -77,14 +78,28 @@ fn down_line(layer: usize, feature: usize, with_top_k: bool) -> String {
 }
 
 fn make_vectors_dir(root: &Path, model: &str) -> std::path::PathBuf {
+    make_vectors_dir_with_header(root, model, serde_json::json!({}))
+}
+
+fn make_vectors_dir_with_header(
+    root: &Path,
+    model: &str,
+    header_fields: serde_json::Value,
+) -> std::path::PathBuf {
     let vectors = root.join("vectors");
     std::fs::create_dir_all(&vectors).unwrap();
-    let header = serde_json::json!({
+    let mut header = serde_json::json!({
         "_header": true,
         "model": model,
         "dimension": HIDDEN_SIZE,
-    })
-    .to_string();
+    });
+    if let Some(extra) = header_fields.as_object() {
+        let header_obj = header.as_object_mut().unwrap();
+        for (key, value) in extra {
+            header_obj.insert(key.clone(), value.clone());
+        }
+    }
+    let header = header.to_string();
     write_lines(
         &vectors.join("ffn_gate.vectors.jsonl"),
         &[
@@ -120,7 +135,21 @@ fn read_f32_file(path: &Path) -> Vec<f32> {
 fn build_from_vectors_writes_sorted_binary_layout_and_config() {
     let root = tempdir().unwrap();
     std::fs::write(root.path().join(TOKENIZER_JSON), MINIMAL_TOKENIZER_JSON).unwrap();
-    let vectors = make_vectors_dir(root.path(), GEMMA_MODEL);
+    let vectors = make_vectors_dir_with_header(
+        root.path(),
+        GEMMA_MODEL,
+        serde_json::json!({
+            "model_config": {
+                "model_type": "gemma3",
+                "hidden_size": HIDDEN_SIZE,
+                "num_hidden_layers": 2,
+                "intermediate_size": 2,
+                "head_dim": HIDDEN_SIZE,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1
+            }
+        }),
+    );
     let output = root.path().join("out");
     let mut callbacks = RecordingCallbacks::default();
 
@@ -141,6 +170,7 @@ fn build_from_vectors_writes_sorted_binary_layout_and_config() {
         serde_json::from_slice(&std::fs::read(output.join(INDEX_JSON)).unwrap()).unwrap();
     assert_eq!(config.model, GEMMA_MODEL);
     assert_eq!(config.family, "gemma3");
+    assert_eq!(config.model_config.as_ref().unwrap().model_type, "gemma3");
     assert_eq!(config.num_layers, 2);
     assert_eq!(config.hidden_size, HIDDEN_SIZE);
     assert_eq!(config.intermediate_size, 2);
@@ -175,7 +205,14 @@ fn build_from_vectors_writes_sorted_binary_layout_and_config() {
 #[test]
 fn build_from_vectors_handles_absent_tokenizer_and_llama_family() {
     let root = tempdir().unwrap();
-    let vectors = make_vectors_dir(root.path(), LLAMA_MODEL);
+    let vectors = make_vectors_dir_with_header(
+        root.path(),
+        LLAMA_MODEL,
+        serde_json::json!({
+            "family": "llama",
+            "embed_scale": 1.0
+        }),
+    );
     let output = root.path().join("out");
     let mut callbacks = RecordingCallbacks::default();
 
@@ -190,6 +227,24 @@ fn build_from_vectors_handles_absent_tokenizer_and_llama_family() {
         .stages
         .iter()
         .any(|stage| stage == STAGE_TOKENIZER));
+}
+
+#[test]
+fn build_from_vectors_does_not_infer_family_from_model_name() {
+    let root = tempdir().unwrap();
+    let vectors = make_vectors_dir(root.path(), AMBIGUOUS_MODEL);
+    let output = root.path().join("out");
+    let mut callbacks = RecordingCallbacks::default();
+
+    build_vindex_from_vectors(&vectors, &output, &mut callbacks).unwrap();
+
+    let config: VindexConfig =
+        serde_json::from_slice(&std::fs::read(output.join(INDEX_JSON)).unwrap()).unwrap();
+    assert_eq!(config.model, AMBIGUOUS_MODEL);
+    assert_eq!(config.family, "unknown");
+    assert_eq!(config.embed_scale, 1.0);
+    assert!(config.model_config.is_none());
+    assert!(config.layer_bands.is_none());
 }
 
 #[test]

@@ -3,6 +3,10 @@
 //! must produce bit-identical output for the same Q4_K bytes.
 //!
 //! Catches silent drift between the two implementations during refactors.
+//!
+//! Gated on the `heavy_tests` feature — see `test_correctness.rs` for
+//! the rationale.
+#![cfg(feature = "heavy_tests")]
 
 use larql_compute::cpu::ops::q4_common::{dequantize_q4_k, quantize_q4_k};
 

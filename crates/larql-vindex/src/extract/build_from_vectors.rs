@@ -9,7 +9,25 @@ use crate::error::VindexError;
 use crate::format::filenames::*;
 
 use super::build::IndexBuildCallbacks;
-use crate::config::{DownMetaRecord, DownMetaTopK, VindexConfig, VindexLayerInfo};
+use crate::config::{
+    DownMetaRecord, DownMetaTopK, LayerBands, VindexConfig, VindexLayerInfo, VindexModelConfig,
+};
+
+const HEADER_MODEL: &str = "model";
+const HEADER_DIMENSION: &str = "dimension";
+const HEADER_MODEL_CONFIG: &str = "model_config";
+const HEADER_MODEL_TYPE: &str = "model_type";
+const HEADER_FAMILY: &str = "family";
+const HEADER_EMBED_SCALE: &str = "embed_scale";
+const HEADER_NUM_LAYERS: &str = "num_hidden_layers";
+const HEADER_HIDDEN_SIZE: &str = "hidden_size";
+
+struct VectorArchitecture {
+    family: String,
+    embed_scale: f32,
+    layer_bands: Option<LayerBands>,
+    model_config: Option<VindexModelConfig>,
+}
 
 /// Build a .vindex from already-extracted NDJSON vector files.
 ///
@@ -45,12 +63,12 @@ pub fn build_vindex_from_vectors(
         serde_json::from_str(&first_line).map_err(|e| VindexError::Parse(e.to_string()))?;
 
     let model_name = header
-        .get("model")
+        .get(HEADER_MODEL)
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
     let hidden_size = header
-        .get("dimension")
+        .get(HEADER_DIMENSION)
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
 
@@ -298,33 +316,20 @@ pub fn build_vindex_from_vectors(
         callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
     }
 
-    // ── 6. Determine embed_scale from model family ──
-    // Gemma models use sqrt(hidden_size), others use 1.0
+    // ── 6. Determine architecture from explicit vector metadata ──
     let intermediate_size = layer_feature_counts.values().max().copied().unwrap_or(0);
-    let model_family_hint = model_name.to_ascii_lowercase();
-    let embed_scale = if model_family_hint.contains("gemma") {
-        (hidden_size as f32).sqrt()
-    } else {
-        1.0
-    };
-    let family = if model_family_hint.contains("gemma") {
-        "gemma3"
-    } else if model_family_hint.contains("llama") {
-        "llama"
-    } else {
-        "unknown"
-    };
+    let architecture = vector_architecture_from_header(&header, hidden_size, num_layers)?;
 
     // ── 7. Write index.json ──
     let config = VindexConfig {
         version: 1,
         model: model_name,
-        family: family.to_string(),
+        family: architecture.family,
         num_layers,
         hidden_size,
         intermediate_size,
         vocab_size,
-        embed_scale,
+        embed_scale: architecture.embed_scale,
         layers: layer_infos,
         down_top_k: down_top_k_size,
         has_model_weights: false,
@@ -333,8 +338,8 @@ pub fn build_vindex_from_vectors(
         extract_level: crate::ExtractLevel::Browse,
         dtype: crate::StorageDtype::F32,
         quant: crate::QuantFormat::None,
-        layer_bands: None,
-        model_config: None,
+        layer_bands: architecture.layer_bands,
+        model_config: architecture.model_config,
         fp4: None,
         ffn_layout: None,
     };
@@ -344,6 +349,87 @@ pub fn build_vindex_from_vectors(
     std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
 
     Ok(())
+}
+
+fn vector_architecture_from_header(
+    header: &serde_json::Value,
+    hidden_size: usize,
+    num_layers: usize,
+) -> Result<VectorArchitecture, VindexError> {
+    if let Some(model_config) = explicit_model_config(header, hidden_size, num_layers)? {
+        let arch = larql_models::detect_from_json(&model_config);
+        let family = arch.family().to_string();
+        return Ok(VectorArchitecture {
+            family: family.clone(),
+            embed_scale: arch.embed_scale(),
+            layer_bands: LayerBands::for_family(&family, num_layers),
+            model_config: Some(VindexModelConfig::from_arch(&*arch)),
+        });
+    }
+
+    let family = header
+        .get(HEADER_FAMILY)
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let embed_scale = header
+        .get(HEADER_EMBED_SCALE)
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(1.0);
+    let layer_bands = if family == "unknown" {
+        None
+    } else {
+        LayerBands::for_family(&family, num_layers)
+    };
+
+    Ok(VectorArchitecture {
+        family,
+        embed_scale,
+        layer_bands,
+        model_config: None,
+    })
+}
+
+fn explicit_model_config(
+    header: &serde_json::Value,
+    hidden_size: usize,
+    num_layers: usize,
+) -> Result<Option<serde_json::Value>, VindexError> {
+    if let Some(value) = header.get(HEADER_MODEL_CONFIG) {
+        let mut config = value.as_object().cloned().ok_or_else(|| {
+            VindexError::Parse(format!(
+                "{HEADER_MODEL_CONFIG} header field must be a JSON object"
+            ))
+        })?;
+        insert_shape_defaults(&mut config, hidden_size, num_layers);
+        return Ok(Some(serde_json::Value::Object(config)));
+    }
+
+    if let Some(model_type) = header.get(HEADER_MODEL_TYPE).and_then(|v| v.as_str()) {
+        let mut config = serde_json::Map::new();
+        config.insert(
+            HEADER_MODEL_TYPE.to_string(),
+            serde_json::Value::String(model_type.to_string()),
+        );
+        insert_shape_defaults(&mut config, hidden_size, num_layers);
+        return Ok(Some(serde_json::Value::Object(config)));
+    }
+
+    Ok(None)
+}
+
+fn insert_shape_defaults(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    hidden_size: usize,
+    num_layers: usize,
+) {
+    config
+        .entry(HEADER_HIDDEN_SIZE.to_string())
+        .or_insert_with(|| serde_json::json!(hidden_size));
+    config
+        .entry(HEADER_NUM_LAYERS.to_string())
+        .or_insert_with(|| serde_json::json!(num_layers));
 }
 
 /// Try to find tokenizer.json near the vectors directory.

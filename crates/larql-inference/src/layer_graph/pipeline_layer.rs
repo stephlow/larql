@@ -5,7 +5,10 @@
 //! Both GPU and CPU paths use this — no duplicated param extraction.
 
 use crate::model::ModelWeights;
-use larql_compute::{FullPipelineLayer, MoeLayerWeights, QuantFormat, QuantWeight};
+use larql_compute::{
+    FullPipelineLayer, MoeLayerWeights, MoeRoutingPolicy, MoeWeightLayout, QuantFormat,
+    QuantWeight,
+};
 
 pub(crate) const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;
 
@@ -268,6 +271,8 @@ pub(crate) fn build_moe_weights<'a>(
     Some(MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: moe_routing_policy(arch.moe_router_type()),
+        weight_layout: MoeWeightLayout::default(),
         expert_data_format,
         router_proj,
         router_scale,
@@ -515,6 +520,8 @@ fn build_moe_stub<'a>(
     MoeLayerWeights {
         experts_gate_up: vec![],
         experts_down: vec![],
+        routing_policy: moe_routing_policy(arch.moe_router_type()),
+        weight_layout: MoeWeightLayout::default(),
         expert_data_format,
         router_proj: &[],
         router_scale: sl(arch.moe_router_scale_key(layer)),
@@ -532,6 +539,13 @@ fn build_moe_stub<'a>(
             larql_models::Activation::GeluTanh => larql_compute::Activation::GeluTanh,
             _ => larql_compute::Activation::Silu,
         },
+    }
+}
+
+fn moe_routing_policy(router_type: &str) -> MoeRoutingPolicy {
+    match router_type {
+        "gemma4_top_k_softmax" => MoeRoutingPolicy::gemma4_hybrid(),
+        _ => MoeRoutingPolicy::top_k_softmax(),
     }
 }
 

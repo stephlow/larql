@@ -6,7 +6,7 @@
 //! regime as the trained slots; this is what makes the contribution land
 //! cleanly without blowing out the residual.
 //!
-//! Convention from `experiments/07_wasm_compute/WASM_GATE_ARCHITECTURE.md` §3.1.2:
+//! Convention from `~/chris-source/chris-experiments/foundations/07_wasm_compute/WASM_GATE_ARCHITECTURE.md` §3.1.2:
 //!
 //! ```text
 //! gate[slot, :]  ← trigger̂ × g_norm × gate_scale

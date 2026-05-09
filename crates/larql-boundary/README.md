@@ -242,20 +242,17 @@ safety on all platforms.
 **Calibration mode** (`calibration_mode = true`, the default): gate ignores all
 thresholds, always falls back to bf16, emits `BoundaryContract::Calibrating`.
 All metadata is logged for telemetry. Set to `false` only after running
-`experiments/44_boundary_gate_calibration/calibrate.py`.
+`~/chris-source/chris-experiments/shannon/44_boundary_gate_calibration/calibrate.py`.
 
 ---
 
 ## Protocol spec
 
 Full spec:  
-[`experiments/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`](
-../../experiments/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md)
+`~/chris-source/chris-experiments/shannon/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`
 
 Calibration:  
-[`experiments/44_boundary_gate_calibration/`](
-../../experiments/44_boundary_gate_calibration/)
+`~/chris-source/chris-experiments/shannon/44_boundary_gate_calibration/`
 
 Residual codec characterisation:  
-[`experiments/43_residual_stream_codec/SPEC.md`](
-../../experiments/43_residual_stream_codec/SPEC.md)
+`~/chris-source/chris-experiments/shannon/43_residual_stream_codec/SPEC.md`

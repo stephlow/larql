@@ -87,7 +87,7 @@ measurement, video, and clean reference code than fifteen capabilities
 in various states of done.
 
 The video series ("I added a 769th expert to GPT-OSS, it's Python";
-the Shannon experiments at experiments/SHANNON_SYNTHESIS.md; the
+the Shannon experiments at ~/chris-source/chris-experiments/SHANNON_SYNTHESIS.md; the
 WASM-in-FFN demos) is the same artefact at different scales: each
 major capability lands as **claim → measurement → code that proves
 the claim**. The research, the videos, and the server are three faces
@@ -134,7 +134,7 @@ attached* — points in this direction. Lean further into it.
   work with measurements.
 - `docs/server-spec.md` — wire-format and endpoint reference (for
   anyone porting endpoints to another stack).
-- `../../experiments/SHANNON_SYNTHESIS.md` — research thesis at the
+- `~/chris-source/chris-experiments/SHANNON_SYNTHESIS.md` — research thesis at the
   information-theoretic level: bits per token, slot-bits as
   factual-confidence readout, in-context decay, entropy-aligned
   measurement of the substrate this server exposes.

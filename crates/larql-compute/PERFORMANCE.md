@@ -22,33 +22,45 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 > `measure_single_cmdbuf_batched`. Corrected numbers: q4k_ffn_gate_up at
 > **274 GB/s = 74% of LPDDR5X peak (bandwidth-bound)**, not 103 GB/s
 > compute-bound. Both big FFN kernels are at bandwidth saturation; the
-> 1.30× decode gap to ollama is distributed across the pipeline, not
-> concentrated in any single kernel.
+> remaining ~1.17× decode gap to ollama is distributed across the
+> pipeline, not concentrated in any single kernel.
 
 ---
 
-## Current state (2026-05-02, post dispatch-geometry fix)
+## Current state (2026-05-09, post QKV defuse)
 
 ```
-larql-metal  gemma3-4b-q4k-v2     83.3–84.1 tok/s 11.89–12.00 ms/tok (post dispatch-geometry fix, quiet GPU)
+larql-metal  gemma3-4b-q4k-v2     87.9–88.1 tok/s 11.35–11.41 ms/tok (post QKV defuse, quiet GPU)
+larql-metal  gemma3-4b-q4k-v2     85.0–86.3 tok/s 11.71–11.79 ms/tok (pre QKV defuse, post dispatch-geometry fix)
 larql-metal  gemma3-4b-q4k-v2     76.1–76.7 tok/s 13.06–13.14 ms/tok (pre dispatch fix; stride-32 lm_head workaround)
 larql-metal  gemma3-4b-q4k-v2     74.6–75.6 tok/s 13.22–13.41 ms/tok (post O-proj routing fix only)
 larql-metal  gemma3-4b-q4k-v2     72–75 tok/s      13.5–13.9 ms/tok  (pre O-proj routing fix)
-Ollama       gemma3:4b            98.5–99.7 tok/s ~10.0 ms/tok (steady-state, same harness)
-Gap          1.18×                ~2.0 ms/tok                 (was 1.30× before dispatch fix)
+Ollama       gemma3:4b            101.5–115.9 tok/s ~8.6–9.9 ms/tok (steady-state, same harness; ±15% session-to-session)
+Gap          1.17×                ~1.66 ms/tok                 (was 1.18× before defuse, 1.30× before dispatch fix)
 
 larql-metal  gemma4-26B-A4B        19.0–19.8 tok/s ~52ms/tok  (post 2026-05-02 moe_dispatch geometry fix)
 larql-metal  gemma4-26B-A4B          5.1 tok/s   ~194ms/tok   (pre-fix; broken dispatch was masking ~3.8× perf AND degrading output)
 LARQL_SKIP_MOE=1 ceiling           56.8 tok/s   ~15ms/tok    (attention + dense FFN only)
 ```
 
-Per-stage (Gemma 3 4B, 30-token run, 8 warmup, 2026-05-02 post dispatch fix):
+Per-stage (Gemma 3 4B, 100-token run, 8 warmup, 2026-05-09 post QKV defuse):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | ~11.11–11.21 ms | 85–86% |
-| lm_head | **~1.84–1.85 ms** | 14% |
+| GPU fwd | ~11.41–11.52 ms | 85–86% |
+| lm_head | **~1.84–1.97 ms** | 14% |
 | embed + norm + detok | ~0.04 ms | <1% |
+
+The QKV defuse change (2026-05-09) cuts decode from 11.79 → 11.35 ms/tok
+(−0.30 ms/tok GPU fwd, +1.6–1.8 tok/s end-to-end) by skipping the fused
+`q4k_q6k_qkv_proj_normed` kernel and using a separate `rms_norm` dispatch
++ non-fused `q4k_q6k_qkv_proj` instead. The fused kernel rereads H + norm_w
+3× per TG (4 simdgroups, different stride patterns for Q4_K Q/K vs Q6_K V),
+dropping it from 287 → 199 GB/s — a 1.46 ms/tok kernel cost that exceeds
+the 0.24 ms/tok dispatch saving the fusion gave. End-to-end magnitude was
+18% of what the per-kernel diag predicted; see ADR-015 § "Magnitude can
+compress 4×" for why bandwidth-headroom wins compress in the live decode
+pipeline. `LARQL_QKV_FUSED=1` opts back in.
 
 The dispatch-geometry fix (2026-05-02) cuts lm_head from 2.95 → 1.85 ms
 (−1.14 ms/tok, +7.7 tok/s end-to-end) by making `MetalBackend::q4k_matvec`
@@ -61,9 +73,10 @@ each TG unscheduled, corrupting half the lm_head output rows. See
 
 The 78.7 / 80.3 tok/s headlines below are preserved for context but
 predate (a) the v5 lm_head stride-32 correctness *workaround*, (b) the
-2026-05 dispatch-fusion wave, and (c) the 2026-05-02 dispatch-geometry
-*fix* that obviated the workaround. The honest current number is **84
-tok/s** with correct output, gap to ollama 1.18×.
+2026-05 dispatch-fusion wave, (c) the 2026-05-02 dispatch-geometry
+*fix* that obviated the workaround, and (d) the 2026-05-09 QKV defuse.
+The honest current number is **88 tok/s** with correct output, gap to
+ollama 1.17×.
 
 ---
 
@@ -156,12 +169,18 @@ shader-module constants while the bound pipeline has different geometry.
 
 ---
 
+**Recent changes (2026-05-09):**
+
+| Change | Model | Effect | Notes |
+|---|---|---|---|
+| **QKV defuse — default flipped to `rms_norm` + `q4k_q6k_qkv_proj` (non-fused)** (was: fused `q4k_q6k_qkv_proj_normed`; opt back in via `LARQL_QKV_FUSED=1`) | Gemma 3 4B v2 | **+1.6 tok/s, −0.30 ms/tok GPU fwd** (warmup 8, n=100, drift = 0.02 ms) | The fused kernel rolled the RMS norm into Phase 1 of the matmul to save 1 dispatch/layer (~0.24 ms/tok) but each TG's 4 simdgroups independently re-traverse H + norm_w in Phase 2 with different stride patterns (Q4_K Q/K vs Q6_K V), dropping it from 287 → 199 GB/s vs the non-fused kernel. **Diag predicted −1.22 ms/tok end-to-end; measured −0.22 ms/tok** — direction matched but magnitude was 18% of prediction. Pinned in [ADR-016](docs/adr/016-defused-rms-norm-qkv.md) (defuse decision) and [ADR-015](docs/adr/015-isolated-vs-batched-kernel-perf.md) § "Magnitude can compress 4×" (case study on per-kernel batched diag over-predicting when the candidate's upside is bandwidth headroom that gets reabsorbed by the surrounding LPDDR5X-bound pipeline). Real win nonetheless; correctness preserved (Paris ✓ on `larql run ... -n 8 --metal`). Fused kernel + dispatcher kept reachable as opt-in fallback. |
+
 **Recent changes (2026-05-01 → 2026-05-02):**
 
 | Change | Model | Effect | Notes |
 |---|---|---|---|
 | **Q4_K O-proj routes through `q4k_matvec_pipeline`** | Gemma 3 4B v2 | **+3–4 tok/s, -0.7 to -0.9 ms GPU fwd** | Decode O-projection was still passing `q4k_proj_pipeline` into the format-aware matvec helper, bypassing the selected 8sg `q4k_matvec_pipeline`. Initial three bench runs after fix: 74.6, 75.6, 75.4 tok/s; follow-up quiet-GPU runs: 76.1, 76.6, 76.3 tok/s; side-by-side steady Ollama: 99.5–100.6 tok/s, 1.30× gap. Correctness smoke: `larql run ... "The Capital of France is" -n 8 --metal` emits Paris. Hybrid decode now uses selected Q4_K/Q6_K KernelHandle geometry too. |
-| **`q4k_ffn_gate_up_nr2` candidate** (opt-in only, `LARQL_GATE_UP_NR2=1`) | Gemma 3 4B v2 | **REGRESSED** 75.9 → 72.9 tok/s, GPU fwd 11.19 → 11.80 ms (+0.62 ms) | Profiler showed iso 0.401 ms / 76.8 GB/s vs 8sg's 0.591 ms / 51.4 GB/s — **1.47× isolated win**. But batched: 0.110 ms / 267 GB/s vs 8sg's 0.106 ms / 279 GB/s — NR2 is *worse* in the production geometry. The iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. Output correctness preserved ("Paris" emits). **Third confirmed instance of the iso-vs-batched pattern** (after `f16_acc` and `attn_fused`); pinned in `docs/adr/015-isolated-vs-batched-kernel-perf.md`. Kept opt-in for sustained-load / future-pipeline-shape exploration; NOT promoted to default. |
+| **`q4k_ffn_gate_up_nr2` candidate** (was opt-in `LARQL_GATE_UP_NR2=1`; **removed 2026-05-09**) | Gemma 3 4B v2 | **REGRESSED** 75.9 → 72.9 tok/s, GPU fwd 11.19 → 11.80 ms (+0.62 ms); re-bench 2026-05-09 confirmed (8sg 86.3 tok/s / 11.71 ms vs NR2 83.4 tok/s / 12.05 ms = **−0.34 ms/tok**) | Profiler showed iso 0.401 ms / 76.8 GB/s vs 8sg's 0.591 ms / 51.4 GB/s — **1.47× isolated win**. But batched: 0.110 ms / 267 GB/s vs 8sg's 0.106 ms / 279 GB/s — NR2 is *worse* in the production geometry. The iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. **Third confirmed instance of the iso-vs-batched pattern** (after `f16_acc` and `attn_fused`); pinned in `docs/adr/015-isolated-vs-batched-kernel-perf.md`. Re-benched 2026-05-09 alongside back-to-back baseline runs (drift = 0.07 ms, well under signal): direction matched the batched diag, magnitude was ~3× the diag delta but the ordering held — so the candidate was deleted rather than left as a dangling opt-in. Shader, pipeline field, env-var, dispatch branch, diag-profile entry, and shader-bench inventory entry all gone. |
 | **`LARQL_LM_HEAD_STRIDE32=0` A/B** | Gemma 3 4B v2 | **REGRESSED** 75.9 → 69.5 tok/s, lm_head 2.99 → 4.08 ms (+1.09 ms) | Tested whether the v5 stride-32 lm_head was paying a perf tax for correctness. It is not — disabling it costs +1.09 ms vs the default. The "+0.7 ms cost" line in the v5 row below is relative to the *pre-fix broken-output* kernel (which produced gibberish), not the current fallback path. **The v5 stride-32 lm_head is both correct AND the fastest available path.** The correctness/perf tradeoff is settled; no further A/B needed here. |
 | **lm_head v5 stride-32 Q4_K matvec** | Gemma 3 4B v2 | **correctness — model now emits "Paris"** | Each lane accumulates over `i % 32 == lane` elements (mirrors `f16_gemv` reduction tree). Same Q4_K bytes, same bandwidth, but reduction tree matches CPU rankings. End-to-end argmax flips to the correct token. ~0.7 ms slower than the prior (incorrect) kernel; held as the production lm_head path. See `shaders/q4k_matvec_stride32.rs`. |
 | **`qk_norm_rope_fused` shader** (default-on; opt-out `LARQL_FUSED_QK_NORM_ROPE=0`) | Gemma 3 4B | -0.10 ms GPU | One TG/head: RMS-norm + RoPE in one kernel. Replaces qk_norm_qk + rope_at_pos_batched_qk. |
@@ -179,7 +198,7 @@ shader-module constants while the bound pipeline has different geometry.
 | **Q4_K dispatch correctness fix** (commit 077884b) | Gemma 3 4B | **−5 tok/s** (84 → 79) | Q4_K was routed through Q4_KF kernel, leaving 75% of output rows unwritten; 81-84 was on broken code, 79 is correct baseline |
 | **`q6k_matvec` ROWS_PER_TG=4 correctness fix** | Gemma 3 4B | **78.7 tok/s, GPU fwd 10.8ms** | Silent bug: rows 1282-2559 were zeros; fixed to ROWS_PER_TG=4 everywhere |
 | **Profiler harness fix** (`measure_single_cmdbuf_batched`) | profiling tool | corrects per-kernel GB/s by 2-4× | Old harness ran each kernel call in its own cmd buffer; per-call dispatch overhead dominated the measurement. Fixed numbers: q6k_matvec 311 GB/s (was 74), q4k_ffn_gate_up 274 GB/s (was 103). |
-| **`q4k_matmul` Metal kernel** + parity tests | prefill | kernel 1.79× isolated; **end-to-end no win** | Wiring into O proj + FFN gate+up was attempted and reverted 2026-04-28: short-prompt prefill within noise, long-prompt prefill regressed ~10%. Same failure mode as f16 acc — kernel was bandwidth-near-peak and matmul's [seq_len × hidden] X working set thrashes L1 on long prompts. Kernel remains available via `MetalBackend::q4k_matmul` for callers that want it; not in production decode/prefill path. |
+| **`q4k_matmul` Metal kernel** + parity tests | prefill | kernel 1.79× isolated; **end-to-end falsified twice** | Wiring into O proj + FFN gate+up was attempted and reverted 2026-04-28: short-prompt prefill within noise, long-prompt prefill regressed ~10% (FFN gate+up: 2933 → 3268 ms on 340 tokens). **Re-benched 2026-05-09** under post-dispatch-fix + post-QKV-defuse state to test whether the diagnosis still held: matmul still 5-7% slower across 10/50/150-token prompts (e.g. 1392 → 1469 ms at 150 tokens). Same failure mode as f16 acc — kernel is bandwidth-near-peak and matmul's [seq_len × hidden] X working set thrashes L1 on long prompts. Kernel + parity tests remain shipped (callers can use `MetalBackend::q4k_matmul` directly) but the production prefill path stays per-position matvec. **Closing the prefill gap needs a different matmul kernel** (K-dim tiled or `simdgroup_matrix`-based), not a wiring change. ROADMAP D-PREFILL-MM closed 2026-05-09; falsification record at `project_prefill_matmul_falsified.md`. |
 | **Encoder coalescing** in 3 dispatch sites (O proj, QKV f32, QKV Q8) | prefill | <5% on long prompts | Below noise on short prompts. Real win is the matmul kernel above; coalescing was the cheap risk-free first move. |
 | **`q4k_ffn_gate_up_f16acc` shader** (opt-in, `LARQL_F16_ACC=1`) | Gemma 3 4B | kernel 1.79× isolated; **end-to-end at parity** | Numerical parity perfect (10-prompt greedy bit-identical), but kernel was already bandwidth-bound — freed ALU cycles get absorbed by surrounding kernels. Initial +23% measurement was thermal-throttle artifact. Kept as opt-in. |
 | **`q4k_ffn_gate_up_8sg` shader** (now default; opt-out `LARQL_GATE_UP_8SG=0`) | Gemma 3 4B | **+2.1% end-to-end** (77.2 → 78.9 tok/s) | 8 simdgroups per TG (256 threads, 8 rows/TG) instead of 4/128/4. Same per-thread register footprint (`nr0=1`). Bit-identical output. First positive end-to-end perf this session. |
@@ -204,19 +223,19 @@ shader-module constants while the bound pipeline has different geometry.
 | q4k_ffn_gate_up (4sg, original) | 0.107 ms | 276 GB/s | 3.6 ms | statistically tied with 8sg at the per-kernel level — the 8sg promotion was an end-to-end win, not a per-kernel one |
 | q4k_ffn_gate_up_f16acc (opt-in) | 0.110 ms | 268 GB/s | 3.7 ms | slower batched; do not promote (ADR-015 instance #1) |
 | q4k_ffn_gate_up_coop (opt-in) | 0.119 ms | 248 GB/s | 4.0 ms | slower batched; do not promote |
-| q4k_ffn_gate_up_nr2 (opt-in) | 0.120 ms | 246 GB/s | 4.1 ms | slower batched; do not promote (ADR-015 instance #3, gap widened from 267→246) |
 | q4k_matvec_8sg (Wo, K=8192) | 0.026 ms | 144 GB/s | 0.9 ms | lower util but small per-token cost |
-| q4k_q6k_qkv_proj (mixed Q/K Q4_K + V Q6_K) | 0.092 ms | 287 GB/s | 3.1 ms | production QKV path |
-| q4k_q6k_qkv_proj_normed (fused norm + QKV) | 0.135 ms | 194 GB/s | 4.6 ms | rereads H + norm per TG; default in production |
+| q4k_q6k_qkv_proj (mixed Q/K Q4_K + V Q6_K) | 0.092 ms | 287 GB/s | 3.1 ms | **production QKV path since 2026-05-09** (paired with separate `rms_norm` dispatch) |
+| q4k_q6k_qkv_proj_normed (fused norm + QKV) | 0.135 ms | 194 GB/s | 4.6 ms | rereads H + norm 3× per TG; was production default until 2026-05-09; now opt-in via `LARQL_QKV_FUSED=1` |
 | f32_gemv (lm_head, 262K×2560) | 0.866 ms | **387 GB/s** | 0.87 ms (×1) | near LPDDR5X peak; production lm_head uses Q4_K stride32 path |
 
-**No headroom in any single kernel.** The 1.30× decode gap to ollama is distributed across dispatch overhead + sustained-clock effects + the cumulative inefficiency of running fewer-fused kernels than llama.cpp.
+**No headroom in any single kernel.** The remaining ~1.17× decode gap to ollama is distributed across dispatch overhead + sustained-clock effects + the cumulative inefficiency of running fewer-fused kernels than llama.cpp. (Was 1.30× before the 2026-05-02 dispatch-geometry fix and 2026-05-09 QKV defuse; both moved larql closer to its hardware ceiling.)
 
 **Promotion rule (2026-05-02):** isolated kernel speedups are not promotion
 evidence for decode. Promote only when production-batched GB/s improves AND
 `larql bench --warmup 8 -n 30 --profile` improves with correct output. False
 positives now include `q4k_ffn_gate_up_f16acc`, `attn_fused`,
-`q4k_ffn_gate_up_nr2`, and `q4k_ffn_gate_up_coop`. Canonical workflow below.
+`q4k_ffn_gate_up_coop`, and the removed `q4k_ffn_gate_up_nr2` (deleted
+2026-05-09 after a second-confirming bench). Canonical workflow below.
 
 ### How to A/B a shader candidate
 

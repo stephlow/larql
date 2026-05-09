@@ -106,8 +106,9 @@ Near-term order:
 > `pipeline.threads_per_tg`, the production `q4k_matvec` is correct AND
 > ~1.10 ms/tok faster than stride-32. **Stride-32 is now the diagnostic
 > fallback; production default is `lm_head_knn_backend` with
-> `q4k_matvec` first.** End-to-end: 76.3 → 84.0 tok/s on Gemma 3 4B,
-> gap to ollama 1.30× → 1.18×. Diagnostic A/B via
+> `q4k_matvec` first.** End-to-end: 76.3 → 84.0 → **88.1** tok/s on
+> Gemma 3 4B (last step is the 2026-05-09 QKV defuse), gap to ollama
+> 1.30× → 1.18× → **1.17×**. Diagnostic A/B via
 > `LARQL_LM_HEAD_SKIP_Q4K=1`. The historical bisect below is preserved
 > for context.
 
@@ -359,9 +360,11 @@ profiler) to localise — kernel-isolated GB/s alone isn't enough.
 ### G-2 — NR0=2 + shared-X-vector port from llama.cpp
 
 **Status**: ❌ Tried 2026-05-01, **slight regression** (~3% slower).
-Kernel kept opt-in (`LARQL_GATE_UP_NR2=1` →
-`q4k_ffn_gate_up_nr2_pipeline`, `shaders/q4k_ffn_gate_up_nr2.rs`) for
-future exploration on different shapes / hardware.
+Re-benched 2026-05-09 (8sg 86.3 / 86.2 tok/s vs NR2 83.4 tok/s on
+quiet M3 Max, 0.07 ms baseline drift), regression reconfirmed.
+**Kernel + `LARQL_GATE_UP_NR2` env var removed 2026-05-09**;
+the candidate had two failed benches against it. See ADR-015 for
+the iso-vs-batched lesson the kernel pinned.
 
 **Result** (3 runs each, thermal-mixed):
 - NR2:           68.6 / 69.2 / 68.3 tok/s, GPU fwd 12.76/12.56/12.84 ms

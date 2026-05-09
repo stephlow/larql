@@ -539,14 +539,6 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
             "cooperative scale-load candidate",
         ),
         (
-            "q4k_ffn_gate_up_nr2",
-            &metal.q4k_ffn_gate_up_nr2_pipeline,
-            gate_q4k.as_slice(),
-            up_q4k.as_slice(),
-            "checked",
-            "NR0=2 candidate",
-        ),
-        (
             "q4kf_ffn_gate_up",
             &metal.q4kf_ffn_gate_up_pipeline,
             gate_q4kf.as_slice(),
@@ -1176,12 +1168,6 @@ fn inventory() -> &'static [InventoryItem] {
         },
         InventoryItem {
             name: "q4k_ffn_gate_up_coop",
-            family: "ffn-gate-up",
-            status: "bench",
-            note: "benchmarked here",
-        },
-        InventoryItem {
-            name: "q4k_ffn_gate_up_nr2",
             family: "ffn-gate-up",
             status: "bench",
             note: "benchmarked here",

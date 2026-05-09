@@ -9,12 +9,8 @@
 
 use ndarray::{Array1, ArrayView2};
 
+use crate::config::hnsw::HnswBuildConfig;
 use crate::index::core::VectorIndex;
-
-const LAYER_HNSW_M: usize = 8;
-const LAYER_HNSW_EF_CONSTRUCTION: usize = 32;
-const EXPERT_HNSW_M: usize = 6;
-const EXPERT_HNSW_EF_CONSTRUCTION: usize = 16;
 
 impl VectorIndex {
     /// Enable HNSW search. Indexes are built lazily on first query per layer.
@@ -59,8 +55,8 @@ impl VectorIndex {
         let view = ArrayView2::from_shape((num_features, self.hidden_size), &data).unwrap();
         Some(super::super::hnsw::HnswLayer::build(
             &view,
-            LAYER_HNSW_M,
-            LAYER_HNSW_EF_CONSTRUCTION,
+            HnswBuildConfig::LAYER.m,
+            HnswBuildConfig::LAYER.ef_construction,
         ))
     }
 
@@ -84,13 +80,10 @@ impl VectorIndex {
         }
         let view = ArrayView2::from_shape((num_features, self.hidden_size), &data).ok()?;
         let slice = view.slice(ndarray::s![feat_start..end, ..]);
-        // Smaller `m` and `ef_construction` for the per-expert case — at
-        // ~704 vectors the layer-level constants are overkill; these build
-        // ~3× faster with comparable recall on this size class.
         Some(super::super::hnsw::HnswLayer::build(
             &slice,
-            EXPERT_HNSW_M,
-            EXPERT_HNSW_EF_CONSTRUCTION,
+            HnswBuildConfig::EXPERT.m,
+            HnswBuildConfig::EXPERT.ef_construction,
         ))
     }
 

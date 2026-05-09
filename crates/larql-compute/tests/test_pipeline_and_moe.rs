@@ -74,6 +74,8 @@ fn make_moe_weights<'a>(
     MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -174,6 +176,8 @@ fn moe_per_expert_scale_applied() {
     let moe_no_scale = MoeLayerWeights {
         experts_gate_up: experts_gate_up.clone(),
         experts_down: experts_down.clone(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -196,6 +200,8 @@ fn moe_per_expert_scale_applied() {
     let moe_scaled = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &per_expert_scale,
@@ -248,6 +254,8 @@ fn moe_router_scale_vector_applied() {
     let moe = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &router_scale, // non-empty → enters the scale branch
         router_per_expert_scale: &[],
@@ -269,7 +277,7 @@ fn moe_router_scale_vector_applied() {
 
 #[test]
 fn moe_router_input_scalar_nonunit() {
-    // Exercises the `router_input_scalar != 1.0 && != 0.0` branch in forward.rs
+    // Exercises the `router_input_scalar != 1.0` branch in forward.rs.
     let hidden = 8;
     let inter = 4;
     let num_experts = 4;
@@ -288,6 +296,8 @@ fn moe_router_input_scalar_nonunit() {
     let moe_scalar = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -313,6 +323,8 @@ fn moe_empty_router_proj_returns_zeros() {
     let moe = MoeLayerWeights {
         experts_gate_up: Vec::new(),
         experts_down: Vec::new(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &[], // empty → early return
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -344,6 +356,8 @@ fn moe_zero_num_experts_returns_zeros() {
     let moe = MoeLayerWeights {
         experts_gate_up: Vec::new(),
         experts_down: Vec::new(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &[1.0f32], // non-empty so we don't hit that guard
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -376,6 +390,8 @@ fn moe_zero_top_k_or_intermediate_returns_zeros() {
     let zero_top_k = MoeLayerWeights {
         experts_gate_up: experts_gate_up.clone(),
         experts_down: experts_down.clone(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -423,6 +439,8 @@ fn moe_missing_selected_expert_tables_are_skipped() {
     let moe = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -460,6 +478,8 @@ fn moe_post_experts_norm_branch_runs() {
     let moe = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -501,6 +521,8 @@ fn moe_gelu_tanh_activation_in_forward() {
     let moe = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -607,6 +629,8 @@ mod moe_prefill_integration {
         MoeLayerWeights {
             experts_gate_up: Vec::new(),
             experts_down: Vec::new(),
+            routing_policy: larql_compute::MoeRoutingPolicy::default(),
+            weight_layout: larql_compute::MoeWeightLayout::default(),
             router_proj: &[],
             router_scale: &[],
             router_per_expert_scale: &[],

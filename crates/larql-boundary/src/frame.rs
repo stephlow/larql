@@ -1,7 +1,7 @@
 //! Wire format types for BOUNDARY ref frames.
 //!
 //! These enums and structs map directly to the protocol spec in
-//! `experiments/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`.
+//! `~/chris-source/chris-experiments/shannon/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`.
 //!
 //! Full serialisation (protobuf, HTTP JSON) is handled by `larql-server`.
 //! This module defines the canonical Rust representation.

@@ -158,14 +158,6 @@ pub struct MetalBackend {
     /// `LARQL_GATE_UP_COOP=1` while perf is being measured. See
     /// `shaders/q4k_ffn_gate_up_coop.rs`.
     pub q4k_ffn_gate_up_coop_pipeline: KernelHandle,
-    /// NR0=2 multi-row + shared-X-vector Q4_K gate+up — same Q4_K
-    /// input as `q4k_ffn_gate_up_pipeline`, but each simdgroup handles
-    /// 2 output rows in parallel with `xl[16]` loaded once and reused
-    /// across both. Mirrors llama.cpp's `N_R0_Q4_K = 2` shape. Aimed
-    /// at the X-cache-traffic bottleneck diagnosed by step-by-step
-    /// vs-ollama comparison (2026-05-01). Opt-in via
-    /// `LARQL_GATE_UP_NR2=1`. See `shaders/q4k_ffn_gate_up_nr2.rs`.
-    pub q4k_ffn_gate_up_nr2_pipeline: KernelHandle,
     pub q4kf_ffn_gate_up_pipeline: KernelHandle,
     pub q4k_geglu_silu_down_pipeline: KernelHandle,
     pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
@@ -388,8 +380,6 @@ impl MetalBackend {
             KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_8sg::Kernel>(&device, &library)?;
         let q4k_ffn_gate_up_coop_pipeline =
             KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_coop::Kernel>(&device, &library)?;
-        let q4k_ffn_gate_up_nr2_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_nr2::Kernel>(&device, &library)?;
         let q4kf_ffn_gate_up_pipeline =
             KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(&device, &library)?;
         // Fused activation+down (KernelHandle).
@@ -533,7 +523,6 @@ impl MetalBackend {
             q4k_ffn_gate_up_f16acc_pipeline,
             q4k_ffn_gate_up_8sg_pipeline,
             q4k_ffn_gate_up_coop_pipeline,
-            q4k_ffn_gate_up_nr2_pipeline,
             q4kf_ffn_gate_up_pipeline,
             q4k_geglu_silu_down_pipeline,
             q4k_geglu_gelu_tanh_down_pipeline,

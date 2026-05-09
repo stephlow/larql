@@ -213,29 +213,13 @@ impl MetalBackend {
             //     opt-in for future hardware/fusion scenarios.
             use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
             use crate::metal::shaders::q4k_ffn_gate_up_coop as q4k_gu_coop;
-            use crate::metal::shaders::q4k_ffn_gate_up_nr2 as q4k_gu_nr2;
-            // `LARQL_GATE_UP_NR2=1`: NR0=2 multi-row + shared-X variant.
-            // Mirrors llama.cpp's `N_R0_Q4_K = 2` shape — each simdgroup
-            // handles 2 output rows with `xl[16]` loaded once and
-            // reused. Targets the X-cache-traffic bottleneck (187 GB/s
-            // = 47% peak on production). Opt-in while perf is being
-            // measured; wins if A/B vs default (8sg) shows tok/s
-            // improvement without breaking arch_golden parity.
-            let use_nr2 = crate::options::env_opt_in(crate::options::ENV_GATE_UP_NR2);
             // `LARQL_GATE_UP_COOP=1`: cooperative scale-loading variant.
             // Tried 2026-05-01 — null end-to-end (kernel-isolated ALU
             // diagnosis was misleading). Kept opt-in.
             let use_coop = crate::options::env_opt_in(crate::options::ENV_GATE_UP_COOP);
             let use_4sg = crate::options::env_opt_out(crate::options::ENV_GATE_UP_8SG);
             let use_f16 = crate::options::env_flag(crate::options::ENV_F16_ACC);
-            let (pipeline, rows_per_tg, threads_per_tg) = if use_nr2 {
-                // NR0=2 wins over coop / 4sg / 8sg — newest under test.
-                (
-                    &self.q4k_ffn_gate_up_nr2_pipeline.state,
-                    q4k_gu_nr2::ROWS_PER_TG,
-                    q4k_gu_nr2::THREADS_PER_TG,
-                )
-            } else if use_coop {
+            let (pipeline, rows_per_tg, threads_per_tg) = if use_coop {
                 // Cooperative wins over the other flags — it's the
                 // newest variant under measurement.
                 (

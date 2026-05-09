@@ -104,7 +104,7 @@ impl Session {
         //    residuals and fire them against full-power ones,
         //    producing the "cosines look fine, activations have a
         //    25-unit gap" silent-drift class of bug noted in
-        //    `experiments/15_v11_model/RESULTS.md §20.3`.
+        //    `~/chris-source/chris-experiments/compilation/15_v11_model/RESULTS.md §20.3`.
         let walk_ffn =
             larql_inference::vindex::WalkFfn::new_unlimited_with_trace(&weights, patched.base());
         let _result =
@@ -200,7 +200,7 @@ impl Session {
 /// Canonical decoy prompt set used by Phase 1b alongside the
 /// template-matched decoys generated from the tokenizer vocab.
 ///
-/// Same set as `experiments/14_vindex_compilation/experiment_vindex_compilation.py`.
+/// Same set as `~/chris-source/chris-experiments/compilation/14_vindex_compilation/experiment_vindex_compilation.py`.
 /// These prompts span literary, philosophical, poetic, and common
 /// completion templates — the canonical bleed targets for a
 /// fact-install slot operating at `gate_scale=30`. Capturing residuals

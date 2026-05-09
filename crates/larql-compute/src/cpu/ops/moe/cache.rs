@@ -34,9 +34,10 @@
 //! caching entirely (right answer once the NEON-vectorised direct-Q4K
 //! matvec lands; see compute ROADMAP).
 //!
-//! Format dispatch (BF16 / Q4_K / F32) is on the dequant path, not the
-//! cache key — same bytes always dequant to the same f32 vector regardless
-//! of the format tag, so a single key works for all formats.
+//! Format dispatch (BF16 / Q4_K / F32) is part of the cache key. The same
+//! address can be interpreted differently across formats or expected padded
+//! lengths, so the key includes pointer, length, format, and expected float
+//! count.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -65,26 +66,39 @@ impl std::error::Error for DequantError {}
 
 /// Cache key — in production the byte slice's start pointer is stable across
 /// the lifetime of the mmap, so different experts in the same packed tensor get
-/// distinct keys via their offset. Tests use short heap Vecs whose addresses can
-/// be recycled between cases, so include a content fingerprint under `cfg(test)`.
+/// distinct keys via their offset. Length, format, and expected float count are
+/// included so reused addresses or differently interpreted byte slices cannot
+/// return a stale decode. Tests use short heap Vecs whose addresses can be
+/// recycled between cases, so include a content fingerprint under `cfg(test)`.
 #[cfg(not(test))]
-type Key = usize;
+type Key = (usize, usize, crate::QuantFormat, usize);
 
 #[cfg(test)]
-type Key = (usize, usize, u64);
+type Key = (usize, usize, crate::QuantFormat, usize, u64);
 
 #[cfg(not(test))]
-fn cache_key(bytes: &[u8]) -> Key {
-    bytes.as_ptr() as usize
+fn cache_key(bytes: &[u8], format: crate::QuantFormat, expected_floats: usize) -> Key {
+    (
+        bytes.as_ptr() as usize,
+        bytes.len(),
+        format,
+        expected_floats,
+    )
 }
 
 #[cfg(test)]
-fn cache_key(bytes: &[u8]) -> Key {
+fn cache_key(bytes: &[u8], format: crate::QuantFormat, expected_floats: usize) -> Key {
     use std::hash::{Hash, Hasher};
 
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
-    (bytes.as_ptr() as usize, bytes.len(), h.finish())
+    (
+        bytes.as_ptr() as usize,
+        bytes.len(),
+        format,
+        expected_floats,
+        h.finish(),
+    )
 }
 
 struct Inner {
@@ -166,7 +180,7 @@ pub(super) fn try_cached_dequant(
         return Err(DequantError::UnsupportedFormat(format));
     }
 
-    let key = cache_key(bytes);
+    let key = cache_key(bytes, format, expected_floats);
     // Fast path: shared read lock — concurrent hits don't contend.
     if let Ok(inner) = cell().read() {
         if let Some(hit) = inner.get(key) {
@@ -241,6 +255,23 @@ mod cache_format_tests {
         }
     }
 
+    #[test]
+    fn cache_key_separates_format_and_expected_length() {
+        let data: Vec<f32> = vec![1.0, 2.0];
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let f32_out = try_cached_dequant(&bytes, QuantFormat::F32, data.len()).unwrap();
+        assert_eq!(&*f32_out, &[1.0, 2.0]);
+
+        let bf16_out = try_cached_dequant(&bytes, QuantFormat::BF16, bytes.len() / 2).unwrap();
+        assert_eq!(bf16_out.len(), bytes.len() / 2);
+        assert_ne!(
+            bf16_out.len(),
+            f32_out.len(),
+            "BF16 lookup must not reuse the prior F32 cache entry"
+        );
+    }
+
     /// Unsupported formats fail explicitly instead of looking like a skipped expert.
     #[test]
     fn unsupported_format_returns_error() {
@@ -269,7 +300,7 @@ mod cache_format_tests {
     fn inner_zero_capacity_drops_inserts() {
         let mut inner = Inner::new(0);
         let bytes = vec![1u8, 2, 3, 4];
-        let key = cache_key(&bytes);
+        let key = cache_key(&bytes, QuantFormat::BF16, 2);
 
         inner.insert(key, Arc::new(vec![42.0]));
 
@@ -283,9 +314,9 @@ mod cache_format_tests {
         let a = vec![1u8];
         let b = vec![2u8];
         let c = vec![3u8];
-        let ka = cache_key(&a);
-        let kb = cache_key(&b);
-        let kc = cache_key(&c);
+        let ka = cache_key(&a, QuantFormat::BF16, 1);
+        let kb = cache_key(&b, QuantFormat::BF16, 1);
+        let kc = cache_key(&c, QuantFormat::BF16, 1);
 
         inner.insert(ka, Arc::new(vec![1.0]));
         inner.insert(kb, Arc::new(vec![2.0]));
@@ -301,7 +332,7 @@ mod cache_format_tests {
     fn inner_duplicate_insert_keeps_original_value_and_order() {
         let mut inner = Inner::new(2);
         let bytes = vec![9u8];
-        let key = cache_key(&bytes);
+        let key = cache_key(&bytes, QuantFormat::BF16, 1);
 
         inner.insert(key, Arc::new(vec![1.0]));
         inner.insert(key, Arc::new(vec![2.0]));

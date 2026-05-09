@@ -72,17 +72,22 @@ pub fn encode_gated(
     q8_stride_bytes: u64,    // Q8 input bytes per pos
     q8s_stride_bytes: u64,   // Q8 scales bytes per pos
 ) {
-    // Gate+up per position. (Tried wiring `q4k_matmul` here for
-    // seq_len>1 prefill — kernel-isolated 1.79× speedup did NOT
-    // translate end-to-end. Long-prompt prefill regressed 10%
-    // (~2933 → ~3268 ms on a 340-token prompt). Same failure mode as
-    // the f16 acc try: kernel was already bandwidth-bound, and on
-    // long prompts the matmul's [seq_len × hidden] X working set no
-    // longer fits in GPU L1, defeating the cache locality the
-    // matvec loop had. Reverted 2026-04-28. The matmul kernel ships
-    // with its parity tests and remains usable via the q4k_matmul
-    // method on `MetalBackend` but is not worth wiring into the
-    // production prefill path on this hardware.)
+    // Gate+up per position. `q4k_matmul` wiring tried twice on Gemma 3 4B,
+    // both falsified end-to-end:
+    //   - 2026-04-28: kernel-isolated 1.79× → long-prompt prefill regressed
+    //     10% (2933 → 3268 ms on 340 tokens).
+    //   - 2026-05-09: re-bench under post-dispatch-fix + post-QKV-defuse
+    //     state still regressed 5–7% across 10/50/150-token prompts
+    //     (e.g. 1392 → 1469 ms at 150 tokens).
+    // Diagnosis: the kernel is bandwidth-bound, and on long prompts the
+    // matmul's [seq_len × hidden] X working set thrashes GPU L1 — the
+    // dequant amortisation gain is paid back in DRAM↔L1 traffic.
+    // The matmul kernel + `q4k_matmul` backend method + parity tests
+    // remain shipped (useful for re-validation on future hardware), but
+    // wiring it into the production prefill path is empirically dead.
+    // Closing the prefill gap to ollama needs a different matmul kernel
+    // (e.g. K-dim tiled, or Apple `simdgroup_matrix` intrinsics), not a
+    // re-wiring of the current one.
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;
         let inter_off = pos as u64 * inter_stride_bytes;

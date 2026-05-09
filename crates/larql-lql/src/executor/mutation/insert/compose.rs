@@ -32,7 +32,7 @@ pub(super) struct InstalledSlot {
 // Gate scale matching the Python install: `gate = gate_dir * g_ref * 30`.
 // Without this multiplier the slot's silu(gate · x) is too small to
 // push the activation past the trained competition. Validated by
-// exp 14 — see `experiments/14_vindex_compilation/experiment_vindex_compilation.py`.
+// exp 14 — see `~/chris-source/chris-experiments/compilation/14_vindex_compilation/experiment_vindex_compilation.py`.
 pub(super) const GATE_SCALE: f32 = 30.0;
 
 impl Session {
@@ -108,7 +108,7 @@ impl Session {
             // ── Gate / up / down synthesis (install_compiled_slot port) ──
             //
             // Direct Rust port of `install_compiled_slot` from
-            // `experiments/14_vindex_compilation/experiment_vindex_compilation.py`.
+            // `~/chris-source/chris-experiments/compilation/14_vindex_compilation/experiment_vindex_compilation.py`.
             // The validated Python pipeline computes three layer-typical
             // norms by sampling existing features at this layer:
             //

@@ -19,6 +19,19 @@ use crate::index::core::IndexLoadCallbacks;
 
 use super::write_f32::{kind, WeightEntry};
 
+/// Whether expert `e` is owned by a shard with `expert_filter`. `None`
+/// means "no shard, keep all experts". `Some((start, end_excl))` is a
+/// half-open range — `e == start` is kept, `e == end_excl` is skipped.
+///
+/// Pulled out as a free function so the boundary behaviour can be unit
+/// tested directly without standing up a Q4_K MoE fixture.
+pub(crate) fn expert_in_shard(e: usize, expert_filter: Option<(usize, usize)>) -> bool {
+    match expert_filter {
+        None => true,
+        Some((start, end_excl)) => e >= start && e < end_excl,
+    }
+}
+
 /// Options for [`load_model_weights_with_opts`]. Filter which
 /// component tensors are actually mmap'd + decoded at load time —
 /// unlike the post-load `drop_*` helpers on `ModelWeights`, these
@@ -671,11 +684,8 @@ pub fn load_model_weights_q4k_shard(
                         // in lockstep. Drift here causes silent None returns.
                         for (e, (gu_off, gu_bytes, dn_off, dn_bytes)) in offsets.iter().enumerate()
                         {
-                            // Skip experts outside the owned range [start, end_excl).
-                            if let Some((start, end_excl)) = expert_filter {
-                                if e < start || e >= end_excl {
-                                    continue;
-                                }
+                            if !expert_in_shard(e, expert_filter) {
+                                continue;
                             }
                             packed_byte_ranges.insert(
                                 larql_models::weights::per_layer_ffn_key(
@@ -760,4 +770,48 @@ pub fn find_tokenizer_path(dir: &Path) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expert_in_shard_none_keeps_everything() {
+        // No filter ⇒ every expert is owned. Pin this so a future
+        // refactor doesn't accidentally invert the meaning of `None`.
+        for e in [0, 1, 7, 127, usize::MAX] {
+            assert!(expert_in_shard(e, None), "e={e} should be kept");
+        }
+    }
+
+    #[test]
+    fn expert_in_shard_half_open_boundaries() {
+        // [4, 8): 4..=7 kept, 3 and 8 dropped.
+        let f = Some((4, 8));
+        assert!(!expert_in_shard(3, f));
+        assert!(expert_in_shard(4, f), "start is inclusive");
+        assert!(expert_in_shard(7, f));
+        assert!(!expert_in_shard(8, f), "end_excl is exclusive");
+        assert!(!expert_in_shard(9, f));
+    }
+
+    #[test]
+    fn expert_in_shard_empty_range_keeps_nothing() {
+        // start == end_excl is a valid (empty) shard, e.g. a worker
+        // configured with `--experts 4-4`. Nothing should slip through.
+        for e in [0, 4, 5, 100] {
+            assert!(!expert_in_shard(e, Some((4, 4))));
+        }
+    }
+
+    #[test]
+    fn expert_in_shard_zero_based_first_shard() {
+        // The Gemma-4-26B "first 16 experts" case: shard (0, 16).
+        let f = Some((0, 16));
+        assert!(expert_in_shard(0, f));
+        assert!(expert_in_shard(15, f));
+        assert!(!expert_in_shard(16, f));
+        assert!(!expert_in_shard(127, f));
+    }
 }

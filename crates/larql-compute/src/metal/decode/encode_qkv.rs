@@ -66,13 +66,20 @@ impl MetalBackend {
         uses_q4k: bool,
     ) {
         if uses_q4k {
-            // Fast path: fused RMS norm + mixed Q4K/Q6K QKV in one dispatch.
-            // Fires when format is Q4_K Q/K + Q6_K V (Gemma 3/4 production),
-            // no bias, standard RMS norm. Saves 1 dispatch per layer × 34.
+            // Default path (since 2026-05-09): separate `rms_norm` dispatch
+            // + non-fused `q4k_q6k_qkv_proj`. The fused alternative
+            // (`q4k_q6k_qkv_proj_normed`) saves 1 dispatch/layer (~0.24
+            // ms/tok) but rereads H+norm_w 3× per TG, dropping the kernel
+            // from 287 → 199 GB/s — the bandwidth cost (~1.4 ms/tok in
+            // the per-kernel diag) exceeds the dispatch saving. Measured
+            // end-to-end on Gemma 3 4B: +1.6 tok/s, −0.30 ms/tok GPU fwd
+            // by defusing. `LARQL_QKV_FUSED=1` opts back in.
             let mixed_q4k_q6k_v = layer.wq.format == crate::QuantFormat::Q4_K
                 && layer.wk.format == crate::QuantFormat::Q4_K
                 && layer.wv.format == crate::QuantFormat::Q6_K;
+            let use_fused = crate::options::env_opt_in(crate::options::ENV_QKV_FUSED);
             if mixed_q4k_q6k_v
+                && use_fused
                 && layer.norm_type == crate::NormType::RmsNorm
                 && layer.input_norm_bias.is_none()
             {

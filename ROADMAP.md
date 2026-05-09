@@ -263,9 +263,9 @@ older context is represented as 2564-byte compressed residual frames.
 KV for the present. Residual boundaries for memory.
 ```
 
-Foundation: `crates/larql-boundary/` (Phases 1–3 shipped).  
-Protocol spec: `experiments/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`.  
-Calibration data: `experiments/44_boundary_gate_calibration/`.
+Foundation: `crates/larql-boundary/` (Phases 1–3 shipped).
+Protocol spec: `~/chris-source/chris-experiments/shannon/43_residual_stream_codec/BOUNDARY_REF_PROTOCOL.md`.
+Calibration data: `~/chris-source/chris-experiments/shannon/44_boundary_gate_calibration/`.
 
 The existing `BoundaryStore` in `larql-inference/src/trace/boundary.rs` stores raw
 bf16 residuals. `larql-boundary` adds the 2× compressed path on top of it. Phase 4
@@ -280,7 +280,7 @@ connects them to the running server.
 | BR5 | Phase 4: boundary archive (disk/remote) + restore path | larql-server + larql-inference | not started |
 | BR6 | Phase 5: boundary frames over gRPC grid (protobuf schema defined) | larql-router + larql-server | not started |
 | BR7 | Track B: per-channel codec (int4 + outlier side-channel, ≤1024 bytes) | larql-boundary | not started |
-| BR8 | Gate calibration n≥300 to tighten 95% CI below 1.6%–10.7% | experiments/44 | not started |
+| BR8 | Gate calibration n≥300 to tighten 95% CI below 1.6%–10.7% | ~/chris-source/chris-experiments/shannon/44_boundary_gate_calibration | not started |
 
 **What D-@high actually contracts:** first ~5 continuation tokens safe at 4.8%
 early-div (95% CI 1.6%–10.7%, n=62). Total 20-token divergence is ~20% regardless

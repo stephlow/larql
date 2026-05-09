@@ -3,6 +3,10 @@
 //! Compares `q4_matvec::dispatch` and `q4_vecmat::dispatch` output against a
 //! pure-Rust dequantize-and-compute reference. Q4/Q8 are lossy, so we check
 //! relative error and cosine similarity rather than exact agreement.
+//!
+//! Gated on the `heavy_tests` feature — see `test_correctness.rs` for
+//! the rationale.
+#![cfg(feature = "heavy_tests")]
 
 use larql_compute::cpu::q4::{q4_matvec, q4_vecmat, quantize_q4_0, quantize_to_q8};
 

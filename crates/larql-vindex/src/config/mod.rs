@@ -19,6 +19,7 @@
 
 pub mod compliance;
 pub mod dtype;
+pub mod hnsw;
 pub mod index;
 pub mod model;
 pub mod quantization;

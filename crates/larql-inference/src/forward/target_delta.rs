@@ -6,7 +6,7 @@
 //! with a KL regulariser keeping the distribution close to baseline.
 //!
 //! This is the per-fact pre-compute that the Python reference at
-//! `experiments/15_v11_model/vindex_compile_rome_v11.py::optimise_target_delta`
+//! `~/chris-source/chris-experiments/compilation/15_v11_model/vindex_compile_rome_v11.py::optimise_target_delta`
 //! runs before MEMIT's closed-form W-edit. Without it, MEMIT's V*
 //! defaults to `target_alpha × embed(target)` — a rough direction
 //! that doesn't account for how downstream layers transform the

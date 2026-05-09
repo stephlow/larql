@@ -553,43 +553,7 @@ pub fn write_model_weights_with_opts(
 
     config.has_model_weights = true;
 
-    let cfg = arch.config();
-    config.model_config = Some(VindexModelConfig {
-        model_type: cfg.model_type.clone(),
-        head_dim: cfg.head_dim,
-        num_q_heads: cfg.num_q_heads,
-        num_kv_heads: cfg.num_kv_heads,
-        rope_base: cfg.rope_base,
-        sliding_window: cfg.sliding_window,
-        moe: if arch.is_moe() {
-            Some(crate::MoeConfig {
-                num_experts: arch.num_experts(),
-                top_k: arch.num_experts_per_token(),
-                shared_expert: arch.num_shared_experts() > 0,
-                router_type: arch.moe_router_type().into(),
-                moe_intermediate_size: if arch.moe_intermediate_size() > 0 {
-                    Some(arch.moe_intermediate_size())
-                } else {
-                    None
-                },
-                hybrid: arch.is_hybrid_moe(),
-            })
-        } else {
-            None
-        },
-        // Per-layer geometry (Gemma 4)
-        global_head_dim: cfg.global_head_dim,
-        num_global_kv_heads: cfg.num_global_kv_heads,
-        partial_rotary_factor: cfg.partial_rotary_factor,
-        sliding_window_pattern: cfg.sliding_window_pattern,
-        layer_types: cfg.layer_types.clone(),
-        attention_k_eq_v: cfg.attention_k_eq_v,
-        num_kv_shared_layers: cfg.num_kv_shared_layers,
-        per_layer_embed_dim: cfg.per_layer_embed_dim,
-        rope_local_base: cfg.rope_local_base,
-        query_pre_attn_scalar: cfg.query_pre_attn_scalar,
-        final_logit_softcapping: cfg.final_logit_softcapping,
-    });
+    config.model_config = Some(VindexModelConfig::from_arch(arch));
 
     let config_json =
         serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;

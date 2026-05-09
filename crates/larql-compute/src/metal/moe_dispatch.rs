@@ -6,7 +6,7 @@
 //!
 //! Flow per MoE layer (after the standard GPU commit for `h_post_attn`):
 //!
-//! 1. CPU: pre-experts norm + router projection + softmax + top-K + renorm.
+//! 1. CPU: model-declared expert input + router policy + softmax + top-K.
 //! 2. CPU→GPU: write the K selected experts' gate / up / down byte slices
 //!    DIRECTLY into pre-allocated Metal staging buffers (one memcpy each).
 //! 3. GPU: `q4k_ffn_gate_up` over all K experts in one dispatch.
@@ -28,7 +28,9 @@ use std::ffi::c_void;
 
 use super::buffers::{read_buffer_f32, BufferCache};
 use super::MetalBackend;
-use crate::cpu::ops::moe::cpu_moe_route;
+use crate::cpu::ops::moe::{
+    moe_expert_input, moe_post_expert_output, moe_route_from_router_input, moe_router_input,
+};
 use crate::MoeLayerWeights;
 
 /// Pre-allocated scratch for the whole MoE decode loop.
@@ -721,23 +723,12 @@ impl MetalBackend {
             "MoE hidden_size drift across layers"
         );
 
-        // ── 1. CPU pre-experts norm + router ─────────────────────────────
-        // Empirical: the trained 26B-A4B weights expect router input =
-        // pre_experts_norm(h_post_attn), not raw h_post_attn — even though
-        // HF's published Gemma4TextDecoderLayer.forward consumes the raw
-        // residual. Switching to the HF convention degrades generation to
-        // token repetition. Match the trained-weights convention here.
-        let h_norm = if !moe.pre_experts_norm.is_empty() {
-            let rms = (h_post_attn.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
-            h_post_attn
-                .iter()
-                .zip(moe.pre_experts_norm)
-                .map(|(x, w)| x / rms * (w + 0.0))
-                .collect::<Vec<f32>>()
-        } else {
-            h_post_attn.to_vec()
-        };
-        let (expert_indices, expert_weights) = cpu_moe_route(&h_norm, moe, eps);
+        // ── 1. CPU expert input + router ─────────────────────────────────
+        // The policy comes from `MoeLayerWeights`, so Gemma's
+        // pre_experts_norm routing convention is no longer implicit here.
+        let expert_input = moe_expert_input(h_post_attn, moe, 0.0, eps);
+        let router_in = moe_router_input(h_post_attn, &expert_input, moe, 0.0, eps);
+        let (expert_indices, expert_weights) = moe_route_from_router_input(&router_in, moe);
 
         // ── 2. Stage expert weight bytes into pre-allocated Metal buffers ─
         let row_bytes = scratch.row_bytes;
@@ -797,7 +788,7 @@ impl MetalBackend {
         // ── 3. Stage router-normed input into pre-allocated x_buf ─────────
         unsafe {
             let x_ptr = scratch.x_buf.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(h_norm.as_ptr(), x_ptr, hidden);
+            std::ptr::copy_nonoverlapping(expert_input.as_ptr(), x_ptr, hidden);
         }
 
         let cmd = self.queue.new_command_buffer();
@@ -885,12 +876,6 @@ impl MetalBackend {
             }
         }
 
-        if !moe.post_experts_norm.is_empty() {
-            let rms = (moe_out.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
-            for (v, &w) in moe_out.iter_mut().zip(moe.post_experts_norm) {
-                *v = *v / rms * (w + 0.0);
-            }
-        }
-        moe_out
+        moe_post_expert_output(&moe_out, moe, 0.0, eps)
     }
 }

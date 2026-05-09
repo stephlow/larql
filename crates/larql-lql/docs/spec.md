@@ -1268,7 +1268,7 @@ pub enum TracePositionMode { Last, All }
 
 // INSERT install mode. Default is Knn (Architecture B retrieval
 // override). Compose is the FFN-overlay install validated in
-// experiments/14_vindex_compilation.
+// ~/chris-source/chris-experiments/compilation/14_vindex_compilation
 pub enum InsertMode { Knn, Compose }
 
 pub enum ExtractLevel {

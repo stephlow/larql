@@ -12,8 +12,8 @@
 //! `decode_token` runs ~340 dispatches/tok at ~30 µs avg = ~10.5 ms
 //! GPU compute, vs llama.cpp/ollama's estimated ~200 dispatches/tok
 //! → ~8 ms. **Dispatch count, not per-kernel speed, is the bottleneck**
-//! after three earlier kernel-utilization optimisations all came out
-//! null (`F16_ACC`, `GATE_UP_COOP`, `GATE_UP_NR2`). This fusion is
+//! after earlier kernel-utilization optimisations came out null
+//! (`F16_ACC`, `GATE_UP_COOP`, and the removed NR2 candidate). This fusion is
 //! the smallest concrete dispatch-reduction step: 1 dispatch saved
 //! per layer × 34 layers = ~34 dispatches/tok × ~7 µs/dispatch ≈
 //! 0.24 ms/tok end-to-end.

@@ -71,9 +71,10 @@ pub mod metal;
 
 pub use pipeline::{
     Activation, AttentionSpec, AttentionWeights, FfnSpec, FfnType, FfnWeights, FullPipelineLayer,
-    LayerNorms, LayerWeights, MoeLayerWeights, MoeSpec, NormType, PositionEncodingType,
-    QuantFormat, QuantWeight, RemoteFfnSpec, RMSNORM_EPSILON_DEFAULT, ROPE_BASE_DEFAULT,
-    ROPE_BASE_GLOBAL,
+    LayerNorms, LayerWeights, MoeDownPaddingPolicy, MoeExpertScalePolicy, MoeInputSource,
+    MoeLayerWeights, MoePostExpertNormPolicy, MoeRouterNormPolicy, MoeRoutingPolicy, MoeSpec,
+    MoeTopKWeightPolicy, MoeWeightLayout, NormType, PositionEncodingType, QuantFormat, QuantWeight,
+    RemoteFfnSpec, RMSNORM_EPSILON_DEFAULT, ROPE_BASE_DEFAULT, ROPE_BASE_GLOBAL,
 };
 
 // ── Re-exports: backend ──

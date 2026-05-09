@@ -109,7 +109,41 @@ pub fn publish_vindex_with_opts(
     };
 
     // Collect files from the root and any immediate subdirectories (e.g. layers/).
-    let mut files: Vec<(PathBuf, String)> = Vec::new(); // (abs_path, repo_path)
+    let files = enumerate_publishable_files(vindex_dir)?;
+
+    for (file_path, filename) in &files {
+        let size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+
+        // Skip-if-unchanged: compare local SHA256 against remote lfs.oid.
+        if opts.skip_unchanged {
+            if let Some(remote_sha) = remote_lfs.get(filename) {
+                if let Ok(local_sha) = crate::format::checksums::sha256_file(file_path) {
+                    if local_sha == *remote_sha {
+                        callbacks.on_file_skipped(filename, size, remote_sha);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        callbacks.on_file_start(filename, size);
+        upload_file_to_hf(repo_id, &token, file_path, filename, callbacks, repo_type)?;
+        callbacks.on_file_done(filename);
+    }
+
+    let url = hf_repo_url(repo_type, repo_id);
+    callbacks.on_complete(&url);
+    Ok(url)
+}
+
+/// Enumerate publishable files in a vindex directory: every file at the
+/// root plus every file in immediate subdirectories (e.g. `layers/`).
+/// Result is sorted by repo path so commits are reproducible.
+///
+/// Returned tuples are `(absolute_path, repo_relative_path)` — the second
+/// is what HuggingFace sees and is always forward-slash separated.
+fn enumerate_publishable_files(vindex_dir: &Path) -> Result<Vec<(PathBuf, String)>, VindexError> {
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
     for entry in std::fs::read_dir(vindex_dir)?.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() {
@@ -141,30 +175,7 @@ pub fn publish_vindex_with_opts(
         }
     }
     files.sort_by(|a, b| a.1.cmp(&b.1));
-
-    for (file_path, filename) in &files {
-        let size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-
-        // Skip-if-unchanged: compare local SHA256 against remote lfs.oid.
-        if opts.skip_unchanged {
-            if let Some(remote_sha) = remote_lfs.get(filename) {
-                if let Ok(local_sha) = crate::format::checksums::sha256_file(file_path) {
-                    if local_sha == *remote_sha {
-                        callbacks.on_file_skipped(filename, size, remote_sha);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        callbacks.on_file_start(filename, size);
-        upload_file_to_hf(repo_id, &token, file_path, filename, callbacks, repo_type)?;
-        callbacks.on_file_done(filename);
-    }
-
-    let url = hf_repo_url(repo_type, repo_id);
-    callbacks.on_complete(&url);
-    Ok(url)
+    Ok(files)
 }
 
 /// List remote files and return `filename → lfs.oid` for every LFS-tracked
@@ -812,4 +823,173 @@ fn commit_lfs_file(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // ─── URL builders ──────────────────────────────────────────────
+
+    #[test]
+    fn hf_repo_url_model() {
+        assert_eq!(
+            hf_repo_url("model", "org/repo"),
+            "https://huggingface.co/org/repo"
+        );
+    }
+
+    #[test]
+    fn hf_repo_url_dataset() {
+        assert_eq!(
+            hf_repo_url("dataset", "org/repo"),
+            "https://huggingface.co/datasets/org/repo"
+        );
+    }
+
+    #[test]
+    fn hf_repo_url_unknown_type_falls_back_to_model() {
+        // Unknown repo types should fall back to the model URL shape so a
+        // typo doesn't silently route to a "datasets" 404.
+        assert_eq!(
+            hf_repo_url("space", "org/repo"),
+            "https://huggingface.co/org/repo"
+        );
+    }
+
+    #[test]
+    fn hf_api_url_model() {
+        assert_eq!(
+            hf_api_url("model", "org/repo", "preupload/main"),
+            "https://huggingface.co/api/models/org/repo/preupload/main"
+        );
+    }
+
+    #[test]
+    fn hf_api_url_dataset() {
+        assert_eq!(
+            hf_api_url("dataset", "org/repo", "tree/main"),
+            "https://huggingface.co/api/datasets/org/repo/tree/main"
+        );
+    }
+
+    // ─── PublishOptions ────────────────────────────────────────────
+
+    #[test]
+    fn publish_options_default_is_model_no_skip() {
+        let opts = PublishOptions::default();
+        assert!(!opts.skip_unchanged);
+        assert_eq!(opts.repo_type, "model");
+    }
+
+    #[test]
+    fn publish_options_skip_unchanged_helper() {
+        let opts = PublishOptions::skip_unchanged();
+        assert!(opts.skip_unchanged);
+        // Should keep the default repo_type — the helper only flips skip.
+        assert_eq!(opts.repo_type, "model");
+    }
+
+    // ─── enumerate_publishable_files ───────────────────────────────
+
+    #[test]
+    fn enumerate_files_root_and_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root files.
+        fs::write(dir.path().join("index.json"), "{}").unwrap();
+        fs::write(dir.path().join("gate_vectors.bin"), b"x").unwrap();
+        // Subdirectory.
+        fs::create_dir_all(dir.path().join("layers")).unwrap();
+        fs::write(dir.path().join("layers/layer_00.weights"), b"y").unwrap();
+        fs::write(dir.path().join("layers/layer_01.weights"), b"z").unwrap();
+
+        let files = enumerate_publishable_files(dir.path()).unwrap();
+        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+
+        // Sorted by repo path so the commit order is stable.
+        assert_eq!(
+            names,
+            vec![
+                "gate_vectors.bin",
+                "index.json",
+                "layers/layer_00.weights",
+                "layers/layer_01.weights",
+            ]
+        );
+        // Subdir paths use forward slashes regardless of platform.
+        assert!(files.iter().any(|(_, n)| n.contains('/')));
+    }
+
+    #[test]
+    fn enumerate_files_skips_nested_subdirs() {
+        // Only immediate subdirectories are walked. Files in `a/b/foo`
+        // must not appear — HF dataset layouts are at most two levels.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        fs::write(dir.path().join("a/b/foo.bin"), b"deep").unwrap();
+        fs::write(dir.path().join("a/top.bin"), b"shallow").unwrap();
+
+        let files = enumerate_publishable_files(dir.path()).unwrap();
+        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+
+        assert_eq!(names, vec!["a/top.bin"]);
+    }
+
+    #[test]
+    fn enumerate_files_empty_dir_returns_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = enumerate_publishable_files(dir.path()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    // ─── publish_vindex_with_opts validation ───────────────────────
+
+    #[test]
+    fn publish_rejects_non_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not-a-dir.txt");
+        fs::write(&file_path, "x").unwrap();
+
+        let mut cb = SilentPublishCallbacks;
+        let err = publish_vindex_with_opts(&file_path, "org/repo", &PublishOptions::default(), &mut cb)
+            .expect_err("path is a file, not a directory");
+        assert!(matches!(err, VindexError::NotADirectory(_)));
+    }
+
+    #[test]
+    fn publish_rejects_directory_without_index_json() {
+        let dir = tempfile::tempdir().unwrap();
+        // Directory exists but has no index.json — should fail before any
+        // network call (no token required to reach this branch).
+        let mut cb = SilentPublishCallbacks;
+        let err = publish_vindex_with_opts(dir.path(), "org/repo", &PublishOptions::default(), &mut cb)
+            .expect_err("missing index.json must error");
+        match err {
+            VindexError::Parse(msg) => assert!(
+                msg.contains("not a vindex directory"),
+                "unexpected error message: {msg}",
+            ),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    // ─── get_hf_token ──────────────────────────────────────────────
+
+    #[test]
+    fn get_hf_token_reads_env_var() {
+        // Process-wide env mutation is unsafe to do under cargo's parallel
+        // test runner without serialisation; this test sets HF_TOKEN to
+        // a known value and immediately reads it. If another test in the
+        // same binary also touches HF_TOKEN, mark both #[serial].
+        let prev = std::env::var("HF_TOKEN").ok();
+        std::env::set_var("HF_TOKEN", "sentinel-token-XYZ");
+        let result = get_hf_token();
+        // Restore before asserting so a panic doesn't leak the override.
+        match prev {
+            Some(v) => std::env::set_var("HF_TOKEN", v),
+            None => std::env::remove_var("HF_TOKEN"),
+        }
+        assert_eq!(result.unwrap(), "sentinel-token-XYZ");
+    }
 }

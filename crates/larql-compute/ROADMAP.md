@@ -25,10 +25,10 @@ Findings now tracked here so follow-up work does not live only in review notes:
   `--features metal` coverage.
 - [x] Add compute coverage targets and a 90%-default per-file policy with
   current debt baselines in `crates/larql-compute/coverage-policy.json`.
-- [x] Raise default-feature line coverage from 56.76% to 67.72% with targeted
+- [x] Raise default-feature line coverage from 56.76% to 93.59% with targeted
   tests for backend default contracts, compute option parsing, Q4K kernels, and
-  MoE helpers. Remaining per-file debt is still concentrated in the
-  instrumented backend trait defaults and MoE/Q4K paths.
+  MoE helpers. Remaining per-file debt is now concentrated in
+  `cpu/ops/moe/expert.rs` and `cpu/ops/moe/forward.rs`.
 - [x] Replace remaining direct `std::env::var` reads in Metal decode/stage
   code with the same options surface, so env names and parsing live in
   `src/options.rs`.
@@ -339,9 +339,13 @@ Concrete next investigation: try different threadgroup configurations (more simd
 
 ## P0: Production gap closers
 
-Remaining gap: **~1.18×** (~84 vs ~99 tok/s, ~2ms/tok) post 2026-05-02
-dispatch geometry fix. Was ~1.30× pre-fix. The historical diagnosis
-below was on the pre-fix baseline — kept for context.
+Remaining gap: **~1.17×** (~88 vs ~103 tok/s, ~1.66 ms/tok) post 2026-05-09
+QKV defuse. Was ~1.18× pre-defuse, ~1.30× pre 2026-05-02 dispatch
+geometry fix. The historical diagnosis below was on the pre-fix baseline —
+kept for context. Acceptance criterion (`~85 tok/s, ~1.16×`) is effectively
+met; remaining work is closing the last ~14% via the multi-TG `attn_fused`
+retry (D-ATTN-MTG below) or accepting the M3 Max ceiling for matvec
+without `simdgroup_matrix`.
 
 ### Open decode-side levers (post 2026-05-02)
 
@@ -350,18 +354,18 @@ below was on the pre-fix baseline — kept for context.
 | **D-ATTN-MTG** | Multi-TG `attn_fused` retry — preserve 12 TGs while fusing qk_norm_rope + kv_append + attend | 0.2–0.4 ms/tok within the 3.48 ms attention bucket | Open. First attempt regressed −1.45 ms because the merge collapsed TG count 12→8; the multi-TG-per-head variant (split QKV+attend across 2 TGs/head, total ≥12) is untried. ADR-015 § "Lesson — diagnostic order" applies. | `metal/shaders/attn_fused.rs` rewrite; gated on `LARQL_FUSED_ATTN=1` until verified |
 | **D-FFN-PROFILE** | Split `encode_ffn` profiler boundary (gate_up vs activation+down) | Diagnostic, not perf. | **SHIPPED 2026-05-04.** `LARQL_PROFILE_SPLIT=1` + `--profile` bench now shows three separate GPU buckets per step. Measured on Gemma 3 4B (10-token steady state): **attn=3.3ms (34%), gate+up=3.5ms (36%), act+down=2.8ms (29%)** — all three roughly equal thirds. Gate+up is the largest single kernel. See `metal/decode/encode_ffn.rs` (split helpers) + `profile.rs` (GateUp/Down stages) + `bench_cmd.rs` (sub-rows). | `metal/decode/encode_ffn.rs` + `metal/decode/profile.rs` |
 | **D-FFN-FUSE** | Q6_K geglu+down fusion with cheaper-activation variant | ~0.2 ms/tok | **BLOCKED — all-NaN bug with production weights.** Kernel passes unit parity tests (synthetic data, production geometry). On real vindex decode: `down_out` = all 2560 NaN even in a fresh encoder with valid gate/up inputs (max±12). Metal API validation reports no errors. Bug not found by static analysis. Possible cause: interaction between production Q6_K block values and the fused kernel's inner-loop accumulation. Needs Metal shader debugger. Wired behind `LARQL_FUSED_Q6K_DOWN=1` (opt-in, broken). | `metal/shaders/q6k_geglu_down.rs` + `encode_ffn.rs` |
-| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | 3–4× prefill speedup on long prompts (closes 4–14× prefill gap to ollama) | Open. Kernel + parity tests shipped; only O-proj wired (within-noise impact). FFN sites are clean per-position matvec → matmul swaps; QKV requires a fused QKV matmul or fallback to per-projection matmul. | `metal/ops/full_pipeline/{stages,ffn}.rs` |
+| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | Was estimated 3–4× prefill speedup. **FALSIFIED twice end-to-end.** | **CLOSED 2026-05-09.** Wiring tried at O-proj (2026-04-28: −10% on long prompts), at FFN gate+up (2026-04-28: 2933 → 3268 ms on 340 tokens), and re-validated FFN gate+up under post-defuse state (2026-05-09: 5–7% regression at 10/50/150-token prompts). Diagnosis: the `q4k_matmul` kernel is bandwidth-bound; the [seq_len × hidden] X working set thrashes GPU L1 on long prompts and the dequant amortisation gain is paid back in DRAM↔L1 traffic. **Closing the prefill gap requires a different matmul kernel** (K-dim tiling, or Apple `simdgroup_matrix` intrinsics) — multi-day kernel research, not wiring. The current `q4k_matmul` shader + `MetalBackend::q4k_matmul` method + parity tests stay shipped for re-validation on future hardware; production prefill stays per-position matvec. | (closed) |
 
-**Sequencing rationale (updated 2026-05-04)**: D-FFN-PROFILE shipped; data
+**Sequencing rationale (updated 2026-05-09)**: D-FFN-PROFILE shipped; data
 shows all three buckets roughly equal thirds (~34/36/29%). Gate+up is the
 largest but already bandwidth-bound at 74% LPDDR5X peak — no headroom left.
 D-FFN-FUSE targets act+down (~0.24 ms from GEGLU dispatch overhead) but is
-blocked by an unexplained production NaN. **Next unblocked levers:**
-D-ATTN-MTG (attention bucket, 0.2–0.4 ms, requires TG-count fix) or
-D-PREFILL-MM (prefill only, independent). D-PREFILL-MM is the cleanest
-because it's isolated to the prefill path and its kernel + parity tests
-are already shipped.
-**D-PREFILL-MM** is independent (prefill-only, doesn't touch decode).
+blocked by an unexplained production NaN. D-PREFILL-MM is closed (twice-
+falsified). **Only unblocked lever: D-ATTN-MTG** (attention bucket,
+0.2–0.4 ms decode, requires TG-count-preserving multi-TG-per-head fusion).
+~2-day kernel project. Beyond that, closing the remaining prefill gap to
+ollama needs a fundamentally different matmul kernel — out of scope for
+session-bounded work.
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)
 
@@ -419,7 +423,7 @@ Reproduction: `cargo run --release --features metal -p larql-cli --bin larql -- 
 
 **Lesson for future kernel work**: the kernel-isolated profiler can be misleading. A 1.79× isolated speedup ≠ 1.79× end-to-end if the kernel was bandwidth-bound or part of a longer pipeline where other resources serialise the GPU. Always validate end-to-end on a quiet system before adopting.
 
-#### Track C — `q4k_ffn_gate_up_nr2` candidate ROUND-TRIPPED 2026-05-02 (opt-in, regressed end-to-end)
+#### Track C — `q4k_ffn_gate_up_nr2` candidate ROUND-TRIPPED 2026-05-02, REMOVED 2026-05-09
 
 NR2 (2 rows / simdgroup variant of `q4k_ffn_gate_up`) was a strong isolated profiler candidate after the 8sg landing — `diag_profile_kernels` showed:
 
@@ -428,14 +432,26 @@ NR2 (2 rows / simdgroup variant of `q4k_ffn_gate_up`) was a strong isolated prof
 | 8sg (default) | 0.591 | 51.4 | 0.106 | **278.9** |
 | NR2 (candidate) | 0.401 | 76.8 | 0.110 | **267.0** |
 
-End-to-end A/B (warmup 8, decode 30, quiet GPU, three runs):
+End-to-end A/B (warmup 8, decode 30, quiet GPU, three runs, 2026-05-02):
 
 | config | tok/s | GPU fwd | lm_head | output |
 |---|---|---|---|---|
 | baseline (8sg) | **75.9** | **11.19 ms** | 2.99 ms | "Paris" ✓ |
 | NR2 (`LARQL_GATE_UP_NR2=1`) | 72.9 | 11.80 ms (**+0.62 ms**) | 2.96 ms | "Paris" ✓ |
 
-NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the batched number, not the isolated one — the 1.47× iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. **Not promoted; kept as opt-in only.**
+NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the batched number, not the isolated one — the 1.47× iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. **Initial outcome (2026-05-02): not promoted; kept as opt-in.**
+
+**Re-benched 2026-05-09** alongside the QKV-gap investigation:
+
+| config | tok/s | GPU fwd |
+|---|---|---|
+| 8sg baseline (run 1) | 86.3 | 11.71 ms |
+| NR2 (`LARQL_GATE_UP_NR2=1`) | 83.4 | 12.05 ms (**+0.34 ms**) |
+| 8sg baseline (run 2, drift check) | 86.2 | 11.64 ms |
+
+The 0.07 ms baseline drift between runs 1 and 2 confirms the −0.34 ms NR2 regression is real signal, not thermal noise (unlike the f16_acc story where a +23% measurement turned out to be thermal artifact). Direction matched the batched-diag prediction; magnitude was ~3× the predicted delta but the ordering held — exactly the contract ADR-015 makes.
+
+**Outcome (2026-05-09): kernel and `LARQL_GATE_UP_NR2` env var removed.** The candidate had two independent benches against it; leaving it as opt-in dead code was inviting re-litigation. Shader (`shaders/q4k_ffn_gate_up_nr2.rs`), pipeline field, env-var constant, dispatch-branch in `encode_ffn`, diag-profile entry, and shader-bench inventory entry all deleted. Historical record preserved here, in `PERFORMANCE.md`, and in ADR-015.
 
 **Same A/B run also confirmed** that the v5 stride-32 lm_head is the *fast* path, not just the correct one: `LARQL_LM_HEAD_STRIDE32=0` regressed lm_head 2.99 → 4.08 ms (+1.09 ms, 75.9 → 69.5 tok/s). The "+0.7 ms cost" framing in PERFORMANCE.md is relative to the pre-fix broken-output kernel, not the current fallback. No tradeoff to chase.
 
@@ -443,22 +459,43 @@ NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the b
 
 `f16_acc` (2026-04-28) + `attn_fused` (2026-05-01) + `nr2` (2026-05-02) all showed isolated wins that failed end-to-end. Pattern pinned in `docs/adr/015-isolated-vs-batched-kernel-perf.md`. **Promotion criterion going forward**: a candidate must win the *batched* `diag_profile_kernels` column AND end-to-end bench. Isolated-only wins do not justify a session of end-to-end measurement on their own — three sessions burned on this so far.
 
-#### Remaining decode gap (after f16 acc, attn_fused, NR2 ruled out)
+#### Track D — QKV defuse PROMOTED 2026-05-09 (+1.6 tok/s, magnitude undershoot)
 
-Decode at ~76 tok/s vs ollama ~99 tok/s steady-state, ~1.30×. The "isolated-only" candidates are exhausted on the FFN gate+up path. Remaining options, ordered:
+The fused `q4k_q6k_qkv_proj_normed` kernel had been the production default for Gemma 3/4 layers since the QKV-stage fusion landed earlier in the year. It saved ~0.24 ms/tok of dispatch overhead but ran at 199 GB/s vs the non-fused `q4k_q6k_qkv_proj`'s 287 GB/s — the per-TG H + norm_w reread (3× redundant device traffic across the 4 simdgroups) was costing ~1.46 ms/tok in the per-kernel batched diag.
+
+Diag prediction: defusing recovers 1.46 ms − 0.24 ms = **−1.22 ms/tok** end-to-end.
+
+End-to-end A/B (warmup 8, n=100, drift 0.02 ms):
+
+| config | tok/s | mean ms | GPU fwd | output |
+|---|---|---|---|---|
+| baseline (fused, default) | 84.8 / 85.0 | 11.79 / 11.77 | 11.79 / 11.86 | "Paris" ✓ |
+| defused (`LARQL_QKV_DEFUSED=1` at the time) | **86.5** | **11.57** | **11.52** | "Paris" ✓ |
+
+**Measured Δ: +1.6 tok/s, −0.30 ms/tok GPU fwd** — direction matched the diag prediction but **magnitude was 18% of predicted**.
+
+**Promoted to default** 2026-05-09; env var renamed to `LARQL_QKV_FUSED=1` (opts back in to fused). Fused shader + `encode_normed_q4k_q6k_qkv` retained as the opt-in fallback. The +1.6 tok/s landing matches the +1.6-tok/s gap that existed at the time of investigation between us and the next-best decode milestone.
+
+**Why magnitude undershot.** The non-fused kernel's 287 GB/s peak is a single-kernel-isolated number. In the production decode pipeline, the candidate shares the LPDDR5X bus with attention, FFN gate+up, FFN down, lm_head — all also bandwidth-bound. The candidate doesn't get to *claim* its kernel-isolated headroom because the surrounding pipeline already saturates the same bus. Predicted batched-diag deltas should be discounted ~3-5× for bandwidth-headroom candidates; cycle-headroom or dispatch-count candidates don't show this discount as severely. Pinned as the first magnitude-compression case study in ADR-015.
+
+#### Remaining decode gap (after f16 acc, attn_fused, NR2 ruled out; QKV defuse landed)
+
+Decode at ~86 tok/s vs ollama ~99-101 tok/s steady-state, ~1.16-1.18×. The "isolated-only" candidates are exhausted on the FFN gate+up path. Remaining options, ordered:
 
 1. **Multi-TG `attn_fused` retry** — the standalone `qk_norm_rope_fused` runs 12 TGs; the fused variant collapses to 8 because of register pressure. A multi-TG-per-head fused variant (split the QKV+attend work across 2 TGs, keep total ≥12) would preserve parallelism while saving the dispatch. **This is the one remaining iso-win-prone candidate that is *also* batched-friendly** — the dispatch saving lives in the cmd-buffer count, not the per-kernel ALU. Estimated +0.2–0.4 ms recovery if successful.
-2. **f16 lm_head wiring** — `MetalBackend::f16_gemv` shipped with a passing test 2026-04-18; `backend_lm_head_topk` still goes f32. ~50 LOC: expose embeddings.bin f16 bytes from `VectorIndex` and prefer the f16 path. Could claw back some of the +0.7 ms paid for v5 stride-32 correctness. Bonus: removes the 5.6 GB f32 clone on 31B.
+2. ~~f16 lm_head wiring~~ — **falsified 2026-05-09**. Production lm_head is already on `q4k_matvec` (1.85 ms/tok) since the 2026-05-02 dispatch-geometry fix; f16_gemv fallback measures 3.88 ms/tok, so wiring f16 ahead of Q4_K would regress lm_head by ~2 ms/tok. The "+0.7 ms paid for v5 stride-32 correctness" framing was itself stale — stride-32 is no longer the production path, the dispatch fix superseded it. 31B memory-footprint concern (5.6 GB f32 clone) is a separate issue addressable independently.
 3. **Wire `ProfileTimings.gate_up_ms` / `down_ms` producer** (#12 in P0 structural cleanup) — without it, the remaining ~2 ms in GPU fwd is unattributed. Diagnostic, not perf — but it points the next swing.
-4. **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis likely applies; expected to also wash out end-to-end. Lower priority unless gate+up finding turns out to be situational.
+4. **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis applies as #2: Q4_K is already the fast path on these. Drop unless a specific dispatch-geometry bug surfaces.
 5. **Dispatch overhead reduction** (~100-dispatch gap to ollama) — closing this means more aggressive kernel fusion. The fused FFN gate+up + GEGLU + down for Q6_K models was tried (#1 below) and regressed — re-enable might require a cheaper activation variant.
-6. **Accept ~1.30× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 25% likely requires fundamental architecture changes.
+6. **Accept ~1.17× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 15% likely requires fundamental architecture changes (`simdgroup_matrix` for matvec).
 
 **Effort**: multi-TG attn_fused retry is ~2 days (split the kernel, keep parity tests, batched bench). f16 lm_head wiring is ~half a day. Other tracks are larger.
 
 #### Acceptance criterion
 
 **Close 1.5 ms of the 3 ms decode gap to reach ~12 tok/s (~85 tok/s, 1.16× of ollama)**. Closing the full 3 ms requires `simdgroup_matrix` for matvec (no llama.cpp precedent for matvec — they use it for matmul/prefill only). Above that ceiling we're chasing Apple-specific intrinsics not exposed publicly.
+
+**Status (2026-05-09)**: QKV defuse landed +1.6–1.8 tok/s → **88 tok/s, 1.17× of ollama** on a fair-thermal session bench. **Acceptance threshold reached** on the tok/s axis (target was ~85), one notch off on the gap-ratio axis (target 1.16×, ollama drift is itself ~±15% session-to-session so this is effectively at the threshold). Closing the remaining ~14% means **multi-TG `attn_fused` retry** (~+0.2-0.4 ms, ~2 days work) — the only known-viable swing left. ~~f16 lm_head wiring~~ was on the table but **falsified 2026-05-09**: production lm_head is already on `q4k_matvec` at 1.85 ms/tok, and f16_gemv fallback measures 3.88 ms/tok — wiring f16 ahead of Q4_K would *regress* lm_head by ~2 ms/tok. The "v5 stride-32 correctness tax" the f16 plan referenced was itself stale: the 2026-05-02 dispatch-geometry fix removed that tax. See `project_f16_gemv_wiring_todo.md` memory entry for the falsification record.
 
 ### #0 — Decode kernel optimisation (NEW, 2026-04-28)
 
@@ -475,7 +512,7 @@ See "Decode kernel optimization" section above. Replaces the older "#6 — Q4_K 
 | 18 tok (chat) | 196 ms (10.9 ms/tok) | 50 ms (2.8 ms/tok) | **3.9×** |
 | 340 tok (long) | 2933 ms (8.6 ms/tok) | 210 ms (0.62 ms/tok) | **14×** |
 
-The widening ratio is the smoking gun: larql is per-position linear (`prefill ≈ seq_len × decode_per_tok`); ollama is sublinear via gemm. Decode itself (seq=1) is only 1.30× behind.
+The widening ratio is the smoking gun: larql is per-position linear (`prefill ≈ seq_len × decode_per_tok`); ollama is sublinear via gemm. Decode itself (seq=1) is only ~1.17× behind (was 1.30× when this diagnosis was written; subsequent dispatch-geometry fix and QKV defuse closed it).
 
 **Root cause** (verified 2026-04-27 by reading `metal/ops/full_pipeline/dispatch.rs`): `prefill_q4 → dispatch_full_pipeline` IS already wired and IS allocating `[seq_len × hidden]` buffers, but every per-stage compute step issues per-position matvec dispatches. For an 18-token × 34-layer prefill that's ~600+ matvec calls vs ollama's ~34 gemm calls per stage.
 
@@ -838,7 +875,7 @@ fusion was attempted but regressed due to GELU-tanh recomputation cost
 Diagnostics were previously scattered across three locations:
 - `src/metal/decode/diag.rs` — NaN detection, residual dumps, per-layer bisect
 - `src/metal/decode/profile.rs` — stage-level `ProfileTimings`
-- `examples/debug_decode_pipeline.rs` — decode pipeline stage bisect entry point
+- `examples/diag_decode_pipeline.rs` — decode pipeline stage bisect entry point
 
 Now consolidated under `src/metal/diag/`:
 - `diag/mod.rs` — public API, re-exports `ProfileTimings`, documents all tools

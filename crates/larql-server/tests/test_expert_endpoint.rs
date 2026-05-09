@@ -331,6 +331,8 @@ fn local_output(
         &MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: larql_compute::MoeRoutingPolicy::default(),
+            weight_layout: larql_compute::MoeWeightLayout::default(),
             expert_data_format: larql_compute::QuantFormat::BF16,
             router_proj,
             router_scale: &[],

@@ -779,3 +779,50 @@ fn normalize_key(key: &str, prefixes: &[&str]) -> String {
 }
 
 use crate::config::dtype::write_floats;
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_key;
+
+    #[test]
+    fn normalize_strips_first_matching_prefix() {
+        let prefixes = ["model.", "transformer."];
+        assert_eq!(
+            normalize_key("model.layers.0.mlp.gate_proj.weight", &prefixes),
+            "layers.0.mlp.gate_proj.weight",
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_key_when_no_prefix_matches() {
+        let prefixes = ["model.", "transformer."];
+        assert_eq!(
+            normalize_key("layers.0.mlp.gate_proj.weight", &prefixes),
+            "layers.0.mlp.gate_proj.weight",
+        );
+    }
+
+    #[test]
+    fn normalize_uses_first_match_only() {
+        // First matching prefix wins; the second isn't applied to the
+        // residue. Pinning this matters because the safetensors loader
+        // walks tensors with a fixed prefix list — re-stripping would
+        // mangle keys like "model.model.embed_tokens.weight".
+        let prefixes = ["model.", "model.model."];
+        assert_eq!(
+            normalize_key("model.model.embed_tokens.weight", &prefixes),
+            "model.embed_tokens.weight",
+        );
+    }
+
+    #[test]
+    fn normalize_with_empty_prefix_list_is_identity() {
+        assert_eq!(normalize_key("anything", &[]), "anything");
+    }
+
+    #[test]
+    fn normalize_handles_empty_input() {
+        let prefixes = ["model."];
+        assert_eq!(normalize_key("", &prefixes), "");
+    }
+}

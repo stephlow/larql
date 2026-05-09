@@ -134,15 +134,15 @@ mod runner {
     fn parse_args() -> Args {
         let mut args = Args {
             vindex: PathBuf::from("output/gemma3-4b-q4k-v2.vindex"),
-            design: PathBuf::from("experiments/37_bit_budget_additivity/results/design_matrix.csv"),
+            design: PathBuf::from("~/chris-source/chris-experiments/shannon/37_bit_budget_additivity/results/design_matrix.csv"),
             out_json: PathBuf::from(
-                "experiments/37_bit_budget_additivity/results/q4k_scored_cells.json",
+                "~/chris-source/chris-experiments/shannon/37_bit_budget_additivity/results/q4k_scored_cells.json",
             ),
             scored_csv: PathBuf::from(
-                "experiments/37_bit_budget_additivity/results/q4k_scored_cells.csv",
+                "~/chris-source/chris-experiments/shannon/37_bit_budget_additivity/results/q4k_scored_cells.csv",
             ),
             interactions_csv: PathBuf::from(
-                "experiments/37_bit_budget_additivity/results/q4k_interactions.csv",
+                "~/chris-source/chris-experiments/shannon/37_bit_budget_additivity/results/q4k_interactions.csv",
             ),
             top_k: 2048,
             feature_top_k: 2048,

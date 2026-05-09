@@ -1,7 +1,7 @@
 //! Debug: per-stage buffer reads in the decode pipeline.
 //! Runs inside larql-compute where we have direct Metal access.
 //!
-//! cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
+//! cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {

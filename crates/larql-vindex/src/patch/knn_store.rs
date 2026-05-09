@@ -5,7 +5,7 @@
 //! whether to override the model's prediction. No FFN slot allocation, no
 //! orthogonality constraint, no Hopfield bound — unlimited scale.
 //!
-//! Port of Python `RetrievalVindex` from experiments/15_v11_model/vindex_build_wordnet_b.py.
+//! Port of Python `RetrievalVindex` from ~/chris-source/chris-experiments/compilation/15_v11_model/vindex_build_wordnet_b.py.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;

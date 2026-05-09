@@ -168,22 +168,26 @@ larql-vindex-ci: larql-vindex-fmt-check larql-vindex-lint larql-vindex-test larq
 
 # larql-compute — CPU/Metal kernels and backend contracts
 #
-# Current local default-feature baseline: 67.72% line coverage from
+# Current local default-feature baseline: 93.59% line coverage from
 # cargo-llvm-cov. Keep this as a ratchet and raise it as per-file debt
 # baselines move toward the 90% default policy.
-LARQL_COMPUTE_COVERAGE_MIN ?= 67
+LARQL_COMPUTE_COVERAGE_MIN ?= 93
 LARQL_COMPUTE_COVERAGE_POLICY ?= crates/larql-compute/coverage-policy.json
 LARQL_COMPUTE_COVERAGE_REPORT ?= coverage/larql-compute/summary.json
 
 larql-compute-test: larql-compute-test-fast
 
+# Default fast path. Plain `cargo test -p larql-compute` matches this
+# now that the slow non-Metal suites are gated behind the `heavy_tests`
+# feature; this target is the canonical invocation.
 larql-compute-test-fast:
-	cargo test -p larql-compute --lib
-	cargo test -p larql-compute --test test_backend_matmul_quant
-	cargo test -p larql-compute --test test_pipeline_and_moe
+	cargo test -p larql-compute
 
+# Full integration suite — turns on `heavy_tests` for the slow non-Metal
+# correctness/parity suites. Adds ~85 s of compile time on top of fast.
+# Add `--features metal` to also build the Metal kernel tests on macOS.
 larql-compute-test-integration:
-	cargo test -p larql-compute --tests
+	cargo test -p larql-compute --features heavy_tests --tests
 
 larql-compute-fmt-check:
 	cargo fmt -p larql-compute -- --check

@@ -601,6 +601,59 @@ mod tests {
         assert_eq!(arch.activation(), crate::config::Activation::GeluTanh);
         assert_eq!(arch.ffn_type(), crate::config::FfnType::Standard);
         assert!(!arch.is_moe());
+
+        // Fused QKV + every-projection biases are GPT-2-specific; trait
+        // defaults return None elsewhere.
+        assert_eq!(
+            arch.fused_qkv_key(3),
+            Some("layers.3.self_attn.qkv_proj.weight".to_string())
+        );
+        assert_eq!(
+            arch.fused_qkv_bias_key(3),
+            Some("layers.3.self_attn.qkv_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_q_bias_key(3),
+            Some("layers.3.self_attn.q_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_k_bias_key(3),
+            Some("layers.3.self_attn.k_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_v_bias_key(3),
+            Some("layers.3.self_attn.v_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_o_bias_key(3),
+            Some("layers.3.self_attn.o_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.ffn_up_bias_key(3),
+            Some("layers.3.mlp.up_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.ffn_down_bias_key(3),
+            Some("layers.3.mlp.down_proj.bias".to_string())
+        );
+
+        // Learned positional embeddings — wpe lookup key.
+        assert_eq!(arch.position_embed_key(), Some("wpe.weight"));
+    }
+
+    #[test]
+    fn test_non_gpt2_archs_have_no_fused_qkv_or_position_embed() {
+        // Defaults must remain None for everyone else, otherwise the loader
+        // would try to split projections that are already separate.
+        let llama = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32
+        });
+        let arch = detect_from_json(&llama);
+        assert!(arch.fused_qkv_key(0).is_none());
+        assert!(arch.fused_qkv_bias_key(0).is_none());
+        assert!(arch.position_embed_key().is_none());
     }
 
     #[test]

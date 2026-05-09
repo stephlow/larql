@@ -41,10 +41,16 @@ pub const ENV_FUSED_KV_APPEND_ATTEND: &str = "LARQL_FUSED_KV_APPEND_ATTEND";
 pub const ENV_FUSED_POST_ATTN_NORM: &str = "LARQL_FUSED_POST_ATTN_NORM";
 /// Disable fused post-FFN norm when set to a false value.
 pub const ENV_FUSED_POST_FFN_NORM: &str = "LARQL_FUSED_POST_FFN_NORM";
-/// Opt in to the NR2 gate+up kernel variant.
-pub const ENV_GATE_UP_NR2: &str = "LARQL_GATE_UP_NR2";
 /// Opt in to the cooperative gate+up kernel variant.
 pub const ENV_GATE_UP_COOP: &str = "LARQL_GATE_UP_COOP";
+/// Opt back in to the fused `q4k_q6k_qkv_proj_normed` shader (RMS norm
+/// rolled into the matmul). The defused path (separate `rms_norm` +
+/// non-fused `q4k_q6k_qkv_proj`) is the default since 2026-05-09 because
+/// end-to-end A/B on Gemma 3 4B showed +1.6 tok/s (−0.30 ms/tok GPU fwd):
+/// the fused kernel rereads H + norm_w 3× per TG (dropping it from 287
+/// to 199 GB/s) and that bandwidth waste exceeds the 0.24 ms/tok dispatch
+/// saving the fusion gave. Set this to compare against the old default.
+pub const ENV_QKV_FUSED: &str = "LARQL_QKV_FUSED";
 /// Select the 8-simdgroup gate+up kernel; set to a false value to opt out.
 pub const ENV_GATE_UP_8SG: &str = "LARQL_GATE_UP_8SG";
 /// Opt in to f16 accumulation for the legacy gate+up kernel.
@@ -246,6 +252,35 @@ mod tests {
             ],
             || {
                 assert!(split_profile_requested());
+            },
+        );
+    }
+
+    #[test]
+    fn env_flag_any_and_debug_helpers_cover_absent_and_present_cases() {
+        with_env_vars(
+            &[
+                (ENV_SKIP_OUTER_NORM, None),
+                (ENV_MOE_DEBUG, None),
+                (ENV_MOE_DEBUG_LEGACY, None),
+            ],
+            || {
+                assert!(!env_flag(ENV_SKIP_OUTER_NORM));
+                assert!(!env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG]));
+                assert!(!moe_debug_enabled());
+            },
+        );
+
+        with_env_vars(
+            &[
+                (ENV_SKIP_OUTER_NORM, Some("1")),
+                (ENV_MOE_DEBUG, Some("1")),
+                (ENV_MOE_DEBUG_LEGACY, None),
+            ],
+            || {
+                assert!(env_flag(ENV_SKIP_OUTER_NORM));
+                assert!(env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG_LEGACY]));
+                assert!(moe_debug_enabled());
             },
         );
     }

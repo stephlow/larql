@@ -20,7 +20,7 @@ pub const RMSNORM_EPSILON_DEFAULT: f32 = 1e-6;
 
 /// Quantization format for a weight tensor.
 /// Names match GGUF conventions (Q4_K, Q6_K, etc.).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum QuantFormat {
     Q4_0,  // 18 bytes per 32 values (one f16 scale)
@@ -157,6 +157,140 @@ pub enum PositionEncodingType {
 ///
 /// Gemma 4 26B A4B runs a dense MLP and an expert block in parallel per layer,
 /// summing their outputs. This struct carries the expert-block tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeInputSource {
+    /// Use the residual stream exactly as passed into the MoE block.
+    Residual,
+    /// Use `rms_norm(residual, pre_experts_norm)` as the stage input.
+    PreExpertsNorm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeRouterNormPolicy {
+    /// Do not apply a router-specific norm.
+    None,
+    /// Apply `router_norm` when present; otherwise leave the router input unchanged.
+    Learned,
+    /// Apply parameter-free RMSNorm regardless of learned router weights.
+    ParameterFree,
+    /// Prefer learned `router_norm`; otherwise use parameter-free RMSNorm when enabled.
+    LearnedOrParameterFree,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeTopKWeightPolicy {
+    /// Keep selected weights as the original softmax probabilities.
+    RawSoftmax,
+    /// Renormalize selected top-k weights so they sum to 1 before scaling.
+    RenormalizedSoftmax,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeExpertScalePolicy {
+    /// Ignore `router_per_expert_scale`.
+    None,
+    /// Multiply selected weights by `router_per_expert_scale[expert_id]` when present.
+    PerExpert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoePostExpertNormPolicy {
+    /// Return the weighted expert sum directly.
+    None,
+    /// Apply `post_experts_norm` via RMSNorm when the tensor is present.
+    RmsNorm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeDownPaddingPolicy {
+    /// Expert down matrices use `intermediate_size` columns.
+    None,
+    /// Expert down matrices are padded to the quant format's block width.
+    QuantBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeWeightLayout {
+    pub down_padding: MoeDownPaddingPolicy,
+}
+
+impl MoeWeightLayout {
+    pub const fn unpadded() -> Self {
+        Self {
+            down_padding: MoeDownPaddingPolicy::None,
+        }
+    }
+
+    pub const fn quant_block_padded_down() -> Self {
+        Self {
+            down_padding: MoeDownPaddingPolicy::QuantBlock,
+        }
+    }
+
+    pub fn down_cols(self, intermediate_size: usize, format: QuantFormat) -> usize {
+        match self.down_padding {
+            MoeDownPaddingPolicy::None => intermediate_size,
+            MoeDownPaddingPolicy::QuantBlock => format
+                .packed_block_layout()
+                .map(|(block_elems, _)| intermediate_size.div_ceil(block_elems) * block_elems)
+                .unwrap_or(intermediate_size),
+        }
+    }
+}
+
+impl Default for MoeWeightLayout {
+    fn default() -> Self {
+        Self::quant_block_padded_down()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRoutingPolicy {
+    pub expert_input: MoeInputSource,
+    pub router_input: MoeInputSource,
+    pub router_norm: MoeRouterNormPolicy,
+    pub selected_weight: MoeTopKWeightPolicy,
+    pub expert_scale: MoeExpertScalePolicy,
+    pub post_expert_norm: MoePostExpertNormPolicy,
+}
+
+impl MoeRoutingPolicy {
+    /// Gemma 4 A4B hybrid-MoE behavior validated by local CPU/Metal parity:
+    /// route and run experts from the pre-experts-normalized residual, apply
+    /// router RMSNorm/scale, renormalize selected top-k probabilities, apply
+    /// learned per-expert scales, then post-normalize the expert branch.
+    pub const fn gemma4_hybrid() -> Self {
+        Self {
+            expert_input: MoeInputSource::PreExpertsNorm,
+            router_input: MoeInputSource::PreExpertsNorm,
+            router_norm: MoeRouterNormPolicy::LearnedOrParameterFree,
+            selected_weight: MoeTopKWeightPolicy::RenormalizedSoftmax,
+            expert_scale: MoeExpertScalePolicy::PerExpert,
+            post_expert_norm: MoePostExpertNormPolicy::RmsNorm,
+        }
+    }
+
+    /// Conventional sparse-MoE router behavior: route on the provided input,
+    /// keep top-k probabilities as softmax weights, and do not apply Gemma 4
+    /// branch-specific scales or post norms.
+    pub const fn top_k_softmax() -> Self {
+        Self {
+            expert_input: MoeInputSource::Residual,
+            router_input: MoeInputSource::Residual,
+            router_norm: MoeRouterNormPolicy::None,
+            selected_weight: MoeTopKWeightPolicy::RawSoftmax,
+            expert_scale: MoeExpertScalePolicy::None,
+            post_expert_norm: MoePostExpertNormPolicy::None,
+        }
+    }
+}
+
+impl Default for MoeRoutingPolicy {
+    fn default() -> Self {
+        Self::gemma4_hybrid()
+    }
+}
+
 pub struct MoeLayerWeights<'a> {
     /// Per-expert gate+up weight bytes (`experts_gate_up[e]` is expert `e`'s
     /// gate+up slice). Bytes are interpreted under `expert_data_format`.
@@ -165,6 +299,10 @@ pub struct MoeLayerWeights<'a> {
     pub experts_gate_up: Vec<&'a [u8]>,
     /// Per-expert down weight bytes (`experts_down[e]` is expert `e`'s down).
     pub experts_down: Vec<&'a [u8]>,
+    /// Explicit routing behavior for this layer/model family.
+    pub routing_policy: MoeRoutingPolicy,
+    /// Explicit byte layout for expert tensors.
+    pub weight_layout: MoeWeightLayout,
     /// Format of the per-expert byte slices. `Q4_K` = per-layer Q4_K files;
     /// `BF16` = legacy monolith. Both flow through the same per-expert tables.
     pub expert_data_format: QuantFormat,
@@ -199,6 +337,13 @@ pub struct MoeLayerWeights<'a> {
     pub intermediate_size: usize,
     /// Activation function for expert MLPs. Gemma 4 uses GeluTanh; Mixtral/others use Silu.
     pub activation: Activation,
+}
+
+impl MoeLayerWeights<'_> {
+    pub fn inter_padded(&self) -> usize {
+        self.weight_layout
+            .down_cols(self.intermediate_size, self.expert_data_format)
+    }
 }
 
 /// Attention projection weights for one layer.
@@ -608,6 +753,8 @@ mod tests {
         let moe = MoeLayerWeights {
             experts_gate_up: Vec::new(),
             experts_down: Vec::new(),
+            routing_policy: MoeRoutingPolicy::default(),
+            weight_layout: MoeWeightLayout::default(),
             router_proj: &[],
             router_scale: &[],
             router_per_expert_scale: &[],
