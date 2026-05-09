@@ -8,6 +8,39 @@ use std::collections::HashMap;
 pub(super) const BINARY_CT: &str = "application/x-larql-ffn";
 pub(super) const BATCH_MARKER: u32 = 0xFFFF_FFFF;
 
+fn checked_mul(a: usize, b: usize, what: &str) -> Result<usize, String> {
+    a.checked_mul(b)
+        .ok_or_else(|| format!("{what}: byte length overflow"))
+}
+
+fn checked_end(offset: usize, len: usize, total: usize, what: &str) -> Result<usize, String> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| format!("{what}: byte range overflow"))?;
+    if end > total {
+        return Err(format!(
+            "{what}: truncated: need {len}, have {}",
+            total.saturating_sub(offset)
+        ));
+    }
+    Ok(end)
+}
+
+fn read_u32(body: &[u8], offset: usize, what: &str) -> Result<u32, String> {
+    let end = checked_end(offset, 4, body.len(), what)?;
+    Ok(u32::from_le_bytes(body[offset..end].try_into().unwrap()))
+}
+
+fn validate_batch_result_count(body: &[u8], num_results: usize, what: &str) -> Result<(), String> {
+    let max_results_with_headers = body.len().saturating_sub(12) / 12;
+    if num_results > max_results_with_headers {
+        return Err(format!(
+            "{what}: declared {num_results} results but only {max_results_with_headers} headers fit"
+        ));
+    }
+    Ok(())
+}
+
 // ── Wire types (JSON fallback) ────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -105,6 +138,9 @@ pub fn decode_binary_single(body: &[u8]) -> Result<(usize, Vec<f32>), String> {
     let layer = marker as usize;
     // bytes 4-7: seq_len (ignored here — caller validates against expected shape)
     // bytes 8-11: latency f32
+    if (body.len() - 12) % 4 != 0 {
+        return Err("binary response: output byte length is not a multiple of f32".into());
+    }
     let floats: Vec<f32> = body[12..]
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -132,31 +168,24 @@ pub fn decode_binary_batch(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, Stri
     }
 
     let num_results = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    validate_batch_result_count(body, num_results, "binary batch")?;
     // bytes 8-11: latency f32 (skip)
     let mut offset = 12usize;
     let mut out = HashMap::with_capacity(num_results);
 
     for _ in 0..num_results {
-        if body.len() < offset + 12 {
-            return Err("binary batch: truncated result header".into());
-        }
-        let layer = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+        checked_end(offset, 12, body.len(), "binary batch result header")?;
+        let layer = read_u32(body, offset, "binary batch layer")? as usize;
         // offset+4: seq_len (skip)
-        let num_floats =
-            u32::from_le_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        let num_floats = read_u32(body, offset + 8, "binary batch output length")? as usize;
         offset += 12;
-        let bytes_needed = num_floats * 4;
-        if body.len() < offset + bytes_needed {
-            return Err(format!(
-                "binary batch: truncated output for layer {layer}: need {bytes_needed}, have {}",
-                body.len() - offset
-            ));
-        }
-        let floats: Vec<f32> = body[offset..offset + bytes_needed]
+        let bytes_needed = checked_mul(num_floats, 4, "binary batch output")?;
+        let end = checked_end(offset, bytes_needed, body.len(), "binary batch output")?;
+        let floats: Vec<f32> = body[offset..end]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        offset += bytes_needed;
+        offset = end;
         out.insert(layer, floats);
     }
     Ok(out)
@@ -179,6 +208,9 @@ pub fn decode_binary_single_f16(body: &[u8]) -> Result<(usize, Vec<f32>), String
         return Err("expected single-layer f16 response but got batch marker".into());
     }
     let layer = marker as usize;
+    if (body.len() - 12) % 2 != 0 {
+        return Err("f16 binary response: output byte length is not a multiple of f16".into());
+    }
     let floats: Vec<f32> = body[12..]
         .chunks_exact(2)
         .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
@@ -203,28 +235,21 @@ pub fn decode_binary_batch_f16(body: &[u8]) -> Result<HashMap<usize, Vec<f32>>, 
         return Ok(m);
     }
     let num_results = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    validate_batch_result_count(body, num_results, "f16 batch")?;
     let mut offset = 12usize;
     let mut out = HashMap::with_capacity(num_results);
     for _ in 0..num_results {
-        if body.len() < offset + 12 {
-            return Err("f16 batch: truncated result header".into());
-        }
-        let layer = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
-        let num_floats =
-            u32::from_le_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        checked_end(offset, 12, body.len(), "f16 batch result header")?;
+        let layer = read_u32(body, offset, "f16 batch layer")? as usize;
+        let num_floats = read_u32(body, offset + 8, "f16 batch output length")? as usize;
         offset += 12;
-        let bytes_needed = num_floats * 2;
-        if body.len() < offset + bytes_needed {
-            return Err(format!(
-                "f16 batch: truncated output for layer {layer}: need {bytes_needed}, have {}",
-                body.len() - offset
-            ));
-        }
-        let floats: Vec<f32> = body[offset..offset + bytes_needed]
+        let bytes_needed = checked_mul(num_floats, 2, "f16 batch output")?;
+        let end = checked_end(offset, bytes_needed, body.len(), "f16 batch output")?;
+        let floats: Vec<f32> = body[offset..end]
             .chunks_exact(2)
             .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
             .collect();
-        offset += bytes_needed;
+        offset = end;
         out.insert(layer, floats);
     }
     Ok(out)
@@ -240,19 +265,17 @@ fn decode_i8_position(
     offset: usize,
     hidden: usize,
 ) -> Result<(Vec<f32>, usize), String> {
-    let needed = 8 + hidden;
-    if body.len() < offset + needed {
-        return Err(format!(
-            "i8: truncated position at offset {offset}: need {needed}"
-        ));
-    }
+    let needed = 8usize
+        .checked_add(hidden)
+        .ok_or_else(|| "i8: position byte length overflow".to_string())?;
+    let end = checked_end(offset, needed, body.len(), "i8 position")?;
     let scale = f32::from_le_bytes(body[offset..offset + 4].try_into().unwrap());
     // zero_point at offset+4 is always 0.0 (symmetric), skip it
     let floats: Vec<f32> = body[offset + 8..offset + 8 + hidden]
         .iter()
         .map(|&b| (b as i8) as f32 * scale)
         .collect();
-    Ok((floats, offset + needed))
+    Ok((floats, end))
 }
 
 /// Decode a binary single-layer i8 response into f32 output.
@@ -274,7 +297,8 @@ pub(crate) fn decode_binary_single_i8(
     let seq_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
     let seq_len = seq_len.max(1);
     let mut offset = 12usize;
-    let mut all_floats = Vec::with_capacity(seq_len * hidden_size);
+    let total_floats = checked_mul(seq_len, hidden_size, "i8 single output")?;
+    let mut all_floats = Vec::with_capacity(total_floats);
     for _ in 0..seq_len {
         let (pos_floats, next_offset) = decode_i8_position(body, offset, hidden_size)?;
         all_floats.extend(pos_floats);
@@ -299,22 +323,25 @@ pub(crate) fn decode_binary_batch_i8(
         return Ok(m);
     }
     let num_results = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    validate_batch_result_count(body, num_results, "i8 batch")?;
     let mut offset = 12usize;
     let mut out = HashMap::with_capacity(num_results);
     for _ in 0..num_results {
-        if body.len() < offset + 12 {
-            return Err("i8 batch: truncated result header".into());
-        }
-        let layer = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
-        let seq_len = u32::from_le_bytes(body[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        checked_end(offset, 12, body.len(), "i8 batch result header")?;
+        let layer = read_u32(body, offset, "i8 batch layer")? as usize;
+        let seq_len = read_u32(body, offset + 4, "i8 batch sequence length")? as usize;
         let seq_len = seq_len.max(1);
-        let num_floats =
-            u32::from_le_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
-        let hidden = num_floats / seq_len;
+        let num_floats = read_u32(body, offset + 8, "i8 batch output length")? as usize;
+        let expected_floats = checked_mul(seq_len, hidden_size, "i8 batch output")?;
+        if num_floats != expected_floats {
+            return Err(format!(
+                "i8 batch: layer {layer} declared {num_floats} floats, expected {expected_floats}"
+            ));
+        }
         offset += 12;
         let mut all_floats = Vec::with_capacity(num_floats);
         for _ in 0..seq_len {
-            let (pos_floats, next_offset) = decode_i8_position(body, offset, hidden)?;
+            let (pos_floats, next_offset) = decode_i8_position(body, offset, hidden_size)?;
             all_floats.extend(pos_floats);
             offset = next_offset;
         }

@@ -47,6 +47,11 @@ enum Commands {
     /// Download a vindex from HuggingFace and cache it locally.
     Pull(pull_cmd::PullArgs),
 
+    /// Manage HuggingFace *model* repos (safetensors + tokenizer + config).
+    /// Companion to `pull` (which is vindex-only). Use `model pull` to
+    /// stage a raw HF model for `convert safetensors-to-vindex`.
+    Model(model_cmd::ModelArgs),
+
     /// Register a local vindex directory with the cache so `run` / `list`
     /// / `show` can find it by shorthand.
     Link(link_cmd::LinkArgs),
@@ -487,6 +492,7 @@ fn main() {
         Commands::Chat(args) => run_cmd::run(args.into()),
         Commands::Bench(args) => bench_cmd::run(args),
         Commands::Pull(args) => pull_cmd::run(args),
+        Commands::Model(args) => model_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
         Commands::List(args) => list_cmd::run(args),
         Commands::Show(args) => show_cmd::run(args),

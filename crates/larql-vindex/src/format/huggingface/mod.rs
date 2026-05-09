@@ -54,7 +54,8 @@ pub use discovery::{
     repo_exists, CollectionItem,
 };
 pub use download::{
-    download_hf_weights, resolve_hf_vindex, resolve_hf_vindex_with_progress, DownloadProgress,
+    download_hf_weights, resolve_hf_model_with_progress, resolve_hf_vindex,
+    resolve_hf_vindex_with_progress, DownloadProgress,
 };
 pub use publish::{
     publish_vindex, publish_vindex_with_opts, PublishCallbacks, PublishOptions,

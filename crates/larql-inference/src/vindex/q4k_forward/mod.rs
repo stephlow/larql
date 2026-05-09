@@ -17,6 +17,7 @@ mod remote_ffn;
 mod tensors;
 mod walk_ffn;
 
+pub(crate) use generation::generate_q4k_cpu_constrained_streaming_sampled_with_eos;
 pub use generation::{
     generate_q4k_cpu, generate_q4k_cpu_constrained, generate_q4k_cpu_constrained_streaming,
     generate_q4k_cpu_constrained_streaming_sampled, generate_q4k_cpu_remote, is_end_of_turn,

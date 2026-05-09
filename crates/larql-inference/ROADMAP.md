@@ -41,11 +41,11 @@ Work items:
 
 | # | Item | Status |
 |---|------|--------|
-| H1 | Restore `cargo test -p larql-inference` after the `GateIndex` trait split by updating walk-FFN test mocks to implement `GateLookup` / `PatchOverrides` / FFN storage traits | in progress |
-| H2 | Make generation honor `max_tokens == 0` across GPU, CPU fallback, constrained, and streaming paths | in progress |
-| H3 | Check EOS on the first generated token in unconstrained GPU generation, including special-token raw decode via `EosConfig::is_eos_with_tokenizer` | in progress |
-| H4 | Stop discarding `EosConfig` in constrained generation; use caller-supplied EOS IDs and stop strings instead of only `vindex::is_end_of_turn` | in progress |
-| H5 | Convert `optimise_target_delta` invalid inputs (`target_id >= vocab`, empty prompt, unsupported shapes) from panics into early `Err` results | planned |
+| H1 | Restore `cargo test -p larql-inference` after the `GateIndex` trait split by updating walk-FFN test mocks to implement `GateLookup` / `PatchOverrides` / FFN storage traits | shipped 2026-05-09 |
+| H2 | Make generation honor `max_tokens == 0` across GPU, CPU fallback, constrained, and streaming paths | shipped 2026-05-09 |
+| H3 | Check EOS on the first generated token in unconstrained GPU generation, including special-token raw decode via `EosConfig::is_eos_with_tokenizer` | shipped 2026-05-09 |
+| H4 | Stop discarding `EosConfig` in constrained generation and CPU fallbacks; use caller-supplied EOS IDs and stop strings instead of only `vindex::is_end_of_turn` | shipped 2026-05-09 |
+| H5 | Convert `optimise_target_delta` invalid inputs (`target_id >= vocab`, empty prompt, unsupported shapes) from panics into early `Err` results | shipped 2026-05-09 |
 | H6 | Harden remote FFN/Q8K wire decoders against untrusted length fields with checked arithmetic and bounded allocation | planned |
 | H7 | Replace ad hoc `Result<_, String>` / silent empty `GenerateResult` failures in generation paths with typed errors where public callers need to distinguish unsupported backend vs. empty output | planned |
 | H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | planned |

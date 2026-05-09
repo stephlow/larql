@@ -12,6 +12,7 @@ mod walk_ffn;
 
 pub use l1_cache::FfnL1Cache;
 pub use loader::open_inference_vindex;
+pub(crate) use q4k_forward::generate_q4k_cpu_constrained_streaming_sampled_with_eos;
 pub use q4k_forward::{
     generate_q4k_cpu, generate_q4k_cpu_constrained, generate_q4k_cpu_constrained_streaming,
     generate_q4k_cpu_constrained_streaming_sampled, generate_q4k_cpu_remote,

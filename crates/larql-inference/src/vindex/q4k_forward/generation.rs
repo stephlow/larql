@@ -176,6 +176,39 @@ where
     M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
+    generate_q4k_cpu_constrained_streaming_sampled_with_eos(
+        weights,
+        tokenizer,
+        prompt_ids,
+        max_tokens,
+        index,
+        mask_fn,
+        on_token,
+        sampling,
+        &crate::layer_graph::EosConfig::builtin(),
+    )
+}
+
+/// Sampling-aware streaming-constrained CPU Q4_K decode with explicit EOS
+/// policy. Kept crate-visible so public legacy helpers continue to use the
+/// built-in stop set while higher-level generation APIs can honor
+/// caller-supplied EOS IDs and stop strings.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_q4k_cpu_constrained_streaming_sampled_with_eos<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    mut mask_fn: M,
+    mut on_token: F,
+    sampling: crate::layer_graph::SamplingConfig,
+    eos: &crate::layer_graph::EosConfig,
+) -> Vec<(String, u32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str, f64),
+{
     let mut ids = prompt_ids.to_vec();
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
@@ -202,7 +235,7 @@ where
         }
         let tok = tokenizer.decode(&[id], true).unwrap_or_default();
 
-        let stop = is_end_of_turn(&tok);
+        let stop = eos.is_eos_with_tokenizer(id, &tok, tokenizer);
         on_token(id, &tok, 1.0);
         out.push((tok, id));
         ids.push(id);

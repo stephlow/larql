@@ -1,7 +1,10 @@
 //! CPU Q4K generate path — used when the active backend does not support the
 //! fused Q4 prefill + KV-cached decode pipeline (today: CpuBackend).
 
-use super::types::{GenerateResult, StageTimings};
+use super::{
+    eos::EosConfig,
+    types::{GenerateResult, StageTimings},
+};
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
@@ -35,6 +38,7 @@ pub(super) fn generate_via_cpu_q4k(
     token_ids: &[u32],
     max_tokens: usize,
     index: &larql_vindex::VectorIndex,
+    eos: &EosConfig,
 ) -> GenerateResult {
     if max_tokens == 0 {
         return GenerateResult {
@@ -58,7 +62,7 @@ pub(super) fn generate_via_cpu_q4k(
     // Seed with the first predicted token from the prefill pass.
     if let (Some(&id), Some(first_pred)) = (first.token_ids.first(), first.predictions.first()) {
         tokens.push((first_pred.0.clone(), 1.0));
-        let stop = crate::vindex::is_end_of_turn(first_pred.0.trim());
+        let stop = eos.is_eos_with_tokenizer(id, &first_pred.0, tokenizer);
         ids.push(id);
         if stop {
             return GenerateResult {
@@ -91,7 +95,7 @@ pub(super) fn generate_via_cpu_q4k(
                     .first()
                     .map(|p| p.0.clone())
                     .unwrap_or_default();
-                let stop = crate::vindex::is_end_of_turn(tok.trim());
+                let stop = eos.is_eos_with_tokenizer(id, &tok, tokenizer);
                 tokens.push((tok, 1.0));
                 ids.push(id);
                 if stop {
@@ -139,6 +143,7 @@ where
         max_tokens,
         index,
         mask_fn,
+        &EosConfig::builtin(),
         |_, _, _| {},
     )
 }
@@ -153,6 +158,7 @@ pub(super) fn generate_constrained_via_cpu_q4k_streaming<M, F>(
     max_tokens: usize,
     index: &larql_vindex::VectorIndex,
     mask_fn: M,
+    eos: &EosConfig,
     on_token: F,
 ) -> GenerateResult
 where
@@ -168,6 +174,7 @@ where
         mask_fn,
         on_token,
         super::sampling::SamplingConfig::greedy(),
+        eos,
     )
 }
 
@@ -184,6 +191,7 @@ pub(super) fn generate_constrained_via_cpu_q4k_streaming_sampled<M, F>(
     mask_fn: M,
     on_token: F,
     sampling: super::sampling::SamplingConfig,
+    eos: &EosConfig,
 ) -> GenerateResult
 where
     M: FnMut(&[u32], &mut Vec<f32>),
@@ -199,8 +207,8 @@ where
     }
 
     let prefill_start = std::time::Instant::now();
-    let out = crate::vindex::generate_q4k_cpu_constrained_streaming_sampled(
-        weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling,
+    let out = crate::vindex::generate_q4k_cpu_constrained_streaming_sampled_with_eos(
+        weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling, eos,
     );
     let total_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     // Heuristic split: attribute the first token to prefill, the rest to

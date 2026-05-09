@@ -29,6 +29,14 @@ pub const LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-layer";
 /// dequantise to f32 before compute.
 pub const LAYER_BATCH_F16_CONTENT_TYPE: &str = "application/x-larql-experts-layer-f16";
 
+fn checked_mul(a: usize, b: usize) -> Option<usize> {
+    a.checked_mul(b)
+}
+
+fn checked_add(a: usize, b: usize) -> Option<usize> {
+    a.checked_add(b)
+}
+
 // ── Layer-batch wire format ───────────────────────────────────────────────────
 //
 // Content-Type: application/x-larql-experts-layer
@@ -78,16 +86,18 @@ pub fn decode_layer_batch_request(bytes: &[u8]) -> Option<(usize, Vec<f32>, Vec<
     let layer = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
     let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
     let k = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
-    let want = 12 + hidden * 4 + k * 8;
+    let residual_bytes = checked_mul(hidden, 4)?;
+    let expert_bytes = checked_mul(k, 8)?;
+    let want = checked_add(checked_add(12, residual_bytes)?, expert_bytes)?;
     if bytes.len() < want {
         return None;
     }
     let mut pos = 12usize;
-    let residual: Vec<f32> = bytes[pos..pos + hidden * 4]
+    let residual: Vec<f32> = bytes[pos..pos + residual_bytes]
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
-    pos += hidden * 4;
+    pos += residual_bytes;
     let mut expert_ids = Vec::with_capacity(k);
     let mut expert_weights = Vec::with_capacity(k);
     for _ in 0..k {
@@ -119,11 +129,13 @@ pub fn decode_layer_batch_response(bytes: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     let hidden = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-    if bytes.len() < 8 + hidden * 4 {
+    let payload_bytes = checked_mul(hidden, 4)?;
+    let want = checked_add(8, payload_bytes)?;
+    if bytes.len() < want {
         return None;
     }
     Some(
-        bytes[8..8 + hidden * 4]
+        bytes[8..want]
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect(),
@@ -247,16 +259,18 @@ pub fn decode_layer_batch_request_f16(
     let layer = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
     let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
     let k = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
-    let want = 12 + hidden * 2 + k * 8;
+    let residual_bytes = checked_mul(hidden, 2)?;
+    let expert_bytes = checked_mul(k, 8)?;
+    let want = checked_add(checked_add(12, residual_bytes)?, expert_bytes)?;
     if bytes.len() < want {
         return None;
     }
     let mut pos = 12usize;
-    let residual: Vec<f32> = bytes[pos..pos + hidden * 2]
+    let residual: Vec<f32> = bytes[pos..pos + residual_bytes]
         .chunks_exact(2)
         .map(|b| f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
         .collect();
-    pos += hidden * 2;
+    pos += residual_bytes;
     let mut expert_ids = Vec::with_capacity(k);
     let mut expert_weights = Vec::with_capacity(k);
     for _ in 0..k {
@@ -288,11 +302,13 @@ pub fn decode_layer_batch_response_f16(bytes: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     let hidden = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-    if bytes.len() < 8 + hidden * 2 {
+    let payload_bytes = checked_mul(hidden, 2)?;
+    let want = checked_add(8, payload_bytes)?;
+    if bytes.len() < want {
         return None;
     }
     Some(
-        bytes[8..8 + hidden * 2]
+        bytes[8..want]
             .chunks_exact(2)
             .map(|b| f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
             .collect(),
@@ -325,8 +341,10 @@ pub fn decode_expert_response(bytes: &[u8]) -> Option<Vec<ExpertResultItem>> {
     let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
     // bytes[8..12] = latency_ms f32 (informational, skip)
     let mut pos = 12usize;
-    let item_bytes = 8 + hidden * 4;
-    if bytes.len() < 12 + n * item_bytes {
+    let payload_bytes = checked_mul(hidden, 4)?;
+    let item_bytes = checked_add(8, payload_bytes)?;
+    let want = checked_add(12, checked_mul(n, item_bytes)?)?;
+    if bytes.len() < want {
         return None;
     }
     let mut results = Vec::with_capacity(n);
@@ -334,11 +352,11 @@ pub fn decode_expert_response(bytes: &[u8]) -> Option<Vec<ExpertResultItem>> {
         let layer = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
         let expert_id = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
         pos += 8;
-        let output: Vec<f32> = bytes[pos..pos + hidden * 4]
+        let output: Vec<f32> = bytes[pos..pos + payload_bytes]
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        pos += hidden * 4;
+        pos += payload_bytes;
         results.push(ExpertResultItem {
             layer,
             expert_id,
@@ -356,8 +374,10 @@ pub fn decode_expert_request(bytes: &[u8]) -> Option<Vec<ExpertCallItem>> {
     let n = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
     let hidden = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
     let mut pos = 8usize;
-    let item_bytes = 8 + hidden * 4;
-    if bytes.len() < 8 + n * item_bytes {
+    let payload_bytes = checked_mul(hidden, 4)?;
+    let item_bytes = checked_add(8, payload_bytes)?;
+    let want = checked_add(8, checked_mul(n, item_bytes)?)?;
+    if bytes.len() < want {
         return None;
     }
     let mut items = Vec::with_capacity(n);
@@ -365,11 +385,11 @@ pub fn decode_expert_request(bytes: &[u8]) -> Option<Vec<ExpertCallItem>> {
         let layer = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
         let expert_id = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
         pos += 8;
-        let residual: Vec<f32> = bytes[pos..pos + hidden * 4]
+        let residual: Vec<f32> = bytes[pos..pos + payload_bytes]
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        pos += hidden * 4;
+        pos += payload_bytes;
         items.push(ExpertCallItem {
             layer,
             expert_id,

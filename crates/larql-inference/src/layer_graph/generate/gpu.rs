@@ -370,7 +370,7 @@ where
     // weights produce coherent reasoning text.
     let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
     if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
-        return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index);
+        return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index, eos);
     }
 
     let norm_offset = weights.arch.norm_weight_offset();
@@ -1054,7 +1054,7 @@ where
     let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
     if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
         return generate_constrained_via_cpu_q4k_streaming_sampled(
-            weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling,
+            weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling, eos,
         );
     }
 

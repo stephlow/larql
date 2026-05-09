@@ -12,6 +12,32 @@ use crate::format::filenames::*;
 use super::publish::get_hf_token;
 use super::{VINDEX_CORE_FILES, VINDEX_WEIGHT_FILES};
 
+/// Which side of the HF API a repo lives on. Datasets are how vindexes
+/// are stored; Models is the canonical home of safetensors / GGUF / etc.
+/// Both share the same blob-cache layout but differ in the URL prefix
+/// and the `{datasets,models}--` cache-dir prefix.
+#[derive(Clone, Copy)]
+enum RepoKind {
+    Dataset,
+    Model,
+}
+
+impl RepoKind {
+    fn url_segment(self) -> &'static str {
+        match self {
+            RepoKind::Dataset => "datasets/",
+            RepoKind::Model => "",
+        }
+    }
+
+    fn cache_prefix(self) -> &'static str {
+        match self {
+            RepoKind::Dataset => "datasets--",
+            RepoKind::Model => "models--",
+        }
+    }
+}
+
 /// Resolve an `hf://` path to a local directory, downloading if needed.
 ///
 /// Supports:
@@ -142,12 +168,13 @@ pub use hf_hub::api::Progress as DownloadProgress;
 /// Returns `None` on any failure (HEAD error, cache missing, etag
 /// absent, etc.); the caller falls back to `download_with_progress`.
 fn cached_snapshot_file(
+    kind: RepoKind,
     repo_id: &str,
     revision: Option<&str>,
     filename: &str,
 ) -> Option<(PathBuf, u64)> {
-    let (etag, size) = head_etag_and_size(repo_id, revision, filename)?;
-    let repo_dir = hf_cache_repo_dir(repo_id)?;
+    let (etag, size) = head_etag_and_size(kind, repo_id, revision, filename)?;
+    let repo_dir = hf_cache_repo_dir(kind, repo_id)?;
     let blob_path = repo_dir.join("blobs").join(&etag);
     let meta = std::fs::metadata(&blob_path).ok()?;
     if !meta.is_file() {
@@ -188,12 +215,16 @@ fn cached_snapshot_file(
 /// redirects. Returns `None` for any failure: bad status, missing
 /// headers, malformed size, etc.
 fn head_etag_and_size(
+    kind: RepoKind,
     repo_id: &str,
     revision: Option<&str>,
     filename: &str,
 ) -> Option<(String, u64)> {
     let rev = revision.unwrap_or("main");
-    let url = format!("https://huggingface.co/datasets/{repo_id}/resolve/{rev}/{filename}");
+    let url = format!(
+        "https://huggingface.co/{}{repo_id}/resolve/{rev}/{filename}",
+        kind.url_segment()
+    );
     let token = get_hf_token().ok();
 
     // **No redirects.** HF LFS files 302 → S3, and `X-Linked-Etag` +
@@ -245,11 +276,11 @@ fn strip_etag_quoting(raw: &str) -> String {
     no_weak.trim_matches('"').to_string()
 }
 
-/// Resolve the hf-hub cache directory for a dataset repo: the root of
-/// `~/.cache/huggingface/hub/datasets--{owner}--{name}/`. Honours
+/// Resolve the hf-hub cache directory for a repo: the root of
+/// `~/.cache/huggingface/hub/{datasets,models}--{owner}--{name}/`. Honours
 /// `HF_HOME` and `HUGGINGFACE_HUB_CACHE` env overrides that hf-hub itself
 /// respects.
-fn hf_cache_repo_dir(repo_id: &str) -> Option<PathBuf> {
+fn hf_cache_repo_dir(kind: RepoKind, repo_id: &str) -> Option<PathBuf> {
     let hub_root = if let Ok(hub) = std::env::var("HUGGINGFACE_HUB_CACHE") {
         PathBuf::from(hub)
     } else if let Ok(hf_home) = std::env::var("HF_HOME") {
@@ -262,7 +293,7 @@ fn hf_cache_repo_dir(repo_id: &str) -> Option<PathBuf> {
             .join("hub")
     };
     let safe = repo_id.replace('/', "--");
-    Some(hub_root.join(format!("datasets--{safe}")))
+    Some(hub_root.join(format!("{}{safe}", kind.cache_prefix())))
 }
 
 /// Like [`resolve_hf_vindex`], but drives a progress reporter per file.
@@ -318,7 +349,7 @@ where
     // see that the file was served from cache, not re-downloaded.
     let mut fetch = |filename: &str, label: &str| -> Option<PathBuf> {
         if let Some((cached_path, size)) =
-            cached_snapshot_file(&repo_id, revision.as_deref(), filename)
+            cached_snapshot_file(RepoKind::Dataset, &repo_id, revision.as_deref(), filename)
         {
             // Tag the progress message so the bar visibly distinguishes
             // "cached" from "just downloaded very fast". Callers rendering
@@ -351,4 +382,122 @@ where
         let _ = fetch(filename, filename);
     }
     Ok(vindex_dir)
+}
+
+/// Filenames that we never want to pull from a model repo even when they're
+/// listed in the siblings response. PyTorch `.bin` weights are skipped when
+/// safetensors are present (the standard HF mirror has both); image and
+/// metadata files are noise; .gguf is a different acquisition path.
+fn want_model_file(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // Junk we never want.
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".gguf")
+        || lower.ends_with(".onnx")
+        || lower == ".gitattributes"
+        || lower.starts_with("readme")
+        || lower.starts_with("license")
+    {
+        return false;
+    }
+    // Skip pickle/torch — we load via safetensors. Keeping these would
+    // double the download size on most HF model repos.
+    if lower.ends_with(".bin") || lower.ends_with(".pt") || lower.ends_with(".pth") {
+        return false;
+    }
+    true
+}
+
+/// Resolve an `hf://` model repo path to a local snapshot directory,
+/// downloading the safetensors + tokenizer + config sidecar files needed
+/// for `larql convert safetensors-to-vindex`. Mirrors
+/// [`resolve_hf_vindex_with_progress`] but talks to the model side of the
+/// HF API (`models/...`) and enumerates files via the repo `info()` call
+/// instead of a fixed list, so sharded checkpoints (Qwen3 4B/27B) Just Work.
+///
+/// Skips PyTorch `.bin` shards when safetensors are also present in the
+/// repo (`want_model_file`) — saves several GB on the typical mirror.
+pub fn resolve_hf_model_with_progress<F, P>(
+    hf_path: &str,
+    mut progress: F,
+) -> Result<PathBuf, VindexError>
+where
+    F: FnMut(&str) -> P,
+    P: DownloadProgress,
+{
+    let path = hf_path
+        .strip_prefix("hf://")
+        .ok_or_else(|| VindexError::Parse(format!("not an hf:// path: {hf_path}")))?;
+
+    let (repo_id, revision) = if let Some((repo, rev)) = path.split_once('@') {
+        (repo.to_string(), Some(rev.to_string()))
+    } else {
+        (path.to_string(), None)
+    };
+
+    let api = hf_hub::api::sync::Api::new()
+        .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
+
+    let repo = if let Some(ref rev) = revision {
+        api.repo(hf_hub::Repo::with_revision(
+            repo_id.clone(),
+            hf_hub::RepoType::Model,
+            rev.clone(),
+        ))
+    } else {
+        api.repo(hf_hub::Repo::new(repo_id.clone(), hf_hub::RepoType::Model))
+    };
+
+    let info = repo
+        .info()
+        .map_err(|e| VindexError::Parse(format!("HF info failed for {hf_path}: {e}")))?;
+
+    let mut wanted: Vec<&str> = info
+        .siblings
+        .iter()
+        .map(|s| s.rfilename.as_str())
+        .filter(|n| want_model_file(n))
+        .collect();
+    wanted.sort();
+
+    if wanted.is_empty() {
+        return Err(VindexError::Parse(format!(
+            "no usable model files in {hf_path} (siblings: {})",
+            info.siblings.len()
+        )));
+    }
+
+    let mut snapshot_dir: Option<PathBuf> = None;
+    let mut fetch = |filename: &str| -> Option<PathBuf> {
+        if let Some((cached_path, size)) =
+            cached_snapshot_file(RepoKind::Model, &repo_id, revision.as_deref(), filename)
+        {
+            let mut p = progress(filename);
+            let tagged = format!("{filename} [cached]");
+            p.init(size as usize, &tagged);
+            p.update(size as usize);
+            p.finish();
+            return Some(cached_path);
+        }
+        repo.download_with_progress(filename, progress(filename))
+            .ok()
+    };
+
+    for filename in &wanted {
+        if let Some(p) = fetch(filename) {
+            if snapshot_dir.is_none() {
+                snapshot_dir = p.parent().map(|d| d.to_path_buf());
+            }
+        }
+    }
+
+    snapshot_dir.ok_or_else(|| {
+        VindexError::Parse(format!(
+            "downloaded zero files from {hf_path} — check repo access"
+        ))
+    })
 }

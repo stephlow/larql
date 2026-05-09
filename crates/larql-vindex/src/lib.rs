@@ -87,9 +87,9 @@ pub use format::load::{
 // Model loading: use larql_models::{load_model_dir, resolve_model_path, load_gguf} directly
 pub use format::huggingface::{
     dataset_repo_exists, download_hf_weights, ensure_collection, fetch_collection_items,
-    is_hf_path, publish_vindex, publish_vindex_with_opts, repo_exists, resolve_hf_vindex,
-    resolve_hf_vindex_with_progress, CollectionItem, DownloadProgress, PublishCallbacks,
-    PublishOptions, SilentPublishCallbacks,
+    is_hf_path, publish_vindex, publish_vindex_with_opts, repo_exists,
+    resolve_hf_model_with_progress, resolve_hf_vindex, resolve_hf_vindex_with_progress,
+    CollectionItem, DownloadProgress, PublishCallbacks, PublishOptions, SilentPublishCallbacks,
 };
 pub use format::weights::{
     load_model_weights, load_model_weights_q4k, load_model_weights_q4k_shard,
