@@ -36,6 +36,13 @@ use serde_json::Value;
 use fallback::fallback_template_for;
 use source::try_hf_template;
 
+const ENV_RAW_PROMPT: &str = "LARQL_RAW_PROMPT";
+const ENV_THINKING: &str = "LARQL_THINKING";
+const ENV_SYSTEM: &str = "LARQL_SYSTEM";
+const ENV_NO_DEFAULT_SYSTEM: &str = "LARQL_NO_DEFAULT_SYSTEM";
+const GEMMA4_DEFAULT_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant. Answer questions concisely.";
+
 /// Outcome of applying (or not applying) a chat template to the user's
 /// prompt. Returned wholesale so callers can both use the rendered string
 /// and surface a note (`"rendered from chat_template.jinja"`,
@@ -152,20 +159,20 @@ pub fn render_user_prompt(
     family: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let raw_prompt = std::env::var("LARQL_RAW_PROMPT").is_ok();
-    let enable_thinking = std::env::var("LARQL_THINKING").is_ok();
-    let user_system = std::env::var("LARQL_SYSTEM").ok();
-    let suppress_default = std::env::var("LARQL_NO_DEFAULT_SYSTEM").is_ok();
+    let raw_prompt = std::env::var(ENV_RAW_PROMPT).is_ok();
+    let enable_thinking = std::env::var(ENV_THINKING).is_ok();
+    let user_system = std::env::var(ENV_SYSTEM).ok();
+    let suppress_default = std::env::var(ENV_NO_DEFAULT_SYSTEM).is_ok();
 
     if raw_prompt {
         return Ok(user_prompt.to_string());
     }
 
     let system_prompt = user_system.or_else(|| {
-        if suppress_default || family != "gemma4" {
+        if suppress_default {
             None
         } else {
-            Some("You are a helpful assistant. Answer questions concisely.".to_string())
+            default_system_prompt_for_family(family).map(str::to_string)
         }
     });
 
@@ -196,6 +203,13 @@ pub fn render_user_prompt(
 
     // Default path: single-user-turn chat template (the existing wrap).
     Ok(wrap_chat_prompt(vindex_dir, None, user_prompt).prompt)
+}
+
+fn default_system_prompt_for_family(family: &str) -> Option<&'static str> {
+    match family {
+        "gemma4" => Some(GEMMA4_DEFAULT_SYSTEM_PROMPT),
+        _ => None,
+    }
 }
 
 /// Read the model's chat template, looking in `chat_template.jinja` first

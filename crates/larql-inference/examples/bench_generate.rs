@@ -157,8 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `crates/larql-vindex/docs/per-layer-ffn-phase2-research.md`.
         if warmup == 0 && result.decode_ms.len() >= 2 {
             let cold = result.decode_ms[0];
-            let warm: f64 = result.decode_ms[1..].iter().sum::<f64>()
-                / (result.decode_ms.len() - 1) as f64;
+            let warm: f64 =
+                result.decode_ms[1..].iter().sum::<f64>() / (result.decode_ms.len() - 1) as f64;
             let overhead = cold - warm;
             let ratio = if warm > 0.0 { cold / warm } else { 0.0 };
             println!();

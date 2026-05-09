@@ -445,6 +445,24 @@ pub trait ModelArchitecture: Send + Sync {
         }
     }
 
+    /// Key for the model-level PLE projection [num_layers * ple_dim, hidden].
+    fn per_layer_model_projection_key(&self) -> Option<String> {
+        if self.has_per_layer_embeddings() {
+            Some("per_layer_model_projection.weight".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Key for the shared PLE projection RMSNorm weight.
+    fn per_layer_projection_norm_key(&self) -> Option<String> {
+        if self.has_per_layer_embeddings() {
+            Some("per_layer_projection_norm.weight".to_string())
+        } else {
+            None
+        }
+    }
+
     /// Key for the per-layer input gate projection [ple_dim, hidden].
     fn per_layer_input_gate_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {

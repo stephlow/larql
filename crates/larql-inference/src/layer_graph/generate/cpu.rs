@@ -20,12 +20,7 @@ use larql_compute::prelude::*;
 /// directly. Metal: yes. Pure CPU: no — that path produces correct forward
 /// results via the vindex Q4K dequant loop in `crate::vindex::q4k_forward`.
 pub(super) fn backend_supports_fused_q4_pipeline(backend: &dyn ComputeBackend) -> bool {
-    // CpuBackend reports `has_q4() == true` (it has Q4 matvecs) but does not
-    // override `prefill_q4` — the trait default returns None. A zero-arg
-    // probe would allocate; probe the backend name instead, which is stable
-    // and cheap. Metal's CpuBackend is labelled "cpu (...)".
-    let name = backend.name();
-    !name.starts_with("cpu")
+    backend.supports(Capability::PrefillQ4) && backend.supports(Capability::DecodeToken)
 }
 
 /// CPU Q4K generate path: loops `predict_q4k` one step at a time. O(N²) in
@@ -46,6 +41,7 @@ pub(super) fn generate_via_cpu_q4k(
             prefill_ms: 0.0,
             decode_ms: Vec::new(),
             stage_timings: StageTimings::default(),
+            error: None,
         };
     }
 
@@ -70,6 +66,7 @@ pub(super) fn generate_via_cpu_q4k(
                 prefill_ms,
                 decode_ms,
                 stage_timings: StageTimings::default(),
+                error: None,
             };
         }
     } else {
@@ -78,6 +75,7 @@ pub(super) fn generate_via_cpu_q4k(
             prefill_ms,
             decode_ms,
             stage_timings: StageTimings::default(),
+            error: Some("CPU Q4K generation produced no first token".to_string()),
         };
     }
 
@@ -119,6 +117,7 @@ pub(super) fn generate_via_cpu_q4k(
             lm_head_ms_total: 0.0,
             detok_ms_total: 0.0,
         },
+        error: None,
     }
 }
 
@@ -203,6 +202,7 @@ where
             prefill_ms: 0.0,
             decode_ms: Vec::new(),
             stage_timings: StageTimings::default(),
+            error: None,
         };
     }
 
@@ -229,5 +229,6 @@ where
         prefill_ms,
         decode_ms,
         stage_timings: StageTimings::default(),
+        error: None,
     }
 }

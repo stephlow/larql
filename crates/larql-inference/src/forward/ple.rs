@@ -34,7 +34,11 @@ pub fn precompute_per_layer_inputs(
     let hidden = weights.hidden_size;
 
     // Stream 1: model projection from main embeddings
-    let w_model_proj = match weights.tensors.get("per_layer_model_projection.weight") {
+    let model_proj_key = match arch.per_layer_model_projection_key() {
+        Some(k) => k,
+        None => return Vec::new(),
+    };
+    let w_model_proj = match weights.tensors.get(&model_proj_key) {
         Some(w) => w,
         None => return Vec::new(),
     };
@@ -42,11 +46,15 @@ pub fn precompute_per_layer_inputs(
     let model_proj_scale = (hidden as f32).powf(-0.5);
 
     // Stream 2: per-layer token embeddings
-    let ple_embed = weights.tensors.get("embed_tokens_per_layer.weight");
+    let ple_embed = arch
+        .per_layer_embed_key()
+        .and_then(|key| weights.tensors.get(&key));
     let embed_scale = (ple_dim as f32).sqrt();
 
     // Per-layer projection norm weight
-    let proj_norm_w = weights.vectors.get("per_layer_projection_norm.weight");
+    let proj_norm_w = arch
+        .per_layer_projection_norm_key()
+        .and_then(|key| weights.vectors.get(&key));
     let norm_offset = arch.norm_weight_offset();
 
     let norm_eps = arch.norm_eps() as f32;

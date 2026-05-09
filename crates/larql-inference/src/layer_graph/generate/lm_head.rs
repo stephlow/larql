@@ -2,7 +2,6 @@
 
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
-use larql_compute::CpuBackend;
 
 /// Top-K logits lookup that transparently handles models with tied
 /// input/output embeddings (Gemma 2/3/4) whose vindex has no dedicated
@@ -39,9 +38,8 @@ pub fn lm_head_topk(
         std::env::var("LARQL_LM_HEAD_SKIP_Q4K").as_deref(),
         Ok("1") | Ok("true") | Ok("on") | Ok("yes")
     );
-    let is_metal_backend = backend.as_any().type_id() != std::any::TypeId::of::<CpuBackend>();
-    if skip_q4k && is_metal_backend {
-        // Diagnostic path: skip the Q4_K Metal matvec and use stride-32
+    if skip_q4k && backend.supports(Capability::F32Gemv) {
+        // Diagnostic path: skip the Q4_K accelerated matvec and use stride-32
         // Q4_K (or f16 GEMV / f32 BLAS) instead. Useful for verifying
         // top-1 stability against a known-stable reduction tree, or for
         // vindexes where the Q4_K lm_head bytes aren't populated.

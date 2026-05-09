@@ -352,6 +352,7 @@ where
             prefill_ms: 0.0,
             decode_ms: Vec::new(),
             stage_timings: StageTimings::default(),
+            error: None,
         };
     }
 
@@ -388,43 +389,19 @@ where
     let has_q8 = index.attn_q8_layer_data(layer_range.start).is_some();
 
     if !backend.has_q4() || q4_ffn.is_none() {
-        let r = crate::layer_graph::predict::predict_honest(
-            weights,
-            tokenizer,
-            token_ids,
-            5,
-            index,
-            backend,
-            cached_layers,
-            layer_range,
+        let _ = (tokenizer, cached_layers, layer_range);
+        return GenerateResult::empty_error(
+            "GPU generation requires backend Q4 support and interleaved Q4 FFN weights",
         );
-        return GenerateResult {
-            tokens: r.predictions.into_iter().take(1).collect(),
-            prefill_ms: 0.0,
-            decode_ms: vec![],
-            stage_timings: StageTimings::default(),
-        };
     }
 
     let q4_ffn_mmap = q4_ffn.unwrap();
     let intermediate = gate_index.num_features(layer_range.start);
     if intermediate == 0 || (!has_q4k && !has_q8) {
-        let r = crate::layer_graph::predict::predict_honest(
-            weights,
-            tokenizer,
-            token_ids,
-            5,
-            index,
-            backend,
-            cached_layers,
-            layer_range,
+        let _ = cached_layers;
+        return GenerateResult::empty_error(
+            "GPU generation requires non-empty FFN features and Q4/Q8 attention weights",
         );
-        return GenerateResult {
-            tokens: r.predictions.into_iter().take(1).collect(),
-            prefill_ms: 0.0,
-            decode_ms: vec![],
-            stage_timings: StageTimings::default(),
-        };
     }
 
     let ffn_format = if ffn_is_q4k {
@@ -450,6 +427,12 @@ where
 
     // ── Phase 1: GPU prefill ──
     let prefill_start = std::time::Instant::now();
+    let seq_len = token_ids.len();
+    if seq_len > DEFAULT_GPU_KV_CACHE_MAX_SEQ {
+        return GenerateResult::empty_error(format!(
+            "prompt length {seq_len} exceeds GPU KV cache capacity {DEFAULT_GPU_KV_CACHE_MAX_SEQ}"
+        ));
+    }
     backend.reset_kv_cache();
 
     // Pre-allocate per-layer KV cache for models with asymmetric attention geometry
@@ -460,7 +443,6 @@ where
         let kv_shapes = kv_cache_shapes_for_arch(weights);
         backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
-    let seq_len = token_ids.len();
 
     let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
@@ -473,57 +455,38 @@ where
     // that would panic on Q4K expert bytes. Token-by-token is correct and builds the
     // KV cache identically to the batched prefill.
     let h_vec = if weights.has_per_layer_ffn() {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            if let Some(metal) = backend
-                .as_any()
-                .downcast_ref::<larql_compute::metal::MetalBackend>()
-            {
-                let norm_eps = weights.arch.norm_eps();
-                let mut last_h = vec![0.0f32; hidden];
-                for pos in 0..seq_len {
-                    let x_pos: Vec<f32> = x[pos * hidden..(pos + 1) * hidden].to_vec();
-                    last_h = metal
-                        .decode_token_q4k_moe(
-                            &layers,
-                            &x_pos,
-                            hidden,
-                            intermediate,
-                            attention.q_dim,
-                            attention.kv_dim,
-                            attention.num_q_heads,
-                            attention.num_kv_heads,
-                            attention.head_dim,
-                            attention.rope_base,
-                            norm_eps,
-                            |layer_idx, expert_idx| {
-                                weights.get_layer_entry_bytes(layer_idx, expert_idx)
-                            },
-                        )
-                        .unwrap_or_else(|| vec![0.0f32; hidden]);
-                }
-                // Return only the last position (same shape as batched prefill output)
-                let mut out = vec![0.0f32; seq_len * hidden];
-                out[(seq_len - 1) * hidden..].copy_from_slice(&last_h);
-                out
-            } else {
-                return GenerateResult {
-                    tokens: Vec::new(),
-                    prefill_ms: 0.0,
-                    decode_ms: Vec::new(),
-                    stage_timings: StageTimings::default(),
-                };
-            }
+        if !backend.supports(Capability::DecodeQ4KMoe) {
+            return GenerateResult::empty_error(
+                "per-layer Q4K expert generation requires backend Q4K MoE decode support",
+            );
         }
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
-        {
-            return GenerateResult {
-                tokens: Vec::new(),
-                prefill_ms: 0.0,
-                decode_ms: Vec::new(),
-                stage_timings: StageTimings::default(),
-            };
+        let norm_eps = weights.arch.norm_eps();
+        let mut last_h = vec![0.0f32; hidden];
+        for pos in 0..seq_len {
+            let x_pos: Vec<f32> = x[pos * hidden..(pos + 1) * hidden].to_vec();
+            let get_expert =
+                |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx);
+            last_h = backend
+                .decode_token_q4k_moe(
+                    &layers,
+                    &x_pos,
+                    hidden,
+                    intermediate,
+                    attention.q_dim,
+                    attention.kv_dim,
+                    attention.num_q_heads,
+                    attention.num_kv_heads,
+                    attention.head_dim,
+                    attention.rope_base,
+                    norm_eps,
+                    &get_expert,
+                )
+                .unwrap_or_else(|| vec![0.0f32; hidden]);
         }
+        // Return only the last position (same shape as batched prefill output)
+        let mut out = vec![0.0f32; seq_len * hidden];
+        out[(seq_len - 1) * hidden..].copy_from_slice(&last_h);
+        out
     } else {
         match backend.prefill_q4(
             &layers,
@@ -541,14 +504,7 @@ where
             softcap_val,
         ) {
             Some(v) => v,
-            None => {
-                return GenerateResult {
-                    tokens: Vec::new(),
-                    prefill_ms: 0.0,
-                    decode_ms: Vec::new(),
-                    stage_timings: StageTimings::default(),
-                }
-            }
+            None => return GenerateResult::empty_error("GPU Q4 prefill returned no output"),
         }
     };
 
@@ -647,6 +603,7 @@ where
                 prefill_ms,
                 decode_ms,
                 stage_timings: StageTimings::default(),
+                error: None,
             };
         }
     }
@@ -715,13 +672,11 @@ where
             // Per-layer Q4_K expert format: route on CPU, dispatch expert FFNs on GPU.
             // Eliminates the BF16 dequant + CPU BLAS path and the per-layer commit
             // overhead that was doing nothing useful for MoE experts.
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            if let Some(metal) = backend
-                .as_any()
-                .downcast_ref::<larql_compute::metal::MetalBackend>()
-            {
+            if backend.supports(Capability::DecodeQ4KMoe) {
                 let norm_eps = weights.arch.norm_eps();
-                metal.decode_token_q4k_moe(
+                let get_expert =
+                    |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx);
+                backend.decode_token_q4k_moe(
                     &layers,
                     &x_dec,
                     hidden,
@@ -733,7 +688,7 @@ where
                     attention.head_dim,
                     attention.rope_base,
                     norm_eps,
-                    |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx),
+                    &get_expert,
                 )
             } else {
                 backend.decode_token(
@@ -749,19 +704,6 @@ where
                     attention.rope_base,
                 )
             }
-            #[cfg(not(all(feature = "metal", target_os = "macos")))]
-            backend.decode_token(
-                &layers,
-                &x_dec,
-                hidden,
-                intermediate,
-                attention.q_dim,
-                attention.kv_dim,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-                attention.rope_base,
-            )
         } else {
             backend.decode_token(
                 &layers,
@@ -926,6 +868,7 @@ where
             lm_head_ms_total: t_lmhead,
             detok_ms_total: t_detok,
         },
+        error: None,
     }
 }
 
@@ -1045,6 +988,7 @@ where
             prefill_ms: 0.0,
             decode_ms: Vec::new(),
             stage_timings: StageTimings::default(),
+            error: None,
         };
     }
 
@@ -1072,46 +1016,19 @@ where
     let has_q8 = index.attn_q8_layer_data(layer_range.start).is_some();
 
     // Constrained mode requires the GPU prefill + Q4 path to be available.
-    // Fall back to the unconstrained dense single-token predict if it isn't —
-    // the mask still applies to that one token via pick_next_token_masked.
     if !backend.has_q4() || q4_ffn.is_none() {
-        // Dense single-token prediction with mask.
-        let r = crate::layer_graph::predict::predict_honest(
-            weights,
-            tokenizer,
-            token_ids,
-            5,
-            index,
-            backend,
-            cached_layers,
-            layer_range,
+        let _ = (tokenizer, cached_layers, layer_range);
+        return GenerateResult::empty_error(
+            "constrained GPU generation requires backend Q4 support and interleaved Q4 FFN weights",
         );
-        return GenerateResult {
-            tokens: r.predictions.into_iter().take(1).collect(),
-            prefill_ms: 0.0,
-            decode_ms: vec![],
-            stage_timings: StageTimings::default(),
-        };
     }
     let q4_ffn_mmap = q4_ffn.unwrap();
     let intermediate = gate_index.num_features(layer_range.start);
     if intermediate == 0 || (!has_q4k && !has_q8) {
-        let r = crate::layer_graph::predict::predict_honest(
-            weights,
-            tokenizer,
-            token_ids,
-            5,
-            index,
-            backend,
-            cached_layers,
-            layer_range,
+        let _ = cached_layers;
+        return GenerateResult::empty_error(
+            "constrained GPU generation requires non-empty FFN features and Q4/Q8 attention weights",
         );
-        return GenerateResult {
-            tokens: r.predictions.into_iter().take(1).collect(),
-            prefill_ms: 0.0,
-            decode_ms: vec![],
-            stage_timings: StageTimings::default(),
-        };
     }
 
     let ffn_format = if ffn_is_q4k {
@@ -1137,12 +1054,17 @@ where
 
     // ── Phase 1: GPU prefill ──
     let prefill_start = std::time::Instant::now();
+    let seq_len = token_ids.len();
+    if seq_len > DEFAULT_GPU_KV_CACHE_MAX_SEQ {
+        return GenerateResult::empty_error(format!(
+            "prompt length {seq_len} exceeds GPU KV cache capacity {DEFAULT_GPU_KV_CACHE_MAX_SEQ}"
+        ));
+    }
     backend.reset_kv_cache();
     {
         let kv_shapes = kv_cache_shapes_for_arch(weights);
         backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
-    let seq_len = token_ids.len();
     let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
     let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
     let softcap_val = arch.attn_logit_softcapping().unwrap_or(0.0);
@@ -1168,12 +1090,7 @@ where
     ) {
         Some(v) => v,
         None => {
-            return GenerateResult {
-                tokens: Vec::new(),
-                prefill_ms: 0.0,
-                decode_ms: Vec::new(),
-                stage_timings: StageTimings::default(),
-            };
+            return GenerateResult::empty_error("constrained GPU Q4 prefill returned no output");
         }
     };
 
@@ -1216,6 +1133,7 @@ where
                     prefill_ms,
                     decode_ms,
                     stage_timings: StageTimings::default(),
+                    error: None,
                 };
             }
             tid
@@ -1226,6 +1144,9 @@ where
                 prefill_ms,
                 decode_ms,
                 stage_timings: StageTimings::default(),
+                error: Some(
+                    "constrained generation mask rejected every first-token candidate".to_string(),
+                ),
             }
         }
     };
@@ -1297,5 +1218,6 @@ where
         prefill_ms,
         decode_ms,
         stage_timings: StageTimings::default(),
+        error: None,
     }
 }

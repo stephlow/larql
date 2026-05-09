@@ -11,6 +11,7 @@ pub mod detok;
 pub mod eos;
 mod gpu;
 mod lm_head;
+pub(crate) mod policy;
 pub mod sampling;
 mod types;
 

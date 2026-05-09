@@ -38,6 +38,8 @@ pub enum Capability {
     DecodeToken,
     /// Decode with a remote-MoE callback (`decode_token_with_moe`).
     DecodeMoe,
+    /// Decode using local GPU dispatch for Q4_K per-layer expert tensors.
+    DecodeQ4KMoe,
     /// Per-stage timing decode (`decode_token_split_profile`).
     DecodeProfile,
     /// Multi-position prefill with KV cache population (`prefill_q4`).

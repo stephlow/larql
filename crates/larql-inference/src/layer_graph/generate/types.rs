@@ -23,6 +23,7 @@ pub struct GenerateResult {
     pub prefill_ms: f64,
     pub decode_ms: Vec<f64>,
     pub stage_timings: StageTimings,
+    pub error: Option<String>,
 }
 
 impl StageTimings {
@@ -46,6 +47,20 @@ impl StageTimings {
 }
 
 impl GenerateResult {
+    pub fn empty_error(reason: impl Into<String>) -> Self {
+        Self {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            stage_timings: StageTimings::default(),
+            error: Some(reason.into()),
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+
     pub fn avg_decode_ms(&self) -> f64 {
         if self.decode_ms.is_empty() {
             0.0

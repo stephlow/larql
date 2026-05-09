@@ -69,52 +69,107 @@
 
 ### Modularity + magic-literal debt
 
-**Status**: Active from the 2026-05-09 review.
+**Status**: Mostly closed. Only the large-file decomposition bullet
+remains open as of 2026-05-09.
 
-The remaining cleanup is concentrated in a few production paths:
+Closed during the 2026-05-09 review (verified against the tree, not
+just the audit doc):
 
-- Replace architecture-specific extraction literals with existing model
-  policy. Dense clustering must use `LayerBands::for_family(...).knowledge`
-  instead of hard-coded layer ranges.
-- Keep vindex file layout literals in `format::filenames`; remaining
-  `down_meta.jsonl` and PLE weight-file call sites should route through
-  constants.
-- Replace stringly typed config fields such as `ffn_layout:
-  "per_layer"` with serde enums.
-- Lift algorithm parameters into named constants/config structs:
-  extraction batch sizes, relation-cluster cap, k-means iterations, and
-  HNSW graph construction parameters.
-- Continue large-file decomposition. Priority files:
-  `format/huggingface/publish.rs`, `extract/streaming.rs`,
-  `format/weights/load.rs`, `format/weights/write_q4k/mod.rs`,
-  `index/core.rs`, and `index/types.rs`.
-- 2026-05-09: `GateIndex` split into narrower capability traits
-  (`GateLookup`, `PatchOverrides`, `NativeFfnAccess`,
-  `QuantizedFfnAccess`, `Fp4FfnAccess`, `FfnRowAccess`) while keeping
-  `GateIndex` as the compatibility composition for existing trait-object
-  consumers.
+- [x] Architecture-specific extraction literals — dense clustering
+  routes through `LayerBands::for_family(...).knowledge` via
+  `extract::build::knowledge_layer_range`. No hard-coded layer ranges
+  remain in the extraction pipeline.
+- [x] Vindex file layout literals — production paths fully routed
+  through `format::filenames`. The 2026-05-09 sweep added
+  `ROUTER_WEIGHTS_BIN` (was the last stray production literal in
+  `extract/streaming.rs`). Test fixtures keep literals deliberately to
+  pin the wire contract.
+- [x] Stringly typed `ffn_layout` — already a typed
+  `Option<FfnLayout>` enum (`config/index.rs`).
+- [x] Algorithm parameters lifted — extraction batch sizes,
+  relation-cluster cap, k-means iterations live in
+  `extract::constants`; HNSW build parameters in
+  `config::hnsw::HnswBuildConfig::{LAYER, EXPERT}`.
+- [x] `GateIndex` split — narrower capability traits (`GateLookup`,
+  `PatchOverrides`, `NativeFfnAccess`, `QuantizedFfnAccess`,
+  `Fp4FfnAccess`, `FfnRowAccess`) with `GateIndex` retained as the
+  compatibility composition for existing trait-object consumers.
+
+Still open:
+
+- [ ] Large-file decomposition. Priority files (current LOC):
+  `format/huggingface/publish.rs` (997),
+  `extract/streaming.rs` (832), `format/weights/load.rs` (817),
+  `index/core.rs` (755), `format/weights/write_q4k/mod.rs` (734),
+  `index/types.rs` (715). Same cadence as the M1–M9 round-4 cleanup.
 
 **Acceptance bar:** no remaining production filename/layout magic
-strings for vindex-owned files, extraction remains model-family
-agnostic, `GateIndex` is split into narrower capability traits, and no
-new module grows past the current large-file debt without a split plan.
+strings for vindex-owned files (met), extraction remains model-family
+agnostic (met — see P1), `GateIndex` split into narrower capability
+traits (met), and no new module grows past the current large-file
+debt without a split plan.
 
 ### Per-layer FFN weight format (`layers/`) — unified dense + MoE
 
-**Status**: Phase 1 shipped 2026-04-26 — format written, GPU dispatch wired, conversion tool available. Phase 2 (pre-allocated buffers) open.
+**Status**: Phase 1 shipped 2026-04-26. **Phase 2 cache machinery is
+shipped in code** (`MetalBackend::moe_scratch` Mutex +
+`AppState::moe_scratches` HashMap, both shape-keyed). The cold/warm
+split measured 2026-05-09 confirms the cache is doing its job
+(first-token overhead is paid once, not per token), **but the warm
+steady-state is 2.4× slower than the 19.4 tok/s baseline reported on
+2026-05-02 (see `crates/larql-compute/ROADMAP.md` Phase 2 entry).**
+Treat as a regression-investigation, not a closed entry.
 
-**Measured results (Gemma 4 26B A4B, M3 Max, 15 warmup / 30 tokens):**
+**Measured 2026-05-09 (Gemma 4 26B A4B, M3 Max, `bench_generate
+--warmup 0 --max-tokens 10`):**
 
-| Phase | Decode | tok/s | vs baseline |
-|---|---|---|---|
-| BF16 blob baseline | 241ms/tok | 4.1 | — |
-| Q4K GPU dispatch (shipped) | ~190ms/tok | **5.2** | **+27%** |
-| Pre-allocated buffers (planned) | ~50ms/tok | **~20** | **~5×** |
-| SKIP_MOE GPU-only ceiling | 15ms/tok | 56.8 | 14× |
+| Token | ms | tok/s |
+|---|---|---|
+| 1 (cold)        | 265.2 | 4 |
+| 2               | 182.7 | 5 |
+| 3               | 126.5 | 8 |
+| 4               | 154.7 | 6 |
+| 5               | 101.0 | 10 |
+| 6               | 97.0  | 10 |
+| 7               | 78.8  | 13 |
+| 8               | 120.3 | 8 |
+| 9               | 87.1  | 11 |
+
+- **Cold (token 1):** 265.2 ms / 4 tok/s
+- **Warm (mean of tokens 2-9):** 118.5 ms / 8 tok/s
+- **First-token overhead:** 146.7 ms (cold/warm = 2.24×)
+
+**What the split confirms:** the 146.7 ms first-token overhead matches
+the original ~120 ms allocation cost claim; the cache amortises it as
+the design intended.
+
+**What the split contradicts:** the 19.4 tok/s = 51 ms/tok number
+reported at `crates/larql-compute/ROADMAP.md§"GPU expert dispatch —
+Phase 2: pre-allocated staging buffers (DONE; baseline corrected
+2026-05-02)"`. Our warm number is 118 ms — 2.4× slower than that
+baseline. Either:
+- a regression landed between 2026-05-02 and 2026-05-09 (recent
+  cleanup commits — `27b1870`, `f84a465`, `430f320`, `ad53c75`,
+  `03429d2`, `8956ed8` — touched server, inference, and compute), or
+- the 2026-05-02 measurement used a different methodology (`larql
+  bench` with `warmup=3` discards the first three tokens, our
+  `bench_generate --warmup 0` does not — but our token-9 alone hits
+  87 ms / 11 tok/s, still far from 51 ms / 19.4 tok/s).
+
+**Open follow-ups:**
+- [ ] Reproduce the 2026-05-02 19.4 tok/s number with `larql bench
+      --warmup 3` on the same vindex. If it hits 19.4, the gap is
+      methodological — close the entry as Done. If it lands near 8
+      tok/s, bisect against `27b1870..HEAD` to find the regression.
+- [ ] If methodological: standardise the headline number on
+      `bench_generate --warmup 0` (cold + warm both reported) so future
+      ROADMAPs can't drift between harnesses.
+- [ ] If regression: fix and re-measure.
+
+**Spec doc:** `crates/larql-vindex/docs/per-layer-ffn-phase2-research.md`
+captures the cache-machinery audit and bench interpretation matrix.
 
 **Phase 1 shipped:** Q4K per-layer format (`layers/layer_{L:02}.weights`), conversion tool (`convert_moe_to_per_layer` example), GPU dispatch via `MetalBackend::gpu_moe_dispatch` + `decode_token_q4k_moe`. Expert bytes written directly to Metal shared-memory buffers (one copy, no intermediate Vec). 59s conversion for 26B A4B (43 GB BF16 → 24 GB Q4K).
-
-**Phase 2 open:** 300 Metal buffer allocations per decode token (8 experts × 30 layers × gate/up/down/act/out) cost ~120ms. Pre-allocate fixed-size scratch buffers once before the decode loop (same pattern as dense `decode_token` scratch buffers) to bring decode toward the ~50ms target.
 
 **SKIP_MOE baseline**: SKIP_MOE baseline = 15ms/tok (56.8 tok/s). With BF16 blob = 241ms/tok. **93.7% of decode time was CPU MoE.**
 
@@ -154,7 +209,7 @@ layers/
 - [x] `routes/expert.rs::run_expert` (larql-server) resolves per-expert via either path. 2026-04-26.
 - [x] Convert + strip + delete on the existing 26B-A4B vindex (manifest stripped of `packed_bf16` expert rows, `experts_packed.bin` deleted, 43 GB freed). 2026-04-26.
 - [x] GPU dispatch in `decode_token_with_moe_fn`: per-layer Q4_K slices gathered into staging buffer, single GPU command buffer per decode token.
-- [ ] Phase 2 (separate work in progress) — pre-allocated Metal scratch buffers to skip ~120 ms allocation overhead per decode token.
+- [~] Phase 2 — cache machinery is shipped (`MetalBackend::moe_scratch` Mutex + server-side `AppState::moe_scratches` HashMap by shape). Cold/warm split measured 2026-05-09 on Gemma 4 26B A4B M3 Max: cold 265 ms, warm 118 ms, first-token overhead 146.7 ms (matches ~120 ms allocation claim). **Regression vs 2026-05-02 19.4 tok/s baseline pending investigation** — see Phase 2 entry above.
 
 **Result on Gemma 4 26B A4B (M3 Max, single-shard `bench_expert_server`):**
 `forward_moe` warm 4.86 → 1.91 ms (2.5×). 30-layer sweep 866 → 56 ms (15×).

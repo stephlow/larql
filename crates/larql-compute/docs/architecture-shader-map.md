@@ -60,7 +60,13 @@ Largely the same shaders as Gemma 3, with these differences:
 | QKV input norm offset | `0.0` (Gemma 4 vs Gemma 3's `1.0` for HF-saved weights) | Same `q4k_q6k_qkv_proj` kernel, different config |
 | FFN intermediate size | E2B: 6144, 31B: 21504 | Same `q4k_ffn_gate_up_8sg` + `q6k_matvec` |
 
-**Known anomaly (2026-05-09)**: gemma4-e2b decode is **~30× slower than Gemma 3 4B per token** despite having smaller dimensions (hidden=1536 vs 2560). Bench at heavily-contended state showed gemma4-e2b at 4205ms/tok vs Gemma 3 at 140ms/tok. Llama 2 7B and Mistral 7B at the same contention show 200-220ms (~1.5× Gemma 3 — expected scaling for 4096 hidden). This is **the first concrete bug surfaced by cross-arch benchmarking**. Possible causes: per-layer head_dim variation forces a slow dispatch path, V-norm dispatch is unbatched, or some Gemma 4-specific path falls through to a per-position loop. Pinned as a roadmap item; investigation needed.
+**Diagnosed anomaly (2026-05-09)**: gemma4-e2b decode runs at **~1670 ms/tok on CPU**, not Metal. Root cause: **Per-Layer Embeddings (PLE, `hidden_size_per_layer_input: 256`) are not implemented in the Metal pipeline.** `larql-inference/src/layer_graph/generate/gpu.rs:372-374` explicitly checks `weights.arch.has_per_layer_embeddings()` and routes the entire generate path to `generate_via_cpu_q4k`. The Metal `decode_token_with_moe_split_fn` is never called — `[gpu-timing]` lines never fire for E2B, while they do for Gemma 3 4B and Gemma 4 31B (which don't have PLE). The CPU fallback is documented in the source comment as deliberate: "Without this routing the model produces multilingual gibberish."
+
+**To restore E2B to Metal**: implement Per-Layer Embeddings in the Metal pipeline (ROADMAP **D-METAL-PLE**). The PLE math is in `larql-inference/src/forward/ple.rs`:
+- Precompute (once at prefill): `projected = main_embeds @ per_layer_model_projection.T * 1/sqrt(hidden)`, then per-layer RMSNorm + add `embed_tokens_per_layer[token_ids] * sqrt(ple_dim)`, scaled by `1/sqrt(2)`.
+- Per layer: `gate = gelu_tanh(h × W_input_gate.T)` → `gated = gate * per_layer_input` → `contribution = gated × W_projection.T` → `RMSNorm(contribution)` → `h += normed`.
+
+Most kernels needed already exist (matvec, geglu element-wise, rms_norm, residual_inject::add). Plumbing + per-layer dispatch + caching the precomputed per-layer-input streams in Metal buffers is the actual work. Estimated 1-2 days; brings E2B from ~1670 ms/tok CPU to ~10-20 ms/tok Metal (80-150× speedup at E2B's compute scale).
 
 ### Gemma 4 26B-A4B (MoE) — `larql-models/architectures/gemma4.rs` with MoE config
 
@@ -156,9 +162,9 @@ Granite is Llama-derived with attention scale modifications. TinyModel is the LA
 
 **Three things this confirms:**
 
-1. **Cross-arch dispatch works.** All 4 families (Gemma 3, Gemma 4, Llama, Mistral) run end-to-end on the Metal path without crashes or fallback to CPU.
+1. **Cross-arch dispatch works.** All non-PLE families (Gemma 3, Gemma 4 31B dense, Llama, Mistral) run end-to-end on Metal without crashes.
 2. **Llama / Mistral scaling is correct.** 4096 hidden × 32 layers vs Gemma 3 4B's 2560 × 34 ≈ 1.5× compute scaling — measured 1.45-1.55× GPU fwd. Matches expectation.
-3. **Gemma 4 E2B has a 30× pathology.** Hidden=1536 / 35 layers should be **faster** than Gemma 3 4B, not 30× slower. Likely candidates: per-layer head_dim variation forcing slow dispatch, V-norm or sliding-window-toggle in a per-position loop, mixed-format vindex layout. **Pinned as roadmap item D-GEMMA4-E2B**; needs investigation when machine is quiet enough to bench cleanly.
+3. **Gemma 4 E2B is on CPU, not Metal** — diagnosed (see anomaly section above). PLE-using models fall back to CPU until D-METAL-PLE lands. The 30× number is CPU-vs-Metal, not a Metal kernel bug.
 
 **To re-bench cleanly** (when system is idle):
 

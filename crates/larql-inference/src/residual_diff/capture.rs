@@ -21,6 +21,7 @@ use larql_models::ModelWeights;
 use larql_vindex::{GateIndex, VectorIndex};
 
 use crate::layer_graph::generate::generate;
+use crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 use crate::layer_graph::CachedLayerGraph;
 
 /// Per-layer end-of-layer hidden state. `layers[l]` is the residual
@@ -134,7 +135,7 @@ impl ResidualCapture {
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
 
         // Build pipeline layers — same wiring `layer_graph::generate` uses.
         let gate_index: &dyn GateIndex = index;
@@ -250,7 +251,7 @@ impl ResidualCapture {
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
 
         let gate_index: &dyn GateIndex = index;
         let (q4_ffn, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {

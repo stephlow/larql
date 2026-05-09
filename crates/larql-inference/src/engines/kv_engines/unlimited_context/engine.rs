@@ -27,6 +27,7 @@ use super::token_archive::TokenArchive;
 use crate::attention::SharedKV;
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::engines::{EngineInfo, KvEngine};
+use crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 use crate::model::ModelWeights;
 
 // ─── EngineStats ─────────────────────────────────────────────────────────────
@@ -454,7 +455,7 @@ pub(crate) fn q4k_prefill_metal(
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
 
     let h_vec = backend.prefill_q4(

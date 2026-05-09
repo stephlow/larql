@@ -442,3 +442,72 @@ pub struct ExpertResultItem {
     pub expert_id: usize,
     pub output: Vec<f32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_batch_request_roundtrips() {
+        let residual = vec![1.0, -2.0, 3.5];
+        let expert_ids = vec![7, 9];
+        let expert_weights = vec![0.25, 0.75];
+        let body = encode_layer_batch_request(3, &residual, &expert_ids, &expert_weights);
+
+        let (layer, decoded_residual, decoded_ids, decoded_weights) =
+            decode_layer_batch_request(&body).unwrap();
+        assert_eq!(layer, 3);
+        assert_eq!(decoded_residual, residual);
+        assert_eq!(decoded_ids, expert_ids);
+        assert_eq!(decoded_weights, expert_weights);
+    }
+
+    #[test]
+    fn layer_batch_request_rejects_impossible_k_before_allocating() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_layer_batch_request(&body).is_none());
+    }
+
+    #[test]
+    fn layer_batch_response_rejects_impossible_hidden_before_allocating() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        assert!(decode_layer_batch_response(&body).is_none());
+        assert!(decode_layer_batch_response_f16(&body).is_none());
+    }
+
+    #[test]
+    fn expert_request_roundtrips() {
+        let items = vec![
+            ExpertCallItem {
+                layer: 1,
+                expert_id: 2,
+                residual: vec![0.1, 0.2],
+            },
+            ExpertCallItem {
+                layer: 3,
+                expert_id: 4,
+                residual: vec![0.3, 0.4],
+            },
+        ];
+        let body = encode_expert_request(&items);
+        let decoded = decode_expert_request(&body).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].layer, 1);
+        assert_eq!(decoded[1].expert_id, 4);
+        assert_eq!(decoded[1].residual, vec![0.3, 0.4]);
+    }
+
+    #[test]
+    fn expert_response_rejects_overflowing_item_layout_before_allocating() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        assert!(decode_expert_response(&body).is_none());
+    }
+}

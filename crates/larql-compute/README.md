@@ -32,21 +32,32 @@ Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec
 ## Performance vs Ollama
 
 Live `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b`
-on M3 Max (2026-05-02, post dispatch-geometry fix):
+on M3 Max (2026-05-09, post QKV defuse):
 
 ```
-  larql-metal  83–84 tok/s   11.9ms/tok   (GPU fwd ~11.16ms, lm_head ~1.85ms)
-  ollama       98.5–99.7 tok/s  10.0ms/tok
-  gap          1.18×          ~2.0ms/tok
+  larql-metal  88 tok/s     11.4ms/tok   (GPU fwd ~11.40ms, lm_head ~1.85ms)
+  ollama       ~103 tok/s   ~9.7ms/tok
+  gap          1.17×        ~1.66ms/tok
 ```
 
 Reproduce: `larql bench <vindex> --backends metal --ollama <tag>`.
-See `PERFORMANCE.md` for the full breakdown, the "Decision: lm_head dispatch
-order" decision-log entry, and ADR-015 for the diagnostic order rule
-("dispatch-geometry first, kernel second, reduction tree last") that drove
-the 2026-05-02 fix.
+**Acceptance criterion (~85 tok/s, ~1.16×) effectively met.** See
+`PERFORMANCE.md` for the full breakdown, [ADR-015](docs/adr/015-isolated-vs-batched-kernel-perf.md)
+(iso-vs-batched diagnostic order), [ADR-016](docs/adr/016-defused-rms-norm-qkv.md)
+(QKV defuse rationale), [ADR-017](docs/adr/017-shader-retention-model-agnosticity.md)
+(shader retention under model agnosticity), [ADR-018](docs/adr/018-architecture-shader-routing.md)
+(architecture → shader routing), [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md)
+(kernel-architecture comparison vs llama.cpp), and
+[docs/architecture-shader-map.md](docs/architecture-shader-map.md)
+(per-architecture shader dispatch map).
 
 ### Key optimisations
+
+**2026-05-09 — QKV defuse (+1.6–1.8 tok/s on Gemma 3 4B)**
+
+| Optimization | Savings | Technique |
+|---|---|---|
+| Default flipped from fused `q4k_q6k_qkv_proj_normed` to separate `rms_norm` + non-fused `q4k_q6k_qkv_proj` | **+1.6–1.8 tok/s, −0.30 ms/tok GPU fwd** | The fused kernel rolled RMS norm into Phase 1 of the matmul to save 1 dispatch/layer (~0.24 ms/tok), but each TG's 4 simdgroups independently re-traverse H + norm_w in Phase 2 (different stride patterns for Q4_K Q/K vs Q6_K V), dropping the kernel from 287 → 199 GB/s. The 1.46 ms/tok kernel cost exceeds the 0.24 ms/tok dispatch saving. ADR-016. `LARQL_QKV_FUSED=1` opts back in to the old fused path. |
 
 **2026-05-02 — dispatch geometry fix (+8 tok/s on Gemma 3 4B, +14 tok/s on Gemma 4 26B A4B)**
 
@@ -80,7 +91,7 @@ the 2026-05-02 fix.
 | f32_gemv (legacy lm_head fallback) | ~387 GB/s | — | bandwidth (at peak) |
 
 Both big FFN kernels are bandwidth-bound at 74–84% of LPDDR5X peak; no
-single-kernel headroom remains. The remaining 1.18× gap to ollama is
+single-kernel headroom remains. The remaining ~1.17× gap to ollama is
 distributed across dispatch overhead + the ~30 ms/tok of CPU-side ops
 (routing, KV append, sampling) — not a hot kernel waiting to be tuned.
 

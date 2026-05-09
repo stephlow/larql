@@ -184,6 +184,28 @@ pub trait DecodeBackend {
         )
     }
 
+    /// Decode one token while dispatching Q4_K per-layer expert tensors on
+    /// the backend. The expert callback returns borrowed `(gate_up, down)`
+    /// byte slices for the requested `(layer, expert)` pair.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_q4k_moe<'w>(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        _q_dim: usize,
+        _kv_dim: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        _norm_eps: f32,
+        _get_expert: &dyn Fn(usize, usize) -> Option<(&'w [u8], &'w [u8])>,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Split fire / collect variant of `decode_token_with_moe`.  At each MoE
     /// layer the implementation calls `moe_fire_fn(layer, h_post_attn)` once
     /// `h_post_attn` is computed, encodes dense FFN + post-FFN residual on a

@@ -551,6 +551,50 @@ mod tests {
     }
 
     #[test]
+    fn decode_single_rejects_partial_float_payload() {
+        let mut body = make_single_response(5, 1, 7.3, &[1.0]);
+        body.push(0);
+        let result = decode_binary_single(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_batch_rejects_impossible_result_count_before_allocating() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&BATCH_MARKER.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        let result = decode_binary_batch(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_batch_rejects_impossible_output_length_before_allocating() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&BATCH_MARKER.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&5u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        let result = decode_binary_batch(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_batch_i8_rejects_inconsistent_output_shape() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&BATCH_MARKER.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&5u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        let result = decode_binary_batch_i8(&body, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn binary_request_response_roundtrip() {
         // Encode a single-layer request, then simulate what the server echoes.
         let residual = vec![0.1f32, 0.2, 0.3, 0.4];

@@ -540,21 +540,23 @@ extraction-only flows (DESCRIBE, KNN, vindex publish) work today.
 
 | Operation | Latency | tok/s |
 |---|---|---|
-| **GPU Q4K decode (Metal, 34L, KV cache)** | **12.0ms** | **83.2** |
+| **GPU Q4K decode (Metal, 34L, KV cache)** | **11.4ms** | **88.1** |
 | Walk prediction (CPU, no attention) | 33ms | 30 |
 | INFER walk (CPU, with attention, mmap FFN) | 517ms | 1.9 |
 | INFER dense (CPU, all matmul) | 535ms | 1.9 |
 | DESCRIBE (knowledge browse) | 33ms | — |
 
-GPU decode per-stage breakdown (post 2026-05-02 dispatch geometry fix):
+GPU decode per-stage breakdown (post 2026-05-09 QKV defuse, ADR-016):
 
 | Component | Time | % of total |
 |---|---|---|
-| GPU forward (34 layers, Q4K/Q6K) | 11.16 ms | 86% |
-| LM head (Q4_K stride-32 + correctness fix) | 1.85 ms | 14% |
+| GPU forward (34 layers, Q4K/Q6K, defused norm+QKV) | 11.40 ms | 86% |
+| LM head (Q4_K production path) | 1.85 ms | 14% |
 | Embed + norm + detokenize | <0.1ms | <1% |
 
-vs ollama gemma3:4b on the same machine: 99 tok/s steady → **gap 1.18×**, was 1.30× before the fix.
+vs ollama gemma3:4b on the same machine: ~103 tok/s steady → **gap 1.17×**, was 1.18× pre QKV defuse, 1.30× pre 2026-05-02 dispatch fix. Acceptance criterion (~85 tok/s, ~1.16×) effectively met.
+
+**Cross-arch coverage (2026-05-09)**: Gemma 3, Gemma 4 31B dense, Llama 2 7B, Mistral 7B all dispatch correctly through Metal. Gemma 4 E2B currently falls back to CPU (Per-Layer Embeddings not yet in Metal — ROADMAP D-METAL-PLE). See [crates/larql-compute/docs/architecture-shader-map.md](crates/larql-compute/docs/architecture-shader-map.md) for the per-architecture shader dispatch table.
 
 CPU walk breakdown:
 

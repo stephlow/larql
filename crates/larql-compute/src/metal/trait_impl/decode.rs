@@ -684,6 +684,38 @@ impl DecodeBackend for MetalBackend {
         ))
     }
 
+    fn decode_token_q4k_moe<'w>(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        norm_eps: f32,
+        get_expert: &dyn Fn(usize, usize) -> Option<(&'w [u8], &'w [u8])>,
+    ) -> Option<Vec<f32>> {
+        MetalBackend::decode_token_q4k_moe(
+            self,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            norm_eps,
+            |layer_idx, expert_idx| get_expert(layer_idx, expert_idx),
+        )
+    }
+
     fn decode_token_with_moe_split(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],

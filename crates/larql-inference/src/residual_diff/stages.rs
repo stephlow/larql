@@ -45,6 +45,7 @@ use larql_models::ModelWeights;
 use larql_vindex::VectorIndex;
 
 use super::compare::{LayerStat, ParityThreshold};
+use crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 
 /// In-memory representation of one backend's per-stage dump for one
 /// layer. Stage names are exactly the suffixes the producer wrote
@@ -218,7 +219,7 @@ impl StageCapture {
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
 
         use larql_vindex::GateIndex;
         let gate_index: &dyn GateIndex = index;
