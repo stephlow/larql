@@ -93,6 +93,7 @@ pub(super) struct ProgramCache {
 }
 
 impl ProgramCache {
+    #[allow(dead_code)]
     pub(super) fn num_codes(&self) -> usize {
         1 << self.base_config_bits_per_group
     }

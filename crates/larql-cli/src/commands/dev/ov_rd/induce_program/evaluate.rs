@@ -1,3 +1,7 @@
+// PromptResult fields (id, stratum, …) are accumulated for a future
+// diagnostic dump; suppress until the viewer is wired.
+#![allow(dead_code)]
+
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
 

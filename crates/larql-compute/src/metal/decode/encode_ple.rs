@@ -65,77 +65,111 @@ impl MetalBackend {
         let Some(ple) = layer.ple_spec() else {
             return;
         };
+        // Kill-switch: skip just the dispatch (helps isolate whether the
+        // gibberish symptom is from PLE math being wrong vs PLE missing).
+        if std::env::var("LARQL_PLE_NOOP").is_ok() {
+            return;
+        }
+        // Step-toggle: skip individual phases to bisect which step is wrong.
+        // LARQL_PLE_PHASES=1234 -> all four (default if unset)
+        // LARQL_PLE_PHASES=1    -> only the gate matvec (debug)
+        let phases =
+            std::env::var("LARQL_PLE_PHASES").unwrap_or_else(|_| "1234".to_string());
+        let do_step1 = phases.contains('1');
+        let do_step2 = phases.contains('2');
+        let do_step3 = phases.contains('3');
+        let do_step4 = phases.contains('4');
 
         let gemv = &self.f32_gemv_pipeline;
 
         // ── Step 1: gate = h × W_input_gate.T → [ple_dim] ──
-        let w_gate_buf = self.bufs.get_f32(ple.input_gate);
-        let n1 = ple_dim as u32;
-        let k1 = hidden as u32;
-        let tgs1 = (ple_dim as u64).div_ceil(gemv.rows_per_tg);
-        enc.set_compute_pipeline_state(&gemv.state);
-        enc.set_buffer(0, Some(&w_gate_buf), 0);
-        enc.set_buffer(1, Some(bufs.h), 0);
-        enc.set_buffer(2, Some(bufs.gate_scratch), 0);
-        enc.set_bytes(3, 4, &n1 as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(4, 4, &k1 as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new(tgs1, 1, 1),
-            MTLSize::new(gemv.threads_per_tg, 1, 1),
-        );
+        if do_step1 {
+            let w_gate_buf = self.bufs.get_f32(ple.input_gate);
+            let n1 = ple_dim as u32;
+            let k1 = hidden as u32;
+            let tgs1 = (ple_dim as u64).div_ceil(gemv.rows_per_tg);
+            enc.set_compute_pipeline_state(&gemv.state);
+            enc.set_buffer(0, Some(&w_gate_buf), 0);
+            enc.set_buffer(1, Some(bufs.h), 0);
+            enc.set_buffer(2, Some(bufs.gate_scratch), 0);
+            enc.set_bytes(3, 4, &n1 as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &k1 as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tgs1, 1, 1),
+                MTLSize::new(gemv.threads_per_tg, 1, 1),
+            );
+        }
 
         // ── Step 2: gate = gelu_tanh(gate) * per_layer_input  (in-place) ──
-        let n2 = ple_dim as u32;
-        enc.set_compute_pipeline_state(&self.ffn.ple_gate_apply_pipeline);
-        enc.set_buffer(0, Some(bufs.gate_scratch), 0); // gate_in
-        enc.set_buffer(1, Some(bufs.per_layer_input), bufs.per_layer_input_offset); // per_layer_input row
-        enc.set_buffer(2, Some(bufs.gate_scratch), 0); // gate_out (alias of gate_in)
-        enc.set_bytes(3, 4, &n2 as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_threads(
-            MTLSize::new(ple_dim as u64, 1, 1),
-            MTLSize::new((ple_dim as u64).min(256), 1, 1),
-        );
+        if do_step2 {
+            let n2 = ple_dim as u32;
+            enc.set_compute_pipeline_state(&self.ffn.ple_gate_apply_pipeline);
+            enc.set_buffer(0, Some(bufs.gate_scratch), 0); // gate_in
+            enc.set_buffer(1, Some(bufs.per_layer_input), bufs.per_layer_input_offset); // per_layer_input row
+            enc.set_buffer(2, Some(bufs.gate_scratch), 0); // gate_out (alias of gate_in)
+            enc.set_bytes(3, 4, &n2 as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(
+                MTLSize::new(ple_dim as u64, 1, 1),
+                MTLSize::new((ple_dim as u64).min(256), 1, 1),
+            );
+        }
 
         // ── Step 3: contrib = gate × W_projection.T → [hidden] ──
-        let w_proj_buf = self.bufs.get_f32(ple.projection);
-        let n3 = hidden as u32;
-        let k3 = ple_dim as u32;
-        let tgs3 = (hidden as u64).div_ceil(gemv.rows_per_tg);
-        enc.set_compute_pipeline_state(&gemv.state);
-        enc.set_buffer(0, Some(&w_proj_buf), 0);
-        enc.set_buffer(1, Some(bufs.gate_scratch), 0);
-        enc.set_buffer(2, Some(bufs.contrib_scratch), 0);
-        enc.set_bytes(3, 4, &n3 as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(4, 4, &k3 as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new(tgs3, 1, 1),
-            MTLSize::new(gemv.threads_per_tg, 1, 1),
-        );
+        if do_step3 {
+            let w_proj_buf = self.bufs.get_f32(ple.projection);
+            let n3 = hidden as u32;
+            let k3 = ple_dim as u32;
+            let tgs3 = (hidden as u64).div_ceil(gemv.rows_per_tg);
+            enc.set_compute_pipeline_state(&gemv.state);
+            enc.set_buffer(0, Some(&w_proj_buf), 0);
+            enc.set_buffer(1, Some(bufs.gate_scratch), 0);
+            enc.set_buffer(2, Some(bufs.contrib_scratch), 0);
+            enc.set_bytes(3, 4, &n3 as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &k3 as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tgs3, 1, 1),
+                MTLSize::new(gemv.threads_per_tg, 1, 1),
+            );
+        }
 
-        // ── Step 4: h += rms_norm(contrib) · w  (post_ffn_norm_residual_add, reused) ──
-        // Aliases h_post_attn (buffer 1) and new_h (buffer 3) to the same
-        // residual buffer. The shader is single-TG with each thread doing
-        // `read h[i]` → `write h[i]` at one index per iteration, so the
-        // aliasing has no race.
-        let post_norm_buf = self.bufs.get_f32(ple.post_norm);
-        let hidden_val = hidden as u32;
-        let eps = layer.eps;
-        let norm_offset = layer.norm_offset;
-        enc.set_compute_pipeline_state(&self.norms.post_ffn_norm_residual_add_pipeline);
-        enc.set_buffer(0, Some(bufs.contrib_scratch), 0); // down_out (== contrib)
-        enc.set_buffer(1, Some(bufs.h), 0); // h_post_attn (== h)
-        enc.set_buffer(2, Some(&post_norm_buf), 0); // w
-        enc.set_buffer(3, Some(bufs.h), 0); // new_h (== h, alias)
-        enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-        enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new(1, 1, 1),
-            MTLSize::new(
-                crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
-                1,
-                1,
-            ),
-        );
+        // ── Step 4: h += rms_norm(contrib) · w ──
+        // Unfused: rms_norm writes into gate_scratch (reused as a hidden-sized
+        // scratch — gate_scratch is `inter * 4` bytes ≥ hidden * 4 bytes for
+        // E2B's intermediate) , then residual_add does `h = h + normed`.
+        // Avoids the aliased post_ffn_norm_residual_add path (which assumed
+        // single-TG read-then-write was safe but currently produces wrong
+        // output on E2B; suspect Metal hazard ordering or a sign issue).
+        if do_step4 {
+            let post_norm_buf = self.bufs.get_f32(ple.post_norm);
+            let hidden_val = hidden as u32;
+            let eps = layer.eps;
+            let norm_offset = layer.norm_offset;
+            // 4a: rms_norm(contrib_scratch, post_norm) -> gate_scratch (reused as hidden-sized scratch)
+            enc.set_compute_pipeline_state(&self.norms.rms_norm_pipeline);
+            enc.set_buffer(0, Some(bufs.contrib_scratch), 0); // x
+            enc.set_buffer(1, Some(&post_norm_buf), 0); // weight
+            enc.set_buffer(2, Some(bufs.gate_scratch), 0); // out (reusing gate_scratch as scratch — sized inter*4 ≥ hidden*4)
+            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(1, 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                    1,
+                    1,
+                ),
+            );
+            // 4b: residual_add(h, normed) -> h (in-place)
+            enc.set_compute_pipeline_state(&self.norms.residual_add_pipeline);
+            enc.set_buffer(0, Some(bufs.h), 0); // a
+            enc.set_buffer(1, Some(bufs.gate_scratch), 0); // b (= normed)
+            enc.set_buffer(2, Some(bufs.h), 0); // out (alias of a — element-wise, safe)
+            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(
+                MTLSize::new(hidden as u64, 1, 1),
+                MTLSize::new((hidden as u64).min(256), 1, 1),
+            );
+        }
     }
 }

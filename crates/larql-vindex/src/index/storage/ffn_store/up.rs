@@ -23,14 +23,15 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only activated feature vectors are read per token.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.up_features_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
+        Arc::make_mut(&mut self.storage).set_up_features(mmap);
         Ok(())
     }
 
     /// Get the full up matrix for a layer: [intermediate, hidden] zero-copy view.
     pub fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.ffn.up_features_mmap.as_ref()?;
+        let bytes = self.storage.up_features_view()?;
+        let mmap: &[u8] = bytes.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 {
             return None;
@@ -51,7 +52,7 @@ impl VectorIndex {
 
     /// Whether both up and down feature-major mmaps are loaded.
     pub fn has_full_mmap_ffn(&self) -> bool {
-        self.ffn.down_features_mmap.is_some() && self.ffn.up_features_mmap.is_some()
+        self.storage.has_down_features() && self.storage.has_up_features()
     }
 }
 

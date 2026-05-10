@@ -8,6 +8,7 @@ mod formatting;
 mod utils;
 
 use commands::dev::*;
+use commands::diagnostics::*;
 use commands::extraction::*;
 use commands::primary::*;
 use commands::query::*;
@@ -120,6 +121,14 @@ enum Commands {
     #[command(next_help_heading = "Build")]
     /// Verify vindex file integrity (SHA256 checksums).
     Verify(verify_cmd::VerifyArgs),
+
+    #[command(next_help_heading = "Build")]
+    /// Engine diagnostic — print which kernel paths fire for a vindex.
+    Diag(diag_cmd::DiagArgs),
+
+    #[command(next_help_heading = "Build")]
+    /// Cross-backend numerical parity diff (CPU vs Metal vs reference).
+    Parity(parity::ParityArgs),
 
     // ── Query (legacy, pre-LQL graph-file surface) ──────────────────
     #[command(next_help_heading = "Query")]
@@ -513,6 +522,8 @@ fn main() {
         Commands::Convert(args) => convert_cmd::run(args),
         Commands::Hf(args) => hf_cmd::run(args),
         Commands::Verify(args) => verify_cmd::run(args),
+        Commands::Diag(args) => diag_cmd::run(args),
+        Commands::Parity(args) => parity::run(args),
 
         // ── Query (legacy graph-file surface) ──
         Commands::Query(args) => query_cmd::run(args),

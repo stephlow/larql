@@ -347,10 +347,26 @@ fn gate_scores_batch_uses_f16_mmap_decode_cache() {
 #[test]
 fn gate_scores_batch_backend_uses_single_row_backend_fast_paths() {
     let mut warmed = heap_gate_index();
-    warmed.gate.gate_mmap_slices = vec![larql_vindex::index::types::GateLayerSlice {
-        float_offset: 0,
-        num_features: GATE_FEATURES,
-    }];
+    // Test poke: the gate KNN warmed-cache fast path needs both the
+    // warmed cache to be populated AND the storage to advertise a
+    // matching layer slice. After step 6 the slice lives on
+    // `MmapStorage`, so we install it via the setter with a
+    // throwaway zero-byte mmap (only the slice meta is consulted on
+    // the warmed-cache path, the bytes are never read).
+    let throwaway = memmap2::MmapOptions::new()
+        .len(GATE_FEATURES * 3 * 4)
+        .map_anon()
+        .unwrap()
+        .make_read_only()
+        .unwrap();
+    std::sync::Arc::make_mut(&mut warmed.storage).set_gate_vectors(
+        std::sync::Arc::new(throwaway),
+        larql_vindex::StorageDtype::F32,
+        vec![larql_vindex::index::types::GateLayerSlice {
+            float_offset: 0,
+            num_features: GATE_FEATURES,
+        }],
+    );
     warmed.gate.warmed_gates.write().unwrap()[0] = Some(vec![1.0, 0.0, 2.0, 0.0, -1.0, 1.0]);
 
     let backend = FakeGemvBackend;

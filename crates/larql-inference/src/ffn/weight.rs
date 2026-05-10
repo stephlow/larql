@@ -304,4 +304,43 @@ mod tests {
             assert!((a - b).abs() < 1e-4, "act diverged: {a} vs {b}");
         }
     }
+
+    // ── Starcoder2-arch: non-gated FFN + biases ────────────────────────
+
+    #[test]
+    fn dense_ffn_forward_starcoder2_runs_non_gated_branch() {
+        // Starcoder2 has ffn_type = NonGated, so dense_ffn_forward takes
+        // the `else` branch (no gate matrix; just up + activation + down).
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let input = x(2, weights.hidden_size);
+        let (out, act) = dense_ffn_forward(&weights, 0, &input);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+        // Non-gated activation has shape (seq, intermediate).
+        assert_eq!(act.shape(), &[2, weights.intermediate_size]);
+    }
+
+    #[test]
+    fn dense_ffn_forward_starcoder2_bias_paths_fire() {
+        // Starcoder2 returns Some from ffn_up_bias_key + ffn_down_bias_key,
+        // so the `add_bias(&mut projected, bias)` and `add_bias(&mut out,
+        // bias)` calls fire.
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let input = x(1, weights.hidden_size);
+        let (out, _) = dense_ffn_forward(&weights, 0, &input);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    // ── Gemma3-arch: GeluTanh activation in gated FFN ──────────────────
+
+    #[test]
+    fn dense_ffn_forward_gemma3_runs_gelu_tanh_gate_up_branch() {
+        // Gemma3 has activation = GeluTanh, exercising the
+        // `gelu_tanh_gate_up` branch instead of the default silu.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let input = x(2, weights.hidden_size);
+        let (out, _) = dense_ffn_forward(&weights, 0, &input);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
 }

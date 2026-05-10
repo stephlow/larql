@@ -396,6 +396,33 @@ mod tests {
     }
 
     #[test]
+    fn walk_trace_from_residuals_returns_per_layer_walk_hits() {
+        use crate::test_utils::TestFixtures;
+        let fx = TestFixtures::build();
+        let patched = larql_vindex::PatchedVindex::new(fx.index);
+        let residuals = vec![
+            (0usize, vec![0.1f32; fx.weights.hidden_size]),
+            (1usize, vec![0.2f32; fx.weights.hidden_size]),
+        ];
+        let trace = walk_trace_from_residuals(&residuals, &patched);
+        // One entry per residual.
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].0, 0);
+        assert_eq!(trace[1].0, 1);
+        // Synthetic vindex returns no FeatureMeta, so walk_hits is empty
+        // — but the per-layer entry must still be present.
+    }
+
+    #[test]
+    fn walk_trace_from_residuals_empty_input_returns_empty() {
+        use crate::test_utils::TestFixtures;
+        let fx = TestFixtures::build();
+        let patched = larql_vindex::PatchedVindex::new(fx.index);
+        let trace = walk_trace_from_residuals(&[], &patched);
+        assert!(trace.is_empty());
+    }
+
+    #[test]
     fn infer_patched_with_knn_store_override_routes_through() {
         use crate::test_utils::TestFixtures;
         let fx = TestFixtures::build();

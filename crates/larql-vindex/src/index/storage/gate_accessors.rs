@@ -14,6 +14,7 @@
 use ndarray::Array2;
 
 use crate::index::core::VectorIndex;
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::index::types::*;
 
 impl VectorIndex {
@@ -65,14 +66,14 @@ impl VectorIndex {
         if self.storage.has_interleaved_q4() {
             parts.push("Q4_0 interleaved".into());
         }
-        if self.ffn.interleaved_mmap.is_some() {
+        if self.storage.has_interleaved_f32() {
             parts.push("f32 interleaved".into());
         }
-        if self.ffn.up_features_mmap.is_some() && self.ffn.down_features_mmap.is_some() {
+        if self.storage.has_up_features() && self.storage.has_down_features() {
             parts.push("full mmap (up+down f32)".into());
         }
-        if self.gate.gate_mmap_bytes.is_some() {
-            parts.push(format!("gate KNN ({:?} mmap)", self.gate.gate_mmap_dtype));
+        if self.storage.has_gate_vectors() {
+            parts.push(format!("gate KNN ({:?} mmap)", self.storage.gate_dtype()));
         }
         if parts.is_empty() {
             "weights fallback (safetensors — vindex not wired)".into()
@@ -90,11 +91,10 @@ impl VectorIndex {
     /// sees `num_features == 0` and falls through to the safetensors
     /// weights path, silently bypassing the vindex entirely.
     pub fn num_features(&self, layer: usize) -> usize {
-        if self.gate.gate_mmap_bytes.is_some() {
+        if self.storage.has_gate_vectors() {
             let n = self
-                .gate
-                .gate_mmap_slices
-                .get(layer)
+                .storage
+                .gate_layer_slice(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0);
             if n > 0 {
@@ -124,10 +124,10 @@ impl VectorIndex {
 
     /// Total gate vectors loaded across all layers.
     pub fn total_gate_vectors(&self) -> usize {
-        if self.gate.gate_mmap_bytes.is_some() {
+        if self.storage.has_gate_vectors() {
             return self
-                .gate
-                .gate_mmap_slices
+                .storage
+                .gate_layer_slices()
                 .iter()
                 .map(|s| s.num_features)
                 .sum();
@@ -155,10 +155,10 @@ impl VectorIndex {
 
     /// Layers that have gate vectors loaded.
     pub fn loaded_layers(&self) -> Vec<usize> {
-        if self.gate.gate_mmap_bytes.is_some() {
+        if self.storage.has_gate_vectors() {
             return self
-                .gate
-                .gate_mmap_slices
+                .storage
+                .gate_layer_slices()
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.num_features > 0)
@@ -199,23 +199,19 @@ impl VectorIndex {
             return None;
         }
         // Mmap path
-        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                if feature >= slice.num_features {
-                    return None;
-                }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                let byte_offset = (slice.float_offset + feature * self.hidden_size) * bpf;
-                let byte_count = self.hidden_size * bpf;
-                if byte_offset + byte_count > mmap.len() {
-                    return None;
-                }
-                let raw = &mmap[byte_offset..byte_offset + byte_count];
-                return Some(crate::config::dtype::decode_floats(
-                    raw,
-                    self.gate.gate_mmap_dtype,
-                ));
+        if let Some(view) = self.storage.gate_layer_view(layer) {
+            if feature >= view.slice.num_features {
+                return None;
             }
+            let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+            let byte_offset = (view.slice.float_offset + feature * self.hidden_size) * bpf;
+            let byte_count = self.hidden_size * bpf;
+            let mmap: &[u8] = view.bytes.as_ref();
+            if byte_offset + byte_count > mmap.len() {
+                return None;
+            }
+            let raw = &mmap[byte_offset..byte_offset + byte_count];
+            return Some(crate::config::dtype::decode_floats(raw, view.dtype));
         }
         None
     }
@@ -238,31 +234,29 @@ impl VectorIndex {
             return Some((data, rows, cols));
         }
         // Mmap path
-        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                if slice.num_features == 0 {
-                    return None;
-                }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                let byte_offset = slice.float_offset * bpf;
-                let byte_count = slice.num_features * self.hidden_size * bpf;
-                if byte_offset + byte_count > mmap.len() {
-                    return None;
-                }
-                let raw = &mmap[byte_offset..byte_offset + byte_count];
-                let data = crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype);
-                return Some((data, slice.num_features, self.hidden_size));
+        if let Some(view) = self.storage.gate_layer_view(layer) {
+            if view.slice.num_features == 0 {
+                return None;
             }
+            let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+            let byte_offset = view.slice.float_offset * bpf;
+            let byte_count = view.slice.num_features * self.hidden_size * bpf;
+            let mmap: &[u8] = view.bytes.as_ref();
+            if byte_offset + byte_count > mmap.len() {
+                return None;
+            }
+            let raw = &mmap[byte_offset..byte_offset + byte_count];
+            let data = crate::config::dtype::decode_floats(raw, view.dtype);
+            return Some((data, view.slice.num_features, self.hidden_size));
         }
         None
     }
 
     /// Number of features at a layer (works in both heap and mmap mode).
     pub fn num_features_at(&self, layer: usize) -> usize {
-        if self.gate.gate_mmap_bytes.is_some() {
-            self.gate
-                .gate_mmap_slices
-                .get(layer)
+        if self.storage.has_gate_vectors() {
+            self.storage
+                .gate_layer_slice(layer)
                 .map(|s| s.num_features)
                 .unwrap_or(0)
         } else {
@@ -282,73 +276,35 @@ impl VectorIndex {
     /// is for single-shard-holds-everything topologies that still want
     /// to bound RSS between requests.
     pub fn release_mmap_pages(&self) {
-        use memmap2::UncheckedAdvice;
         // Linux: MADV_DONTNEED immediately drops clean pages from RSS.
-        // Darwin: MADV_DONTNEED is advisory for shared file-backed mmap;
-        // the kernel may defer release until memory pressure. Layer
-        // sharding (`--layers`) is the strict bound on macOS; this call
-        // is the strict bound on Linux.
+        // Darwin: MADV_DONTNEED is advisory for shared file-backed
+        // mmap; the kernel may defer release until memory pressure.
         //
-        // Safety: `unchecked_advise` requires no live references into the
-        // mmap during the call. The server calls this from the walk-ffn
-        // handler AFTER the per-request borrow of `patched` (and any
-        // derived byte slices) has dropped — the handler closure builds
-        // its own read-lock on `patched`, and the earlier request
-        // closure has returned before this function runs.
-        let advise = |m: &memmap2::Mmap| unsafe {
-            let _ = m.unchecked_advise(UncheckedAdvice::DontNeed);
-        };
-        if let Some(ref m) = self.gate.gate_mmap_bytes {
-            advise(m);
-        }
-        if let Some(ref m) = self.ffn.down_features_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.ffn.up_features_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.projections.lm_head_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.projections.lm_head_f16_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.ffn.interleaved_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.ffn.interleaved_q4_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.ffn.interleaved_q4k_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.gate.gate_q4_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.projections.lm_head_q4_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.projections.attn_q4k_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.projections.attn_q4_mmap {
-            advise(m);
-        }
-        if let Some(ref m) = self.projections.attn_q8_mmap {
-            advise(m);
-        }
+        // Every mmap-backed file in the vindex is registered with
+        // `MmapStorage::mmap_handles` (the setters track them as they
+        // install bytes). One call covers all of them.
+        // Heap-backed entries (synth lm_head) aren't registered, so
+        // iterating is safe.
+        //
+        // Safety: `unchecked_advise` requires no live references into
+        // the mmap during the call. The server calls this from the
+        // walk-ffn handler AFTER the per-request borrow of `patched`
+        // (and any derived byte slices) has dropped.
+        self.storage.release_pages();
     }
 
     /// Pre-decode f16 gate vectors to f32 for lock-free access.
     /// For f32 vindexes this is a no-op — the mmap path is already zero-copy.
     pub fn warmup(&self) {
-        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
+        if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F32 {
             return;
         }
 
-        let Some(ref mmap) = self.gate.gate_mmap_bytes else {
+        let Some(bytes) = self.storage.gate_bytes_view() else {
             return;
         };
+        let mmap: &[u8] = bytes.as_ref();
+        let dtype = self.storage.gate_dtype();
         let mut warmed = self.gate.warmed_gates.write().unwrap();
         if warmed.len() < self.num_layers {
             warmed.resize_with(self.num_layers, || None);
@@ -357,11 +313,11 @@ impl VectorIndex {
             if warmed[layer].is_some() {
                 continue;
             }
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
+            if let Some(slice) = self.storage.gate_layer_slice(layer) {
                 if slice.num_features == 0 {
                     continue;
                 }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
+                let bpf = crate::config::dtype::bytes_per_float(dtype);
                 let byte_offset = slice.float_offset * bpf;
                 let byte_count = slice.num_features * self.hidden_size * bpf;
                 let byte_end = byte_offset + byte_count;
@@ -877,9 +833,11 @@ mod accessor_tests {
 
     #[test]
     fn warmup_no_op_without_mmap() {
-        // Heap-only index with F16 dtype — no mmap → early return.
-        let mut v = VectorIndex::empty(1, 4);
-        v.gate.gate_mmap_dtype = StorageDtype::F16;
+        // Heap-only index — no gate mmap → early return regardless
+        // of dtype. After step 6 the dtype lives on `MmapStorage`,
+        // not the substore; an empty storage stays at the F32 default
+        // and the warmup early-returns on the dtype check anyway.
+        let v = VectorIndex::empty(1, 4);
         v.warmup();
         let warmed = v.gate.warmed_gates.read().unwrap();
         assert!(warmed.iter().all(|s| s.is_none()));

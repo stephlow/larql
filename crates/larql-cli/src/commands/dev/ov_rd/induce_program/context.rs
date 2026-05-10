@@ -1,3 +1,8 @@
+// FitContext / PromptCapture carry diagnostic fields (config,
+// codebook_fingerprint, num_codes helper) accumulated for a future
+// debug dump; suppress until the viewer is wired.
+#![allow(dead_code)]
+
 use super::super::pq::ModeDTable;
 use super::super::types::{HeadId, PqConfig};
 

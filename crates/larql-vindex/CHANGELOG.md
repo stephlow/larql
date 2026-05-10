@@ -6,6 +6,202 @@ The format follows the conventions of [Keep a Changelog](https://keepachangelog.
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-10] — Coverage push after the migration
+
+Lifted the post-step-6/7 debt baselines back up. Migration shrunk
+several files (forwarders) which mechanically lowered % even though
+covered-line counts barely changed; this pass rebuilds coverage with
+new tests on the actual conditional branches.
+
+### Files lifted
+- `gate_knn/dispatch.rs`: **64.68% → 78.67%** (+14 points). 13 new
+  inline tests covering `gate_knn` heap path, `gate_walk`,
+  `gate_knn_expert` (heap + invalid range), `walk` with metadata,
+  `gate_knn_batch` (empty / single / parallel-branch / heap fallback),
+  `gate_knn_q4` (no-Q4-data branch), `gate_knn_adaptive` heap
+  fall-through.
+- `gate_knn/scores_batch.rs`: **70.97% → 83.39%** (+12 points). 9
+  new tests covering empty seq, out-of-range layer, heap multi-pos
+  + single-pos, f16 mmap fast path with decode-cache population,
+  warmed-cache fast path, backend fall-back to BLAS, empty-layer
+  short-circuit.
+- `lm_head/knn.rs`: **72.04% → 84.73%** (+13 points). 4 new tests
+  covering `lm_head_knn_backend` f32 fall-back (no Q4/f16),
+  `lm_head_knn_backend_skip_q4k` f32 fall-back, stride-32 path
+  short-circuit when no Q4 mmap, f16 path None on vocab=0.
+
+### Files already at 90%+ that no longer need debt baselines
+After step 6/7 the actual coverage was much higher than the
+defensively-lowered baselines. Removed entries for:
+`mmap_storage.rs` (99.63%), `core/mod.rs` (96.88%),
+`core/quantized_ffn.rs` (98.82%), `ffn_store/mod.rs` (98.48%),
+`patch/overlay.rs` (82.95% — kept at 82.0 baseline; close).
+
+### Tests + tooling
+- Lib tests **896 → 922** (+26 across the three files).
+- Total coverage: 89.68% → **90.04%** (cleared the workspace 90%
+  line).
+- 86 / 126 files at the 90% per-file default (was 82).
+- 40 debt baselines (was 44).
+- `cargo clippy --lib --tests --benches -- -D warnings`: clean.
+- `cargo fmt --check`: clean.
+- All four self-contained examples still run end-to-end.
+
+## [2026-05-10] — Step 7: f32 native FFN to MmapStorage + madvise consolidation
+
+Closes the last "future cleanup" thread from step 6. Every
+file-backed mmap now lives on `MmapStorage`; substores hold only
+caches + FP4.
+
+### Migrated to `MmapStorage`
+- `up_features` (`up_features.bin`, f32) — new setter
+  `set_up_features`, `has_up_features`, `up_features_view`.
+- `down_features` (`down_features.bin`, f32) — `set_down_features`,
+  `has_down_features`, `down_features_view`.
+- `interleaved_f32` (`interleaved.bin`, f32) — `set_interleaved_f32`,
+  `has_interleaved_f32`, `interleaved_f32_view`.
+
+### Loader + accessor migrations
+- `ffn_store/up.rs` — `load_up_features` writes via setter;
+  `up_layer_matrix` reads via `up_features_view`. `has_full_mmap_ffn`
+  now via storage.
+- `ffn_store/down.rs` — `load_down_features` writes via setter;
+  `has_down_features`, `down_feature_vector`, `down_layer_matrix`
+  read via storage views.
+- `ffn_store/interleaved.rs` — `load_interleaved`,
+  `has_interleaved`, `interleaved_{gate,up,down}`,
+  `prefetch_interleaved_layer` all migrated.
+- `index/core/native_ffn.rs::has_down_features` trait shim now
+  forwards through the inherent method (which forwards to storage).
+- `gate_accessors::describe_ffn_backend` `is_some()` checks for
+  the three f32 paths now use `storage.has_*()`.
+
+### `release_mmap_pages` simplified
+- Was: `self.storage.release_pages()` + manual madvise on the three
+  substore mmaps that hadn't migrated.
+- Now: just `self.storage.release_pages()`. All file-backed mmaps
+  are tracked in `MmapStorage::mmap_handles`; one call covers them
+  all. Heap-backed entries (synth lm_head) excluded as before.
+
+### `FfnStore` final shape
+After step 7 the substore holds only:
+- `q4k_ffn_cache` / `q4k_ffn_cache_lru` / `q4k_ffn_cache_max_layers`
+  — bounded LRU dequant cache for the legacy CPU per-position path.
+- `q4k_ffn_once` — lock-free per-slot dequant cache for the
+  parallel batch server path.
+- `fp4_storage: Option<Arc<Fp4Storage>>` — FP4 / FP8 FFN storage.
+  FP4 stays out of the trait by design (it's a per-feature decoder,
+  not a byte handle).
+
+### Tests + tooling
+- Lib tests stay at **896**. Updated 3 `core::refactor_tests`
+  assertions to check `storage.has_*()` instead of dropped
+  `ffn.<field>_mmap` fields.
+- All four self-contained examples (`mmap_demo`, `demo_memit_solve`,
+  `q4k_demo`, `walker_demo`) run end-to-end. All other examples
+  compile clean via `cargo check --examples`.
+- All 9 benches compile and pass criterion's `--test` mode.
+- `cargo clippy --lib --tests --benches -- -D warnings` clean.
+- `cargo fmt --check` clean.
+- Coverage policy passes: total **89.90%** lines, 82/126 files at
+  90% default, 44 debt baselines.
+
+### Documentation
+- `README.md` — substore directory tree updated to reflect
+  `vindex_storage/` replacing `projection_store.rs`. Other doc
+  references (`fp4.projections.*` in `format-spec.md` /
+  `operations-spec.md` / `fp4-format-spec.md`) are JSON schema
+  paths, unrelated to the deleted `ProjectionStore` Rust struct.
+
+### Open
+- Coverage debt baselines lowered for several files in step 6
+  (`compute/gate_knn/*`, `gate_store`, `lm_head/knn`,
+  `mmap_storage`, others) reflecting new conditional branches that
+  aren't all exercised. Lifting these toward 90% is a focused test
+  pass; tracked separately.
+
+## [2026-05-10] — Step 6: `MmapStorage` becomes the source of truth
+
+Completes the `VindexStorage` migration. `MmapStorage` now owns every
+trait-covered byte buffer; substores hold only heap-mode state and
+caches.
+
+### Dropped substore fields
+- **`ProjectionStore` deleted entirely.** All 9 fields (`lm_head_*`,
+  `attn_q4k_*`, `attn_q4_*`, `attn_q8_*`) moved to `MmapStorage`.
+  `VectorIndex.projections` field removed; `pub mod projection_store`
+  removed.
+- **`GateStore`** lost `gate_mmap_bytes`, `gate_mmap_dtype`,
+  `gate_mmap_slices`, `gate_q4_mmap`, `gate_q4_slices`. Heap fields
+  (`gate_vectors`, decode caches, HNSW caches, atomics) stayed.
+- **`FfnStore`** lost `interleaved_q4k_mmap` / `_manifest`,
+  `interleaved_q4_mmap`, `down_features_q4k_mmap` / `_manifest`.
+  Kept f32 native paths (`up_features_mmap`, `down_features_mmap`,
+  `interleaved_mmap`) and FP4 storage — not yet behind the trait.
+
+### Read migrations (~75 sites)
+- `gate_accessors.rs` — `num_features`, `total_gate_vectors`,
+  `loaded_layers`, `num_features_at`, `gate_vector`,
+  `gate_vectors_flat`, `release_mmap_pages`, `warmup`,
+  `describe_ffn_backend` all consume `self.storage.*` instead of
+  substore fields.
+- `compute/gate_knn/dispatch.rs`, `scores_batch.rs`,
+  `hnsw_lifecycle.rs` — gate-KNN compute uses
+  `gate_layer_view(layer)` for the bytes + dtype + slice trio that
+  feeds ndarray views.
+- `gate_store.rs::resolve_gate` and `gate_knn_mmap_fast` —
+  `gate_layer_view` instead of three-field reach.
+- `mutate/mod.rs::set_gate_vector` and `promote_layer_to_heap` —
+  `gate_layer_view` for the mmap → heap promotion path.
+- `patch/overlay.rs` — overlay's mmap-mode gate decode uses
+  `base.storage.gate_layer_view`.
+- `lm_head/knn.rs` — Q4_K + f16 + f32 paths read through
+  `self.storage.lm_head_*_view` / `lm_head_q4_view`.
+- `interleaved_q4k.rs::prefetch_interleaved_q4k_layer`,
+  `interleaved_q4.rs::dequant_q4_matrix` /
+  `prefetch_interleaved_q4_layer` — all migrated to whole-buffer
+  view + per-layer view.
+
+### `MmapStorage::release_pages()`
+- New method calls `madvise(MADV_DONTNEED)` on each tracked
+  `Arc<Mmap>` (kept in `mmap_handles: Vec<Arc<Mmap>>` populated
+  per setter call). Heap-backed entries (synth lm_head) are
+  not registered, so iterating is safe.
+- `gate_accessors::release_mmap_pages` now calls
+  `self.storage.release_pages()` for trait-covered mmaps + advises
+  the f32 native FFN mmaps directly (still on substore until that
+  migration lands).
+
+### Concrete helpers added on `MmapStorage`
+- `gate_layer_slices()`, `gate_dtype()`, `gate_layer_slice(layer)`,
+  `gate_q4_layer_slices()`, `gate_q4_layer_slice(layer)`,
+  `gate_bytes_view()`, `gate_q4_bytes_view()`. Inherent (not on
+  the trait) because they expose mmap-shaped metadata that doesn't
+  carry across to a Redis backend.
+
+### Tests + tooling
+- Lib tests **890 → 896** (+6: gate helpers / release_pages /
+  register_mmap / BytesView::is_empty).
+- `cargo clippy --lib --tests --benches -- -D warnings`: clean.
+- `cargo fmt --check`: clean.
+- Coverage policy passes: total **89.68%** lines, 82/126 files at
+  90% default, 44 debt baselines (several updated to reflect step 6
+  shrinkage / new branches across `compute/gate_knn/*`,
+  `gate_store`, `lm_head/knn`).
+- `from_substores` removed (was the bridge during step 5; gone
+  with substore fields). The bench builds `MmapStorage` directly
+  via `set_*` setters.
+
+### What's left
+- f32 native FFN paths (`up_features_mmap`, `down_features_mmap`,
+  `interleaved_mmap`) — not yet in the trait surface. Migrating
+  them to `MmapStorage` would shrink `FfnStore` further; left as a
+  future cleanup since no Redis-backed need has materialised.
+- `MmapStorage::release_pages()` does **not** advise the f32
+  native FFN mmaps (they're still on substore). The legacy
+  `gate_accessors::release_mmap_pages` advises both paths — once
+  f32 FFN migrates, the substore-side advise loop can drop too.
+
 ## [2026-05-10] — `VindexStorage` trait skeleton + `MmapStorage` parity wrapper
 
 Steps 1–3 of the `VindexStorage` migration (P0 active in

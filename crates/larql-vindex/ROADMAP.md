@@ -2,7 +2,7 @@
 
 ## Current state (as of 2026-05-10)
 
-- **866 lib tests** on `larql-vindex` (`cargo test -p larql-vindex
+- **922 lib tests** on `larql-vindex` (`cargo test -p larql-vindex
   --lib`). Crate-local checks are wired through `make larql-vindex-ci`:
   fmt, clippy `-D warnings`, tests, example compile checks, bench
   compile/tests, and coverage policy. All four self-contained examples
@@ -199,16 +199,21 @@ the trait surface should leave room for it but we don't implement.
   `gate_accessors.rs` `is_some()` checks, `is_mmap()`,
   `attn_q4_data`. `MmapStorage` field visibility tightened to
   `pub(crate)` for test ergonomics.
-- [ ] Step 6 — finish read migration for gate KNN compute
-  (`gate_accessors.rs` per-layer reads, `compute/gate_knn/*`,
-  `gate_store.rs`, `mutate/mod.rs`, `patch/overlay.rs`); migrate
-  the f32 native FFN paths (`up_features_mmap`,
-  `down_features_mmap`, `interleaved_mmap`) once they have trait
-  coverage; drop substore mmap fields; add
-  `MmapStorage::release_pages()` for madvise. The gate KNN
-  reaches share a structural pattern (bytes + dtype + slice
-  combine for ndarray views) — `gate_layer_view()` is the
-  intended consumption shape.
+- [x] Step 6 — gate KNN compute paths (`gate_accessors.rs`,
+  `compute/gate_knn/*`, `gate_store.rs`, `mutate/mod.rs`,
+  `patch/overlay.rs`) migrated to `self.storage.gate_layer_view(layer)`;
+  trait-covered `Arc<Mmap>` substore fields dropped from
+  `FfnStore` / `GateStore`. `ProjectionStore` deleted entirely (its
+  9 fields all moved to `MmapStorage`). `MmapStorage::release_pages()`
+  added — tracks `Arc<Mmap>` handles per setter; replaces the
+  per-substore-field madvise loop in `release_mmap_pages`. Heap
+  fields (`gate_vectors`, decode caches, HNSW caches, FP4 storage)
+  stay on substores.
+- [x] Step 7 — f32 native FFN paths (`up_features`,
+  `down_features`, `interleaved_f32`) migrated to `MmapStorage`.
+  `FfnStore` shrunk to caches + FP4 storage only.
+  `release_mmap_pages` collapsed to a single
+  `self.storage.release_pages()` call.
 
 See `CHANGELOG.md` 2026-05-10 entry for the full step 1-3 writeup
 plus bench numbers.

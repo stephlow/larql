@@ -423,4 +423,70 @@ mod tests {
         assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
         assert!(kv_out.is_none(), "shared-KV path must not return new KV");
     }
+
+    // ── Gemma3-arch (post-norms branch in run_ffn) ─────────────────────
+
+    #[test]
+    fn run_ffn_post_norms_arch_routes_through_post_norm_branch() {
+        // Gemma3 has has_post_norms=true → run_ffn takes the
+        // pre_feedforward_layernorm + post_feedforward_layernorm path.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (out, _) = run_ffn(&weights, &input, 0, &ffn, false);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn run_layer_with_ffn_gemma3_arch_completes_full_layer() {
+        // Full layer pass on Gemma3 — exercises post-norm + qk-norm in
+        // attention AND post-norm in FFN simultaneously.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (h_out, _, kv) =
+            run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None).unwrap();
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+        assert!(h_out.iter().all(|v| v.is_finite()));
+        assert!(kv.is_some());
+    }
+
+    // ── Starcoder2-arch (FFN biases) ───────────────────────────────────
+
+    #[test]
+    fn run_layer_with_ffn_starcoder2_arch_runs_bias_branches() {
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (h_out, _, _) =
+            run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None).unwrap();
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+        assert!(h_out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn run_layer_with_capture_hooked_shared_kv_branch() {
+        // Hooked-capture variant of the shared-KV branch — exercises lines
+        // around L247-250 in the `if shared_kv.is_some()` arm.
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (_, shared) = run_attention_with_kv_cache(&weights, &input, 0).unwrap();
+        let mut hook = crate::forward::hooks::NoopHook;
+        let (h_out, _, _, kv_out) = run_layer_with_capture_hooked(
+            &weights,
+            &input,
+            1,
+            &ffn,
+            false,
+            false,
+            None,
+            Some(&shared),
+            &mut hook,
+        )
+        .expect("hooked shared-KV path must succeed");
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+        assert!(kv_out.is_none(), "shared-KV path must not return new KV");
+    }
 }

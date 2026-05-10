@@ -42,8 +42,16 @@ pub fn top_k_from_logits(
     let probs = softmax(logits);
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     let k = k.min(indexed.len());
-    indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed.truncate(k);
+    // `select_nth_unstable_by(k, ...)` requires `k < len`. When the
+    // caller asks for the entire vocabulary (k == len) — or k == 0 for
+    // an empty vocab — skip the partition; the subsequent sort handles
+    // ordering on its own.
+    if k > 0 && k < indexed.len() {
+        indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.truncate(k);
+    } else if k == 0 {
+        return Vec::new();
+    }
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     indexed
         .into_iter()
@@ -107,5 +115,50 @@ mod tests {
         let w = make_test_weights();
         let logits = project_to_logits(&w, &vec![1.0f32; w.hidden_size]);
         assert!(logits.iter().any(|v| v.abs() > 1e-8));
+    }
+
+    #[test]
+    fn project_to_logits_layernorm_arch_routes_through_layernorm_branch() {
+        // Starcoder2 has NormType::LayerNorm — exercises the LayerNorm
+        // arm in `apply_norm` (vs the default RMSNorm).
+        let w = crate::test_utils::make_starcoder2_test_weights();
+        let logits = project_to_logits(&w, &vec![0.1f32; w.hidden_size]);
+        assert_eq!(logits.len(), w.vocab_size);
+        assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn top_k_from_logits_returns_top_predictions() {
+        let w = make_test_weights();
+        let tok = crate::test_utils::make_test_tokenizer(w.vocab_size);
+        let logits: Vec<f32> = (0..w.vocab_size).map(|i| i as f32 * 0.1).collect();
+        let top = top_k_from_logits(&logits, &tok, 3);
+        assert!(top.len() <= 3);
+        // Sorted by prob descending.
+        for w in top.windows(2) {
+            assert!(w[0].1 >= w[1].1, "top-K not sorted by prob");
+        }
+        // Last element of logits is highest, so its decoded form should be first.
+        if let Some((_, top_prob)) = top.first() {
+            assert!(top_prob.is_finite());
+        }
+    }
+
+    #[test]
+    fn top_k_from_logits_k_zero_returns_empty() {
+        let w = make_test_weights();
+        let tok = crate::test_utils::make_test_tokenizer(w.vocab_size);
+        let logits = vec![1.0f32; w.vocab_size];
+        let top = top_k_from_logits(&logits, &tok, 0);
+        assert!(top.is_empty());
+    }
+
+    #[test]
+    fn top_k_from_logits_k_larger_than_vocab_clamps() {
+        let w = make_test_weights();
+        let tok = crate::test_utils::make_test_tokenizer(w.vocab_size);
+        let logits = vec![1.0f32; 5];
+        let top = top_k_from_logits(&logits, &tok, 1_000_000);
+        assert_eq!(top.len(), 5);
     }
 }

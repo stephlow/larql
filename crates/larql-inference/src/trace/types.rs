@@ -287,4 +287,95 @@ mod tests {
         let t = make_trace(2, 2);
         assert!(t.position_trajectory(99).is_empty());
     }
+
+    // ── vocab-projection methods (need real ModelWeights + Tokenizer) ──
+
+    fn real_trace() -> (
+        ResidualTrace,
+        crate::model::ModelWeights,
+        tokenizers::Tokenizer,
+    ) {
+        let weights = crate::test_utils::make_test_weights();
+        let tokenizer = crate::test_utils::make_test_tokenizer(weights.vocab_size);
+        let n_layers = weights.num_layers;
+        let hidden = weights.hidden_size;
+        let n_tokens = 3;
+        let mut nodes = Vec::new();
+        for pos in 0..n_tokens {
+            for l in -1..n_layers as i32 {
+                nodes.push(TraceNode {
+                    layer: l,
+                    position: pos,
+                    residual: vec![0.05f32; hidden],
+                    attn_delta: vec![0.01f32; hidden],
+                    ffn_delta: vec![0.02f32; hidden],
+                });
+            }
+        }
+        let trace = ResidualTrace {
+            prompt: "hello".into(),
+            tokens: vec!["[0]".into(), "[1]".into(), "[2]".into()],
+            token_ids: vec![0u32, 1, 2],
+            n_layers,
+            hidden_size: hidden,
+            nodes,
+            attention: Vec::new(),
+        };
+        (trace, weights, tokenizer)
+    }
+
+    #[test]
+    fn vocab_project_returns_full_vocab_logits() {
+        let (trace, weights, _) = real_trace();
+        let v = vec![0.05f32; weights.hidden_size];
+        let logits = trace.vocab_project(&weights, &v);
+        assert_eq!(logits.len(), weights.vocab_size);
+        assert!(logits.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn top_k_returns_at_most_k_predictions() {
+        let (trace, weights, tokenizer) = real_trace();
+        let top = trace.top_k(&weights, &tokenizer, 0, 1, 4);
+        assert!(top.len() <= 4);
+        for (_, p) in &top {
+            assert!(p.is_finite());
+        }
+    }
+
+    #[test]
+    fn top_k_returns_empty_for_missing_node() {
+        let (trace, weights, tokenizer) = real_trace();
+        let top = trace.top_k(&weights, &tokenizer, 99, 99, 5);
+        assert!(top.is_empty());
+    }
+
+    #[test]
+    fn answer_trajectory_one_waypoint_per_layer_including_embedding() {
+        let (trace, weights, _) = real_trace();
+        let traj = trace.answer_trajectory(&weights, 0);
+        // -1 embedding + n_layers transformer layers.
+        assert_eq!(traj.len(), trace.n_layers + 1);
+        assert_eq!(traj[0].layer, -1);
+        for w in &traj {
+            assert!(w.prob.is_finite());
+            assert!(w.rank >= 1);
+            assert!(w.residual_norm.is_finite());
+        }
+    }
+
+    #[test]
+    fn layer_summaries_one_per_layer_including_embedding() {
+        let (trace, weights, tokenizer) = real_trace();
+        let sums = trace.layer_summaries(&weights, &tokenizer);
+        assert_eq!(sums.len(), trace.n_layers + 1);
+        assert_eq!(sums[0].layer, -1);
+        for s in &sums {
+            assert!(s.residual_norm.is_finite());
+            assert!(s.attn_delta_norm.is_finite());
+            assert!(s.ffn_delta_norm.is_finite());
+            // tinymodel is greedy-deterministic; just confirm prob is finite.
+            assert!(s.top1_prob.is_finite());
+        }
+    }
 }

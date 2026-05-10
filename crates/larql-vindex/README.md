@@ -195,7 +195,11 @@ larql-vindex/src/
 │       │   └── knn.rs          lm_head_knn_backend (Q4/f16/f32) + skip_q4k variant +
 │       │                       top_k_sorted reduce + lm_head_knn (f32 fallback)
 │       ├── attn.rs             Attention weight loaders (Q8, Q4_K, Q4)
-│       ├── projection_store.rs ProjectionStore (lm_head, embed)
+│       ├── vindex_storage/     VindexStorage trait + MmapStorage impl
+│       │                       (single source of truth for every
+│       │                       file-backed mmap; loaders mutate via
+│       │                       Arc::make_mut + set_*; release_pages
+│       │                       madvise covers all tracked handles)
 │       ├── metadata_store.rs   MetadataStore (down_meta + overrides)
 │       ├── fp4_store.rs        Fp4Storage runtime store (exp 26)
 │       └── residency.rs        Adaptive layer pinning (memory → performance)

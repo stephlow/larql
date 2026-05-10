@@ -183,18 +183,45 @@ pub fn build_arch_params<'a>(
             .moe_post_outer_norm_key(layer)
             .and_then(|k| weights.vectors.get(&k))
             .map(|v| v.as_slice()),
-        ple_input_gate: arch
-            .per_layer_input_gate_key(layer)
-            .and_then(|k| weights.tensors.get(&k))
-            .and_then(|t| t.as_slice()),
-        ple_projection: arch
-            .per_layer_projection_key(layer)
-            .and_then(|k| weights.tensors.get(&k))
-            .and_then(|t| t.as_slice()),
-        ple_post_norm: arch
-            .post_per_layer_input_norm_key(layer)
-            .and_then(|k| weights.vectors.get(&k))
-            .map(|v| v.as_slice()),
+        ple_input_gate: arch.per_layer_input_gate_key(layer).and_then(|k| {
+            let t = weights.tensors.get(&k);
+            if layer == 0 {
+                if let Some(t) = t {
+                    eprintln!(
+                        "[ple-debug] L0 input_gate key={k:?} shape={:?} as_slice_some={}",
+                        t.shape(),
+                        t.as_slice().is_some()
+                    );
+                } else {
+                    eprintln!("[ple-debug] L0 input_gate key={k:?} MISSING from tensors map");
+                }
+            }
+            t.and_then(|t| t.as_slice())
+        }),
+        ple_projection: arch.per_layer_projection_key(layer).and_then(|k| {
+            let t = weights.tensors.get(&k);
+            if layer == 0 {
+                if let Some(t) = t {
+                    eprintln!(
+                        "[ple-debug] L0 projection key={k:?} shape={:?} as_slice_some={}",
+                        t.shape(),
+                        t.as_slice().is_some()
+                    );
+                }
+            }
+            t.and_then(|t| t.as_slice())
+        }),
+        ple_post_norm: arch.post_per_layer_input_norm_key(layer).and_then(|k| {
+            let v = weights.vectors.get(&k);
+            if layer == 0 {
+                eprintln!(
+                    "[ple-debug] L0 post_norm key={k:?} present={} len={:?}",
+                    v.is_some(),
+                    v.map(|x| x.len())
+                );
+            }
+            v.map(|v| v.as_slice())
+        }),
     }
 }
 

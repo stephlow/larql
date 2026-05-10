@@ -31,10 +31,9 @@ impl QuantizedFfnAccess for VectorIndex {
     }
 
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
-        self.ffn
-            .interleaved_q4_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
+        self.storage
+            .interleaved_q4_whole_buffer_view()
+            .map(|b| b.as_ref())
     }
 
     fn has_interleaved_q4k(&self) -> bool {
@@ -42,10 +41,9 @@ impl QuantizedFfnAccess for VectorIndex {
     }
 
     fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
-        self.ffn
-            .interleaved_q4k_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
+        self.storage
+            .interleaved_q4k_whole_buffer_view()
+            .map(|b| b.as_ref())
     }
 
     fn prefetch_interleaved_q4k_layer(&self, layer: usize) {

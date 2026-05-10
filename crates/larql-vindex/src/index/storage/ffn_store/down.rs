@@ -23,20 +23,21 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only the activated feature vectors are read per token.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.down_features_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
+        Arc::make_mut(&mut self.storage).set_down_features(mmap);
         Ok(())
     }
 
     /// Whether feature-major down vectors are loaded.
     pub fn has_down_features(&self) -> bool {
-        self.ffn.down_features_mmap.is_some()
+        self.storage.has_down_features()
     }
 
     /// Get a feature's contiguous down vector from the mmap'd feature-major file.
     /// Returns `[hidden_size]` f32 slice — zero-copy from mmap.
     pub fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        let mmap = self.ffn.down_features_mmap.as_ref()?;
+        let bytes = self.storage.down_features_view()?;
+        let mmap: &[u8] = bytes.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 || feature >= intermediate {
             return None;
@@ -60,7 +61,8 @@ impl VectorIndex {
 
     /// Get the full down matrix for a layer: [intermediate, hidden] zero-copy view.
     pub fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.ffn.down_features_mmap.as_ref()?;
+        let bytes = self.storage.down_features_view()?;
+        let mmap: &[u8] = bytes.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 {
             return None;

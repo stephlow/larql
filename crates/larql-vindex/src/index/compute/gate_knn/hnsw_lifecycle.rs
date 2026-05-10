@@ -11,6 +11,7 @@ use ndarray::{Array1, ArrayView2};
 
 use crate::config::hnsw::HnswBuildConfig;
 use crate::index::core::VectorIndex;
+use crate::index::storage::vindex_storage::VindexStorage;
 
 impl VectorIndex {
     /// Enable HNSW search. Indexes are built lazily on first query per layer.
@@ -237,27 +238,27 @@ impl VectorIndex {
         let cache = self.gate.hnsw_cache.lock().unwrap();
         let hnsw = cache[layer].as_ref()?;
 
-        let mut candidates = if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32
-            && self.gate.gate_mmap_bytes.is_some()
+        let mut candidates = if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F32
+            && self.storage.has_gate_vectors()
         {
             // Zero-copy view onto f32-mmap.
-            let mmap = self.gate.gate_mmap_bytes.as_ref().unwrap();
-            let slice = self.gate.gate_mmap_slices.get(layer)?;
-            if slice.num_features == 0 {
+            let view = self.storage.gate_layer_view(layer)?;
+            if view.slice.num_features == 0 {
                 return None;
             }
-            let byte_offset = slice.float_offset * 4;
-            let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
+            let byte_offset = view.slice.float_offset * 4;
+            let byte_end = byte_offset + view.slice.num_features * self.hidden_size * 4;
+            let mmap: &[u8] = view.bytes.as_ref();
             if byte_end > mmap.len() {
                 return None;
             }
             let data = unsafe {
                 let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
-                std::slice::from_raw_parts(ptr, slice.num_features * self.hidden_size)
+                std::slice::from_raw_parts(ptr, view.slice.num_features * self.hidden_size)
             };
-            let view =
-                ArrayView2::from_shape((slice.num_features, self.hidden_size), data).unwrap();
-            hnsw.search(&view, residual, hnsw_k, ef)
+            let arr =
+                ArrayView2::from_shape((view.slice.num_features, self.hidden_size), data).unwrap();
+            hnsw.search(&arr, residual, hnsw_k, ef)
         } else {
             // Fallback (f16 mmap or heap): owned clone.
             let (data, num_features) = self.gate_matrix_f32(layer)?;

@@ -183,3 +183,258 @@ impl TestFixtures {
         }
     }
 }
+
+// ── Alternate-arch fixtures ─────────────────────────────────────────────
+//
+// `make_test_weights` uses the `tinymodel` arch which leaves many optional
+// branches dormant (no bias keys, no QK norm, no post norms, gated FFN
+// only). The fixtures below pin those branches by routing through a
+// real arch impl that enables them. Each fixture provides exactly the
+// tensors + vectors the matching forward path needs to reach finite
+// output without panicking.
+
+fn rand_mat_seeded(rows: usize, cols: usize, scale: f32, seed: u64) -> WeightArray {
+    let mut state = seed;
+    let data: Vec<f32> = (0..rows * cols)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state as u32) as f32 / u32::MAX as f32 * 2.0 * scale - scale
+        })
+        .collect();
+    Array2::from_shape_vec((rows, cols), data)
+        .unwrap()
+        .into_shared()
+}
+
+/// Build a synthetic `ModelWeights` configured as a Gemma 3-style arch.
+///
+/// Enables the dormant branches in `attention/{block, gpu}.rs` and
+/// `forward/layer.rs` that tinymodel never reaches:
+/// - **QK norm** — `attn_q_norm_key` / `attn_k_norm_key` return Some
+/// - **post norms** — `has_post_norms()` is true; pre/post FFN norm keys
+///   are populated, the FFN dispatch routes through the post-norm arm
+/// - **GeluTanh activation** — `activation()` is `GeluTanh`, exercising
+///   the gelu-tanh gate-up branches in `ffn/weight.rs` and `attention`
+/// - **`embed_scale = sqrt(hidden)`** — non-1.0 embed scaling
+/// - **`norm_weight_offset = 1.0`** — non-zero offset added to every
+///   norm weight at runtime
+pub fn make_gemma3_test_weights() -> ModelWeights {
+    const VOCAB: usize = 32;
+    const HIDDEN: usize = 16;
+    const INTER: usize = 32;
+    const NUM_Q: usize = 2;
+    const NUM_KV: usize = 1;
+    const HEAD_DIM: usize = 8;
+    const NUM_LAYERS: usize = 2;
+
+    let arch_json = serde_json::json!({
+        "model_type": "gemma3",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": NUM_LAYERS,
+        "intermediate_size": INTER,
+        "head_dim": HEAD_DIM,
+        "num_attention_heads": NUM_Q,
+        "num_key_value_heads": NUM_KV,
+        "vocab_size": VOCAB,
+        "rope_theta": 10000.0,
+        // Non-default scaling: exercises the `res_mult != 1.0` branch in
+        // `forward/layer.rs::run_ffn` and `attention/gpu.rs::run_attention_block_gpu`.
+        "residual_multiplier": 0.5,
+    });
+    let arch = detect_from_json(&arch_json);
+
+    let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+    let q_dim = NUM_Q * HEAD_DIM;
+    let kv_dim = NUM_KV * HEAD_DIM;
+
+    // Embed + lm_head — small, non-zero so post-norm RMS doesn't divide by 0.
+    let embed = rand_mat_seeded(VOCAB, HIDDEN, 0.1, 0x9e3779b9);
+    let lm_head = rand_mat_seeded(VOCAB, HIDDEN, 0.1, 0xa1b2c3d4);
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+
+    // Final norm — Gemma3 uses norm_weight_offset=1.0, so the saved
+    // weight is the *delta* off identity. Zeros → unit-scale norm at
+    // runtime (offset=1 + weight=0 → 1.0).
+    vectors.insert(arch.final_norm_key().to_string(), vec![0.0; HIDDEN]);
+
+    let mut seed_counter: u64 = 0xdeadbeef;
+    let mut next_seed = || {
+        seed_counter = seed_counter.wrapping_add(0x9e3779b97f4a7c15);
+        seed_counter
+    };
+
+    for layer in 0..NUM_LAYERS {
+        // Attention projections
+        tensors.insert(arch.attn_q_key(layer), rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.attn_k_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.attn_v_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.attn_o_key(layer), rand_mat_seeded(HIDDEN, q_dim, 0.1, next_seed()));
+
+        // FFN
+        tensors.insert(arch.ffn_gate_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.ffn_up_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.ffn_down_key(layer), rand_mat_seeded(HIDDEN, INTER, 0.1, next_seed()));
+
+        // Layer norms — input + post-attention. norm_weight_offset=1.0
+        // means saved weights are deltas; zeros = identity.
+        vectors.insert(arch.input_layernorm_key(layer), vec![0.0; HIDDEN]);
+        vectors.insert(arch.post_attention_layernorm_key(layer), vec![0.0; HIDDEN]);
+        // Gemma3-specific: pre/post FFN norms (post-norms branch).
+        if let Some(k) = arch.pre_feedforward_layernorm_key(layer) {
+            vectors.insert(k, vec![0.0; HIDDEN]);
+        }
+        if let Some(k) = arch.post_feedforward_layernorm_key(layer) {
+            vectors.insert(k, vec![0.0; HIDDEN]);
+        }
+
+        // QK norm — per-head dim weights.
+        if let Some(k) = arch.attn_q_norm_key(layer) {
+            vectors.insert(k, vec![0.0; HEAD_DIM]);
+        }
+        if let Some(k) = arch.attn_k_norm_key(layer) {
+            vectors.insert(k, vec![0.0; HEAD_DIM]);
+        }
+    }
+
+    ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: HashMap::new(),
+        packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed,
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers: NUM_LAYERS,
+        hidden_size: HIDDEN,
+        intermediate_size: INTER,
+        vocab_size: VOCAB,
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q,
+        num_kv_heads: NUM_KV,
+        rope_base: 10_000.0,
+    }
+}
+
+/// Build a synthetic `ModelWeights` configured as a Starcoder2-style arch.
+///
+/// Enables the dormant branches:
+/// - **Non-gated FFN** — `ffn_type()` is `NonGated`, exercising the
+///   `else` arm in `ffn/weight.rs::dense_ffn_forward_backend`
+/// - **FFN bias** — `ffn_up_bias_key` / `ffn_down_bias_key` return Some,
+///   so the `add_bias` calls fire
+/// - **Attention bias** — `attn_q_bias_key` / `attn_k_bias_key` /
+///   `attn_v_bias_key` / `attn_o_bias_key` return Some
+/// - **Gelu activation** — `activation()` is `Gelu`
+pub fn make_starcoder2_test_weights() -> ModelWeights {
+    const VOCAB: usize = 32;
+    const HIDDEN: usize = 16;
+    const INTER: usize = 32;
+    const NUM_Q: usize = 2;
+    const NUM_KV: usize = 1;
+    const HEAD_DIM: usize = 8;
+    const NUM_LAYERS: usize = 2;
+
+    let arch_json = serde_json::json!({
+        "model_type": "starcoder2",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": NUM_LAYERS,
+        "intermediate_size": INTER,
+        "head_dim": HEAD_DIM,
+        "num_attention_heads": NUM_Q,
+        "num_key_value_heads": NUM_KV,
+        "vocab_size": VOCAB,
+        // Non-default scaling: exercises the `res_mult != 1.0` branch in
+        // the no-post-norms arm of `forward/layer.rs::run_ffn` and the
+        // `attention_multiplier()` branch in `attention/gpu.rs`.
+        "residual_multiplier": 0.5,
+        "attention_multiplier": 2.0,
+    });
+    let arch = detect_from_json(&arch_json);
+
+    let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+    let q_dim = NUM_Q * HEAD_DIM;
+    let kv_dim = NUM_KV * HEAD_DIM;
+
+    let embed = rand_mat_seeded(VOCAB, HIDDEN, 0.1, 0x12345678);
+    let lm_head = rand_mat_seeded(VOCAB, HIDDEN, 0.1, 0x87654321);
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+
+    vectors.insert(arch.final_norm_key().to_string(), vec![1.0; HIDDEN]);
+
+    let mut seed_counter: u64 = 0xfeedbabe;
+    let mut next_seed = || {
+        seed_counter = seed_counter.wrapping_add(0x9e3779b97f4a7c15);
+        seed_counter
+    };
+
+    for layer in 0..NUM_LAYERS {
+        // Attention projections
+        tensors.insert(arch.attn_q_key(layer), rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.attn_k_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.attn_v_key(layer), rand_mat_seeded(kv_dim, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.attn_o_key(layer), rand_mat_seeded(HIDDEN, q_dim, 0.1, next_seed()));
+
+        // Attention biases — Starcoder2 has them.
+        if let Some(k) = arch.attn_q_bias_key(layer) {
+            vectors.insert(k, vec![0.01; q_dim]);
+        }
+        if let Some(k) = arch.attn_k_bias_key(layer) {
+            vectors.insert(k, vec![0.01; kv_dim]);
+        }
+        if let Some(k) = arch.attn_v_bias_key(layer) {
+            vectors.insert(k, vec![0.01; kv_dim]);
+        }
+        if let Some(k) = arch.attn_o_bias_key(layer) {
+            vectors.insert(k, vec![0.01; HIDDEN]);
+        }
+
+        // FFN — non-gated, so up + down only. No gate matrix.
+        tensors.insert(arch.ffn_up_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
+        tensors.insert(arch.ffn_down_key(layer), rand_mat_seeded(HIDDEN, INTER, 0.1, next_seed()));
+        // Add gate too — code may probe regardless of ffn_type for some paths.
+        tensors.insert(arch.ffn_gate_key(layer), rand_mat_seeded(INTER, HIDDEN, 0.1, next_seed()));
+
+        // FFN biases — Starcoder2 has them.
+        if let Some(k) = arch.ffn_up_bias_key(layer) {
+            vectors.insert(k, vec![0.01; INTER]);
+        }
+        if let Some(k) = arch.ffn_down_bias_key(layer) {
+            vectors.insert(k, vec![0.01; HIDDEN]);
+        }
+
+        // Layer norms — Starcoder2 uses standard LayerNorm/RMSNorm,
+        // norm_weight_offset=0, so weights are the actual scale.
+        vectors.insert(arch.input_layernorm_key(layer), vec![1.0; HIDDEN]);
+        vectors.insert(arch.post_attention_layernorm_key(layer), vec![1.0; HIDDEN]);
+    }
+
+    ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: HashMap::new(),
+        packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed,
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers: NUM_LAYERS,
+        hidden_size: HIDDEN,
+        intermediate_size: INTER,
+        vocab_size: VOCAB,
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q,
+        num_kv_heads: NUM_KV,
+        rope_base: 10_000.0,
+    }
+}

@@ -12,6 +12,7 @@ pub mod fields {
 }
 
 /// Well-known stratum identifiers. Predicates use these string values.
+#[allow(dead_code)]
 pub mod strata {
     pub const NATURAL_PROSE: &str = "natural_prose";
     pub const TRANSLATION: &str = "translation";

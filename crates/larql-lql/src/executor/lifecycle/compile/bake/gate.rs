@@ -150,4 +150,267 @@ mod tests {
         let err = encode_row(&[1.0, 2.0], 3, &mut buf).unwrap_err();
         assert!(err.to_string().contains("unsupported"));
     }
+
+    // ── End-to-end fixture tests ────────────────────────────
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "larql_bake_gate_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn fixture_config(
+        num_layers: usize,
+        hidden: usize,
+        num_features_per_layer: usize,
+        bpf: usize,
+    ) -> larql_vindex::VindexConfig {
+        use larql_vindex::config::dtype::StorageDtype;
+        let dtype = if bpf == BYTES_PER_F32 {
+            StorageDtype::F32
+        } else {
+            StorageDtype::F16
+        };
+        let mut layers = Vec::new();
+        let row_bytes = hidden * bpf;
+        let layer_bytes = num_features_per_layer * row_bytes;
+        for li in 0..num_layers {
+            layers.push(larql_vindex::VindexLayerInfo {
+                layer: li,
+                offset: (li * layer_bytes) as u64,
+                length: layer_bytes as u64,
+                num_features: num_features_per_layer,
+                num_experts: None,
+                num_features_per_expert: None,
+            });
+        }
+        larql_vindex::VindexConfig {
+            version: 1,
+            model: "test".into(),
+            family: "test".into(),
+            source: None,
+            checksums: None,
+            num_layers,
+            hidden_size: hidden,
+            intermediate_size: num_features_per_layer,
+            vocab_size: 16,
+            embed_scale: 1.0,
+            extract_level: larql_vindex::ExtractLevel::All,
+            dtype,
+            quant: larql_vindex::QuantFormat::None,
+            layer_bands: None,
+            layers,
+            down_top_k: 0,
+            has_model_weights: false,
+            model_config: None,
+            fp4: None,
+            ffn_layout: None,
+        }
+    }
+
+    fn write_synthetic_gate_bin(
+        dir: &std::path::Path,
+        num_layers: usize,
+        num_features_per_layer: usize,
+        hidden: usize,
+        bpf: usize,
+    ) {
+        let total_features = num_layers * num_features_per_layer;
+        let mut bytes = Vec::with_capacity(total_features * hidden * bpf);
+        for fi in 0..total_features {
+            for d in 0..hidden {
+                let v = (fi * 100 + d) as f32 * 0.01;
+                if bpf == BYTES_PER_F32 {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                } else {
+                    let h = larql_models::quant::half::f32_to_f16(v);
+                    bytes.extend_from_slice(&h.to_le_bytes());
+                }
+            }
+        }
+        std::fs::write(dir.join(GATE_VECTORS_BIN), &bytes).unwrap();
+    }
+
+    fn read_gate_row_f32(
+        dir: &std::path::Path,
+        layer: usize,
+        feature: usize,
+        num_features_per_layer: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let bytes = std::fs::read(dir.join(GATE_VECTORS_BIN)).unwrap();
+        let row_bytes = hidden * BYTES_PER_F32;
+        let layer_bytes = num_features_per_layer * row_bytes;
+        let start = layer * layer_bytes + feature * row_bytes;
+        (0..hidden)
+            .map(|d| {
+                let cell = start + d * BYTES_PER_F32;
+                f32::from_le_bytes(bytes[cell..cell + BYTES_PER_F32].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn patch_gate_vectors_no_overrides_is_noop() {
+        let dir = unique_dir("noop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = fixture_config(2, 4, 4, BYTES_PER_F32);
+        // Empty overrides — function returns Ok without touching disk.
+        let result = patch_gate_vectors(&dir, &dir, &cfg, &HashMap::new());
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gate_vectors_f32_writes_correct_row() {
+        let dir = unique_dir("f32");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let num_layers = 2;
+        let hidden = 4;
+        let nf = 4;
+        let cfg = fixture_config(num_layers, hidden, nf, BYTES_PER_F32);
+        write_synthetic_gate_bin(&src, num_layers, nf, hidden, BYTES_PER_F32);
+
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        let new_row: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+        overrides.insert((1, 2), new_row.clone());
+
+        patch_gate_vectors(&src, &dst, &cfg, &overrides).unwrap();
+
+        let read_back = read_gate_row_f32(&dst, 1, 2, nf, hidden);
+        assert_eq!(read_back, new_row);
+
+        // Adjacent feature row untouched.
+        let neighbour = read_gate_row_f32(&dst, 1, 1, nf, hidden);
+        let global_feat = 1 * nf + 1; // layer 1, feature 1
+        for (d, val) in neighbour.iter().enumerate() {
+            let expected = (global_feat * 100 + d) as f32 * 0.01;
+            assert!(
+                (val - expected).abs() < 1e-6,
+                "neighbour d={d}: got {val}, want {expected}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gate_vectors_f16_round_trips() {
+        let dir = unique_dir("f16");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let num_layers = 2;
+        let hidden = 4;
+        let nf = 4;
+        let cfg = fixture_config(num_layers, hidden, nf, BYTES_PER_F16);
+        write_synthetic_gate_bin(&src, num_layers, nf, hidden, BYTES_PER_F16);
+
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        let new_row: Vec<f32> = vec![1.0, -2.0, 0.5, 0.0];
+        overrides.insert((0, 1), new_row.clone());
+
+        patch_gate_vectors(&src, &dst, &cfg, &overrides).unwrap();
+
+        // Read back as f16.
+        let bytes = std::fs::read(dst.join(GATE_VECTORS_BIN)).unwrap();
+        let row_bytes = hidden * BYTES_PER_F16;
+        let row_start = 1 * row_bytes; // layer 0, feature 1
+        for (d, want) in new_row.iter().enumerate() {
+            let cell = row_start + d * BYTES_PER_F16;
+            let bits = u16::from_le_bytes(bytes[cell..cell + BYTES_PER_F16].try_into().unwrap());
+            let got = larql_models::quant::half::f16_to_f32(bits);
+            assert!(
+                (got - want).abs() < 0.01,
+                "f16 d={d}: got {got}, want {want}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gate_vectors_errors_on_missing_source() {
+        let dir = unique_dir("missing");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let cfg = fixture_config(2, 4, 4, BYTES_PER_F32);
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((0, 0), vec![0.0; 4]);
+
+        // No gate_vectors.bin in src — error.
+        let err = patch_gate_vectors(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("no gate_vectors.bin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gate_vectors_rejects_wrong_shape() {
+        let dir = unique_dir("shape");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let cfg = fixture_config(2, 4, 4, BYTES_PER_F32);
+        write_synthetic_gate_bin(&src, 2, 4, 4, BYTES_PER_F32);
+
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((0, 0), vec![1.0, 2.0]); // 2 instead of hidden=4
+
+        let err = patch_gate_vectors(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("wrong shape"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gate_vectors_rejects_unknown_layer() {
+        let dir = unique_dir("layer");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        // Config has 2 layers, override targets layer 99.
+        let cfg = fixture_config(2, 4, 4, BYTES_PER_F32);
+        write_synthetic_gate_bin(&src, 2, 4, 4, BYTES_PER_F32);
+
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((99, 0), vec![0.0; 4]);
+
+        let err = patch_gate_vectors(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("not in config.layers"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gate_vectors_rejects_out_of_range_feature() {
+        let dir = unique_dir("feat");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let cfg = fixture_config(2, 4, 4, BYTES_PER_F32);
+        write_synthetic_gate_bin(&src, 2, 4, 4, BYTES_PER_F32);
+
+        let mut overrides: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        overrides.insert((0, 99), vec![0.0; 4]);
+
+        let err = patch_gate_vectors(&src, &dst, &cfg, &overrides).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

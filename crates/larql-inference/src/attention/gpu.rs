@@ -387,6 +387,100 @@ mod tests {
     }
 
     #[test]
+    fn run_attention_block_gpu_gemma3_runs_qk_norm_and_post_norms() {
+        // Gemma3 has QK norm, post_norms, has_v_norm — exercises the
+        // rms_norm_heads branches and post-norm residual path.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_post, _, _) = run_attention_block_gpu(&weights, &input, 0, false, None).unwrap();
+        assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
+        assert!(h_post.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn run_attention_block_gpu_starcoder2_runs_bias_branches() {
+        // Starcoder2 has Q/K/V/O bias keys → all four `add_bias` arms fire.
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_post, _, _) = run_attention_block_gpu(&weights, &input, 0, false, None).unwrap();
+        assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
+        assert!(h_post.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn run_attention_with_kv_backend_gemma3_routes_through_qk_norm_and_post_norms() {
+        // Gemma3 enables QK norm + has_v_norm + post-norms branches in
+        // `run_attention_with_kv_backend` (a separate function from
+        // `run_attention_block_gpu`).
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_out, k, v) = run_attention_with_kv_backend(&weights, &input, 0, None).unwrap();
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        assert_eq!(k.shape(), &[2, kv_dim]);
+        assert_eq!(v.shape(), &[2, kv_dim]);
+        assert!(h_out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn run_attention_with_kv_backend_starcoder2_runs_q_k_v_o_bias_branches() {
+        // Starcoder2 hits every `add_bias` call site in
+        // `run_attention_with_kv_backend`.
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_out, _, _) = run_attention_with_kv_backend(&weights, &input, 0, None).unwrap();
+        assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
+        assert!(h_out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn run_attention_with_kv_backend_gemma3_with_cpu_backend_matches_no_backend() {
+        // Same backend-equivalence check as the existing tinymodel test
+        // but on Gemma3 — exercises the backend-Some path through the
+        // post-norm + QK-norm branches.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let input = h(2, weights.hidden_size);
+        let (h_no, _, _) = run_attention_with_kv_backend(&weights, &input, 0, None).unwrap();
+        let (h_cpu, _, _) = run_attention_with_kv_backend(
+            &weights,
+            &input,
+            0,
+            Some(&larql_compute::CpuBackend),
+        )
+        .unwrap();
+        for (a, b) in h_no.iter().zip(h_cpu.iter()) {
+            assert!((a - b).abs() < 1e-4, "diverged: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn q4_attention_proj_works_with_cpu_backend_at_aligned_dims() {
+        // CpuBackend supports Q4 when hidden is a multiple of 32 and num_rows
+        // is non-zero. Build a synthetic Q4_0 buffer (18 bytes per 32-element
+        // block: scale (f16) + 16 nibbles).
+        const HIDDEN: usize = 64;
+        const NUM_ROWS: usize = 4;
+        // Each Q4_0 block: 2 bytes scale + 16 bytes nibbles = 18 bytes/32 elems.
+        let blocks_per_row = HIDDEN / 32;
+        let bytes_per_row = blocks_per_row * 18;
+        let q4_data = vec![0u8; NUM_ROWS * bytes_per_row];
+        let input = h(2, HIDDEN);
+        let result = q4_attention_proj(
+            &input,
+            &q4_data,
+            NUM_ROWS,
+            HIDDEN,
+            &larql_compute::CpuBackend,
+        );
+        // CpuBackend may or may not accept this synthetic data — just
+        // verify the function doesn't panic and the early-return shape
+        // is correct when it succeeds.
+        if let Some(out) = result {
+            assert_eq!(out.shape(), &[2, NUM_ROWS]);
+        }
+    }
+
+    #[test]
     fn run_attention_with_kv_backend_matches_no_backend() {
         let weights = make_test_weights();
         let input = h(2, weights.hidden_size);

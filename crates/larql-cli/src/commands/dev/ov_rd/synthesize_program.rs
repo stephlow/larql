@@ -1,13 +1,12 @@
+// SynthesisStep variants (Fail, NeedsOracle.suggested_program) are
+// constructed for a diagnostic trace dump; suppress until consumed.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 
 use clap::Args;
-use serde_json::Value;
 
-use super::program::{
-    BaseConfig, ConstructionMode, Program, ProgramRule, ProgramStage, TerminalClass,
-};
 use super::program_cache::ProgramCache;
-use super::types::HeadId;
 
 #[derive(Args)]
 pub(super) struct SynthesizeProgramArgs {

@@ -19,9 +19,7 @@ use bytes::Bytes;
 
 use crate::config::dtype::StorageDtype;
 use crate::index::storage::attn::ATTN_TENSORS_PER_LAYER;
-use crate::index::storage::ffn_store::{DownFeaturesQ4kEntry, FfnStore, FFN_COMPONENTS_PER_LAYER};
-use crate::index::storage::gate_store::GateStore;
-use crate::index::storage::projection_store::ProjectionStore;
+use crate::index::storage::ffn_store::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER};
 use crate::index::types::{GateLayerSlice, GateQ4Slice};
 
 use super::sealed::Sealed;
@@ -44,6 +42,11 @@ pub struct MmapStorage {
     pub(crate) interleaved_q4: Option<Bytes>,
     pub(crate) down_features_q4k: Option<Bytes>,
     pub(crate) down_features_q4k_manifest: Option<Vec<DownFeaturesQ4kEntry>>,
+
+    // ── FFN f32 native paths ────────────────────────────────────────
+    pub(crate) up_features: Option<Bytes>,
+    pub(crate) down_features: Option<Bytes>,
+    pub(crate) interleaved_f32: Option<Bytes>,
 
     // ── Attention ────────────────────────────────────────────────────
     pub(crate) attn_q4k: Option<Bytes>,
@@ -70,68 +73,19 @@ pub struct MmapStorage {
     /// doesn't have to.
     #[allow(dead_code)]
     hidden_size: usize,
+
+    /// Arc<Mmap> handles kept alongside the `Bytes` views for the
+    /// `release_pages()` (madvise) path. `Bytes::from_owner(arc)` is
+    /// zero-copy but doesn't expose the `Arc<Mmap>` back, and madvise
+    /// on a Bytes pointer would be unsafe for heap-backed entries
+    /// (the synth lm_head). Heap-backed entries are not added to this
+    /// list — only file-backed mmaps are, so iterating is safe.
+    pub(crate) mmap_handles: Vec<Arc<memmap2::Mmap>>,
 }
 
 impl Sealed for MmapStorage {}
 
 impl MmapStorage {
-    /// Build a parity wrapper from today's substores. Cheap — every
-    /// `Arc<Mmap>` clone is a refcount bump; the only allocation is
-    /// `Bytes::from_owner` once per whole-file mmap.
-    ///
-    /// `lm_head_q4_synth` (in-RAM Q4 synthesised from f16 embeddings)
-    /// is folded into `lm_head_q4`: callers don't see the difference.
-    pub fn from_substores(
-        ffn: &FfnStore,
-        gate: &GateStore,
-        projections: &ProjectionStore,
-        hidden_size: usize,
-    ) -> Self {
-        // lm_head_q4 unifies the mmap and the in-RAM synth fallback.
-        // The synth path is `Arc<Vec<u8>>`; the mmap path is
-        // `Arc<Mmap>`. Both convert to `Bytes::from_owner` cleanly.
-        let lm_head_q4 = projections
-            .lm_head_q4_mmap
-            .as_ref()
-            .map(arc_mmap_to_bytes)
-            .or_else(|| {
-                projections
-                    .lm_head_q4_synth
-                    .as_ref()
-                    .map(|v| Bytes::from_owner(ArcAsBytes(v.clone())))
-            });
-
-        Self {
-            // FFN
-            interleaved_q4k: ffn.interleaved_q4k_mmap.as_ref().map(arc_mmap_to_bytes),
-            interleaved_q4k_manifest: ffn.interleaved_q4k_manifest.clone(),
-            interleaved_q4: ffn.interleaved_q4_mmap.as_ref().map(arc_mmap_to_bytes),
-            down_features_q4k: ffn.down_features_q4k_mmap.as_ref().map(arc_mmap_to_bytes),
-            down_features_q4k_manifest: ffn.down_features_q4k_manifest.clone(),
-
-            // Attention
-            attn_q4k: projections.attn_q4k_mmap.as_ref().map(arc_mmap_to_bytes),
-            attn_q4k_manifest: projections.attn_q4k_manifest.clone(),
-            attn_q4: projections.attn_q4_mmap.as_ref().map(arc_mmap_to_bytes),
-            attn_q4_manifest: projections.attn_q4_manifest.clone(),
-            attn_q8: projections.attn_q8_mmap.as_ref().map(arc_mmap_to_bytes),
-            attn_q8_manifest: projections.attn_q8_manifest.clone(),
-
-            // lm_head
-            lm_head_f32: projections.lm_head_mmap.as_ref().map(arc_mmap_to_bytes),
-            lm_head_f16: projections.lm_head_f16_mmap.as_ref().map(arc_mmap_to_bytes),
-            lm_head_q4,
-
-            // Gate
-            gate_bytes: gate.gate_mmap_bytes.as_ref().map(arc_mmap_to_bytes),
-            gate_dtype: gate.gate_mmap_dtype,
-            gate_slices: gate.gate_mmap_slices.clone(),
-            gate_q4_bytes: gate.gate_q4_mmap.as_ref().map(arc_mmap_to_bytes),
-            gate_q4_slices: gate.gate_q4_slices.clone(),
-            hidden_size,
-        }
-    }
-
     // ── Per-field setters (loader-side mutation) ───────────────────────
     //
     // Loaders that used to write `self.<substore>.<field> = Some(...)`
@@ -152,11 +106,31 @@ impl MmapStorage {
     ) {
         self.interleaved_q4k = Some(arc_mmap_to_bytes(&mmap));
         self.interleaved_q4k_manifest = manifest;
+        self.register_mmap(&mmap);
     }
 
     /// Set the FFN interleaved Q4_0 mmap (no manifest — uniform stride).
     pub fn set_interleaved_q4(&mut self, mmap: Arc<memmap2::Mmap>) {
         self.interleaved_q4 = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
+    }
+
+    /// Set the f32 feature-major up projections mmap (`up_features.bin`).
+    pub fn set_up_features(&mut self, mmap: Arc<memmap2::Mmap>) {
+        self.up_features = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
+    }
+
+    /// Set the f32 feature-major down projections mmap (`down_features.bin`).
+    pub fn set_down_features(&mut self, mmap: Arc<memmap2::Mmap>) {
+        self.down_features = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
+    }
+
+    /// Set the f32 interleaved [gate|up|down] FFN mmap (`interleaved.bin`).
+    pub fn set_interleaved_f32(&mut self, mmap: Arc<memmap2::Mmap>) {
+        self.interleaved_f32 = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
     }
 
     /// Set the W2 feature-major Q4_K down mmap + manifest.
@@ -167,6 +141,7 @@ impl MmapStorage {
     ) {
         self.down_features_q4k = Some(arc_mmap_to_bytes(&mmap));
         self.down_features_q4k_manifest = Some(manifest);
+        self.register_mmap(&mmap);
     }
 
     /// Set the attention Q4_K mmap + manifest.
@@ -177,12 +152,14 @@ impl MmapStorage {
     ) {
         self.attn_q4k = Some(arc_mmap_to_bytes(&mmap));
         self.attn_q4k_manifest = manifest;
+        self.register_mmap(&mmap);
     }
 
     /// Set the attention Q4_0 mmap + manifest.
     pub fn set_attn_q4(&mut self, mmap: Arc<memmap2::Mmap>, manifest: Option<Vec<(usize, usize)>>) {
         self.attn_q4 = Some(arc_mmap_to_bytes(&mmap));
         self.attn_q4_manifest = manifest;
+        self.register_mmap(&mmap);
     }
 
     /// Set the attention Q8 mmap + manifest.
@@ -193,25 +170,30 @@ impl MmapStorage {
     ) {
         self.attn_q8 = Some(arc_mmap_to_bytes(&mmap));
         self.attn_q8_manifest = manifest;
+        self.register_mmap(&mmap);
     }
 
     /// Set the lm_head f32 mmap.
     pub fn set_lm_head_f32(&mut self, mmap: Arc<memmap2::Mmap>) {
         self.lm_head_f32 = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
     }
 
     /// Set the lm_head f16 mmap (tied-embedding case).
     pub fn set_lm_head_f16(&mut self, mmap: Arc<memmap2::Mmap>) {
         self.lm_head_f16 = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
     }
 
     /// Set the lm_head Q4 from an mmap'd file.
     pub fn set_lm_head_q4_mmap(&mut self, mmap: Arc<memmap2::Mmap>) {
         self.lm_head_q4 = Some(arc_mmap_to_bytes(&mmap));
+        self.register_mmap(&mmap);
     }
 
     /// Set the lm_head Q4 from in-RAM synthesised bytes (the f16
-    /// embeddings → Q4 fallback path).
+    /// embeddings → Q4 fallback path). Does **not** register a
+    /// `mmap_handles` entry — the synth bytes live on the heap.
     pub fn set_lm_head_q4_synth(&mut self, bytes: Arc<Vec<u8>>) {
         self.lm_head_q4 = Some(Bytes::from_owner(ArcAsBytes(bytes)));
     }
@@ -226,12 +208,50 @@ impl MmapStorage {
         self.gate_bytes = Some(arc_mmap_to_bytes(&mmap));
         self.gate_dtype = dtype;
         self.gate_slices = slices;
+        self.register_mmap(&mmap);
     }
 
     /// Set the Q4_0 gate vectors mmap + per-layer Q4 slices.
     pub fn set_gate_q4(&mut self, mmap: Arc<memmap2::Mmap>, slices: Vec<GateQ4Slice>) {
         self.gate_q4_bytes = Some(arc_mmap_to_bytes(&mmap));
         self.gate_q4_slices = slices;
+        self.register_mmap(&mmap);
+    }
+
+    /// Register an `Arc<Mmap>` for the `release_pages()` (madvise)
+    /// path. Called by every setter that takes a file-backed mmap;
+    /// heap-backed setters skip it.
+    fn register_mmap(&mut self, mmap: &Arc<memmap2::Mmap>) {
+        self.mmap_handles.push(Arc::clone(mmap));
+    }
+
+    // ── Gate-related concrete accessors ────────────────────────────────
+    //
+    // Inherent on `MmapStorage` rather than on the trait because they
+    // surface mmap-shaped metadata (slices, dtype) that doesn't carry
+    // cleanly across to a Redis backend. Used by the gate-KNN compute
+    // path, which iterates all layers.
+
+    pub fn gate_layer_slices(&self) -> &[GateLayerSlice] {
+        &self.gate_slices
+    }
+    pub fn gate_dtype(&self) -> StorageDtype {
+        self.gate_dtype
+    }
+    pub fn gate_layer_slice(&self, layer: usize) -> Option<&GateLayerSlice> {
+        self.gate_slices.get(layer)
+    }
+    pub fn gate_q4_layer_slices(&self) -> &[GateQ4Slice] {
+        &self.gate_q4_slices
+    }
+    pub fn gate_q4_layer_slice(&self, layer: usize) -> Option<&GateQ4Slice> {
+        self.gate_q4_slices.get(layer)
+    }
+    pub fn gate_bytes_view(&self) -> Option<&Bytes> {
+        self.gate_bytes.as_ref()
+    }
+    pub fn gate_q4_bytes_view(&self) -> Option<&Bytes> {
+        self.gate_q4_bytes.as_ref()
     }
 
     // ── Boolean capability checks (consumed by `is_some()` migrations) ─
@@ -269,6 +289,15 @@ impl MmapStorage {
     pub fn has_gate_q4(&self) -> bool {
         self.gate_q4_bytes.is_some()
     }
+    pub fn has_up_features(&self) -> bool {
+        self.up_features.is_some()
+    }
+    pub fn has_down_features(&self) -> bool {
+        self.down_features.is_some()
+    }
+    pub fn has_interleaved_f32(&self) -> bool {
+        self.interleaved_f32.is_some()
+    }
 
     // ── Whole-buffer view accessors (zero-atomic borrows) ──────────────
 
@@ -293,6 +322,15 @@ impl MmapStorage {
     pub fn lm_head_q4_view(&self) -> Option<&Bytes> {
         self.lm_head_q4.as_ref()
     }
+    pub fn up_features_view(&self) -> Option<&Bytes> {
+        self.up_features.as_ref()
+    }
+    pub fn down_features_view(&self) -> Option<&Bytes> {
+        self.down_features.as_ref()
+    }
+    pub fn interleaved_f32_view(&self) -> Option<&Bytes> {
+        self.interleaved_f32.as_ref()
+    }
 
     /// Inert empty wrapper — every `Option` is `None`. Used by
     /// `VectorIndex::empty()` and tests. Constructed without any of
@@ -305,6 +343,9 @@ impl MmapStorage {
             interleaved_q4: None,
             down_features_q4k: None,
             down_features_q4k_manifest: None,
+            up_features: None,
+            down_features: None,
+            interleaved_f32: None,
             attn_q4k: None,
             attn_q4k_manifest: None,
             attn_q4: None,
@@ -320,6 +361,28 @@ impl MmapStorage {
             gate_q4_bytes: None,
             gate_q4_slices: Vec::new(),
             hidden_size,
+            mmap_handles: Vec::new(),
+        }
+    }
+
+    /// Drop resident pages for every mmap'd file held by this
+    /// storage. Best-effort `madvise(MADV_DONTNEED)`. On Linux this
+    /// immediately drops clean pages from RSS; on Darwin
+    /// `MADV_DONTNEED` is advisory and the kernel may delay.
+    ///
+    /// **Heap-backed entries are not advised** — `mmap_handles` only
+    /// contains file-backed `Arc<Mmap>` handles. The synth lm_head
+    /// (heap `Arc<Vec<u8>>`) stays resident.
+    pub fn release_pages(&self) {
+        use memmap2::UncheckedAdvice;
+        // SAFETY: `unchecked_advise` requires no live references into
+        // the mmap during the call. Production callers (the walk-ffn
+        // server handler) call this after the per-request borrow has
+        // dropped — see `gate_accessors::release_mmap_pages`.
+        for handle in &self.mmap_handles {
+            unsafe {
+                let _ = handle.unchecked_advise(UncheckedAdvice::DontNeed);
+            }
         }
     }
 }
@@ -992,29 +1055,128 @@ mod tests {
         assert!(s.gate_q4_layer_data(0).is_none());
     }
 
-    /// `from_substores` clones the underlying `Arc<Mmap>` handles,
-    /// not the bytes themselves — verify by constructing substores
-    /// with one mmap each and checking the storage's whole-buffer
-    /// view points at the same memory region.
+    /// `set_interleaved_q4k` is zero-copy from `Arc<Mmap>` — the
+    /// `Bytes` view points at the same memory the original mmap
+    /// occupies, no copy.
     #[test]
-    fn from_substores_shares_bytes_with_substore_mmaps() {
-        use crate::index::storage::ffn_store::FfnStore;
-        use crate::index::storage::gate_store::GateStore;
-        use crate::index::storage::projection_store::ProjectionStore;
+    fn set_interleaved_q4k_is_zero_copy_from_arc_mmap() {
         let payload = vec![0u8; 32];
         let mmap_arc = arc_mmap_from(&payload);
+        let mmap_ref_ptr = mmap_arc.as_ref().as_ptr();
 
-        let mut ffn = FfnStore::empty(1);
-        ffn.interleaved_q4k_mmap = Some(mmap_arc.clone());
-        let gate = GateStore::empty(1);
-        let proj = ProjectionStore::empty();
-
-        let s = MmapStorage::from_substores(&ffn, &gate, &proj, 8);
-        assert!(s.has_interleaved_q4k());
+        let mut s = MmapStorage::empty(8);
+        s.set_interleaved_q4k(mmap_arc, None);
         let view = s.interleaved_q4k_whole_buffer_view().expect("buf");
-        // `Bytes::from_owner(arc.clone())` is zero-copy; the view's
-        // pointer should point inside the mmap'd region.
-        let mmap_ref: &[u8] = mmap_arc.as_ref();
-        assert_eq!(view.as_ref().as_ptr(), mmap_ref.as_ptr());
+        assert_eq!(view.as_ref().as_ptr(), mmap_ref_ptr);
+    }
+
+    // ── Step 6 helpers: gate layer-slice + dtype + bytes_view +
+    //                    release_pages ────────────────────────────
+
+    #[test]
+    fn gate_helpers_round_trip() {
+        let payload = vec![0u8; 32];
+        let mut s = MmapStorage::empty(4);
+        let slices = vec![
+            GateLayerSlice {
+                float_offset: 0,
+                num_features: 2,
+            },
+            GateLayerSlice {
+                float_offset: 8,
+                num_features: 2,
+            },
+        ];
+        s.set_gate_vectors(arc_mmap_from(&payload), StorageDtype::F16, slices.clone());
+
+        // Concrete helpers added in step 6.
+        assert_eq!(s.gate_dtype(), StorageDtype::F16);
+        assert_eq!(s.gate_layer_slices().len(), 2);
+        assert_eq!(s.gate_layer_slice(1).map(|s| s.float_offset), Some(8));
+        assert!(s.gate_layer_slice(99).is_none());
+        assert!(s.gate_bytes_view().is_some());
+    }
+
+    #[test]
+    fn gate_q4_helpers_round_trip() {
+        let payload = vec![0u8; 32];
+        let mut s = MmapStorage::empty(4);
+        s.set_gate_q4(
+            arc_mmap_from(&payload),
+            vec![GateQ4Slice {
+                byte_offset: 0,
+                byte_len: 16,
+                num_features: 4,
+            }],
+        );
+        assert_eq!(s.gate_q4_layer_slices().len(), 1);
+        assert_eq!(s.gate_q4_layer_slice(0).map(|s| s.byte_len), Some(16));
+        assert!(s.gate_q4_layer_slice(99).is_none());
+        assert!(s.gate_q4_bytes_view().is_some());
+    }
+
+    /// `release_pages` calls madvise on every tracked file-backed
+    /// mmap. Best-effort and platform-dependent — this test pins
+    /// only "doesn't panic, doesn't lose state".
+    #[test]
+    fn release_pages_does_not_destroy_storage() {
+        let payload = vec![0u8; 64];
+        let mut s = MmapStorage::empty(4);
+        s.set_interleaved_q4k(arc_mmap_from(&payload), None);
+        s.set_attn_q4k(arc_mmap_from(&payload), None);
+        s.set_lm_head_f32(arc_mmap_from(&payload));
+        s.set_gate_vectors(arc_mmap_from(&payload), StorageDtype::F16, vec![]);
+        s.set_gate_q4(arc_mmap_from(&payload), vec![]);
+        s.set_lm_head_q4_synth(Arc::new(vec![1u8, 2, 3, 4]));
+
+        // Five mmap-backed setters → 5 handles. The synth setter does
+        // NOT register a handle.
+        assert_eq!(s.mmap_handles.len(), 5);
+
+        // No panic; data still readable after.
+        s.release_pages();
+        assert!(s.has_interleaved_q4k());
+        assert!(s.has_attn_q4k());
+        assert!(s.has_lm_head_f32());
+        assert!(s.has_gate_vectors());
+        assert!(s.has_gate_q4());
+        assert!(s.has_lm_head_q4());
+    }
+
+    /// `release_pages` on an empty storage is a no-op.
+    #[test]
+    fn release_pages_empty_is_noop() {
+        let s = MmapStorage::empty(4);
+        s.release_pages();
+        assert_eq!(s.mmap_handles.len(), 0);
+    }
+
+    /// `register_mmap` is private but exercised through every
+    /// `set_*` mmap-taking setter. Verify the count matches the
+    /// number of mmap-taking setter calls (synth lm_head excluded).
+    #[test]
+    fn register_mmap_only_tracks_file_backed_handles() {
+        let payload = vec![0u8; 16];
+        let mut s = MmapStorage::empty(4);
+        assert_eq!(s.mmap_handles.len(), 0);
+
+        s.set_lm_head_q4_synth(Arc::new(vec![1u8, 2, 3]));
+        assert_eq!(s.mmap_handles.len(), 0, "synth (heap) should not register");
+
+        s.set_lm_head_q4_mmap(arc_mmap_from(&payload));
+        assert_eq!(s.mmap_handles.len(), 1);
+
+        s.set_attn_q8(arc_mmap_from(&payload), None);
+        assert_eq!(s.mmap_handles.len(), 2);
+    }
+
+    /// `BytesView::is_empty` covers the zero-length path.
+    #[test]
+    fn bytes_view_is_empty() {
+        let bytes = Bytes::from(vec![0u8; 16]);
+        let zero = BytesView::new(&bytes, 0, 0);
+        assert!(zero.is_empty());
+        assert_eq!(zero.len(), 0);
+        assert_eq!(zero.as_slice().len(), 0);
     }
 }

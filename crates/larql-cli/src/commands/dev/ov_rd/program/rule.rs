@@ -87,6 +87,7 @@ impl ProgramRule {
         matches!(self, ProgramRule::MapUnless { .. })
     }
 
+    #[allow(dead_code)]
     pub fn complexity(&self) -> f64 {
         match self {
             ProgramRule::Map { .. } | ProgramRule::Keep { .. } => 1.0,

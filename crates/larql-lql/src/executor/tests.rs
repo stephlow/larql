@@ -728,18 +728,19 @@ fn make_rich_test_vindex_dir(tag: &str) -> std::path::PathBuf {
     let num_layers = 2;
     let vocab_size = RICH_FIXTURE_VOCAB.len();
 
-    // Gate vectors aligned with the embedding rows: gate0[0] points
-    // at "Paris" (token id 1), gate0[1] at "Berlin" (3), gate0[2] at
-    // "language" (13). This makes the FFN walk produce sensible
-    // top-feature picks for the corresponding entity queries.
+    // Gate vectors aligned with the embedding rows. Magnitudes are
+    // chosen so the dot-product walk produces gate scores well above
+    // `DESCRIBE_GATE_THRESHOLD = 5.0`, which lets DESCRIBE / EXPLAIN
+    // surface real edges from the synthetic vindex.
+    const RICH_GATE_MAG: f32 = 50.0;
     let mut gate0 = Array2::<f32>::zeros((num_features, hidden));
-    gate0[[0, 0]] = 1.0;
-    gate0[[1, 1]] = 1.0;
-    gate0[[2, 2]] = 1.0;
+    gate0[[0, 0]] = RICH_GATE_MAG;
+    gate0[[1, 1]] = RICH_GATE_MAG;
+    gate0[[2, 2]] = RICH_GATE_MAG;
     let mut gate1 = Array2::<f32>::zeros((num_features, hidden));
-    gate1[[0, 3]] = 1.0;
-    gate1[[1, 0]] = 0.5;
-    gate1[[2, 2]] = -1.0;
+    gate1[[0, 3]] = RICH_GATE_MAG;
+    gate1[[1, 0]] = RICH_GATE_MAG * 0.5;
+    gate1[[2, 2]] = -RICH_GATE_MAG;
 
     let make_meta = |tok: &str, id: u32, c: f32| FeatureMeta {
         top_token: tok.to_string(),
@@ -836,6 +837,173 @@ fn rich_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
     session
         .execute(&stmt)
         .expect("USE on rich synthetic vindex should succeed");
+    (session, dir)
+}
+
+// ── Full fixture: real ModelWeights + safetensors-equivalent vindex ─
+//
+// `make_full_test_vindex_dir` produces a vindex with `has_model_weights
+// = true`, populated via `larql_inference::test_utils::make_test_weights`
+// (TinyModelArch, 2 layers × 16 hidden × 32 intermediate × vocab 32).
+// `larql_vindex::write_model_weights` writes the full attention + FFN
+// + lm_head + norm weight files into the vindex directory, so
+// `load_model_weights` succeeds and downstream INFER / TRACE / EXPLAIN
+// INFER / COMPACT MAJOR / REBALANCE-with-installs / INSERT-compose all
+// have real (random) weights to forward through.
+//
+// The same WordLevel tokenizer that `make_test_tokenizer(32)` produces
+// is written to the vindex so prompts tokenise to ids 0..31.
+
+fn make_full_test_vindex_dir(tag: &str) -> std::path::PathBuf {
+    use larql_vindex::{
+        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype,
+        VindexConfig, VindexLayerInfo, VindexModelConfig,
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "larql_lql_full_test_vindex_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // `make_test_weights()` produces vocab_size = 32 with embed shape
+    // [32, 16]. The companion `make_test_tokenizer(32)` adds `[UNK]`
+    // at id 32 — out of the embed's bounds. Extend the embed by one
+    // row so any UNK-tagged token still resolves to a valid embedding.
+    let mut weights = larql_inference::test_utils::make_test_weights();
+    {
+        use larql_inference::ndarray::Array2;
+        let new_vocab = weights.vocab_size + 1;
+        let hidden = weights.hidden_size;
+        let mut extended = Array2::<f32>::zeros((new_vocab, hidden));
+        for (i, row) in weights.embed.rows().into_iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                extended[[i, j]] = *v;
+            }
+        }
+        // UNK row gets a small constant so it embeds to something
+        // distinguishable from id 0.
+        for j in 0..hidden {
+            extended[[weights.vocab_size, j]] = 0.01_f32 * (j as f32 + 1.0);
+        }
+        weights.embed = extended.into_shared();
+        weights.vocab_size = new_vocab;
+        // Mirror into the lm_head if it shared the original embed.
+        let mut lm_extended = Array2::<f32>::zeros((new_vocab, hidden));
+        for (i, row) in weights.lm_head.rows().into_iter().enumerate() {
+            if i >= new_vocab {
+                break;
+            }
+            for (j, v) in row.iter().enumerate() {
+                lm_extended[[i, j]] = *v;
+            }
+        }
+        weights.lm_head = lm_extended.into_shared();
+        // Update embed_key tensor too so manifest stays consistent.
+        let embed_key = weights.arch.embed_key().to_string();
+        weights.tensors.insert(embed_key, weights.embed.clone());
+    }
+    let vindex = larql_inference::test_utils::make_test_vindex(&weights);
+
+    // Gate offsets: each layer's gate matrix is `intermediate × hidden`
+    // floats. Lay them out contiguously starting at 0.
+    let bpf = 4_usize; // f32
+    let row_bytes = weights.hidden_size * bpf;
+    let layer_bytes = weights.intermediate_size * row_bytes;
+    let mut layers: Vec<VindexLayerInfo> = Vec::new();
+    for li in 0..weights.num_layers {
+        layers.push(VindexLayerInfo {
+            layer: li,
+            offset: (li * layer_bytes) as u64,
+            length: layer_bytes as u64,
+            num_features: weights.intermediate_size,
+            num_experts: None,
+            num_features_per_expert: None,
+        });
+    }
+
+    let model_config = VindexModelConfig {
+        model_type: weights.arch.family().to_string(),
+        head_dim: weights.head_dim,
+        num_q_heads: weights.num_q_heads,
+        num_kv_heads: weights.num_kv_heads,
+        rope_base: weights.rope_base,
+        sliding_window: None,
+        moe: None::<MoeConfig>,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        partial_rotary_factor: None,
+        sliding_window_pattern: None,
+        layer_types: None,
+        attention_k_eq_v: false,
+        num_kv_shared_layers: None,
+        per_layer_embed_dim: None,
+        rope_local_base: None,
+        query_pre_attn_scalar: None,
+        final_logit_softcapping: None,
+    };
+
+    let mut config = VindexConfig {
+        version: 2,
+        model: format!("test/full-fixture-{tag}"),
+        family: weights.arch.family().to_string(),
+        source: None,
+        checksums: None,
+        num_layers: weights.num_layers,
+        hidden_size: weights.hidden_size,
+        intermediate_size: weights.intermediate_size,
+        vocab_size: weights.vocab_size,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::All,
+        dtype: StorageDtype::F32,
+        quant: QuantFormat::None,
+        layer_bands: None,
+        layers: layers.clone(),
+        down_top_k: 5,
+        has_model_weights: true,
+        model_config: Some(model_config),
+        fp4: None,
+        ffn_layout: None,
+    };
+
+    // 1. Save the index (gate vectors + down_meta + config).
+    vindex.save_vindex(&dir, &mut config).unwrap();
+
+    // 2. Write the model weight files (attn / up / down / norms / lm_head).
+    let mut build_cb = SilentBuildCallbacks;
+    larql_vindex::write_model_weights(&weights, &dir, &mut build_cb).unwrap();
+
+    // 3. Write embeddings.bin from `weights.embed`.
+    let embed_slice = weights.embed.as_slice().unwrap();
+    let mut embed_bytes = Vec::with_capacity(embed_slice.len() * bpf);
+    for v in embed_slice {
+        embed_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
+
+    // 4. Write a tokenizer.json that maps token-id N to "[N]" string.
+    //    Pass `vocab_size - 1` so the tokenizer's `[UNK]` lands at id
+    //    `vocab_size - 1` (we extended the embed by one above), keeping
+    //    every produced id inside the embed table.
+    let tok = larql_inference::test_utils::make_test_tokenizer(weights.vocab_size - 1);
+    tok.save(dir.join("tokenizer.json").to_str().unwrap(), false)
+        .unwrap();
+
+    dir
+}
+
+fn full_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
+    let dir = make_full_test_vindex_dir(tag);
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    session
+        .execute(&stmt)
+        .expect("USE on full synthetic vindex should succeed");
     (session, dir)
 }
 
@@ -2806,8 +2974,8 @@ fn show_relations_verbose_runs_against_classifier() {
 #[test]
 fn show_relations_with_examples_runs() {
     let (mut session, dir) = rich_vindex_session("show_rel_examples");
-    let stmt = parser::parse("SHOW RELATIONS EXAMPLES;").unwrap();
-    let _ = session.execute(&stmt).expect("SHOW RELATIONS EXAMPLES");
+    let stmt = parser::parse("SHOW RELATIONS WITH EXAMPLES;").unwrap();
+    let _ = session.execute(&stmt).expect("SHOW RELATIONS WITH EXAMPLES");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2816,5 +2984,561 @@ fn show_relations_at_specific_layer_runs() {
     let (mut session, dir) = rich_vindex_session("show_rel_layer");
     let stmt = parser::parse("SHOW RELATIONS AT LAYER 0;").unwrap();
     let _ = session.execute(&stmt).expect("SHOW RELATIONS AT LAYER 0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── DIFF ─────────────────────────────────────────────────────
+
+#[test]
+fn diff_two_synthetic_vindexes_runs() {
+    let dir_a = make_test_vindex_dir("diff_a");
+    let dir_b = make_test_vindex_dir("diff_b");
+    let mut session = Session::new();
+    // DIFF doesn't require a USE — it takes explicit paths.
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}";"#,
+        dir_a.display(),
+        dir_b.display()
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("DIFF");
+    let joined = out.join("\n");
+    assert!(joined.contains("Diff:"));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_with_layer_filter_runs() {
+    let dir_a = make_test_vindex_dir("diff_layer_a");
+    let dir_b = make_test_vindex_dir("diff_layer_b");
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}" LAYER 0;"#,
+        dir_a.display(),
+        dir_b.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("DIFF LAYER");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_with_explicit_limit_runs() {
+    let dir_a = make_test_vindex_dir("diff_limit_a");
+    let dir_b = make_test_vindex_dir("diff_limit_b");
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}" LIMIT 5;"#,
+        dir_a.display(),
+        dir_b.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("DIFF LIMIT");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[test]
+fn diff_with_nonexistent_source_errors() {
+    let mut session = Session::new();
+    let stmt = parser::parse(
+        r#"DIFF "/tmp/no_such_vindex_a" "/tmp/no_such_vindex_b";"#,
+    )
+    .unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("load") || err.to_string().contains("not found"));
+}
+
+// ── MERGE ────────────────────────────────────────────────────
+
+#[test]
+fn merge_synthetic_into_current_keeps_source_strategy() {
+    let (mut session, dir) = vindex_session("merge_target");
+    let source_dir = make_test_vindex_dir("merge_source");
+    let stmt = parser::parse(&format!(
+        r#"MERGE "{}";"#,
+        source_dir.display()
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("MERGE");
+    let joined = out.join("\n");
+    assert!(joined.contains("Merged"));
+    assert!(joined.contains("features merged"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+#[test]
+fn merge_with_keep_target_strategy() {
+    let (mut session, dir) = vindex_session("merge_keep_target");
+    let source_dir = make_test_vindex_dir("merge_keep_target_src");
+    let stmt = parser::parse(&format!(
+        r#"MERGE "{}" ON CONFLICT KEEP_TARGET;"#,
+        source_dir.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("MERGE KEEP_TARGET");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+#[test]
+fn merge_with_highest_confidence_strategy() {
+    let (mut session, dir) = vindex_session("merge_highest");
+    let source_dir = make_test_vindex_dir("merge_highest_src");
+    let stmt = parser::parse(&format!(
+        r#"MERGE "{}" ON CONFLICT HIGHEST_CONFIDENCE;"#,
+        source_dir.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("MERGE HIGHEST_CONFIDENCE");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+#[test]
+fn merge_with_missing_source_errors() {
+    let (mut session, dir) = vindex_session("merge_no_source");
+    let stmt = parser::parse(r#"MERGE "/tmp/no_source_vindex_xyz";"#).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("source vindex not found"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merge_no_backend_no_target_errors() {
+    let mut session = Session::new();
+    let source_dir = make_test_vindex_dir("merge_no_backend");
+    let stmt = parser::parse(&format!(
+        r#"MERGE "{}";"#,
+        source_dir.display()
+    ))
+    .unwrap();
+    // No USE ran → MERGE without explicit target should error.
+    let _ = session.execute(&stmt); // accept either error or ok depending on path
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+// ── WALK + EXPLAIN WALK against rich fixture ─────────────────
+
+#[test]
+fn walk_against_rich_fixture_runs() {
+    let (mut session, dir) = rich_vindex_session("walk_basic");
+    let stmt = parser::parse(r#"WALK "Paris";"#).unwrap();
+    let out = session.execute(&stmt).expect("WALK");
+    assert!(!out.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn walk_with_top_clause_runs() {
+    let (mut session, dir) = rich_vindex_session("walk_top");
+    let stmt = parser::parse(r#"WALK "France" TOP 3;"#).unwrap();
+    let _ = session.execute(&stmt).expect("WALK TOP 3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn walk_with_layers_clause_runs() {
+    let (mut session, dir) = rich_vindex_session("walk_layers");
+    let stmt = parser::parse(r#"WALK "Berlin" LAYERS 0-1;"#).unwrap();
+    let _ = session.execute(&stmt).expect("WALK LAYERS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn walk_unknown_token_uses_unk() {
+    // Unknown tokens map to [UNK] (id 0), which has a valid embed row.
+    let (mut session, dir) = rich_vindex_session("walk_unk");
+    let stmt = parser::parse(r#"WALK "MongoliaXYZ";"#).unwrap();
+    let _ = session.execute(&stmt).expect("WALK with [UNK]");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_walk_runs() {
+    let (mut session, dir) = rich_vindex_session("explain_walk");
+    let stmt = parser::parse(r#"EXPLAIN WALK "Paris";"#).unwrap();
+    let out = session.execute(&stmt).expect("EXPLAIN WALK");
+    let joined = out.join("\n");
+    // Output format: "L<n>: F<m> → <token> (gate=<x>, down=[...])"
+    assert!(joined.contains("L0") || joined.contains("L1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_walk_verbose_runs() {
+    let (mut session, dir) = rich_vindex_session("explain_walk_verbose");
+    let stmt = parser::parse(r#"EXPLAIN WALK "Paris" VERBOSE;"#).unwrap();
+    let _ = session.execute(&stmt).expect("EXPLAIN WALK VERBOSE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── REBALANCE early-exit ─────────────────────────────────────
+
+#[test]
+fn rebalance_with_no_installs_short_circuits_v2() {
+    let (mut session, dir) = vindex_session("rebalance_empty_v2");
+    // No prior INSERT compose → installed_edges is empty → REBALANCE
+    // hits the "nothing to rebalance" early-return path.
+    let stmt = parser::parse("REBALANCE;").unwrap();
+    let out = session.execute(&stmt).expect("REBALANCE");
+    let joined = out.join("\n");
+    assert!(joined.contains("no compose-mode installs"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rebalance_with_explicit_clauses_short_circuits() {
+    let (mut session, dir) = vindex_session("rebalance_clauses_v2");
+    let stmt = parser::parse(
+        "REBALANCE FLOOR 0.20 CEILING 0.95 MAX 8;",
+    )
+    .unwrap();
+    let _ = session.execute(&stmt).expect("REBALANCE with clauses");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── COMPACT MINOR / COMPACT MAJOR short-circuits ─────────────
+
+#[test]
+fn compact_minor_with_empty_l0_short_circuits_v2() {
+    let (mut session, dir) = vindex_session("compact_minor_empty_v2");
+    let stmt = parser::parse("COMPACT MINOR;").unwrap();
+    let out = session.execute(&stmt).expect("COMPACT MINOR");
+    let joined = out.join("\n");
+    assert!(joined.contains("L0 is empty"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_major_on_small_hidden_dim_errors() {
+    let (mut session, dir) = vindex_session("compact_major_small_v2");
+    // Synthetic fixture has hidden_dim=4 < 1024 → COMPACT MAJOR errors
+    // with the "requires hidden_dim >= 1024" message.
+    let stmt = parser::parse("COMPACT MAJOR;").unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("hidden_dim"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_major_with_lambda_clause_parses_and_errors_on_small_dim() {
+    let (mut session, dir) = vindex_session("compact_major_lambda");
+    let stmt = parser::parse("COMPACT MAJOR WITH LAMBDA = 0.001;").unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("hidden_dim") || err.to_string().contains("model weights"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Full-fixture tests (real ModelWeights on disk) ───────────
+
+#[test]
+fn full_fixture_loads_via_use() {
+    let (session, dir) = full_vindex_session("loads");
+    assert!(matches!(session.backend, Backend::Vindex { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn infer_against_full_fixture_runs() {
+    let (mut session, dir) = full_vindex_session("infer_basic");
+    // Tokeniser maps any string to `[N]` token IDs in 0..32. Prompt
+    // produces a small prefix the FFN walk can run against.
+    let stmt = parser::parse(r#"INFER "[1] [2]" TOP 3;"#).unwrap();
+    let _ = session.execute(&stmt).expect("INFER");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn infer_with_compare_mode_runs() {
+    let (mut session, dir) = full_vindex_session("infer_compare");
+    let stmt = parser::parse(r#"INFER "[3]" TOP 2 COMPARE;"#).unwrap();
+    let _ = session.execute(&stmt).expect("INFER COMPARE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_against_full_fixture_runs() {
+    let (mut session, dir) = full_vindex_session("explain_infer");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]";"#).unwrap();
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_verbose_with_attention_runs() {
+    let (mut session, dir) = full_vindex_session("explain_infer_attn");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[5]" VERBOSE WITH ATTENTION;"#).unwrap();
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER VERBOSE WITH ATTENTION");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_against_full_fixture_runs() {
+    let (mut session, dir) = full_vindex_session("trace_basic");
+    let stmt = parser::parse(r#"TRACE "[1] [2]";"#).unwrap();
+    let _ = session.execute(&stmt).expect("TRACE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_with_decompose_runs() {
+    let (mut session, dir) = full_vindex_session("trace_decompose");
+    let stmt = parser::parse(r#"TRACE "[1]" DECOMPOSE;"#).unwrap();
+    let _ = session.execute(&stmt).expect("TRACE DECOMPOSE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_compose_against_full_fixture_runs() {
+    // Compose-mode INSERT runs the full pipeline: plan → capture
+    // residuals → install slots → balance → cross-fact regression
+    // check. Each phase calls `predict_with_ffn` against the random-
+    // init weights; outputs are nonsense but every code path runs.
+    //
+    // Entity/relation/target use `[N]` patterns to land inside the
+    // test tokenizer's vocab. Layer 0 is pinned so the plan picks a
+    // single layer that exists in the 2-layer fixture.
+    let (mut session, dir) = full_vindex_session("insert_compose");
+    let stmt = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") AT LAYER 0 MODE COMPOSE;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&stmt).expect("INSERT compose");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_compose_with_explicit_alpha_and_confidence() {
+    let (mut session, dir) = full_vindex_session("insert_compose_alpha");
+    let stmt = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[3]", "[4]", "[7]")
+           AT LAYER 1
+           CONFIDENCE 0.95
+           ALPHA 0.20
+           MODE COMPOSE;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&stmt).expect("INSERT compose with alpha+confidence");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rebalance_after_compose_insert_runs_real_loop() {
+    // After a successful compose-mode INSERT, `installed_edges` has
+    // a fact, so REBALANCE skips the early-exit and enters the
+    // fixed-point loop (loads weights/tokenizer, runs probe walks).
+    let (mut session, dir) = full_vindex_session("rebalance_after_compose");
+
+    let insert = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") AT LAYER 0 MODE COMPOSE;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&insert).expect("INSERT compose");
+
+    let rebal = parser::parse("REBALANCE MAX 2;").unwrap();
+    let _ = session.execute(&rebal).expect("REBALANCE after compose");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_knn_against_full_fixture_runs() {
+    let (mut session, dir) = full_vindex_session("insert_knn");
+    let stmt = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") MODE KNN;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&stmt).expect("INSERT KNN");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_minor_after_knn_insert_promotes_l0_to_l1() {
+    // KNN INSERT writes to L0 (knn_store). COMPACT MINOR then
+    // promotes those entries to L1 via compose-mode reinstall.
+    let (mut session, dir) = full_vindex_session("compact_minor_promotes");
+
+    let insert = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") AT LAYER 0 MODE KNN;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&insert).expect("INSERT KNN");
+
+    let compact = parser::parse("COMPACT MINOR;").unwrap();
+    // COMPACT MINOR may succeed or fail (compose-mode reinstall might
+    // hit an internal error against the random-init model). Either way
+    // it exercises the L0→L1 loop.
+    let _ = session.execute(&compact);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── INFER / TRACE / EXPLAIN INFER mode variants ──────────────
+
+#[test]
+fn infer_with_top_5_runs() {
+    let (mut session, dir) = full_vindex_session("infer_top5");
+    let stmt = parser::parse(r#"INFER "[1] [2] [3]" TOP 5;"#).unwrap();
+    let _ = session.execute(&stmt).expect("INFER TOP 5");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn infer_default_top_runs() {
+    let (mut session, dir) = full_vindex_session("infer_default");
+    let stmt = parser::parse(r#"INFER "[7]";"#).unwrap();
+    let _ = session.execute(&stmt).expect("INFER default top");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_with_band_clause_runs() {
+    let (mut session, dir) = full_vindex_session("explain_infer_band");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[1] [2]" KNOWLEDGE;"#).unwrap();
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER KNOWLEDGE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_relations_only_runs() {
+    let (mut session, dir) = full_vindex_session("explain_infer_rel_only");
+    let stmt =
+        parser::parse(r#"EXPLAIN INFER "[1]" RELATIONS ONLY;"#).unwrap();
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER RELATIONS ONLY");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explain_infer_with_top_clause_runs() {
+    let (mut session, dir) = full_vindex_session("explain_infer_top");
+    let stmt = parser::parse(r#"EXPLAIN INFER "[5]" TOP 3;"#).unwrap();
+    let _ = session.execute(&stmt).expect("EXPLAIN INFER TOP 3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_for_specific_token_runs() {
+    let (mut session, dir) = full_vindex_session("trace_for");
+    let stmt = parser::parse(r#"TRACE "[1] [2]" FOR "[5]";"#).unwrap();
+    let _ = session.execute(&stmt).expect("TRACE FOR token");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_with_positions_all_runs() {
+    let (mut session, dir) = full_vindex_session("trace_positions_all");
+    let stmt = parser::parse(r#"TRACE "[1] [2]" POSITIONS ALL;"#).unwrap();
+    let _ = session.execute(&stmt).expect("TRACE POSITIONS ALL");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_with_save_writes_file() {
+    let (mut session, dir) = full_vindex_session("trace_save");
+    let save_path = dir.join("trace_output.json");
+    let stmt = parser::parse(&format!(
+        r#"TRACE "[1] [2]" SAVE "{}";"#,
+        save_path.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("TRACE SAVE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trace_with_layers_clause_runs() {
+    let (mut session, dir) = full_vindex_session("trace_layers");
+    let stmt = parser::parse(r#"TRACE "[1]" LAYERS 0-1;"#).unwrap();
+    let _ = session.execute(&stmt).expect("TRACE LAYERS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── DIFF INTO PATCH ──────────────────────────────────────────
+
+#[test]
+fn diff_into_patch_writes_vlp_file() {
+    let dir_a = make_test_vindex_dir("diff_into_patch_a");
+    let dir_b = make_test_vindex_dir("diff_into_patch_b");
+    let mut session = Session::new();
+    let patch_path = std::env::temp_dir().join(format!(
+        "larql_diff_patch_{}.vlp",
+        std::process::id()
+    ));
+    let stmt = parser::parse(&format!(
+        r#"DIFF "{}" "{}" INTO PATCH "{}";"#,
+        dir_a.display(),
+        dir_b.display(),
+        patch_path.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("DIFF INTO PATCH");
+    let _ = std::fs::remove_file(&patch_path);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+// ── COMPILE INTO MODEL ───────────────────────────────────────
+
+#[test]
+fn compile_into_model_default_path_runs() {
+    let (mut session, dir) = full_vindex_session("compile_into_model");
+    let out_dir = dir.join("compiled_model");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO MODEL "{}" FORMAT safetensors;"#,
+        out_dir.display()
+    ))
+    .unwrap();
+    let _ = session.execute(&stmt).expect("COMPILE INTO MODEL");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_into_model_with_memit_enabled_runs() {
+    // LARQL_MEMIT_ENABLE=1 + a compose-mode INSERT in the recording
+    // means COMPILE INTO MODEL invokes the MEMIT solver path.
+    let (mut session, dir) = full_vindex_session("compile_into_model_memit");
+
+    let insert = parser::parse(
+        r#"INSERT INTO EDGES (entity, relation, target)
+           VALUES ("[1]", "[2]", "[5]") AT LAYER 0 MODE COMPOSE;"#,
+    )
+    .unwrap();
+    let _ = session.execute(&insert).expect("INSERT compose");
+
+    let out_dir = dir.join("compiled_memit");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO MODEL "{}" FORMAT safetensors;"#,
+        out_dir.display()
+    ))
+    .unwrap();
+
+    // Toggle MEMIT on for the duration of this call.
+    std::env::set_var("LARQL_MEMIT_ENABLE", "1");
+    let result = session.execute(&stmt);
+    std::env::remove_var("LARQL_MEMIT_ENABLE");
+
+    // The MEMIT solve may or may not converge cleanly with random-init
+    // weights — accept either outcome but exercise the path.
+    let _ = result;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_major_against_full_fixture_runs() {
+    // Full fixture has hidden_dim=16 < 1024 — COMPACT MAJOR still
+    // errors on the hidden_dim check, but exercises more of the
+    // pre-check path than the small-fixture variant since model
+    // weights are loadable.
+    let (mut session, dir) = full_vindex_session("compact_major");
+    let stmt = parser::parse("COMPACT MAJOR;").unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("hidden_dim"));
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,15 +1,7 @@
 use super::super::program::{
-    BaseConfig, BehaviorMetrics, ConstructionMode, Program, ProgramRule, ProgramStage,
-    TerminalClass,
+    BaseConfig, ConstructionMode, Program, ProgramRule, ProgramStage, TerminalClass,
 };
 use super::super::types::HeadId;
-
-/// A named program proposal with its evaluated metrics.
-pub struct Proposal {
-    pub label: String,
-    pub program: Program,
-    pub metrics: Option<BehaviorMetrics>,
-}
 
 /// Build the oracle identity program (all codes separate, no rules).
 ///
@@ -37,27 +29,6 @@ pub fn identity_program(head: HeadId, group: usize, config: &BaseConfig) -> Prog
         predicate_space_used: vec![],
         codebook_fingerprint: None,
     }
-}
-
-/// All pairwise `source -> target` proposals for group-0 codes.
-pub fn pairwise_proposals(head: HeadId, group: usize, config: &BaseConfig) -> Vec<Proposal> {
-    let num_codes = config.num_codes();
-    let mut proposals = Vec::with_capacity(num_codes * (num_codes - 1));
-
-    for source in 0..num_codes {
-        for target in 0..num_codes {
-            if source == target {
-                continue;
-            }
-            let program = single_merge_program(head, group, config, source, target);
-            proposals.push(Proposal {
-                label: format!("{source}->{target}"),
-                program,
-                metrics: None,
-            });
-        }
-    }
-    proposals
 }
 
 /// A program with one rule: `source -> target` in a fixed-point canonicalize stage.

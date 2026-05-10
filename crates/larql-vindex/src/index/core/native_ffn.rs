@@ -13,7 +13,7 @@ impl NativeFfnAccess for VectorIndex {
     }
 
     fn has_down_features(&self) -> bool {
-        self.ffn.down_features_mmap.is_some()
+        self.has_down_features()
     }
 
     fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {

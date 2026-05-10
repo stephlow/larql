@@ -193,23 +193,30 @@ impl VectorIndex {
     /// matrices) — matches the build_q4k_weights writer.
     pub fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.ffn.interleaved_q4k_mmap {
+        if let Some(bytes) = self.storage.interleaved_q4k_whole_buffer_view() {
+            let mmap: &[u8] = bytes.as_ref();
             let intermediate = self.num_features(layer);
             if intermediate == 0 {
                 return;
             }
-            let (start, len) = if let Some(ref manifest) = self.ffn.interleaved_q4k_manifest {
-                let base = layer * FFN_COMPONENTS_PER_LAYER;
-                if base + FFN_COMPONENTS_PER_LAYER > manifest.len() {
+            // The trait gives us the layer view directly when a
+            // manifest is loaded — that's the correct (start, end)
+            // span. Without the per-layer view we fall back to the
+            // legacy uniform-Q4_K stride.
+            let (start, len) = if let Some(arr) = self.storage.interleaved_q4k_layer_data(layer) {
+                // Span = first component's start to last component's end.
+                let first_start = {
+                    let (view, _) = arr[0];
+                    view.offset
+                };
+                let last_end = {
+                    let (view, _) = arr[FFN_DOWN];
+                    view.offset + view.length
+                };
+                if first_start >= mmap.len() || last_end <= first_start {
                     return;
                 }
-                let s = manifest[base].0;
-                let (last_off, last_len, _) = &manifest[base + FFN_DOWN];
-                let e = (last_off + last_len).min(mmap.len());
-                if s >= mmap.len() || e <= s {
-                    return;
-                }
-                (s, e - s)
+                (first_start, last_end - first_start)
             } else {
                 // Uniform-stride fallback: matches build_q4k_weights's
                 // Q4_K-only writer. Q4_K is 144 bytes per 256 elements.

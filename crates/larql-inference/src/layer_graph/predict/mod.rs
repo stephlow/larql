@@ -373,4 +373,103 @@ mod tests {
         let result = predict_pipeline(&weights, &tokenizer, &[0u32, 1], 3, graph, Some(&index));
         assert!(result.token_ids.len() <= 3);
     }
+
+    #[test]
+    fn predict_pipeline_falls_back_when_no_index() {
+        // index = None → must skip the vindex-logits path and use full
+        // matmul via predict_with_graph.
+        use crate::layer_graph::LayerGraph;
+        let f = fx();
+        let (weights, tokenizer) = (&f.weights, &f.tokenizer);
+        let ffn = WeightFfn { weights: &weights };
+        let g = crate::layer_graph::WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let graph: &dyn LayerGraph = &g;
+        let result = predict_pipeline(&weights, &tokenizer, &[0u32], 3, graph, None);
+        assert!(result.predictions.len() <= 3);
+    }
+
+    #[test]
+    fn predict_pipeline_falls_back_when_index_lacks_lm_head() {
+        // Synthetic vindex doesn't load lm_head — `has_lm_head` returns
+        // false → still routes to predict_with_graph (full matmul).
+        use crate::layer_graph::LayerGraph;
+        let f = fx();
+        let ffn = WeightFfn {
+            weights: &f.weights,
+        };
+        let g = crate::layer_graph::WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let graph: &dyn LayerGraph = &g;
+        // Synthetic index has no lm_head data populated.
+        let result =
+            predict_pipeline(&f.weights, &f.tokenizer, &[0u32], 3, graph, Some(&f.index));
+        assert!(result.predictions.len() <= 3);
+    }
+
+    #[test]
+    fn predict_with_graph_returns_predictions() {
+        use crate::layer_graph::{LayerGraph, WalkLayerGraph};
+        let f = fx();
+        let ffn = WeightFfn {
+            weights: &f.weights,
+        };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let graph: &dyn LayerGraph = &g;
+        let result = predict_with_graph(&f.weights, &f.tokenizer, &[0u32, 1, 2], 4, graph);
+        assert!(result.predictions.len() <= 4);
+    }
+
+    #[test]
+    fn trace_with_graph_returns_per_layer_residuals() {
+        use crate::layer_graph::{LayerGraph, WalkLayerGraph};
+        let f = fx();
+        let ffn = WeightFfn {
+            weights: &f.weights,
+        };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let graph: &dyn LayerGraph = &g;
+        let trace = trace_with_graph(
+            &f.weights,
+            &[0u32, 1, 2],
+            &[0, 1],
+            graph,
+        );
+        assert_eq!(trace.residuals.len(), 2);
+        assert_eq!(trace.residuals[0].0, 0);
+        assert_eq!(trace.residuals[1].0, 1);
+        for (_, r) in &trace.residuals {
+            assert_eq!(r.len(), f.weights.hidden_size);
+            assert!(r.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn trace_with_graph_empty_capture_runs_zero_layers() {
+        use crate::layer_graph::{LayerGraph, WalkLayerGraph};
+        let f = fx();
+        let ffn = WeightFfn {
+            weights: &f.weights,
+        };
+        let g = WalkLayerGraph {
+            ffn: &ffn,
+            backend: None,
+        };
+        let graph: &dyn LayerGraph = &g;
+        // Empty capture → max_layer defaults to 0 (per `unwrap_or(&0)`)
+        // → still walks layer 0 but never records.
+        let trace = trace_with_graph(&f.weights, &[0u32], &[], graph);
+        assert!(trace.residuals.is_empty());
+        assert!(trace.activations.is_empty());
+    }
 }

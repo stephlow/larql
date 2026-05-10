@@ -179,18 +179,7 @@ impl VectorIndex {
         if !backend.has_q4() {
             return None;
         }
-        let q4_bytes: Option<&[u8]> = self
-            .projections
-            .lm_head_q4_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
-            .or_else(|| {
-                self.projections
-                    .lm_head_q4_synth
-                    .as_ref()
-                    .map(|v| v.as_slice())
-            });
-        let q4_data = q4_bytes?;
+        let q4_data: &[u8] = self.storage.lm_head_q4_view().map(|b| b.as_ref())?;
         let vocab = self.vocab_size;
         let hidden = self.hidden_size;
         if vocab == 0 {
@@ -515,5 +504,92 @@ mod tests {
     fn stride32_mode_unknown_value_falls_back() {
         let _g = EnvSet::set(Some("maybe"));
         assert_eq!(lm_head_stride32_mode(), Stride32Mode::Fallback);
+    }
+
+    // ── Backend dispatch coverage ─────────────────────────────────
+    //
+    // These tests exercise the `lm_head_knn_backend` /
+    // `lm_head_knn_backend_skip_q4k` paths on a `CpuBackend`. The
+    // Cpu backend has Q4 support (`has_q4()` true), so the Q4
+    // stride-32 / matvec branches fire when Q4 bytes are present.
+    // f32 fallback fires when neither Q4 nor f16 is loaded.
+
+    #[test]
+    #[serial_test::serial]
+    fn lm_head_knn_backend_falls_back_to_f32_when_no_q4_or_f16() {
+        // Stride-32 disabled so the backend tries f16 (none) → f32.
+        let _g = EnvSet::set(Some("0"));
+        let lm_head: Vec<f32> = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+        ];
+        let v = vindex_with_lm_head(2, 2, &lm_head);
+        let cpu = larql_compute::CpuBackend;
+        let q = Array1::from_vec(vec![1.0_f32, 0.0]);
+        let hits = v.lm_head_knn_backend(&q, 1, &cpu);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 0, "token 0 [1, 0] best matches query [1, 0]");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lm_head_knn_backend_skip_q4k_falls_back_to_f32() {
+        let _g = EnvSet::set(Some("0"));
+        let lm_head: Vec<f32> = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+        ];
+        let v = vindex_with_lm_head(2, 2, &lm_head);
+        let cpu = larql_compute::CpuBackend;
+        let q = Array1::from_vec(vec![0.0_f32, 1.0]);
+        let hits = v.lm_head_knn_backend_skip_q4k(&q, 1, &cpu);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 1);
+    }
+
+    /// `lm_head_stride32_backend_hits` short-circuits when no Q4 mmap
+    /// is loaded on the storage façade. Exercised through the public
+    /// `lm_head_knn_backend` with stride32 enabled.
+    #[test]
+    #[serial_test::serial]
+    fn lm_head_stride32_path_returns_none_without_q4_mmap() {
+        let _g = EnvSet::set(Some("1"));
+        let lm_head: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+        let v = vindex_with_lm_head(2, 2, &lm_head);
+        // Storage has no lm_head_q4 — stride32 returns None, falls
+        // through to f16 (none) → f32, returns the f32 dot.
+        let cpu = larql_compute::CpuBackend;
+        let q = Array1::from_vec(vec![1.0_f32, 0.0]);
+        let hits = v.lm_head_knn_backend(&q, 1, &cpu);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 0);
+    }
+
+    /// `lm_head_f16_backend_hits` returns None when vocab_size is 0.
+    /// We force the path by populating the f16 mmap then setting
+    /// vocab_size = 0 — the early-return on `vocab > 0` fires.
+    #[test]
+    #[serial_test::serial]
+    fn lm_head_f16_path_returns_none_when_vocab_zero() {
+        let _g = EnvSet::set(Some("0")); // skip stride32
+
+        // f16-encoded 2×2 lm_head.
+        let f16_bytes = larql_models::quant::half::encode_f16(&[1.0, 0.0, 0.0, 1.0]);
+        let mut anon = memmap2::MmapOptions::new()
+            .len(f16_bytes.len())
+            .map_anon()
+            .unwrap();
+        anon.copy_from_slice(&f16_bytes);
+        let mmap = anon.make_read_only().unwrap();
+
+        let mut v = VectorIndex::empty(1, 2);
+        v.set_lm_head_f16_mmap(std::sync::Arc::new(mmap));
+        // Force vocab_size = 0 so the f16 path bails on the inner guard.
+        v.vocab_size = 0;
+        let cpu = larql_compute::CpuBackend;
+        let q = Array1::from_vec(vec![1.0_f32, 0.0]);
+        // f16 returns None (vocab=0), f32 fallback also vocab=0 → empty.
+        let hits = v.lm_head_knn_backend(&q, 1, &cpu);
+        assert!(hits.is_empty());
     }
 }

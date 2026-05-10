@@ -212,8 +212,15 @@ where
         && std::env::var("LARQL_METAL_PLE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+    eprintln!(
+        "[ple-route] needs_per_layer_embed={} metal_ple_enabled={} fused_q4_supported={}",
+        needs_per_layer_embed,
+        metal_ple_enabled,
+        backend_supports_fused_q4_pipeline(backend)
+    );
     if !backend_supports_fused_q4_pipeline(backend) || (needs_per_layer_embed && !metal_ple_enabled)
     {
+        eprintln!("[ple-route] -> falling back to generate_via_cpu_q4k");
         return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index, eos);
     }
 
@@ -255,9 +262,11 @@ where
     // backend cannot be a `MetalBackend` and the PLE path is unreachable.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     let metal_ple = if metal_ple_enabled {
-        backend
+        let m = backend
             .as_any()
-            .downcast_ref::<larql_compute::metal::MetalBackend>()
+            .downcast_ref::<larql_compute::metal::MetalBackend>();
+        eprintln!("[ple-route] downcast to MetalBackend: ok={}", m.is_some());
+        m
     } else {
         None
     };
@@ -289,6 +298,15 @@ where
                 flat.push(*v);
             }
         }
+        eprintln!(
+            "[ple-up] uploading: per_layer_inputs.len={} flat.len={} (expected {} = {}*{}) tok={}",
+            per_layer_inputs.len(),
+            flat.len(),
+            num_layers * ple_dim,
+            num_layers,
+            ple_dim,
+            token_id,
+        );
         metal.prepare_ple_inputs(&flat, num_layers, ple_dim);
     };
 

@@ -9,6 +9,48 @@ pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 Entries migrated from ROADMAP.md on 2026-05-10; pre-2026-05-10 entries
 preserve the date and voice they were originally written in.
 
+## [2026-05-10] — Coverage push: 53.13% → 63.18% (+10.05 pp)
+
+Targeted-test sweep on synthetic-friendly files. 654 → **811 lib tests**
+(+157 new tests, all passing). Per-file 90% floor crossed by 7 new files.
+
+**Files crossed past the 90% floor:**
+
+| File | Before | After |
+|------|-------:|------:|
+| `ffn/moe_remote/multi_layer_wire.rs` | 57.14% | **98.54%** |
+| `ffn/remote/codec.rs` | 70.80% | **97.18%** |
+| `attention/gqa.rs` | 78.46% | **98.78%** |
+| `forward/trace.rs` | 76.14% | **95.88%** |
+| `layer_graph/cached.rs` | 65.17% | **96.68%** |
+| `forward/target_delta.rs` | 70.80% | **96.29%** |
+| `trace/context.rs` | 62.63% | **94.11%** |
+| `forward/predict/dense.rs` | 40.79% | **95.37%** |
+
+**Big lifts that didn't cross 90% (arch-dependent or infrastructure-bound):**
+
+| File | Before | After | Blocker |
+|------|-------:|------:|---------|
+| `attention/block.rs` | 57.33% | 89.54% | Bias/QK-norm Some-arms need non-tinymodel arch |
+| `vindex/walk_ffn/mod.rs` | 62.35% | 89.24% | Override-routing branch needs custom `PatchOverrides` mock |
+| `ffn/graph_backend.rs` | 63.40% | 84.50% | Streaming-build error paths |
+| `forward/layer.rs` | 69.98% | 83.45% | post_norms branch needs Gemma-style arch |
+| `forward/infer_patched.rs` | 71.24% | 82.56% | `infer_patched_q4k` needs real Q4K vindex |
+| `ffn/weight.rs` | 76.79% | 86.36% | Non-gated FFN + bias paths need different arch |
+| `attention/gpu.rs` | 66.27% | 76.39% | Q4 matvec + post_norms branches |
+| `layer_graph/generate/lm_head.rs` | 54.05% | 80.00% | `lm_head_topk_with_policy` skip-Q4K branch |
+| `ffn/sparse_compute.rs` | 55.81% | 78.58% | Some `sparse_ffn_forward_full_impl` branches |
+
+**Files left untouched** (require infrastructure beyond synthetic fixtures):
+
+- `layer_graph/grid/remote_moe.rs` (1192 LOC, 1.4%) — needs gRPC backend
+- `ffn/moe_remote/backend.rs` (1013 LOC, 1.2%) — needs HTTP+grid
+- `layer_graph/grid/remote_ffn.rs` (810 LOC, 0%) — same
+- `vindex/q4k_forward/{metal, hidden, interventions, walk_ffn, …}.rs` — need a real Q4K vindex on disk
+- The H12 splits (`gpu/{mod, decode_loop, prefill}.rs`, `predict/{split, honest}.rs`, `shard/*`) — need a `MockComputeBackend`
+
+**Crate total**: lines 53.13% → **63.18%**, regions 54.55% → 60.69%, functions 62.78% → 68.50%.
+
 ## [2026-05-10] — `forced_logits` synthetic tests
 
 The H12 `gpu/` split landed three new files at 0% coverage. `forced_logits.rs`

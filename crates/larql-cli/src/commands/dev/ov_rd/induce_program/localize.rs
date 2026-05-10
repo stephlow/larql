@@ -1,6 +1,11 @@
+// Diagnostic-capture structs accumulate per-prompt fields (clears_failure,
+// metrics, worst_prompt_kl, …) for a future dump/serializer; suppress until
+// the viewer is wired.
+#![allow(dead_code)]
+
 use larql_vindex::VectorIndex;
 
-use super::super::metrics::{argmax, bool_rate, kl_logp, log_softmax, mean, percentile};
+use super::super::metrics::{argmax, kl_logp, log_softmax, mean, percentile};
 use super::super::oracle_pq_forward::{final_logits, forward_q4k_predicted_address_mode_d_head};
 use super::super::program::BehaviorMetrics;
 use super::context::{FitContext, PromptCapture};
@@ -163,10 +168,10 @@ pub fn localize_failure(
     fit: &FitContext,
     merged_codes: &[usize],
     target: usize,
-    failing_max_kl: f64,
+    _failing_max_kl: f64,
 ) -> Result<LocalizeResult, Box<dyn std::error::Error>> {
     // Step 1: find worst prompt from the full-merge evaluation.
-    let full_metrics = eval_leave_code_oracle(weights, index, fit, merged_codes, target, None)?;
+    let _full_metrics = eval_leave_code_oracle(weights, index, fit, merged_codes, target, None)?;
     let (worst_idx, worst_kl) = fit
         .captures
         .iter()

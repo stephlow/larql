@@ -24,19 +24,20 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         // Demand-paged: per-layer prefetch issued at query time via prefetch_interleaved_layer.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.interleaved_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
+        Arc::make_mut(&mut self.storage).set_interleaved_f32(mmap);
         Ok(())
     }
 
     /// Whether interleaved FFN data is loaded.
     pub fn has_interleaved(&self) -> bool {
-        self.ffn.interleaved_mmap.is_some()
+        self.storage.has_interleaved_f32()
     }
 
     /// Get gate matrix for a layer from the interleaved file: [intermediate, hidden].
     pub fn interleaved_gate(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.ffn.interleaved_mmap.as_ref()?;
+        let bytes = self.storage.interleaved_f32_view()?;
+        let mmap: &[u8] = bytes.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 {
             return None;
@@ -57,7 +58,8 @@ impl VectorIndex {
 
     /// Get up matrix for a layer from the interleaved file: [intermediate, hidden].
     pub fn interleaved_up(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.ffn.interleaved_mmap.as_ref()?;
+        let bytes = self.storage.interleaved_f32_view()?;
+        let mmap: &[u8] = bytes.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 {
             return None;
@@ -78,7 +80,8 @@ impl VectorIndex {
 
     /// Get down matrix for a layer from the interleaved file: [intermediate, hidden].
     pub fn interleaved_down(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        let mmap = self.ffn.interleaved_mmap.as_ref()?;
+        let bytes = self.storage.interleaved_f32_view()?;
+        let mmap: &[u8] = bytes.as_ref();
         let intermediate = self.num_features(layer);
         if intermediate == 0 {
             return None;
@@ -100,7 +103,8 @@ impl VectorIndex {
     /// Prefetch next layer's interleaved data into page cache.
     pub fn prefetch_interleaved_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.ffn.interleaved_mmap {
+        if let Some(bytes) = self.storage.interleaved_f32_view() {
+            let mmap: &[u8] = bytes.as_ref();
             let intermediate = self.num_features(layer);
             if intermediate == 0 {
                 return;

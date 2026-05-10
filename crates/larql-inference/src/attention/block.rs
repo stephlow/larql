@@ -801,4 +801,54 @@ mod tests {
         )
         .is_none());
     }
+
+    // ── Gemma3-arch fixture (post-norms, QK norm, gelu_tanh) ───────────
+
+    #[test]
+    fn attention_block_with_qk_norm_keys_routes_through_qk_norm_branch() {
+        // Gemma3 returns Some from attn_q_norm_key/attn_k_norm_key, hitting
+        // the rms_norm_heads branch in run_attention_block_core that
+        // tinymodel never exercises.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let h = hidden(2, weights.hidden_size);
+        let (h_post, _, _) = run_attention_block(&weights, &h, 0, false).unwrap();
+        assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
+        assert!(h_post.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn attention_block_post_norms_arch_runs_through_post_norm_branch() {
+        // Gemma3 has has_post_norms=true, so the post-attention path
+        // takes a different branch in run_attention_block_core.
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let h = hidden(2, weights.hidden_size);
+        let (h_post, _, _) = run_attention_block(&weights, &h, 1, false).unwrap();
+        assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
+        assert!(h_post.iter().all(|v| v.is_finite()));
+    }
+
+    // ── Starcoder2-arch fixture (attention + FFN biases) ───────────────
+
+    #[test]
+    fn attention_block_with_q_k_v_o_biases_runs_add_bias_branches() {
+        // Starcoder2 returns Some from every attn_*_bias_key, so every
+        // `add_bias` call site fires.
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let h = hidden(2, weights.hidden_size);
+        let (h_post, _, _) = run_attention_block(&weights, &h, 0, false).unwrap();
+        assert_eq!(h_post.shape(), &[2, weights.hidden_size]);
+        assert!(h_post.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn attention_block_starcoder_with_kv_out_returns_finite_kv() {
+        let weights = crate::test_utils::make_starcoder2_test_weights();
+        let h = hidden(3, weights.hidden_size);
+        let (_, _, _, k, v) =
+            run_attention_block_with_kv_out(&weights, &h, 0, false, None).unwrap();
+        assert_eq!(k.shape()[0], 3);
+        assert_eq!(v.shape()[0], 3);
+        assert!(k.iter().all(|x| x.is_finite()));
+        assert!(v.iter().all(|x| x.is_finite()));
+    }
 }

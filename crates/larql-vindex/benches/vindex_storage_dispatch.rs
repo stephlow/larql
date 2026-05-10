@@ -84,27 +84,22 @@ fn build_fixture(
         }
     }
 
-    // Construct an inert `VectorIndex` then poke the FFN substore
-    // fields — same pattern the production loader uses (see
-    // `ffn_store/interleaved_q4k.rs::load_interleaved_q4k`), minus
-    // the on-disk read. `VectorIndex::new` (vs the crate-private
-    // `empty`) is the public constructor for in-memory builds.
+    // Construct an inert `VectorIndex` then install the synthetic
+    // FFN bytes through the `MmapStorage` setter — same path the
+    // production loader uses (`ffn_store/interleaved_q4k.rs::load_interleaved_q4k`)
+    // minus the on-disk read.
     let mut index = larql_vindex::index::VectorIndex::new(
         vec![None; num_layers],
         vec![None; num_layers],
         num_layers,
         hidden,
     );
-    index.ffn.interleaved_q4k_mmap = Some(Arc::new(mmap));
-    index.ffn.interleaved_q4k_manifest = Some(manifest);
+    Arc::make_mut(&mut index.storage).set_interleaved_q4k(Arc::new(mmap), Some(manifest));
 
-    let storage = MmapStorage::from_substores(
-        &index.ffn,
-        &index.gate,
-        &index.projections,
-        index.hidden_size,
-    );
-
+    // Take a snapshot of `index.storage` for the concrete-shape
+    // benchmark group (the trait-dispatch group rewraps it as
+    // `Arc<dyn>`).
+    let storage = (*index.storage).clone();
     (index, storage)
 }
 

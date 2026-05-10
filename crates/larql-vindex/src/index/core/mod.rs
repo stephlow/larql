@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use ndarray::Array2;
 
-use super::storage::{FfnStore, GateStore, MetadataStore, MmapStorage, ProjectionStore};
+use super::storage::{FfnStore, GateStore, MetadataStore, MmapStorage};
 // Re-export all shared types from types.rs so external callers can
 // keep using `crate::index::core::{VectorIndex, FeatureMeta, …}` paths.
 pub use super::types::*;
@@ -57,10 +57,9 @@ pub struct VectorIndex {
 
     /// Gate matrix storage + decode caches + HNSW index.
     pub gate: GateStore,
-    /// FFN mmap handles + Q4_K dequant cache + FP4 storage.
+    /// FFN heap caches + FP4 storage. Mmap-backed FFN tensors moved
+    /// to `storage` (step 6 of the migration).
     pub ffn: FfnStore,
-    /// lm_head + attention weight mmaps.
-    pub projections: ProjectionStore,
     /// down_meta + per-feature overrides.
     pub metadata: MetadataStore,
 
@@ -90,7 +89,6 @@ impl Clone for VectorIndex {
             layer_range: self.layer_range,
             gate: self.gate.clone(),
             ffn: self.ffn.clone(),
-            projections: self.projections.clone(),
             metadata: self.metadata.clone(),
             storage: Arc::clone(&self.storage),
         }
@@ -109,7 +107,6 @@ impl VectorIndex {
             layer_range: None,
             gate: GateStore::empty(num_layers),
             ffn: FfnStore::empty(num_layers),
-            projections: ProjectionStore::empty(),
             metadata: MetadataStore::empty(num_layers),
             storage: Arc::new(MmapStorage::empty(hidden_size)),
         }
@@ -132,13 +129,6 @@ impl VectorIndex {
 
     /// Build a zero-copy mmap-mode index — gate vectors come from the
     /// supplied mmap; down_meta is optionally mmap'd too.
-    ///
-    /// **Step 5 transition state**: writes the gate mmap to **both**
-    /// `self.gate` (substore) and `self.storage` (façade). Gate-KNN
-    /// compute (`gate_accessors.rs` + `gate_knn/*`) still reads from
-    /// substore fields; step 6 will migrate those reads to
-    /// `self.storage.gate_layer_view(layer)` and drop the substore
-    /// gate fields.
     pub fn new_mmap(
         gate_mmap: memmap2::Mmap,
         gate_slices: Vec<GateLayerSlice>,
@@ -148,11 +138,7 @@ impl VectorIndex {
         hidden_size: usize,
     ) -> Self {
         let mut v = Self::empty(num_layers, hidden_size);
-        let gate_mmap_arc = Arc::new(gate_mmap);
-        v.gate.gate_mmap_bytes = Some(Arc::clone(&gate_mmap_arc));
-        v.gate.gate_mmap_dtype = dtype;
-        v.gate.gate_mmap_slices = gate_slices.clone();
-        Arc::make_mut(&mut v.storage).set_gate_vectors(gate_mmap_arc, dtype, gate_slices);
+        Arc::make_mut(&mut v.storage).set_gate_vectors(Arc::new(gate_mmap), dtype, gate_slices);
         v.metadata.down_meta_mmap = down_meta_mmap.map(Arc::new);
         v
     }
@@ -213,14 +199,10 @@ mod refactor_tests {
         assert_eq!(v.vocab_size, 0);
         assert_eq!(v.layer_range, None);
 
-        // GateStore defaults
+        // GateStore defaults — heap fields + caches. Mmap fields
+        // moved to `MmapStorage` in step 6 of the migration.
         assert_eq!(v.gate.gate_vectors.len(), 3);
         assert!(v.gate.gate_vectors.iter().all(|s| s.is_none()));
-        assert!(v.gate.gate_mmap_bytes.is_none());
-        assert!(v.gate.gate_mmap_slices.is_empty());
-        assert!(v.gate.gate_q4_mmap.is_none());
-        assert!(v.gate.gate_q4_slices.is_empty());
-        assert!(matches!(v.gate.gate_mmap_dtype, crate::StorageDtype::F32));
         assert!(!v.gate.hnsw_enabled.load(Ordering::Relaxed));
         assert_eq!(v.gate.hnsw_ef_search.load(Ordering::Relaxed), 200);
         assert_eq!(v.gate.gate_cache_max_layers.load(Ordering::Relaxed), 0);
@@ -228,27 +210,17 @@ mod refactor_tests {
         assert_eq!(v.gate.warmed_gates.read().unwrap().len(), 3);
         assert_eq!(v.gate.hnsw_cache.lock().unwrap().len(), 3);
 
-        // FfnStore defaults
-        assert!(v.ffn.down_features_mmap.is_none());
-        assert!(v.ffn.up_features_mmap.is_none());
-        assert!(v.ffn.interleaved_mmap.is_none());
-        assert!(v.ffn.interleaved_q4_mmap.is_none());
-        assert!(v.ffn.interleaved_q4k_mmap.is_none());
-        assert!(v.ffn.interleaved_q4k_manifest.is_none());
+        // FfnStore defaults — only Q4_K dequant cache + FP4 storage
+        // remain. All file-backed mmaps moved to `MmapStorage`.
         assert!(v.ffn.fp4_storage.is_none());
         assert_eq!(v.ffn.q4k_ffn_cache.lock().unwrap().len(), 3);
+        assert!(!v.storage.has_down_features());
+        assert!(!v.storage.has_up_features());
+        assert!(!v.storage.has_interleaved_f32());
 
-        // ProjectionStore defaults
-        assert!(v.projections.lm_head_mmap.is_none());
-        assert!(v.projections.lm_head_f16_mmap.is_none());
-        assert!(v.projections.lm_head_q4_mmap.is_none());
-        assert!(v.projections.lm_head_q4_synth.is_none());
-        assert!(v.projections.attn_q4k_mmap.is_none());
-        assert!(v.projections.attn_q4k_manifest.is_none());
-        assert!(v.projections.attn_q4_mmap.is_none());
-        assert!(v.projections.attn_q4_manifest.is_none());
-        assert!(v.projections.attn_q8_mmap.is_none());
-        assert!(v.projections.attn_q8_manifest.is_none());
+        // ProjectionStore is now empty — every former field moved to
+        // `MmapStorage`. Remaining type kept as a placeholder for
+        // existing `index.projections` callsites.
 
         // MetadataStore defaults
         assert!(v.metadata.down_meta_mmap.is_none());
@@ -256,6 +228,16 @@ mod refactor_tests {
         assert!(v.metadata.up_overrides.is_empty());
 
         // Storage façade — empty MmapStorage on a freshly-empty index.
+        assert!(!v.storage.has_interleaved_q4k());
+        assert!(!v.storage.has_interleaved_q4());
+        assert!(!v.storage.has_attn_q4k());
+        assert!(!v.storage.has_attn_q4());
+        assert!(!v.storage.has_attn_q8());
+        assert!(!v.storage.has_lm_head_q4());
+        assert!(!v.storage.has_lm_head_f16());
+        assert!(!v.storage.has_lm_head_f32());
+        assert!(!v.storage.has_gate_vectors());
+        assert!(!v.storage.has_gate_q4());
         assert!(v.storage.interleaved_q4k_whole_buffer().is_none());
         assert!(v.storage.attn_q4k_layer_data(0).is_none());
         assert!(v.storage.lm_head_q4_bytes().is_none());
@@ -272,7 +254,7 @@ mod refactor_tests {
         assert_eq!(v.gate.gate_vectors[0].as_ref().unwrap().shape(), &[2, 4]);
         assert!(v.metadata.down_meta[1].is_some());
         assert_eq!(v.metadata.down_meta[1].as_ref().unwrap().len(), 5);
-        assert!(v.gate.gate_mmap_bytes.is_none());
+        assert!(!v.storage.has_gate_vectors());
         assert!(v.ffn.fp4_storage.is_none());
     }
 
@@ -289,18 +271,16 @@ mod refactor_tests {
         let v = VectorIndex::new_mmap(mmap, Vec::new(), crate::StorageDtype::F16, None, 4, 16);
         assert_eq!(v.num_layers, 4);
         assert_eq!(v.hidden_size, 16);
-        assert!(v.gate.gate_mmap_bytes.is_some());
-        assert!(matches!(v.gate.gate_mmap_dtype, crate::StorageDtype::F16));
-        assert!(v.ffn.down_features_mmap.is_none());
+        assert!(v.storage.has_gate_vectors());
+        assert!(matches!(v.storage.gate_dtype(), crate::StorageDtype::F16));
+        assert!(!v.storage.has_down_features());
         assert!(v.ffn.fp4_storage.is_none());
         assert_eq!(v.vocab_size, 0);
         assert_eq!(v.gate.f16_decode_cache.lock().unwrap().len(), 4);
 
-        // `new_mmap` calls `refresh_storage`, so the gate buffer is
-        // reachable through the storage façade.
-        let view = v.storage.gate_layer_view(0);
         // No layer slices supplied → `gate_layer_view` is None
         // (matches the empty-gate-mmap case in MmapStorage).
+        let view = v.storage.gate_layer_view(0);
         assert!(view.is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -317,15 +297,18 @@ mod refactor_tests {
         let original =
             VectorIndex::new_mmap(mmap, Vec::new(), crate::StorageDtype::F32, None, 2, 8);
 
-        let src_arc = original.gate.gate_mmap_bytes.as_ref().unwrap();
-        let src_strong_before = Arc::strong_count(src_arc);
-
+        // After step 6 the gate `Arc<Mmap>` lives only inside
+        // `MmapStorage::mmap_handles`. `Clone for VectorIndex` is a
+        // single `Arc::clone(&self.storage)`, so the storage refcount
+        // bumps by 1; the inner mmap_handles share the same `Arc`.
+        let storage_strong_before = Arc::strong_count(&original.storage);
         let cloned = original.clone();
-        let src_strong_after = Arc::strong_count(src_arc);
-
-        assert_eq!(src_strong_after, src_strong_before + 1);
-        let cloned_arc = cloned.gate.gate_mmap_bytes.as_ref().unwrap();
-        assert!(Arc::ptr_eq(src_arc, cloned_arc));
+        let storage_strong_after = Arc::strong_count(&original.storage);
+        assert_eq!(storage_strong_after, storage_strong_before + 1);
+        // Both clones see the same backing buffer.
+        let src_view = original.storage.gate_bytes_view().expect("src");
+        let cloned_view = cloned.storage.gate_bytes_view().expect("cloned");
+        assert_eq!(src_view.as_ptr(), cloned_view.as_ptr());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

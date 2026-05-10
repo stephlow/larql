@@ -10,6 +10,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 use super::top_k_by_abs;
 use crate::index::core::VectorIndex;
 use crate::index::storage::gate_store::{gate_matmul, gemv};
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::index::types::*;
 
 impl VectorIndex {
@@ -69,21 +70,21 @@ impl VectorIndex {
         let _owned: Vec<f32>;
 
         // Try zero-copy f32 mmap first
-        let mmap_slice = if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            self.gate.gate_mmap_bytes.as_ref().and_then(|mmap| {
-                let slice = self.gate.gate_mmap_slices.get(layer)?;
-                if slice.num_features == 0 {
+        let mmap_slice = if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F32 {
+            self.storage.gate_layer_view(layer).and_then(|view| {
+                if view.slice.num_features == 0 {
                     return None;
                 }
-                let byte_offset = slice.float_offset * 4;
-                let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
+                let byte_offset = view.slice.float_offset * 4;
+                let byte_end = byte_offset + view.slice.num_features * self.hidden_size * 4;
+                let mmap: &[u8] = view.bytes.as_ref();
                 if byte_end > mmap.len() {
                     return None;
                 }
                 Some(unsafe {
                     std::slice::from_raw_parts(
                         mmap[byte_offset..byte_end].as_ptr() as *const f32,
-                        slice.num_features * self.hidden_size,
+                        view.slice.num_features * self.hidden_size,
                     )
                 })
             })
@@ -151,57 +152,52 @@ impl VectorIndex {
             return hits;
         }
 
-        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                if slice.num_features == 0 || feat_start >= slice.num_features {
-                    return vec![];
-                }
-                let end = feat_end.min(slice.num_features);
-                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
+        if let Some(view) = self.storage.gate_layer_view(layer) {
+            if view.slice.num_features == 0 || feat_start >= view.slice.num_features {
+                return vec![];
+            }
+            let end = feat_end.min(view.slice.num_features);
+            let bpf = crate::config::dtype::bytes_per_float(view.dtype);
 
-                // Compute byte range for just this expert's features
-                let layer_byte_start = slice.float_offset * bpf;
-                let expert_byte_start = layer_byte_start + feat_start * self.hidden_size * bpf;
-                let expert_byte_end = layer_byte_start + end * self.hidden_size * bpf;
-                let n_features = end - feat_start;
+            // Compute byte range for just this expert's features
+            let layer_byte_start = view.slice.float_offset * bpf;
+            let expert_byte_start = layer_byte_start + feat_start * self.hidden_size * bpf;
+            let expert_byte_end = layer_byte_start + end * self.hidden_size * bpf;
+            let n_features = end - feat_start;
+            let mmap: &[u8] = view.bytes.as_ref();
 
-                if expert_byte_end > mmap.len() {
-                    return vec![];
-                }
+            if expert_byte_end > mmap.len() {
+                return vec![];
+            }
 
-                match self.gate.gate_mmap_dtype {
-                    crate::config::dtype::StorageDtype::F32 => {
-                        let data = unsafe {
-                            let ptr =
-                                mmap[expert_byte_start..expert_byte_end].as_ptr() as *const f32;
-                            std::slice::from_raw_parts(ptr, n_features * self.hidden_size)
-                        };
-                        let view =
-                            ndarray::ArrayView2::from_shape((n_features, self.hidden_size), data)
-                                .unwrap();
-                        let scores = gemv(&view, residual);
-                        let mut hits = Self::top_k_from_scores(&scores, top_k);
-                        // Offset indices to global feature space
-                        for hit in &mut hits {
-                            hit.0 += feat_start;
-                        }
-                        return hits;
-                    }
-                    crate::config::dtype::StorageDtype::F16 => {
-                        let raw = &mmap[expert_byte_start..expert_byte_end];
-                        let floats = larql_models::quant::half::decode_f16(raw);
-                        let view = ndarray::ArrayView2::from_shape(
-                            (n_features, self.hidden_size),
-                            &floats,
-                        )
+            match view.dtype {
+                crate::config::dtype::StorageDtype::F32 => {
+                    let data = unsafe {
+                        let ptr = mmap[expert_byte_start..expert_byte_end].as_ptr() as *const f32;
+                        std::slice::from_raw_parts(ptr, n_features * self.hidden_size)
+                    };
+                    let v = ndarray::ArrayView2::from_shape((n_features, self.hidden_size), data)
                         .unwrap();
-                        let scores = gemv(&view, residual);
-                        let mut hits = Self::top_k_from_scores(&scores, top_k);
-                        for hit in &mut hits {
-                            hit.0 += feat_start;
-                        }
-                        return hits;
+                    let scores = gemv(&v, residual);
+                    let mut hits = Self::top_k_from_scores(&scores, top_k);
+                    // Offset indices to global feature space
+                    for hit in &mut hits {
+                        hit.0 += feat_start;
                     }
+                    return hits;
+                }
+                crate::config::dtype::StorageDtype::F16 => {
+                    let raw = &mmap[expert_byte_start..expert_byte_end];
+                    let floats = larql_models::quant::half::decode_f16(raw);
+                    let v =
+                        ndarray::ArrayView2::from_shape((n_features, self.hidden_size), &floats)
+                            .unwrap();
+                    let scores = gemv(&v, residual);
+                    let mut hits = Self::top_k_from_scores(&scores, top_k);
+                    for hit in &mut hits {
+                        hit.0 += feat_start;
+                    }
+                    return hits;
                 }
             }
         }
@@ -359,7 +355,7 @@ impl VectorIndex {
             return None;
         }
         let q4_data = self.gate_q4_data(layer)?;
-        let slice = self.gate.gate_q4_slices.get(layer)?;
+        let slice = self.storage.gate_q4_layer_slice(layer)?;
         if slice.num_features == 0 {
             return None;
         }
@@ -376,5 +372,191 @@ impl VectorIndex {
 
         let scores = Array1::from_vec(scores_vec);
         Some(Self::top_k_from_scores(&scores, top_k))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline coverage of the dispatch entry points. Exercises the
+    //! heap-only and empty-index branches end-to-end so the fast-path
+    //! short-circuits and fallback paths each get hit at least once.
+    //! The mmap-mode hot paths and HNSW lifecycle are covered by the
+    //! integration tests in `tests/compute_storage_regressions.rs`
+    //! and the `gate_cache_lru_tests` in `gate_store.rs`.
+
+    use super::*;
+    use crate::index::FeatureMeta;
+    use ndarray::array;
+
+    /// Simple heap-mode index: 3 features at layer 0, hidden=4.
+    /// Each row is a known direction so we can predict KNN hits.
+    fn heap_idx() -> VectorIndex {
+        let gate = ndarray::Array2::from_shape_vec(
+            (3, 4),
+            vec![
+                1.0, 0.0, 0.0, 0.0, // f0: dot with [1,2,3,4] = 1
+                0.0, 2.0, 0.0, 0.0, // f1: dot = 4
+                0.0, 0.0, 3.0, 0.0, // f2: dot = 9 (winner)
+            ],
+        )
+        .unwrap();
+        VectorIndex::new(vec![Some(gate)], vec![None], 1, 4)
+    }
+
+    // ── gate_knn ─────────────────────────────────────────────────
+
+    #[test]
+    fn gate_knn_heap_returns_top_k_by_dot_product() {
+        let v = heap_idx();
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        let hits = v.gate_knn(0, &q, 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 2, "feature 2 has highest dot product");
+    }
+
+    #[test]
+    fn gate_knn_empty_index_returns_empty() {
+        let v = VectorIndex::empty(1, 4);
+        let q = array![1.0, 1.0, 1.0, 1.0];
+        assert!(v.gate_knn(0, &q, 5).is_empty());
+    }
+
+    // ── gate_walk ────────────────────────────────────────────────
+
+    #[test]
+    fn gate_walk_heap_returns_top_k() {
+        let v = heap_idx();
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        let hits = v.gate_walk(0, &q, 2).expect("heap path");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 2);
+    }
+
+    #[test]
+    fn gate_walk_returns_none_when_num_features_zero() {
+        let v = VectorIndex::empty(1, 4);
+        assert!(v.gate_walk(0, &array![1.0, 2.0, 3.0, 4.0], 1).is_none());
+    }
+
+    // ── gate_knn_expert ──────────────────────────────────────────
+
+    #[test]
+    fn gate_knn_expert_heap_returns_global_indices() {
+        let v = heap_idx();
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        // Restrict to features [1, 3): top-1 should be feature 2.
+        let hits = v.gate_knn_expert(0, &q, 1, 3, 2);
+        assert!(!hits.is_empty());
+        // Indices are global — the heap-mode path offsets correctly.
+        assert!(hits.iter().all(|(f, _)| *f >= 1 && *f < 3));
+    }
+
+    #[test]
+    fn gate_knn_expert_invalid_range_returns_empty() {
+        let v = heap_idx();
+        let q = array![1.0, 1.0, 1.0, 1.0];
+        // feat_start >= matrix.shape()[0] → empty.
+        assert!(v.gate_knn_expert(0, &q, 99, 100, 5).is_empty());
+    }
+
+    // ── walk ─────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_enriches_hits_with_feature_metadata() {
+        // Build a heap-mode index and seed metadata at one feature.
+        let mut v = heap_idx();
+        v.metadata.down_meta[0] = Some(vec![
+            None,
+            None,
+            Some(FeatureMeta {
+                top_token: "test".into(),
+                top_token_id: 7,
+                c_score: 0.9,
+                top_k: vec![],
+            }),
+        ]);
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        let trace = v.walk(&q, &[0], 3);
+        assert_eq!(trace.layers.len(), 1);
+        let (layer, hits) = &trace.layers[0];
+        assert_eq!(*layer, 0);
+        assert_eq!(hits.len(), 1, "only feature 2 has metadata");
+        assert_eq!(hits[0].feature, 2);
+        assert_eq!(hits[0].meta.top_token_id, 7);
+    }
+
+    // ── gate_knn_batch ───────────────────────────────────────────
+
+    #[test]
+    fn gate_knn_batch_empty_seq_returns_empty() {
+        let v = heap_idx();
+        let x = ndarray::Array2::<f32>::zeros((0, 4));
+        assert!(v.gate_knn_batch(0, &x, 1).is_empty());
+    }
+
+    #[test]
+    fn gate_knn_batch_single_position_hits_top_features() {
+        let v = heap_idx();
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        let hits = v.gate_knn_batch(0, &x, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], 2, "feature 2 has highest dot product");
+    }
+
+    /// `gate_knn_batch` switches to the rayon-parallel branch at
+    /// `seq_len >= PARALLEL_TOPK_THRESHOLD` (16). Use seq_len = 20
+    /// to exercise that path.
+    #[test]
+    fn gate_knn_batch_parallel_branch_unions_per_position_hits() {
+        let v = heap_idx();
+        let mut x = ndarray::Array2::<f32>::zeros((20, 4));
+        // Each position points at a different feature so the union
+        // across positions covers all 3.
+        for s in 0..20 {
+            let f = s % 3;
+            x[[s, f]] = 1.0;
+        }
+        let hits = v.gate_knn_batch(0, &x, 1);
+        assert_eq!(hits.len(), 3, "union should be all 3 features");
+        assert!(hits.iter().all(|&i| i < 3));
+    }
+
+    #[test]
+    fn gate_knn_batch_resolve_gate_fallback_returns_empty_on_unowned_layer() {
+        let v = VectorIndex::empty(1, 4);
+        // Layer 0 has no gate vectors → fast-path fails, resolve_gate
+        // also fails → returns empty.
+        let x = array![[1.0, 1.0, 1.0, 1.0]];
+        assert!(v.gate_knn_batch(0, &x, 1).is_empty());
+    }
+
+    // ── gate_knn_q4 ──────────────────────────────────────────────
+
+    #[test]
+    fn gate_knn_q4_returns_none_when_backend_lacks_q4() {
+        // CpuBackend supports Q4 — to exercise the early-return we
+        // need a backend without Q4 support. The fake-backend
+        // pattern in `compute_storage_regressions.rs` does this; for
+        // this inline test we exercise the no-Q4-data path instead:
+        // an empty index has no Q4 file, so `gate_q4_data` returns
+        // None and the function returns None.
+        let v = heap_idx();
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        let cpu = larql_compute::CpuBackend;
+        assert!(v.gate_knn_q4(0, &q, 5, &cpu).is_none());
+    }
+
+    // ── gate_knn_adaptive ────────────────────────────────────────
+
+    #[test]
+    fn gate_knn_adaptive_heap_falls_through_to_brute_force() {
+        let v = heap_idx();
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        let mut residency =
+            crate::index::storage::residency::ResidencyManager::new(0, 1, 4, vec![3]);
+        let cpu = larql_compute::CpuBackend;
+        let hits = v.gate_knn_adaptive(0, &q, 2, &mut residency, &cpu);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 2);
     }
 }

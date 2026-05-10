@@ -33,6 +33,7 @@ pub struct Program {
 }
 
 impl Program {
+    #[allow(dead_code)]
     pub fn pq_config(&self) -> PqConfig {
         PqConfig::from(&self.base_config)
     }

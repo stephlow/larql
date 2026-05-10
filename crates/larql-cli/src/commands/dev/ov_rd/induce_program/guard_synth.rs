@@ -146,7 +146,7 @@ pub fn synthesize_guard(
     fit: &FitContext,
     localize: &LocalizeResult,
     merged_codes: &[usize],
-    target: usize,
+    _target: usize,
 ) -> Option<GuardCandidate> {
     let target_group = fit.group;
 

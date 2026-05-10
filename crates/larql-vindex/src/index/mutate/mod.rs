@@ -14,6 +14,7 @@ use ndarray::Array1;
 use crate::config::VindexConfig;
 use crate::error::VindexError;
 use crate::format::filenames::*;
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::index::{FeatureMeta, VectorIndex};
 
 impl VectorIndex {
@@ -39,7 +40,7 @@ impl VectorIndex {
     /// If the index is in mmap mode, promotes this layer to heap first.
     pub fn set_gate_vector(&mut self, layer: usize, feature: usize, vector: &Array1<f32>) {
         // Promote from mmap to heap if needed
-        if self.gate.gate_mmap_bytes.is_some()
+        if self.storage.has_gate_vectors()
             && self
                 .gate
                 .gate_vectors
@@ -113,27 +114,25 @@ impl VectorIndex {
 
     /// Copy a layer's gate vectors from mmap to heap (for mutation).
     fn promote_layer_to_heap(&mut self, layer: usize) {
-        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                if slice.num_features > 0 {
-                    let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                    let byte_offset = slice.float_offset * bpf;
-                    let byte_count = slice.num_features * self.hidden_size * bpf;
-                    let byte_end = byte_offset + byte_count;
-                    if byte_end <= mmap.len() {
-                        let raw = &mmap[byte_offset..byte_end];
-                        let floats =
-                            crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype);
-                        let matrix = ndarray::Array2::from_shape_vec(
-                            (slice.num_features, self.hidden_size),
-                            floats,
-                        )
-                        .unwrap();
-                        while self.gate.gate_vectors.len() <= layer {
-                            self.gate.gate_vectors.push(None);
-                        }
-                        self.gate.gate_vectors[layer] = Some(matrix);
+        if let Some(view) = self.storage.gate_layer_view(layer) {
+            if view.slice.num_features > 0 {
+                let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+                let byte_offset = view.slice.float_offset * bpf;
+                let byte_count = view.slice.num_features * self.hidden_size * bpf;
+                let byte_end = byte_offset + byte_count;
+                let mmap: &[u8] = view.bytes.as_ref();
+                if byte_end <= mmap.len() {
+                    let raw = &mmap[byte_offset..byte_end];
+                    let floats = crate::config::dtype::decode_floats(raw, view.dtype);
+                    let matrix = ndarray::Array2::from_shape_vec(
+                        (view.slice.num_features, self.hidden_size),
+                        floats,
+                    )
+                    .unwrap();
+                    while self.gate.gate_vectors.len() <= layer {
+                        self.gate.gate_vectors.push(None);
                     }
+                    self.gate.gate_vectors[layer] = Some(matrix);
                 }
             }
         }
@@ -345,21 +344,18 @@ impl VectorIndex {
                         .ok_or_else(|| VindexError::Parse("gate vectors not contiguous".into()))?
                         .to_vec(),
                 )
-            } else if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                    if slice.num_features > 0 {
-                        let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                        let byte_offset = slice.float_offset * bpf;
-                        let byte_count = slice.num_features * self.hidden_size * bpf;
-                        let byte_end = byte_offset + byte_count;
-                        if byte_end <= mmap.len() {
-                            Some(crate::config::dtype::decode_floats(
-                                &mmap[byte_offset..byte_end],
-                                self.gate.gate_mmap_dtype,
-                            ))
-                        } else {
-                            None
-                        }
+            } else if let Some(view) = self.storage.gate_layer_view(layer) {
+                if view.slice.num_features > 0 {
+                    let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+                    let byte_offset = view.slice.float_offset * bpf;
+                    let byte_count = view.slice.num_features * self.hidden_size * bpf;
+                    let byte_end = byte_offset + byte_count;
+                    let mmap: &[u8] = view.bytes.as_ref();
+                    if byte_end <= mmap.len() {
+                        Some(crate::config::dtype::decode_floats(
+                            &mmap[byte_offset..byte_end],
+                            view.dtype,
+                        ))
                     } else {
                         None
                     }

@@ -16,13 +16,13 @@
 //! - `gate_knn_mmap_fast`   — zero-copy f32 mmap path used as the
 //!                            `gate_knn` happy path.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 
 use larql_compute::{ComputeBackend, MatMul};
 use ndarray::{Array1, Array2, ArrayView2};
 
 use crate::index::core::VectorIndex;
-use crate::index::types::{GateLayerSlice, GateQ4Slice};
+use crate::index::storage::vindex_storage::VindexStorage;
 
 // ── GateStore — composes all gate-matrix-and-cache state ────────────────
 
@@ -35,12 +35,6 @@ use crate::index::types::{GateLayerSlice, GateQ4Slice};
 pub struct GateStore {
     /// Per-layer gate vectors (heap mode).
     pub gate_vectors: Vec<Option<Array2<f32>>>,
-    /// Mmap'd gate vector bytes (zero-copy mode).
-    pub gate_mmap_bytes: Option<Arc<memmap2::Mmap>>,
-    /// Storage dtype for mmap'd data (drives f16 decode).
-    pub gate_mmap_dtype: crate::config::dtype::StorageDtype,
-    /// Per-layer slice info for mmap mode.
-    pub gate_mmap_slices: Vec<GateLayerSlice>,
     /// Lazy decode cache for f16 gate vectors.
     pub f16_decode_cache: Mutex<Vec<Option<Vec<f32>>>>,
     /// LRU queue for `f16_decode_cache`. Back is oldest, front is newest.
@@ -49,10 +43,6 @@ pub struct GateStore {
     pub gate_cache_max_layers: std::sync::atomic::AtomicUsize,
     /// Warm-up cache (RwLock — lock-free reads).
     pub warmed_gates: RwLock<Vec<Option<Vec<f32>>>>,
-    /// Q4_0 gate vectors mmap.
-    pub gate_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Per-layer byte offset + length in `gate_q4_mmap`.
-    pub gate_q4_slices: Vec<GateQ4Slice>,
     /// HNSW per-layer index, lazily built on first query when enabled.
     pub hnsw_cache: Mutex<Vec<Option<super::super::hnsw::HnswLayer>>>,
     /// Fine-grained HNSW indexed by `(layer, expert_id)` over each expert's
@@ -74,15 +64,10 @@ impl GateStore {
     pub fn empty(num_layers: usize) -> Self {
         Self {
             gate_vectors: vec![None; num_layers],
-            gate_mmap_bytes: None,
-            gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
-            gate_mmap_slices: Vec::new(),
             f16_decode_cache: Mutex::new(vec![None; num_layers]),
             gate_cache_lru: Mutex::new(std::collections::VecDeque::new()),
             gate_cache_max_layers: std::sync::atomic::AtomicUsize::new(0),
             warmed_gates: RwLock::new(vec![None; num_layers]),
-            gate_q4_mmap: None,
-            gate_q4_slices: Vec::new(),
             hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
             hnsw_unit_cache: Mutex::new(std::collections::HashMap::new()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -92,25 +77,22 @@ impl GateStore {
 }
 
 impl Clone for GateStore {
-    /// Mmaps + slices + atomics carry over by Arc/copy; mutex-guarded
-    /// caches reset to fresh state per the existing VectorIndex Clone
-    /// contract (caches are working memory, not durable state).
+    /// Heap data + atomics carry over; mutex-guarded caches reset to
+    /// fresh state per the existing VectorIndex Clone contract
+    /// (caches are working memory, not durable state). Mmap fields
+    /// moved to `MmapStorage::mmap_handles` in step 6 of the
+    /// `VindexStorage` migration.
     fn clone(&self) -> Self {
         use std::sync::atomic::Ordering;
-        let nl = self.gate_mmap_slices.len().max(self.gate_vectors.len());
+        let nl = self.gate_vectors.len();
         Self {
             gate_vectors: self.gate_vectors.clone(),
-            gate_mmap_bytes: self.gate_mmap_bytes.clone(),
-            gate_mmap_dtype: self.gate_mmap_dtype,
-            gate_mmap_slices: self.gate_mmap_slices.clone(),
             f16_decode_cache: Mutex::new(vec![None; nl]),
             gate_cache_lru: Mutex::new(std::collections::VecDeque::new()),
             gate_cache_max_layers: std::sync::atomic::AtomicUsize::new(
                 self.gate_cache_max_layers.load(Ordering::Relaxed),
             ),
             warmed_gates: RwLock::new(vec![None; nl]),
-            gate_q4_mmap: self.gate_q4_mmap.clone(),
-            gate_q4_slices: self.gate_q4_slices.clone(),
             hnsw_cache: Mutex::new((0..nl).map(|_| None).collect()),
             hnsw_unit_cache: Mutex::new(std::collections::HashMap::new()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(
@@ -260,9 +242,8 @@ impl VectorIndex {
             let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
                 let nf = self
-                    .gate
-                    .gate_mmap_slices
-                    .get(layer)
+                    .storage
+                    .gate_layer_slice(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
                 if nf > 0 {
@@ -283,46 +264,45 @@ impl VectorIndex {
         }
 
         // 3. Mmap
-        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                if slice.num_features == 0 {
-                    return None;
-                }
-                let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                let byte_offset = slice.float_offset * bpf;
-                let byte_count = slice.num_features * self.hidden_size * bpf;
-                let byte_end = byte_offset + byte_count;
-                if byte_end > mmap.len() {
-                    return None;
-                }
-
-                let data = match self.gate.gate_mmap_dtype {
-                    crate::config::dtype::StorageDtype::F32 => {
-                        let float_count = slice.num_features * self.hidden_size;
-                        unsafe {
-                            let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
-                            std::slice::from_raw_parts(ptr, float_count).to_vec()
-                        }
-                    }
-                    crate::config::dtype::StorageDtype::F16 => {
-                        let mut cache = self.gate.f16_decode_cache.lock().unwrap();
-                        if cache.len() <= layer {
-                            cache.resize(layer + 1, None);
-                        }
-                        let miss = cache[layer].is_none();
-                        if miss {
-                            let raw = &mmap[byte_offset..byte_end];
-                            cache[layer] = Some(larql_models::quant::half::decode_f16(raw));
-                        }
-                        self.touch_gate_cache_lru(layer, miss, &mut cache);
-                        cache[layer].as_ref().unwrap().clone()
-                    }
-                };
-                return Some(GateData {
-                    data,
-                    num_features: slice.num_features,
-                });
+        if let Some(view) = self.storage.gate_layer_view(layer) {
+            if view.slice.num_features == 0 {
+                return None;
             }
+            let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+            let byte_offset = view.slice.float_offset * bpf;
+            let byte_count = view.slice.num_features * self.hidden_size * bpf;
+            let byte_end = byte_offset + byte_count;
+            let mmap: &[u8] = view.bytes.as_ref();
+            if byte_end > mmap.len() {
+                return None;
+            }
+
+            let data = match view.dtype {
+                crate::config::dtype::StorageDtype::F32 => {
+                    let float_count = view.slice.num_features * self.hidden_size;
+                    unsafe {
+                        let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
+                        std::slice::from_raw_parts(ptr, float_count).to_vec()
+                    }
+                }
+                crate::config::dtype::StorageDtype::F16 => {
+                    let mut cache = self.gate.f16_decode_cache.lock().unwrap();
+                    if cache.len() <= layer {
+                        cache.resize(layer + 1, None);
+                    }
+                    let miss = cache[layer].is_none();
+                    if miss {
+                        let raw = &mmap[byte_offset..byte_end];
+                        cache[layer] = Some(larql_models::quant::half::decode_f16(raw));
+                    }
+                    self.touch_gate_cache_lru(layer, miss, &mut cache);
+                    cache[layer].as_ref().unwrap().clone()
+                }
+            };
+            return Some(GateData {
+                data,
+                num_features: view.slice.num_features,
+            });
         }
 
         None
@@ -341,9 +321,8 @@ impl VectorIndex {
             let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
                 let nf = self
-                    .gate
-                    .gate_mmap_slices
-                    .get(layer)
+                    .storage
+                    .gate_layer_slice(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
                 if nf > 0 {
@@ -355,26 +334,25 @@ impl VectorIndex {
         }
 
         // f32 mmap zero-copy.
-        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                    if slice.num_features == 0 {
-                        return None;
-                    }
-                    let bpf = 4;
-                    let byte_offset = slice.float_offset * bpf;
-                    let byte_end = byte_offset + slice.num_features * self.hidden_size * bpf;
-                    if byte_end > mmap.len() {
-                        return None;
-                    }
-                    let data = unsafe {
-                        let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
-                        std::slice::from_raw_parts(ptr, slice.num_features * self.hidden_size)
-                    };
-                    let view = ArrayView2::from_shape((slice.num_features, self.hidden_size), data)
-                        .unwrap();
-                    return Some(gemv(&view, residual));
+        if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F32 {
+            if let Some(view) = self.storage.gate_layer_view(layer) {
+                if view.slice.num_features == 0 {
+                    return None;
                 }
+                let bpf = 4;
+                let byte_offset = view.slice.float_offset * bpf;
+                let byte_end = byte_offset + view.slice.num_features * self.hidden_size * bpf;
+                let mmap: &[u8] = view.bytes.as_ref();
+                if byte_end > mmap.len() {
+                    return None;
+                }
+                let data = unsafe {
+                    let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
+                    std::slice::from_raw_parts(ptr, view.slice.num_features * self.hidden_size)
+                };
+                let arr = ArrayView2::from_shape((view.slice.num_features, self.hidden_size), data)
+                    .unwrap();
+                return Some(gemv(&arr, residual));
             }
         }
 

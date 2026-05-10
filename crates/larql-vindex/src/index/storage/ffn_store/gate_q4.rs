@@ -45,13 +45,7 @@ impl VectorIndex {
             offset += q4_bytes;
         }
 
-        // Step 5 transition: dual-write substore + storage so gate
-        // KNN compute (`gate_accessors.rs` + `dispatch.rs`) keeps
-        // working until step 6 migrates those reads.
-        let mmap_arc = Arc::new(mmap);
-        self.gate.gate_q4_mmap = Some(Arc::clone(&mmap_arc));
-        self.gate.gate_q4_slices = slices.clone();
-        Arc::make_mut(&mut self.storage).set_gate_q4(mmap_arc, slices);
+        Arc::make_mut(&mut self.storage).set_gate_q4(Arc::new(mmap), slices);
         Ok(())
     }
 

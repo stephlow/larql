@@ -237,6 +237,11 @@ impl MetalBackend {
         // once per token so the per-layer loop can read it without
         // re-locking the mutex on every iteration. `None` for non-PLE archs.
         let ple_inputs = self.ple_inputs_snapshot();
+        eprintln!(
+            "[ple] decode entry: ple_inputs={} num_layers in scratch={}",
+            ple_inputs.is_some(),
+            layers.len()
+        );
         // Split mode: when a fire+collect callback pair is present, defer
         // FFN encoding for MoE layers until *after* the remote MoE call has
         // been fired, so dense FFN runs on the GPU in parallel with the
