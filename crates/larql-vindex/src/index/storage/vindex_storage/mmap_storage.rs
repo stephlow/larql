@@ -374,14 +374,17 @@ impl MmapStorage {
     /// contains file-backed `Arc<Mmap>` handles. The synth lm_head
     /// (heap `Arc<Vec<u8>>`) stays resident.
     pub fn release_pages(&self) {
-        use memmap2::UncheckedAdvice;
-        // SAFETY: `unchecked_advise` requires no live references into
-        // the mmap during the call. Production callers (the walk-ffn
-        // server handler) call this after the per-request borrow has
-        // dropped — see `gate_accessors::release_mmap_pages`.
-        for handle in &self.mmap_handles {
-            unsafe {
-                let _ = handle.unchecked_advise(UncheckedAdvice::DontNeed);
+        #[cfg(unix)]
+        {
+            use memmap2::UncheckedAdvice;
+            // SAFETY: `unchecked_advise` requires no live references into
+            // the mmap during the call. Production callers (the walk-ffn
+            // server handler) call this after the per-request borrow has
+            // dropped — see `gate_accessors::release_mmap_pages`.
+            for handle in &self.mmap_handles {
+                unsafe {
+                    let _ = handle.unchecked_advise(UncheckedAdvice::DontNeed);
+                }
             }
         }
     }
