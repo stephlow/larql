@@ -495,11 +495,7 @@ mod tests {
             num_entries: entries.len(),
             num_windows,
             num_tokens: num_windows * window_size,
-            entries_per_window: if num_windows > 0 {
-                entries.len() / num_windows
-            } else {
-                0
-            },
+            entries_per_window: entries.len().checked_div(num_windows).unwrap_or(0),
             crystal_layer: 29,
             window_size,
             arch_config: ArchConfig::default(),
