@@ -1349,7 +1349,7 @@ fn print_table(rows: &[BenchRow]) {
         println!();
         println!(
             "  Per-stage average (remote-ffn, {} layers × RTT):",
-            r.backend.split('(').nth(0).unwrap_or("").trim()
+            r.backend.split('(').next().unwrap_or("").trim()
         );
         println!(
             "    attn+norm+lmhead {:>7.2}ms  ({:>4.1}%)",

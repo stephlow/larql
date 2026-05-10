@@ -197,20 +197,20 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         metal.reset_kv_cache();
         for _ in 0..5 {
-            let _ = metal.decode_token(
-                &q4k_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4k_21, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q4k_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4k_21, &x, hidden, inter);
         }
         let q4k_21_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -283,20 +283,20 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         metal.reset_kv_cache();
         for _ in 0..5 {
-            let _ = metal.decode_token(
-                &q8_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q8_21, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q8_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q8_21, &x, hidden, inter);
         }
         let q8_21_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -370,20 +370,20 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         metal.reset_kv_cache();
         for _ in 0..3 {
-            let _ = metal.decode_token(
-                &q4k_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4k_34, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q4k_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4k_34, &x, hidden, inter);
         }
         let q4k_34_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -464,19 +464,19 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
         metal.reset_kv_cache();
         for _ in 0..5 {
-            let _ = metal.decode_token(
-                &q4kf_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4kf_21, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q4kf_21, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4kf_21, &x, hidden, inter);
         }
         let q4kf_21_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -548,19 +548,19 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
         metal.reset_kv_cache();
         for _ in 0..3 {
-            let _ = metal.decode_token(
-                &q4kf_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4kf_34, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q4kf_34, &x, hidden, inter, q_dim, kv_dim, num_q, num_kv, hd, 10000.0,
-            );
+            let _ = metal.decode_token(&q4kf_34, &x, hidden, inter);
         }
         let q4kf_34_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 

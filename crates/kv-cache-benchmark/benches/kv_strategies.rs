@@ -71,9 +71,7 @@ fn bench_memory_sweep(c: &mut Criterion) {
 /// hidden-state correctness (cosine, KL, softmax). Useful for understanding
 /// how much the correctness checks add to a real-model test run.
 fn bench_accuracy_metrics(c: &mut Criterion) {
-    use larql_kv::accuracy::{
-        cosine_similarity, js_divergence, kl_divergence, mse, softmax,
-    };
+    use larql_kv::accuracy::{cosine_similarity, js_divergence, kl_divergence, mse, softmax};
 
     let hidden = 2560usize; // Gemma 3 4B hidden_dim
     let mut rng = StdRng::seed_from_u64(99);
