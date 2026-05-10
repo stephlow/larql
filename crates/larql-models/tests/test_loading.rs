@@ -836,7 +836,18 @@ fn mlx_weights_subdir_is_found() {
 #[test]
 fn no_safetensors_files_returns_error() {
     let dir = TempDir::new().unwrap();
-    let config = serde_json::json!({"model_type": "llama"});
+    // Complete config.json: the loader must reach the safetensors-scan
+    // step (and report no files) rather than erroring earlier on a
+    // partial config.
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 4,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+    });
     std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
     // No .safetensors files → NoSafetensors error
     match load_model_dir(dir.path()) {
