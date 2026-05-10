@@ -28,7 +28,9 @@ impl Drop for EnvBaseGuard {
                 crate::format::huggingface::publish::protocol::TEST_BASE_ENV,
                 v,
             ),
-            None => std::env::remove_var(crate::format::huggingface::publish::protocol::TEST_BASE_ENV),
+            None => {
+                std::env::remove_var(crate::format::huggingface::publish::protocol::TEST_BASE_ENV)
+            }
         }
     }
 }

@@ -297,7 +297,10 @@ fn build_from_vectors_rejects_gate_record_missing_layer() {
     let err = build_vindex_from_vectors(&vectors, &root.path().join("out"), &mut callbacks)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("missing or non-integer 'layer' field"), "{err}");
+    assert!(
+        err.contains("missing or non-integer 'layer' field"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -311,10 +314,7 @@ fn build_from_vectors_rejects_gate_record_with_non_array_vector() {
     let err = build_vindex_from_vectors(&vectors, &root.path().join("out"), &mut callbacks)
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("missing or non-array 'vector' field"),
-        "{err}"
-    );
+    assert!(err.contains("missing or non-array 'vector' field"), "{err}");
 }
 
 #[test]

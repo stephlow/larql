@@ -23,9 +23,9 @@ use crate::index::core::VectorIndex;
 use crate::index::storage::vindex_storage::VindexStorage;
 use crate::mmap_util::mmap_demand_paged;
 
-use super::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER};
 #[cfg(unix)]
 use super::FFN_DOWN;
+use super::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER};
 
 /// Read + typed-deserialise a Q4_K manifest JSON file. Validates each
 /// entry's format tag against `quant::registry`. `display_name` is the

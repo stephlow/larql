@@ -49,10 +49,7 @@ mod tests {
         std::env::set_var("HF_TOKEN", "prior-token");
         {
             let _g = TestEnvGuard::new("override://value");
-            assert_eq!(
-                std::env::var(TEST_BASE_ENV).unwrap(),
-                "override://value"
-            );
+            assert_eq!(std::env::var(TEST_BASE_ENV).unwrap(), "override://value");
             assert_eq!(std::env::var("HF_TOKEN").unwrap(), "test-token");
         }
         assert_eq!(std::env::var(TEST_BASE_ENV).unwrap(), "prior://value");

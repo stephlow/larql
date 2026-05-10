@@ -71,14 +71,7 @@ impl QuantizedFfnAccess for Stub {
     fn q4k_ffn_row_dot(&self, _: usize, _: usize, _: usize, _: &[f32]) -> Option<f32> {
         self.q4k_dot
     }
-    fn q4k_ffn_row_scaled_add(
-        &self,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: f32,
-        _: &mut [f32],
-    ) -> bool {
+    fn q4k_ffn_row_scaled_add(&self, _: usize, _: usize, _: usize, _: f32, _: &mut [f32]) -> bool {
         self.q4k_scaled_add_returns
     }
     fn q4k_ffn_row_scaled_add_via_cache(
@@ -106,14 +99,7 @@ impl Fp4FfnAccess for Stub {
     fn fp4_ffn_row_dot(&self, _: usize, _: usize, _: usize, _: &[f32]) -> Option<f32> {
         self.fp4_dot
     }
-    fn fp4_ffn_row_scaled_add(
-        &self,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: f32,
-        _: &mut [f32],
-    ) -> bool {
+    fn fp4_ffn_row_scaled_add(&self, _: usize, _: usize, _: usize, _: f32, _: &mut [f32]) -> bool {
         self.fp4_scaled_add_returns
     }
     fn fp4_ffn_row_into(&self, _: usize, _: usize, _: usize, _: &mut [f32]) -> bool {

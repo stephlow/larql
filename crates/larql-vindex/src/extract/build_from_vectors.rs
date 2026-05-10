@@ -34,9 +34,9 @@ fn parse_f32_vector(obj: &serde_json::Value, field: &str) -> Result<Vec<f32>, Vi
         .ok_or_else(|| VindexError::Parse(format!("missing or non-array '{field}' field")))?
         .iter()
         .map(|v| {
-            v.as_f64().map(|f| f as f32).ok_or_else(|| {
-                VindexError::Parse(format!("non-float element in '{field}' array"))
-            })
+            v.as_f64()
+                .map(|f| f as f32)
+                .ok_or_else(|| VindexError::Parse(format!("non-float element in '{field}' array")))
         })
         .collect()
 }

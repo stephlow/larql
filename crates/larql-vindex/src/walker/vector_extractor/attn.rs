@@ -1,8 +1,6 @@
 //! Attention OV / QK per-layer extraction methods.
 
-use larql_models::{
-    TopKEntry, VectorRecord, COMPONENT_ATTN_OV, COMPONENT_ATTN_QK,
-};
+use larql_models::{TopKEntry, VectorRecord, COMPONENT_ATTN_OV, COMPONENT_ATTN_QK};
 
 use super::loader::VectorExtractor;
 use super::types::{ExtractCallbacks, ExtractConfig};
