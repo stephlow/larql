@@ -70,6 +70,43 @@ pub(super) fn get_tensor_f32(
         return Ok(None);
     }
 
+    // MXFP4 (DeepSeek-V4 expert weights): the streaming extract has its own
+    // f32 decoder separate from `larql-models::loading::safetensors`, so the
+    // I8+F8_E8M0 pairing has to be detected here too. Without it,
+    // `gate_vectors.bin` came out 0 bytes for V4 models because every layer's
+    // gate fell into the catch-all `_ => return Ok(None)` below.
+    //
+    // Detection contract: `.weight` tensor with `I8` dtype and a `.scale`
+    // companion of dtype `F8_E8M0` whose row count matches and whose column
+    // count divides the unpacked-cols evenly into a sane group size
+    // {16, 32, 64, 128}. Anything else falls through to the dtype match.
+    if view.dtype() == safetensors::Dtype::I8 && tensor_name.ends_with(".weight") {
+        let scale_name = tensor_name.replacen(".weight", ".scale", 1);
+        if let Ok(scale_view) = st.tensor(&scale_name) {
+            if scale_view.dtype() == safetensors::Dtype::F8_E8M0 {
+                let s_shape = scale_view.shape();
+                if s_shape.len() == 2 && s_shape[0] == shape[0] {
+                    let cols_unpacked = shape[1] * 2;
+                    if s_shape[1] > 0 && cols_unpacked % s_shape[1] == 0 {
+                        let group_size = cols_unpacked / s_shape[1];
+                        if [16usize, 32, 64, 128].contains(&group_size) {
+                            let unpacked = larql_models::quant::mxfp4::dequantize_expert(
+                                view.data(),
+                                scale_view.data(),
+                                shape[0],
+                                s_shape[1],
+                            )
+                            .map_err(|e| VindexError::Parse(e.to_string()))?;
+                            let arr = Array2::from_shape_vec((shape[0], cols_unpacked), unpacked)
+                                .map_err(|e| VindexError::Parse(e.to_string()))?;
+                            return Ok(Some(arr));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let data = match view.dtype() {
         safetensors::Dtype::F32 => view
             .data()
@@ -78,7 +115,7 @@ pub(super) fn get_tensor_f32(
             .collect(),
         safetensors::Dtype::F16 => crate::format::quant::half::decode_f16(view.data()),
         safetensors::Dtype::BF16 => crate::format::quant::half::decode_bf16(view.data()),
-        _ => return Ok(None), // skip non-float
+        _ => return Ok(None), // skip non-float (and non-MXFP4) tensors
     };
 
     let arr = Array2::from_shape_vec((shape[0], shape[1]), data)
