@@ -418,7 +418,7 @@ fn quant_matvec_defaults_forward_and_dequantise_q8_tail() {
         vec![1.0, 1.0]
     );
     assert_eq!(
-        be.quant_matvec_q8_input(QuantFormat::Q8_0, &weights, &[1, -1], &[0.5], 3, 2)
+        be.quant_matvec_q8_input(QuantFormat::Q4_0, &weights, &[1, -1], &[0.5], 3, 2)
             .unwrap(),
         vec![2.0, 2.0, 2.0]
     );

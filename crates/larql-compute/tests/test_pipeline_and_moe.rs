@@ -620,6 +620,10 @@ mod moe_prefill_integration {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            kv_shared_source: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
         }
     }
 
@@ -666,9 +670,7 @@ mod moe_prefill_integration {
             layer(&q4k, &norm, None),
         ];
         let x = vec![0.0f32; seq_len * hidden];
-        let out = metal.prefill_q4(
-            &layers, &x, hidden, inter, hidden, hidden, seq_len, 4, 4, 64, 10000.0, false, 0.0,
-        );
+        let out = metal.prefill_q4(&layers, &x, hidden, inter, seq_len, false, 0.0);
         let out = out.expect("prefill_q4 must return Some on Metal");
         assert_eq!(
             out.len(),
@@ -699,9 +701,7 @@ mod moe_prefill_integration {
             .collect();
         let x = vec![0.0f32; seq_len * hidden];
         let out = metal
-            .prefill_q4(
-                &layers, &x, hidden, inter, hidden, hidden, seq_len, 4, 4, 64, 10000.0, false, 0.0,
-            )
+            .prefill_q4(&layers, &x, hidden, inter, seq_len, false, 0.0)
             .expect("prefill_q4 must return Some on Metal");
         assert_eq!(out.len(), seq_len * hidden);
         assert!(out.iter().all(|v| v.is_finite()));
@@ -722,9 +722,7 @@ mod moe_prefill_integration {
         let layers = vec![layer(&q4k, &norm, None), layer(&q4k, &norm, None)];
         let x = vec![0.0f32; seq_len * hidden];
         let out = metal
-            .prefill_q4(
-                &layers, &x, hidden, inter, hidden, hidden, seq_len, 4, 4, 64, 10000.0, false, 0.0,
-            )
+            .prefill_q4(&layers, &x, hidden, inter, seq_len, false, 0.0)
             .expect("prefill_q4 must return Some on Metal");
         assert_eq!(out.len(), seq_len * hidden);
         assert!(out.iter().all(|v| v.is_finite()));

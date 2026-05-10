@@ -135,6 +135,10 @@ fn main() {
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
+        kv_shared_source: None,
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
     };
 
     // Test 1: All-Q4_K (synthetic, matching formats)
@@ -303,6 +307,10 @@ fn main() {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            kv_shared_source: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
         };
         let mut kv4 = metal.create_kv_cache(1, 4096, num_kv, head_dim);
         let r = larql_compute::metal::MetalBackend::decode_token(
@@ -393,6 +401,10 @@ fn main() {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            kv_shared_source: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
         };
         let mut kv5 = metal.create_kv_cache(1, 4096, num_kv, head_dim);
         let r = larql_compute::metal::MetalBackend::decode_token(

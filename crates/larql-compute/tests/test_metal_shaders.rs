@@ -1430,22 +1430,21 @@ fn full_pipeline_seq1_produces_nonzero() {
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
+        kv_shared_source: None,
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
     };
 
+    let _ = (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim);
     let result = metal.full_pipeline_q4(
         &[layer],
         &x,
         hidden,
         inter,
-        q_dim,
-        kv_dim,
-        1,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        10000.0,
-        false,
-        0.0,
+        1,     // seq_len
+        false, // use_qk_norm
+        0.0,   // softcap
     );
 
     assert!(result.is_some(), "full_pipeline_q4 should return Some");

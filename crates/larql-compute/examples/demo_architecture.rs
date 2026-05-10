@@ -181,7 +181,9 @@ fn main() {
 
         let t = Instant::now();
         let result = backend.full_pipeline_q4(
-            &layers, &x, 2560, 10240, 2560, 1280, 1, 8, 4, 320, 10000.0, false, 0.0,
+            &layers, &x, 2560, 10240, 1,     // seq_len
+            false, // use_qk_norm
+            0.0,   // softcap
         );
         println!(
             "   1 layer (attn+FFN): {:.2}ms",

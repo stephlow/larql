@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::Read;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Args, Subcommand};
@@ -525,7 +525,7 @@ struct VindexShannonRuntime {
 }
 
 fn load_vindex_runtime(
-    vindex: &PathBuf,
+    vindex: &Path,
     metal: bool,
 ) -> Result<VindexShannonRuntime, Box<dyn std::error::Error>> {
     if !metal {

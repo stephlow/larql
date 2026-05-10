@@ -1,5 +1,20 @@
 #![allow(clippy::doc_overindented_list_items)]
 #![allow(clippy::type_complexity)]
+// Architectural lints suppressed crate-wide:
+//
+//  - `too_many_arguments`: most command runners have wide signatures
+//    (`run(args, output, callbacks, ...)`) reflecting CLI surface, not
+//    internal coupling. Reducing to ≤7 args would mean introducing
+//    parameter structs across every command, which is a bigger refactor
+//    than a lint cleanup.
+//  - `large_enum_variant`: a few command-arg enums (notably `OvRdArgs`)
+//    have one or two large variants. Boxing them would change call
+//    sites everywhere.
+//
+// Mechanical lints (iter-on-map-keys, ptr_arg, needless_deref,
+// map_entry, etc.) are fixed in place rather than suppressed.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
 
 use clap::{Parser, Subcommand};
 

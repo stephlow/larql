@@ -142,6 +142,10 @@ fn build_synth_layer<'a>(
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
+        kv_shared_source: None,
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
     }
 }
 
@@ -427,6 +431,10 @@ fn decode_token_gemma3_style_post_norms_smoke() {
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
+        kv_shared_source: None,
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
     };
 
     let x = synth_input(HIDDEN, 1.9);
@@ -632,6 +640,10 @@ fn decode_token_qkv_fused_opt_in_smoke() {
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
+        kv_shared_source: None,
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
     };
 
     let x = synth_input(HIDDEN, 2.9);
@@ -720,13 +732,7 @@ fn prefill_q4_seq4_synthetic_smoke() {
             &x,
             HIDDEN,
             INTER,
-            Q_DIM,
-            KV_DIM,
             seq_len,
-            NUM_Q_HEADS,
-            NUM_KV_HEADS,
-            HEAD_DIM,
-            10_000.0,
             false, // use_qk_norm
             0.0,   // softcap
         );

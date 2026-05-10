@@ -101,10 +101,10 @@ mod tests {
     #[test]
     fn rank_one_matrix_recovers_top_singular_vector() {
         // A = u * v^T with v = (1,2,3,4)/sqrt(30), should recover v as top-1.
-        let v_true = vec![1.0f32, 2.0, 3.0, 4.0];
+        let v_true = [1.0f32, 2.0, 3.0, 4.0];
         let v_norm: f32 = v_true.iter().map(|x| x * x).sum::<f32>().sqrt();
         let v_unit: Vec<f32> = v_true.iter().map(|x| x / v_norm).collect();
-        let u_true = vec![0.5f32, 0.5, 0.5, 0.5];
+        let u_true = [0.5f32, 0.5, 0.5, 0.5];
 
         let a = Array2::from_shape_fn((4, 4), |(i, j)| u_true[i] * v_unit[j] * 7.0);
         let v_est = top_k_right_singular_vectors(a.view(), 1, 5, 42);

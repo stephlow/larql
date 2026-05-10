@@ -193,38 +193,20 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         metal.reset_kv_cache();
         for _ in 0..5 {
-            let _ = metal.decode_token(
-                &q4kf_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-            );
+            let _ = metal.decode_token(&q4kf_layers, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q4kf_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-            );
+            let _ = metal.decode_token(&q4kf_layers, &x, hidden, inter);
         }
         let q4kf_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -297,38 +279,20 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         metal.reset_kv_cache();
         for _ in 0..5 {
-            let _ = metal.decode_token(
-                &q4k_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-            );
+            let _ = metal.decode_token(&q4k_layers, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &q4k_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-            );
+            let _ = metal.decode_token(&q4k_layers, &x, hidden, inter);
         }
         let q4k_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -401,38 +365,20 @@ fn main() {
                 ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         metal.reset_kv_cache();
         for _ in 0..5 {
-            let _ = metal.decode_token(
-                &gguf_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-            );
+            let _ = metal.decode_token(&gguf_layers, &x, hidden, inter);
         }
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.decode_token(
-                &gguf_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-            );
+            let _ = metal.decode_token(&gguf_layers, &x, hidden, inter);
         }
         let gguf_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
