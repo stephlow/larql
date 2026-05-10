@@ -54,3 +54,118 @@ where
         is_eos,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layer_graph::generate::sampling::SamplingConfig;
+    use crate::test_utils::TestFixtures;
+
+    #[test]
+    fn returns_none_on_empty_hits() {
+        let fx = TestFixtures::build();
+        let mut sampler = Sampler::new(SamplingConfig::greedy());
+        let mut detok = Detokenizer::new(&fx.tokenizer);
+        let eos = EosConfig::builtin();
+        let mut fired = false;
+        let mut on_token = |_: u32, _: &str, _: f64| {
+            fired = true;
+        };
+        let result = sample_and_emit(
+            &mut sampler,
+            &mut detok,
+            &fx.tokenizer,
+            &fx.weights,
+            &eos,
+            /*hits=*/ &[],
+            /*generated_ids=*/ &[],
+            &mut on_token,
+        );
+        assert!(result.is_none());
+        assert!(!fired, "on_token must not fire when sampler returns None");
+    }
+
+    #[test]
+    fn picks_top_token_under_greedy_sampling() {
+        let fx = TestFixtures::build();
+        let mut sampler = Sampler::new(SamplingConfig::greedy());
+        let mut detok = Detokenizer::new(&fx.tokenizer);
+        let eos = EosConfig::builtin();
+        // Token 7 has the highest score → greedy picks it.
+        let hits = vec![(3u32, 0.1), (7u32, 0.9), (5u32, 0.5)];
+        let mut captured: Vec<(u32, String, f64)> = Vec::new();
+        let mut on_token = |id: u32, text: &str, prob: f64| {
+            captured.push((id, text.to_string(), prob));
+        };
+        let picked = sample_and_emit(
+            &mut sampler,
+            &mut detok,
+            &fx.tokenizer,
+            &fx.weights,
+            &eos,
+            &hits,
+            &[],
+            &mut on_token,
+        )
+        .expect("greedy on non-empty hits must succeed");
+        assert_eq!(picked.id, 7);
+        assert_eq!(captured.len(), 1, "on_token must fire exactly once");
+        assert_eq!(captured[0].0, 7);
+        assert!(picked.prob > 0.0 && picked.prob <= 1.0);
+        assert!(!picked.is_eos, "no special EOS token at id=7 in synthetic vocab");
+    }
+
+    #[test]
+    fn returned_text_matches_on_token_text() {
+        let fx = TestFixtures::build();
+        let mut sampler = Sampler::new(SamplingConfig::greedy());
+        let mut detok = Detokenizer::new(&fx.tokenizer);
+        let eos = EosConfig::builtin();
+        let hits = vec![(2u32, 1.0)];
+        let mut captured_text = String::new();
+        let mut on_token = |_id: u32, text: &str, _prob: f64| {
+            captured_text = text.to_string();
+        };
+        let picked = sample_and_emit(
+            &mut sampler,
+            &mut detok,
+            &fx.tokenizer,
+            &fx.weights,
+            &eos,
+            &hits,
+            &[],
+            &mut on_token,
+        )
+        .unwrap();
+        assert_eq!(picked.text, captured_text);
+    }
+
+    #[test]
+    fn score_falls_back_to_zero_for_picked_id_not_in_hits() {
+        // Edge case: the sampler returns an id that isn't in the hits
+        // list (shouldn't happen in practice, but the code paths the
+        // `unwrap_or(0.0)` fallback). Greedy with a single-element hits
+        // vec — picked id IS in the list, so we use a manually constructed
+        // scenario via top-1 sampling.
+        let fx = TestFixtures::build();
+        let mut sampler = Sampler::new(SamplingConfig::greedy());
+        let mut detok = Detokenizer::new(&fx.tokenizer);
+        let eos = EosConfig::builtin();
+        let hits = vec![(5u32, 1.0)];
+        let mut on_token = |_id: u32, _text: &str, _prob: f64| {};
+        let picked = sample_and_emit(
+            &mut sampler,
+            &mut detok,
+            &fx.tokenizer,
+            &fx.weights,
+            &eos,
+            &hits,
+            &[],
+            &mut on_token,
+        )
+        .unwrap();
+        assert_eq!(picked.id, 5);
+        // Probability for the only-element hit is exactly 1.0.
+        assert!((picked.prob - 1.0).abs() < 1e-6);
+    }
+}

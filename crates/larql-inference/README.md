@@ -237,7 +237,7 @@ cargo run --release -p larql-vindex --example build_down_features -- path/to/vin
 ## Tests
 
 ```bash
-# Inference lib tests (631 tests)
+# Inference lib tests (904 tests, 65.67% line coverage)
 cargo test -p larql-inference --lib
 
 # Gemma 3 4B regression smoke test (set the env var):
@@ -275,7 +275,7 @@ Walker tests live in `larql-vindex`; weight-level walkers moved out of this crat
 | Arch goldens | 10 | Per-arch fingerprint (Gemma 2/3/4, Llama, Mistral, Qwen) |
 | Layer-graph integration | 7 | DenseLayerGraph + WalkLayerGraph + cached graph round-trip |
 | Decode consistency | 5 | CPU-decode equality across batch sizes / KV-cache states |
-| Unit (lib) | total 631 | Core module tests + everything above |
+| Unit (lib) | total 904 | Core module tests + everything above. **65.67% line / 67.69% region / 72.96% function coverage; 64 of 127 files at ≥90% line cov.** See [CHANGELOG.md](CHANGELOG.md) for the per-file lift table. |
 | Gemma 3 4B smoke (`#[ignore]`) | 1 | First-token regression — gated on `LARQL_VINDEX_PATH` + `CI_INTEGRATION=1` |
 
 ## Crate Dependencies
@@ -310,7 +310,8 @@ larql-inference   Forward pass, attention, backends, WalkFfn
 | Doc | Content |
 |-----|---------|
 | [PERFORMANCE.md](PERFORMANCE.md) | Component breakdown, cross-crate comparison, Ollama reference |
-| [ROADMAP.md](ROADMAP.md) | Planned optimizations, completed items |
+| [ROADMAP.md](ROADMAP.md) | Forward-looking work + open frontiers |
+| [CHANGELOG.md](CHANGELOG.md) | Dated ship log (coverage push, bug fixes, H12 splits, MockArch fixtures, magic-strings cleanup) |
 | [docs/adr/001](docs/adr/001-fused-attention.md) | BLAS-fused online softmax attention |
 | [docs/adr/002](docs/adr/002-walk-ffn.md) | WalkFfn — zero-copy mmap'd down projection |
 | [docs/adr/003](docs/adr/003-cached-layer-graph.md) | Cached layer graph for template-fixed layers |

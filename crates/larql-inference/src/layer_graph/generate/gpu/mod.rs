@@ -532,3 +532,127 @@ fn diag_compare_cpu_topk(
 
     eprintln!("[compare] (run `larql walk --predict` (no --metal) for CPU reference tokens)");
 }
+
+
+#[cfg(test)]
+mod tests {
+    //! Tests that exercise the early-return guards reachable with
+    //! `CpuBackend`. The full GPU path needs a Q4-supporting backend
+    //! AND a Q4_K-loaded vindex, so the deeper branches stay 0%
+    //! covered until that fixture infrastructure exists.
+    use super::*;
+    use crate::test_utils::TestFixtures;
+
+    #[test]
+    fn generate_returns_empty_success_when_max_tokens_is_zero() {
+        let fx = TestFixtures::build();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let mut weights = crate::test_utils::make_test_weights();
+        let result = generate(
+            &mut weights,
+            &fx.tokenizer,
+            &[0u32, 1],
+            /*max_tokens=*/ 0,
+            &fx.index,
+            &larql_compute::CpuBackend,
+            &cached,
+            0..2,
+        );
+        assert!(result.tokens.is_empty());
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn generate_streaming_returns_empty_success_when_max_tokens_is_zero() {
+        let fx = TestFixtures::build();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let mut fired = false;
+        let mut weights = crate::test_utils::make_test_weights();
+        let result = generate_streaming(
+            &mut weights,
+            &fx.tokenizer,
+            &[0u32],
+            0,
+            &fx.index,
+            &larql_compute::CpuBackend,
+            &cached,
+            0..2,
+            SamplingConfig::greedy(),
+            &EosConfig::builtin(),
+            |_, _, _| fired = true,
+        );
+        assert!(result.tokens.is_empty());
+        assert!(!fired, "callback must not fire when max_tokens == 0");
+    }
+
+    // NOTE: a `generate_with_cpu_backend_falls_back_to_cpu_q4k_path`
+    // test would route to `generate_via_cpu_q4k`, which then panics with
+    // "attn Q4K slices missing for layer 0" because the synthetic vindex
+    // has no Q4K attention data. Adding such a test requires either a
+    // synthetic Q4K vindex fixture or a Q4K-tolerant CPU fallback.
+
+    #[test]
+    fn try_generate_returns_ok_for_empty_max_tokens() {
+        let fx = TestFixtures::build();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let mut weights = crate::test_utils::make_test_weights();
+        let result = try_generate(
+            &mut weights,
+            &fx.tokenizer,
+            &[0u32],
+            0,
+            &fx.index,
+            &larql_compute::CpuBackend,
+            &cached,
+            0..2,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn try_generate_streaming_passes_through_to_streaming_path() {
+        let fx = TestFixtures::build();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let mut weights = crate::test_utils::make_test_weights();
+        let result = try_generate_streaming(
+            &mut weights,
+            &fx.tokenizer,
+            &[0u32],
+            0,
+            &fx.index,
+            &larql_compute::CpuBackend,
+            &cached,
+            0..2,
+            SamplingConfig::greedy(),
+            &EosConfig::builtin(),
+            |_, _, _| {},
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn try_generate_with_sampling_passes_through() {
+        let fx = TestFixtures::build();
+        let cached = CachedLayerGraph::from_residuals(vec![]);
+        let mut weights = crate::test_utils::make_test_weights();
+        let result = try_generate_with_sampling(
+            &mut weights,
+            &fx.tokenizer,
+            &[0u32],
+            0,
+            &fx.index,
+            &larql_compute::CpuBackend,
+            &cached,
+            0..2,
+            SamplingConfig::greedy(),
+            &EosConfig::builtin(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn lmhead_k_for_sampling_uses_topk_greedy_for_greedy_config() {
+        let greedy = SamplingConfig::greedy();
+        assert_eq!(lmhead_k_for_sampling(&greedy), LMHEAD_TOPK_GREEDY);
+    }
+}

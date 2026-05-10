@@ -589,6 +589,271 @@ logic in the request entry points.
 
 ---
 
+## REV: Code review (2026-05-10)
+
+Lens: per `THESIS.md`, legibility is a primary feature — a vLLM/SGLang/TGI
+engineer should be able to read this and copy ideas out. Findings below are
+prioritised by what would damage that primary goal if a stranger landed in
+the file today. Severity tags: **P0** = correctness/security ship-blocker,
+**P1** = structural/legibility fixes that affect "reads like a citation",
+**P2** = defensive polish.
+
+### REV1. Panic on NaN in gRPC sort *(P0)*
+
+**Files**: `src/grpc.rs:311`, `src/grpc.rs:432`.
+
+`edges.sort_by(|a, b| b.gate_score.partial_cmp(&a.gate_score).unwrap())`
+panics when any score is NaN. Same pattern at `:432` for `c_score`.
+A corrupted vindex or a future patched-scoring path that produces NaN
+takes the gRPC worker down.
+
+**Acceptance**: replace with `.unwrap_or(std::cmp::Ordering::Equal)`;
+add a unit test that injects NaN into the score vector and asserts the
+handler returns a clean response (NaN entries pushed to tail or filtered).
+
+### REV2. Non-constant-time API key comparison *(P0 security)*
+
+**Files**: `src/auth.rs:38`.
+
+`if token == required_key` on `&str` is bytewise short-circuit — a real
+timing channel against any deployed key. Use `subtle::ConstantTimeEq`
+on the byte slices, or hash both sides (e.g. SHA-256) and compare the
+fixed-length digests.
+
+**Acceptance**: timing-equality used in production path; a unit test that
+verifies wrong-key still produces 401 (existing) plus a doc comment naming
+the threat model.
+
+### REV3. `blocking_read` on tokio RwLock inside async path *(P0)*
+
+**Files**: `src/session.rs:107` (inside `apply_patch`, called while holding
+`sessions.write().await`).
+
+`model.patched.blocking_read()` on a `tokio::sync::RwLock` from an async
+task can stall a multi-thread runtime worker, and combined with the held
+`sessions` write guard creates a real deadlock window if anything else in
+the request graph contends on `model.patched`. Fix is either
+`tokio::task::block_in_place` around the read, or restructure so the
+`sessions` write guard is dropped before touching `patched`.
+
+**Acceptance**: no `blocking_read`/`blocking_write` on tokio locks reachable
+from an `async fn`. A regression test that drives concurrent `apply_patch`
++ a writer on `model.patched` and asserts forward progress within a bounded
+deadline.
+
+### REV4. OpenAI error envelope diverges from spec *(P0 — breaks OpenAI SDKs)*
+
+**Files**: `src/error.rs:9-13` (`ErrorBody { error: String }`),
+vs `src/routes/openai/util.rs` (SSE `error_chunk` already nested correctly).
+
+Non-streaming responses return `{"error": "msg"}`; the OpenAI Python SDK
+expects `{"error": {"message": "...", "type": "...", "code": null}}`.
+Streaming SSE error chunks already use the nested form, so non-stream and
+stream errors are inconsistent. SDK consumers fail on field access against
+non-streaming errors today.
+
+**Acceptance**: introduce a nested `OpenAIError` envelope used by the
+`/v1/embeddings`, `/v1/completions`, `/v1/chat/completions` handlers (LARQL
+paradigm endpoints can keep flat shape if desired, but document the choice
+in `docs/server-spec.md`). Curl-level fixture test asserting the OpenAI
+SDK can parse a 400 from each of the three endpoints.
+
+### REV5. Tool-call JSON parsing via `find('{')` / `rfind('}')` returns 500 instead of 400 *(P0 legibility)*
+
+**Files**: `src/routes/openai/chat.rs:967-974` (`build_tool_call_message`).
+
+Slicing tool-call JSON out of model output via `find('{')` and `rfind('}')`
+mis-parses on nested braces (function args containing `{}` themselves).
+The current code surfaces the parse failure as `ServerError::Internal`
+(500) — a serving-stack engineer reading this for ideas sees the wrong
+status class for a recoverable client problem.
+
+**Acceptance**: structured-output schema parser already lives in
+`routes/openai/schema/`; tool-call parsing should reuse the same FSM. On
+parse failure return 400 with the OpenAI `invalid_request_error` shape
+(after **REV4** lands). Add a test with a tool-call response containing
+nested-brace arguments.
+
+---
+
+### REV6. Split `bootstrap.rs` (1279 lines) *(P1 legibility)*
+
+**Files**: `src/bootstrap.rs` → new `src/bootstrap/{parsing,loader,warmup}.rs`.
+
+Natural seams:
+- `bootstrap/parsing.rs` (~lines 38–141): `parse_ram_bytes`, `parse_layer_range`, `UnitManifest` and friends.
+- `bootstrap/loader.rs` (~lines 143–370): `load_single_vindex`, `discover_vindexes`, vindex selection logic.
+- `bootstrap/warmup.rs`: the three warmup blocks (walk-ffn, hnsw-units, metal-experts).
+- Remaining `bootstrap.rs`: `Cli`, `serve()` orchestration, listener setup, gRPC + announce spawn — should land at ≤ ~500 lines.
+
+**Acceptance**: `serve()` reads top-to-bottom in one screen. Per-file
+coverage stays ≥ 90% (project floor). No public API change.
+
+### REV7. Split `routes/walk_ffn.rs` (1347 lines) *(P1 legibility)*
+
+**Files**: `src/routes/walk_ffn.rs` → new `src/routes/walk_ffn/binary.rs`.
+
+The binary codec (`decode_binary_request`, `encode_binary_output*`,
+~lines 1–170 + helpers, ~240 LOC total) is orthogonal to the compute
+core and HTTP handler logic. Move it out. Move the in-file `#[cfg(test)]`
+block (~230 lines) into a sibling test module. Core compute + handlers
+stay together (~600 LOC).
+
+**Acceptance**: `walk_ffn.rs` ≤ ~700 LOC; binary codec testable in
+isolation; existing integration tests unchanged.
+
+### REV8. Split / de-duplicate `routes/openai/chat.rs` (1214 lines) *(P1 legibility)*
+
+**Files**: `src/routes/openai/chat.rs`.
+
+Streaming and non-streaming handlers duplicate setup (tokenization, model
+lock, schema/sampling config). Extract a `ChatPrep` (or similar) struct so
+each handler body is short and the difference between the two paths is
+obvious at a glance. Tool-call/tools rendering and tool-call parsing
+(~lines 822–998) belong in their own submodule.
+
+**Acceptance**: `chat.rs` ≤ ~700 LOC; streaming and non-streaming entry
+points fit on one screen each.
+
+### REV9. gRPC error mapping is uniformly `Status::internal` *(P1)*
+
+**Files**: `src/grpc.rs:99,115,134,157,175,194` (and similar `.map_err`
+sites in `grpc_expert.rs`).
+
+Every blocking-task failure coerces to `Status::internal`. Tokenization,
+validation, and real internal failures collapse to one code; clients can't
+distinguish recoverable from non-recoverable. Map at least
+`ServerError::BadRequest`/`NotFound` → `invalid_argument`/`not_found`.
+
+**Acceptance**: a single `From<ServerError> for tonic::Status` impl that
+preserves status class. Test asserting a malformed `DescribeRequest`
+returns `Code::InvalidArgument`, not `Code::Internal`.
+
+### REV10. Single-vs-multi-model handler duplication *(P1 legibility)*
+
+**Files**: `src/routes/describe.rs:279-314` (and the same shape in
+`walk.rs`, `select.rs`, `infer.rs`, `relations.rs`, `patches.rs`).
+
+Single-model and `/v1/{model_id}/...` handlers are copy/paste with one
+line difference (`model_or_err(None)` vs `model_or_err(Some(&model_id))`).
+A porter has to mentally diff every pair. Consolidate behind one handler
+that takes `Option<&str>`, or behind a small macro.
+
+**Acceptance**: each route has one handler body; the router still wires
+both paths; tests cover both.
+
+### REV11. Streaming client-disconnect leak (chat / completions) *(P1)*
+
+**Files**: `src/routes/openai/chat.rs:517-520`,
+`src/routes/openai/completions.rs:243`.
+
+When the SSE channel closes, the on-token callback flips `early_stop` and
+returns, but the `spawn_blocking` generation task continues to natural EOS
+— burns a CPU-bound worker on a gone client. The expert layer-batch route
+already models the right pattern (semaphore permit held across spawn,
+released on cancellation); port it to the OpenAI streaming handlers.
+
+**Acceptance**: a test that opens an SSE stream, drops the receiver, and
+asserts the spawn_blocking handle finishes within a small bounded window
+of the disconnect rather than running to completion.
+
+---
+
+### REV12. Float validation gaps (NaN/Inf) *(P2)*
+
+**Files**: `src/routes/describe.rs:46` (`min_score`),
+`src/routes/walk_ffn.rs` (residual deserialisation),
+`src/routes/openai/util.rs:113-145` (`temperature`/`top_p` silent clamp).
+
+Incoming `f32`s are not checked for finitude; OpenAI sampler params are
+silently clamped rather than rejected. Reject NaN/Inf with 400; reject
+out-of-range with a typed message instead of clamping silently.
+
+### REV13. `max_tokens` upper bound unenforced *(P2)*
+
+**Files**: `src/routes/openai/{chat,completions}.rs` request structs.
+
+Raw `usize` is accepted; allocates token buffers from arbitrary client
+input. Add a per-model cap (config-derivable from `LoadedModel`) and
+return 400 above it.
+
+### REV14. Cache key truncates float to u32 *(P2)*
+
+**Files**: `src/cache.rs:34`.
+
+`format!("{:x}", min_score as u32)` collides `5.2` and `5.7`. Either
+encode the full f32 (e.g. `min_score.to_bits()`) or document the
+intentional bucketing.
+
+### REV15. Tests use bare `.unwrap()` on RPC results *(P2)*
+
+**Files**: `tests/test_grpc.rs` (17 instances at lines 34, 43, 51, 68,
+92, …).
+
+When the RPC itself errors, `.unwrap()` panics on the wrong line and
+hides which assertion was being checked. Replace with
+`.expect("describe should succeed")` (or similar).
+
+### REV16. `#[allow(dead_code)]` on library APIs *(P2)*
+
+**Files**: `src/session.rs:55` (`get_or_create`), `:166` (`session_count`);
+`src/ratelimit.rs:82` (`evict_stale`); `src/ffn_l2_cache.rs:92` (`stats`);
+`src/error.rs:24` (`InferenceUnavailable`).
+
+Either delete or add a one-line doc comment saying they're public for
+out-of-tree consumers; right now a reader can't tell intent.
+
+---
+
+### REV-COVERAGE. Test coverage gaps vs 90%/file project floor *(P1)*
+
+**Files**: no dedicated unit test files for `src/cache.rs`,
+`src/ratelimit.rs`, `src/session.rs`, `src/routes/topology.rs`. Missing
+test cases: malformed-JSON rejection (axum `JsonRejection` → 400),
+body-size-limit 413s, ETag 304 paths beyond the one
+`test_http_describe.rs` happy path, gRPC stream backpressure, gRPC
+client cancel mid-stream, OpenAI SSE `[DONE]` framing, OpenAI streaming
+error chunk shape.
+
+**Acceptance**: each file ≥ 90% line coverage (project floor), and the
+above behaviours each have at least one direct test.
+
+### REV-SPEC. Spec / OpenAPI drift *(P1)*
+
+**Files**: `src/openapi.rs:113-118` vs `proto/vindex.proto:194-196`
+(`LoadedCapabilities` differs between HTTP and gRPC); `proto/vindex.proto`
+populates both `predictions` and `walk_predictions`/`dense_predictions`
+in `InferResponse` regardless of mode (HTTP differentiates). Both are
+intentional but undocumented and untested across both transports.
+Separately, `docs/server-spec.md` does not mention 422 anywhere and
+handlers do not emit it — pick a stance (probably 400 only) and state it.
+
+**Acceptance**: a cross-transport contract test that exercises the same
+operation over HTTP and gRPC and asserts equivalent semantics. A
+paragraph in `docs/server-spec.md` documenting the shape differences
+that remain.
+
+---
+
+### Strengths to preserve (do not regress)
+
+- `ServerError` enum + `IntoResponse` discipline — no generic `Internal`
+  catch-all in handler paths.
+- Centralised `env_flags` with cached reads and README cross-reference —
+  the right pattern for a reference implementation.
+- Rate limiter degrades open on poisoned mutex; `X-Forwarded-For` only
+  honoured under explicit flag.
+- Expert `layer_batch` semaphore-as-backpressure — a clean illustration
+  of the right way to bound rayon under HTTP load. Treat as a teaching
+  artefact and consider citing in the README.
+- Sampling clamping + stop-string handling in `routes/openai/util.rs` is
+  well-tested and idiomatic.
+- Binary wire format with `Accept`-header negotiation in `walk_ffn` is
+  elegant; the f16/i8/f32 negotiation is the kind of concrete pattern the
+  THESIS expects to diffuse into other stacks.
+
+---
+
 ## P0: Active
 
 ### G-TRANSPORT. Wire format evolution + WebSocket streaming + QUIC (ADR-0009, ADR-0010)

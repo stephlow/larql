@@ -191,3 +191,59 @@ fn prefill_q4k_moe(
     out[(seq_len - 1) * hidden..].copy_from_slice(&last_h);
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit-test the early-return guards. The full prefill paths (PLE,
+    //! Q4_K MoE, standard fused) need both a Q4-supporting backend AND a
+    //! Q4_K-loaded vindex — out of reach for synthetic fixtures. The
+    //! guard tests below exercise the rejection paths reachable with
+    //! `CpuBackend`, which doesn't advertise either Q4 or DecodeQ4KMoe.
+    use super::*;
+    use crate::test_utils::make_test_weights;
+
+    fn synth_attention(weights: &crate::model::ModelWeights) -> AttentionGeometry {
+        AttentionGeometry {
+            q_dim: weights.num_q_heads * weights.head_dim,
+            kv_dim: weights.num_kv_heads * weights.head_dim,
+            num_q_heads: weights.num_q_heads,
+            num_kv_heads: weights.num_kv_heads,
+            head_dim: weights.head_dim,
+            rope_base: weights.rope_base as f32,
+        }
+    }
+
+    #[test]
+    fn prefill_q4k_moe_rejects_backend_without_decode_q4k_moe_capability() {
+        // CpuBackend doesn't support `Capability::DecodeQ4KMoe` → the
+        // guard fires and returns Err before touching layers.
+        let weights = make_test_weights();
+        let attention = synth_attention(&weights);
+        let layers: Vec<FullPipelineLayer<'_>> = Vec::new();
+        let token_ids = vec![0u32, 1];
+        let x = vec![0.0f32; 2 * weights.hidden_size];
+        let err = prefill_q4k_moe(
+            &weights,
+            &larql_compute::CpuBackend,
+            &layers,
+            attention,
+            weights.hidden_size,
+            weights.intermediate_size,
+            &token_ids,
+            &x,
+        )
+        .expect_err("CpuBackend without DecodeQ4KMoe must be rejected");
+        // Use Display so we don't depend on private GenerateError variants.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Q4K") || msg.contains("decode") || msg.contains("backend"),
+            "expected Q4K/decode/backend wording, got: {msg}"
+        );
+    }
+
+    // The non-metal `prefill_for_streaming` doesn't take a `metal_ple`
+    // argument — its branch set is just (per-layer Q4K MoE, standard).
+    // Both paths require backend Q4 support, so CpuBackend short-circuits
+    // through the moe_q4k guard above before reaching the standard
+    // `prefill_q4_prompt` path.
+}

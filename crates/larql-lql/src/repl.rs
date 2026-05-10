@@ -441,4 +441,90 @@ mod tests {
         let result = run_statement("NOT A VALID STATEMENT;");
         assert!(result.is_err());
     }
+
+    // ── Comment / whitespace handling ──────────────────────────────
+
+    #[test]
+    fn batch_empty_string_returns_empty() {
+        let result = run_batch("").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn batch_only_comments_returns_empty() {
+        let result = run_batch("-- one\n-- two\n").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn batch_only_whitespace_returns_empty() {
+        // Whitespace-only input has no statement text after splitting;
+        // run_batch should silently produce no output.
+        let result = run_batch("    \n  \t  ").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn batch_mixed_comment_and_statement() {
+        let result = run_batch("-- header\nSHOW MODELS;\n-- trailer\n").unwrap();
+        assert!(!result.is_empty());
+        assert!(!result.iter().any(|l| l.contains("header")));
+    }
+
+    // ── String / quote handling in split_statements ──────────────────
+
+    #[test]
+    fn split_preserves_single_quoted_strings() {
+        let stmts = split_statements(r#"WALK 'hello; world' TOP 5;"#);
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].contains("hello; world"));
+    }
+
+    #[test]
+    fn split_handles_double_then_single_quotes() {
+        let stmts = split_statements(r#"A "x;" B 'y;' C;"#);
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn split_two_statements_each_with_quoted_semicolon() {
+        let stmts = split_statements(r#"A "x;y"; B 'p;q';"#);
+        assert_eq!(stmts.len(), 2);
+    }
+
+    // ── Help banner ──────────────────────────────────────────────
+
+    #[test]
+    fn print_help_does_not_panic() {
+        // Trivially invokes print_help() to cover the println! and
+        // confirm the BANNER text is well-formed.
+        super::print_help();
+    }
+
+    #[test]
+    fn banner_constant_is_non_empty() {
+        // Sanity: BANNER is rendered at REPL start-up; an empty banner
+        // would point to a refactor regression on the constants block.
+        assert!(!super::BANNER.is_empty());
+        assert!(super::PROMPT.contains(">"));
+        assert!(!super::CONTINUATION.is_empty());
+    }
+
+    // ── History-path helpers ───────────────────────────────────────
+
+    #[test]
+    fn history_path_returns_either_some_or_none() {
+        // Resolution depends on the test environment ($HOME / dirs);
+        // the contract is just that it doesn't panic in either case
+        // and the path (if any) ends with the history-file name.
+        if let Some(path) = super::history_path() {
+            let s = path.to_string_lossy();
+            assert!(s.ends_with(".larql_history") || s.contains("history"));
+        }
+    }
+
+    #[test]
+    fn dirs_or_home_returns_either_some_or_none() {
+        let _ = super::dirs_or_home();
+    }
 }

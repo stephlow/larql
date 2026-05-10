@@ -1,6 +1,6 @@
 # Roadmap — larql-inference
 
-## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 639 lib tests | 53.11% line cov
+## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 904 lib tests | 65.67% line cov (64 of 127 files at ≥90% line cov)
 
 ## Recommended next (priority order, 2026-05-09)
 
@@ -35,10 +35,22 @@ detail.
    Best-in-class mechanistic interpretability engine".
 
 6. **P1 mechanical backlog** (parallelisable, low risk) — synthetic e2e test
-   for `generate()` (currently `#[ignore]` only); per-file 90% floor work for
-   the 84 files still below; the deferred structure moves (`capture.rs →
-   trace/`, `residual.rs → forward/norm.rs`, `predict.rs` 700-LOC split). See
+   for `generate()` (currently `#[ignore]` only); per-file 90% floor work
+   for the **63 files still below** (was 84; coverage push 2026-05-10 lifted 34 files past
+   the floor — see CHANGELOG.md); the deferred structure moves (`capture.rs →
+   trace/`, `residual.rs → forward/norm.rs`). See
    "P1: Test coverage gaps", "P1: Structure & file layout", "P1: Quality bugs".
+
+7. **Coverage push: synthetic-Q4K vindex fixture** (parallelisable, ~2-3 hr,
+   line cov +1-1.5 pp) — would unlock the ~30 files at 0% line cov that
+   are gated on a Q4K vindex on disk: `vindex/q4k_forward/{metal, hidden,
+   interventions, walk_ffn, …}.rs`, `layer_graph/generate/gpu/{decode_loop,
+   prefill}.rs` deeper paths, `forward/predict/honest.rs`. The fixture
+   needs valid Q4_K bytes (144B per 256-element block) for attention +
+   FFN + lm_head, written to a tempdir matching the vindex file layout.
+   The companion `MockComputeBackend` (advertising `Capability::PrefillQ4`
+   + `DecodeToken`, returning `Some` from those methods) is the smaller
+   half of the work.
 
 ## Open: Mechanistic research engine surface — Q4K interventions for OV/RD
 

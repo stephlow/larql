@@ -9,84 +9,105 @@ pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 Entries migrated from ROADMAP.md on 2026-05-10; pre-2026-05-10 entries
 preserve the date and voice they were originally written in.
 
-## [2026-05-10] — Coverage push round 2: 63.66% → 63.73% line (full session 52.80% → 63.73%, +10.93 pp)
+## [2026-05-10] — Coverage push round 2: 52.80% → 65.67% line (+12.87 pp), 2 bug fixes
 
 Continued the targeted-test sweep with **MockArch fixtures** (Gemma3-style
-+ Starcoder2-style) plus per-file deep dives. **+239 lib tests** (654 → 893)
-and **2 production bug fixes** along the way.
++ Starcoder2-style), per-file deep dives, and a small unit-test pass on
+the new H12 `gpu/` splits. **+250 lib tests** (654 → 904), zero failures,
+and **2 production bug fixes** surfaced by edge-case tests.
 
-**Bug fixes**
+### Bug fixes (both pre-existing, both reachable from public APIs)
 
-| Bug | Fix | Surfaced by |
-|-----|-----|-------------|
-| `backend_lm_head_topk(top_k=0)` panicked with `index out of bounds: 0` because the per-score loop accessed `heap[0]` before the `k > 0` check | Early-return `Vec::new()` when `k == 0` | `backend_lm_head_topk_top_k_zero_returns_empty` regression test |
-| `top_k_from_logits(k=logits.len())` panicked with `partition_at_index index N greater than length N` because `select_nth_unstable_by` requires `k < len` | Skip the partition when `k == 0` (return empty) or `k == len` (sort still produces the full ordering) | `top_k_from_logits_k_larger_than_vocab_clamps` regression test |
+| Bug | Fix | Regression test |
+|-----|-----|-----------------|
+| `backend_lm_head_topk(top_k=0)` panicked with `index out of bounds: 0` — the per-score loop accessed `heap[0]` before checking `k > 0` | Early-return `Vec::new()` when `k == 0` | `backend_lm_head_topk_top_k_zero_returns_empty` |
+| `top_k_from_logits(k=logits.len())` panicked with `partition_at_index N greater than length N` — `select_nth_unstable_by` requires `k < len` | Skip the partition when `k == 0` or `k == len` (the sort still produces the full ordering) | `top_k_from_logits_k_larger_than_vocab_clamps` |
 
-**MockArch fixtures** — added two new synthetic-arch fixtures to `test_utils`
-to drive previously-unreachable arch-dependent branches:
+### MockArch fixtures (`test_utils.rs`)
 
-- `make_gemma3_test_weights()` — drives QK norm + post-norms + GeluTanh +
-  has_v_norm + non-1.0 `embed_scale` + non-1.0 `residual_multiplier`
-  + non-1.0 `qk_norm_weight_offset` branches
-- `make_starcoder2_test_weights()` — drives non-gated FFN + FFN biases
-  (up + down) + Q/K/V/O attention biases + `Activation::Gelu` + LayerNorm
+Added two synthetic-arch builders to drive previously-unreachable
+arch-dependent branches:
+
+- `make_gemma3_test_weights()` — QK norm + post-norms + GeluTanh +
+  `has_v_norm` + non-1.0 `embed_scale` + non-1.0 `residual_multiplier`
+  + non-1.0 `qk_norm_weight_offset`
+- `make_starcoder2_test_weights()` — non-gated FFN + FFN biases (up +
+  down) + Q/K/V/O attention biases + `Activation::Gelu` + LayerNorm
   branch + non-1.0 `attention_multiplier`
 
-**Files crossed past 90% line coverage in this session** (cumulative;
-several from round 1 included):
+### Final coverage (both rounds combined)
 
-| File | Start | End | Line cov |
-|------|------:|----:|---------:|
-| `attention/block.rs` | 57.33% | 95.71% region | **96.x% line** ✅ |
-| `attention/gpu.rs` | 66.27% | 97.27% region | **97.34% line** ✅ |
-| `attention/gqa.rs` | 78.46% | 98.78% region | **97.84% line** ✅ |
-| `cached.rs` | 65.17% | 96.68% region | **97.65% line** ✅ |
-| `forced_logits.rs` (new H12 split) | 0% | 47.58% region | (still under) |
-| `forward/dump_config.rs` | n/a (new) | — | **99.08% line** ✅ |
-| `forward/infer_patched.rs` | 71.24% | 91.00% region | **86.47% line** (close) |
-| `forward/layer.rs` | 69.98% | 89.84% region | **~88% line** (close) |
-| `forward/patching.rs` | — | 98.28% region | **96.92% line** ✅ |
-| `forward/predict/dense.rs` | 40.79% | 95.37% region | ✅ |
-| `forward/predict/ffn.rs` | 52.43% | 96.60% region | **97.08% line** ✅ |
-| `forward/target_delta.rs` | 70.80% | 96.29% region | ✅ |
-| `forward/trace.rs` | 76.14% | 95.88% region | ✅ |
-| `ffn/graph_backend.rs` | 63.40% | 95.56% region | ✅ |
-| `ffn/mod.rs` | 77.78% | 100% region | **100% line** ✅ |
-| `ffn/moe_remote/multi_layer_wire.rs` | 57.14% | 98.54% region | **99.21% line** ✅ |
-| `ffn/moe_remote/router.rs` | 76.41% | 99.55% region | **99.63% line** ✅ |
-| `ffn/remote/codec.rs` | 70.80% | 97.18% region | **98.00% line** ✅ |
-| `ffn/sparse_compute.rs` | 55.81% | 95.18% region | ✅ |
-| `ffn/weight.rs` | 76.79% | 93.70% region | ✅ |
-| `layer_graph/generate/lm_head.rs` | 54.05% | 91.43% region | ✅ |
-| `tokenizer.rs` | 58.65% | 96.26% region | **98.43% line** ✅ |
-| `trace/context.rs` | 62.63% | 94.11% region | ✅ |
-| `trace/types.rs` | 57.88% | 98.65% region | **98.41% line** ✅ |
-| `trace/vocab.rs` | 65.12% | 98.06% region | **98.39% line** ✅ |
+| Metric | Session start | End | Δ |
+|--------|--------------:|----:|--:|
+| **Line coverage** | **52.80%** | **65.67%** | **+12.87 pp** |
+| Region coverage | 54.80% | 67.69% | +12.89 pp |
+| Function coverage | 61.98% | 72.96% | +10.98 pp |
+| Lib tests | 654 | **904** | +250 |
+| Files ≥90% line cov | ~30 | **64 of 127** | +34 |
 
-**Final state** (after both rounds):
-- **59 of 127 files at ≥90% line coverage** (46.5%)
-- Region coverage 54.80% → 66.47%, function 61.98% → 71.35%, line 52.80% → **63.73%**
-- 893 lib tests pass; 0 failures, 4 ignored
+### Files crossed past 90% line coverage
 
-**What's left below 90% line coverage**:
-- ~30 files at 0% — need infrastructure (real Q4K vindex on disk, gRPC
-  backend, HTTP test server, MockComputeBackend with `PrefillQ4` +
-  `DecodeToken` capabilities)
-- ~38 files between 0% and 90% — most have specific arch-dependent
-  branches (Gemma 4 PLE/MoE/layer_scalar) or backend-dependent paths
-  (Q4 matvec + Metal-only kernels) that aren't exercisable from synthetic
-  fixtures without significant mock infrastructure
+| File | Start line% | End line% |
+|------|------------:|----------:|
+| `ffn/mod.rs` | 77.78 | **100.00** |
+| `ffn/moe_remote/router.rs` | 75.82 | **99.63** |
+| `ffn/moe_remote/multi_layer_wire.rs` | 57.14 | **99.21** |
+| `forward/dump_config.rs` | n/a | **99.08** |
+| `attention/gqa.rs` | 78.46 | **97.84** |
+| `cached.rs` | 65.17 | **97.65** |
+| `forced_logits.rs` (H12 split) | 0 | 51.28 (capped) |
+| `tokenizer.rs` | 58.65 | **98.43** |
+| `trace/types.rs` | 57.88 | **98.41** |
+| `trace/vocab.rs` | 65.12 | **98.39** |
+| `trace/context.rs` | 62.63 | 94.11 region (line ~94+) |
+| `forward/predict/ffn.rs` | 40.94 | **97.08** |
+| `forward/predict/dense.rs` | 40.79 | 95.37 region |
+| `forward/target_delta.rs` | 70.80 | 96.29 region |
+| `forward/trace.rs` | 76.14 | 95.88 region |
+| `forward/patching.rs` | n/a | **96.92** |
+| `attention/block.rs` | 57.33 | **95.71** |
+| `attention/gpu.rs` | 66.27 | **97.34** |
+| `ffn/weight.rs` | 76.79 | 95.40 region |
+| `ffn/graph_backend.rs` | 63.40 | 96.10 region |
+| `ffn/sparse_compute.rs` | 55.81 | 95.02 region |
+| `ffn/remote/codec.rs` | 70.80 | **98.00** |
+| `layer_graph/generate/lm_head.rs` | 54.05 | 93.31 region |
+| `layer_graph/generate/gpu/sampling_step.rs` (H12 split) | 0 | **97.64** |
+| `forward/infer_patched.rs` | 71.24 | 86.47 (close to 90, dense path tested; q4k path infra-bound) |
 
-Honest about what each round bought:
-- Round 1 (target_delta, multi_layer_wire, codec, gqa, cached, trace,
-  predict/dense, sparse_compute, graph_backend, lm_head, attention/block,
-  attention/gpu, forward/layer, ffn/weight) hit the easy synthetic-friendly
-  files first.
-- Round 2 (MockArch fixtures + close-to-90 polish + bug fixes) finished
-  off the arch-dependent paths and pushed several borderline files past
-  the floor. Diminishing returns now: remaining files need either
-  `MockComputeBackend` (would unlock the gpu/ H12 splits + remote/grid
-  paths) or real Q4K vindex fixtures (would unlock all of `vindex/q4k_forward/`).
+### Notable lifts that didn't quite cross 90% line
+
+| File | Start | End | Blocker |
+|------|------:|----:|---------|
+| `vindex/walk_ffn/mod.rs` | 62.35 | 88.74 | Override-routing branch needs custom `PatchOverrides` mock with non-default impls |
+| `forward/layer.rs` | 69.98 | ~88 | `apply_layer_scalar` body fires only on Gemma 4 (`layer_scalar_key` returns Some); `LARQL_*_DUMP_LAYERS` env paths are `OnceLock`-cached |
+| `experts/loader.rs` | 61.90 | ~89 | `load_module` / `instantiate` need real WASM modules |
+| `layer_graph/template.rs` | 65.13 | 81.62 | `TemplateUniverse::build` can't tokenise `[N]` literals through the synthetic Whitespace tokenizer |
+| `forward/predict/honest.rs` (H12 split) | 21.28 | similar | needs Q4K vindex |
+| `layer_graph/generate/gpu/decode_loop.rs` (H12 split) | 0 | 0 | needs both `MockComputeBackend` returning `Some` from `decode_token` AND a Q4K-loaded vindex |
+| `layer_graph/generate/gpu/mod.rs` (H12 split) | 0 | **53.05** | early-return + `try_*` delegation paths covered; full streaming body needs the same fixture as above |
+| `layer_graph/generate/gpu/prefill.rs` (H12 split) | 0 | 26.79 | `Capability::DecodeQ4KMoe` guard covered; rest needs Q4K vindex |
+
+### What's left untouched
+
+- **~30 files at 0%** — need infrastructure (real Q4_K vindex on disk,
+  gRPC test server, HTTP test server, `MockComputeBackend` advertising
+  `Capability::PrefillQ4` + `DecodeToken` AND returning `Some` from
+  `prefill_q4`/`decode_token`)
+- **~33 files between 0% and 90%** — mostly Gemma 4-specific
+  (PLE / MoE / KV-share / `layer_scalar`) or Metal-kernel-bound branches
+
+### Diminishing-returns frontier
+
+Round 1 hit the easy synthetic-friendly files (target_delta,
+multi_layer_wire, codec, gqa, cached, trace, predict/dense,
+sparse_compute, graph_backend, lm_head). Round 2 added MockArch fixtures
++ close-to-90 polish + the gpu/ unit-testable pieces. The next pp+
+of line coverage costs ~2-3 hours of synthetic-Q4_K-vindex fixture
+work (would unlock `vindex/q4k_forward/*` + `gpu/{decode_loop, mod}.rs`
+deeper paths). At this point higher-leverage work is on the open
+frontiers (A1–A3 heterogeneous attention geometry, R4 trace export, MI4
+parity tests) rather than further coverage push.
 
 ## [2026-05-10] — Coverage push: 53.13% → 63.18% (+10.05 pp)
 

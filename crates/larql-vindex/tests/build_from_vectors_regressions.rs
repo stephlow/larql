@@ -266,3 +266,67 @@ fn build_from_vectors_reports_missing_or_empty_gate_file() {
         .to_string();
     assert!(empty.contains("empty gate file"));
 }
+
+fn write_gate_file(root: &Path, gate_lines: &[String]) -> std::path::PathBuf {
+    let vectors = root.join("vectors");
+    std::fs::create_dir_all(&vectors).unwrap();
+    let header = serde_json::json!({
+        "_header": true,
+        "model": GEMMA_MODEL,
+        "dimension": HIDDEN_SIZE,
+    })
+    .to_string();
+    let mut all = vec![header];
+    all.extend_from_slice(gate_lines);
+    write_lines(&vectors.join("ffn_gate.vectors.jsonl"), &all);
+    // build_vindex_from_vectors only opens embeddings + down after gate parses,
+    // so empty stubs are sufficient for these failure-path tests.
+    std::fs::write(vectors.join("embeddings.vectors.jsonl"), "").unwrap();
+    std::fs::write(vectors.join("ffn_down.vectors.jsonl"), "").unwrap();
+    vectors
+}
+
+#[test]
+fn build_from_vectors_rejects_gate_record_missing_layer() {
+    let root = tempdir().unwrap();
+    let vectors = write_gate_file(
+        root.path(),
+        &[serde_json::json!({"feature": 0, "vector": [1.0, 2.0]}).to_string()],
+    );
+    let mut callbacks = RecordingCallbacks::default();
+    let err = build_vindex_from_vectors(&vectors, &root.path().join("out"), &mut callbacks)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing or non-integer 'layer' field"), "{err}");
+}
+
+#[test]
+fn build_from_vectors_rejects_gate_record_with_non_array_vector() {
+    let root = tempdir().unwrap();
+    let vectors = write_gate_file(
+        root.path(),
+        &[serde_json::json!({"layer": 0, "feature": 0, "vector": "oops"}).to_string()],
+    );
+    let mut callbacks = RecordingCallbacks::default();
+    let err = build_vindex_from_vectors(&vectors, &root.path().join("out"), &mut callbacks)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("missing or non-array 'vector' field"),
+        "{err}"
+    );
+}
+
+#[test]
+fn build_from_vectors_rejects_gate_record_with_non_float_vector_element() {
+    let root = tempdir().unwrap();
+    let vectors = write_gate_file(
+        root.path(),
+        &[serde_json::json!({"layer": 0, "feature": 0, "vector": [1.0, "nope"]}).to_string()],
+    );
+    let mut callbacks = RecordingCallbacks::default();
+    let err = build_vindex_from_vectors(&vectors, &root.path().join("out"), &mut callbacks)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("non-float element in 'vector' array"), "{err}");
+}

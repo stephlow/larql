@@ -997,6 +997,422 @@ fn make_full_test_vindex_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Build a synthetic vindex with hidden_size=1024.
+///
+/// `make_test_weights()` is hardcoded to hidden=16, but `COMPACT MAJOR`
+/// guards on `hidden_dim >= 1024`. This fixture mirrors the full-vindex
+/// builder with parameterised dimensions large enough to clear that
+/// guard while staying small enough for unit-test runtime (~5 MB on
+/// disk, sub-second forward pass per fact).
+fn make_large_test_vindex_dir(tag: &str) -> std::path::PathBuf {
+    use larql_inference::ndarray::Array2;
+    use larql_models::{detect_from_json, ModelWeights, WeightArray};
+    use larql_vindex::{
+        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype,
+        VindexConfig, VindexLayerInfo, VindexModelConfig,
+    };
+    use std::collections::HashMap;
+
+    // Just over the COMPACT MAJOR threshold; intermediate kept tiny so
+    // gate/up/down stay under 1 MB each.
+    const VOCAB: usize = 32;
+    const HIDDEN: usize = 1024;
+    const INTER: usize = 64;
+    const NUM_Q: usize = 2;
+    const NUM_KV: usize = 1;
+    const HEAD_DIM: usize = 64;
+    const NUM_LAYERS: usize = 2;
+
+    let dir = std::env::temp_dir().join(format!(
+        "larql_lql_large_test_vindex_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let arch_json = serde_json::json!({
+        "model_type": "tinymodel",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": NUM_LAYERS,
+        "intermediate_size": INTER,
+        "head_dim": HEAD_DIM,
+        "num_attention_heads": NUM_Q,
+        "num_key_value_heads": NUM_KV,
+        "vocab_size": VOCAB,
+    });
+    let arch = detect_from_json(&arch_json);
+    let arch_family = arch.family().to_string();
+
+    let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut rng_state = 0x600d_face_u64;
+    let mut rand_mat = |rows: usize, cols: usize, scale: f32| -> WeightArray {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng_state as u32) as f32 / u32::MAX as f32 * 2.0 * scale - scale
+            })
+            .collect();
+        Array2::from_shape_vec((rows, cols), data)
+            .unwrap()
+            .into_shared()
+    };
+
+    // Reserve one extra vocab row for the [UNK] token (mirrors the
+    // small-fixture extension trick).
+    let new_vocab = VOCAB + 1;
+    let mut embed_arr = Array2::<f32>::zeros((new_vocab, HIDDEN));
+    let base_embed = rand_mat(VOCAB, HIDDEN, 0.05);
+    for (i, row) in base_embed.rows().into_iter().enumerate() {
+        for (j, v) in row.iter().enumerate() {
+            embed_arr[[i, j]] = *v;
+        }
+    }
+    for j in 0..HIDDEN {
+        embed_arr[[VOCAB, j]] = 0.005_f32 * ((j % 13) as f32 + 1.0);
+    }
+    let embed = embed_arr.into_shared();
+    let lm_head = rand_mat(new_vocab, HIDDEN, 0.05);
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+
+    vectors.insert(arch.final_norm_key().to_string(), vec![1.0; HIDDEN]);
+
+    let q_dim = NUM_Q * HEAD_DIM;
+    let kv_dim = NUM_KV * HEAD_DIM;
+
+    for layer in 0..NUM_LAYERS {
+        tensors.insert(arch.attn_q_key(layer), rand_mat(q_dim, HIDDEN, 0.05));
+        tensors.insert(arch.attn_k_key(layer), rand_mat(kv_dim, HIDDEN, 0.05));
+        tensors.insert(arch.attn_v_key(layer), rand_mat(kv_dim, HIDDEN, 0.05));
+        tensors.insert(arch.attn_o_key(layer), rand_mat(HIDDEN, q_dim, 0.05));
+        tensors.insert(arch.ffn_gate_key(layer), rand_mat(INTER, HIDDEN, 0.05));
+        tensors.insert(arch.ffn_up_key(layer), rand_mat(INTER, HIDDEN, 0.05));
+        tensors.insert(arch.ffn_down_key(layer), rand_mat(HIDDEN, INTER, 0.05));
+        vectors.insert(arch.input_layernorm_key(layer), vec![1.0; HIDDEN]);
+        vectors.insert(arch.post_attention_layernorm_key(layer), vec![1.0; HIDDEN]);
+    }
+
+    let weights = ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: HashMap::new(),
+        packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed: embed.clone(),
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers: NUM_LAYERS,
+        hidden_size: HIDDEN,
+        intermediate_size: INTER,
+        vocab_size: new_vocab,
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q,
+        num_kv_heads: NUM_KV,
+        rope_base: 10_000.0,
+    };
+
+    // Build vindex with random gate vectors, mirroring make_test_vindex.
+    let n_features = INTER;
+    let gate_vectors: Vec<Option<Array2<f32>>> = (0..NUM_LAYERS)
+        .map(|l| {
+            let mut state = 0xabcdef_u64.wrapping_add(l as u64 * 0x9e3779b97f4a7c15);
+            let data: Vec<f32> = (0..n_features * HIDDEN)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state as u32) as f32 / u32::MAX as f32 * 0.1 - 0.05
+                })
+                .collect();
+            Some(Array2::from_shape_vec((n_features, HIDDEN), data).unwrap())
+        })
+        .collect();
+    let down_meta = vec![None; NUM_LAYERS];
+    let vindex = larql_vindex::VectorIndex::new(gate_vectors, down_meta, NUM_LAYERS, HIDDEN);
+
+    let bpf = 4_usize;
+    let row_bytes = HIDDEN * bpf;
+    let layer_bytes = INTER * row_bytes;
+    let layers: Vec<VindexLayerInfo> = (0..NUM_LAYERS)
+        .map(|li| VindexLayerInfo {
+            layer: li,
+            offset: (li * layer_bytes) as u64,
+            length: layer_bytes as u64,
+            num_features: INTER,
+            num_experts: None,
+            num_features_per_expert: None,
+        })
+        .collect();
+
+    let model_config = VindexModelConfig {
+        model_type: arch_family.clone(),
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q,
+        num_kv_heads: NUM_KV,
+        rope_base: 10_000.0,
+        sliding_window: None,
+        moe: None::<MoeConfig>,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        partial_rotary_factor: None,
+        sliding_window_pattern: None,
+        layer_types: None,
+        attention_k_eq_v: false,
+        num_kv_shared_layers: None,
+        per_layer_embed_dim: None,
+        rope_local_base: None,
+        query_pre_attn_scalar: None,
+        final_logit_softcapping: None,
+    };
+
+    let mut config = VindexConfig {
+        version: 2,
+        model: format!("test/large-fixture-{tag}"),
+        family: arch_family,
+        source: None,
+        checksums: None,
+        num_layers: NUM_LAYERS,
+        hidden_size: HIDDEN,
+        intermediate_size: INTER,
+        vocab_size: new_vocab,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::All,
+        dtype: StorageDtype::F32,
+        quant: QuantFormat::None,
+        layer_bands: None,
+        layers: layers.clone(),
+        down_top_k: 5,
+        has_model_weights: true,
+        model_config: Some(model_config),
+        fp4: None,
+        ffn_layout: None,
+    };
+
+    vindex.save_vindex(&dir, &mut config).unwrap();
+
+    let mut build_cb = SilentBuildCallbacks;
+    larql_vindex::write_model_weights(&weights, &dir, &mut build_cb).unwrap();
+
+    let embed_slice = embed.as_slice().unwrap();
+    let mut embed_bytes = Vec::with_capacity(embed_slice.len() * bpf);
+    for v in embed_slice {
+        embed_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
+
+    let tok = larql_inference::test_utils::make_test_tokenizer(VOCAB);
+    tok.save(dir.join("tokenizer.json").to_str().unwrap(), false)
+        .unwrap();
+
+    dir
+}
+
+fn large_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
+    let dir = make_large_test_vindex_dir(tag);
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    session
+        .execute(&stmt)
+        .expect("USE on large synthetic vindex should succeed");
+    (session, dir)
+}
+
+/// Build a synthetic vindex with an MoE router so the `Backend::Vindex.router`
+/// field gets populated by `RouterIndex::load` during USE. Unlocks the
+/// `try_moe_describe` path in `describe/moe.rs`.
+fn make_moe_test_vindex_dir(tag: &str) -> std::path::PathBuf {
+    use larql_vindex::{
+        ExtractLevel, MoeConfig, QuantFormat, SilentBuildCallbacks, StorageDtype,
+        VindexConfig, VindexLayerInfo, VindexModelConfig,
+    };
+
+    const NUM_EXPERTS: usize = 4;
+    const TOP_K: usize = 2;
+
+    let dir = std::env::temp_dir().join(format!(
+        "larql_lql_moe_test_vindex_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Reuse the make_test_weights/make_test_vindex helpers from the
+    // full fixture for tensor scaffolding.
+    let mut weights = larql_inference::test_utils::make_test_weights();
+    {
+        use larql_inference::ndarray::Array2;
+        let new_vocab = weights.vocab_size + 1;
+        let hidden = weights.hidden_size;
+        let mut extended = Array2::<f32>::zeros((new_vocab, hidden));
+        for (i, row) in weights.embed.rows().into_iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                extended[[i, j]] = *v;
+            }
+        }
+        for j in 0..hidden {
+            extended[[weights.vocab_size, j]] = 0.01_f32 * (j as f32 + 1.0);
+        }
+        weights.embed = extended.into_shared();
+        weights.vocab_size = new_vocab;
+        let mut lm_extended = Array2::<f32>::zeros((new_vocab, hidden));
+        for (i, row) in weights.lm_head.rows().into_iter().enumerate() {
+            if i >= new_vocab {
+                break;
+            }
+            for (j, v) in row.iter().enumerate() {
+                lm_extended[[i, j]] = *v;
+            }
+        }
+        weights.lm_head = lm_extended.into_shared();
+        let embed_key = weights.arch.embed_key().to_string();
+        weights.tensors.insert(embed_key, weights.embed.clone());
+    }
+    let vindex = larql_inference::test_utils::make_test_vindex(&weights);
+
+    let bpf = 4_usize;
+    let row_bytes = weights.hidden_size * bpf;
+    let layer_bytes = weights.intermediate_size * row_bytes;
+    let layers: Vec<VindexLayerInfo> = (0..weights.num_layers)
+        .map(|li| VindexLayerInfo {
+            layer: li,
+            offset: (li * layer_bytes) as u64,
+            length: layer_bytes as u64,
+            num_features: weights.intermediate_size,
+            num_experts: Some(NUM_EXPERTS),
+            num_features_per_expert: Some(weights.intermediate_size / NUM_EXPERTS),
+        })
+        .collect();
+
+    let model_config = VindexModelConfig {
+        model_type: weights.arch.family().to_string(),
+        head_dim: weights.head_dim,
+        num_q_heads: weights.num_q_heads,
+        num_kv_heads: weights.num_kv_heads,
+        rope_base: weights.rope_base,
+        sliding_window: None,
+        moe: Some(MoeConfig {
+            num_experts: NUM_EXPERTS,
+            top_k: TOP_K,
+            shared_expert: false,
+            router_type: "top_k_softmax".into(),
+            moe_intermediate_size: None,
+            hybrid: false,
+        }),
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        partial_rotary_factor: None,
+        sliding_window_pattern: None,
+        layer_types: None,
+        attention_k_eq_v: false,
+        num_kv_shared_layers: None,
+        per_layer_embed_dim: None,
+        rope_local_base: None,
+        query_pre_attn_scalar: None,
+        final_logit_softcapping: None,
+    };
+
+    let mut config = VindexConfig {
+        version: 2,
+        model: format!("test/moe-fixture-{tag}"),
+        family: weights.arch.family().to_string(),
+        source: None,
+        checksums: None,
+        num_layers: weights.num_layers,
+        hidden_size: weights.hidden_size,
+        intermediate_size: weights.intermediate_size,
+        vocab_size: weights.vocab_size,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::All,
+        dtype: StorageDtype::F32,
+        quant: QuantFormat::None,
+        layer_bands: None,
+        layers: layers.clone(),
+        down_top_k: 5,
+        has_model_weights: true,
+        model_config: Some(model_config),
+        fp4: None,
+        ffn_layout: None,
+    };
+
+    vindex.save_vindex(&dir, &mut config).unwrap();
+
+    let mut build_cb = SilentBuildCallbacks;
+    larql_vindex::write_model_weights(&weights, &dir, &mut build_cb).unwrap();
+
+    // `write_model_weights` rewrites `model_config` from the arch
+    // (`VindexModelConfig::from_arch`), which clobbers our manually-set
+    // MoE entry — `tinymodel` is dense so the arch-derived config has
+    // moe=None. Patch the file back in place so RouterIndex::load picks
+    // up the fixture's MoE configuration during USE.
+    {
+        let index_path = dir.join("index.json");
+        let mut on_disk: VindexConfig =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        if let Some(mc) = on_disk.model_config.as_mut() {
+            mc.moe = Some(MoeConfig {
+                num_experts: NUM_EXPERTS,
+                top_k: TOP_K,
+                shared_expert: false,
+                router_type: "top_k_softmax".into(),
+                moe_intermediate_size: None,
+                hybrid: false,
+            });
+        }
+        std::fs::write(&index_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
+    }
+
+    let embed_slice = weights.embed.as_slice().unwrap();
+    let mut embed_bytes = Vec::with_capacity(embed_slice.len() * bpf);
+    for v in embed_slice {
+        embed_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
+
+    let tok = larql_inference::test_utils::make_test_tokenizer(weights.vocab_size - 1);
+    tok.save(dir.join("tokenizer.json").to_str().unwrap(), false)
+        .unwrap();
+
+    // Router weights: per_layer = num_experts*hidden + num_experts.
+    // Use a deterministic LCG so each layer has different scores and
+    // top-k selection isn't always the same expert.
+    let per_layer = NUM_EXPERTS * weights.hidden_size + NUM_EXPERTS;
+    let total = per_layer * weights.num_layers;
+    let mut router_bytes = Vec::with_capacity(total * bpf);
+    let mut state: u64 = 0xc0_ffee_42;
+    for _ in 0..total {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let v = (state as u32) as f32 / u32::MAX as f32 * 0.4 - 0.2;
+        router_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join("router_weights.bin"), router_bytes).unwrap();
+
+    dir
+}
+
+fn moe_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
+    let dir = make_moe_test_vindex_dir(tag);
+    let mut session = Session::new();
+    let stmt = parser::parse(&format!(r#"USE "{}";"#, dir.display())).unwrap();
+    session
+        .execute(&stmt)
+        .expect("USE on MoE synthetic vindex should succeed");
+    (session, dir)
+}
+
 fn full_vindex_session(tag: &str) -> (Session, std::path::PathBuf) {
     let dir = make_full_test_vindex_dir(tag);
     let mut session = Session::new();
@@ -3595,5 +4011,225 @@ fn compact_major_against_full_fixture_runs() {
     let stmt = parser::parse("COMPACT MAJOR;").unwrap();
     let err = session.execute(&stmt).unwrap_err();
     assert!(err.to_string().contains("hidden_dim"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── COMPACT MAJOR full MEMIT path (large fixture, hidden_dim ≥ 1024) ──
+
+#[test]
+fn compact_major_against_large_fixture_with_no_patches_short_circuits() {
+    // Large fixture clears the hidden_dim guard. With no patches and
+    // no overlay edges, COMPACT MAJOR returns the empty-L1 short-circuit.
+    let (mut session, dir) = large_vindex_session("compact_major_empty_l1");
+    let stmt = parser::parse("COMPACT MAJOR;").unwrap();
+    let out = session.execute(&stmt).expect("COMPACT MAJOR no-op");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("L1 is empty"),
+        "expected empty-L1 message, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a `VindexPatch` containing a single Insert op. Used to
+/// pre-seat committed patches before invoking COMPACT MAJOR.
+fn mk_insert_patch(
+    layer: usize,
+    feature: usize,
+    entity: &str,
+    relation: Option<&str>,
+    target: &str,
+) -> larql_vindex::VindexPatch {
+    larql_vindex::VindexPatch {
+        version: 1,
+        base_model: String::new(),
+        base_checksum: None,
+        created_at: String::new(),
+        description: None,
+        author: None,
+        tags: Vec::new(),
+        operations: vec![larql_vindex::PatchOp::Insert {
+            layer,
+            feature,
+            relation: relation.map(str::to_string),
+            entity: entity.into(),
+            target: target.into(),
+            confidence: Some(0.9),
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
+            down_meta: None,
+        }],
+    }
+}
+
+#[test]
+fn compact_major_against_large_fixture_runs_full_memit_solve() {
+    // Pre-seat one committed patch with a relation so COMPACT MAJOR
+    // runs the full MEMIT pipeline: residual capture, target embedding
+    // lookup, ndarray solve, decomposition-quality report, and persist
+    // to memit_store.json.
+    let (mut session, dir) = large_vindex_session("compact_major_memit");
+    {
+        let (_, _, patched) = session.require_patched_mut().unwrap();
+        patched
+            .patches
+            .push(mk_insert_patch(0, 0, "[1]", Some("[2]"), "[3]"));
+    }
+
+    let stmt = parser::parse("COMPACT MAJOR;").unwrap();
+    let out = session.execute(&stmt).expect("COMPACT MAJOR full path");
+    let joined = out.join("\n");
+
+    assert!(
+        joined.contains("Running MEMIT solver"),
+        "expected MEMIT solver output, got: {joined}",
+    );
+    assert!(
+        joined.contains("Decomposition quality"),
+        "expected quality report, got: {joined}",
+    );
+    assert!(
+        joined.contains("COMPACT MAJOR complete"),
+        "expected completion line, got: {joined}",
+    );
+
+    let memit_path = dir.join("memit_store.json");
+    assert!(
+        memit_path.exists(),
+        "expected memit_store.json to be persisted",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_major_against_large_fixture_with_lambda_override() {
+    // WITH LAMBDA = X threads through a non-default lambda; the value
+    // is echoed in the progress report.
+    let (mut session, dir) = large_vindex_session("compact_major_lambda");
+    {
+        let (_, _, patched) = session.require_patched_mut().unwrap();
+        patched
+            .patches
+            .push(mk_insert_patch(0, 0, "[1]", Some("[2]"), "[3]"));
+    }
+
+    let stmt = parser::parse("COMPACT MAJOR WITH LAMBDA = 0.01;").unwrap();
+    let out = session.execute(&stmt).expect("COMPACT MAJOR custom lambda");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("lambda=1.0e-2") || joined.contains("lambda=1e-2"),
+        "expected custom lambda echo, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── DESCRIBE on MoE-router fixture (try_moe_describe path) ─────────────
+
+#[test]
+fn describe_on_moe_fixture_loads_router() {
+    // USE on the MoE fixture should populate Backend::Vindex.router via
+    // `RouterIndex::load`. DESCRIBE then routes through `try_moe_describe`
+    // and reports per-expert hit counts.
+    let (mut session, dir) = moe_vindex_session("describe_moe");
+
+    // Sanity: router file is on disk and the live backend's router
+    // got constructed (otherwise try_moe_describe short-circuits to None).
+    assert!(
+        dir.join("router_weights.bin").exists(),
+        "router_weights.bin should exist at {}",
+        dir.display()
+    );
+    if let Backend::Vindex { router, .. } = &session.backend {
+        assert!(
+            router.is_some(),
+            "RouterIndex::load should populate Backend::Vindex.router for the MoE fixture",
+        );
+    } else {
+        panic!("expected Backend::Vindex");
+    }
+
+    let stmt = parser::parse(r#"DESCRIBE "[1]";"#).unwrap();
+    let out = session.execute(&stmt).expect("DESCRIBE on MoE fixture");
+    let joined = out.join("\n");
+    // Expected output format from describe/moe.rs:
+    //   [1]
+    //     Experts (L0-1):
+    //       E<id>  <count>/<layers> layers  (<pct>% avg)
+    //   ...
+    assert!(
+        joined.contains("Experts"),
+        "expected 'Experts' header in MoE DESCRIBE, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn describe_verbose_on_moe_fixture_shows_routing() {
+    // VERBOSE branch prints the per-layer routing table.
+    let (mut session, dir) = moe_vindex_session("describe_moe_verbose");
+
+    let stmt = parser::parse(r#"DESCRIBE "[1]" VERBOSE;"#).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("DESCRIBE VERBOSE on MoE fixture");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("Routing (L"),
+        "expected verbose 'Routing' header, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn describe_on_moe_fixture_unknown_entity_reports_not_found() {
+    // The "(not found)" branch fires when the entity doesn't tokenise
+    // to anything in vocab. Use a literal that the WordLevel tokenizer
+    // can't resolve to avoid the embedding lookup short-circuit.
+    let (mut session, dir) = moe_vindex_session("describe_moe_unknown");
+
+    let stmt = parser::parse(r#"DESCRIBE "totally_unknown_entity_that_wont_tokenize";"#).unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("DESCRIBE on unknown entity");
+    let joined = out.join("\n");
+    // Either "(not found)" or the entity name with empty experts is
+    // acceptable — the test is that we don't panic on unknown input.
+    assert!(
+        joined.contains("not found") || joined.contains("Experts"),
+        "expected sensible MoE DESCRIBE output, got: {joined}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_major_skips_inserts_with_no_relation() {
+    // A Compose patch with relation=None should be skipped and counted
+    // in the "skipped insert(s)" report, exercising the
+    // `skipped_no_relation` reporting branch. The relation-bearing edge
+    // still flows through MEMIT.
+    let (mut session, dir) = large_vindex_session("compact_major_no_rel");
+    {
+        let (_, _, patched) = session.require_patched_mut().unwrap();
+        patched
+            .patches
+            .push(mk_insert_patch(0, 0, "[1]", None, "[3]"));
+        patched
+            .patches
+            .push(mk_insert_patch(0, 1, "[4]", Some("[2]"), "[5]"));
+    }
+
+    let stmt = parser::parse("COMPACT MAJOR;").unwrap();
+    let out = session.execute(&stmt).expect("COMPACT MAJOR mixed");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("Skipped 1 insert"),
+        "expected skipped-no-relation message, got: {joined}",
+    );
+    assert!(
+        joined.contains("MEMIT") && joined.contains("complete"),
+        "expected the relation-bearing edge to still flow through MEMIT, got: {joined}",
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

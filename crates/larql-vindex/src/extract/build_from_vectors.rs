@@ -22,6 +22,25 @@ const HEADER_EMBED_SCALE: &str = "embed_scale";
 const HEADER_NUM_LAYERS: &str = "num_hidden_layers";
 const HEADER_HIDDEN_SIZE: &str = "hidden_size";
 
+fn parse_u64_field(obj: &serde_json::Value, field: &str) -> Result<u64, VindexError> {
+    obj.get(field)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| VindexError::Parse(format!("missing or non-integer '{field}' field")))
+}
+
+fn parse_f32_vector(obj: &serde_json::Value, field: &str) -> Result<Vec<f32>, VindexError> {
+    obj.get(field)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| VindexError::Parse(format!("missing or non-array '{field}' field")))?
+        .iter()
+        .map(|v| {
+            v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                VindexError::Parse(format!("non-float element in '{field}' array"))
+            })
+        })
+        .collect()
+}
+
 struct VectorArchitecture {
     family: String,
     embed_scale: f32,
@@ -97,14 +116,9 @@ pub fn build_vindex_from_vectors(
             continue;
         }
 
-        let layer = obj["layer"].as_u64().unwrap() as usize;
-        let feature = obj["feature"].as_u64().unwrap() as usize;
-        let vector: Vec<f32> = obj["vector"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_f64().unwrap() as f32)
-            .collect();
+        let layer = parse_u64_field(&obj, "layer")? as usize;
+        let feature = parse_u64_field(&obj, "feature")? as usize;
+        let vector = parse_f32_vector(&obj, "vector")?;
 
         if layer > max_layer {
             max_layer = layer;
@@ -201,13 +215,8 @@ pub fn build_vindex_from_vectors(
             continue;
         }
 
-        let feature = obj["feature"].as_u64().unwrap() as usize;
-        let vector: Vec<f32> = obj["vector"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_f64().unwrap() as f32)
-            .collect();
+        let feature = parse_u64_field(&obj, "feature")? as usize;
+        let vector = parse_f32_vector(&obj, "vector")?;
 
         if feature + 1 > vocab_size {
             vocab_size = feature + 1;
@@ -261,8 +270,8 @@ pub fn build_vindex_from_vectors(
             continue;
         }
 
-        let layer = obj["layer"].as_u64().unwrap() as usize;
-        let feature = obj["feature"].as_u64().unwrap() as usize;
+        let layer = parse_u64_field(&obj, "layer")? as usize;
+        let feature = parse_u64_field(&obj, "feature")? as usize;
         let top_token = obj["top_token"].as_str().unwrap_or("").to_string();
         let top_token_id = obj["top_token_id"].as_u64().unwrap_or(0) as u32;
         let c_score = obj["c_score"].as_f64().unwrap_or(0.0) as f32;
