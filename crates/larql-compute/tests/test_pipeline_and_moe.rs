@@ -74,6 +74,8 @@ fn make_moe_weights<'a>(
     MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -174,6 +176,8 @@ fn moe_per_expert_scale_applied() {
     let moe_no_scale = MoeLayerWeights {
         experts_gate_up: experts_gate_up.clone(),
         experts_down: experts_down.clone(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -196,6 +200,8 @@ fn moe_per_expert_scale_applied() {
     let moe_scaled = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &per_expert_scale,
@@ -248,6 +254,8 @@ fn moe_router_scale_vector_applied() {
     let moe = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &router_scale, // non-empty → enters the scale branch
         router_per_expert_scale: &[],
@@ -269,7 +277,7 @@ fn moe_router_scale_vector_applied() {
 
 #[test]
 fn moe_router_input_scalar_nonunit() {
-    // Exercises the `router_input_scalar != 1.0 && != 0.0` branch in forward.rs
+    // Exercises the `router_input_scalar != 1.0` branch in forward.rs.
     let hidden = 8;
     let inter = 4;
     let num_experts = 4;
@@ -288,6 +296,8 @@ fn moe_router_input_scalar_nonunit() {
     let moe_scalar = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -313,6 +323,8 @@ fn moe_empty_router_proj_returns_zeros() {
     let moe = MoeLayerWeights {
         experts_gate_up: Vec::new(),
         experts_down: Vec::new(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &[], // empty → early return
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -344,6 +356,8 @@ fn moe_zero_num_experts_returns_zeros() {
     let moe = MoeLayerWeights {
         experts_gate_up: Vec::new(),
         experts_down: Vec::new(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &[1.0f32], // non-empty so we don't hit that guard
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -365,6 +379,130 @@ fn moe_zero_num_experts_returns_zeros() {
 }
 
 #[test]
+fn moe_zero_top_k_or_intermediate_returns_zeros() {
+    let hidden = 8;
+    let router = vec![1.0f32; hidden * 2];
+    let gate_up = bf16_fill(2 * 2 * hidden, 1.0);
+    let down = bf16_fill(2 * hidden, 1.0);
+    let (experts_gate_up, experts_down) = bf16_expert_tables(&gate_up, &down, 1, 2, hidden);
+    let h = vec![1.0f32; hidden];
+
+    let zero_top_k = MoeLayerWeights {
+        experts_gate_up: experts_gate_up.clone(),
+        experts_down: experts_down.clone(),
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
+        router_proj: &router,
+        router_scale: &[],
+        router_per_expert_scale: &[],
+        router_norm: &[],
+        router_norm_parameter_free: false,
+        router_input_scalar: 1.0,
+        pre_experts_norm: &[],
+        post_ffn1_norm: &[],
+        post_experts_norm: &[],
+        num_experts: 2,
+        top_k: 0,
+        intermediate_size: 2,
+        activation: Activation::Silu,
+        expert_data_format: larql_compute::QuantFormat::BF16,
+    };
+    assert_eq!(
+        cpu_moe_forward(&h, &zero_top_k, 0.0, 1e-6),
+        vec![0.0; hidden]
+    );
+
+    let zero_intermediate = MoeLayerWeights {
+        top_k: 1,
+        intermediate_size: 0,
+        ..zero_top_k
+    };
+    assert_eq!(
+        cpu_moe_forward(&h, &zero_intermediate, 0.0, 1e-6),
+        vec![0.0; hidden]
+    );
+}
+
+#[test]
+fn moe_missing_selected_expert_tables_are_skipped() {
+    let hidden = 8;
+    let inter = 2;
+    let num_experts = 4;
+    let top_k = 1;
+    let gate_up = bf16_fill(2 * inter * hidden, 1.0);
+    let down = bf16_fill(hidden * inter, 1.0);
+    let (experts_gate_up, experts_down) = bf16_expert_tables(&gate_up, &down, 1, inter, hidden);
+    let mut router = vec![0.0f32; num_experts * hidden];
+    for v in &mut router[3 * hidden..4 * hidden] {
+        *v = 10.0;
+    }
+    let moe = MoeLayerWeights {
+        experts_gate_up,
+        experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
+        router_proj: &router,
+        router_scale: &[],
+        router_per_expert_scale: &[],
+        router_norm: &[],
+        router_norm_parameter_free: false,
+        router_input_scalar: 1.0,
+        pre_experts_norm: &[],
+        post_ffn1_norm: &[],
+        post_experts_norm: &[],
+        num_experts,
+        top_k,
+        intermediate_size: inter,
+        activation: Activation::Silu,
+        expert_data_format: larql_compute::QuantFormat::BF16,
+    };
+    let h = vec![1.0f32; hidden];
+
+    assert_eq!(cpu_moe_forward(&h, &moe, 0.0, 1e-6), vec![0.0; hidden]);
+}
+
+#[test]
+fn moe_post_experts_norm_branch_runs() {
+    let hidden = 8;
+    let inter = 4;
+    let num_experts = 2;
+    let top_k = 1;
+    let gate_up = bf16_fill(num_experts * 2 * inter * hidden, 1.0);
+    let down = bf16_fill(num_experts * hidden * inter, 1.0);
+    let router: Vec<f32> = (0..num_experts * hidden)
+        .map(|i| if i < hidden { 1.0 } else { 0.0 })
+        .collect();
+    let post_norm = vec![1.0f32; hidden];
+    let (experts_gate_up, experts_down) =
+        bf16_expert_tables(&gate_up, &down, num_experts, inter, hidden);
+    let moe = MoeLayerWeights {
+        experts_gate_up,
+        experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
+        router_proj: &router,
+        router_scale: &[],
+        router_per_expert_scale: &[],
+        router_norm: &[],
+        router_norm_parameter_free: false,
+        router_input_scalar: 1.0,
+        pre_experts_norm: &[],
+        post_ffn1_norm: &[],
+        post_experts_norm: &post_norm,
+        num_experts,
+        top_k,
+        intermediate_size: inter,
+        activation: Activation::Silu,
+        expert_data_format: larql_compute::QuantFormat::BF16,
+    };
+
+    let out = cpu_moe_forward(&vec![1.0f32; hidden], &moe, 0.0, 1e-6);
+
+    assert_eq!(out.len(), hidden);
+    assert!(out.iter().all(|v| v.is_finite()));
+}
+
+#[test]
 fn moe_gelu_tanh_activation_in_forward() {
     // Exercises the GeluTanh arm of the match in the rayon closure (forward.rs line 157).
     let hidden = 8;
@@ -383,6 +521,8 @@ fn moe_gelu_tanh_activation_in_forward() {
     let moe = MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router,
         router_scale: &[],
         router_per_expert_scale: &[],
@@ -414,7 +554,7 @@ fn moe_gelu_tanh_activation_in_forward() {
 // so they exercise the full `dispatch_full_pipeline` + `moe_fn` callback
 // chain without reaching into private internals.
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod moe_prefill_integration {
     use larql_compute::backend::DecodeBackend;
     use larql_compute::metal::MetalBackend;
@@ -489,6 +629,8 @@ mod moe_prefill_integration {
         MoeLayerWeights {
             experts_gate_up: Vec::new(),
             experts_down: Vec::new(),
+            routing_policy: larql_compute::MoeRoutingPolicy::default(),
+            weight_layout: larql_compute::MoeWeightLayout::default(),
             router_proj: &[],
             router_scale: &[],
             router_per_expert_scale: &[],

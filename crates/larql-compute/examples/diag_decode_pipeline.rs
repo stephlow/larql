@@ -1,14 +1,14 @@
 //! Debug: per-stage buffer reads in the decode pipeline.
 //! Runs inside larql-compute where we have direct Metal access.
 //!
-//! cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
+//! cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {
-    eprintln!("This example requires --features metal");
+    eprintln!("This example requires macOS and --features metal");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() {
     let metal = larql_compute::metal::MetalBackend::new().expect("need metal");
     let bufs = metal.bufs();
@@ -169,7 +169,7 @@ fn main() {
         let hidden_val = hidden as u32;
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&metal.rms_norm_pipeline);
+        enc.set_compute_pipeline_state(&metal.norms.rms_norm_pipeline);
         enc.set_buffer(0, Some(&h_buf), 0);
         enc.set_buffer(1, Some(&norm_w), 0);
         enc.set_buffer(2, Some(&norm_out), 0);
@@ -207,7 +207,7 @@ fn main() {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&metal.residual_norm_q8_pipeline);
+        enc.set_compute_pipeline_state(&metal.norms.residual_norm_q8_pipeline);
         enc.set_buffer(0, Some(&a_buf), 0);
         enc.set_buffer(1, Some(&b_buf), 0);
         enc.set_buffer(2, Some(&norm_w), 0);

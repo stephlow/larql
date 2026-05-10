@@ -27,7 +27,7 @@
 //! return `Ok` so CI stays green. `LARQL_ARCH_STRICT=1` flips skips
 //! to hard failures (useful locally to confirm the test actually ran).
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::path::PathBuf;
 

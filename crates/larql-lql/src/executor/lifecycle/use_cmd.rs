@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::ast::UseTarget;
 use crate::error::LqlError;
 use crate::executor::helpers::{dir_size, format_number};
+use crate::executor::memit_persist::load_memit_store;
 use crate::executor::{Backend, Session};
 use crate::relations::RelationClassifier;
 use larql_vindex::format::filenames::KNN_STORE_BIN;
@@ -76,13 +77,26 @@ impl Session {
                     }
                 }
 
+                // Rehydrate the L2 MEMIT store from disk if a previous
+                // session left a snapshot. A corrupt or unreadable
+                // snapshot is logged but does NOT block the USE — the
+                // session falls back to an empty store.
+                let memit_store = match load_memit_store(&path) {
+                    Ok(Some(store)) => store,
+                    Ok(None) => larql_vindex::MemitStore::new(),
+                    Err(e) => {
+                        eprintln!("warning: failed to load memit_store.json: {e}");
+                        larql_vindex::MemitStore::new()
+                    }
+                };
+
                 self.backend = Backend::Vindex {
                     path,
                     config,
                     patched,
                     relation_classifier,
                     router,
-                    memit_store: larql_vindex::MemitStore::new(),
+                    memit_store,
                 };
                 // Reset any previous patch session
                 self.patch_recording = None;

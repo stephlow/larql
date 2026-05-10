@@ -24,7 +24,7 @@
 //! These are kernel-level invariants — they don't depend on a real
 //! vindex and run in milliseconds.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -100,27 +100,27 @@ fn q4_pipelines_handle_contract() {
 fn k_matvec_handle_contract() {
     let metal = get_metal();
     assert_q4k_selected_handle_matches_active_marker(
-        &metal.q4k_matvec_pipeline,
+        &metal.quant.q4k_matvec_pipeline,
         "q4k_matvec_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_matvec::Kernel>(
-        &metal.q4k_matvec_4sg_pipeline,
+        &metal.quant.q4k_matvec_4sg_pipeline,
         "q4k_matvec_4sg_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_matvec_8sg::Kernel>(
-        &metal.q4k_matvec_8sg_pipeline,
+        &metal.quant.q4k_matvec_8sg_pipeline,
         "q4k_matvec_8sg_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_matvec_stride32::Kernel>(
-        &metal.q4k_matvec_stride32_pipeline,
+        &metal.quant.q4k_matvec_stride32_pipeline,
         "q4k_matvec_stride32_pipeline",
     );
     assert_handle_matches_marker::<shaders::q6k_matvec::Kernel>(
-        &metal.q6k_matvec_pipeline,
+        &metal.quant.q6k_matvec_pipeline,
         "q6k_matvec_pipeline",
     );
     assert_handle_matches_marker::<shaders::q8_matvec::Kernel>(
-        &metal.q8_matvec_pipeline,
+        &metal.quant.q8_matvec_pipeline,
         "q8_matvec_pipeline",
     );
 }
@@ -130,11 +130,11 @@ fn k_matvec_handle_contract() {
 fn ffn_gate_up_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_ffn_gate_up::Kernel>(
-        &metal.q4k_ffn_gate_up_pipeline,
+        &metal.ffn.q4k_ffn_gate_up_pipeline,
         "q4k_ffn_gate_up_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_ffn_gate_up::Kernel>(
-        &metal.q4kf_ffn_gate_up_pipeline,
+        &metal.ffn.q4kf_ffn_gate_up_pipeline,
         "q4kf_ffn_gate_up_pipeline",
     );
 }
@@ -145,23 +145,23 @@ fn ffn_gate_up_handle_contract() {
 fn qkv_proj_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_qkv_proj::QkvKernel>(
-        &metal.q4k_qkv_proj_pipeline,
+        &metal.attention.q4k_qkv_proj_pipeline,
         "q4k_qkv_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_qkv_proj::ProjKernel>(
-        &metal.q4k_proj_pipeline,
+        &metal.attention.q4k_proj_pipeline,
         "q4k_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_qkv_proj::QkvKernel>(
-        &metal.q4kf_qkv_proj_pipeline,
+        &metal.attention.q4kf_qkv_proj_pipeline,
         "q4kf_qkv_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4kf_qkv_proj::ProjKernel>(
-        &metal.q4kf_proj_pipeline,
+        &metal.attention.q4kf_proj_pipeline,
         "q4kf_proj_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_q6k_qkv_proj::Kernel>(
-        &metal.q4k_q6k_qkv_proj_pipeline,
+        &metal.attention.q4k_q6k_qkv_proj_pipeline,
         "q4k_q6k_qkv_proj_pipeline",
     );
 }
@@ -174,7 +174,7 @@ fn qkv_proj_handle_contract() {
 fn q8_qkv_proj_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q8_attn_proj::QkvKernel>(
-        &metal.q8_qkv_proj_pipeline,
+        &metal.attention.q8_qkv_proj_pipeline,
         "q8_qkv_proj_pipeline",
     );
 }
@@ -184,11 +184,11 @@ fn q8_qkv_proj_handle_contract() {
 fn geglu_down_handle_contract() {
     let metal = get_metal();
     assert_handle_matches_marker::<shaders::q4k_geglu_down::SiluKernel>(
-        &metal.q4k_geglu_silu_down_pipeline,
+        &metal.ffn.q4k_geglu_silu_down_pipeline,
         "q4k_geglu_silu_down_pipeline",
     );
     assert_handle_matches_marker::<shaders::q4k_geglu_down::GeluTanhKernel>(
-        &metal.q4k_geglu_gelu_tanh_down_pipeline,
+        &metal.ffn.q4k_geglu_gelu_tanh_down_pipeline,
         "q4k_geglu_gelu_tanh_down_pipeline",
     );
 }

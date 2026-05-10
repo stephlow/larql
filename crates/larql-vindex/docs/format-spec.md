@@ -380,7 +380,7 @@ gate, was downgraded after failing it, or was set by policy regardless).
 
 **Status:** Shipped 2026-04-26 for MoE — `experts_packed.bin` (BF16 monolith) is no longer written. Dense layers still use `interleaved_q4k.bin` for now; per-layer dense is a future migration. Activated when `index.json` carries `"ffn_layout": "per_layer"`.
 
-**Reading code (current):** `format/weights/load.rs:614` mmaps each `layers/layer_{L}.weights`, parses the LYRW header + offset table, and exposes per-expert byte ranges via `ModelWeights::get_layer_entry_bytes(layer, entry)`. The CPU MoE path (`larql-compute::cpu::ops::moe`) and the remote-expert HTTP handler (`larql-server::routes::expert::run_expert`) both consume per-expert slices directly — no monolith arithmetic.
+**Reading code (current):** `format/weights/load/q4k.rs::load_model_weights_q4k_shard` mmaps each `layers/layer_{L}.weights`, parses the LYRW header + offset table, and exposes per-expert byte ranges via `ModelWeights::get_layer_entry_bytes(layer, entry)`. The CPU MoE path (`larql-compute::cpu::ops::moe`) and the remote-expert HTTP handler (`larql-server::routes::expert::run_expert`) both consume per-expert slices directly — no monolith arithmetic.
 
 **Migrating an old MoE vindex:** run `cargo run --release -p larql-cli --example convert_moe_to_per_layer -- <vindex>` to write the `layers/*.weights` files and set `"ffn_layout": "per_layer"`, then strip the `packed_bf16` rows referencing `experts_packed.bin` from `weight_manifest.json` and delete the file. Validated end-to-end on Gemma 4 26B A4B: `forward_moe` warm latency 4.86 → 1.91 ms (2.5×), 30-layer sweep 866 → 56 ms (15×), RSS 16.6 → 9.7 GB, disk 58 → 16 GB.
 

@@ -29,11 +29,11 @@ pub(super) struct InstalledSlot {
     pub patch_op: larql_vindex::PatchOp,
 }
 
-// Gate scale matching the Python install: `gate = gate_dir * g_ref * 30`.
-// Without this multiplier the slot's silu(gate · x) is too small to
-// push the activation past the trained competition. Validated by
-// exp 14 — see `experiments/14_vindex_compilation/experiment_vindex_compilation.py`.
-pub(super) const GATE_SCALE: f32 = 30.0;
+// `GATE_SCALE` lives in `executor::tuning`. Re-exported as a `pub(super)`
+// alias so the existing tests at the bottom of this file (and the code
+// above it) keep their short, scoped name without depending on the
+// tuning module path directly.
+pub(super) use crate::executor::tuning::GATE_SCALE;
 
 impl Session {
     /// Walk the plan's layers, insert a slot per layer, and run the
@@ -108,7 +108,7 @@ impl Session {
             // ── Gate / up / down synthesis (install_compiled_slot port) ──
             //
             // Direct Rust port of `install_compiled_slot` from
-            // `experiments/14_vindex_compilation/experiment_vindex_compilation.py`.
+            // `~/chris-source/chris-experiments/compilation/14_vindex_compilation/experiment_vindex_compilation.py`.
             // The validated Python pipeline computes three layer-typical
             // norms by sampling existing features at this layer:
             //
@@ -146,21 +146,14 @@ impl Session {
                 if let Some((_, ref residual)) = captured.iter().find(|(l, _)| *l == layer) {
                     unit_vector(residual)
                 } else {
-                    let entity_encoding = tokenizer
-                        .encode(entity, false)
-                        .map_err(|e| LqlError::exec("tokenize error", e))?;
-                    let entity_ids: Vec<u32> = entity_encoding.get_ids().to_vec();
-                    let mut ev = vec![0.0f32; plan.hidden];
-                    for &tok in &entity_ids {
-                        let row = embed.row(tok as usize);
-                        for j in 0..plan.hidden {
-                            ev[j] += row[j] * embed_scale;
-                        }
-                    }
-                    let n = entity_ids.len().max(1) as f32;
-                    for v in &mut ev {
-                        *v /= n;
-                    }
+                    let ev = crate::executor::helpers::entity_query_vec(
+                        &tokenizer,
+                        &embed,
+                        embed_scale,
+                        entity,
+                    )?
+                    .map(|a| a.to_vec())
+                    .unwrap_or_else(|| vec![0.0f32; plan.hidden]);
                     unit_vector(&ev)
                 };
 

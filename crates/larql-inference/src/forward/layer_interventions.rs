@@ -31,10 +31,10 @@ pub fn run_layer_with_zeroed_pre_o_heads(
     let (h_post_attn, kv_out) = crate::attention::run_attention_block_zero_pre_o_heads(
         weights, h, layer, heads, shared_kv,
     )?;
-    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+    if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
+        let path = crate::forward::dump_config::cpu_layer_h_post_attn_path(dir, layer);
         let _ = std::fs::write(&path, &bytes);
     }
     let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
@@ -48,6 +48,7 @@ pub fn run_layer_with_zeroed_pre_o_heads(
 /// This supports static-injection gates: a head can be replaced by global,
 /// position, prompt-type, or token-role means while the rest of the block runs
 /// through the normal residual path.
+#[allow(clippy::too_many_arguments)]
 pub fn run_layer_with_replaced_pre_o_head(
     weights: &ModelWeights,
     h: &Array2<f32>,
@@ -79,6 +80,7 @@ pub fn run_layer_with_replaced_pre_o_head(
 /// inspect the original `(seq_len, head_dim)` pre-W_O slice and synthesize a
 /// replacement, while the engine owns attention recomputation, FFN, PLE,
 /// layer-scalar, and shared-KV handling.
+#[allow(clippy::too_many_arguments)]
 pub fn run_layer_with_mapped_pre_o_head<F>(
     weights: &ModelWeights,
     h: &Array2<f32>,
@@ -124,6 +126,7 @@ where
 /// This is the Mode D adapter: the mapper can replace W_O with a residual
 /// lookup/add table while the engine still owns attention recomputation, FFN,
 /// PLE, layer scalar, and shared-KV behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn run_layer_with_mapped_head_residual_delta<F>(
     weights: &ModelWeights,
     h: &Array2<f32>,
@@ -231,6 +234,7 @@ pub fn run_layer_with_subtracted_pre_o_heads(
 /// This is the Mode D validation path: a precomputed lookup/add table can
 /// provide `replacement_delta` directly in residual space, bypassing W_O while
 /// preserving FFN, PLE, and layer scalar behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn run_layer_with_replaced_head_residual_delta(
     weights: &ModelWeights,
     h: &Array2<f32>,
@@ -258,9 +262,9 @@ pub fn run_layer_with_replaced_head_residual_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
     use crate::forward::run_layer_with_ffn;
+    use crate::test_utils::make_test_weights;
     use ndarray::Array2;
 
     fn h(rows: usize, hidden: usize) -> Array2<f32> {

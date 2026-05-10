@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use ndarray::Array2;
 
-use super::http::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend};
+use super::http::{RemoteFfnConfig, RemoteFfnError, RemoteWalkBackend, WirePreference};
 use crate::ffn::FfnBackend;
 use larql_compute::cpu::ops::q4k_q8k_dot::Q8KActivation;
 
@@ -33,10 +33,21 @@ pub struct LayerShardedBackend {
 impl LayerShardedBackend {
     /// Build from a spec string and connect (health-check) each shard.
     pub fn connect(spec: &str, timeout: Duration) -> Result<Self, RemoteFfnError> {
+        Self::connect_with_wire(spec, timeout, WirePreference::BestAvailable)
+    }
+
+    /// Build from a spec string with an explicit wire format preference.
+    pub fn connect_with_wire(
+        spec: &str,
+        timeout: Duration,
+        wire: WirePreference,
+    ) -> Result<Self, RemoteFfnError> {
         let shards = if spec.contains('=') {
-            parse_shard_map(spec, timeout)?
+            parse_shard_map_with_wire(spec, timeout, wire)?
         } else {
-            let config = RemoteFfnConfig::new(spec).with_timeout(timeout);
+            let config = RemoteFfnConfig::new(spec)
+                .with_timeout(timeout)
+                .with_wire(wire);
             let backend = RemoteWalkBackend::connect(config)?;
             vec![LayerShard {
                 start: 0,
@@ -67,6 +78,29 @@ impl LayerShardedBackend {
             .iter()
             .find(|s| layer >= s.start && layer <= s.end)
             .map(|s| &s.backend)
+    }
+
+    /// Total wire bytes sent across all shards (request bodies).
+    pub fn wire_bytes_sent(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.backend.wire_bytes_sent())
+            .sum()
+    }
+
+    /// Total wire bytes received across all shards (response bodies).
+    pub fn wire_bytes_recv(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.backend.wire_bytes_recv())
+            .sum()
+    }
+
+    /// Reset wire byte counters on all shards.
+    pub fn reset_wire_counters(&self) {
+        for s in &self.shards {
+            s.backend.reset_wire_counters();
+        }
     }
 }
 
@@ -137,7 +171,7 @@ impl LayerShardedBackend {
                 let shard_ptr = shard as *const RemoteWalkBackend;
                 if let Some(g) = shard_groups
                     .iter_mut()
-                    .find(|g| g.shard as *const RemoteWalkBackend == shard_ptr)
+                    .find(|g| std::ptr::eq(g.shard, shard_ptr))
                 {
                     g.layers.push((layer, layer));
                 } else {
@@ -242,7 +276,11 @@ impl FfnBackend for LayerShardedBackend {
 
 // ── Parse "START-END=URL,..." ─────────────────────────────────────────────────
 
-fn parse_shard_map(spec: &str, timeout: Duration) -> Result<Vec<LayerShard>, RemoteFfnError> {
+fn parse_shard_map_with_wire(
+    spec: &str,
+    timeout: Duration,
+    wire: WirePreference,
+) -> Result<Vec<LayerShard>, RemoteFfnError> {
     let mut shards = Vec::new();
     for segment in spec.split(',') {
         let segment = segment.trim();
@@ -259,7 +297,9 @@ fn parse_shard_map(spec: &str, timeout: Duration) -> Result<Vec<LayerShard>, Rem
         let (start, end) = parse_layer_range(range_str).ok_or_else(|| {
             RemoteFfnError::Client(format!("bad layer range {range_str:?} in --ffn"))
         })?;
-        let config = RemoteFfnConfig::new(url).with_timeout(timeout);
+        let config = RemoteFfnConfig::new(url)
+            .with_timeout(timeout)
+            .with_wire(wire);
         let backend = RemoteWalkBackend::connect(config)?;
         shards.push(LayerShard {
             start,

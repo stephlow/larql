@@ -271,7 +271,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_active",
         "q4k-matvec",
-        &metal.q4k_matvec_pipeline,
+        &metal.quant.q4k_matvec_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -283,7 +283,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_4sg",
         "q4k-matvec",
-        &metal.q4k_matvec_4sg_pipeline,
+        &metal.quant.q4k_matvec_4sg_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -295,7 +295,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_8sg",
         "q4k-matvec",
-        &metal.q4k_matvec_8sg_pipeline,
+        &metal.quant.q4k_matvec_8sg_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -307,7 +307,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q4k_matvec_stride32",
         "q4k-matvec",
-        &metal.q4k_matvec_stride32_pipeline,
+        &metal.quant.q4k_matvec_stride32_pipeline,
         &q4k_w,
         shape.hidden,
         shape.hidden,
@@ -319,7 +319,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q6k_matvec_active",
         "q6k-matvec",
-        &metal.q6k_matvec_pipeline,
+        &metal.quant.q6k_matvec_pipeline,
         &q6k_w,
         shape.hidden,
         shape.inter,
@@ -331,7 +331,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q6k_matvec_4sg",
         "q6k-matvec",
-        &metal.q6k_matvec_4sg_pipeline,
+        &metal.quant.q6k_matvec_4sg_pipeline,
         &q6k_w,
         shape.hidden,
         shape.inter,
@@ -343,7 +343,7 @@ fn run_benches(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<BenchRes
         shape,
         "q6k_matvec_8sg",
         "q6k-matvec",
-        &metal.q6k_matvec_8sg_pipeline,
+        &metal.quant.q6k_matvec_8sg_pipeline,
         &q6k_w,
         shape.hidden,
         shape.inter,
@@ -414,7 +414,7 @@ fn bench_q8_matvec(metal: &MetalBackend, cfg: &Config, shape: Shape) -> BenchRes
     let xb = bufs.transient_from_i8(&x_q8);
     let xsb = bufs.transient_from_f32(&x_scales);
     let ob = bufs.output((n * 4) as u64);
-    let kh = &metal.q8_matvec_pipeline;
+    let kh = &metal.quant.q8_matvec_pipeline;
     let n_val = n as u32;
     let k_val = k as u32;
     let tgs = (n as u64).div_ceil(kh.rows_per_tg);
@@ -508,7 +508,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
     for (name, kh, gate, up, sanity, note) in [
         (
             "q4k_ffn_gate_up",
-            &metal.q4k_ffn_gate_up_pipeline,
+            &metal.ffn.q4k_ffn_gate_up_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
             "checked",
@@ -516,7 +516,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
         ),
         (
             "q4k_ffn_gate_up_8sg",
-            &metal.q4k_ffn_gate_up_8sg_pipeline,
+            &metal.ffn.q4k_ffn_gate_up_8sg_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
             "checked",
@@ -524,7 +524,7 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
         ),
         (
             "q4k_ffn_gate_up_f16acc",
-            &metal.q4k_ffn_gate_up_f16acc_pipeline,
+            &metal.ffn.q4k_ffn_gate_up_f16acc_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
             "checked",
@@ -532,23 +532,15 @@ fn bench_gate_up_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec
         ),
         (
             "q4k_ffn_gate_up_coop",
-            &metal.q4k_ffn_gate_up_coop_pipeline,
+            &metal.ffn.q4k_ffn_gate_up_coop_pipeline,
             gate_q4k.as_slice(),
             up_q4k.as_slice(),
             "checked",
             "cooperative scale-load candidate",
         ),
         (
-            "q4k_ffn_gate_up_nr2",
-            &metal.q4k_ffn_gate_up_nr2_pipeline,
-            gate_q4k.as_slice(),
-            up_q4k.as_slice(),
-            "checked",
-            "NR0=2 candidate",
-        ),
-        (
             "q4kf_ffn_gate_up",
-            &metal.q4kf_ffn_gate_up_pipeline,
+            &metal.ffn.q4kf_ffn_gate_up_pipeline,
             gate_q4kf.as_slice(),
             up_q4kf.as_slice(),
             "layout-sensitive",
@@ -630,7 +622,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             shape,
             "q4k_geglu_silu_down",
             "ffn-down",
-            &metal.q4k_geglu_silu_down_pipeline,
+            &metal.ffn.q4k_geglu_silu_down_pipeline,
             &q4k_down,
             &gate,
             &up,
@@ -643,7 +635,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             shape,
             "q4k_geglu_gelu_tanh_down",
             "ffn-down",
-            &metal.q4k_geglu_gelu_tanh_down_pipeline,
+            &metal.ffn.q4k_geglu_gelu_tanh_down_pipeline,
             &q4k_down,
             &gate,
             &up,
@@ -656,7 +648,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             shape,
             "q6k_geglu_silu_down",
             "ffn-down",
-            &metal.q6k_geglu_silu_down_pipeline,
+            &metal.ffn.q6k_geglu_silu_down_pipeline,
             &q6k_down,
             &gate,
             &up,
@@ -669,7 +661,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             shape,
             "q6k_geglu_gelu_tanh_down",
             "ffn-down",
-            &metal.q6k_geglu_gelu_tanh_down_pipeline,
+            &metal.ffn.q6k_geglu_gelu_tanh_down_pipeline,
             &q6k_down,
             &gate,
             &up,
@@ -682,7 +674,7 @@ fn bench_geglu_down_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> 
             shape,
             "q6k_geglu_gelu_tanh_down_cached",
             "ffn-down",
-            &metal.q6k_geglu_gelu_tanh_down_cached_pipeline,
+            &metal.ffn.q6k_geglu_gelu_tanh_down_cached_pipeline,
             &q6k_down,
             &gate,
             &up,
@@ -759,7 +751,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             cfg,
             shape,
             "q4k_qkv_proj",
-            &metal.q4k_qkv_proj_pipeline,
+            &metal.attention.q4k_qkv_proj_pipeline,
             &q4_q,
             &q4_k,
             &q4_v,
@@ -771,7 +763,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             cfg,
             shape,
             "q4kf_qkv_proj",
-            &metal.q4kf_qkv_proj_pipeline,
+            &metal.attention.q4kf_qkv_proj_pipeline,
             &q4kf_q,
             &q4kf_k,
             &q4kf_v,
@@ -783,7 +775,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             cfg,
             shape,
             "q4k_q6k_qkv_proj",
-            &metal.q4k_q6k_qkv_proj_pipeline,
+            &metal.attention.q4k_q6k_qkv_proj_pipeline,
             &q4_q,
             &q4_k,
             &q6_v,
@@ -796,7 +788,7 @@ fn bench_qkv_family(metal: &MetalBackend, cfg: &Config, shape: Shape) -> Vec<Ben
             cfg,
             shape,
             "q4k_q6k_qkv_proj_normed",
-            &metal.q4k_q6k_qkv_proj_normed_pipeline,
+            &metal.attention.q4k_q6k_qkv_proj_normed_pipeline,
             &q4_q,
             &q4_k,
             &q6_v,
@@ -900,7 +892,7 @@ fn bench_q4k_q6k_qkv(
     let k_rows = shape.kv_rows as u32;
     let v_rows = shape.kv_rows as u32;
     let hidden = shape.hidden as u32;
-    let eps = 1e-6f32;
+    let eps = crate::RMSNORM_EPSILON_DEFAULT;
     let offset = 0.0f32;
     let tgs = ((shape.q_rows + 2 * shape.kv_rows) as u64).div_ceil(kh.rows_per_tg);
 
@@ -1176,12 +1168,6 @@ fn inventory() -> &'static [InventoryItem] {
         },
         InventoryItem {
             name: "q4k_ffn_gate_up_coop",
-            family: "ffn-gate-up",
-            status: "bench",
-            note: "benchmarked here",
-        },
-        InventoryItem {
-            name: "q4k_ffn_gate_up_nr2",
             family: "ffn-gate-up",
             status: "bench",
             note: "benchmarked here",

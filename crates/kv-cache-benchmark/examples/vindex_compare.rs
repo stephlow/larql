@@ -7,8 +7,8 @@
 //!         --example vindex_compare -- \
 //!         --reference output/gemma3-4b-f16.vindex \
 //!         --candidate output/gemma3-4b-fp4.vindex \
-//!         --prompts   experiments/26_fp4_quantisation/prompts.txt \
-//!         --out       experiments/26_fp4_quantisation/results/q2_fp4.json
+//!         --prompts   ~/chris-source/chris-experiments/routing/26_fp4_quantisation/prompts.txt \
+//!         --out       ~/chris-source/chris-experiments/routing/26_fp4_quantisation/results/q2_fp4.json
 //!
 //! Any future storage-format comparison (FP6, NF4, Q4K regression
 //! tests) reuses the same binary — nothing here is FP4-specific.

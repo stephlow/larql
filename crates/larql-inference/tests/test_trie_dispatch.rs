@@ -20,9 +20,9 @@ use larql_inference::{
     encode_prompt,
     forward::{forward_to_layer, generate_cached_constrained},
     prompt::ChatTemplate,
-    trie::CascadeTrie,
     InferenceModel, WeightFfn,
 };
+use larql_vindex::CascadeTrie;
 use serde_json::{json, Value};
 
 // ── Infrastructure ────────────────────────────────────────────────────────────

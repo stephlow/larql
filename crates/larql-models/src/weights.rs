@@ -66,6 +66,10 @@ pub struct ModelWeights {
     /// Output projection matrix. Same as embed if tie_word_embeddings=true,
     /// separate lm_head.weight otherwise.
     pub lm_head: WeightArray,
+    /// Learned absolute positional embeddings, when the architecture uses
+    /// them (GPT-2 / `wpe`). `None` for rotary or no-positional models.
+    /// Indexed by token position; columns are hidden_size.
+    pub position_embed: Option<WeightArray>,
     pub arch: Box<dyn ModelArchitecture>,
     // Cached from arch.config() for convenience — these are hot-path values.
     pub num_layers: usize,
@@ -86,7 +90,8 @@ impl ModelWeights {
     pub fn get_packed_bytes(&self, key: &str) -> Option<&[u8]> {
         if let Some((file, offset, length)) = self.packed_byte_ranges.get(key) {
             if let Some(mmap) = self.packed_mmaps.get(file) {
-                return Some(&mmap[*offset..*offset + *length]);
+                let end = offset.checked_add(*length)?;
+                return mmap.get(*offset..end);
             }
         }
         self.raw_bytes.get(key).map(|v| v.as_slice())

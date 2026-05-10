@@ -106,8 +106,8 @@ fn cmp_desc_nan_last(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::model::ModelWeights;
+    use crate::test_utils::make_test_weights;
     use std::sync::OnceLock;
 
     fn shared_weights() -> &'static ModelWeights {

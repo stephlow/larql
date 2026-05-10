@@ -569,6 +569,7 @@ fn drop_ffn_weights_removes_ffn_tensors() {
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
+        position_embed: None,
         arch,
         num_layers: 2,
         hidden_size: 4,
@@ -650,6 +651,7 @@ fn drop_ffn_weights_removes_moe_experts() {
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
+        position_embed: None,
         arch,
         num_layers: 1,
         hidden_size: 4,
@@ -721,6 +723,7 @@ fn drop_ffn_weights_removes_starcoder2_ffn_tensors_and_biases() {
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
+        position_embed: None,
         arch,
         num_layers: 1,
         hidden_size: 4,
@@ -1465,6 +1468,7 @@ fn minimal_weights() -> larql_models::ModelWeights {
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
+        position_embed: None,
         arch,
         num_layers: 1,
         hidden_size: 4,
@@ -1544,6 +1548,27 @@ fn get_packed_bytes_from_mmap_range_takes_precedence() {
         .insert("tensor.key".into(), ("packed.bin".into(), 2, 3));
 
     assert_eq!(w.get_packed_bytes("tensor.key").unwrap(), &[12u8, 13, 14]);
+}
+
+#[test]
+fn get_packed_bytes_out_of_bounds_mmap_range_returns_none() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.bin");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&[10u8, 11, 12, 13]).unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let mut w = minimal_weights();
+    w.packed_mmaps.insert("packed.bin".into(), mmap);
+    w.packed_byte_ranges
+        .insert("tensor.key".into(), ("packed.bin".into(), 3, 4));
+
+    assert!(w.get_packed_bytes("tensor.key").is_none());
 }
 
 #[test]

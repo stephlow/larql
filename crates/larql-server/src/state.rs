@@ -70,6 +70,13 @@ pub struct LoadedModel {
     pub probe_labels: HashMap<(usize, usize), String>,
     /// L2 FFN output cache — shared across all clients, persists for server lifetime.
     pub ffn_l2_cache: FfnL2Cache,
+    /// Per-layer latency tracker — records compute time per walk-ffn layer.
+    /// Snapshots are sent to the router in HeartbeatMsg.layer_stats (GT3).
+    pub layer_latency_tracker: std::sync::Arc<crate::metrics::LayerLatencyTracker>,
+    /// Active walk-ffn request counter — incremented on request entry,
+    /// decremented on return. Used by GT6 drain to know when it is safe
+    /// to send DroppingMsg(reason="reassigned").
+    pub requests_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Expert ID range this server owns (from `--experts START-END`).
     /// `None` = serve all experts. Used by the expert endpoint to reject
     /// requests for experts this shard doesn't hold.
@@ -89,13 +96,13 @@ pub struct LoadedModel {
     /// `Some(Some(backend))` = initialised, available; `Some(None)` =
     /// initialised, Metal not available; `None` = not yet initialised.
     /// Only present under `--features metal-experts`.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_backend: std::sync::OnceLock<Option<larql_compute::MetalBackend>>,
     /// Cached MoE scratch per `(top_k, hidden, inter)` shape — one entry
     /// per architecture in practice.  `MoeScratch` contains mutable Metal
     /// staging buffers, so Metal expert dispatch holds this mutex while
     /// using a scratch entry.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub moe_scratches: std::sync::Mutex<
         std::collections::HashMap<(usize, usize, usize), Arc<larql_compute::MoeScratch>>,
     >,
@@ -104,7 +111,7 @@ pub struct LoadedModel {
     /// Metal FFN request from the interleaved Q4K mmap (zero-copy via
     /// `new_buffer_with_bytes_no_copy` for page-aligned mmap data).
     /// Only populated when the server has interleaved Q4K data loaded.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_ffn_layer_bufs: std::sync::OnceLock<Vec<[larql_compute::MetalBuffer; 3]>>,
 }
 
@@ -380,14 +387,16 @@ mod loaded_model_tests {
             weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
+            layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+            requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             moe_scratches: std::sync::Mutex::new(HashMap::new()),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         }
     }

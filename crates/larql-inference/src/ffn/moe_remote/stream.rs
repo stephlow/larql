@@ -1,5 +1,10 @@
 use super::error::RemoteMoeError;
 
+/// Receiver end of a shard stream's per-collect result channel.
+/// Inner item is `(h2, server_compute_ms)`.
+type ShardStreamResultRx =
+    std::sync::Mutex<std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), RemoteMoeError>>>;
+
 // ── InflightMoe — handle returned by forward_moe_stream_fire ─────────────────
 //
 // Carries the post-norm context across the fire/collect boundary so callers do
@@ -9,8 +14,9 @@ use super::error::RemoteMoeError;
 
 /// Opaque handle for a fire-and-collect MoE round trip on a stream.
 pub struct InflightMoe {
+    pub(super) layer: usize,
     pub(super) hidden: usize,
-    pub(super) n_streams: usize,
+    pub(super) active_stream_indices: Vec<usize>,
     pub(super) post_experts_norm: Vec<f32>,
     pub(super) norm_offset: f32,
     pub(super) eps: f32,
@@ -51,8 +57,7 @@ pub struct ShardStream {
     /// two threads ever called `collect()` on the same stream concurrently —
     /// which the API contract forbids — so the lock is uncontended in
     /// practice and adds only the futex check cost.
-    pub(super) result_rx:
-        std::sync::Mutex<std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), RemoteMoeError>>>,
+    pub(super) result_rx: ShardStreamResultRx,
     /// Keep the runtime alive so the tokio task keeps running.
     pub(super) _runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }

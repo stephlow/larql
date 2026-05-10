@@ -25,12 +25,13 @@ HTML report alongside the existing formats automatically.
 Three Make targets wrap the suite:
 
 ```
-make bench           # run all three (no gating)
+make bench-compute   # run the primary quant_matvec bench with Metal
 make bench-save      # record current results as the `main` baseline
 make bench-check     # re-run; fail if any cell regressed past Criterion's noise threshold
 ```
 
-The detector is `scripts/bench-regress.sh`. Tunables:
+`bench-save` and `bench-check` call `scripts/bench-regress.sh`, which gates
+all three compute benches by default. Tunables:
 
 | Env var | Default | Effect |
 |---|---|---|

@@ -33,3 +33,21 @@ pub mod traits;
 
 pub use handle::KernelHandle;
 pub use traits::{get_shader_pipeline, ShaderKernel, TiledKernel};
+
+/// Default maximum threads per threadgroup for **flat per-element
+/// dispatches** (`enc.dispatch_threads(MTLSize::new(N, 1, 1),
+/// MTLSize::new(DISPATCH_TG_MAX_THREADS.min(N), 1, 1))`).
+///
+/// 256 is the canonical Apple-Silicon-friendly TG width: 8 simdgroups
+/// × 32 lanes, which fits the per-row reduction kernels (rms_norm,
+/// residual_add, geglu, etc.) without oversubscribing the TG memory
+/// budget. Per-row reductions clamp to `min(DISPATCH_TG_MAX_THREADS,
+/// row_len)` so short rows don't dispatch idle threads.
+///
+/// **Tiled kernels** (q4_matvec_v4, q4k_matvec, q4k_ffn_gate_up, …)
+/// declare their own `THREADS_PER_TG` via [`TiledKernel`] and bind it
+/// through [`KernelHandle`] — that path is independent of this
+/// constant and must NOT use it (see the q4_matvec_v4 75% row-drop
+/// ship-log entry on what happens when the dispatcher and the kernel
+/// disagree on threadgroup width).
+pub const DISPATCH_TG_MAX_THREADS: u64 = 256;

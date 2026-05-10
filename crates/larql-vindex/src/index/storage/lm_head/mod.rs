@@ -217,7 +217,10 @@ mod tests {
         // Byte length check uses canonical Q4_K block geometry from
         // `larql-models::quant::ggml` so the test fails immediately if the
         // writer ever switches blocks under us.
-        let synth = index.projections.lm_head_q4_synth.as_ref().unwrap();
+        let synth = index
+            .storage
+            .lm_head_q4_view()
+            .expect("synth must populate lm_head_q4");
         let super_blocks = (vocab * hidden) / Q4_K_BLOCK_ELEMS;
         assert_eq!(
             synth.len(),
@@ -235,10 +238,9 @@ mod tests {
         let ptr_before = synth.as_ptr();
         index.synthesize_lm_head_q4();
         let ptr_after = index
-            .projections
-            .lm_head_q4_synth
-            .as_ref()
-            .unwrap()
+            .storage
+            .lm_head_q4_view()
+            .expect("synth must remain populated")
             .as_ptr();
         assert_eq!(ptr_before, ptr_after, "second call should not reallocate");
     }
@@ -353,7 +355,7 @@ mod tests {
         // Inject into a synthetic VectorIndex via the synth path.
         let mut index = VectorIndex::empty(1, hidden);
         index.vocab_size = vocab;
-        index.projections.lm_head_q4_synth = Some(Arc::new(q4k_bytes));
+        Arc::make_mut(&mut index.storage).set_lm_head_q4_synth(Arc::new(q4k_bytes));
 
         // Pick a query that points at a known peak — token 42's row peaks
         // at column 42, so the dot product is highest at row 42.
@@ -438,10 +440,9 @@ mod tests {
         index.synthesize_lm_head_q4();
 
         let synth = index
-            .projections
-            .lm_head_q4_synth
-            .as_ref()
-            .expect("synth must populate lm_head_q4_synth");
+            .storage
+            .lm_head_q4_view()
+            .expect("synth must populate lm_head_q4");
         // Q4_K size invariant: Q4_K_BLOCK_BYTES per Q4_K_BLOCK_ELEMS-element super-block.
         assert_eq!(
             synth.len(),

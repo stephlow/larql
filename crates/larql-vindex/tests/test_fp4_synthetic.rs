@@ -16,7 +16,7 @@ use std::path::Path;
 use larql_models::quant::fp4_block::BLOCK_ELEMENTS;
 use larql_vindex::format::fp4_storage::{write_fp4_projection, write_fp8_projection};
 use larql_vindex::{
-    ExtractLevel, Fp4Config, GateIndex, SilentLoadCallbacks, StorageDtype, VectorIndex,
+    ExtractLevel, FfnRowAccess, Fp4Config, SilentLoadCallbacks, StorageDtype, VectorIndex,
     VindexConfig, VindexLayerInfo,
 };
 
@@ -130,17 +130,11 @@ fn build_minimal_vindex() -> (
     let tok_json =
         r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
-    // down_meta.bin header: magic "DMET" + version + num_layers + top_k, no feature records.
-    let mut down_meta = Vec::<u8>::new();
-    down_meta.extend_from_slice(b"DMET");
-    down_meta.extend_from_slice(&1u32.to_le_bytes()); // version
-    down_meta.extend_from_slice(&(per_layer_features.len() as u32).to_le_bytes());
-    down_meta.extend_from_slice(&1u32.to_le_bytes()); // top_k
-                                                      // Per-layer num_features counts.
-    for &n in &per_layer_features {
-        down_meta.extend_from_slice(&(n as u32).to_le_bytes());
-    }
-    std::fs::write(dir.join("down_meta.bin"), down_meta).unwrap();
+    let down_meta: Vec<Option<Vec<Option<larql_vindex::FeatureMeta>>>> = per_layer_features
+        .iter()
+        .map(|&n| Some(vec![None; n]))
+        .collect();
+    larql_vindex::down_meta::write_binary(&dir, &down_meta, 1).unwrap();
 
     // A zeroed embeddings.bin so any opportunistic embed reader doesn't
     // trip on a missing file. Size = vocab × hidden × 4.
@@ -329,7 +323,7 @@ fn synthetic_num_features_never_zero_on_fp4_vindex() {
     let index = load_minimal(&dir);
 
     for (layer, &expected) in per_layer_features.iter().enumerate() {
-        let got = larql_vindex::GateIndex::num_features(&index, layer);
+        let got = larql_vindex::GateLookup::num_features(&index, layer);
         assert_eq!(
             got, expected,
             "layer {layer}: num_features returned {got}, expected {expected} — \

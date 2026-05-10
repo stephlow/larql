@@ -17,6 +17,55 @@ use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
 
 use super::quant_matvec;
+use crate::QuantFormat;
+
+/// Which fused-QKV strategy a given `(q, k, v)` format triple maps to.
+///
+/// Pure data — independent of any pipeline. Use [`pick_qkv_route`] to
+/// translate a layer's three projection formats into the dispatch
+/// strategy. New format combinations land as one match arm in
+/// `pick_qkv_route` plus one branch in the dispatcher, instead of
+/// editing 2–3 hard-coded boolean expressions across the encoders.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QkvFormatRoute {
+    /// All three projections are uniform Q4_K → `q4k_qkv_proj` shader
+    /// ([`FusedQkvKernel::Q4k`]).
+    UniformQ4K,
+    /// All three projections are uniform Q4_KF → `q4kf_qkv_proj`
+    /// shader ([`FusedQkvKernel::Q4kf`]).
+    UniformQ4Kf,
+    /// Q4_K Q + Q4_K K + Q6_K V (Gemma 3 / Gemma 4 with Ollama-convention
+    /// extracts) → `q4k_q6k_qkv_proj` shader.
+    MixedQ4kQ6kV,
+    /// Anything else: per-projection dispatch through `quant_matvec`.
+    /// Slower but covers Q4_KF + Q6_K V, mixed legacy Q4_0, etc.
+    PerProjection,
+}
+
+impl QkvFormatRoute {
+    /// `true` for any single-dispatch fused path. Useful when the
+    /// caller wants to short-circuit per-projection scratch setup that
+    /// the fused path doesn't need.
+    pub fn is_fused(self) -> bool {
+        !matches!(self, Self::PerProjection)
+    }
+}
+
+/// Pick the fused-QKV route for a `(q, k, v)` format triple.
+///
+/// This is the single source of truth for which Metal QKV pipeline
+/// handles which weight-format combination. Adding a new combo (e.g.
+/// Q4_KF Q/K + Q6_K V, or a future FP4 family) is a one-line addition
+/// here — encode_qkv.rs and decode_hybrid.rs read the route through
+/// this helper and route dispatch via `match` on the result.
+pub fn pick_qkv_route(q: QuantFormat, k: QuantFormat, v: QuantFormat) -> QkvFormatRoute {
+    match (q, k, v) {
+        (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K) => QkvFormatRoute::UniformQ4K,
+        (QuantFormat::Q4_KF, QuantFormat::Q4_KF, QuantFormat::Q4_KF) => QkvFormatRoute::UniformQ4Kf,
+        (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q6_K) => QkvFormatRoute::MixedQ4kQ6kV,
+        _ => QkvFormatRoute::PerProjection,
+    }
+}
 
 /// Per-projection format + weight tuple used by the mixed-format path.
 pub struct Proj<'a> {
@@ -190,4 +239,68 @@ pub fn encode_fused_q8(
     enc.set_bytes(13, 4, &v_rows_val as *const u32 as *const c_void);
     enc.set_bytes(14, 4, &k_val as *const u32 as *const c_void);
     enc.dispatch_thread_groups(MTLSize::new(total_rows, 1, 1), MTLSize::new(256, 1, 1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QuantFormat;
+
+    /// The four production triples must each map to a distinct fused
+    /// route. Anything else falls through to per-projection.
+    #[test]
+    fn pick_qkv_route_recognises_supported_triples() {
+        // Uniform Q4_K (Llama 2 / Mistral / Qwen with all-Q4_K extracts).
+        assert_eq!(
+            pick_qkv_route(QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K),
+            QkvFormatRoute::UniformQ4K,
+        );
+        // Uniform Q4_KF (llama.cpp-exact pre-baked-scales fast path).
+        assert_eq!(
+            pick_qkv_route(QuantFormat::Q4_KF, QuantFormat::Q4_KF, QuantFormat::Q4_KF),
+            QkvFormatRoute::UniformQ4Kf,
+        );
+        // Gemma 3 / Gemma 4 Ollama convention: Q4_K Q+K, Q6_K V.
+        assert_eq!(
+            pick_qkv_route(QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q6_K),
+            QkvFormatRoute::MixedQ4kQ6kV,
+        );
+    }
+
+    /// Anything outside the table falls back to per-projection. Pin a
+    /// few representative misses so a future "we now support X" change
+    /// is forced to update this test (and therefore the table).
+    #[test]
+    fn pick_qkv_route_falls_back_to_per_projection() {
+        // Q4_KF Q/K + Q6_K V — plausible future combo, not yet wired.
+        assert_eq!(
+            pick_qkv_route(QuantFormat::Q4_KF, QuantFormat::Q4_KF, QuantFormat::Q6_K),
+            QkvFormatRoute::PerProjection,
+        );
+        // Mixed legacy Q4_0.
+        assert_eq!(
+            pick_qkv_route(QuantFormat::Q4_0, QuantFormat::Q4_0, QuantFormat::Q4_0),
+            QkvFormatRoute::PerProjection,
+        );
+        // Pure Q6_K (no fused kernel exists).
+        assert_eq!(
+            pick_qkv_route(QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K),
+            QkvFormatRoute::PerProjection,
+        );
+        // f32 input — fused QKV is f32-input-only on the kernel side
+        // but the dispatcher still routes through the format-aware
+        // helper for raw float weights.
+        assert_eq!(
+            pick_qkv_route(QuantFormat::F32, QuantFormat::F32, QuantFormat::F32),
+            QkvFormatRoute::PerProjection,
+        );
+    }
+
+    #[test]
+    fn is_fused_marks_per_projection_as_not_fused() {
+        assert!(QkvFormatRoute::UniformQ4K.is_fused());
+        assert!(QkvFormatRoute::UniformQ4Kf.is_fused());
+        assert!(QkvFormatRoute::MixedQ4kQ6kV.is_fused());
+        assert!(!QkvFormatRoute::PerProjection.is_fused());
+    }
 }

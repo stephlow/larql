@@ -6,6 +6,23 @@
 //! Both kernels support partial rotation via `rotary_dim`:
 //! only the first `rotary_dim` dimensions are rotated, the rest pass through.
 //! Gemma 4 global layers use 25% rotation (rotary_dim = head_dim * 0.25).
+//!
+//! ## RoPE variant coverage gap (model-agnosticity audit, 2026-05-09)
+//!
+//! llama.cpp ships four RoPE variants (per `libggml-metal.dylib` symbols):
+//!
+//! - `kernel_rope_norm_*` — split-half (this kernel's pattern). ✓ covered.
+//! - `kernel_rope_neox_*` — interleaved RoPE (NeoX style: rotates (x[2i], x[2i+1]) pairs
+//!   instead of (x[i], x[i+half_dim])). **TODO**: needed for GPT-NeoX, Pythia, some
+//!   Falcon variants. Not present.
+//! - `kernel_rope_multi_*` — multi-frequency-band RoPE (used by some long-context
+//!   models with frequency interpolation). **TODO**: not present.
+//! - `kernel_rope_vision_*` — 2D RoPE for vision models. Not load-bearing for
+//!   text-only LMs.
+//!
+//! Add NeoX variant when a non-split-half RoPE model is brought into scope
+//! (current architectures in `larql-models/architectures/` all use split-half).
+//! See `docs/llama-cpp-comparison.md` §3 and `docs/shader-inventory.md`.
 
 pub const SHADER: &str = r#"
 // Apply RoPE to a single vector [dim] in-place at a given absolute position.

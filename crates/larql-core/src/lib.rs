@@ -21,8 +21,11 @@ pub use io::{from_bytes, load, load_with_format, save, save_with_format, to_byte
 
 pub use algo::components::{are_connected, connected_components};
 pub use algo::diff::{diff, ChangedEdge, GraphDiff};
-pub use algo::filter::{filter_graph, FilterConfig};
-pub use algo::merge::{merge_graphs, merge_graphs_with_strategy};
+pub use algo::filter::{filter_graph, FilterConfig, MetadataCompare, MetadataPredicate};
+pub use algo::merge::{
+    default_source_priority, merge_graphs, merge_graphs_with_source_priority,
+    merge_graphs_with_strategy,
+};
 pub use algo::pagerank::{pagerank, PageRankResult};
 pub use algo::shortest_path::{astar, shortest_path, shortest_path_with_weight, PathResult};
 pub use algo::traversal::{bfs as bfs_traversal, dfs, TraversalResult};

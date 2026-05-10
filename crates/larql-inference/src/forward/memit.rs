@@ -19,7 +19,7 @@
 //!
 //! Validated in Python: 200/200 (100%) at N=200 with multi-layer
 //! distribution across L8-L12 on v11 TinyStories 115M. See
-//! `experiments/15_v11_model/RESULTS.md §20`.
+//! `~/chris-source/chris-experiments/compilation/15_v11_model/RESULTS.md §20`.
 
 use super::trace::{capture_ffn_activation_matrix, estimate_ffn_covariance};
 use crate::model::ModelWeights;
@@ -468,7 +468,7 @@ fn memit_solve_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     #[test]
     fn test_memit_fact_creation() {
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn run_memit_empty_facts_returns_empty() {
-        use crate::engines::test_utils::make_test_tokenizer;
+        use crate::test_utils::make_test_tokenizer;
         let weights = make_test_weights();
         // by_layer is empty → run_memit_inner returns before touching the tokenizer.
         // Pass a real tokenizer so the test doesn't rely on pointer provenance.
@@ -523,7 +523,8 @@ mod tests {
     #[test]
     #[ignore = "requires LARQL_VINDEX_PATH pointing to a non-Q4K vindex with model weights"]
     fn run_memit_single_fact_produces_delta() {
-        let vpath = std::env::var("LARQL_VINDEX_PATH").expect("LARQL_VINDEX_PATH not set");
+        let vpath =
+            std::env::var(crate::vindex::ENV_VINDEX_PATH).expect("LARQL_VINDEX_PATH not set");
         let path = std::path::Path::new(&vpath);
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let weights = larql_vindex::load_model_weights(path, &mut cb).expect("weights load failed");

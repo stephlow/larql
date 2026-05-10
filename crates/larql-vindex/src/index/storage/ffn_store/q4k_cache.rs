@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use super::FFN_DOWN;
 use crate::index::core::VectorIndex;
 
 impl VectorIndex {
@@ -139,14 +140,14 @@ impl VectorIndex {
             * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         let info = crate::quant::registry::lookup(format)?;
         let decoded = (info.dequantize)(bytes, padded).ok()?;
-        // Gate (0) and up (1) are stored row-major [intermediate, hidden] — row
+        // Gate and up are stored row-major [intermediate, hidden] — row
         // `feat` already contains that feature's weight vector.
         //
-        // Down (2) is stored row-major [hidden, intermediate] (the native PyTorch
+        // Down is stored row-major [hidden, intermediate] (the native PyTorch
         // nn.Linear(intermediate, hidden) orientation). To give callers a
         // feature-major view matching gate/up, we transpose here: after the flip
         // arc[feat*hidden..(feat+1)*hidden] is feature `feat`'s down vector.
-        let final_data: Vec<f32> = if component == 2 {
+        let final_data: Vec<f32> = if component == FFN_DOWN {
             let mut t = vec![0.0f32; n];
             for h in 0..hidden {
                 let src_row = &decoded[h * intermediate..(h + 1) * intermediate];
@@ -238,7 +239,7 @@ impl VectorIndex {
             let info = crate::quant::registry::lookup(format)?;
             let decoded = (info.dequantize)(bytes, padded).ok()?;
 
-            let final_data: Vec<f32> = if component == 2 {
+            let final_data: Vec<f32> = if component == FFN_DOWN {
                 // Transpose on-disk [hidden, intermediate] → feature-major
                 // [intermediate, hidden] so callers can use activation.dot(&view)
                 // directly (matches layout produced by q4k_ffn_layer).
@@ -257,5 +258,219 @@ impl VectorIndex {
         });
 
         result.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Cache-path-only coverage. The dequant happy path lives in
+    //! `tests/test_vindex_to_q4k.rs` end-to-end fixtures; here we
+    //! pin the cache-hit, LRU, stats, and early-return branches that
+    //! don't require real Q4_K-encoded bytes.
+    use std::sync::atomic::Ordering;
+
+    use ndarray::Array2;
+
+    use super::*;
+
+    fn fresh(num_layers: usize, hidden: usize) -> VectorIndex {
+        let mut v = VectorIndex::empty(num_layers, hidden);
+        for layer in 0..num_layers {
+            // num_features fallback wants a populated gate matrix; the
+            // exact shape doesn't matter for the cache tests.
+            v.gate.gate_vectors[layer] = Some(Array2::<f32>::zeros((4, hidden)));
+        }
+        v
+    }
+
+    fn install_cache_entry(v: &VectorIndex, layer: usize, component: usize, data: Vec<f32>) {
+        let mut cache = v.ffn.q4k_ffn_cache.lock().unwrap();
+        cache[layer][component] = Some(Arc::new(data));
+    }
+
+    // ── q4k_ffn_cache_stats ────────────────────────────────────────
+
+    #[test]
+    fn cache_stats_zero_when_empty() {
+        let v = fresh(3, 8);
+        let (slots, bytes) = v.q4k_ffn_cache_stats();
+        assert_eq!(slots, 0);
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn cache_stats_counts_populated_slots_and_bytes() {
+        let v = fresh(3, 8);
+        install_cache_entry(&v, 0, 0, vec![0.0_f32; 4]); // 16 bytes
+        install_cache_entry(&v, 0, 1, vec![0.0_f32; 8]); // 32 bytes
+        install_cache_entry(&v, 2, 2, vec![0.0_f32; 16]); // 64 bytes
+        let (slots, bytes) = v.q4k_ffn_cache_stats();
+        assert_eq!(slots, 3);
+        assert_eq!(bytes, 16 + 32 + 64);
+    }
+
+    // ── set_q4k_ffn_cache_max_layers ───────────────────────────────
+
+    #[test]
+    fn set_max_layers_zero_unbounded_does_not_evict() {
+        let v = fresh(4, 8);
+        for layer in 0..4 {
+            install_cache_entry(&v, layer, 0, vec![0.0_f32; 4]);
+            v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(layer);
+        }
+        v.set_q4k_ffn_cache_max_layers(0);
+        let (slots, _) = v.q4k_ffn_cache_stats();
+        assert_eq!(slots, 4, "max=0 means unbounded");
+    }
+
+    #[test]
+    fn set_max_layers_evicts_lru_tail() {
+        let v = fresh(5, 8);
+        for layer in 0..5 {
+            install_cache_entry(&v, layer, 0, vec![0.0_f32; 4]);
+            v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(layer);
+        }
+        // After this lru = [4, 3, 2, 1, 0] (front=most-recent).
+        v.set_q4k_ffn_cache_max_layers(2);
+        let (slots, _) = v.q4k_ffn_cache_stats();
+        assert_eq!(slots, 2, "shrinks to cap");
+        assert_eq!(v.ffn.q4k_ffn_cache_max_layers.load(Ordering::Relaxed), 2);
+        // The two MRU entries (layers 3 and 4) survive; LRU tail (0,1,2) evicted.
+        let cache = v.ffn.q4k_ffn_cache.lock().unwrap();
+        assert!(cache[3][0].is_some() || cache[4][0].is_some());
+        assert!(cache[0][0].is_none());
+        assert!(cache[1][0].is_none());
+        assert!(cache[2][0].is_none());
+    }
+
+    #[test]
+    fn set_max_layers_handles_evict_index_oob() {
+        // Edge case: lru pop_back yields a layer >= cache.len() (e.g. if
+        // the cache was resized). The eviction must skip that slot
+        // without panicking.
+        let v = fresh(3, 8);
+        v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(99);
+        v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(0);
+        v.set_q4k_ffn_cache_max_layers(1);
+        // Survives without panic; the OoB index is ignored.
+    }
+
+    // ── q4k_ffn_layer cache-hit path ───────────────────────────────
+
+    #[test]
+    fn q4k_ffn_layer_returns_none_for_invalid_component() {
+        let v = fresh(2, 8);
+        assert!(v.q4k_ffn_layer(0, 99).is_none());
+        // Even with a cache entry "installed" in slot 0, component 99 is rejected early.
+        install_cache_entry(&v, 0, 0, vec![1.0_f32; 8]);
+        assert!(v.q4k_ffn_layer(0, 99).is_none());
+    }
+
+    #[test]
+    fn q4k_ffn_layer_returns_cached_arc_on_hit() {
+        let v = fresh(2, 8);
+        install_cache_entry(&v, 0, 1, vec![1.0_f32; 8]);
+        let arc = v.q4k_ffn_layer(0, 1).expect("cache hit returns Some");
+        assert_eq!(arc.as_slice(), &[1.0_f32; 8]);
+    }
+
+    #[test]
+    fn q4k_ffn_layer_cache_hit_bumps_lru() {
+        let v = fresh(3, 8);
+        v.set_q4k_ffn_cache_max_layers(3);
+        install_cache_entry(&v, 0, 0, vec![1.0_f32; 4]);
+        install_cache_entry(&v, 1, 0, vec![2.0_f32; 4]);
+        install_cache_entry(&v, 2, 0, vec![3.0_f32; 4]);
+        // Seed LRU with 0, 1, 2 (front=most-recent).
+        {
+            let mut lru = v.ffn.q4k_ffn_cache_lru.lock().unwrap();
+            lru.push_back(0);
+            lru.push_back(1);
+            lru.push_back(2);
+        }
+        // Hit on layer 0 — moves it to the front.
+        let _ = v.q4k_ffn_layer(0, 0).unwrap();
+        let lru = v.ffn.q4k_ffn_cache_lru.lock().unwrap();
+        assert_eq!(lru.front().copied(), Some(0), "hit promotes to MRU");
+    }
+
+    #[test]
+    fn q4k_ffn_layer_returns_none_with_no_q4k_data() {
+        // No interleaved_q4k mmap, no cached entry → None.
+        let v = fresh(1, 8);
+        assert!(v.q4k_ffn_layer(0, 0).is_none());
+    }
+
+    #[test]
+    fn q4k_ffn_layer_oob_layer_returns_none() {
+        let v = fresh(1, 8);
+        assert!(v.q4k_ffn_layer(99, 0).is_none());
+    }
+
+    // ── q4k_ffn_row_scaled_add_via_cache ───────────────────────────
+
+    #[test]
+    fn row_scaled_add_via_cache_writes_alpha_times_row() {
+        let v = fresh(1, 4);
+        // Cached layer is a flat feature-major buffer: 2 features × 4 hidden.
+        install_cache_entry(
+            &v,
+            0,
+            0,
+            vec![1.0, 2.0, 3.0, 4.0, /* feature 1 */ 5.0, 6.0, 7.0, 8.0],
+        );
+        let mut out = [10.0_f32, 10.0, 10.0, 10.0];
+        // Pull feature index 1, alpha = 0.5 → out += 0.5 * [5, 6, 7, 8].
+        let ok = v.q4k_ffn_row_scaled_add_via_cache(0, 0, 1, 0.5, &mut out);
+        assert!(ok);
+        assert_eq!(out, [12.5, 13.0, 13.5, 14.0]);
+    }
+
+    #[test]
+    fn row_scaled_add_via_cache_returns_false_with_no_cache() {
+        let v = fresh(1, 4);
+        let mut out = [0.0_f32; 4];
+        // No q4k data, no cache → q4k_ffn_layer returns None → false.
+        assert!(!v.q4k_ffn_row_scaled_add_via_cache(0, 0, 0, 1.0, &mut out));
+    }
+
+    #[test]
+    fn row_scaled_add_via_cache_rejects_oob_feature() {
+        let v = fresh(1, 4);
+        install_cache_entry(&v, 0, 0, vec![0.0_f32; 8]); // 2 features × 4
+        let mut out = [0.0_f32; 4];
+        // feat=99 → row_end > arc.len() → false.
+        assert!(!v.q4k_ffn_row_scaled_add_via_cache(0, 0, 99, 1.0, &mut out));
+    }
+
+    #[test]
+    fn row_scaled_add_via_cache_rejects_wrong_out_len() {
+        let v = fresh(1, 4);
+        install_cache_entry(&v, 0, 0, vec![0.0_f32; 8]);
+        let mut out = [0.0_f32; 7]; // wrong length
+        assert!(!v.q4k_ffn_row_scaled_add_via_cache(0, 0, 0, 1.0, &mut out));
+    }
+
+    // ── q4k_ffn_layer_once early returns ───────────────────────────
+
+    #[test]
+    fn q4k_ffn_layer_once_invalid_component_returns_none() {
+        let v = fresh(1, 8);
+        assert!(v.q4k_ffn_layer_once(0, 99).is_none());
+    }
+
+    #[test]
+    fn q4k_ffn_layer_once_oob_layer_returns_none() {
+        let v = fresh(1, 8);
+        assert!(v.q4k_ffn_layer_once(99, 0).is_none());
+    }
+
+    #[test]
+    fn q4k_ffn_layer_once_returns_none_with_no_q4k_data() {
+        let v = fresh(2, 8);
+        // get_or_init runs and the closure returns None → cached
+        // permanently as None. Subsequent call also yields None.
+        assert!(v.q4k_ffn_layer_once(0, 0).is_none());
+        assert!(v.q4k_ffn_layer_once(0, 0).is_none());
     }
 }

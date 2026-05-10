@@ -44,9 +44,9 @@ fn bench_matmul_transb(c: &mut Criterion) {
 
     let cpu = CpuBackend;
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     let metal = larql_compute::metal::MetalBackend::new();
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     if let Some(ref m) = metal {
         m.set_flop_threshold(1);
     }
@@ -69,7 +69,7 @@ fn bench_matmul_transb(c: &mut Criterion) {
             },
         );
 
-        #[cfg(feature = "metal")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         if let Some(ref m_be) = metal {
             group.bench_with_input(
                 BenchmarkId::from_parameter(format!("metal/{label}")),
@@ -88,7 +88,7 @@ fn bench_matmul_transb(c: &mut Criterion) {
 /// `matmul_transb`). Bench covers the N=262144 vocab projection where
 /// `M=1` makes the tiled sgemm waste 31/32 threads, and the
 /// row-per-simdgroup `f32_gemv` shader's the specialised replacement.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn bench_f32_gemv_lmhead(c: &mut Criterion) {
     let Some(metal) = larql_compute::metal::MetalBackend::new() else {
         return;
@@ -112,7 +112,7 @@ fn bench_f32_gemv_lmhead(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn bench_f32_gemv_lmhead(_c: &mut Criterion) { /* metal-only */
 }
 

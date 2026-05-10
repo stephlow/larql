@@ -56,6 +56,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
 use crate::error::ServerError;
+use crate::routes::openai::OpenAIError;
 use crate::state::{AppState, LoadedModel};
 
 use super::schema::{ObjectSchema, Schema};
@@ -145,7 +146,7 @@ pub struct ChatCompletionsRequest {
     pub presence_penalty: Option<f32>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ChatChoiceMessage {
     pub role: &'static str,
     /// Always present, but `null` when the assistant emitted tool_calls
@@ -161,7 +162,7 @@ pub struct ChatChoiceMessage {
 
 /// OpenAI's tool-call shape on the response side: `id`, `type`,
 /// `function: {name, arguments}`. `arguments` is JSON-stringified.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -169,7 +170,7 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ToolCallFunction {
     pub name: String,
     /// JSON-encoded string, not a nested object — preserves the wire
@@ -235,19 +236,19 @@ pub struct ChatCompletionsResponse {
          body = crate::openapi::schemas::OpenAiChatResponse),
         (status = 200, description = "SSE stream when `stream: true`. Each event is `data: <ChatCompletionChunk JSON>\\n\\n`, terminated by `data: [DONE]`.",
          content_type = "text/event-stream", body = String),
-        (status = 400, body = crate::error::ErrorBody),
-        (status = 500, body = crate::error::ErrorBody),
+        (status = 400, body = crate::routes::openai::error::OpenAIErrorBody),
+        (status = 500, body = crate::routes::openai::error::OpenAIErrorBody),
     ),
 )]
 pub async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionsRequest>,
-) -> Result<Response, ServerError> {
+) -> Result<Response, OpenAIError> {
     state.bump_requests();
 
     if req.n.unwrap_or(1) > 1 {
-        return Err(ServerError::BadRequest(
-            "n>1 not yet supported; only n=1 (single completion per prompt)".into(),
+        return Err(OpenAIError::invalid_request(
+            "n>1 not yet supported; only n=1 (single completion per prompt)",
         ));
     }
     // Tools take precedence over response_format. If tools are
@@ -264,19 +265,19 @@ pub async fn handle_chat_completions(
 
     let model = state.model_or_err(req.model.as_deref())?;
     if model.infer_disabled {
-        return Err(ServerError::InferenceUnavailable(
-            "inference disabled (--no-infer / --embed-only / --ffn-only)".into(),
+        return Err(OpenAIError::service_unavailable(
+            "inference disabled (--no-infer / --embed-only / --ffn-only)",
         ));
     }
     if req.messages.is_empty() {
-        return Err(ServerError::BadRequest("messages is empty".into()));
+        return Err(OpenAIError::invalid_request("messages is empty"));
     }
     for (i, m) in req.messages.iter().enumerate() {
         if !matches!(
             m.role.as_str(),
             USER_ROLE | ASSISTANT_ROLE | SYSTEM_ROLE | TOOL_ROLE
         ) {
-            return Err(ServerError::BadRequest(format!(
+            return Err(OpenAIError::invalid_request(format!(
                 "messages[{i}].role must be 'user' | 'assistant' | 'system' | 'tool' (got {:?})",
                 m.role
             )));
@@ -288,12 +289,12 @@ pub async fn handle_chat_completions(
         match m.role.as_str() {
             TOOL_ROLE => {
                 if m.tool_call_id.is_none() {
-                    return Err(ServerError::BadRequest(format!(
+                    return Err(OpenAIError::invalid_request(format!(
                         "messages[{i}] role=tool requires tool_call_id"
                     )));
                 }
                 if m.content.is_none() {
-                    return Err(ServerError::BadRequest(format!(
+                    return Err(OpenAIError::invalid_request(format!(
                         "messages[{i}] role=tool requires content"
                     )));
                 }
@@ -304,14 +305,14 @@ pub async fn handle_chat_completions(
                     .as_ref()
                     .is_some_and(|v| !v.is_null() && !is_empty_json_array(v));
                 if !has_tool_calls && m.content.is_none() {
-                    return Err(ServerError::BadRequest(format!(
+                    return Err(OpenAIError::invalid_request(format!(
                         "messages[{i}] role=assistant requires content (or tool_calls)"
                     )));
                 }
             }
             USER_ROLE | SYSTEM_ROLE => {
                 if m.content.is_none() {
-                    return Err(ServerError::BadRequest(format!(
+                    return Err(OpenAIError::invalid_request(format!(
                         "messages[{i}] role={} requires content",
                         m.role
                     )));
@@ -376,7 +377,9 @@ pub async fn handle_chat_completions(
         match build_tool_call_message(&output.text) {
             Ok(m) => (m, "tool_calls"),
             Err(e) => {
-                return Err(ServerError::Internal(format!(
+                // 400 not 500: the failure is recoverable (client can
+                // retry, simplify tool schema, or fall back).
+                return Err(OpenAIError::invalid_request(format!(
                     "tool_call output failed to parse: {e}; raw: {:?}",
                     output.text
                 )));
@@ -961,18 +964,32 @@ fn resolve_tools(req: &ChatCompletionsRequest) -> Result<Option<Schema>, ServerE
 }
 
 /// Parse a constrained-decoder output back into a `ChatChoiceMessage`
-/// with `tool_calls` populated. Constrained decoding guarantees a
-/// well-formed JSON object, but we still tolerate incidental leading
-/// or trailing whitespace.
+/// with `tool_calls` populated.
+///
+/// Constrained decoding guarantees a well-formed JSON object as the
+/// model's full emission, so the only legit input variability is
+/// surrounding whitespace. Earlier versions of this function tried to
+/// be clever with `find('{')` + `rfind('}')` substring slicing — but
+/// that mis-handles model-output drift (trailing junk, multiple JSON
+/// objects, markdown-wrapped output) by silently picking the wrong
+/// slice and surfacing the failure as a 500 internal error. The
+/// straight-line `serde_json::from_str` here gives a clean diagnostic
+/// (`invalid JSON: …`) at the call site, which then surfaces as a
+/// 400 invalid_request_error so the client can see the failure mode
+/// and either retry, reduce tool complexity, or fall back.
 fn build_tool_call_message(text: &str) -> Result<ChatChoiceMessage, String> {
     let trimmed = text.trim();
-    let (start, end) = trimmed
-        .find('{')
-        .and_then(|s| trimmed.rfind('}').map(|e| (s, e + 1)))
-        .ok_or_else(|| "no `{...}` JSON object in tool output".to_string())?;
-    let json_slice = &trimmed[start..end];
+    if trimmed.is_empty() {
+        return Err("tool output was empty".to_string());
+    }
     let parsed: serde_json::Value =
-        serde_json::from_str(json_slice).map_err(|e| format!("invalid JSON: {e}"))?;
+        serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {e}"))?;
+    if !parsed.is_object() {
+        return Err(format!(
+            "tool output must be a JSON object, got {} value",
+            json_value_kind(&parsed)
+        ));
+    }
     let name = parsed
         .get("name")
         .and_then(|n| n.as_str())
@@ -994,6 +1011,17 @@ fn build_tool_call_message(text: &str) -> Result<ChatChoiceMessage, String> {
             function: ToolCallFunction { name, arguments },
         }]),
     })
+}
+
+fn json_value_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Map an OpenAI `response_format` field to the `Schema` the FSM
@@ -1210,5 +1238,101 @@ mod tests {
         assert_eq!(req.messages[2].role, "tool");
         assert_eq!(req.messages[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(req.messages[2].content.as_deref(), Some("23C"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // REV5 — build_tool_call_message: replace fragile find/rfind slicer
+    // with serde_json::from_str on the trimmed text. Failure surfaces
+    // as ServerError::BadRequest (400 + invalid_request_error) at the
+    // entry handler, not Internal (500).
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_tool_call_happy_path() {
+        let text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
+        let msg = build_tool_call_message(text).unwrap();
+        let calls = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+        assert!(msg.content.is_none());
+    }
+
+    #[test]
+    fn build_tool_call_tolerates_surrounding_whitespace() {
+        let text = "  \n\t {\"name\":\"f\",\"arguments\":{}} \n";
+        let msg = build_tool_call_message(text).unwrap();
+        assert_eq!(msg.tool_calls.unwrap()[0].function.name, "f");
+    }
+
+    #[test]
+    fn build_tool_call_handles_nested_braces_in_arguments() {
+        // Pre-REV5 the rfind('}') would have walked back past the
+        // outer closing brace correctly here (it's still the LAST
+        // '}'), so this case actually worked before. We keep the test
+        // to lock that the cleaner serde_json approach also handles
+        // nested braces — the property the original code was trying
+        // to preserve.
+        let text = r#"{"name":"f","arguments":{"x":"{}","y":[{"z":1}]}}"#;
+        let msg = build_tool_call_message(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&msg.tool_calls.unwrap()[0].function.arguments).unwrap();
+        assert_eq!(args["x"], "{}");
+        assert_eq!(args["y"][0]["z"], 1);
+    }
+
+    #[test]
+    fn build_tool_call_rejects_trailing_junk_with_clean_error() {
+        // Pre-REV5 this would have produced an invalid slice (the
+        // rfind('}') matched the trailing brace inside "extra}") and
+        // serfailed → 500 Internal. Post-REV5 the parse fails at the
+        // first non-JSON character, surfacing a clean
+        // `invalid JSON: trailing characters …` diagnostic which the
+        // entry handler maps to 400.
+        let text = r#"{"name":"f","arguments":{}} extra}"#;
+        let err = build_tool_call_message(text).unwrap_err();
+        assert!(
+            err.starts_with("invalid JSON:"),
+            "want diagnostic prefix; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_tool_call_rejects_empty_input() {
+        assert_eq!(
+            build_tool_call_message("   ").unwrap_err(),
+            "tool output was empty"
+        );
+    }
+
+    #[test]
+    fn build_tool_call_rejects_non_object_top_level() {
+        let err = build_tool_call_message(r#"["not","an","object"]"#).unwrap_err();
+        assert!(
+            err.starts_with("tool output must be a JSON object"),
+            "got {err:?}"
+        );
+        assert!(
+            err.contains("array"),
+            "kind should be reported; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_tool_call_rejects_missing_name() {
+        let err = build_tool_call_message(r#"{"arguments":{}}"#).unwrap_err();
+        assert_eq!(err, "tool output missing `name`");
+    }
+
+    #[test]
+    fn build_tool_call_rejects_missing_arguments() {
+        let err = build_tool_call_message(r#"{"name":"f"}"#).unwrap_err();
+        assert_eq!(err, "tool output missing `arguments`");
+    }
+
+    #[test]
+    fn build_tool_call_rejects_invalid_json() {
+        let err = build_tool_call_message("not json at all").unwrap_err();
+        assert!(err.starts_with("invalid JSON:"));
     }
 }

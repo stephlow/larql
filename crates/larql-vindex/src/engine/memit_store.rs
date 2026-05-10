@@ -85,6 +85,18 @@ impl MemitStore {
         &self.cycles
     }
 
+    /// Rehydrate a store from a previously-extracted cycle list, e.g.
+    /// after loading a JSON snapshot from disk. `next_cycle_id` is set
+    /// to one past the highest existing id so subsequent `add_cycle`
+    /// calls don't collide with rehydrated ids.
+    pub fn from_cycles(cycles: Vec<MemitCycle>) -> Self {
+        let next_cycle_id = cycles.iter().map(|c| c.cycle_id).max().map_or(0, |m| m + 1);
+        Self {
+            cycles,
+            next_cycle_id,
+        }
+    }
+
     /// Lookup all facts for an entity across all cycles.
     pub fn facts_for_entity(&self, entity: &str) -> Vec<&MemitFact> {
         let mut out = Vec::new();

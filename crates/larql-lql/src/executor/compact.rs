@@ -1,11 +1,13 @@
 //! Compaction executor: COMPACT MINOR, COMPACT MAJOR.
 
+use super::memit_persist::save_memit_store;
+use super::tuning::{
+    canonical_prompt, MEMIT_COMPACT_LAMBDA as DEFAULT_MEMIT_LAMBDA,
+    MEMIT_MIN_RECONSTRUCTION_COS as MIN_RECONSTRUCTION_COS,
+};
 use super::Session;
 use crate::ast::InsertMode;
 use crate::error::LqlError;
-
-const DEFAULT_MEMIT_LAMBDA: f32 = 1e-3;
-const MIN_RECONSTRUCTION_COS: f32 = 0.95;
 
 impl Session {
     /// `COMPACT MINOR` — promote L0 (KNN) entries to L1 (arch-A compose edges).
@@ -116,21 +118,31 @@ impl Session {
             ));
         }
 
-        // Collect L1 edges from patches
+        // Collect L1 edges from patches.
+        //
+        // Skip Insert ops that lack a relation: the MEMIT prompt is
+        // built as `"The {relation} of {entity} is"`, so a missing
+        // relation captures the wrong residual and bakes junk into
+        // `down_weights.bin`. The skipped count is reported back to
+        // the user.
         let mut edges: Vec<(usize, String, String, String, u32)> = Vec::new();
+        let mut skipped_no_relation = 0usize;
         for patch in &patched.patches {
             for op in &patch.operations {
                 if let larql_vindex::PatchOp::Insert {
                     layer,
                     entity,
                     target,
+                    relation,
                     ..
                 } = op
                 {
-                    // Relation isn't stored directly in PatchOp::Insert;
-                    // reconstruct from entity/target or use a default
-                    let relation = "unknown".to_string();
-                    edges.push((*layer, entity.clone(), relation, target.clone(), 0));
+                    match relation {
+                        Some(rel) => {
+                            edges.push((*layer, entity.clone(), rel.clone(), target.clone(), 0));
+                        }
+                        None => skipped_no_relation += 1,
+                    }
                 }
             }
         }
@@ -152,6 +164,12 @@ impl Session {
             "COMPACT MAJOR: processing {} L1 edges with lambda={:.1e}...",
             n_edges, lambda,
         )];
+        if skipped_no_relation > 0 {
+            out.push(format!(
+                "  Skipped {skipped_no_relation} insert(s) with no relation \
+                 (cannot build canonical MEMIT prompt without one)"
+            ));
+        }
 
         // ── Phase 2: capture residuals ──
         let path_owned = path.to_owned();
@@ -194,8 +212,7 @@ impl Session {
 
             let (_, _, patched) = self.require_vindex()?;
             for (layer, entity, relation, target, _tid) in &edges {
-                let rel_words = relation.replace(['-', '_'], " ");
-                let prompt = format!("The {rel_words} of {entity} is");
+                let prompt = canonical_prompt(relation, entity);
                 let encoding = tokenizer
                     .encode(prompt.as_str(), true)
                     .map_err(|e| LqlError::exec("tokenize error", e))?;
@@ -286,6 +303,23 @@ impl Session {
             out.push(format!(
                 "  Stored {n} decomposed (k, d) pairs as cycle #{cycle_id} at layer {install_layer}."
             ));
+
+            // Persist the store to disk so the next `USE` rehydrates
+            // the cycle. Without this, COMPACT MAJOR mutations are
+            // session-only and `SHOW COMPACT STATUS` always reports
+            // zero facts after a restart.
+            let vindex_dir = match &self.backend {
+                super::Backend::Vindex { path, .. } => path.clone(),
+                _ => return Err(LqlError::NoBackend),
+            };
+            if let Some(store) = self.memit_store() {
+                if let Err(e) = save_memit_store(&vindex_dir, store) {
+                    out.push(format!(
+                        "  warning: failed to persist memit_store.json: {e}"
+                    ));
+                }
+            }
+
             out.push(format!(
                 "COMPACT MAJOR complete: {n} facts compiled, {:.0}% quality.",
                 mean_cos * 100.0,

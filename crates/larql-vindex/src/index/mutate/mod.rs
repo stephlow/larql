@@ -14,6 +14,7 @@ use ndarray::Array1;
 use crate::config::VindexConfig;
 use crate::error::VindexError;
 use crate::format::filenames::*;
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::index::{FeatureMeta, VectorIndex};
 
 impl VectorIndex {
@@ -39,7 +40,7 @@ impl VectorIndex {
     /// If the index is in mmap mode, promotes this layer to heap first.
     pub fn set_gate_vector(&mut self, layer: usize, feature: usize, vector: &Array1<f32>) {
         // Promote from mmap to heap if needed
-        if self.gate.gate_mmap_bytes.is_some()
+        if self.storage.has_gate_vectors()
             && self
                 .gate
                 .gate_vectors
@@ -113,27 +114,25 @@ impl VectorIndex {
 
     /// Copy a layer's gate vectors from mmap to heap (for mutation).
     fn promote_layer_to_heap(&mut self, layer: usize) {
-        if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-            if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                if slice.num_features > 0 {
-                    let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                    let byte_offset = slice.float_offset * bpf;
-                    let byte_count = slice.num_features * self.hidden_size * bpf;
-                    let byte_end = byte_offset + byte_count;
-                    if byte_end <= mmap.len() {
-                        let raw = &mmap[byte_offset..byte_end];
-                        let floats =
-                            crate::config::dtype::decode_floats(raw, self.gate.gate_mmap_dtype);
-                        let matrix = ndarray::Array2::from_shape_vec(
-                            (slice.num_features, self.hidden_size),
-                            floats,
-                        )
-                        .unwrap();
-                        while self.gate.gate_vectors.len() <= layer {
-                            self.gate.gate_vectors.push(None);
-                        }
-                        self.gate.gate_vectors[layer] = Some(matrix);
+        if let Some(view) = self.storage.gate_layer_view(layer) {
+            if view.slice.num_features > 0 {
+                let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+                let byte_offset = view.slice.float_offset * bpf;
+                let byte_count = view.slice.num_features * self.hidden_size * bpf;
+                let byte_end = byte_offset + byte_count;
+                let mmap: &[u8] = view.bytes.as_ref();
+                if byte_end <= mmap.len() {
+                    let raw = &mmap[byte_offset..byte_end];
+                    let floats = crate::config::dtype::decode_floats(raw, view.dtype);
+                    let matrix = ndarray::Array2::from_shape_vec(
+                        (view.slice.num_features, self.hidden_size),
+                        floats,
+                    )
+                    .unwrap();
+                    while self.gate.gate_vectors.len() <= layer {
+                        self.gate.gate_vectors.push(None);
                     }
+                    self.gate.gate_vectors[layer] = Some(matrix);
                 }
             }
         }
@@ -252,9 +251,8 @@ impl VectorIndex {
     /// JSONL is no longer written — use `larql dump-meta` for human-readable output.
     /// Loading still falls back to JSONL for v1 compat if binary is absent.
     pub fn save_down_meta(&self, dir: &Path) -> Result<usize, VindexError> {
-        let max_top_k = self
-            .metadata
-            .down_meta
+        let down_meta = self.materialize_down_meta();
+        let max_top_k = down_meta
             .iter()
             .filter_map(|l| l.as_ref())
             .flat_map(|metas| metas.iter().filter_map(|m| m.as_ref()))
@@ -262,7 +260,39 @@ impl VectorIndex {
             .max()
             .unwrap_or(10);
 
-        crate::format::down_meta::write_binary(dir, &self.metadata.down_meta, max_top_k)
+        crate::format::down_meta::write_binary(dir, &down_meta, max_top_k)
+    }
+
+    fn materialize_down_meta(&self) -> Vec<Option<Vec<Option<FeatureMeta>>>> {
+        let mut out = Vec::with_capacity(self.num_layers);
+        for layer in 0..self.num_layers {
+            let heap_len = self
+                .metadata
+                .down_meta
+                .get(layer)
+                .and_then(|m| m.as_ref())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let mmap_len = self
+                .metadata
+                .down_meta_mmap
+                .as_ref()
+                .map(|dm| dm.num_features(layer))
+                .unwrap_or(0);
+            let gate_len = self.num_features(layer);
+            let num_features = heap_len.max(mmap_len).max(gate_len);
+            if num_features == 0 {
+                out.push(None);
+                continue;
+            }
+
+            let mut layer_meta = Vec::with_capacity(num_features);
+            for feature in 0..num_features {
+                layer_meta.push(self.feature_meta(layer, feature));
+            }
+            out.push(Some(layer_meta));
+        }
+        out
     }
 
     /// Write gate_vectors.bin back to disk and return updated layer info.
@@ -271,6 +301,30 @@ impl VectorIndex {
     pub fn save_gate_vectors(
         &self,
         dir: &Path,
+    ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
+        self.save_gate_vectors_with_dtype(dir, crate::config::dtype::StorageDtype::F32)
+    }
+
+    /// Write gate vectors using the dtype and per-layer metadata from config.
+    pub fn save_gate_vectors_with_config(
+        &self,
+        dir: &Path,
+        config: &crate::config::VindexConfig,
+    ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
+        let mut layer_infos = self.save_gate_vectors_with_dtype(dir, config.dtype)?;
+        for info in &mut layer_infos {
+            if let Some(existing) = config.layers.iter().find(|layer| layer.layer == info.layer) {
+                info.num_experts = existing.num_experts;
+                info.num_features_per_expert = existing.num_features_per_expert;
+            }
+        }
+        Ok(layer_infos)
+    }
+
+    fn save_gate_vectors_with_dtype(
+        &self,
+        dir: &Path,
+        dtype: crate::config::dtype::StorageDtype,
     ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
         let path = dir.join(GATE_VECTORS_BIN);
         let tmp_path = dir.join("gate_vectors.bin.tmp");
@@ -290,21 +344,18 @@ impl VectorIndex {
                         .ok_or_else(|| VindexError::Parse("gate vectors not contiguous".into()))?
                         .to_vec(),
                 )
-            } else if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                    if slice.num_features > 0 {
-                        let bpf = crate::config::dtype::bytes_per_float(self.gate.gate_mmap_dtype);
-                        let byte_offset = slice.float_offset * bpf;
-                        let byte_count = slice.num_features * self.hidden_size * bpf;
-                        let byte_end = byte_offset + byte_count;
-                        if byte_end <= mmap.len() {
-                            Some(crate::config::dtype::decode_floats(
-                                &mmap[byte_offset..byte_end],
-                                self.gate.gate_mmap_dtype,
-                            ))
-                        } else {
-                            None
-                        }
+            } else if let Some(view) = self.storage.gate_layer_view(layer) {
+                if view.slice.num_features > 0 {
+                    let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+                    let byte_offset = view.slice.float_offset * bpf;
+                    let byte_count = view.slice.num_features * self.hidden_size * bpf;
+                    let byte_end = byte_offset + byte_count;
+                    let mmap: &[u8] = view.bytes.as_ref();
+                    if byte_end <= mmap.len() {
+                        Some(crate::config::dtype::decode_floats(
+                            &mmap[byte_offset..byte_end],
+                            view.dtype,
+                        ))
                     } else {
                         None
                     }
@@ -317,15 +368,8 @@ impl VectorIndex {
 
             if let Some(ref data) = data {
                 let num_features = data.len() / self.hidden_size;
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        data.as_ptr() as *const u8,
-                        data.len() * std::mem::size_of::<f32>(),
-                    )
-                };
-                writer.write_all(bytes)?;
+                let length = crate::config::dtype::write_floats(&mut writer, data, dtype)?;
 
-                let length = bytes.len() as u64;
                 layer_infos.push(crate::config::VindexLayerInfo {
                     layer,
                     num_features,
@@ -356,7 +400,7 @@ impl VectorIndex {
     /// Save the full vindex (gate_vectors.bin + down_meta.jsonl + index.json).
     /// Updates the config's layer info to match current state.
     pub fn save_vindex(&self, dir: &Path, config: &mut VindexConfig) -> Result<(), VindexError> {
-        let layer_infos = self.save_gate_vectors(dir)?;
+        let layer_infos = self.save_gate_vectors_with_config(dir, config)?;
         config.layers = layer_infos;
         self.save_down_meta(dir)?;
         Self::save_config(config, dir)?;

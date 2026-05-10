@@ -26,8 +26,11 @@
 pub mod chat;
 pub mod completions;
 pub mod embeddings;
+pub mod error;
 pub mod schema;
 pub mod util;
+
+pub use error::OpenAIError;
 
 // Re-export the handler functions so the route table in `routes/mod.rs`
 // can reach them as `openai::chat::handle_chat_completions`, etc. The

@@ -5,12 +5,13 @@
 //! shard. The BF16 expert weights are dequantized on demand so only the
 //! selected experts pay the conversion cost.
 
-use super::cache::{cached_dequant, ExpertF32};
+use super::cache::{try_cached_dequant, ExpertF32};
 use super::math::{gelu_tanh, matmul_vec, matmul_vec_into, rms_norm, silu};
 use crate::cpu::ops::q4_common::q4k_matvec_into;
 use crate::cpu::ops::q4k_q8k_dot::{
     q4k_q8k_matvec_into, quantize_x_to_q8k, quantize_x_to_q8k_into, Q8KActivation,
 };
+use crate::options;
 // `q4k_q8k_gate_up_into` exists for future kernel exploration but is not
 // wired into the hot path — see comment in `run_single_expert_q4k_q8k_into`.
 
@@ -116,7 +117,7 @@ pub fn run_single_expert(
     // (kernel-debug A/B).
     if matches!(format, crate::QuantFormat::Q4_K)
         && hidden.is_multiple_of(256)
-        && std::env::var("LARQL_DISABLE_Q4K_DIRECT").is_err()
+        && !super::q4k_direct_disabled()
     {
         thread_local! {
             static SCRATCH: std::cell::RefCell<Option<ExpertScratch>> =
@@ -156,7 +157,8 @@ pub fn run_single_expert(
         });
     }
 
-    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
+    let gate_up_w = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
+        .unwrap_or_else(|err| panic!("{err}"));
     if gate_up_w.is_empty() {
         return vec![0.0f32; hidden];
     }
@@ -178,7 +180,8 @@ pub fn run_single_expert(
         };
     }
 
-    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
+    let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
+        .unwrap_or_else(|err| panic!("{err}"));
     if down_w.is_empty() {
         return vec![0.0f32; hidden];
     }
@@ -227,7 +230,7 @@ pub fn run_single_expert_into<'s>(
     // gate; the env-var check is cached in TLS to avoid a syscall per call.
     thread_local! {
         static EXPERT_TIMING: bool =
-            std::env::var("LARQL_MOE_EXPERT_TIMING").is_ok();
+            options::env_flag(options::ENV_MOE_EXPERT_TIMING);
     }
     let timing = EXPERT_TIMING.with(|t| *t);
     let mut t = std::time::Instant::now();
@@ -239,7 +242,7 @@ pub fn run_single_expert_into<'s>(
     // we ship a NEON-vectorized version.
     thread_local! {
         static Q4K_DIRECT: bool =
-            std::env::var("LARQL_Q4K_DIRECT").is_ok();
+            options::env_flag(options::ENV_Q4K_DIRECT);
     }
     let q4k_direct = Q4K_DIRECT.with(|v| *v);
     let q4k_path = q4k_direct && matches!(format, crate::QuantFormat::Q4_K);
@@ -252,7 +255,8 @@ pub fn run_single_expert_into<'s>(
     let gate_up_w_arc: Option<ExpertF32> = if q4k_path {
         None
     } else {
-        let v = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
+        let v = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
+            .unwrap_or_else(|err| panic!("{err}"));
         if v.is_empty() {
             for v in scratch.out.iter_mut() {
                 *v = 0.0;
@@ -267,7 +271,8 @@ pub fn run_single_expert_into<'s>(
     }
 
     if q4k_path {
-        let row_block_bytes = (hidden / 256) * 144;
+        let row_block_bytes = (hidden / larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
+            * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
         let half = inter * row_block_bytes;
         let gate_bytes = &gate_up_bytes[..half];
         let up_bytes = &gate_up_bytes[half..2 * half];
@@ -351,7 +356,8 @@ pub fn run_single_expert_into<'s>(
         t = std::time::Instant::now();
     }
 
-    let down_w = cached_dequant(down_bytes, format, hidden * inter_padded);
+    let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
+        .unwrap_or_else(|err| panic!("{err}"));
     if down_w.is_empty() {
         for v in scratch.out.iter_mut() {
             *v = 0.0;
@@ -429,7 +435,7 @@ pub fn run_single_expert_q4k_q8k_into<'s>(
     // Per-stage timing for kernel diagnosis.  Enable with
     // `LARQL_KERNEL_TIMING=1`.  Cached in TLS to avoid syscall per call.
     thread_local! {
-        static KERNEL_TIMING: bool = std::env::var("LARQL_KERNEL_TIMING").is_ok();
+        static KERNEL_TIMING: bool = options::env_flag(options::ENV_KERNEL_TIMING);
     }
     let timing = KERNEL_TIMING.with(|t| *t);
 
@@ -441,10 +447,10 @@ pub fn run_single_expert_q4k_q8k_into<'s>(
         return &scratch.out;
     }
 
-    // Q4_K weight stride (in bytes) per row: ceil(hidden / 256) * 144.
+    // Q4_K weight stride (in bytes) per row: ceil(hidden / Q4_K_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES.
     let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
     let inter_padded = inter.div_ceil(block) * block;
-    let row_block_bytes = (hidden / 256) * 144;
+    let row_block_bytes = (hidden / block) * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
     let half = inter * row_block_bytes;
     if gate_up_bytes.len() < 2 * half {
         for v in scratch.out.iter_mut() {
@@ -554,6 +560,7 @@ pub fn run_single_expert_with_norm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::ops::q4_common::quantize_q4_k;
     use crate::{Activation, QuantFormat};
 
     // BF16 encoding for common values (little-endian: low byte first).
@@ -588,6 +595,26 @@ mod tests {
     }
 
     #[test]
+    fn pre_experts_norm_empty_weight_returns_input_copy() {
+        let h = vec![1.0f32, -2.0, 3.5];
+        let out = pre_experts_norm(&h, &[], 0.0, 1e-6);
+        assert_eq!(out, h);
+    }
+
+    #[test]
+    fn pre_experts_norm_applies_weight_and_offset() {
+        let h = vec![3.0f32, 4.0];
+        let norm_w = vec![1.0f32, 2.0];
+        let out = pre_experts_norm(&h, &norm_w, 0.5, 0.0);
+        let rms = ((3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
+        let expected = [3.0 / rms * 1.5, 4.0 / rms * 2.5];
+
+        for (actual, expected) in out.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn nonzero_weights_produce_nonzero_output() {
         let hidden = 4;
         let inter = 2;
@@ -608,6 +635,145 @@ mod tests {
             out.iter().any(|v| v.abs() > 0.01),
             "expected nonzero output, got {out:?}"
         );
+    }
+
+    #[test]
+    fn run_single_expert_into_matches_allocating_path() {
+        let hidden = 4;
+        let inter = 2;
+        let gate_up = fill_bf16(2 * inter * hidden, 0.75);
+        let down = fill_bf16(hidden * inter, -0.5);
+        let h = vec![1.0f32, 0.5, -0.25, 2.0];
+        let expected = run_single_expert(
+            &h,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::BF16,
+            Activation::Silu,
+        );
+        let mut scratch = ExpertScratch::new(hidden, inter, inter);
+
+        let actual = run_single_expert_into(
+            &mut scratch,
+            &h,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::BF16,
+            Activation::Silu,
+        );
+
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn run_single_expert_into_zeroes_output_for_empty_weights() {
+        let hidden = 4;
+        let inter = 2;
+        let h = vec![1.0f32; hidden];
+        let mut scratch = ExpertScratch::new(hidden, inter, inter);
+        scratch.out.fill(9.0);
+
+        let out = run_single_expert_into(
+            &mut scratch,
+            &h,
+            &[],
+            &[],
+            inter,
+            QuantFormat::BF16,
+            Activation::Silu,
+        );
+
+        assert_eq!(out, &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn quantize_h_norm_for_q4k_rejects_empty_or_misaligned_input() {
+        assert!(quantize_h_norm_for_q4k(&[]).is_none());
+        assert!(quantize_h_norm_for_q4k(&vec![1.0f32; 255]).is_none());
+
+        let q8 = quantize_h_norm_for_q4k(&vec![1.0f32; 256]).unwrap();
+        assert_eq!(q8.qs.len(), 256);
+    }
+
+    #[test]
+    fn run_single_expert_q4k_q8k_into_zeroes_output_for_short_gate_up() {
+        let hidden = 256;
+        let inter = 1;
+        let mut scratch = ExpertScratch::new(hidden, inter, 256);
+        scratch.out.fill(7.0);
+        let h_q8 = quantize_h_norm_for_q4k(&vec![1.0f32; hidden]).unwrap();
+
+        let out =
+            run_single_expert_q4k_q8k_into(&mut scratch, &h_q8, &[], &[], inter, Activation::Silu);
+
+        assert!(out.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn run_single_expert_q4k_q8k_into_valid_weights_produces_finite_output() {
+        let hidden = 256;
+        let inter = 256;
+        let h: Vec<f32> = (0..hidden)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.03)
+            .collect();
+        let h_q8 = quantize_h_norm_for_q4k(&h).unwrap();
+        let gate_up_f32: Vec<f32> = (0..2 * inter * hidden)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.002)
+            .collect();
+        let down_f32: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.0025)
+            .collect();
+        let gate_up = quantize_q4_k(&gate_up_f32);
+        let down = quantize_q4_k(&down_f32);
+        let mut scratch = ExpertScratch::new(hidden, inter, inter);
+
+        let out = run_single_expert_q4k_q8k_into(
+            &mut scratch,
+            &h_q8,
+            &gate_up,
+            &down,
+            inter,
+            Activation::GeluTanh,
+        );
+
+        assert_eq!(out.len(), hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(out.iter().any(|v| v.abs() > 1e-8), "got all-zero output");
+    }
+
+    #[test]
+    fn run_single_expert_into_q4k_cached_dequant_path_runs() {
+        let hidden = 256;
+        let inter = 256;
+        let h: Vec<f32> = (0..hidden)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.01)
+            .collect();
+        let gate_up_f32: Vec<f32> = (0..2 * inter * hidden)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.0015)
+            .collect();
+        let down_f32: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.001)
+            .collect();
+        let gate_up = quantize_q4_k(&gate_up_f32);
+        let down = quantize_q4_k(&down_f32);
+        let mut scratch = ExpertScratch::new(hidden, inter, inter);
+
+        let out = run_single_expert_into(
+            &mut scratch,
+            &h,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::Q4_K,
+            Activation::Silu,
+        );
+
+        assert_eq!(out.len(), hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 
     #[test]

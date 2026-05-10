@@ -18,6 +18,13 @@ pub mod weight;
 
 use ndarray::Array2;
 
+/// Number of elements in one Q4_K / Q8_K super-block (the block size both
+/// formats share). Hidden sizes that are not a multiple of this value
+/// can't use the block-quantised wire formats — `walk_ffn` and
+/// `grid::remote_ffn` use this for their dispatch checks. Mirrors
+/// llama.cpp's `QK_K`.
+pub const Q4K_Q8K_SUPERBLOCK_ELEMS: usize = 256;
+
 // ── Trait ──
 
 /// FFN backend trait. Defines how a single layer's FFN is computed.
@@ -48,6 +55,7 @@ pub trait FfnBackend {
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
 pub use remote::{
     LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
+    WirePreference,
 };
 pub use sparse::SparseFfn;
 pub use sparse_compute::{
@@ -108,6 +116,54 @@ pub fn gelu_tanh_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
 pub fn gelu_tanh(x: f32) -> f32 {
     let c = 0.797_884_6_f32;
     0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::test_utils::make_test_weights;
+    use weight::WeightFfn;
+
+    #[test]
+    fn ffn_backend_default_forward_moe_full_layer_returns_none() {
+        // The trait's default `forward_moe_full_layer` impl always
+        // returns None — non-MoE backends rely on this fallback.
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let h = larql_vindex::ndarray::Array2::<f32>::zeros((1, weights.hidden_size));
+        assert!(ffn.forward_moe_full_layer(0, &h).is_none());
+    }
+
+    #[test]
+    fn layer_ffn_router_uniform_returns_same_backend_for_every_layer() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let router = LayerFfnRouter::uniform(&ffn, 4);
+        // All four layers return the same backend's name.
+        for layer in 0..4 {
+            assert_eq!(router.get(layer).name(), "weights");
+        }
+    }
+
+    #[test]
+    fn layer_ffn_router_per_layer_dispatches_per_index() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let backends: Vec<&dyn FfnBackend> = (0..3).map(|_| &ffn as &dyn FfnBackend).collect();
+        let router = LayerFfnRouter::per_layer(backends);
+        for layer in 0..3 {
+            assert_eq!(router.get(layer).name(), "weights");
+        }
+    }
+
+    #[test]
+    fn layer_ffn_router_get_out_of_range_clamps_to_last() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let router = LayerFfnRouter::uniform(&ffn, 2);
+        // Layer 99 > num_layers=2 → clamps to last (index 1).
+        assert_eq!(router.get(99).name(), "weights");
+    }
 }
 
 // Architecture-correct FFN computation is in weight::dense_ffn_forward

@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `v_norm_batched` — the parameter-free RMSNorm
 //! used by Gemma 4's V-projection inside KV-cached decode.
@@ -67,7 +67,7 @@ fn run_v_norm_batched(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.v_norm_batched_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.v_norm_batched_pipeline);
     enc.set_buffer(0, Some(in_buf), 0);
     enc.set_buffer(1, Some(out_buf), 0);
     enc.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);

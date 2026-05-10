@@ -10,7 +10,7 @@
 //! mapping within each simdgroup, and reduction are all identical.
 //! The only difference is how many rows a single TG produces.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -105,7 +105,7 @@ fn q4k_ffn_gate_up_8sg_matches_4sg_bit_equal() {
     use larql_compute::metal::shaders::{q4k_ffn_gate_up as p4, q4k_ffn_gate_up_8sg as p8};
     let (g4, u4) = dispatch(
         &metal,
-        &metal.q4k_ffn_gate_up_pipeline.state,
+        &metal.ffn.q4k_ffn_gate_up_pipeline.state,
         p4::ROWS_PER_TG,
         p4::THREADS_PER_TG,
         &gate_q4k,
@@ -116,7 +116,7 @@ fn q4k_ffn_gate_up_8sg_matches_4sg_bit_equal() {
     );
     let (g8, u8) = dispatch(
         &metal,
-        &metal.q4k_ffn_gate_up_8sg_pipeline.state,
+        &metal.ffn.q4k_ffn_gate_up_8sg_pipeline.state,
         p8::ROWS_PER_TG,
         p8::THREADS_PER_TG,
         &gate_q4k,
@@ -163,7 +163,7 @@ fn q4k_ffn_gate_up_8sg_perf_vs_4sg() {
     for _ in 0..5 {
         let _ = dispatch(
             &metal,
-            &metal.q4k_ffn_gate_up_pipeline.state,
+            &metal.ffn.q4k_ffn_gate_up_pipeline.state,
             p4::ROWS_PER_TG,
             p4::THREADS_PER_TG,
             &gate_q4k,
@@ -174,7 +174,7 @@ fn q4k_ffn_gate_up_8sg_perf_vs_4sg() {
         );
         let _ = dispatch(
             &metal,
-            &metal.q4k_ffn_gate_up_8sg_pipeline.state,
+            &metal.ffn.q4k_ffn_gate_up_8sg_pipeline.state,
             p8::ROWS_PER_TG,
             p8::THREADS_PER_TG,
             &gate_q4k,
@@ -190,7 +190,7 @@ fn q4k_ffn_gate_up_8sg_perf_vs_4sg() {
     for _ in 0..iters {
         let _ = dispatch(
             &metal,
-            &metal.q4k_ffn_gate_up_pipeline.state,
+            &metal.ffn.q4k_ffn_gate_up_pipeline.state,
             p4::ROWS_PER_TG,
             p4::THREADS_PER_TG,
             &gate_q4k,
@@ -206,7 +206,7 @@ fn q4k_ffn_gate_up_8sg_perf_vs_4sg() {
     for _ in 0..iters {
         let _ = dispatch(
             &metal,
-            &metal.q4k_ffn_gate_up_8sg_pipeline.state,
+            &metal.ffn.q4k_ffn_gate_up_8sg_pipeline.state,
             p8::ROWS_PER_TG,
             p8::THREADS_PER_TG,
             &gate_q4k,

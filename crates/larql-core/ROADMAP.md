@@ -32,8 +32,8 @@ engine.
 
 ## P0 - Correctness and robustness
 
-Status: shipped. Keep this section as a record of the hardening pass and the
-regressions now covered by tests.
+Status: shipped for the original hardening pass. Keep this section as a record
+of covered regressions plus any newly found P0 follow-ups.
 
 | Item | Area | Status |
 |---|---|---|
@@ -42,6 +42,7 @@ regressions now covered by tests.
 | Replace ad hoc CSV parsing/writing | `io::csv` | Done. CSV supports quoted commas, escaped quotes, CRLF/LF records, and multiline quoted fields. |
 | Diff all edge attributes | `algo::diff` | Done. Same-triple changes now include confidence, source, metadata, and injection. |
 | Clarify traversal edge semantics | `algo::traversal` | Done. `TraversalResult.edges` means edges actually traversed to newly discovered nodes. |
+| Sanitize confidence on deserialize | `core::edge`, `core::graph`, `algo` | Open. `CompactEdge -> Edge` stores confidence directly, bypassing `with_confidence`; NaN or out-of-range values can later panic unwrap-based `partial_cmp` sorts in walk/PageRank paths. Clamp or reject non-finite confidence at graph format boundaries. |
 
 ---
 

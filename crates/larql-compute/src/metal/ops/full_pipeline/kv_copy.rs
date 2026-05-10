@@ -120,7 +120,7 @@ mod tests {
             post_attn_norm_bias: None,
             norm_offset: 1.0,
             qk_norm_offset: 1.0,
-            eps: 1e-6,
+            eps: crate::pipeline::RMSNORM_EPSILON_DEFAULT,
             has_post_norms: false,
             norm_type: NormType::RmsNorm,
             ffn_type: FfnType::Gated,
@@ -129,7 +129,7 @@ mod tests {
             head_dim,
             num_q_heads,
             num_kv_heads,
-            rope_base: 10000.0,
+            rope_base: crate::pipeline::ROPE_BASE_DEFAULT,
             rotary_dim: 0,
             sliding_window: 0,
             has_v_norm: false,
@@ -142,6 +142,10 @@ mod tests {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
+            kv_shared_source: None,
         }
     }
 

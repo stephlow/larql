@@ -5,7 +5,7 @@
 //! gated on `LARQL_PERF_SPOT_CHECK=1` so it doesn't slow down `cargo
 //! test`.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

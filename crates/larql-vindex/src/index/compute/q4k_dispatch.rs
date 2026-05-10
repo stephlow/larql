@@ -322,4 +322,96 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         assert!(!index.q4k_down_feature_scaled_add(0, 0, 1.0, &mut out));
     }
+
+    // ── q4k_matmul_transb early returns ────────────────────────────
+
+    #[test]
+    fn q4k_matmul_transb_rejects_invalid_component() {
+        let index = VectorIndex::empty(1, 256);
+        let x = vec![0.0_f32; 256];
+        for component in [3usize, 4, 99] {
+            assert!(index.q4k_matmul_transb(0, component, &x, 1, None).is_none());
+        }
+    }
+
+    #[test]
+    fn q4k_matmul_transb_returns_none_when_no_q4k_data() {
+        // No interleaved_q4k mmap → interleaved_q4k_layer_data returns
+        // None → matmul bails out.
+        let index = VectorIndex::empty(1, 256);
+        let x = vec![0.0_f32; 256];
+        assert!(index.q4k_matmul_transb(0, 0, &x, 1, None).is_none());
+    }
+
+    // ── q4k_ffn_row_dot early returns ──────────────────────────────
+
+    #[test]
+    fn q4k_ffn_row_dot_rejects_invalid_component() {
+        let index = VectorIndex::empty(1, 256);
+        let x = vec![0.0_f32; 256];
+        for component in [3usize, 99] {
+            assert!(index.q4k_ffn_row_dot(0, component, 0, &x).is_none());
+        }
+    }
+
+    #[test]
+    fn q4k_ffn_row_dot_rejects_wrong_x_len() {
+        let index = VectorIndex::empty(1, 256);
+        let bad = vec![0.0_f32; 128]; // hidden_size is 256
+        assert!(index.q4k_ffn_row_dot(0, 0, 0, &bad).is_none());
+    }
+
+    #[test]
+    fn q4k_ffn_row_dot_returns_none_when_no_q4k_data() {
+        let index = VectorIndex::empty(1, 256);
+        let x = vec![0.0_f32; 256];
+        assert!(index.q4k_ffn_row_dot(0, 0, 0, &x).is_none());
+    }
+
+    // ── q4k_ffn_row_scaled_add: existing tests covered c=2 and out.len()
+    //
+    // Add: no q4k data → false.
+
+    #[test]
+    fn q4k_ffn_row_scaled_add_returns_false_when_no_q4k_data() {
+        let index = VectorIndex::empty(1, 256);
+        let mut out = vec![0.0_f32; 256];
+        // component=0, valid out.len() — fails on the `interleaved_q4k_layer_data
+        // → None` guard, not on the out.len()/component checks.
+        assert!(!index.q4k_ffn_row_scaled_add(0, 0, 0, 1.0, &mut out));
+    }
+
+    // ── q4k_down_feature_scaled_add early returns ──────────────────
+
+    #[test]
+    fn q4k_down_feature_scaled_add_rejects_wrong_out_len() {
+        let index = VectorIndex::empty(1, 256);
+        let mut bad = vec![0.0_f32; 128];
+        assert!(!index.q4k_down_feature_scaled_add(0, 0, 1.0, &mut bad));
+    }
+
+    // ── q4k_ffn_row_into early returns ─────────────────────────────
+
+    #[test]
+    fn q4k_ffn_row_into_rejects_invalid_component() {
+        let index = VectorIndex::empty(1, 256);
+        let mut out = vec![0.0_f32; 256];
+        for component in [3usize, 99] {
+            assert!(!index.q4k_ffn_row_into(0, component, 0, &mut out));
+        }
+    }
+
+    #[test]
+    fn q4k_ffn_row_into_rejects_wrong_out_len() {
+        let index = VectorIndex::empty(1, 256);
+        let mut bad = vec![0.0_f32; 128];
+        assert!(!index.q4k_ffn_row_into(0, 0, 0, &mut bad));
+    }
+
+    #[test]
+    fn q4k_ffn_row_into_returns_false_when_no_q4k_data() {
+        let index = VectorIndex::empty(1, 256);
+        let mut out = vec![0.0_f32; 256];
+        assert!(!index.q4k_ffn_row_into(0, 0, 0, &mut out));
+    }
 }

@@ -1,5 +1,7 @@
 //! Raw-logits forward passes used by target-delta optimisation and Apollo.
 
+use std::ops::Range;
+
 use super::super::embed::embed_tokens;
 use super::super::layer::run_layer_with_ffn;
 use super::super::ple::precompute_per_layer_inputs;
@@ -19,6 +21,23 @@ pub struct RawForward {
     pub logits: ndarray::Array1<f32>,
 }
 
+/// Apply the model's final logits transform: divide by `logits_scaling`
+/// then apply the optional `final_logit_softcapping` tanh.
+fn apply_logits_transform(weights: &ModelWeights, raw_row: &[f32]) -> ndarray::Array1<f32> {
+    let inv_scale = 1.0 / weights.arch.logits_scaling();
+    let final_softcap = weights.arch.final_logit_softcapping();
+    raw_row
+        .iter()
+        .map(|&v| {
+            let mut logit = v * inv_scale;
+            if let Some(cap) = final_softcap {
+                logit = (logit / cap).tanh() * cap;
+            }
+            logit
+        })
+        .collect()
+}
+
 /// Project a single hidden state row to raw logits (pre-softmax, pre-temperature).
 ///
 /// Used by constrained generation: the caller masks the returned vector (e.g. sets
@@ -31,21 +50,8 @@ pub fn hidden_to_raw_logits(weights: &ModelWeights, h_single: &Array2<f32>) -> V
         weights.arch.final_norm_key(),
         norm_offset,
     );
-    let logits_scale = weights.arch.logits_scaling();
-    let final_softcap = weights.arch.final_logit_softcapping();
     let logits_raw = dot_proj(&h_final.slice(ndarray::s![0..1, ..]), &weights.lm_head);
-    let inv_scale = 1.0 / logits_scale;
-    logits_raw
-        .row(0)
-        .iter()
-        .map(|&v| {
-            let mut logit = v * inv_scale;
-            if let Some(cap) = final_softcap {
-                logit = (logit / cap).tanh() * cap;
-            }
-            logit
-        })
-        .collect()
+    apply_logits_transform(weights, logits_raw.row(0).as_slice().unwrap()).to_vec()
 }
 
 /// Raw-logits forward pass used by target-delta optimisation.
@@ -56,10 +62,6 @@ pub fn hidden_to_raw_logits(weights: &ModelWeights, h_single: &Array2<f32>) -> V
 /// matching the Python reference `ffn_out[0, -1, :] += delta; h = h + ffn_out`
 /// (since `run_layer_with_ffn` already collapses the block's output +
 /// skip, perturbing the post-block `h[-1]` is algebraically the same).
-///
-/// This is a thin wrapper around [`forward_raw_logits_with_prefix`] with
-/// no prefix. Code sharing rather than duplication — the prefix path is
-/// what Apollo-style boundary-residual replay uses.
 pub fn forward_raw_logits(
     weights: &ModelWeights,
     token_ids: &[u32],
@@ -92,117 +94,13 @@ pub fn forward_raw_logits_with_prefix(
     initial_residual: Option<&[f32]>,
     perturb: Option<(usize, ndarray::ArrayView1<f32>)>,
 ) -> RawForward {
-    let num_layers = weights.num_layers;
-    let query_len = token_ids.len();
-    let hidden = weights.hidden_size;
-
-    // Build the full input residual stream:
-    //   if prefix: row 0 = prefix, rows 1..=query_len = query embeddings
-    //   if no prefix: rows 0..query_len = query embeddings
-    let q_embed = embed_tokens(weights, token_ids);
-    let (mut h, total_len, has_prefix) = if let Some(prefix) = initial_residual {
-        assert_eq!(
-            prefix.len(),
-            hidden,
-            "initial_residual len {} does not match hidden size {}",
-            prefix.len(),
-            hidden,
-        );
-        let mut h = ndarray::Array2::<f32>::zeros((query_len + 1, hidden));
-        for (i, &v) in prefix.iter().enumerate() {
-            h[[0, i]] = v;
-        }
-        for r in 0..query_len {
-            for c in 0..hidden {
-                h[[r + 1, c]] = q_embed[[r, c]];
-            }
-        }
-        (h, query_len + 1, true)
-    } else {
-        (q_embed, query_len, false)
-    };
-
-    // PLE: only used by Gemma 4 E2B. When a prefix is prepended there's no
-    // token_id for that virtual row, so we pass a placeholder 0. For models
-    // where PLE is active this is a known approximation; for Gemma 3 4B
-    // (the Apollo target) PLE is disabled and this branch is a no-op.
-    let ple_token_ids: Vec<u32> = if has_prefix {
-        let mut v = Vec::with_capacity(query_len + 1);
-        v.push(0);
-        v.extend_from_slice(token_ids);
-        v
-    } else {
-        token_ids.to_vec()
-    };
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, &ple_token_ids);
-    let ffn = WeightFfn { weights };
-
-    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
-
-    for layer in 0..num_layers {
-        let shared_kv = weights
-            .arch
-            .kv_shared_source_layer(layer)
-            .and_then(|src| kv_cache.get(&src));
-
-        if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
-            weights,
-            &h,
-            layer,
-            &ffn,
-            false,
-            ple_inputs.get(layer),
-            shared_kv,
-        ) {
-            h = h_new;
-            if let Some(kv) = kv_out {
-                kv_cache.insert(layer, kv);
-            }
-            // Perturb the LAST row (the query's last token) after this
-            // layer's block. With a prefix present the last row is
-            // total_len - 1 = query_len (not query_len - 1).
-            if let Some((target_layer, delta)) = perturb {
-                if layer == target_layer {
-                    let last = total_len - 1;
-                    let mut row = h.row_mut(last);
-                    for (i, d) in delta.iter().enumerate() {
-                        if i < row.len() {
-                            row[i] += *d;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Snapshot pre-norm residual for the caller's backward pass.
-    let h_pre_norm = h.clone();
-
-    let norm_offset = weights.arch.norm_weight_offset();
-    let h_final = apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
-
-    let logits_scale = weights.arch.logits_scaling();
-    let final_softcap = weights.arch.final_logit_softcapping();
-    let last_2d = h_final.slice(ndarray::s![total_len - 1..total_len, ..]);
-    let logits_raw = dot_proj(&last_2d, &weights.lm_head);
-    let inv_scale = 1.0 / logits_scale;
-    let logits: ndarray::Array1<f32> = logits_raw
-        .row(0)
-        .iter()
-        .map(|&v| {
-            let mut logit = v * inv_scale;
-            if let Some(cap) = final_softcap {
-                logit = (logit / cap).tanh() * cap;
-            }
-            logit
-        })
-        .collect();
-
-    RawForward {
-        h_pre_norm,
-        h_final,
-        logits,
-    }
+    forward_layer_range(
+        weights,
+        token_ids,
+        initial_residual,
+        0..weights.num_layers,
+        perturb,
+    )
 }
 
 /// Forward pass starting at `from_layer` using a pre-computed boundary
@@ -222,40 +120,76 @@ pub fn forward_from_layer(
     from_layer: usize,
     perturb: Option<(usize, ndarray::ArrayView1<f32>)>,
 ) -> RawForward {
+    forward_layer_range(
+        weights,
+        token_ids,
+        Some(boundary_residual),
+        from_layer..weights.num_layers,
+        perturb,
+    )
+}
+
+/// Shared implementation. Runs `layer_range` of the transformer with an
+/// optional position-0 residual prefix, perturbs the last row at the
+/// requested target layer, and projects the last position to logits.
+///
+/// Layout when `prefix` is `Some`: row 0 = prefix, rows 1..=q = query
+/// embeddings, total_len = q + 1. PLE token ids prepend a `0` placeholder
+/// for the virtual prefix row.
+///
+/// Layout when `prefix` is `None`: rows 0..q = query embeddings,
+/// total_len = q.
+fn forward_layer_range(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    prefix: Option<&[f32]>,
+    layer_range: Range<usize>,
+    perturb: Option<(usize, ndarray::ArrayView1<f32>)>,
+) -> RawForward {
     let hidden = weights.hidden_size;
     let q_len = token_ids.len();
-    let total_len = q_len + 1; // +1 for boundary position-0
 
-    assert_eq!(
-        boundary_residual.len(),
-        hidden,
-        "boundary_residual len {} != hidden {}",
-        boundary_residual.len(),
-        hidden
-    );
-
-    // Build h: row 0 = boundary, rows 1..total_len = query embeddings.
     let q_embed = embed_tokens(weights, token_ids);
-    let mut h = ndarray::Array2::<f32>::zeros((total_len, hidden));
-    for (i, &v) in boundary_residual.iter().enumerate() {
-        h[[0, i]] = v;
-    }
-    for r in 0..q_len {
-        for c in 0..hidden {
-            h[[r + 1, c]] = q_embed[[r, c]];
+    let (mut h, total_len) = if let Some(prefix) = prefix {
+        assert_eq!(
+            prefix.len(),
+            hidden,
+            "prefix len {} does not match hidden size {}",
+            prefix.len(),
+            hidden,
+        );
+        let mut h = ndarray::Array2::<f32>::zeros((q_len + 1, hidden));
+        for (i, &v) in prefix.iter().enumerate() {
+            h[[0, i]] = v;
         }
-    }
+        for r in 0..q_len {
+            for c in 0..hidden {
+                h[[r + 1, c]] = q_embed[[r, c]];
+            }
+        }
+        (h, q_len + 1)
+    } else {
+        (q_embed, q_len)
+    };
 
+    // PLE: only used by Gemma 4 E2B. With a prefix prepended there's no
+    // token id for the virtual row, so we pass a placeholder 0. For models
+    // where PLE is active this is a known approximation; for Gemma 3 4B
+    // (the Apollo target) PLE is disabled and this branch is a no-op.
+    let ple_token_ids: Vec<u32> = if prefix.is_some() {
+        let mut v = Vec::with_capacity(q_len + 1);
+        v.push(0);
+        v.extend_from_slice(token_ids);
+        v
+    } else {
+        token_ids.to_vec()
+    };
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, &ple_token_ids);
     let ffn = WeightFfn { weights };
-    // PLE placeholder (Gemma 4 only; no-op on Gemma 3 4B).
-    let mut ple_ids = Vec::with_capacity(total_len);
-    ple_ids.push(0u32);
-    ple_ids.extend_from_slice(token_ids);
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, &ple_ids);
-    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = Default::default();
 
-    // Only run layers from_layer..num_layers.
-    for layer in from_layer..weights.num_layers {
+    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
+
+    for layer in layer_range {
         let shared_kv = weights
             .arch
             .kv_shared_source_layer(layer)
@@ -274,8 +208,11 @@ pub fn forward_from_layer(
             if let Some(kv) = kv_out {
                 kv_cache.insert(layer, kv);
             }
-            if let Some((target, delta)) = perturb {
-                if layer == target {
+            // Perturb the LAST row (the query's last token) after this
+            // layer's block runs. With a prefix present the last row is
+            // total_len - 1 = q_len (not q_len - 1).
+            if let Some((target_layer, delta)) = perturb {
+                if layer == target_layer {
                     let last = total_len - 1;
                     let mut row = h.row_mut(last);
                     for (i, d) in delta.iter().enumerate() {
@@ -291,22 +228,10 @@ pub fn forward_from_layer(
     let h_pre_norm = h.clone();
     let norm_offset = weights.arch.norm_weight_offset();
     let h_final = apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
-    let logits_scale = weights.arch.logits_scaling();
-    let final_softcap = weights.arch.final_logit_softcapping();
+
     let last_2d = h_final.slice(ndarray::s![total_len - 1..total_len, ..]);
     let logits_raw = dot_proj(&last_2d, &weights.lm_head);
-    let inv_scale = 1.0 / logits_scale;
-    let logits: ndarray::Array1<f32> = logits_raw
-        .row(0)
-        .iter()
-        .map(|&v| {
-            let mut logit = v * inv_scale;
-            if let Some(cap) = final_softcap {
-                logit = (logit / cap).tanh() * cap;
-            }
-            logit
-        })
-        .collect();
+    let logits = apply_logits_transform(weights, logits_raw.row(0).as_slice().unwrap());
 
     RawForward {
         h_pre_norm,
@@ -320,7 +245,7 @@ pub fn forward_from_layer(
 #[cfg(test)]
 mod forward_from_layer_tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     #[test]
     fn forward_raw_logits_returns_vocab_logits() {

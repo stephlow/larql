@@ -4,12 +4,12 @@
 //!   cargo run --release --features metal -p larql-compute --example diag_shader_bench
 //!   cargo run --release --features metal -p larql-compute --example diag_shader_bench -- --profile gemma3 --json /tmp/shaders.json
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {
-    eprintln!("This example requires --features metal");
+    eprintln!("This example requires macOS and --features metal");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = match larql_compute::metal::diag::shader_bench::Config::from_args(&args) {

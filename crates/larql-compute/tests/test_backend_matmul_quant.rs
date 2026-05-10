@@ -97,6 +97,7 @@ fn f32_gemv_returns_none_on_cpu() {
     let w = synth(512, 256, 7);
     let x = synth_vec(256, 8);
     assert!(cpu.f32_gemv(w.view(), &x).is_none());
+    assert!(cpu.f32_gemv_topk1(w.view(), &x).is_none());
 }
 
 #[test]
@@ -116,6 +117,8 @@ fn f16_gemv_returns_none_on_cpu() {
     let w_f16 = vec![0u8; n * k * 2];
     let x = synth_vec(k, 11);
     assert!(cpu.f16_gemv(&w_f16, &x, n, k).is_none());
+    assert!(cpu.f16_gemv_topk1(&w_f16, &x, n, k).is_none());
+    assert!(cpu.f16_gemv_topk(&w_f16, &x, n, k, 8).is_none());
 }
 
 #[test]
@@ -254,6 +257,7 @@ fn q4_vecmat_via_trait_nonzero() {
 
 use larql_compute::backend::DecodeBackend;
 use ndarray::ArrayView2;
+use std::cell::{Cell, RefCell};
 
 struct MinimalBackend;
 
@@ -278,6 +282,117 @@ impl larql_compute::ComputeBackend for MinimalBackend {
     // supports:    default → false
 }
 
+struct RecordingQuantBackend {
+    q4_calls: Cell<usize>,
+    q4k_inputs: RefCell<Vec<Vec<f32>>>,
+}
+
+impl RecordingQuantBackend {
+    fn new() -> Self {
+        Self {
+            q4_calls: Cell::new(0),
+            q4k_inputs: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl QuantMatVec for RecordingQuantBackend {
+    fn q4_matvec(
+        &self,
+        _q4_data: &[u8],
+        _q8_x: &[i8],
+        _q8_scales: &[f32],
+        num_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        self.q4_calls.set(self.q4_calls.get() + 1);
+        Some(vec![self.q4_calls.get() as f32; num_rows])
+    }
+
+    fn q4k_matvec(
+        &self,
+        _q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        self.q4k_inputs.borrow_mut().push(x.to_vec());
+        Some(vec![x.iter().sum(); num_rows])
+    }
+}
+
+struct ForwardingDecodeBackend {
+    full_pipeline_calls: Cell<usize>,
+    decode_calls: Cell<usize>,
+    prefill_calls: Cell<usize>,
+    moe_calls: Cell<usize>,
+}
+
+impl ForwardingDecodeBackend {
+    fn new() -> Self {
+        Self {
+            full_pipeline_calls: Cell::new(0),
+            decode_calls: Cell::new(0),
+            prefill_calls: Cell::new(0),
+            moe_calls: Cell::new(0),
+        }
+    }
+}
+
+impl DecodeBackend for ForwardingDecodeBackend {
+    fn full_pipeline_q4(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        seq_len: usize,
+        _use_qk_norm: bool,
+        _softcap: f32,
+    ) -> Option<Vec<f32>> {
+        self.full_pipeline_calls
+            .set(self.full_pipeline_calls.get() + 1);
+        Some(vec![seq_len as f32])
+    }
+
+    fn decode_token(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+    ) -> Option<Vec<f32>> {
+        self.decode_calls.set(self.decode_calls.get() + 1);
+        Some(x.to_vec())
+    }
+
+    fn decode_token_with_moe(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        self.moe_calls.set(self.moe_calls.get() + 1);
+        Some(moe_fn(7, x))
+    }
+
+    fn prefill_q4(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        seq_len: usize,
+        _use_qk_norm: bool,
+        _softcap: f32,
+    ) -> Option<Vec<f32>> {
+        self.prefill_calls.set(self.prefill_calls.get() + 1);
+        Some(x.iter().take(seq_len).copied().collect())
+    }
+}
+
 #[test]
 fn default_device_info_delegates_to_name() {
     let be = MinimalBackend;
@@ -292,6 +407,95 @@ fn default_supports_returns_false() {
 }
 
 #[test]
+fn quant_matvec_defaults_forward_and_dequantise_q8_tail() {
+    let be = RecordingQuantBackend::new();
+    let weights = vec![0u8; 18];
+    let x = vec![1.0f32; 32];
+
+    assert_eq!(
+        be.quant_matvec(QuantFormat::Q4_0, &weights, &x, 2, 32)
+            .unwrap(),
+        vec![1.0, 1.0]
+    );
+    assert_eq!(
+        be.quant_matvec_q8_input(QuantFormat::Q8_0, &weights, &[1, -1], &[0.5], 3, 2)
+            .unwrap(),
+        vec![2.0, 2.0, 2.0]
+    );
+
+    let mut q8 = vec![2i8; 35];
+    q8[32] = -3;
+    q8[33] = 4;
+    q8[34] = -5;
+    let out = be
+        .quant_matvec_q8_input(QuantFormat::Q4_K, &weights, &q8, &[0.25], 1, 35)
+        .unwrap();
+    let captured = be.q4k_inputs.borrow();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0][0], 0.5);
+    assert_eq!(&captured[0][32..], &[-3.0, 4.0, -5.0]);
+    assert_eq!(out, vec![16.0 - 4.0]);
+}
+
+#[test]
+fn decode_defaults_forward_to_specialized_entrypoints() {
+    let be = ForwardingDecodeBackend::new();
+    let layers: Vec<larql_compute::FullPipelineLayer<'_>> = Vec::new();
+    let x = vec![1.0f32, 2.0, 3.0, 4.0];
+
+    assert_eq!(
+        be.full_pipeline_q4_with_head_replacement(&layers, &x, 4, 8, 3, false, 0.0, 2, 0, &x,)
+            .unwrap(),
+        vec![3.0]
+    );
+    assert_eq!(be.full_pipeline_calls.get(), 1);
+
+    let mut ignored = 0usize;
+    assert_eq!(
+        be.decode_token_with_moe(&layers, &x, 4, 8, &mut |layer, h| {
+            ignored += layer + h.len();
+            vec![9.0; h.len()]
+        },)
+            .unwrap(),
+        vec![9.0; 4]
+    );
+    assert_eq!(be.moe_calls.get(), 1);
+    assert_eq!(ignored, 11);
+
+    let mut fired = 0usize;
+    let mut collected = 0usize;
+    assert_eq!(
+        be.decode_token_with_moe_split(
+            &layers,
+            &x,
+            4,
+            8,
+            &mut |layer, h| fired += layer + h.len(),
+            &mut |layer| {
+                collected += layer;
+                vec![layer as f32; 2]
+            },
+        )
+        .unwrap(),
+        vec![7.0, 7.0]
+    );
+    assert_eq!((fired, collected), (11, 7));
+
+    assert_eq!(
+        be.decode_token_split_profile(&layers, &x, 4, 8),
+        (Some(x.clone()), 0.0, 0.0, 0.0)
+    );
+    assert_eq!(be.decode_calls.get(), 1);
+
+    assert_eq!(
+        be.prefill_q4_with_head_replacement(&layers, &x, 4, 8, 2, false, 0.0, 0, 0, &x,)
+            .unwrap(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(be.prefill_calls.get(), 1);
+}
+
+#[test]
 fn default_quant_matvec_stubs_return_none() {
     let be = MinimalBackend;
     let dummy = vec![0u8; 18];
@@ -299,10 +503,70 @@ fn default_quant_matvec_stubs_return_none() {
     let dummy_f32 = vec![0.0f32; 256];
     let dummy_scales = vec![0.0f32; 1];
     assert!(be
+        .quant_matvec(QuantFormat::BF16, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::F16, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::F32, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::Q4_0, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::Q8_0, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::Q4_K, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::Q4_KF, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec(QuantFormat::Q6_K, &dummy, &dummy_f32, 1, 256)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::BF16, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::F16, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::F32, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::Q4_0, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::Q8_0, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::Q4_K, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::Q4_KF, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .quant_matvec_q8_input(QuantFormat::Q6_K, &dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
         .q4_matvec(&dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .q4_matvec_topk1(&dummy, &dummy_i8, &dummy_scales, 1, 32)
+        .is_none());
+    assert!(be
+        .q4_matvec_topk(&dummy, &dummy_i8, &dummy_scales, 1, 32, 4)
         .is_none());
     assert!(be.q4_vecmat(&dummy_f32[..32], &dummy, 32, 256).is_none());
     assert!(be.q4k_matvec(&dummy, &dummy_f32[..256], 1, 256).is_none());
+    assert!(be
+        .q4k_matvec_stride32(&dummy, &dummy_f32[..256], 1, 256)
+        .is_none());
+    assert!(be
+        .q4k_matmul(&dummy, &dummy_f32[..256], 1, 256, 1)
+        .is_none());
     assert!(be.q6k_matvec(&dummy, &dummy_f32[..256], 1, 256).is_none());
     assert!(be
         .q4_matvec_pair_batch(&dummy, &dummy, &dummy_f32[..256], 1, 1, 256)
@@ -313,6 +577,56 @@ fn default_quant_matvec_stubs_return_none() {
 #[test]
 fn default_decode_stubs() {
     let be = MinimalBackend;
+    let layers: Vec<larql_compute::FullPipelineLayer<'_>> = Vec::new();
+    let x = vec![0.0f32; 4];
     assert!(!be.has_kv_cache());
+    assert_eq!(be.kv_cache_len(), 0);
+    be.populate_kv_layer(0, &x, &x, 1, 1, 4);
+    be.preallocate_kv_cache_per_layer(&[(1, 4)], 16);
+    be.truncate_kv_cache(0);
     be.reset_kv_cache(); // default no-op, must not panic
+    assert!(be
+        .full_pipeline_q4(&layers, &x, 4, 8, 1, false, 0.0)
+        .is_none());
+    assert!(be
+        .full_pipeline_q4_with_head_replacement(&layers, &x, 4, 8, 1, false, 0.0, 0, 0, &x,)
+        .is_none());
+    assert!(be.multi_layer_q4_ffn(&[], &x, 8, 4).is_none());
+    assert!(be.decode_token(&layers, &x, 4, 8).is_none());
+
+    let mut fired = 0usize;
+    let mut collected = 0usize;
+    assert!(be
+        .decode_token_with_moe(&layers, &x, 4, 8, &mut |layer, h| {
+            fired += layer + h.len();
+            vec![1.0; h.len()]
+        },)
+        .is_none());
+    assert!(be
+        .decode_token_with_moe_split(
+            &layers,
+            &x,
+            4,
+            8,
+            &mut |layer, h| {
+                fired += layer + h.len();
+            },
+            &mut |layer| {
+                collected += layer + 1;
+                vec![2.0; 4]
+            },
+        )
+        .is_none());
+    assert_eq!((fired, collected), (0, 0));
+    assert_eq!(
+        be.decode_token_split_profile(&layers, &x, 4, 8),
+        (None, 0.0, 0.0, 0.0)
+    );
+    assert!(be.prefill_q4(&layers, &x, 4, 8, 1, false, 0.0).is_none());
+    assert!(be
+        .full_pipeline_q4_capture_pre_wo(&layers, &x, 4, 8, 1, false, 0.0, 0, 0,)
+        .is_none());
+    assert!(be
+        .prefill_q4_with_head_replacement(&layers, &x, 4, 8, 1, false, 0.0, 0, 0, &x,)
+        .is_none());
 }

@@ -6,7 +6,7 @@
 //!
 //! Flow per MoE layer (after the standard GPU commit for `h_post_attn`):
 //!
-//! 1. CPU: pre-experts norm + router projection + softmax + top-K + renorm.
+//! 1. CPU: model-declared expert input + router policy + softmax + top-K.
 //! 2. CPU→GPU: write the K selected experts' gate / up / down byte slices
 //!    DIRECTLY into pre-allocated Metal staging buffers (one memcpy each).
 //! 3. GPU: `q4k_ffn_gate_up` over all K experts in one dispatch.
@@ -28,7 +28,9 @@ use std::ffi::c_void;
 
 use super::buffers::{read_buffer_f32, BufferCache};
 use super::MetalBackend;
-use crate::cpu::ops::moe::cpu_moe_route;
+use crate::cpu::ops::moe::{
+    moe_expert_input, moe_post_expert_output, moe_route_from_router_input, moe_router_input,
+};
 use crate::MoeLayerWeights;
 
 /// Pre-allocated scratch for the whole MoE decode loop.
@@ -277,7 +279,7 @@ impl MetalBackend {
             return vec![0.0f32; hidden];
         }
 
-        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let timing_enabled = crate::options::env_flag(crate::options::ENV_METAL_MOE_TIMING);
         let t_start = std::time::Instant::now();
 
         let valid_count = expert_bufs.len().min(scratch.top_k);
@@ -299,11 +301,16 @@ impl MetalBackend {
         let gate_half_bytes = (inter * row_bytes) as u64;
         let n_rows = inter as u32;
         let k_cols = hidden as u32;
-        let tgs_per_mat =
-            (inter as u64).div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        // Geometry travels with `q4k_ffn_gate_up_pipeline` — read it
+        // off the `KernelHandle` rather than re-importing shader-module
+        // constants, so a future bump of the field to a different
+        // simdgroup variant doesn't silently drop rows. Same dispatch-
+        // geometry-mismatch class as the q4_matvec_v4 ROADMAP entry.
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_pipeline;
+        let tgs_per_mat = (inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
         for (e, (gate_up_buf, _)) in expert_bufs.iter().enumerate().take(valid_count) {
-            enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+            enc.set_compute_pipeline_state(&gate_up_kh.state);
             // Wg = gate (offset 0), Wu = up (offset gate_half_bytes) within the
             // same per-expert mmap-backed buffer.
             enc.set_buffer(0, Some(gate_up_buf), 0);
@@ -317,7 +324,7 @@ impl MetalBackend {
             enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(tgs_per_mat * 2, 1, 1),
-                MTLSize::new(crate::metal::shaders::q4k_ffn_gate_up::THREADS_PER_TG, 1, 1),
+                MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
             );
         }
 
@@ -327,14 +334,18 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
-            enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+            enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
             enc.set_buffer(0, Some(&scratch.g_out), g_offset);
             enc.set_buffer(1, Some(&scratch.u_out), u_offset);
             enc.set_buffer(2, Some(&scratch.act_buf), a_offset);
             enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(inter as u64, 1, 1),
-                MTLSize::new(256.min(inter as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                    1,
+                    1,
+                ),
             );
         }
 
@@ -347,13 +358,13 @@ impl MetalBackend {
         // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
         // only writes rows 0..3 of each TG's 8-row range. See the matching
         // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
         for (e, (_, down_buf)) in expert_bufs.iter().enumerate().take(valid_count) {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(down_buf), 0);
             enc.set_buffer(1, Some(&scratch.act_buf), act_offset);
             enc.set_buffer(2, Some(&scratch.expert_outs), out_offset);
@@ -430,7 +441,7 @@ impl MetalBackend {
             return vec![0.0f32; hidden];
         }
 
-        let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
+        let timing_enabled = crate::options::env_flag(crate::options::ENV_METAL_MOE_TIMING);
         let t_start = std::time::Instant::now();
 
         // ── Stage expert weight bytes into pre-allocated Metal buffers ─────
@@ -504,12 +515,14 @@ impl MetalBackend {
         let enc = cmd.new_compute_command_encoder();
 
         // q4k_ffn_gate_up over all valid_count experts at once.
+        // Geometry travels with the `KernelHandle` (see `decode_hybrid.rs`
+        // ship-log entry on this bug class).
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_pipeline;
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
-        let tgs = (valid_count as u64 * inter as u64)
-            .div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        let tgs = (valid_count as u64 * inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
-        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+        enc.set_compute_pipeline_state(&gate_up_kh.state);
         enc.set_buffer(0, Some(&scratch.gate_buf), 0);
         enc.set_buffer(1, Some(&scratch.up_buf), 0);
         enc.set_buffer(2, Some(&scratch.x_buf), 0);
@@ -519,7 +532,7 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(tgs * 2, 1, 1),
-            MTLSize::new(crate::metal::shaders::q4k_ffn_gate_up::THREADS_PER_TG, 1, 1),
+            MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
         );
 
         // GELU-tanh activation per expert (strided to inter_padded).
@@ -528,14 +541,18 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
-            enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+            enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
             enc.set_buffer(0, Some(&scratch.g_out), g_offset);
             enc.set_buffer(1, Some(&scratch.u_out), u_offset);
             enc.set_buffer(2, Some(&scratch.act_buf), a_offset);
             enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(inter as u64, 1, 1),
-                MTLSize::new(256.min(inter as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                    1,
+                    1,
+                ),
             );
         }
 
@@ -548,14 +565,14 @@ impl MetalBackend {
         // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
         // only writes rows 0..3 of each TG's 8-row range. See the matching
         // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
 
         for e in 0..valid_count {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(&scratch.down_bufs[e]), 0);
             enc.set_buffer(1, Some(&scratch.act_buf), act_offset);
             enc.set_buffer(2, Some(&scratch.expert_outs), out_offset);
@@ -615,8 +632,6 @@ impl MetalBackend {
         inter: usize,
         inter_padded: usize,
     ) -> Vec<f32> {
-        use crate::metal::shaders::q4k_ffn_gate_up_8sg as q4k_gu_8sg;
-
         if hidden == 0 || inter == 0 {
             return vec![0.0f32; hidden];
         }
@@ -634,10 +649,13 @@ impl MetalBackend {
         let enc = cmd.new_compute_command_encoder();
 
         // 1. q4k_ffn_gate_up_8sg — gate and up projections.
+        // Geometry pulled from the bound `KernelHandle` so a future
+        // pipeline swap can't drift from the dispatched TG shape.
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_8sg_pipeline;
         let n_rows = inter as u32;
         let k_cols = hidden as u32;
-        let n_tgs = (inter as u64).div_ceil(q4k_gu_8sg::ROWS_PER_TG);
-        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_8sg_pipeline.state);
+        let n_tgs = (inter as u64).div_ceil(gate_up_kh.rows_per_tg);
+        enc.set_compute_pipeline_state(&gate_up_kh.state);
         enc.set_buffer(0, Some(gate_buf), 0);
         enc.set_buffer(1, Some(up_buf), 0);
         enc.set_buffer(2, Some(&x_buf), 0);
@@ -647,19 +665,23 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(n_tgs * 2, 1, 1),
-            MTLSize::new(q4k_gu_8sg::THREADS_PER_TG, 1, 1),
+            MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
         );
 
         // 2. geglu_gelu_tanh activation.
         let inter_u32 = inter as u32;
-        enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+        enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
         enc.set_buffer(0, Some(&gate_out), 0);
         enc.set_buffer(1, Some(&up_out), 0);
         enc.set_buffer(2, Some(&act_buf), 0);
         enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
         enc.dispatch_threads(
             MTLSize::new(inter as u64, 1, 1),
-            MTLSize::new(256.min(inter as u64), 1, 1),
+            MTLSize::new(
+                crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                1,
+                1,
+            ),
         );
 
         // 3. q4k_matvec down projection.
@@ -667,10 +689,10 @@ impl MetalBackend {
         // the 4sg-vs-8sg dispatch geometry mismatch bug documented in ROADMAP.
         let n_out = hidden as u32;
         let k_in = inter_padded as u32;
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
-        enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+        enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
         enc.set_buffer(0, Some(down_buf), 0);
         enc.set_buffer(1, Some(&act_buf), 0);
         enc.set_buffer(2, Some(&out_buf), 0);
@@ -721,23 +743,12 @@ impl MetalBackend {
             "MoE hidden_size drift across layers"
         );
 
-        // ── 1. CPU pre-experts norm + router ─────────────────────────────
-        // Empirical: the trained 26B-A4B weights expect router input =
-        // pre_experts_norm(h_post_attn), not raw h_post_attn — even though
-        // HF's published Gemma4TextDecoderLayer.forward consumes the raw
-        // residual. Switching to the HF convention degrades generation to
-        // token repetition. Match the trained-weights convention here.
-        let h_norm = if !moe.pre_experts_norm.is_empty() {
-            let rms = (h_post_attn.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
-            h_post_attn
-                .iter()
-                .zip(moe.pre_experts_norm)
-                .map(|(x, w)| x / rms * (w + 0.0))
-                .collect::<Vec<f32>>()
-        } else {
-            h_post_attn.to_vec()
-        };
-        let (expert_indices, expert_weights) = cpu_moe_route(&h_norm, moe, eps);
+        // ── 1. CPU expert input + router ─────────────────────────────────
+        // The policy comes from `MoeLayerWeights`, so Gemma's
+        // pre_experts_norm routing convention is no longer implicit here.
+        let expert_input = moe_expert_input(h_post_attn, moe, 0.0, eps);
+        let router_in = moe_router_input(h_post_attn, &expert_input, moe, 0.0, eps);
+        let (expert_indices, expert_weights) = moe_route_from_router_input(&router_in, moe);
 
         // ── 2. Stage expert weight bytes into pre-allocated Metal buffers ─
         let row_bytes = scratch.row_bytes;
@@ -797,19 +808,21 @@ impl MetalBackend {
         // ── 3. Stage router-normed input into pre-allocated x_buf ─────────
         unsafe {
             let x_ptr = scratch.x_buf.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(h_norm.as_ptr(), x_ptr, hidden);
+            std::ptr::copy_nonoverlapping(expert_input.as_ptr(), x_ptr, hidden);
         }
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
 
         // ── 4. q4k_ffn_gate_up over all valid_count experts at once ──────
+        // Geometry travels with the `KernelHandle`; no shader-module
+        // ROWS_PER_TG/THREADS_PER_TG re-imports.
+        let gate_up_kh = &self.ffn.q4k_ffn_gate_up_pipeline;
         let n_rows = (valid_count * inter) as u32;
         let k_cols = hidden as u32;
-        let tgs = (valid_count as u64 * inter as u64)
-            .div_ceil(crate::metal::shaders::q4k_ffn_gate_up::ROWS_PER_TG);
+        let tgs = (valid_count as u64 * inter as u64).div_ceil(gate_up_kh.rows_per_tg);
 
-        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline.state);
+        enc.set_compute_pipeline_state(&gate_up_kh.state);
         enc.set_buffer(0, Some(&scratch.gate_buf), 0);
         enc.set_buffer(1, Some(&scratch.up_buf), 0);
         enc.set_buffer(2, Some(&scratch.x_buf), 0);
@@ -819,7 +832,7 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &k_cols as *const u32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(tgs * 2, 1, 1),
-            MTLSize::new(crate::metal::shaders::q4k_ffn_gate_up::THREADS_PER_TG, 1, 1),
+            MTLSize::new(gate_up_kh.threads_per_tg, 1, 1),
         );
 
         // ── 5. GELU-tanh activation per expert (strided to inter_padded) ──
@@ -832,14 +845,18 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
-            enc.set_compute_pipeline_state(&self.geglu_gelu_tanh_pipeline);
+            enc.set_compute_pipeline_state(&self.ffn.geglu_gelu_tanh_pipeline);
             enc.set_buffer(0, Some(&scratch.g_out), g_offset);
             enc.set_buffer(1, Some(&scratch.u_out), u_offset);
             enc.set_buffer(2, Some(&scratch.act_buf), a_offset);
             enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(inter as u64, 1, 1),
-                MTLSize::new(256.min(inter as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                    1,
+                    1,
+                ),
             );
         }
 
@@ -852,14 +869,14 @@ impl MetalBackend {
         // default since 2026-04-28) leaves simdgroups 4..7 unscheduled and
         // only writes rows 0..3 of each TG's 8-row range. See the matching
         // fix in `trait_impl/quant_matvec.rs::q4k_matvec`.
-        let down_rows_per_tg = self.q4k_matvec_pipeline.rows_per_tg;
-        let down_threads_per_tg = self.q4k_matvec_pipeline.threads_per_tg;
+        let down_rows_per_tg = self.quant.q4k_matvec_pipeline.rows_per_tg;
+        let down_threads_per_tg = self.quant.q4k_matvec_pipeline.threads_per_tg;
         let down_tgs = (hidden as u64).div_ceil(down_rows_per_tg);
 
         for e in 0..valid_count {
             let act_offset = (e * inter_padded * 4) as u64;
             let out_offset = (e * hidden * 4) as u64;
-            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline.state);
+            enc.set_compute_pipeline_state(&self.quant.q4k_matvec_pipeline.state);
             enc.set_buffer(0, Some(&scratch.down_bufs[e]), 0);
             enc.set_buffer(1, Some(&scratch.act_buf), act_offset);
             enc.set_buffer(2, Some(&scratch.expert_outs), out_offset);
@@ -885,12 +902,6 @@ impl MetalBackend {
             }
         }
 
-        if !moe.post_experts_norm.is_empty() {
-            let rms = (moe_out.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
-            for (v, &w) in moe_out.iter_mut().zip(moe.post_experts_norm) {
-                *v = *v / rms * (w + 0.0);
-            }
-        }
-        moe_out
+        moe_post_expert_output(&moe_out, moe, 0.0, eps)
     }
 }

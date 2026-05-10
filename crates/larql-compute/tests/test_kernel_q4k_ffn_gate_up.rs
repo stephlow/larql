@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `q4k_ffn_gate_up` — the fused gate+up matvec
 //! that runs once per layer in production Q4_K decode.
@@ -87,7 +87,7 @@ fn assert_q4k_ffn_gate_up_matches_per_matrix(label: &str, inter: usize, hidden: 
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_ffn_gate_up_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.ffn.q4k_ffn_gate_up_pipeline.state);
     enc.set_buffer(0, Some(&gate_w_buf), 0);
     enc.set_buffer(1, Some(&up_w_buf), 0);
     enc.set_buffer(2, Some(&x_buf), 0);
@@ -216,7 +216,7 @@ fn q4k_ffn_gate_up_zero_input() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_ffn_gate_up_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.ffn.q4k_ffn_gate_up_pipeline.state);
     enc.set_buffer(0, Some(&gate_w_buf), 0);
     enc.set_buffer(1, Some(&up_w_buf), 0);
     enc.set_buffer(2, Some(&x_buf), 0);

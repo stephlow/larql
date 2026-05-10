@@ -146,6 +146,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result.avg_decode_ms(),
             result.decode_tok_s()
         );
+
+        // Cold vs warm split — when run with `--warmup 0`, token 1 is
+        // the first decode call against a fresh backend and pays any
+        // one-time costs (Metal buffer allocation for `MoeScratch`,
+        // KV-cache first-touch, mmap fault-in). Tokens 2+ are
+        // steady-state. The ratio answers "is the per-decode allocation
+        // claim in ROADMAPs (~120ms on Gemma 4 26B A4B) actually
+        // amortized after the first token?" — see
+        // `crates/larql-vindex/docs/per-layer-ffn-phase2-research.md`.
+        if warmup == 0 && result.decode_ms.len() >= 2 {
+            let cold = result.decode_ms[0];
+            let warm: f64 =
+                result.decode_ms[1..].iter().sum::<f64>() / (result.decode_ms.len() - 1) as f64;
+            let overhead = cold - warm;
+            let ratio = if warm > 0.0 { cold / warm } else { 0.0 };
+            println!();
+            println!("  Cold vs warm (warmup=0, MoE Phase 2 acceptance check):");
+            println!(
+                "    Cold (token 1):              {:>7.1}ms  ({:.0} tok/s)",
+                cold,
+                1000.0 / cold
+            );
+            println!(
+                "    Warm (mean of tokens 2-{}): {:>7.1}ms  ({:.0} tok/s)",
+                result.decode_ms.len(),
+                warm,
+                1000.0 / warm
+            );
+            println!(
+                "    First-token overhead:        {:>7.1}ms  (cold/warm = {:.2}×)",
+                overhead, ratio
+            );
+        }
     }
 
     println!();

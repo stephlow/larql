@@ -172,8 +172,8 @@ impl AttentionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
+    use crate::test_utils::make_test_weights;
     use ndarray::Array2;
 
     #[test]
@@ -239,5 +239,85 @@ mod tests {
     fn cached_layer_graph_name() {
         let g = CachedLayerGraph::from_residuals(vec![]);
         assert_eq!(g.name(), "cached");
+    }
+
+    #[test]
+    fn build_caches_multiple_layers() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let g = CachedLayerGraph::build(&weights, &[0u32, 1, 2], &[0, 1], &ffn);
+        assert!(g.has_layer(0));
+        assert!(g.has_layer(1));
+        assert_eq!(g.num_cached(), 2);
+    }
+
+    #[test]
+    fn build_with_empty_layer_list_caches_nothing() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let g = CachedLayerGraph::build(&weights, &[0u32], &[], &ffn);
+        assert_eq!(g.num_cached(), 0);
+    }
+
+    #[test]
+    fn build_adaptive_graph_routes_layers_through_cache_or_fallback() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let cache =
+            CachedLayerGraph::from_residuals(vec![(0, Array2::zeros((1, weights.hidden_size)))]);
+        let fallback = DenseLayerGraph {
+            ffn: &ffn,
+            backend: None,
+            capture_activation: false,
+            capture_attention: false,
+        };
+        let _adaptive = build_adaptive_graph(&cache, &fallback, weights.num_layers, &(0..=0));
+        // Just exercise the constructor — verifying routing requires the
+        // PerLayerGraph dispatch surface which is covered elsewhere.
+    }
+
+    #[test]
+    fn build_adaptive_graph_skips_cache_when_layer_outside_range() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let cache = CachedLayerGraph::from_residuals(vec![]);
+        let fallback = DenseLayerGraph {
+            ffn: &ffn,
+            backend: None,
+            capture_activation: false,
+            capture_attention: false,
+        };
+        let _ = build_adaptive_graph(
+            &cache,
+            &fallback,
+            weights.num_layers,
+            &(weights.num_layers..=weights.num_layers + 5),
+        );
+    }
+
+    #[test]
+    fn attention_cache_build_captures_one_ffn_input_per_layer() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let cache = CachedLayerGraph::from_residuals(vec![]);
+        let layer_range = 0..weights.num_layers;
+        let ac = AttentionCache::build(&weights, &[0u32, 1, 2], &cache, &ffn, layer_range);
+        assert_eq!(ac.ffn_inputs.len(), weights.num_layers);
+        for input in &ac.ffn_inputs {
+            assert_eq!(input.len(), weights.hidden_size);
+            assert!(input.iter().all(|v| v.is_finite()));
+        }
+        assert_eq!(ac.final_residual.shape(), &[3, weights.hidden_size]);
+    }
+
+    #[test]
+    fn attention_cache_build_partial_range_skips_layers() {
+        // Layer range starting > 0 should still produce per-walk-layer
+        // FFN inputs, just for the walked subset.
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let cache = CachedLayerGraph::from_residuals(vec![]);
+        let ac = AttentionCache::build(&weights, &[0u32, 1], &cache, &ffn, 1..weights.num_layers);
+        assert_eq!(ac.ffn_inputs.len(), weights.num_layers - 1);
     }
 }

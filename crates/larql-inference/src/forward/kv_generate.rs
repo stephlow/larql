@@ -467,8 +467,8 @@ fn masked_argmax(logits: &[f32], tokenizer: &tokenizers::Tokenizer) -> Option<(u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{make_test_tokenizer, make_test_weights};
     use crate::ffn::WeightFfn;
+    use crate::test_utils::{make_test_tokenizer, make_test_weights};
 
     #[test]
     fn generate_cached_returns_token_ids() {

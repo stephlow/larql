@@ -1,4 +1,4 @@
-//! Rust-native port of `experiments/07_wasm_compute/wasm_solver_demo_v11.py`
+//! Rust-native port of `~/chris-source/chris-experiments/foundations/07_wasm_compute/wasm_solver_demo_v11.py`
 //! scheduling benchmark, using `model-compute::wasm` as the host runtime.
 //!
 //! Problem: assign N tasks to distinct time slots in [0, max_time-1],
@@ -6,7 +6,7 @@
 //! makespan = 4 (tasks go to slots 0..4).
 //!
 //! The WASM guest is the CP-SAT solver from
-//! `experiments/07_wasm_compute/solver/` — the same 22 KB module that
+//! `~/chris-source/chris-experiments/foundations/07_wasm_compute/solver/` — the same 22 KB module that
 //! demonstrated "constraint solving inside a transformer forward pass".
 //! This example shows the host-side path in Rust: load module, encode
 //! problem bytes, call solve, decode result.
@@ -15,9 +15,9 @@
 //!   cargo run --example cpsat_scheduling -p model-compute --features wasm
 //!
 //! The example auto-discovers the prebuilt .wasm at
-//! `experiments/07_wasm_compute/solver/target/wasm32-unknown-unknown/release/larql_wasm_solver.wasm`.
+//! `~/chris-source/chris-experiments/foundations/07_wasm_compute/solver/target/wasm32-unknown-unknown/release/larql_wasm_solver.wasm`.
 //! To rebuild the module:
-//!   (cd experiments/07_wasm_compute/solver && cargo build --release --target wasm32-unknown-unknown)
+//!   (cd ~/chris-source/chris-experiments/foundations/07_wasm_compute/solver && cargo build --release --target wasm32-unknown-unknown)
 
 #[cfg(not(feature = "wasm"))]
 fn main() {
@@ -126,12 +126,12 @@ fn find_wasm() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         .and_then(|p| p.parent())
         .ok_or("failed to locate workspace root")?;
     let wasm = workspace.join(
-        "experiments/07_wasm_compute/solver/target/wasm32-unknown-unknown/release/larql_wasm_solver.wasm",
+        "~/chris-source/chris-experiments/foundations/07_wasm_compute/solver/target/wasm32-unknown-unknown/release/larql_wasm_solver.wasm",
     );
     if !wasm.exists() {
         return Err(format!(
             "WASM module not found at {}\n\
-             Build it first:\n  (cd experiments/07_wasm_compute/solver && \\\n  \
+             Build it first:\n  (cd ~/chris-source/chris-experiments/foundations/07_wasm_compute/solver && \\\n  \
              cargo build --release --target wasm32-unknown-unknown)",
             wasm.display()
         )

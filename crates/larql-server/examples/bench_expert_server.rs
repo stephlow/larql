@@ -589,6 +589,8 @@ fn main() {
     let layer_w = MoeLayerWeights {
         experts_gate_up: experts_gate_up_local,
         experts_down: experts_down_local,
+        routing_policy: larql_compute::MoeRoutingPolicy::gemma4_hybrid(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router_proj,
         router_scale: &router_scale,
         router_per_expert_scale: &router_per_expert_scale,

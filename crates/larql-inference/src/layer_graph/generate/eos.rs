@@ -286,7 +286,7 @@ mod tests {
                 "unk_token": "[UNK]",
             },
         });
-        tokenizers::Tokenizer::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap()
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap()
     }
 
     #[test]

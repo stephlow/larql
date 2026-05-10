@@ -7,6 +7,7 @@ use crate::architectures::gemma2::Gemma2Arch;
 use crate::architectures::gemma3::Gemma3Arch;
 use crate::architectures::gemma4::Gemma4Arch;
 use crate::architectures::generic::GenericArch;
+use crate::architectures::gpt2::Gpt2Arch;
 use crate::architectures::gpt_oss::GptOssArch;
 use crate::architectures::granite::GraniteArch;
 use crate::architectures::llama::LlamaArch;
@@ -81,6 +82,8 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "mistral" => Box::new(MistralArch::from_config(model_config)),
         // Mixtral (MoE) — block_sparse_moe pattern
         "mixtral" => Box::new(MixtralArch::from_config(model_config)),
+        // GPT-2 (non-gated FFN, LayerNorm, learned positional embeddings)
+        "gpt2" => Box::new(Gpt2Arch::from_config(model_config)),
         // GPT-OSS (MoE, MXFP4 packed experts)
         "gpt_oss" => Box::new(GptOssArch::from_config(model_config)),
         // Qwen family (dense and MoE share same keys)
@@ -573,6 +576,84 @@ mod tests {
             arch.expert_ffn_down_key(0, 5).unwrap(),
             "layers.0.mlp.experts.5.down_proj.weight"
         );
+    }
+
+    #[test]
+    fn test_detect_gpt2() {
+        // GPT-2 small config. Architecture must dispatch to Gpt2Arch with
+        // LayerNorm + Standard (non-gated) FFN + GELU-tanh activation.
+        let config = serde_json::json!({
+            "model_type": "gpt2",
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "num_key_value_heads": 12,
+            "vocab_size": 50257
+        });
+
+        let arch = detect_from_json(&config);
+        assert_eq!(arch.family(), "gpt2");
+        assert_eq!(arch.config().hidden_size, 768);
+        assert_eq!(arch.config().intermediate_size, 3072);
+        assert_eq!(arch.config().num_layers, 12);
+        assert_eq!(arch.norm_type(), crate::config::NormType::LayerNorm);
+        assert_eq!(arch.activation(), crate::config::Activation::GeluTanh);
+        assert_eq!(arch.ffn_type(), crate::config::FfnType::Standard);
+        assert!(!arch.is_moe());
+
+        // Fused QKV + every-projection biases are GPT-2-specific; trait
+        // defaults return None elsewhere.
+        assert_eq!(
+            arch.fused_qkv_key(3),
+            Some("layers.3.self_attn.qkv_proj.weight".to_string())
+        );
+        assert_eq!(
+            arch.fused_qkv_bias_key(3),
+            Some("layers.3.self_attn.qkv_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_q_bias_key(3),
+            Some("layers.3.self_attn.q_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_k_bias_key(3),
+            Some("layers.3.self_attn.k_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_v_bias_key(3),
+            Some("layers.3.self_attn.v_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.attn_o_bias_key(3),
+            Some("layers.3.self_attn.o_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.ffn_up_bias_key(3),
+            Some("layers.3.mlp.up_proj.bias".to_string())
+        );
+        assert_eq!(
+            arch.ffn_down_bias_key(3),
+            Some("layers.3.mlp.down_proj.bias".to_string())
+        );
+
+        // Learned positional embeddings — wpe lookup key.
+        assert_eq!(arch.position_embed_key(), Some("wpe.weight"));
+    }
+
+    #[test]
+    fn test_non_gpt2_archs_have_no_fused_qkv_or_position_embed() {
+        // Defaults must remain None for everyone else, otherwise the loader
+        // would try to split projections that are already separate.
+        let llama = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32
+        });
+        let arch = detect_from_json(&llama);
+        assert!(arch.fused_qkv_key(0).is_none());
+        assert!(arch.fused_qkv_bias_key(0).is_none());
+        assert!(arch.position_embed_key().is_none());
     }
 
     #[test]

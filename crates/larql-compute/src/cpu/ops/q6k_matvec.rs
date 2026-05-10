@@ -3,8 +3,7 @@
 //! Mirrors the Metal shader `q6k_matvec` exactly for cross-backend testing.
 //! Not optimised — scalar code intended as a correctness reference.
 
-/// Q6_K super-block size: 210 bytes per 256 values.
-const Q6K_BLOCK_SIZE: usize = 210;
+use larql_models::quant::ggml::Q6_K_BLOCK_BYTES as Q6K_BLOCK_SIZE;
 
 /// Decode f16 bits to f32.
 fn f16_to_f32(bits: u16) -> f32 {

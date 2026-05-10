@@ -2,7 +2,28 @@
 
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
-use larql_compute::CpuBackend;
+
+const ENV_LM_HEAD_SKIP_Q4K: &str = "LARQL_LM_HEAD_SKIP_Q4K";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LmHeadPolicy {
+    pub skip_q4k: bool,
+}
+
+impl LmHeadPolicy {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            skip_q4k: env_bool(ENV_LM_HEAD_SKIP_Q4K),
+        }
+    }
+}
+
+fn env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
 
 /// Top-K logits lookup that transparently handles models with tied
 /// input/output embeddings (Gemma 2/3/4) whose vindex has no dedicated
@@ -26,6 +47,24 @@ pub fn lm_head_topk(
     top_k: usize,
     backend: &dyn ComputeBackend,
 ) -> Vec<(u32, f32)> {
+    lm_head_topk_with_policy(
+        index,
+        weights,
+        query,
+        top_k,
+        backend,
+        &LmHeadPolicy::from_env(),
+    )
+}
+
+pub(crate) fn lm_head_topk_with_policy(
+    index: &larql_vindex::VectorIndex,
+    weights: &ModelWeights,
+    query: &ndarray::Array1<f32>,
+    top_k: usize,
+    backend: &dyn ComputeBackend,
+    policy: &LmHeadPolicy,
+) -> Vec<(u32, f32)> {
     // Default route: `lm_head_knn_backend` — Metal `q4k_matvec` first
     // (1.85 ms/tok on Gemma 3 4B, was 2.95 ms via the stride-32 workaround
     // before the 2026-05-02 dispatch-geometry fix), f16 GEMV fallback for
@@ -35,13 +74,8 @@ pub fn lm_head_topk(
     // (stride-32 Q4_K → f16 → f32) for diagnostic A/B against the Q4_K
     // path. See `crates/larql-compute/PERFORMANCE.md` "Decision: lm_head
     // dispatch order" for the full root-cause history.
-    let skip_q4k = matches!(
-        std::env::var("LARQL_LM_HEAD_SKIP_Q4K").as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-    );
-    let is_metal_backend = backend.as_any().type_id() != std::any::TypeId::of::<CpuBackend>();
-    if skip_q4k && is_metal_backend {
-        // Diagnostic path: skip the Q4_K Metal matvec and use stride-32
+    if policy.skip_q4k && backend.supports(Capability::F32Gemv) {
+        // Diagnostic path: skip the Q4_K accelerated matvec and use stride-32
         // Q4_K (or f16 GEMV / f32 BLAS) instead. Useful for verifying
         // top-1 stability against a known-stable reduction tree, or for
         // vindexes where the Q4_K lm_head bytes aren't populated.
@@ -146,6 +180,12 @@ pub(super) fn backend_lm_head_topk(
     // Min-heap of size k: O(k) space, O(N log k) time.
     // Avoids allocating the full 262K×8=2MB indexed Vec.
     let k = top_k.min(vocab);
+    if k == 0 {
+        // top_k=0 means "no results requested" — return empty without
+        // touching the heap (else `heap[0]` indexes out of bounds in
+        // the per-score loop).
+        return Vec::new();
+    }
     let _ = vocab;
     let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
 
@@ -241,32 +281,6 @@ pub(super) fn backend_lm_head_scores(
     }
 }
 
-/// Apply `mask_fn` to dense logits, then return the argmax `(id, score)`
-/// over finite (post-mask) entries. Returns `None` if every entry is NaN
-/// or `-inf`. Greedy under mask (no sampler).
-pub(super) fn pick_next_token_masked<M>(
-    weights: &ModelWeights,
-    h_1d: &ndarray::Array1<f32>,
-    generated: &[u32],
-    backend: &dyn ComputeBackend,
-    mask_fn: &mut M,
-) -> Option<(u32, f32)>
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-{
-    let mut logits = backend_lm_head_scores(weights, h_1d, backend);
-    if logits.is_empty() {
-        return None;
-    }
-    mask_fn(generated, &mut logits);
-    logits
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| !v.is_nan() && v.is_finite())
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, &s)| (i as u32, s))
-}
-
 /// Sampling-under-mask variant. Runs the dense LM head, applies the
 /// mask, then defers token selection to the caller-supplied
 /// [`Sampler`]. Repetition penalties on the sampler are applied as
@@ -294,4 +308,241 @@ where
     let id = sampler.sample_with_history(&logits, generated)?;
     let score = *logits.get(id as usize)?;
     Some((id, score))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::TestFixtures;
+    use ndarray::Array1;
+
+    fn fx() -> TestFixtures {
+        TestFixtures::build()
+    }
+
+    #[test]
+    fn env_bool_recognises_truthy_values() {
+        std::env::remove_var("LARQL_TEST_LMHEAD_ENV_BOOL");
+        assert!(!env_bool("LARQL_TEST_LMHEAD_ENV_BOOL"));
+        for &v in &["1", "true", "on", "yes"] {
+            std::env::set_var("LARQL_TEST_LMHEAD_ENV_BOOL", v);
+            assert!(
+                env_bool("LARQL_TEST_LMHEAD_ENV_BOOL"),
+                "value {v:?} should be truthy"
+            );
+        }
+        // Falsy: anything else.
+        std::env::set_var("LARQL_TEST_LMHEAD_ENV_BOOL", "no");
+        assert!(!env_bool("LARQL_TEST_LMHEAD_ENV_BOOL"));
+        std::env::remove_var("LARQL_TEST_LMHEAD_ENV_BOOL");
+    }
+
+    #[test]
+    fn lm_head_policy_default_is_off() {
+        let p = LmHeadPolicy::default();
+        assert!(!p.skip_q4k);
+    }
+
+    #[test]
+    fn backend_lm_head_topk_returns_at_most_top_k() {
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.1);
+        let hits = backend_lm_head_topk(&f.weights, &q, 5, &larql_compute::CpuBackend);
+        assert!(hits.len() <= 5);
+        assert!(hits.iter().all(|(_, s)| s.is_finite()));
+    }
+
+    #[test]
+    fn backend_lm_head_topk_handles_empty_lm_head() {
+        // Force an empty lm_head.
+        let mut f = fx();
+        f.weights.lm_head = ndarray::Array2::<f32>::zeros((0, f.weights.hidden_size)).into_shared();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.1);
+        let hits = backend_lm_head_topk(&f.weights, &q, 5, &larql_compute::CpuBackend);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn backend_lm_head_topk_handles_empty_query() {
+        let f = fx();
+        let q = Array1::<f32>::zeros(0);
+        let hits = backend_lm_head_topk(&f.weights, &q, 5, &larql_compute::CpuBackend);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn backend_lm_head_topk_handles_dim_mismatch() {
+        let f = fx();
+        let q = Array1::<f32>::zeros(f.weights.hidden_size + 1);
+        let hits = backend_lm_head_topk(&f.weights, &q, 5, &larql_compute::CpuBackend);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn cpu_lm_head_topk_matches_backend_with_cpu() {
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
+        let cpu = cpu_lm_head_topk(&f.weights, &q, 4);
+        let direct = backend_lm_head_topk(&f.weights, &q, 4, &larql_compute::CpuBackend);
+        assert_eq!(cpu.len(), direct.len());
+        for ((a_t, a_s), (b_t, b_s)) in cpu.iter().zip(direct.iter()) {
+            assert_eq!(a_t, b_t);
+            assert!((a_s - b_s).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn backend_lm_head_scores_returns_full_vocab_vector() {
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.1);
+        let scores = backend_lm_head_scores(&f.weights, &q, &larql_compute::CpuBackend);
+        assert_eq!(scores.len(), f.weights.vocab_size);
+        assert!(scores.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn backend_lm_head_scores_handles_dim_mismatch() {
+        let f = fx();
+        let q = Array1::<f32>::zeros(f.weights.hidden_size + 1);
+        let scores = backend_lm_head_scores(&f.weights, &q, &larql_compute::CpuBackend);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn backend_lm_head_scores_handles_empty_lm_head() {
+        let mut f = fx();
+        f.weights.lm_head = ndarray::Array2::<f32>::zeros((0, f.weights.hidden_size)).into_shared();
+        let q = Array1::<f32>::zeros(f.weights.hidden_size);
+        assert!(backend_lm_head_scores(&f.weights, &q, &larql_compute::CpuBackend).is_empty());
+    }
+
+    #[test]
+    fn pick_next_token_masked_sampled_returns_id_and_score() {
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
+        let mut sampler =
+            super::super::sampling::Sampler::new(super::super::sampling::SamplingConfig::greedy());
+        let mut mask = |_generated: &[u32], _logits: &mut Vec<f32>| {
+            // No-op mask
+        };
+        let pick = pick_next_token_masked_sampled(
+            &f.weights,
+            &q,
+            &[],
+            &larql_compute::CpuBackend,
+            &mut mask,
+            &mut sampler,
+        );
+        let (id, score) = pick.expect("greedy pick on full vocab must succeed");
+        assert!((id as usize) < f.weights.vocab_size);
+        assert!(score.is_finite());
+    }
+
+    #[test]
+    fn pick_next_token_masked_sampled_returns_none_when_lm_head_empty() {
+        let mut f = fx();
+        f.weights.lm_head = ndarray::Array2::<f32>::zeros((0, f.weights.hidden_size)).into_shared();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.0);
+        let mut sampler =
+            super::super::sampling::Sampler::new(super::super::sampling::SamplingConfig::greedy());
+        let mut mask = |_g: &[u32], _l: &mut Vec<f32>| {};
+        assert!(pick_next_token_masked_sampled(
+            &f.weights,
+            &q,
+            &[],
+            &larql_compute::CpuBackend,
+            &mut mask,
+            &mut sampler,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn lm_head_topk_uses_policy_from_env_default() {
+        // Public `lm_head_topk` consults LmHeadPolicy::from_env() — when
+        // the env var is unset the default skip_q4k=false routes through
+        // the standard path. Synthetic vindex has no lm_head data, so
+        // `lm_head_knn_backend` returns empty hits → fallback to
+        // `backend_lm_head_topk` against weights.lm_head.
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
+        let hits = lm_head_topk(&f.index, &f.weights, &q, 4, &larql_compute::CpuBackend);
+        // Either populated by backend_lm_head_topk fallback or empty (both valid).
+        assert!(hits.len() <= 4);
+        for (id, _) in &hits {
+            assert!((*id as usize) < f.weights.vocab_size);
+        }
+    }
+
+    #[test]
+    fn lm_head_topk_with_policy_skip_q4k_routes_through_diagnostic_path() {
+        // skip_q4k=true + a backend that supports F32Gemv (CpuBackend
+        // does) routes through the `lm_head_knn_backend_skip_q4k` arm
+        // and falls back to backend_lm_head_topk on empty hits.
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
+        let policy = LmHeadPolicy { skip_q4k: true };
+        let hits = lm_head_topk_with_policy(
+            &f.index,
+            &f.weights,
+            &q,
+            4,
+            &larql_compute::CpuBackend,
+            &policy,
+        );
+        assert!(hits.len() <= 4);
+    }
+
+    #[test]
+    fn backend_lm_head_topk_top_k_1_fast_path_returns_argmax() {
+        // top_k=1 routes through the f32_gemv_topk1 fast path on backends
+        // that support it; CpuBackend may or may not — falls through to
+        // the linear scan otherwise. Either way the result is a single
+        // top-scoring (id, score) pair.
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
+        let hits = backend_lm_head_topk(&f.weights, &q, 1, &larql_compute::CpuBackend);
+        assert_eq!(hits.len(), 1);
+        let (id, score) = hits[0];
+        assert!((id as usize) < f.weights.vocab_size);
+        assert!(score.is_finite());
+    }
+
+    #[test]
+    fn backend_lm_head_topk_top_k_zero_returns_empty() {
+        // Regression: top_k=0 used to panic with `index out of bounds: 0`
+        // in the heap path because the per-score loop accessed `heap[0]`
+        // before checking `k > 0`. Fixed by early-return on `k == 0`.
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.1);
+        let hits = backend_lm_head_topk(&f.weights, &q, 0, &larql_compute::CpuBackend);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn pick_next_token_masked_sampled_invokes_mask_fn() {
+        let f = fx();
+        let q = Array1::<f32>::from_elem(f.weights.hidden_size, 0.05);
+        let mut sampler =
+            super::super::sampling::Sampler::new(super::super::sampling::SamplingConfig::greedy());
+        // Mask all but token 7 to NEG_INFINITY → greedy pick must be 7.
+        let target_id = 7u32;
+        let mut mask = |_g: &[u32], logits: &mut Vec<f32>| {
+            for (i, l) in logits.iter_mut().enumerate() {
+                if i as u32 != target_id {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        };
+        let (id, _) = pick_next_token_masked_sampled(
+            &f.weights,
+            &q,
+            &[],
+            &larql_compute::CpuBackend,
+            &mut mask,
+            &mut sampler,
+        )
+        .expect("greedy pick under tight mask");
+        assert_eq!(id, target_id);
+    }
 }

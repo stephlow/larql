@@ -1,6 +1,8 @@
 # Rust
 target/
+coverage/
 **/*.rs.bk
+.cargo/
 
 # Python / maturin
 .venv/
@@ -13,6 +15,8 @@ __pycache__/
 dist/
 build/
 *.whl
+# Don't ignore Rust source modules named `build/`
+!crates/*/src/**/build/
 
 # IDE
 .idea/
@@ -25,6 +29,21 @@ build/
 
 # Checkpoints / temp
 *.checkpoint
+
+# Weights and binary model files — never commit these
+*.npz
+*.npy
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.pkl
+*.h5
+*.hdf5
+*.vindex
 
 # Nix
 result

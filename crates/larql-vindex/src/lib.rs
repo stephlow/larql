@@ -35,6 +35,8 @@ pub mod format;
 pub mod index;
 pub mod patch;
 pub mod quant;
+pub mod trie;
+pub mod walker;
 // Back-compat alias — the top-level lifecycle dir was renamed
 // `storage/` → `engine/` in the 2026-04-25 round-2 cleanup. The name
 // `storage` was confusing because `index/storage/` held the actual
@@ -52,9 +54,9 @@ pub use tokenizers;
 // Config
 pub use config::dtype::StorageDtype;
 pub use config::types::{
-    ComplianceGate, DownMetaRecord, DownMetaTopK, ExtractLevel, Fp4Config, LayerBands, MoeConfig,
-    Precision, ProjectionFormat, Projections, QuantFormat, VindexConfig, VindexLayerInfo,
-    VindexModelConfig, VindexSource,
+    ComplianceGate, DownMetaRecord, DownMetaTopK, ExtractLevel, FfnLayout, Fp4Config, LayerBands,
+    MoeConfig, Precision, ProjectionFormat, Projections, QuantFormat, VindexConfig,
+    VindexLayerInfo, VindexModelConfig, VindexSource,
 };
 
 // Error
@@ -62,8 +64,9 @@ pub use error::VindexError;
 
 // Index
 pub use index::core::{
-    FeatureMeta, GateIndex, IndexLoadCallbacks, SilentLoadCallbacks, StorageBucket, VectorIndex,
-    WalkHit, WalkTrace,
+    FeatureMeta, FfnRowAccess, Fp4FfnAccess, GateIndex, GateLookup, IndexLoadCallbacks,
+    NativeFfnAccess, PatchOverrides, QuantizedFfnAccess, SilentLoadCallbacks, StorageBucket,
+    VectorIndex, WalkHit, WalkTrace,
 };
 pub use index::residency::{LayerState, ResidencyManager};
 pub use index::router::{RouteResult, RouterIndex};
@@ -73,8 +76,8 @@ pub use describe::{DescribeEdge, LabelSource};
 
 // Extract
 pub use extract::{
-    build_vindex, build_vindex_from_vectors, build_vindex_resume, build_vindex_streaming,
-    snapshot_hf_metadata, IndexBuildCallbacks, SilentBuildCallbacks, SNAPSHOT_FILES,
+    build_vindex, build_vindex_from_vectors, build_vindex_streaming, snapshot_hf_metadata,
+    IndexBuildCallbacks, SilentBuildCallbacks, SNAPSHOT_FILES,
 };
 
 // Format
@@ -86,9 +89,9 @@ pub use format::load::{
 // Model loading: use larql_models::{load_model_dir, resolve_model_path, load_gguf} directly
 pub use format::huggingface::{
     dataset_repo_exists, download_hf_weights, ensure_collection, fetch_collection_items,
-    is_hf_path, publish_vindex, publish_vindex_with_opts, repo_exists, resolve_hf_vindex,
-    resolve_hf_vindex_with_progress, CollectionItem, DownloadProgress, PublishCallbacks,
-    PublishOptions, SilentPublishCallbacks,
+    is_hf_path, publish_vindex, publish_vindex_with_opts, repo_exists,
+    resolve_hf_model_with_progress, resolve_hf_vindex, resolve_hf_vindex_with_progress,
+    CollectionItem, DownloadProgress, PublishCallbacks, PublishOptions, SilentPublishCallbacks,
 };
 pub use format::weights::{
     load_model_weights, load_model_weights_q4k, load_model_weights_q4k_shard,
@@ -101,6 +104,19 @@ pub use format::weights::{
 pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};
 pub use patch::knn_store::{KnnEntry, KnnStore};
 pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};
+
+// Trie probe (route classifier loaded from JSON)
+pub use trie::CascadeTrie;
+
+// Walker — build-time graph extraction (FFN + attention) and vector dump.
+// Full module surface is reachable via `larql_vindex::walker::*`.
+pub use walker::attention_walker::{AttentionLayerResult, AttentionWalker};
+pub use walker::vector_extractor::{
+    ExtractCallbacks, ExtractConfig, ExtractSummary, VectorExtractor,
+};
+pub use walker::weight_walker::{
+    walk_model, LayerResult, LayerStats, WalkCallbacks, WalkConfig, WeightWalker,
+};
 
 // Storage engine — `engine` (preferred); `storage` still available as alias.
 pub use engine::{

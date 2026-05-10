@@ -28,6 +28,7 @@ use super::PredictResult;
 /// Constructed via [`InferenceWeights::load`]. Callers use
 /// [`InferenceWeights::infer_patched`] and [`InferenceWeights::as_weights`]
 /// without branching on the underlying format.
+#[allow(clippy::large_enum_variant)]
 pub enum InferenceWeights {
     Dense(ModelWeights),
     Quantised {

@@ -15,12 +15,17 @@
 //! refactor moves to direct callbacks, `run_with_dump_dir` can become a
 //! callback adapter without changing the public surface.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use larql_models::ModelWeights;
 use larql_vindex::{GateIndex, VectorIndex};
 
+use crate::forward::dump_config::{
+    cpu_layer_file, decode_layer_file, metal_layer_h_out_file, ENV_CPU_DUMP_LAYERS,
+    ENV_DECODE_DUMP_LAYERS, ENV_METAL_DUMP_LAYERS,
+};
 use crate::layer_graph::generate::generate;
+use crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 use crate::layer_graph::CachedLayerGraph;
 
 /// Per-layer end-of-layer hidden state. `layers[l]` is the residual
@@ -86,13 +91,13 @@ impl ResidualCapture {
         let num_layers = weights.num_layers;
         let seq_len = ids.len();
 
-        let dir = run_with_dump_dir("LARQL_CPU_DUMP_LAYERS", || {
+        let dir = run_with_dump_dir(ENV_CPU_DUMP_LAYERS, || {
             let _ = crate::vindex::predict_q4k_hidden(weights, ids, index, None);
         })?;
 
         let layers = (0..num_layers)
             .map(|l| {
-                let path = dir.path().join(format!("cpu_layer_{l:02}.f32"));
+                let path = dir.path().join(cpu_layer_file(l));
                 read_f32_vec(&path)
                     .ok_or_else(|| format!("CPU dump missing for layer {l} at {}", path.display()))
             })
@@ -134,7 +139,7 @@ impl ResidualCapture {
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
 
         // Build pipeline layers — same wiring `layer_graph::generate` uses.
         let gate_index: &dyn GateIndex = index;
@@ -162,9 +167,6 @@ impl ResidualCapture {
             ffn_format,
         );
 
-        let q_dim = weights.num_q_heads * weights.head_dim;
-        let kv_dim = weights.num_kv_heads * weights.head_dim;
-        let rope = arch.rope_base_for_layer(0) as f32;
         let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
         let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
@@ -178,13 +180,7 @@ impl ResidualCapture {
                 &prefill_x,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
                 prefix_ids.len(),
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
                 qk_norm_val,
                 softcap,
             )
@@ -193,24 +189,13 @@ impl ResidualCapture {
         // Decode one token, with the per-layer dump hook active.
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[new_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
-        let dir = run_with_dump_dir("LARQL_DECODE_DUMP_LAYERS", || {
-            let _ = backend.decode_token(
-                &layers,
-                &dec_x,
-                hidden,
-                intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
-            );
+        let dir = run_with_dump_dir(ENV_DECODE_DUMP_LAYERS, || {
+            let _ = backend.decode_token(&layers, &dec_x, hidden, intermediate);
         })?;
 
         let layer_dumps = (0..num_layers)
             .map(|l| {
-                let path = dir.path().join(format!("decode_layer_{l:02}.f32"));
+                let path = dir.path().join(decode_layer_file(l));
                 read_f32_vec(&path).ok_or_else(|| {
                     format!("decode dump missing for layer {l} at {}", path.display())
                 })
@@ -250,7 +235,7 @@ impl ResidualCapture {
         let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
             .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
             .collect();
-        backend.preallocate_kv_cache_per_layer(&kv_shapes, 4096);
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
 
         let gate_index: &dyn GateIndex = index;
         let (q4_ffn, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
@@ -277,9 +262,6 @@ impl ResidualCapture {
             ffn_format,
         );
 
-        let q_dim = weights.num_q_heads * weights.head_dim;
-        let kv_dim = weights.num_kv_heads * weights.head_dim;
-        let rope = arch.rope_base_for_layer(0) as f32;
         let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
         let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
@@ -291,13 +273,7 @@ impl ResidualCapture {
                 &prefill_x,
                 hidden,
                 intermediate,
-                q_dim,
-                kv_dim,
                 prefix_ids.len(),
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
                 qk_norm_val,
                 softcap,
             )
@@ -309,41 +285,19 @@ impl ResidualCapture {
         for &id in &new_ids[..new_ids.len() - 1] {
             let dec_embed = crate::forward::embed_tokens_pub(weights, &[id]);
             let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
-            let _ = backend.decode_token(
-                &layers,
-                &dec_x,
-                hidden,
-                intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
-            );
+            let _ = backend.decode_token(&layers, &dec_x, hidden, intermediate);
         }
 
         let last_id = *new_ids.last().unwrap();
         let dec_embed = crate::forward::embed_tokens_pub(weights, &[last_id]);
         let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
-        let dir = run_with_dump_dir("LARQL_DECODE_DUMP_LAYERS", || {
-            let _ = backend.decode_token(
-                &layers,
-                &dec_x,
-                hidden,
-                intermediate,
-                q_dim,
-                kv_dim,
-                weights.num_q_heads,
-                weights.num_kv_heads,
-                weights.head_dim,
-                rope,
-            );
+        let dir = run_with_dump_dir(ENV_DECODE_DUMP_LAYERS, || {
+            let _ = backend.decode_token(&layers, &dec_x, hidden, intermediate);
         })?;
 
         let layer_dumps = (0..num_layers)
             .map(|l| {
-                let path = dir.path().join(format!("decode_layer_{l:02}.f32"));
+                let path = dir.path().join(decode_layer_file(l));
                 read_f32_vec(&path).ok_or_else(|| {
                     format!("decode dump missing for layer {l} at {}", path.display())
                 })
@@ -378,7 +332,7 @@ impl ResidualCapture {
         // the vindex if the caller hasn't already loaded it — avoiding
         // putting the tokenizer in the public signature keeps the API
         // symmetrical with `cpu_prefill`.
-        let dir = run_with_dump_dir("LARQL_METAL_DUMP_LAYERS", || {
+        let dir = run_with_dump_dir(ENV_METAL_DUMP_LAYERS, || {
             let cached = CachedLayerGraph::from_residuals(Vec::new());
             // generate() also drives the embed→prefill→sample chain,
             // including the per-layer dump hook for Metal.
@@ -397,7 +351,7 @@ impl ResidualCapture {
 
         let layers = (0..num_layers)
             .map(|l| {
-                let path = dir.path().join(format!("metal_layer_{l:02}_h_out.f32"));
+                let path = dir.path().join(metal_layer_h_out_file(l));
                 read_f32_vec(&path).ok_or_else(|| {
                     format!(
                         "Metal prefill dump missing for layer {l} at {}",

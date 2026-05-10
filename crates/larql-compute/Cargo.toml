@@ -38,6 +38,13 @@ openblas-src = { version = "0.10", features = ["system"] }
 [features]
 default = []
 metal = ["dep:metal", "dep:objc"]
+# Opt-in gate for the slow non-Metal integration suites. Plain
+# `cargo test -p larql-compute` skips them so the dev loop stays under
+# ~10 s; CI / release runs flip this on (and `metal` separately) to get
+# coverage. Metal kernel tests stay on the `metal` feature so a Metal
+# devloop (`cargo test -p larql-compute --features metal`) still runs
+# them — the two axes are independent on purpose.
+heavy_tests = []
 # cuda = []  # Future: CUDA backend
 
 [build-dependencies]

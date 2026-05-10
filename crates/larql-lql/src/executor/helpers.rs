@@ -4,6 +4,80 @@
 
 use std::path::Path;
 
+use larql_inference::ndarray::Array1;
+
+/// Number of leading characters of a target token used for `starts_with`
+/// fuzzy matching against tokenizer outputs (e.g. "Pos" → matches " Pos",
+/// "Posei", "Poseidon"). Three characters is enough discrimination for
+/// the per-relation candidate sets that balance/rebalance probe.
+pub(crate) const TARGET_PREFIX_CHARS: usize = 3;
+
+/// Take the first `n` characters of `s`, slicing on a UTF-8 character
+/// boundary. The previous `&s[..s.len().min(3)]` shape panicked on any
+/// multi-byte target ("Köln", emoji, CJK).
+pub(crate) fn target_prefix(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Average a sequence of embedding rows, applying `embed_scale`. The
+/// pure half of [`entity_query_vec`]: extracted so unit tests can
+/// exercise the math without a tokenizer fixture.
+///
+/// Bounds-checks `embed.row(idx)` — out-of-vocab token ids are skipped
+/// rather than panicking. Returns `None` when no token ids land in
+/// range.
+pub(crate) fn average_embed_rows(
+    embed: &larql_inference::ndarray::Array2<f32>,
+    embed_scale: f32,
+    token_ids: &[u32],
+) -> Option<Array1<f32>> {
+    let hidden = embed.shape()[1];
+    let vocab = embed.shape()[0];
+    let mut avg = Array1::<f32>::zeros(hidden);
+    let mut counted = 0usize;
+    for &tok in token_ids {
+        let idx = tok as usize;
+        if idx >= vocab {
+            continue;
+        }
+        let row = embed.row(idx);
+        for (j, v) in row.iter().enumerate() {
+            avg[j] += v * embed_scale;
+        }
+        counted += 1;
+    }
+    if counted == 0 {
+        return None;
+    }
+    avg.mapv_inplace(|v| v / counted as f32);
+    Some(avg)
+}
+
+/// Build the averaged-embedding query vector that SELECT / DESCRIBE /
+/// INSERT (compose + knn) walks the FFN against. Six call sites used
+/// to inline this loop; the helper fixes two issues at once:
+///
+///   1. Bounds-checks `embed.row(tok)` (via `average_embed_rows`).
+///   2. Single canonical "averaging" definition.
+pub(crate) fn entity_query_vec(
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    embed: &larql_inference::ndarray::Array2<f32>,
+    embed_scale: f32,
+    entity: &str,
+) -> Result<Option<Array1<f32>>, crate::error::LqlError> {
+    let encoding = tokenizer
+        .encode(entity, false)
+        .map_err(|e| crate::error::LqlError::exec("tokenize entity", e))?;
+    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if token_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(average_embed_rows(embed, embed_scale, &token_ids))
+}
+
 /// Get total size of a directory in bytes.
 pub(crate) fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
@@ -77,7 +151,7 @@ pub(crate) fn is_readable_token(tok: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::format_knn_override_summary;
+    use super::*;
 
     #[test]
     fn knn_override_summary_names_post_logits_source_and_model_top1() {
@@ -93,6 +167,99 @@ mod tests {
         assert!(summary.contains("cos=0.99"));
         assert!(summary.contains("L26"));
         assert!(summary.contains("model_top1=London (42.00%)"));
+    }
+
+    #[test]
+    fn target_prefix_ascii_three_chars() {
+        assert_eq!(target_prefix("Poseidon", 3), "Pos");
+    }
+
+    #[test]
+    fn target_prefix_handles_multibyte() {
+        // "Köln" — `ö` is two UTF-8 bytes. The previous byte-slicing
+        // version panicked here.
+        assert_eq!(target_prefix("Köln", 3), "Köl");
+        // CJK and emoji — each codepoint is multi-byte; slicing must
+        // land on a char boundary.
+        assert_eq!(target_prefix("東京タワー", 3), "東京タ");
+        assert_eq!(target_prefix("🦀🦀🦀🦀", 3), "🦀🦀🦀");
+    }
+
+    #[test]
+    fn target_prefix_returns_full_string_when_shorter_than_n() {
+        assert_eq!(target_prefix("Hi", 5), "Hi");
+        assert_eq!(target_prefix("", 3), "");
+    }
+
+    #[test]
+    fn target_prefix_chars_constant_is_three() {
+        // Pinned: balance/rebalance assume 3-char discrimination.
+        assert_eq!(TARGET_PREFIX_CHARS, 3);
+    }
+
+    #[test]
+    fn format_number_buckets() {
+        assert_eq!(format_number(5), "5");
+        assert_eq!(format_number(1_500), "1.5K");
+        assert_eq!(format_number(2_500_000), "2.50M");
+    }
+
+    #[test]
+    fn format_bytes_buckets() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2 * 1024), "2.0 KB");
+        assert_eq!(format_bytes(3 * 1_048_576), "3.0 MB");
+        assert_eq!(format_bytes(2 * 1_073_741_824), "2.00 GB");
+    }
+
+    // The pure averaging math is the interesting part of
+    // `entity_query_vec`; the tokenizer wrapper is exercised by the
+    // executor integration tests. We unit-test `average_embed_rows`
+    // directly so we don't have to bake a tokenizer fixture.
+
+    #[test]
+    fn average_embed_rows_averages_token_embeddings() {
+        // Two-token average.
+        let mut embed = larql_inference::ndarray::Array2::<f32>::zeros((30, 3));
+        embed[[0, 0]] = 1.0;
+        embed[[1, 1]] = 1.0;
+
+        let q = average_embed_rows(&embed, 1.0, &[0u32, 1u32]).expect("two tokens");
+        assert!((q[0] - 0.5).abs() < 1e-6);
+        assert!((q[1] - 0.5).abs() < 1e-6);
+        assert!(q[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn average_embed_rows_applies_embed_scale() {
+        let mut embed = larql_inference::ndarray::Array2::<f32>::zeros((30, 2));
+        embed[[0, 0]] = 1.0;
+        let q = average_embed_rows(&embed, 4.0, &[0u32]).unwrap();
+        // Single-token, scale 4 → row [4, 0].
+        assert!((q[0] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn average_embed_rows_skips_out_of_vocab_tokens() {
+        // Vocab has 5 rows; token id 25 is past the embed's vocab.
+        // Helper must skip rather than panic.
+        let mut embed = larql_inference::ndarray::Array2::<f32>::zeros((5, 2));
+        embed[[0, 0]] = 2.0;
+        let q = average_embed_rows(&embed, 1.0, &[0u32, 25u32]).expect("at least one in-range");
+        // Only id 0 contributes.
+        assert!((q[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn average_embed_rows_returns_none_when_all_out_of_vocab() {
+        let embed = larql_inference::ndarray::Array2::<f32>::zeros((1, 2));
+        assert!(average_embed_rows(&embed, 1.0, &[5u32, 10u32]).is_none());
+    }
+
+    #[test]
+    fn average_embed_rows_returns_none_for_empty_input() {
+        let embed = larql_inference::ndarray::Array2::<f32>::zeros((1, 2));
+        assert!(average_embed_rows(&embed, 1.0, &[]).is_none());
     }
 }
 

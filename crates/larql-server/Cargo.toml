@@ -26,7 +26,14 @@ larql-router-protocol = { path = "../larql-router-protocol" }
 larql-compute = { path = "../larql-compute" }
 
 axum = { version = "0.8", features = ["ws"] }
+half = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+reqwest = { version = "0.12", features = ["json"] }
+sha2 = "0.10"
+# Constant-time byte equality for API-key comparison (auth middleware).
+# Already in the lockfile via rustls; declared here as a direct dep so the
+# threat-model rationale is visible at the crate boundary.
+subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.13"

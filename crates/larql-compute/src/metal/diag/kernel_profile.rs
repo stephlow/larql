@@ -152,7 +152,7 @@ fn measure_single_cmdbuf_batched(
 ///
 /// Returns one `KernelResult` per kernel. Prints a formatted table to stdout.
 /// Pass `n_layers=34` for Gemma 3 4B, `warmup=5`, `iters=50` for reliable numbers.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelResult> {
     use crate::{
         cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k},
@@ -215,7 +215,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let wb = metal.bufs().get_bytes(&w);
         let xb = metal.bufs().transient_from_f32(&x);
         let ob = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q6k_matvec_pipeline;
+        let kh = &metal.quant.q6k_matvec_pipeline;
         let n_tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;
@@ -318,7 +318,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let xb = metal.bufs().transient_from_f32(&x);
         let go = metal.bufs().output((n * 4) as u64);
         let uo = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q4k_ffn_gate_up_8sg_pipeline;
+        let kh = &metal.ffn.q4k_ffn_gate_up_8sg_pipeline;
         let tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;
@@ -440,73 +440,6 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         results.push(r);
     }
 
-    // ── q4k_ffn_gate_up_nr2: candidate fused gate+up variant ───────────────
-    {
-        let n = inter;
-        let k = hidden;
-        let mb = 2.0 * (n * (k / sb * q4k_sb)) as f64 / 1e6;
-        let gate_q4k = quantize_q4_k(&synth_f32(n * k, 0.2));
-        let up_q4k = quantize_q4_k(&synth_f32(n * k, 0.3));
-        let x = synth_f32(k, 0.5);
-
-        let wg = metal.bufs().get_bytes(&gate_q4k);
-        let wu = metal.bufs().get_bytes(&up_q4k);
-        let xb = metal.bufs().transient_from_f32(&x);
-        let go = metal.bufs().output((n * 4) as u64);
-        let uo = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q4k_ffn_gate_up_nr2_pipeline;
-        let tgs = (n as u64).div_ceil(kh.rows_per_tg);
-        let n_val = n as u32;
-        let k_val = k as u32;
-
-        let dispatch = |enc: &metal::ComputeCommandEncoderRef| {
-            enc.set_compute_pipeline_state(&kh.state);
-            enc.set_buffer(0, Some(&wg), 0);
-            enc.set_buffer(1, Some(&wu), 0);
-            enc.set_buffer(2, Some(&xb), 0);
-            enc.set_buffer(3, Some(&go), 0);
-            enc.set_buffer(4, Some(&uo), 0);
-            enc.set_bytes(5, 4, &n_val as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &k_val as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new(tgs * 2, 1, 1),
-                MTLSize::new(kh.threads_per_tg, 1, 1),
-            );
-        };
-
-        let (iso_ms, iso_sd) = measure_isolated(warmup, iters, &mut || {
-            let cmd = metal.queue().new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            dispatch(enc);
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-        });
-        let bat_ms = measure_single_cmdbuf_batched(&metal, warmup, iters, n_layers, &dispatch);
-
-        let iso_kernel = (iso_ms - commit_overhead_ms).max(0.001);
-        let r = KernelResult {
-            name: "q4k_ffn_gate_up_nr2 (candidate, 10240×2560)".into(),
-            mb_per_call: mb,
-            isolated_ms: iso_ms,
-            isolated_sd_ms: iso_sd,
-            isolated_gbs: mb / iso_kernel,
-            batched_ms_per_layer: bat_ms,
-            batched_gbs: mb / bat_ms,
-        };
-        println!(
-            "{:<44} {:>7.3}ms {:>7.1} {:>7.3}ms {:>7.1} {:>7.1}ms",
-            r.name,
-            r.isolated_ms,
-            r.isolated_gbs,
-            r.batched_ms_per_layer,
-            r.batched_gbs,
-            r.ms_per_token(n_layers)
-        );
-        println!("  ↳ decode A/B: LARQL_GATE_UP_NR2=1 ./target/release/larql bench ...");
-        results.push(r);
-    }
-
     // ── q4k_matvec: Wo O-projection (N=hidden, K=q_dim) ──────────────────
     {
         let n = hidden;
@@ -525,7 +458,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let wb = metal.bufs().get_bytes(&w);
         let xb = metal.bufs().transient_from_f32(&x);
         let ob = metal.bufs().output((n * 4) as u64);
-        let kh = &metal.q4k_matvec_pipeline;
+        let kh = &metal.quant.q4k_matvec_pipeline;
         let n_tgs = (n as u64).div_ceil(kh.rows_per_tg);
         let n_val = n as u32;
         let k_val = k as u32;
@@ -593,7 +526,7 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let qo = metal.bufs().output((q_rows * 4) as u64);
         let ko = metal.bufs().output((k_rows * 4) as u64);
         let vo = metal.bufs().output((v_rows * 4) as u64);
-        let kh = &metal.q4k_qkv_proj_pipeline;
+        let kh = &metal.attention.q4k_qkv_proj_pipeline;
         let n_tgs = (total_rows as u64).div_ceil(kh.rows_per_tg);
         let q_val = q_rows as u32;
         let k_val_n = k_rows as u32;
@@ -684,13 +617,13 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
         let qo = metal.bufs().output((q_rows * 4) as u64);
         let ko = metal.bufs().output((k_rows * 4) as u64);
         let vo = metal.bufs().output((v_rows * 4) as u64);
-        let kh = &metal.q4k_q6k_qkv_proj_normed_pipeline;
+        let kh = &metal.attention.q4k_q6k_qkv_proj_normed_pipeline;
         let n_tgs = (total_rows as u64).div_ceil(kh.rows_per_tg);
         let q_val = q_rows as u32;
         let k_rows_val = k_rows as u32;
         let v_val = v_rows as u32;
         let k_val = k as u32;
-        let eps = 1e-6f32;
+        let eps = crate::RMSNORM_EPSILON_DEFAULT;
         let offset = 1.0f32;
 
         let dispatch = |enc: &metal::ComputeCommandEncoderRef| {

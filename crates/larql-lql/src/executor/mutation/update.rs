@@ -5,7 +5,7 @@ use crate::ast::{Assignment, Condition, Value};
 use crate::error::LqlError;
 use crate::executor::Session;
 
-use super::{relation_filter_matches, string_condition};
+use super::{relation_filter_matches, WhereFilters};
 
 impl Session {
     pub(crate) fn exec_update(
@@ -13,60 +13,19 @@ impl Session {
         set: &[Assignment],
         conditions: &[Condition],
     ) -> Result<Vec<String>, LqlError> {
-        let entity_filter = conditions
-            .iter()
-            .find(|c| c.field == "entity")
-            .and_then(|c| {
-                if let Value::String(ref s) = c.value {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            });
-        let layer_filter = conditions
-            .iter()
-            .find(|c| c.field == "layer")
-            .and_then(|c| {
-                if let Value::Integer(n) = c.value {
-                    Some(n as usize)
-                } else {
-                    None
-                }
-            });
-        let feature_filter = conditions
-            .iter()
-            .find(|c| c.field == "feature")
-            .and_then(|c| {
-                if let Value::Integer(n) = c.value {
-                    Some(n as usize)
-                } else {
-                    None
-                }
-            });
-        let relation_filter = string_condition(conditions, "relation");
+        let filters = WhereFilters::from_conditions(conditions);
 
         // Collect updates, then record
         let mut update_ops: Vec<(usize, usize, larql_vindex::FeatureMeta)> = Vec::new();
         let matches: Vec<(usize, usize)> = {
             let (_path, _config, patched) = self.require_vindex()?;
-
-            // Fast path: explicit (layer, feature) — same shape as DELETE.
-            // Bypasses `find_features` so the caller can target a single
-            // slot directly without needing to match by entity.
-            let candidates: Vec<(usize, usize)> =
-                if let (Some(layer), Some(feature)) = (layer_filter, feature_filter) {
-                    vec![(layer, feature)]
-                } else {
-                    patched
-                        .base()
-                        .find_features(entity_filter, None, layer_filter)
-                };
+            let candidates = filters.resolve_candidates(patched.base());
 
             let mut matches = Vec::new();
             for (layer, feature) in candidates {
                 if relation_filter_matches(
                     self.relation_classifier(),
-                    relation_filter,
+                    filters.relation,
                     layer,
                     feature,
                 )? {

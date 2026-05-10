@@ -1888,20 +1888,23 @@ fn registry_memory_stable_across_many_calls() {
 
 #[test]
 fn module_cache_file_is_written_and_reused() {
-    // Exercise the .cwasm precompile cache: after a load, a sibling .cwasm
-    // file should exist; after wiping it, the next load should recreate it.
+    // Exercise the .cwasm precompile cache against a private copy. Other
+    // expert tests load the same fixture in parallel, and the cache lives next
+    // to the .wasm, so using the shared fixture makes this mtime assertion
+    // race-prone.
     let wasm_path = wasm("arithmetic");
     if !wasm_path.exists() {
         return;
     }
-    let cwasm_path = wasm_path.with_extension("cwasm");
-
-    let _ = std::fs::remove_file(&cwasm_path);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let private_wasm_path = tmp.path().join("larql_expert_arithmetic.wasm");
+    std::fs::copy(&wasm_path, &private_wasm_path).expect("copy wasm fixture");
+    let cwasm_path = private_wasm_path.with_extension("cwasm");
 
     // First load compiles and writes the cache.
     {
         let mut reg = ExpertRegistry::default();
-        reg.load_file(&wasm_path).expect("first load");
+        reg.load_file(&private_wasm_path).expect("first load");
     }
     assert!(
         cwasm_path.exists(),
@@ -1915,7 +1918,7 @@ fn module_cache_file_is_written_and_reused() {
     let cwasm_mtime_before = std::fs::metadata(&cwasm_path).unwrap().modified().unwrap();
     {
         let mut reg = ExpertRegistry::default();
-        reg.load_file(&wasm_path).expect("second load");
+        reg.load_file(&private_wasm_path).expect("second load");
         let result = reg
             .call("gcd", &json!({"a": 12, "b": 8}))
             .expect("gcd dispatches");

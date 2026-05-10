@@ -9,7 +9,7 @@
 //! to change is `metal::run_experts_metal_batch`'s opt-in gate at the
 //! top of the function.
 
-#![cfg(feature = "metal-experts")]
+#![cfg(all(feature = "metal-experts", target_os = "macos"))]
 
 use std::sync::Arc;
 use std::time::Instant;

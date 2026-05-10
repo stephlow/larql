@@ -1,7 +1,7 @@
 # ADR-015: Isolated kernel speedup ≠ end-to-end win when batched throughput is already saturated
 
-**Status**: Accepted (recurring pattern, four confirmed instances)
-**Date**: 2026-05-02 (initial; updated with NR2 then `q4k_matvec` lm_head)
+**Status**: Accepted (recurring pattern, four direction-mismatch instances + one magnitude-compression instance)
+**Date**: 2026-05-02 (initial; updated with NR2 then `q4k_matvec` lm_head; NR2 kernel removed 2026-05-09 after second-confirming bench; QKV defuse added 2026-05-09 as the first magnitude-compression case)
 **Context**: A pattern that has now reproduced across three independent kernel
 optimisation attempts on Gemma 3 4B decode. Future kernel work needs to budget
 benchmark cost against this prior — the isolated `diag_profile_kernels` number
@@ -25,7 +25,7 @@ production workload.
 |---|---|---|---|---|
 | `q4k_ffn_gate_up_f16acc` (2026-04-28) | 1.79× (0.607 → 0.340 ms) | within noise | parity on quiet GPU | opt-in only (`LARQL_F16_ACC=1`) |
 | `attn_fused` (2026-05-01) | merged 2 kernels into 1 | TGs collapse 12 → 8 | **−1.45 ms regression** | opt-in only (`LARQL_FUSED_ATTN=1`) |
-| `q4k_ffn_gate_up_nr2` (2026-05-02) | 1.47× (0.591 → 0.401 ms iso) | 279 → 267 GB/s (−4%) | **−0.62 ms regression on GPU fwd** | not promoted; opt-in `LARQL_GATE_UP_NR2=1` |
+| `q4k_ffn_gate_up_nr2` (2026-05-02) | 1.47× (0.591 → 0.401 ms iso) | 279 → 267 GB/s (−4%) | **−0.62 ms regression on GPU fwd** (re-bench 2026-05-09: 11.71 → 12.05 ms, **−0.34 ms / −2.9 tok/s**, direction matched batched diag) | **kernel + `LARQL_GATE_UP_NR2` env-var removed 2026-05-09**; the second bench confirmed the batched-diag prediction so the candidate was retired rather than left dangling as opt-in |
 | **`q4k_matvec` lm_head** (broken-fast → fixed) | n/a — different category | 1.47 ms (broken) vs stride-32's 2.95 ms | initially +10 tok/s but FAILED smoke ("Capital" / truncated). **Root cause: dispatch geometry mismatch, not kernel-level drift. Fixed 2026-05-02 — kernel was correct all along.** | now production default; fixed `pipeline.rows_per_tg` / `threads_per_tg` lookup. Net **+8 tok/s end-to-end**. |
 
 The mechanisms differ but the symptom is identical at the perf level — a
@@ -92,8 +92,9 @@ Run all three measurements before deciding:
    A regression here is enough to drop the candidate. A win here is
    necessary but not sufficient.
 2. **Batched** (`diag_shader_bench` `bat_ms` / `GB/s` columns): the
-   production geometry. **This is the number that predicts end-to-end.**
-   If batched regresses or is within noise, the candidate is not a win.
+   production geometry. **This predicts the *direction* of end-to-end
+   reliably. It does NOT predict the *magnitude*.** If batched regresses
+   or is within noise, the candidate is not a win.
 3. **End-to-end bench A/B** (`larql bench --warmup 8 -n 30 --profile`):
    final confirmation, with correctness smoke (`larql run "The capital of
    France is" -n 8 --metal` should still emit Paris).
@@ -101,6 +102,46 @@ Run all three measurements before deciding:
 Steps 1 and 2 take ~30 s total. Step 3 takes another minute. Skipping step 2
 and going straight from isolated → end-to-end has burned three sessions; do
 not skip it.
+
+### Magnitude can compress 4×: QKV defuse case (2026-05-09)
+
+The QKV defuse change (revert the fused `q4k_q6k_qkv_proj_normed` kernel
+back to a separate `rms_norm` + non-fused `q4k_q6k_qkv_proj` pair —
+canonical record at [ADR-016](016-defused-rms-norm-qkv.md)) is the first
+case where the batched diag's *direction* matched but its *magnitude*
+did not.
+
+| measurement | predicted | observed |
+|---|---|---|
+| batched diag (kernel-only) | 4.59 ms (fused) → 3.13 ms (non-fused) = −1.46 ms |  |
+| + rms_norm dispatch added back | +0.24 ms (1 dispatch × 34 layers × 7 µs) |  |
+| **predicted end-to-end Δ** | **−1.22 ms/tok** |  |
+| **measured end-to-end Δ** |  | **−0.22 ms/tok** (warmup 8, n=100, drift 0.02 ms) |
+
+The non-fused kernel's 287 GB/s peak is a *single-kernel-in-isolation*
+number. In the production decode pipeline, it shares the LPDDR5X bus with
+attention, FFN gate+up, FFN down, lm_head — all of which are also bandwidth-
+bound. The candidate doesn't get to claim its kernel-isolated headroom
+when the surrounding pipeline is already saturating the same bus.
+
+**When to expect magnitude compression:** the candidate's win comes from
+*bandwidth headroom* rather than *cycles* (compute-bound kernels) or
+*dispatches saved* (cross-kernel structural changes). Bandwidth headroom
+that exists in isolation may not translate to wall-clock reduction when
+the pipeline is already bandwidth-saturated as a whole.
+
+**Implications for promotion decisions:**
+
+- A predicted batched-diag delta is a **lower bound on conviction** ("yes
+  this should help"), not an upper bound on celebration ("we'll get the
+  full ms back"). Discount the predicted magnitude by ~3-5× when
+  budgeting against ollama parity.
+- The diag is still load-bearing — without it we wouldn't know the
+  candidate is worth running end-to-end. But the *gap-closing budget*
+  needs to be sized off the end-to-end measurement, not the diag.
+- Direction-mismatch (NR2, f16_acc, attn_fused) remains a strict killer.
+  Direction-match + magnitude-undershoot is still a promotion signal,
+  just a smaller one than the diag suggests.
 
 ### Mechanised flow (2026-05-02)
 
@@ -134,16 +175,22 @@ wins. Kernels above ~80% don't.
 - Kernels that pass the batched test (e.g. fused QK norm + RoPE; the
   May 2026 fusion wave that landed −1.5 ms cumulatively) are the
   evidence-based bar for promotion.
-- Decode at ~76 tok/s on this hardware is closer to the parallelism /
-  bandwidth ceiling than headline isolated numbers suggest. Closing the
-  remaining 1.30× to ollama needs work that *changes the batched
-  measurement*, not work that just makes a single kernel faster in
-  isolation.
+- Decode at ~88 tok/s on this hardware (post 2026-05-09 QKV defuse) is
+  close to the parallelism / bandwidth ceiling. Closing the remaining
+  ~1.17× to ollama needs work that *changes the batched measurement*,
+  not work that just makes a single kernel faster in isolation. Was
+  ~1.30× when this ADR was first written; the dispatch-geometry fix
+  (2026-05-02, +7.7 tok/s) and QKV defuse (2026-05-09, +1.6-1.8 tok/s)
+  were both batched-measurement-changing wins, exactly the class of
+  work this ADR points at.
 
 ## Related
 
 - ADR-008 (Q4_K kernel optimization findings) — predecessor pattern at the
   matvec level.
+- ADR-016 (Defused RMS norm + QKV) — the canonical record of the
+  QKV-defuse decision; this ADR holds the *general lesson* (magnitude
+  compression), ADR-016 holds the specific decision.
 - `crates/larql-compute/PERFORMANCE.md` recent-changes table.
 - `crates/larql-compute/ROADMAP.md` "P0: Production gap closers" — multi-TG
   `attn_fused` retry is the next target that explicitly works *with* this

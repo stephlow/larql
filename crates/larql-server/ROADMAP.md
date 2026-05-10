@@ -1,6 +1,37 @@
 # Roadmap — larql-server / larql-router
 
-## Current state (as of 2026-05-01)
+## Current state (as of 2026-05-07)
+
+### 2026-05-07 — Wire format evolution + WebSocket streaming + Criterion benchmarks
+
+GT1–GT4 and GT9 shipped. See `G-TRANSPORT` and `G-BENCH` sections below for full details.
+
+**GT1 (f16 wire default)**: `application/x-larql-ffn-f16` content-type; Accept header
+negotiation; `encode_binary_output_f16` in server; `decode_binary_single/batch_f16`
+in client. Client sends `Accept: i8, f16, f32`; server honours f16 by default
+(`LARQL_F16_WIRE_DISABLE` opt-out). 50% bandwidth reduction on all grid paths.
+
+**GT2 (i8 residuals)**: `application/x-larql-ffn-i8`; per-position symmetric
+quantisation (scale = max(|x|)/127, zero_point = 0); `encode_binary_output_i8` +
+`decode_binary_single/batch_i8`. Opt-in via `LARQL_I8_WIRE=1`. 75% bandwidth reduction.
+
+**GT3 (per-layer latency)**: `LayerLatency { layer, avg_ms, p99_ms }` added to
+`HeartbeatMsg.layer_stats` and `ServerInfo.layer_stats` in grid.proto. Server collects
+EMA + p99 ring-buffer per layer in `metrics::LayerLatencyTracker`; heartbeat sends
+snapshot every 10s. Router stores per-layer latency in `ServerEntry.layer_latencies`
+and prefers lowest `avg_ms` for the requested layer when routing replicas.
+
+**GT4 (WebSocket generate)**: `WS /v1/stream` now supports `{"type":"generate",
+"prompt":"...","max_tokens":N}` command. Streams `{"type":"token","text":"...","index":N}`
+frames per token; emits `{"type":"done","tokens":N,"latency_ms":M}`. Client can send
+`{"type":"cancel"}` to abort. Uses same `generate_streaming` engine as SSE chat completions.
+SSE streaming on `POST /v1/chat/completions` (N0.1 slice 3) confirmed already wired.
+
+**GT9 (Criterion benchmarks)**: `larql-inference/benches/wire_codec.rs` (encode/decode
+throughput at h2560/h4096/h5120, seq1/32/256). `larql-router/benches/routing.rs`
+(route/route_all/update_heartbeat/rebuild at 1/10/100 servers). `larql-router` now
+has a `lib.rs` exposing `grid` for tests/benches. Makefile targets: `bench-wire`,
+`bench-routing`, `bench-grid`, `bench-all`.
 
 ### 2026-05-01 — HTTP CPU-path optimisation session
 
@@ -19,6 +50,17 @@ opt-in. See `Completed` section below for the full per-change list.
 - Test coverage: **74.2% line / 81.2% function** at the 2026-04-26
   baseline (478 tests). 2026-05-01 (post Q1 cleanup): **131 lib tests +
   37 integration files (~580 tests total), all green**.
+- 2026-05-10 re-measurement (post REV1–REV5 fixes, full `--tests`
+  run): **65.68% line / 72.18% function** across ~660 tests.
+  Coverage drifted ~8 pts down vs the 2026-04-26 claim — partly
+  because the upstream `larql-inference` / `larql-compute` API
+  refactor temporarily broke `tests/test_expert_endpoint.rs` (now
+  fixed) and the four `routes/expert/*` modules sit at 0% line
+  coverage because they need a live grid harness to exercise. Per-
+  file 90% floor + debt baselines now codified in
+  `crates/larql-server/coverage-policy.json`; run
+  `make larql-server-coverage-summary` to re-measure (added in this
+  session — see CHANGELOG.md).
 - Q1 code-quality cleanup (2026-05-01) shipped 9 of 10 items: 1044-LOC
   `routes/expert.rs` split into 7 focused files; 656-LOC `main.rs` reduced
   to 26 LOC with `bootstrap::serve(cli)` as the orchestration point; new
@@ -558,7 +600,719 @@ logic in the request entry points.
 
 ---
 
+## REV: Code review (2026-05-10)
+
+Lens: per `THESIS.md`, legibility is a primary feature — a vLLM/SGLang/TGI
+engineer should be able to read this and copy ideas out. Findings below are
+prioritised by what would damage that primary goal if a stranger landed in
+the file today. Severity tags: **P0** = correctness/security ship-blocker,
+**P1** = structural/legibility fixes that affect "reads like a citation",
+**P2** = defensive polish.
+
+### REV1. Panic on NaN in gRPC sort *(P0)*
+
+**Status**: ✅ **Shipped 2026-05-10.**
+
+Both sort sites in `src/grpc.rs` (the `describe` handler at line ~311 and the
+`select` handler at line ~432) used `partial_cmp(...).unwrap()`, which
+panics on NaN. Replaced with a shared `cmp_score_desc(a, b)` helper that
+returns `Ordering::Equal` on NaN, removing the panic path. New
+`#[cfg(test)] mod tests` in `grpc.rs` covers: descending order, NaN→Equal,
+sort-with-NaN no-panic + length-preservation, sort-with-infinities
+ordering, and all-finite descending sort. Five new unit tests, all green;
+`cargo test -p larql-server --test test_grpc` (28 integration tests) still
+green.
+
+**Files touched**: `src/grpc.rs` (one new helper, two call sites, one new
+test module).
+
+**Note on the strict-weak-ordering trade-off**: NaN-as-Equal violates strict
+weak ordering, so `sort_by` cannot guarantee that finite values around
+NaN are globally descending — only that the call doesn't panic and that
+finite/NaN counts are preserved. Acceptable for a defensive change against
+upstream data corruption; downstream `truncate(limit)` still picks
+finite values when present, which is the property production cared about.
+
+### REV2. Non-constant-time API key comparison *(P0 security)*
+
+**Status**: ✅ **Shipped 2026-05-10.**
+
+`auth.rs` now hashes both the provided token and the configured key with
+SHA-256 and compares the 32-byte digests via `subtle::ConstantTimeEq`.
+The hash step removes the length-leak; the constant-time compare removes
+the bytewise short-circuit leak. Module-level doc comment names the
+threat model so the next reader doesn't accidentally regress to `==`.
+
+**Files touched**:
+- `Cargo.toml`: added `subtle = "2.6"` as a direct dep (already in the
+  lockfile via rustls — declaring it directly makes the threat-model
+  rationale visible at the crate boundary).
+- `src/auth.rs`: rewritten with module docs, a private
+  `tokens_match(provided, expected) -> bool` helper, and a
+  `#[cfg(test)] mod tests` covering equal/unequal/empty/length-different/
+  single-byte-difference cases (6 unit tests).
+
+**Verification**:
+- 6 new auth unit tests pass.
+- All 6 existing `http_auth_*` integration tests in `test_http_core.rs`
+  still pass (no behavioural regression).
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
+
+### REV3. `blocking_read` on tokio RwLock inside async path *(P0)*
+
+**Status**: ✅ **Shipped 2026-05-10.**
+
+`apply_patch` is now structured fast-path / slow-path. The fast path
+(session already exists) takes one write guard, mutates, returns. The
+slow path drops the sessions write guard, awaits `model.patched.read()`
+to get the base, then re-acquires the sessions write guard and uses
+`entry().or_insert_with(...)` to absorb the race where another task
+inserted the same `session_id` between our drop and re-acquire. No
+`blocking_read`/`blocking_write` is reachable from an `async fn` in
+`session.rs` anymore (the remaining `sessions_blocking_write` helper is
+explicitly intended for `spawn_blocking` callers, documented as such).
+
+A module-level lock-discipline doc-block on `apply_patch` names the
+hazard so the next reader doesn't reintroduce it.
+
+**Files touched**:
+- `src/session.rs`: `apply_patch` rewritten with fast/slow split + doc
+  block.
+- `tests/test_http_session.rs`: existing tests' workaround
+  (`sm.get_or_create(...)` pre-create dance) removed since the slow path
+  is now safe; two new regression tests added:
+  - `apply_patch_slow_path_makes_progress_with_held_patched_reader` —
+    spawns a task holding `model.patched.read()`, asserts the slow-path
+    apply_patch finishes within 5s.
+  - `concurrent_apply_patch_same_session_finishes` — 16-way
+    `apply_patch("contended", …)` from spawned tasks, asserts all
+    finish within 5s and the final patch list has 16 entries.
+
+**Verification**:
+- 7/7 session integration tests pass (5 existing, post-cleanup, plus 2
+  new).
+- 232/232 lib tests pass.
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
+
+**Note**: `get_or_create` (line ~56) also nests `sessions.write().await`
+→ `model.patched.read().await`, but uses async-aware `read().await`
+(not `blocking_read`), so it doesn't block a worker. The lock-ordering
+hazard (deadlock if anywhere acquires `patched.write` then
+`sessions.*`) is not reachable today — the only `patched.write()` call
+sites in `routes/patches.rs` don't touch `sessions`. Documented in the
+new doc-block on `apply_patch` so future contributors keep the order
+consistent.
+
+### REV4. OpenAI error envelope diverges from spec *(P0 — breaks OpenAI SDKs)*
+
+**Status**: ✅ **Edits applied 2026-05-10; verification pending stable workspace build.**
+
+Two-envelope split, per the original recommendation:
+
+- **LARQL paradigm endpoints** keep the flat `{"error": "msg"}` shape via
+  the existing `crate::error::ServerError` (unchanged).
+- **OpenAI-compat endpoints** (`/v1/embeddings`, `/v1/completions`,
+  `/v1/chat/completions`) now use a new `OpenAIError` type that renders
+  the canonical nested envelope:
+  ```json
+  {"error": {"message": "...", "type": "invalid_request_error",
+             "param": null, "code": null}}
+  ```
+  with the OpenAI-canonical `type` strings (`invalid_request_error`,
+  `not_found_error`, `service_unavailable_error`, `server_error`).
+  `param` and `code` are always emitted (possibly `null`) since some SDKs
+  hard-key on those fields.
+
+**Files touched**:
+- New `src/routes/openai/error.rs` — `OpenAIError`, `OpenAIErrorBody`,
+  `OpenAIErrorPayload`, constructor helpers
+  (`invalid_request`/`not_found`/`service_unavailable`/`server_error`),
+  `From<ServerError>` impl, `IntoResponse`, 7 unit tests covering all
+  status classes, the nested-envelope shape, the From mapping, and the
+  always-present `param`/`code` keys.
+- `src/routes/openai/mod.rs` — registers the module + re-exports
+  `OpenAIError`.
+- `src/routes/openai/chat.rs` — entry-point return type
+  `Result<Response, ServerError>` → `Result<Response, OpenAIError>`.
+  All 8 direct-`return Err(ServerError::X(...))` sites in the entry
+  handler converted to `OpenAIError::invalid_request(...)` or
+  `service_unavailable(...)`. Internal helpers
+  (`run_chat_generation`, `resolve_tools`,
+  `schema_for_response_format`) keep `ServerError`; their results
+  propagate via `?` through `From<ServerError> for OpenAIError`.
+- `src/routes/openai/completions.rs` — same pattern: 5 entry-point
+  error sites converted; internal helpers unchanged.
+- `src/routes/openai/embeddings.rs` — same pattern: 3 entry-point sites
+  converted.
+- `src/openapi.rs` — registers `OpenAIErrorBody`/`OpenAIErrorPayload`
+  in the `components(schemas(...))` block; the three OpenAI handlers'
+  utoipa annotations now reference `OpenAIErrorBody` for 400/500
+  responses (LARQL endpoints keep `ErrorBody`).
+- `docs/server-spec.md` §8.3.1 rewritten to document the two-envelope
+  split with the canonical `type` table.
+- `tests/test_http_embed.rs` — added 6 integration tests
+  (`http_openai_embeddings_400_uses_nested_envelope`,
+  `_empty_uses_nested_envelope`,
+  `http_openai_completions_400_uses_nested_envelope`,
+  `_503_uses_nested_envelope`,
+  `http_openai_chat_completions_400_uses_nested_envelope`,
+  `_503_uses_nested_envelope`) using a shared
+  `assert_openai_error_envelope` helper that asserts the response body
+  has the nested shape with the expected `type` and the always-present
+  `param`/`code` keys.
+
+**Verification**:
+- `cargo test -p larql-server --lib openai::error` — 6/6 passed.
+- `cargo test -p larql-server --test test_http_embed _uses_nested_envelope`
+  — 6/6 passed (covers the three handlers × 400/503 cases).
+- `cargo test -p larql-server --test test_http_embed http_openai`
+  — 55/55 passed (no regression in the existing OpenAI surface).
+- `cargo test -p larql-server --lib` — 247/247 passed.
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
+
+### REV5. Tool-call JSON parsing via `find('{')` / `rfind('}')` returns 500 instead of 400 *(P0 legibility)*
+
+**Status**: ✅ **Shipped 2026-05-10.**
+
+`build_tool_call_message` rewritten as a straight-line
+`serde_json::from_str(text.trim())`. The `find('{')` / `rfind('}')`
+heuristic is gone — it was supposed to absorb model-output drift
+(trailing junk, multiple JSON objects, markdown wrappers) but in
+practice silently picked the wrong slice and surfaced the failure as
+500 Internal at the call site. The new parser fails fast with a clean
+`invalid JSON: …` diagnostic, distinguishes "not an object" from
+"missing field", and the call site flips from `ServerError::Internal`
+→ `OpenAIError::invalid_request` so the client now sees a
+**400 invalid_request_error** with a concrete message (and the raw
+output included for debugging) instead of a 500 server_error.
+
+The schema FSM in `routes/openai/schema/` is for *constraining*
+generation, not validating it post-hoc. Re-parsing with the FSM would
+duplicate the Schema-shaped state machine that already runs during
+generation. The straight-line `serde_json` parse is the right level
+of validation for the post-emit path.
+
+**Files touched**:
+- `src/routes/openai/chat.rs::build_tool_call_message` — rewritten;
+  added `json_value_kind` helper for clean error messages.
+- `src/routes/openai/chat.rs::handle_chat_completions` (line ~377) —
+  parse-failure error switched from `ServerError::Internal` to
+  `OpenAIError::invalid_request`.
+- `src/routes/openai/chat.rs` — added `#[derive(Debug)]` to
+  `ChatChoiceMessage`, `ToolCall`, `ToolCallFunction` to support
+  `Result::unwrap_err()` in tests.
+- `src/routes/openai/chat.rs` `#[cfg(test)] mod tests` — 9 new unit
+  tests:
+  - happy path
+  - tolerates surrounding whitespace
+  - handles nested braces in arguments (locks the property the old
+    code was trying to preserve)
+  - rejects trailing junk with a clean `invalid JSON:` prefix
+    (pre-REV5 this was the 500 trap)
+  - rejects empty input
+  - rejects non-object top-level (with kind reported)
+  - rejects missing `name`
+  - rejects missing `arguments`
+  - rejects invalid JSON
+
+**Verification**:
+- `cargo test -p larql-server --lib build_tool_call` — 9/9 passed.
+- `cargo test -p larql-server --lib` — 247/247 passed.
+- `cargo clippy -p larql-server --lib --no-deps -- -D warnings` clean.
+- `cargo fmt -p larql-server -- --check` clean.
+
+**Note on the streaming path** (chat.rs ~line 586): mid-stream
+parse-failures still emit an SSE `data: {"error": ...}` chunk via
+`error_chunk(...)` and let the stream terminate gracefully. That path
+already returned the OpenAI nested error shape in chunks, so no
+behaviour change there — the fix here is only on the buffered
+non-streaming path.
+
+---
+
+### REV6. Split `bootstrap.rs` (1279 lines) *(P1 legibility)*
+
+**Files**: `src/bootstrap.rs` → new `src/bootstrap/{parsing,loader,warmup}.rs`.
+
+Natural seams:
+- `bootstrap/parsing.rs` (~lines 38–141): `parse_ram_bytes`, `parse_layer_range`, `UnitManifest` and friends.
+- `bootstrap/loader.rs` (~lines 143–370): `load_single_vindex`, `discover_vindexes`, vindex selection logic.
+- `bootstrap/warmup.rs`: the three warmup blocks (walk-ffn, hnsw-units, metal-experts).
+- Remaining `bootstrap.rs`: `Cli`, `serve()` orchestration, listener setup, gRPC + announce spawn — should land at ≤ ~500 lines.
+
+**Acceptance**: `serve()` reads top-to-bottom in one screen. Per-file
+coverage stays ≥ 90% (project floor). No public API change.
+
+### REV7. Split `routes/walk_ffn.rs` (1347 lines) *(P1 legibility)*
+
+**Files**: `src/routes/walk_ffn.rs` → new `src/routes/walk_ffn/binary.rs`.
+
+The binary codec (`decode_binary_request`, `encode_binary_output*`,
+~lines 1–170 + helpers, ~240 LOC total) is orthogonal to the compute
+core and HTTP handler logic. Move it out. Move the in-file `#[cfg(test)]`
+block (~230 lines) into a sibling test module. Core compute + handlers
+stay together (~600 LOC).
+
+**Acceptance**: `walk_ffn.rs` ≤ ~700 LOC; binary codec testable in
+isolation; existing integration tests unchanged.
+
+### REV8. Split / de-duplicate `routes/openai/chat.rs` (1214 lines) *(P1 legibility)*
+
+**Files**: `src/routes/openai/chat.rs`.
+
+Streaming and non-streaming handlers duplicate setup (tokenization, model
+lock, schema/sampling config). Extract a `ChatPrep` (or similar) struct so
+each handler body is short and the difference between the two paths is
+obvious at a glance. Tool-call/tools rendering and tool-call parsing
+(~lines 822–998) belong in their own submodule.
+
+**Acceptance**: `chat.rs` ≤ ~700 LOC; streaming and non-streaming entry
+points fit on one screen each.
+
+### REV9. gRPC error mapping is uniformly `Status::internal` *(P1)*
+
+**Files**: `src/grpc.rs:99,115,134,157,175,194` (and similar `.map_err`
+sites in `grpc_expert.rs`).
+
+Every blocking-task failure coerces to `Status::internal`. Tokenization,
+validation, and real internal failures collapse to one code; clients can't
+distinguish recoverable from non-recoverable. Map at least
+`ServerError::BadRequest`/`NotFound` → `invalid_argument`/`not_found`.
+
+**Acceptance**: a single `From<ServerError> for tonic::Status` impl that
+preserves status class. Test asserting a malformed `DescribeRequest`
+returns `Code::InvalidArgument`, not `Code::Internal`.
+
+### REV10. Single-vs-multi-model handler duplication *(P1 legibility)*
+
+**Files**: `src/routes/describe.rs:279-314` (and the same shape in
+`walk.rs`, `select.rs`, `infer.rs`, `relations.rs`, `patches.rs`).
+
+Single-model and `/v1/{model_id}/...` handlers are copy/paste with one
+line difference (`model_or_err(None)` vs `model_or_err(Some(&model_id))`).
+A porter has to mentally diff every pair. Consolidate behind one handler
+that takes `Option<&str>`, or behind a small macro.
+
+**Acceptance**: each route has one handler body; the router still wires
+both paths; tests cover both.
+
+### REV11. Streaming client-disconnect leak (chat / completions) *(P1)*
+
+**Files**: `src/routes/openai/chat.rs:517-520`,
+`src/routes/openai/completions.rs:243`.
+
+When the SSE channel closes, the on-token callback flips `early_stop` and
+returns, but the `spawn_blocking` generation task continues to natural EOS
+— burns a CPU-bound worker on a gone client. The expert layer-batch route
+already models the right pattern (semaphore permit held across spawn,
+released on cancellation); port it to the OpenAI streaming handlers.
+
+**Acceptance**: a test that opens an SSE stream, drops the receiver, and
+asserts the spawn_blocking handle finishes within a small bounded window
+of the disconnect rather than running to completion.
+
+---
+
+### REV12. Float validation gaps (NaN/Inf) *(P2)*
+
+**Files**: `src/routes/describe.rs:46` (`min_score`),
+`src/routes/walk_ffn.rs` (residual deserialisation),
+`src/routes/openai/util.rs:113-145` (`temperature`/`top_p` silent clamp).
+
+Incoming `f32`s are not checked for finitude; OpenAI sampler params are
+silently clamped rather than rejected. Reject NaN/Inf with 400; reject
+out-of-range with a typed message instead of clamping silently.
+
+### REV13. `max_tokens` upper bound unenforced *(P2)*
+
+**Files**: `src/routes/openai/{chat,completions}.rs` request structs.
+
+Raw `usize` is accepted; allocates token buffers from arbitrary client
+input. Add a per-model cap (config-derivable from `LoadedModel`) and
+return 400 above it.
+
+### REV14. Cache key truncates float to u32 *(P2)*
+
+**Files**: `src/cache.rs:34`.
+
+`format!("{:x}", min_score as u32)` collides `5.2` and `5.7`. Either
+encode the full f32 (e.g. `min_score.to_bits()`) or document the
+intentional bucketing.
+
+### REV15. Tests use bare `.unwrap()` on RPC results *(P2)*
+
+**Files**: `tests/test_grpc.rs` (17 instances at lines 34, 43, 51, 68,
+92, …).
+
+When the RPC itself errors, `.unwrap()` panics on the wrong line and
+hides which assertion was being checked. Replace with
+`.expect("describe should succeed")` (or similar).
+
+### REV16. `#[allow(dead_code)]` on library APIs *(P2)*
+
+**Files**: `src/session.rs:55` (`get_or_create`), `:166` (`session_count`);
+`src/ratelimit.rs:82` (`evict_stale`); `src/ffn_l2_cache.rs:92` (`stats`);
+`src/error.rs:24` (`InferenceUnavailable`).
+
+Either delete or add a one-line doc comment saying they're public for
+out-of-tree consumers; right now a reader can't tell intent.
+
+---
+
+### REV-COVERAGE. Test coverage gaps vs 90%/file project floor *(P1, partly addressed)*
+
+**Status**: 🟡 **Tooling + policy shipped 2026-05-10; per-file gap-fill ongoing.**
+
+Done in this session:
+- `make larql-server-{test,fmt-check,lint,coverage,coverage-summary,coverage-html,coverage-policy,ci}`
+  added to the workspace Makefile (mirror the `larql-compute` /
+  `larql-vindex` patterns).
+- `crates/larql-server/coverage-policy.json` created. Default per-
+  file floor is **90.0%**; 28 debt baselines snapshotted from the
+  2026-05-10 measurement; `total_line_min_percent: 65.6` matches the
+  current floor. New / split files automatically inherit the 90%
+  default.
+- Real coverage measured: 65.68% line / 72.18% function (was
+  claiming 74.2% / 81.2% at 2026-04-26 — drift since then).
+- Mainline files added in this session land at 100% (`routes/openai/error.rs`)
+  or close to it (`auth.rs` 98.0%, `session.rs` 96.1%).
+
+Still open (per-file gap-fill, listed roughly by impact):
+- `routes/openai/completions.rs` 40.3% → 90% (REV8 split helps)
+- `routes/walk_ffn.rs` 49.0% → 90% (REV7 split helps)
+- `routes/openai/chat.rs` 53.4% → 90% (REV8 split helps)
+- `routes/stream.rs` 53.3% → 90% (Q1.10 split helps)
+- `routes/explain.rs` 44.8% → 90%
+- `routes/infer.rs` 50.2% → 90%
+- `routes/expert/{batch_legacy,multi_layer_batch,single,warmup}.rs`
+  all 0% — these need a live-grid harness and are best treated as
+  one ticket once the grid test fixture exists.
+- `routes/openai/schema/mask.rs` 0% — orthogonal to the splits;
+  needs unit tests on the FSM-mask behaviour.
+- Behavioural-test gaps still open from the original review:
+  malformed-JSON rejection (axum `JsonRejection` → 400),
+  body-size-limit 413s, ETag 304 paths beyond the one
+  `test_http_describe.rs` happy path, gRPC stream backpressure,
+  gRPC client cancel mid-stream, OpenAI SSE `[DONE]` framing,
+  OpenAI streaming error chunk shape.
+
+**Acceptance**: each file ≥ 90% line coverage (project floor) — track
+via `coverage-policy.json` ratchet; each behavioural gap above has at
+least one direct test.
+
+### REV-SPEC. Spec / OpenAPI drift *(P1)*
+
+**Files**: `src/openapi.rs:113-118` vs `proto/vindex.proto:194-196`
+(`LoadedCapabilities` differs between HTTP and gRPC); `proto/vindex.proto`
+populates both `predictions` and `walk_predictions`/`dense_predictions`
+in `InferResponse` regardless of mode (HTTP differentiates). Both are
+intentional but undocumented and untested across both transports.
+Separately, `docs/server-spec.md` does not mention 422 anywhere and
+handlers do not emit it — pick a stance (probably 400 only) and state it.
+
+**Acceptance**: a cross-transport contract test that exercises the same
+operation over HTTP and gRPC and asserts equivalent semantics. A
+paragraph in `docs/server-spec.md` documenting the shape differences
+that remain.
+
+---
+
+### Strengths to preserve (do not regress)
+
+- `ServerError` enum + `IntoResponse` discipline — no generic `Internal`
+  catch-all in handler paths.
+- Centralised `env_flags` with cached reads and README cross-reference —
+  the right pattern for a reference implementation.
+- Rate limiter degrades open on poisoned mutex; `X-Forwarded-For` only
+  honoured under explicit flag.
+- Expert `layer_batch` semaphore-as-backpressure — a clean illustration
+  of the right way to bound rayon under HTTP load. Treat as a teaching
+  artefact and consider citing in the README.
+- Sampling clamping + stop-string handling in `routes/openai/util.rs` is
+  well-tested and idiomatic.
+- Binary wire format with `Accept`-header negotiation in `walk_ffn` is
+  elegant; the f16/i8/f32 negotiation is the kind of concrete pattern the
+  THESIS expects to diffuse into other stacks.
+
+---
+
 ## P0: Active
+
+### G-TRANSPORT. Wire format evolution + WebSocket streaming + QUIC (ADR-0009, ADR-0010)
+
+All work here is architecture-agnostic: no hardcoded layer counts, hidden
+sizes, or model-family assumptions. Sizes and dtypes are read from vindex
+config at runtime.
+
+#### GT1 — f16 wire default
+
+**Status**: ✅ **Shipped 2026-05-07.**
+
+Added `FFN_F16_CT = "application/x-larql-ffn-f16"` in `wire.rs`; `encode_binary_output_f16` in `walk_ffn.rs`; `preferred_response_ct` selects f16 when client sends `Accept: application/x-larql-ffn-f16`. Client (`ffn/remote/http.rs`) sends `Accept: i8, f16, f32` on every grid request. `LARQL_F16_WIRE_DISABLE` opt-out. `half = "2"` added to both crates.
+
+**Spec**: ADR-0009 §Decision, §Wire Layout (f16).
+
+Wire format is currently f32-only (4 bytes/value). For a model with
+hidden_size=H and seq_len=1, one round-trip costs `H × 4 × 2` bytes
+(request + response). f16 halves this with no accuracy loss for all tested
+architectures.
+
+- Add `F16_WIRE = "LARQL_F16_WIRE"` to `env_flags.rs` (present = opt-out,
+  i.e. `LARQL_F16_WIRE=0` forces f32).
+- Add `F16_CT = "application/x-larql-ffn-f16"` to `wire.rs`.
+- In `routes/walk_ffn.rs`: inspect `Accept` header; if client sends
+  `Accept: application/x-larql-ffn-f16`, encode response as f16.
+- In `larql-inference/src/ffn/remote/http.rs`: set
+  `Accept: application/x-larql-ffn-f16` by default (opt-out via flag).
+- Accuracy gate: `larql bench <vindex> --wire f32,f16 --assert-topk-match 5`
+  must pass for each model family before enabling as default.
+
+**Acceptance**: `larql bench <vindex> --ffn URL --wire f32,f16` shows <1%
+tok/s difference and identical top-5 tokens. Wire bytes column shows 50% reduction.
+
+#### GT2 — i8 quantised residuals (opt-in)
+
+**Status**: ✅ **Shipped 2026-05-07.**
+
+Added `FFN_I8_CT`; `encode_binary_output_i8` (per-position symmetric scale, zero_point=0) in `walk_ffn.rs`; `decode_binary_single/batch_i8` in `codec.rs`. Client advertises i8 in Accept header; server honours when `LARQL_I8_WIRE=1`. `preferred_response_ct` checks i8 before f16.
+
+**Spec**: ADR-0009 §Wire Layout (i8), §Negotiation Protocol.
+
+Per-position symmetric quantisation: `scale = max(|x|)/127`, `zero_point = 0`.
+Wire: `[scale f32 LE][zero_point f32 LE][data i8[] × hidden_size]` per position.
+
+- Add `I8_WIRE = "LARQL_I8_WIRE"` to `env_flags.rs` (opt-in, default off).
+- Add `I8_CT = "application/x-larql-ffn-i8"` to `wire.rs`.
+- Add `encode_i8_request`, `decode_i8_single/batch` to `ffn/remote/codec.rs`.
+- Add `encode_i8_output` to `routes/walk_ffn.rs`.
+- Accuracy gate: `--wire f32,i8 --assert-topk-match 1` must pass before
+  enabling i8 as opt-out on any model family.
+
+**Acceptance**: 75% bandwidth reduction vs f32; top-1 token identical on
+≥95% of decode steps across tested architectures.
+
+#### GT3 — Per-layer latency in HeartbeatMsg
+
+**Status**: ✅ **Shipped 2026-05-07.**
+
+`LayerLatency { layer, avg_ms, p99_ms }` added to grid.proto (`HeartbeatMsg.layer_stats` + `ServerInfo.layer_stats`). New `metrics::LayerLatencyTracker` (EMA α=0.1, p99 ring-buffer per layer, thread-safe Mutex). `LoadedModel.layer_latency_tracker` populated at construction; `walk_ffn.rs` records timing per layer after each FFN forward. `announce.rs` heartbeat sender calls `tracker.snapshot()`. Router `grid.rs` stores `layer_latencies: HashMap<u32, (avg_ms, p99_ms)>` in `ServerEntry`; `route()` prefers lowest `avg_ms` for the requested layer.
+
+**Spec**: ADR-0011 §HeartbeatMsg Extension.
+
+Current heartbeat sends `cpu_pct`, `ram_used`, `requests_in_flight` — all
+global. Router uses `requests_in_flight` for load balancing. This is blind to
+per-layer compute bottlenecks (e.g. a sparse MoE model where layer 15 is 3×
+slower than others due to expert placement).
+
+Proto change (`grid.proto`):
+```protobuf
+message LayerLatency {
+  uint32 layer  = 1;
+  float  avg_ms = 2;  // EMA α=0.1
+  float  p99_ms = 3;  // ring-buffer p99 over last 100 requests
+}
+message HeartbeatMsg {
+  // existing fields unchanged
+  repeated LayerLatency layer_stats = 4;
+}
+```
+
+Server changes:
+- `LayerLatencyTracker` struct in new `src/metrics.rs`: one EMA + `VecDeque`
+  per layer, updated in `routes/walk_ffn.rs` after each layer forward.
+- `announce.rs`: populate `layer_stats` in the heartbeat sender.
+
+Router change:
+- `grid.rs::update_heartbeat`: store `layer_stats` in `ServerEntry`.
+- `grid.rs::route`: prefer server with lowest `layer_stats[layer].avg_ms`
+  when multiple replicas cover the same layer.
+
+**Acceptance**: `larql serve --join ... --log-level debug` logs per-layer
+latency in each heartbeat. Router `/grid-status` response includes
+`layer_stats` per server.
+
+#### GT4 — WebSocket token streaming (Q1.10 completion + N0.1 SSE)
+
+**Status**: ✅ **Shipped 2026-05-07.**
+
+`handle_stream_generate` added to `routes/stream.rs`: accepts `{"type":"generate","prompt":"...","max_tokens":N}` WebSocket message, calls `generate_streaming` in a `spawn_blocking` task, streams `{"type":"token","text":"...","index":N}` per token, emits `{"type":"done","tokens":N,"latency_ms":M}` on completion. Client cancel supported via `{"type":"cancel"}` frame. SSE on `/v1/chat/completions` (`stream:true`) was confirmed already fully wired (N0.1 slice 3 complete).
+
+`routes/stream.rs` previously had a working WebSocket handler for `describe` and `infer`
+commands but lacked a streaming token generation path. This is the missing
+piece for N0.1 slice 3 (SSE on `POST /v1/chat/completions`).
+
+- Complete `handle_stream_infer` in `routes/stream.rs`:
+  - Accept `{"type": "generate", "prompt": "..."}` WS message.
+  - Call `generate_streaming` (already exists in larql-inference).
+  - Emit one `{"type": "token", "text": "..."}` frame per token.
+  - Emit `{"type": "done", "tokens": N, "ms": M}` on completion.
+  - Handle `{"type": "cancel"}` to abort generation.
+- Add binary frame support: client can send
+  `{"type": "generate", "format": "binary"}` to receive token IDs as u32 LE
+  instead of JSON (lower overhead for embedding clients).
+- Wire SSE for N0.1: in `routes/chat.rs`, when `stream: true`, use
+  `axum::response::Sse` to wrap the same `generate_streaming` callback.
+  Emit OpenAI-format `data: {...}\n\n` chunks; terminate with `data: [DONE]\n\n`.
+
+**Acceptance**: `wscat -c ws://localhost:8080/v1/stream` receives one JSON
+frame per token. `curl -N -H "Accept: text/event-stream" \
+-d '{"model":"...","messages":[...],"stream":true}' \
+http://localhost:8080/v1/chat/completions` streams tokens in SSE format.
+
+#### GT7 — QUIC transport for grid
+
+**Status**: Not started.
+
+**Spec**: ADR-0010 (full spec).
+
+Feature-gated (`cargo build --features quic`). QUIC is opt-in; TCP gRPC
+remains the default and is never removed.
+
+- Add `quinn = "0.11"` as optional dep in `Cargo.toml` behind `quic` feature.
+- New `src/transport/` directory:
+  - `src/transport/quic.rs`: quinn endpoint setup, stream wrapper as
+    `AsyncRead + AsyncWrite`, tonic channel factory.
+  - `src/transport/mod.rs`: re-export; feature-gated.
+- `bootstrap.rs`: accept `--quic-port N`; generate self-signed TLS cert if
+  not provided; spawn QUIC listener.
+- `announce.rs`: parse `quic://` scheme in `--join`; use QUIC transport
+  instead of TCP for the GridService.Join stream.
+
+**Acceptance**: `larql serve --join quic://router:50053 --layers 0-14` appears
+in `larql-router` grid-status after connecting via QUIC. Measured RTT in
+grid-status is ≤ TCP RTT on LAN; lower on lossy WAN paths.
+
+---
+
+### G-MODEB. Self-assembling grid Mode B (ADR-0011)
+
+#### GT5 — Gap-fill assignment
+
+**Status**: Not started.
+
+**Spec**: ADR-0011 §Phase B1 Protocol.
+
+A server starts with no shard loaded:
+```bash
+larql serve --join grpc://router:50052 \
+            --available-ram 24GB \
+            --vindex-store /mnt/shards/
+```
+
+Router changes (`grid.rs`):
+- Add `available_servers: HashMap<String, AvailableEntry>` to `GridState`.
+- Add `pending_assignments: HashMap<String, AssignmentRecord>`.
+- On `AvailableMsg`: call `check_coverage_gaps()`, select gap, send `AssignMsg`.
+- Assignment timeout: 10 min default (configurable `--assignment-timeout`).
+
+Server changes:
+- `announce.rs`: handle `AssignMsg` → spawn `shard_loader::download_shard()`.
+- New `src/shard_loader.rs`:
+  - `async fn download_shard(origin_url, store_path, expected_hash, progress)`
+  - HTTP range requests (resumable); SHA-256 verify; atomic rename.
+- After successful load: send `ReadyMsg`; announce loop transitions to Mode A.
+- On failure: send `RefuseMsg(reason="download_failed")`; re-enter available state.
+
+New server endpoint: `GET /v1/shard/{model_id}/{layer_start}-{layer_end}` —
+streams the shard directory as a tar for peer-to-peer distribution.
+
+**Acceptance**: `larql serve --join grpc://router --available-ram 24GB`
+appears in `/grid-status` as "available"; after `AssignMsg`, transitions to
+"loading"; after `ReadyMsg`, appears as "serving" with correct layer range.
+
+#### GT6 — Dynamic rebalancing
+
+**Status**: Not started. Requires GT5.
+
+**Spec**: ADR-0011 §Phase B2 Protocol.
+
+New `crates/larql-router/src/rebalancer.rs`:
+- Background tokio task, 30s check interval (configurable).
+- Triggers when: `max(avg_layer_latency_ms) / min(avg_layer_latency_ms) > 2.0`
+  sustained over 60s, AND a spare `AvailableEntry` exists.
+- Action: send `UnassignMsg(reason="rebalancing")` to overloaded server.
+
+Server drain protocol (in `announce.rs`):
+- On `UnassignMsg`: set `draining = true` on the shard.
+- Wait up to 30s for in-flight requests to complete (tracked via atomic counter).
+- Unload shard weights from memory.
+- Send `DroppingMsg(reason="reassigned")`.
+- Re-enter `AvailableMsg` loop for new assignment.
+
+**Acceptance**: Two servers covering the same layer range with artificial load
+skew (one processing 5× more requests): rebalancer detects imbalance, drains
+the overloaded server, load re-equalises within 2 rebalance cycles.
+
+---
+
+### G-BENCH. Grid benchmarking (ADR-0012)
+
+#### GT8 — `larql bench` grid/wire/transport extensions
+
+**Status**: Not started.
+
+**Spec**: ADR-0012 §Layer 1.
+
+All benchmarks are architecture-agnostic: `hidden_size`, `num_layers`,
+`quant_format` are read from vindex config. No model-family constants
+in the bench code.
+
+New flags added to `bench_cmd.rs`:
+```
+--bench-grid          Shard-count scaling sweep
+--wire f32,f16,i8     Wire format comparison (requires --ffn)
+--transport http,quic Transport comparison (requires --join or --ffn)
+--concurrent N        Concurrent client simulation
+--output json         Machine-readable JSON
+--output-file PATH    JSON destination (default stdout)
+```
+
+New bench submodules (under `commands/primary/bench/`):
+- `grid.rs` — scaling sweep: 1..N shards, report tok/s + p50/p99/shard_efficiency
+- `wire.rs` — wire format comparison: encode/decode timing + bandwidth + parity check
+- `transport.rs` — TCP vs QUIC comparison
+
+JSON schema: `{timestamp, model, grid, wire, transport, concurrent, results{tok_per_s, ms_per_tok{mean,p50,p95,p99}, wire_bytes_per_tok, per_layer_rtt_ms[]}}`.
+
+**Acceptance**: `larql bench <vindex> --ffn URL --wire f32,f16 --output json`
+emits valid JSON with both wire format results; `wire_bytes_per_tok` for f16
+is within 2% of `wire_bytes_per_tok(f32) / 2`.
+
+#### GT9 — Criterion micro-benchmarks
+
+**Status**: ✅ **Shipped 2026-05-07.**
+
+`larql-inference/benches/wire_codec.rs` (encode f32 request, decode f32/f16 response, 30-layer batch) and `larql-router/benches/routing.rs` (route single layer, route_all 30/62 layers, update_heartbeat, rebuild_route_table) — both parameterised over server counts and hidden sizes with no hardcoded model names. `larql-router` gained `src/lib.rs` re-exporting `pub mod grid`. Makefile: `bench-wire`, `bench-routing`, `bench-grid`, `bench-all`.
+
+**Spec**: ADR-0012 §Layer 2.
+
+- `crates/larql-inference/benches/wire_codec.rs`: encode/decode throughput
+  (MB/s) for f32/f16/i8 at hidden_size ∈ {2560, 4096, 5120}, seq_len ∈ {1, 32, 256}.
+  Parameters read as `criterion::BenchmarkId` — no hardcoded model names.
+- `crates/larql-router/benches/routing.rs`: `route()` hot path (ns/op at
+  1/10/100 servers), `rebuild_route_table()` cold path, `update_heartbeat()`.
+
+Run with: `make bench-wire` / `make bench-routing`.
+
+#### GT10 — CI regression gate
+
+**Status**: Not started. Requires GT8.
+
+**Spec**: ADR-0012 §Layer 3.
+
+- `scripts/bench-grid-regress.sh`: runs `larql bench --output json`, compares
+  against baseline in `bench/baselines/<model>.json`.
+- `scripts/bench_compare.py`: fails if tok/s drops >5% or p99 rises >10%.
+- Baselines committed to repo; updated explicitly after intentional improvements.
+- `Makefile` targets: `bench-wire`, `bench-routing`, `bench-grid`, `bench-all`.
+
+**Acceptance**: `make bench-grid MODEL=gemma3-4b-q4k` exits 0 on a clean run;
+exits 1 if a deliberate 10% regression is introduced.
+
+---
 
 ### F-COLLECT. Parallelize shard collection in `forward_moe_stream_collect_with_timing`
 
@@ -1357,7 +2111,7 @@ Chat Completions SSE) forces a similar shape.
 
 | Item | Outcome |
 |---|---|
-| **Q1.1** Split `routes/expert.rs` (1044 LOC, 6 concerns) | New `routes/expert/{mod,single,batch_legacy,layer_batch,cpu,metal,warmup}.rs` directory. mod.rs (90 LOC) re-exports the historical public surface (`run_expert`, `run_experts_cpu_batch`, `run_experts_metal_batch`, `warmup_*`, `handle_*`); each sibling file is ~100-225 LOC with one clear concern. `metal.rs` is `#[cfg(feature = "metal-experts")]`-gated so non-Metal builds compile clean. |
+| **Q1.1** Split `routes/expert.rs` (1044 LOC, 6 concerns) | New `routes/expert/{mod,single,batch_legacy,layer_batch,cpu,metal,warmup}.rs` directory. mod.rs (90 LOC) re-exports the historical public surface (`run_expert`, `run_experts_cpu_batch`, `run_experts_metal_batch`, `warmup_*`, `handle_*`); each sibling file is ~100-225 LOC with one clear concern. `metal.rs` is `#[cfg(all(feature = "metal-experts", target_os = "macos"))]`-gated so non-Metal builds compile clean. |
 | **Q1.2** Centralise env-var flags into `src/env_flags.rs` | New module with one `pub const` per `LARQL_*` name + cached presence accessors backed by `std::sync::OnceLock` (process-wide, not TLS — env vars don't change at runtime). Replaced 12 raw `std::env::var(...)` call sites in `routes/expert/*` and `grpc_expert.rs`; removed two ad-hoc `thread_local! { static HTTP_TIMING ... }` blocks. README env-var table now references the same names that show up in `env_flags::*`. |
 | **Q1.3 + Q1.9** Shared `wire::has_content_type` | New `src/wire.rs` with `has_content_type(headers, expected) -> bool` (uses `contains` so parameterised types like `application/json; charset=utf-8` match). Replaced 4 inline header-detection patterns in `routes/walk_ffn.rs`, `routes/embed.rs` (×2), `routes/expert/batch_legacy.rs`. 4 unit tests cover exact-match, parameterised, mismatch, and missing-header cases. |
 | **Q1.4** Body-size limit constants | `REQUEST_BODY_LIMIT_BYTES = 64 MB` and `REQUEST_BODY_LIMIT_LARGE_BYTES = 256 MB` in `src/http.rs`. Replaced 3 bare literals; `EXPERT_BATCH_BODY_LIMIT` in `routes/mod.rs` now references the same const. |

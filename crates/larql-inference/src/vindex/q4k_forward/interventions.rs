@@ -131,7 +131,6 @@ where
                     }
                 },
             )
-            .map(|(h_new, kv_out)| (h_new, kv_out))
             .ok_or_else(|| mapper_error.unwrap_or_else(|| "pre-W_O mapper returned None".into()))
             .map(Some)
         },
@@ -295,7 +294,6 @@ where
                     }
                 },
             )
-            .map(|(h_new, kv_out)| (h_new, kv_out))
             .ok_or_else(|| {
                 mapper_error.unwrap_or_else(|| "residual-delta mapper returned None".into())
             })

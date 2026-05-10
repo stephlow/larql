@@ -34,16 +34,16 @@ The rungs are not interchangeable — they answer different questions:
 
 ## Implementation status
 
-All engines now live in `larql_inference::engines::kv_engines/`. This crate
+All engines now live in the `larql-kv` crate. This crate
 re-exports from there; the implementations are no longer duplicated here.
 
 | Strategy | Lives in | End-to-end real | Synthetic |
 |---|---|---|---|
 | Standard KV | `real_model::kv_capture` | ✓ | ✓ `standard_kv` |
-| TurboQuant | `larql_inference::engines::kv_engines::turbo_quant` | ✓ (~95 tok/s Metal) | ✓ |
-| Markov RS | `larql_inference::engines::kv_engines::markov_residual` | ✓ (~95 tok/s Metal, bit-perfect) | ✓ |
-| UnlimitedContext | `larql_inference::engines::kv_engines::unlimited_context` | ✓ (~94 tok/s Metal) | ✓ |
-| ApolloEngine | `larql_inference::engines::kv_engines::apollo` | ✓ (compressed path via `forward_from_layer`) | ✓ |
+| TurboQuant | `larql_kv::engines::turbo_quant` | ✓ (~95 tok/s Metal) | ✓ |
+| Markov RS | `larql_kv::engines::markov_residual` | ✓ (~95 tok/s Metal, bit-perfect) | ✓ |
+| UnlimitedContext | `larql_kv::engines::unlimited_context` | ✓ (~94 tok/s Metal) | ✓ |
+| ApolloEngine | `larql_kv::engines::apollo` | ✓ (compressed path via `forward_from_layer`) | ✓ |
 | Graph Walk | `graph_walk::GraphWalk` (memory accounting only) | partial | — |
 
 ### Speed (Gemma 3 4B, Metal Q4K, 2026-04-26)
@@ -90,16 +90,7 @@ KL is not reported separately because `cos = 1.000000` on the hidden state force
 
 - Rows 1–3: measured end-to-end on Gemma 3 4B via the `real-model` feature. **Row 3 validation:** the most recent run (2026-04-23, trace above) measured `Markov RS hidden cosine vs baseline = 1.000000` on all five factual prompts, re-confirming the bit-perfect claim. The full `#[ignore]`'d suite (`tests/test_real_model.rs::test_accuracy_markov_rs_bitperfect` and adjacent) still requires weights + vindex on disk and does not run in default `cargo test`; the example above is the lightweight reproduction.
 - Row 4 (Tier 2): measured via `tests/test_unlimited_context::test_compression_ratio`. Within-window K,V is bit-exact via model-forward replay from the prior window's per-layer K,V checkpoint.
-- Row 5 (Tier 3): the Rust `ApolloEngine` loads `apollo-demo/apollo11_store/` end-to-end (2.13 MB in RAM) and runs the full pipeline: tf-idf-lite routing → positional-proximity entry retrieval → forward-with-injection (answer-tokens-only, step-0 only) at L30 coefficient 10× → greedy decode.
-
-  Four entry points, all measured end-to-end on Gemma 3 4B. The axes are orthogonal: **decode length** (single-token top-1 vs iterative decode) × **context representation** (raw window tokens vs 10 KB boundary vector):
-
-  |                      | Uncompressed (raw window tokens, ~519 tok) | Compressed (10 KB boundary + query, ~9 tok) |
-  |----------------------|-----|-----|
-  | **Single-token top-1** (`query_greedy*`) | `" John"` @ logit 24.0 | `" John"` @ logit 31.1 |
-  | **Iterative decode** (`query_generate*`) | **`" John Coyle.\n\n02 05 5"`** — correct answer, then drifts into the transcript's time-stamp structure | `" John and Mary.\n\nJohn and Mary won the porridge eating"` — first token correct (injection lands), hallucinates "Mary" because the single-vector boundary can't uniquely identify the "Coyle" continuation |
-
-  **The gap between compressed and uncompressed outputs is exactly the fidelity/compression trade-off the four-rung ladder predicts**: uncompressed forwards have the raw window text to ground on, compressed forwards rely on the ~10 KB boundary (variant-ii-class) + injection — which lands the first-token fact via amplification but can't carry detailed continuation info. A Tier 2-style per-layer K/V checkpoint (~139 KB per window) would reproduce "Coyle" exactly at the cost of ~14× more storage per boundary.
+- Row 5 (Tier 3): the Rust `ApolloEngine` (now in the `larql-kv` crate at `larql_kv::apollo`) loads `apollo-demo/apollo11_store/` end-to-end (2.13 MB in RAM) and runs the full pipeline: tf-idf-lite routing → positional-proximity entry retrieval → forward-with-injection (answer-tokens-only, step-0 only) at L30 coefficient 10× → greedy decode. The end-to-end demo harness (single-token top-1 vs iterative decode × raw window tokens vs 10 KB boundary) lived in `tests/test_apollo_query.rs` and `tests/test_apollo_accuracy.rs` until 2026-05-09; both were demo-only `#[ignore]` tests dependent on a specific apollo11_store on disk and were removed during the larql-kv extraction. Recover from git history if you want the harness back. The historical headline result (`" John Coyle.\n\n02 05 5"` correct answer + drift into the transcript's time-stamp structure on uncompressed; first token correct, "Mary" hallucination on compressed) measured exactly the fidelity/compression trade-off the four-rung ladder predicts: uncompressed forwards have the raw window text to ground on, compressed forwards rely on the ~10 KB boundary (variant-ii-class) + injection — which lands the first-token fact via amplification but can't carry detailed continuation info. A Tier 2-style per-layer K/V checkpoint (~139 KB per window) would reproduce "Coyle" exactly at the cost of ~14× more storage per boundary.
 
   Python reference: `chuk-mlx/src/chuk_lazarus/inference/context/research/unlimited_engine.py` + `vec_inject/`.
 - Row 6: see the † footnote under the headline ladder. The 1.5 MB figure is projected conditional on the cracked-attention path landing; FFN graph walk is proven (`real_model::graph_walk_layer`), but queries outside the factual graph currently fall back to Markov RS.

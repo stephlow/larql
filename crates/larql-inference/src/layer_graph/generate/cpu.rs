@@ -1,7 +1,10 @@
 //! CPU Q4K generate path — used when the active backend does not support the
 //! fused Q4 prefill + KV-cached decode pipeline (today: CpuBackend).
 
-use super::types::{GenerateResult, StageTimings};
+use super::{
+    eos::EosConfig,
+    types::{GenerateError, GenerateResult, StageTimings},
+};
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
@@ -17,12 +20,7 @@ use larql_compute::prelude::*;
 /// directly. Metal: yes. Pure CPU: no — that path produces correct forward
 /// results via the vindex Q4K dequant loop in `crate::vindex::q4k_forward`.
 pub(super) fn backend_supports_fused_q4_pipeline(backend: &dyn ComputeBackend) -> bool {
-    // CpuBackend reports `has_q4() == true` (it has Q4 matvecs) but does not
-    // override `prefill_q4` — the trait default returns None. A zero-arg
-    // probe would allocate; probe the backend name instead, which is stable
-    // and cheap. Metal's CpuBackend is labelled "cpu (...)".
-    let name = backend.name();
-    !name.starts_with("cpu")
+    backend.supports(Capability::PrefillQ4) && backend.supports(Capability::DecodeToken)
 }
 
 /// CPU Q4K generate path: loops `predict_q4k` one step at a time. O(N²) in
@@ -35,7 +33,12 @@ pub(super) fn generate_via_cpu_q4k(
     token_ids: &[u32],
     max_tokens: usize,
     index: &larql_vindex::VectorIndex,
+    eos: &EosConfig,
 ) -> GenerateResult {
+    if max_tokens == 0 {
+        return GenerateResult::empty_success();
+    }
+
     let prefill_start = std::time::Instant::now();
     // First-token pass covers the prompt — that's our "prefill" here.
     let first = crate::vindex::predict_q4k(weights, tokenizer, token_ids, 5, index);
@@ -49,7 +52,7 @@ pub(super) fn generate_via_cpu_q4k(
     // Seed with the first predicted token from the prefill pass.
     if let (Some(&id), Some(first_pred)) = (first.token_ids.first(), first.predictions.first()) {
         tokens.push((first_pred.0.clone(), 1.0));
-        let stop = crate::vindex::is_end_of_turn(first_pred.0.trim());
+        let stop = eos.is_eos_with_tokenizer(id, &first_pred.0, tokenizer);
         ids.push(id);
         if stop {
             return GenerateResult {
@@ -57,6 +60,7 @@ pub(super) fn generate_via_cpu_q4k(
                 prefill_ms,
                 decode_ms,
                 stage_timings: StageTimings::default(),
+                error: None,
             };
         }
     } else {
@@ -65,6 +69,9 @@ pub(super) fn generate_via_cpu_q4k(
             prefill_ms,
             decode_ms,
             stage_timings: StageTimings::default(),
+            error: Some(GenerateError::empty_output(
+                "CPU Q4K generation produced no first token",
+            )),
         };
     }
 
@@ -82,7 +89,7 @@ pub(super) fn generate_via_cpu_q4k(
                     .first()
                     .map(|p| p.0.clone())
                     .unwrap_or_default();
-                let stop = crate::vindex::is_end_of_turn(tok.trim());
+                let stop = eos.is_eos_with_tokenizer(id, &tok, tokenizer);
                 tokens.push((tok, 1.0));
                 ids.push(id);
                 if stop {
@@ -106,60 +113,8 @@ pub(super) fn generate_via_cpu_q4k(
             lm_head_ms_total: 0.0,
             detok_ms_total: 0.0,
         },
+        error: None,
     }
-}
-
-/// Constrained variant of [`generate_via_cpu_q4k`]. Thin wrapper over
-/// `vindex::q4k_forward::generate_q4k_cpu_constrained` that adapts the
-/// result shape into `GenerateResult`.
-pub(super) fn generate_constrained_via_cpu_q4k<M>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    mask_fn: M,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-{
-    generate_constrained_via_cpu_q4k_streaming(
-        weights,
-        tokenizer,
-        token_ids,
-        max_tokens,
-        index,
-        mask_fn,
-        |_, _, _| {},
-    )
-}
-
-/// Streaming variant of [`generate_constrained_via_cpu_q4k`]. Greedy
-/// under the mask; for sampling under mask see
-/// [`generate_constrained_via_cpu_q4k_streaming_sampled`].
-pub(super) fn generate_constrained_via_cpu_q4k_streaming<M, F>(
-    weights: &mut ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
-    token_ids: &[u32],
-    max_tokens: usize,
-    index: &larql_vindex::VectorIndex,
-    mask_fn: M,
-    on_token: F,
-) -> GenerateResult
-where
-    M: FnMut(&[u32], &mut Vec<f32>),
-    F: FnMut(u32, &str, f64),
-{
-    generate_constrained_via_cpu_q4k_streaming_sampled(
-        weights,
-        tokenizer,
-        token_ids,
-        max_tokens,
-        index,
-        mask_fn,
-        on_token,
-        super::sampling::SamplingConfig::greedy(),
-    )
 }
 
 /// Sampling-aware bridge to the CPU Q4_K constrained decoder. Threads
@@ -175,14 +130,19 @@ pub(super) fn generate_constrained_via_cpu_q4k_streaming_sampled<M, F>(
     mask_fn: M,
     on_token: F,
     sampling: super::sampling::SamplingConfig,
+    eos: &EosConfig,
 ) -> GenerateResult
 where
     M: FnMut(&[u32], &mut Vec<f32>),
     F: FnMut(u32, &str, f64),
 {
+    if max_tokens == 0 {
+        return GenerateResult::empty_success();
+    }
+
     let prefill_start = std::time::Instant::now();
-    let out = crate::vindex::generate_q4k_cpu_constrained_streaming_sampled(
-        weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling,
+    let out = crate::vindex::generate_q4k_cpu_constrained_streaming_sampled_with_eos(
+        weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling, eos,
     );
     let total_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     // Heuristic split: attribute the first token to prefill, the rest to
@@ -203,5 +163,6 @@ where
         prefill_ms,
         decode_ms,
         stage_timings: StageTimings::default(),
+        error: None,
     }
 }

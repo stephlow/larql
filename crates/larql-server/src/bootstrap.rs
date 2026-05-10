@@ -35,6 +35,26 @@ pub const DEFAULT_DESCRIBE_CACHE_TTL_SECS: u64 = 0;
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 
+/// Parse a human-readable RAM size string into bytes.
+/// Supports: "24GB", "16384MB", "4096KB", raw decimal bytes.
+pub fn parse_ram_bytes(s: &str) -> Result<u64, BoxError> {
+    let s = s.trim();
+    let (num_str, mult) = if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB").or_else(|| s.strip_suffix("mb")) {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
+        (n, 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("--available-ram: invalid number '{num_str}'"))?;
+    Ok(n * mult)
+}
+
 pub fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
     let parts: Vec<&str> = s.splitn(2, '-').collect();
     if parts.len() != 2 {
@@ -207,7 +227,7 @@ pub fn load_single_vindex(
         // `--ffn-only` skips attention weights (no infer path) but MUST
         // still mmap interleaved_q4k so per-layer walk-ffn requests can
         // call `q4k_ffn_forward_layer`.
-        let need_ffn_mmap = (!opts.no_infer && !opts.ffn_only && has_weights) || opts.ffn_only;
+        let need_ffn_mmap = opts.ffn_only || (!opts.no_infer && has_weights);
         if !opts.no_infer && !opts.ffn_only && has_weights {
             if path.join(LM_HEAD_BIN).is_file() {
                 let _ = index.load_lm_head(&path);
@@ -335,14 +355,16 @@ pub fn load_single_vindex(
         weights: std::sync::OnceLock::new(),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
+        layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
         moe_remote: opts.moe_remote.clone(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     })
 }
@@ -592,6 +614,19 @@ pub struct Cli {
     #[arg(long, env = "LARQL_GRID_KEY")]
     pub grid_key: Option<String>,
 
+    /// Mode B: advertise available RAM to the router (no vindex preloaded).
+    /// The router will assign a shard via AssignMsg.
+    /// Example: "24GB" or "16384MB" or raw bytes "17179869184".
+    /// Requires --join and --vindex-store.
+    #[arg(long, value_name = "SIZE")]
+    pub available_ram: Option<String>,
+
+    /// Mode B: directory where assigned shards will be downloaded.
+    /// The router assigns a shard; this server downloads it here.
+    /// Example: "/mnt/shards/"
+    #[arg(long, value_name = "PATH")]
+    pub vindex_store: Option<String>,
+
     /// Server-side MoE expert shard map: `"START-END=URL,START-END=URL,..."`
     /// The walk-ffn handler dispatches MoE expert calls to these remote servers.
     /// Combine with --layers for full 2D (layer × expert) sharding.
@@ -831,7 +866,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     }
 
     // Metal expert cache warmup (cfg=metal-experts only).
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     for m in &state.models {
         if m.expert_filter.is_none() {
             continue;
@@ -949,6 +984,31 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         if join_urls.len() > 1 {
             info!("Joining {} routers (stateless fan-out)", join_urls.len());
         }
+        // Mode B: --available-ram without a loaded model → advertise capacity.
+        if let Some(ref ram_str) = cli.available_ram {
+            match parse_ram_bytes(ram_str) {
+                Ok(ram_bytes) => {
+                    let store_path = cli
+                        .vindex_store
+                        .clone()
+                        .unwrap_or_else(|| "/tmp/larql-shards".to_string());
+                    for join_url in &join_urls {
+                        announce::run_announce_available(announce::AvailableConfig {
+                            join_url: join_url.clone(),
+                            listen_url: listen_url.clone(),
+                            ram_bytes,
+                            disk_bytes: 0, // TODO: query disk
+                            store_path: store_path.clone(),
+                            grid_key: cli.grid_key.clone(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("--available-ram parse error: {e} — falling through to Mode A");
+                }
+            }
+        }
+
         for m in &models {
             let (layer_start, layer_end) = match layer_range {
                 Some((s, e)) => (s as u32, (e - 1) as u32),
@@ -965,6 +1025,8 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     ram_bytes: 0,
                     grid_key: cli.grid_key.clone(),
                     vindex_hash: vhash.clone(),
+                    latency_tracker: m.layer_latency_tracker.clone(),
+                    requests_in_flight: m.requests_in_flight.clone(),
                 });
             }
         }
@@ -1035,6 +1097,27 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ram_bytes_gb() {
+        assert_eq!(parse_ram_bytes("24GB").unwrap(), 24 * 1024 * 1024 * 1024);
+        assert_eq!(parse_ram_bytes("16gb").unwrap(), 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_ram_bytes_mb() {
+        assert_eq!(parse_ram_bytes("4096MB").unwrap(), 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_ram_bytes_raw() {
+        assert_eq!(parse_ram_bytes("1073741824").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_ram_bytes_invalid() {
+        assert!(parse_ram_bytes("notanumber").is_err());
+    }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();

@@ -50,7 +50,10 @@ use larql_inference::{
     vindex::{WalkFfn, WalkFfnConfig},
     FfnBackend, InferenceModel, WeightFfn,
 };
-use larql_vindex::{FeatureMeta, GateIndex, SilentLoadCallbacks, StorageBucket, VectorIndex};
+use larql_vindex::{
+    FeatureMeta, FfnRowAccess, Fp4FfnAccess, GateIndex, GateLookup, NativeFfnAccess,
+    PatchOverrides, QuantizedFfnAccess, SilentLoadCallbacks, StorageBucket, VectorIndex,
+};
 
 // ── Corpus ─────────────────────────────────────────────────────────────
 
@@ -260,8 +263,7 @@ struct MaskedGateIndex<'a> {
     mask: PathMask,
 }
 
-impl<'a> GateIndex for MaskedGateIndex<'a> {
-    // ── Required ────────────────────────────────────────────────────────
+impl<'a> GateLookup for MaskedGateIndex<'a> {
     fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
         self.inner.gate_knn(layer, residual, top_k)
     }
@@ -272,78 +274,6 @@ impl<'a> GateIndex for MaskedGateIndex<'a> {
         self.inner.num_features(layer)
     }
 
-    // ── Booleans (masked) ───────────────────────────────────────────────
-    fn has_fp4_storage(&self) -> bool {
-        !self.mask.hide_fp4 && self.inner.has_fp4_storage()
-    }
-    fn has_interleaved_q4(&self) -> bool {
-        !self.mask.hide_q4 && self.inner.has_interleaved_q4()
-    }
-    fn has_interleaved(&self) -> bool {
-        !self.mask.hide_interleaved && self.inner.has_interleaved()
-    }
-    fn has_full_mmap_ffn(&self) -> bool {
-        !self.mask.hide_full_mmap && self.inner.has_full_mmap_ffn()
-    }
-    fn has_interleaved_q4k(&self) -> bool {
-        !self.mask.hide_q4k && self.inner.has_interleaved_q4k()
-    }
-    fn has_down_features(&self) -> bool {
-        !self.mask.hide_down_features && self.inner.has_down_features()
-    }
-    fn has_overrides_at(&self, layer: usize) -> bool {
-        self.inner.has_overrides_at(layer)
-    }
-    fn has_down_features_q4k(&self) -> bool {
-        self.inner.has_down_features_q4k()
-    }
-
-    // ── Data passthrough ────────────────────────────────────────────────
-    fn down_override(&self, l: usize, f: usize) -> Option<&[f32]> {
-        self.inner.down_override(l, f)
-    }
-    fn up_override(&self, l: usize, f: usize) -> Option<&[f32]> {
-        self.inner.up_override(l, f)
-    }
-    fn gate_override(&self, l: usize, f: usize) -> Option<&[f32]> {
-        self.inner.gate_override(l, f)
-    }
-    fn down_feature_vector(&self, l: usize, f: usize) -> Option<&[f32]> {
-        self.inner.down_feature_vector(l, f)
-    }
-    fn down_layer_matrix(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.inner.down_layer_matrix(l)
-    }
-    fn up_layer_matrix(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.inner.up_layer_matrix(l)
-    }
-    fn interleaved_gate(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.inner.interleaved_gate(l)
-    }
-    fn interleaved_up(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.inner.interleaved_up(l)
-    }
-    fn interleaved_down(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.inner.interleaved_down(l)
-    }
-    fn interleaved_q4_gate(&self, l: usize) -> Option<ndarray::Array2<f32>> {
-        self.inner.interleaved_q4_gate(l)
-    }
-    fn interleaved_q4_up(&self, l: usize) -> Option<ndarray::Array2<f32>> {
-        self.inner.interleaved_q4_up(l)
-    }
-    fn interleaved_q4_down(&self, l: usize) -> Option<ndarray::Array2<f32>> {
-        self.inner.interleaved_q4_down(l)
-    }
-    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
-        self.inner.interleaved_q4_mmap_ref()
-    }
-    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
-        self.inner.interleaved_q4k_mmap_ref()
-    }
-    fn interleaved_q4k_layer_data(&self, l: usize) -> Option<[(&[u8], &str); 3]> {
-        self.inner.interleaved_q4k_layer_data(l)
-    }
     fn gate_scores_batch(&self, l: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
         self.inner.gate_scores_batch(l, x)
     }
@@ -354,6 +284,107 @@ impl<'a> GateIndex for MaskedGateIndex<'a> {
         backend: Option<&dyn larql_compute::ComputeBackend>,
     ) -> Option<Array2<f32>> {
         self.inner.gate_scores_batch_backend(l, x, backend)
+    }
+    fn gate_knn_q4(
+        &self,
+        l: usize,
+        residual: &Array1<f32>,
+        top_k: usize,
+        backend: &dyn larql_compute::ComputeBackend,
+    ) -> Option<Vec<(usize, f32)>> {
+        self.inner.gate_knn_q4(l, residual, top_k, backend)
+    }
+    fn gate_walk(
+        &self,
+        l: usize,
+        residual: &Array1<f32>,
+        top_k: usize,
+    ) -> Option<Vec<(usize, f32)>> {
+        self.inner.gate_walk(l, residual, top_k)
+    }
+}
+
+impl<'a> PatchOverrides for MaskedGateIndex<'a> {
+    fn down_override(&self, l: usize, f: usize) -> Option<&[f32]> {
+        self.inner.down_override(l, f)
+    }
+    fn up_override(&self, l: usize, f: usize) -> Option<&[f32]> {
+        self.inner.up_override(l, f)
+    }
+    fn gate_override(&self, l: usize, f: usize) -> Option<&[f32]> {
+        self.inner.gate_override(l, f)
+    }
+    fn has_overrides_at(&self, layer: usize) -> bool {
+        self.inner.has_overrides_at(layer)
+    }
+}
+
+impl<'a> NativeFfnAccess for MaskedGateIndex<'a> {
+    fn has_down_features(&self) -> bool {
+        !self.mask.hide_down_features && self.inner.has_down_features()
+    }
+    fn down_feature_vector(&self, l: usize, f: usize) -> Option<&[f32]> {
+        self.inner.down_feature_vector(l, f)
+    }
+    fn down_layer_matrix(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.inner.down_layer_matrix(l)
+    }
+    fn up_layer_matrix(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.inner.up_layer_matrix(l)
+    }
+    fn has_full_mmap_ffn(&self) -> bool {
+        !self.mask.hide_full_mmap && self.inner.has_full_mmap_ffn()
+    }
+    fn has_interleaved(&self) -> bool {
+        !self.mask.hide_interleaved && self.inner.has_interleaved()
+    }
+    fn interleaved_gate(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.inner.interleaved_gate(l)
+    }
+    fn interleaved_up(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.inner.interleaved_up(l)
+    }
+    fn interleaved_down(&self, l: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
+        self.inner.interleaved_down(l)
+    }
+    fn prefetch_interleaved_layer(&self, l: usize) {
+        self.inner.prefetch_interleaved_layer(l)
+    }
+}
+
+impl<'a> QuantizedFfnAccess for MaskedGateIndex<'a> {
+    fn has_interleaved_q4(&self) -> bool {
+        !self.mask.hide_q4 && self.inner.has_interleaved_q4()
+    }
+    fn interleaved_q4_gate(&self, l: usize) -> Option<ndarray::Array2<f32>> {
+        self.inner.interleaved_q4_gate(l)
+    }
+    fn interleaved_q4_up(&self, l: usize) -> Option<ndarray::Array2<f32>> {
+        self.inner.interleaved_q4_up(l)
+    }
+    fn interleaved_q4_down(&self, l: usize) -> Option<ndarray::Array2<f32>> {
+        self.inner.interleaved_q4_down(l)
+    }
+    fn prefetch_interleaved_q4_layer(&self, l: usize) {
+        self.inner.prefetch_interleaved_q4_layer(l)
+    }
+    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
+        self.inner.interleaved_q4_mmap_ref()
+    }
+    fn has_interleaved_q4k(&self) -> bool {
+        !self.mask.hide_q4k && self.inner.has_interleaved_q4k()
+    }
+    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
+        self.inner.interleaved_q4k_mmap_ref()
+    }
+    fn prefetch_interleaved_q4k_layer(&self, l: usize) {
+        self.inner.prefetch_interleaved_q4k_layer(l)
+    }
+    fn interleaved_q4k_layer_data(&self, l: usize) -> Option<[(&[u8], &str); 3]> {
+        self.inner.interleaved_q4k_layer_data(l)
+    }
+    fn has_down_features_q4k(&self) -> bool {
+        self.inner.has_down_features_q4k()
     }
     fn q4k_ffn_layer(&self, l: usize, c: usize) -> Option<std::sync::Arc<Vec<f32>>> {
         self.inner.q4k_ffn_layer(l, c)
@@ -397,6 +428,12 @@ impl<'a> GateIndex for MaskedGateIndex<'a> {
     ) -> Option<Vec<f32>> {
         self.inner.q4k_matmul_transb(l, c, x, x_rows, backend)
     }
+}
+
+impl<'a> Fp4FfnAccess for MaskedGateIndex<'a> {
+    fn has_fp4_storage(&self) -> bool {
+        !self.mask.hide_fp4 && self.inner.has_fp4_storage()
+    }
     fn fp4_ffn_row_dot(&self, l: usize, c: usize, f: usize, x: &[f32]) -> Option<f32> {
         self.inner.fp4_ffn_row_dot(l, c, f, x)
     }
@@ -412,32 +449,6 @@ impl<'a> GateIndex for MaskedGateIndex<'a> {
     }
     fn fp4_ffn_row_into(&self, l: usize, c: usize, f: usize, out: &mut [f32]) -> bool {
         self.inner.fp4_ffn_row_into(l, c, f, out)
-    }
-    fn gate_knn_q4(
-        &self,
-        l: usize,
-        residual: &Array1<f32>,
-        top_k: usize,
-        backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> {
-        self.inner.gate_knn_q4(l, residual, top_k, backend)
-    }
-    fn gate_walk(
-        &self,
-        l: usize,
-        residual: &Array1<f32>,
-        top_k: usize,
-    ) -> Option<Vec<(usize, f32)>> {
-        self.inner.gate_walk(l, residual, top_k)
-    }
-    fn prefetch_interleaved_layer(&self, l: usize) {
-        self.inner.prefetch_interleaved_layer(l)
-    }
-    fn prefetch_interleaved_q4_layer(&self, l: usize) {
-        self.inner.prefetch_interleaved_q4_layer(l)
-    }
-    fn prefetch_interleaved_q4k_layer(&self, l: usize) {
-        self.inner.prefetch_interleaved_q4k_layer(l)
     }
 }
 

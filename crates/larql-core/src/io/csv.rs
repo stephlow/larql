@@ -9,6 +9,8 @@ use crate::core::edge::Edge;
 use crate::core::enums::SourceType;
 use crate::core::graph::{Graph, GraphError};
 
+const CSV_HEADER: [&str; 5] = ["subject", "relation", "object", "confidence", "source"];
+
 /// Load a graph from CSV. Expected columns: subject,relation,object,confidence,source
 pub fn load_csv(path: impl AsRef<Path>) -> Result<Graph, GraphError> {
     let contents = std::fs::read_to_string(path)?;
@@ -18,7 +20,7 @@ pub fn load_csv(path: impl AsRef<Path>) -> Result<Graph, GraphError> {
         if fields.iter().all(|f| f.trim().is_empty()) {
             continue;
         }
-        if i == 0 && fields.first().is_some_and(|f| f.trim() == "subject") {
+        if i == 0 && fields.first().is_some_and(|f| f.trim() == CSV_HEADER[0]) {
             continue;
         }
 
@@ -51,7 +53,7 @@ pub fn load_csv(path: impl AsRef<Path>) -> Result<Graph, GraphError> {
 /// Save a graph to CSV.
 pub fn save_csv(graph: &Graph, path: impl AsRef<Path>) -> Result<(), GraphError> {
     let mut file = std::fs::File::create(path)?;
-    writeln!(file, "subject,relation,object,confidence,source")?;
+    writeln!(file, "{}", CSV_HEADER.join(","))?;
     for edge in graph.edges() {
         write_csv_field(&mut file, &edge.subject)?;
         write!(file, ",")?;

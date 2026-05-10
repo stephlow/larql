@@ -570,7 +570,7 @@ mod tests {
         let path = std::env::temp_dir().join("larql_trace_test_bad_magic.trac");
         let mut bytes = [0u8; 64];
         bytes[0..4].copy_from_slice(b"XXXX");
-        std::fs::write(&path, &bytes).expect("write");
+        std::fs::write(&path, bytes).expect("write");
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "bad magic should return error");
         let _ = std::fs::remove_file(&path);
@@ -593,6 +593,200 @@ mod tests {
 
         let result = TraceStore::open(&path);
         assert!(result.is_err(), "truncated trace should not open");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_file_smaller_than_header_returns_error() {
+        // mmap.len() < HEADER_SIZE — early return before parsing magic.
+        let path = std::env::temp_dir().join("larql_trace_test_too_small.trac");
+        std::fs::write(&path, [0u8; 16]).expect("write tiny file");
+        let result = TraceStore::open(&path);
+        assert!(result.is_err(), "file smaller than header must error");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_unsupported_version_returns_error() {
+        let path = std::env::temp_dir().join("larql_trace_test_bad_version.trac");
+        // Forge a header with the right magic but wrong version. Header
+        // is exactly HEADER_SIZE bytes, which matches expected_file_len
+        // when n_tokens=0, so the length check passes first.
+        let header = TraceHeader {
+            magic: MAGIC,
+            version: VERSION + 99,
+            hidden_size: 4,
+            n_layers: 2,
+            n_tokens: 0,
+            _reserved: [0; 44],
+        };
+        std::fs::write(&path, header.to_bytes()).expect("write");
+        let result = TraceStore::open(&path);
+        assert!(result.is_err(), "unsupported version must error");
+        let err = match result {
+            Ok(_) => unreachable!("unsupported version must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("version"),
+            "error should mention version: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attn_delta_accessor_reads_correct_component() {
+        // attn_delta is exercised by component-2 tests above only via
+        // residual/ffn_delta. Lock the accessor explicitly.
+        let path = std::env::temp_dir().join("larql_trace_test_attn_delta.trac");
+        let hidden = 4;
+        let mut writer = TraceWriter::create(&path, hidden, 2).expect("create");
+        let mut chain = make_chain(2, 0, hidden);
+        // Stamp attn_delta with a recognizable signature so we can verify
+        // the offset math hits component=1 (not residual or ffn_delta).
+        for n in &mut chain {
+            n.attn_delta = vec![42.0; hidden];
+        }
+        writer.append_chain(&chain).expect("append");
+        writer.finish().expect("finish");
+
+        let store = TraceStore::open(&path).expect("open");
+        let attn = store.attn_delta(0, 0).expect("attn_delta");
+        assert_eq!(attn.len(), hidden);
+        for &v in attn {
+            assert!((v - 42.0).abs() < 1e-6, "attn_delta should be 42.0");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_trace_appends_all_positions_in_order() {
+        // Drives `write_trace` happy path: collects per-position chains,
+        // sorts by layer, validates, appends.
+        let path = std::env::temp_dir().join("larql_trace_test_write_trace.trac");
+        let hidden = 4;
+        let n_layers = 2;
+        let mut writer = TraceWriter::create(&path, hidden, n_layers).expect("create");
+
+        // Build a 3-position trace where ffn_delta encodes position so we
+        // can verify ordering survived the round trip.
+        let mut nodes = Vec::new();
+        for pos in 0..3 {
+            for layer in -1..(n_layers as i32) {
+                nodes.push(zero_node(layer, pos, hidden));
+            }
+        }
+        let trace = ResidualTrace {
+            prompt: String::new(),
+            tokens: vec!["a".into(), "b".into(), "c".into()],
+            token_ids: vec![1, 2, 3],
+            n_layers,
+            hidden_size: hidden,
+            nodes,
+            attention: Vec::new(),
+        };
+        let written = writer.write_trace(&trace).expect("write_trace");
+        assert_eq!(written, 3);
+        writer.finish().expect("finish");
+
+        let store = TraceStore::open(&path).expect("open");
+        assert_eq!(store.n_tokens(), 3);
+        for pos in 0..3 {
+            let ffn = store.ffn_delta(pos, 0).expect("ffn_delta");
+            assert!(
+                (ffn[0] - pos as f32).abs() < 1e-6,
+                "position {pos} round-trip failed"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writer_open_appends_to_existing_file() {
+        // TraceWriter::open exercises the "open existing for append" path,
+        // including header parsing + length validation + seek-to-end.
+        let path = std::env::temp_dir().join("larql_trace_test_writer_open.trac");
+        {
+            let mut w = TraceWriter::create(&path, 4, 2).expect("create");
+            w.append_chain(&make_chain(2, 0, 4)).expect("append");
+            w.finish().expect("finish");
+        }
+        // Reopen and append a second chain.
+        let mut w2 = TraceWriter::open(&path).expect("open existing");
+        assert_eq!(w2.n_tokens(), 1);
+        w2.append_chain(&make_chain(2, 1, 4)).expect("append #2");
+        assert_eq!(w2.n_tokens(), 2);
+        w2.finish().expect("finish");
+
+        let store = TraceStore::open(&path).expect("open store");
+        assert_eq!(store.n_tokens(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writer_open_rejects_bad_magic() {
+        let path = std::env::temp_dir().join("larql_trace_test_writer_open_bad_magic.trac");
+        std::fs::write(&path, [0u8; HEADER_SIZE]).expect("write");
+        let result = TraceWriter::open(&path);
+        assert!(result.is_err(), "bad magic must error on writer open");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writer_open_rejects_unsupported_version() {
+        let path = std::env::temp_dir().join("larql_trace_test_writer_open_bad_version.trac");
+        let header = TraceHeader {
+            magic: MAGIC,
+            version: VERSION + 99,
+            hidden_size: 4,
+            n_layers: 2,
+            n_tokens: 0,
+            _reserved: [0; 44],
+        };
+        std::fs::write(&path, header.to_bytes()).expect("write");
+        let result = TraceWriter::open(&path);
+        assert!(result.is_err(), "writer open must reject unknown version");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn writer_open_rejects_length_mismatch() {
+        let path = std::env::temp_dir().join("larql_trace_test_writer_open_bad_len.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        writer.append_chain(&make_chain(2, 0, 4)).expect("append");
+        writer.finish().expect("finish");
+        // Pad the file with extra bytes so length doesn't match the header.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append-open")
+            .write_all(&[0u8; 16])
+            .expect("pad");
+        let result = TraceWriter::open(&path);
+        assert!(result.is_err(), "writer open must reject length mismatch");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_chain_rejects_position_mismatch() {
+        let path = std::env::temp_dir().join("larql_trace_test_pos_mismatch.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        let mut chain = make_chain(2, 0, 4);
+        chain[1].position = 7; // diverge from chain[0]
+        let result = writer.append_chain(&chain);
+        assert!(result.is_err(), "position mismatch must error");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_chain_rejects_vector_size_mismatch() {
+        let path = std::env::temp_dir().join("larql_trace_test_vec_size.trac");
+        let mut writer = TraceWriter::create(&path, 4, 2).expect("create");
+        let mut chain = make_chain(2, 0, 4);
+        chain[0].residual = vec![0.0; 99]; // wrong hidden size
+        let result = writer.append_chain(&chain);
+        assert!(result.is_err(), "vector size mismatch must error");
         let _ = std::fs::remove_file(&path);
     }
 }

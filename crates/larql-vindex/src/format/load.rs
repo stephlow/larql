@@ -9,15 +9,18 @@ use ndarray::Array2;
 use crate::config::VindexConfig;
 use crate::error::VindexError;
 use crate::format::filenames::{
-    DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON, INTERLEAVED_Q4K_BIN,
-    INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN, TOKENIZER_JSON,
+    DOWN_META_BIN, DOWN_META_JSONL, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON,
+    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
+    TOKENIZER_JSON,
 };
+use crate::index::storage::ffn_store::FFN_COMPONENTS_PER_LAYER;
 use crate::index::{IndexLoadCallbacks, VectorIndex};
 
 impl VectorIndex {
     /// Load a VectorIndex from a .vindex directory.
     ///
-    /// Reads gate_vectors.bin (mmap'd), down_meta.jsonl, and index.json.
+    /// Reads gate_vectors.bin (mmap'd), down_meta.bin or legacy down_meta.jsonl,
+    /// and index.json.
     /// The embeddings and tokenizer are loaded separately via `load_vindex_embeddings`.
     pub fn load_vindex(
         dir: &Path,
@@ -129,30 +132,20 @@ impl VectorIndex {
             (empty, gate_slices, crate::config::dtype::StorageDtype::F16)
         };
 
-        // Load down metadata — mmap binary (zero heap), fall back to JSONL (legacy)
+        // Load down metadata — mmap binary (zero heap), fall back to JSONL
+        // only when the binary file is absent. A present-but-invalid binary
+        // is a corrupt vindex and should fail loudly.
         let start = std::time::Instant::now();
 
-        let down_meta_mmap = if crate::format::down_meta::has_binary(dir) {
-            match load_vindex_tokenizer(dir) {
-                Ok(tokenizer) => {
-                    callbacks
-                        .on_file_start("down_meta", &dir.join(DOWN_META_BIN).display().to_string());
-                    let tok = std::sync::Arc::new(tokenizer);
-                    match crate::format::down_meta::mmap_binary(dir, tok) {
-                        Ok(dm) => {
-                            let count = dm.total_features();
-                            callbacks.on_file_done(
-                                "down_meta",
-                                count,
-                                start.elapsed().as_secs_f64() * 1000.0,
-                            );
-                            Some(dm)
-                        }
-                        Err(_) => None,
-                    }
-                }
-                Err(_) => None,
-            }
+        let has_binary_down_meta = crate::format::down_meta::has_binary(dir);
+        let down_meta_mmap = if has_binary_down_meta {
+            let tokenizer = load_vindex_tokenizer(dir)?;
+            callbacks.on_file_start("down_meta", &dir.join(DOWN_META_BIN).display().to_string());
+            let tok = std::sync::Arc::new(tokenizer);
+            let dm = crate::format::down_meta::mmap_binary(dir, tok)?;
+            let count = dm.total_features();
+            callbacks.on_file_done("down_meta", count, start.elapsed().as_secs_f64() * 1000.0);
+            Some(dm)
         } else {
             None
         };
@@ -173,6 +166,13 @@ impl VectorIndex {
         // (4× slower fallback to the f32 BLAS gemv).
         if config.vocab_size > 0 {
             index.vocab_size = config.vocab_size;
+        }
+
+        if !has_binary_down_meta {
+            let legacy_path = dir.join(DOWN_META_JSONL);
+            if legacy_path.exists() {
+                index.load_down_meta(&legacy_path, callbacks)?;
+            }
         }
 
         // Opportunistically wire up FFN payload mmaps so walk_ffn_sparse can
@@ -306,7 +306,7 @@ fn synthesize_gate_from_q4k(
             continue;
         }
         // Manifest entries per layer are [gate, up, down] in order.
-        let base = info.layer * 3;
+        let base = info.layer * FFN_COMPONENTS_PER_LAYER;
         let gate_entry = manifest_json.get(base).ok_or_else(|| {
             VindexError::Parse(format!(
                 "q4k manifest missing gate entry for layer {}",
@@ -511,7 +511,7 @@ mod tests {
 {"l":0,"f":1,"t":"French"}
 {"l":1,"f":0,"t":"Berlin"}
 "#;
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels.len(), 3);
@@ -525,7 +525,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let jsonl = r#"{"layer":2,"feature":5,"top_token":"Spain"}
 "#;
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels[&(2, 5)], "Spain");
@@ -537,7 +537,7 @@ mod tests {
         let jsonl = r#"{"_header":true,"version":1}
 {"l":0,"f":0,"t":"Rome"}
 "#;
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels.len(), 1);
@@ -548,7 +548,7 @@ mod tests {
     fn load_feature_labels_skips_blank_lines() {
         let dir = TempDir::new().unwrap();
         let jsonl = "  \n{\"l\":0,\"f\":0,\"t\":\"Tokyo\"}\n\n";
-        let path = dir.path().join("down_meta.jsonl");
+        let path = dir.path().join(DOWN_META_JSONL);
         std::fs::write(&path, jsonl).unwrap();
         let labels = load_feature_labels(&path).unwrap();
         assert_eq!(labels.len(), 1);

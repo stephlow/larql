@@ -1,4 +1,4 @@
-//! Model-agnostic chat-template helpers.
+//! Model-agnostic chat-template helpers (heuristic, no vindex required).
 //!
 //! Wraps a raw user prompt in the instruction-tuning format the target model
 //! was trained on. Selecting the wrong template produces garbage output, so
@@ -13,6 +13,28 @@
 //! When you have a loaded model, prefer [`ChatTemplate::for_family`] with the
 //! string returned by [`larql_models::ModelArchitecture::family`] — that's the
 //! authoritative signal.
+//!
+//! ## Sibling chat-template machinery
+//!
+//! Three modules share this space; they are complementary, not redundant:
+//!
+//! - **This module ([`crate::prompt`])** — heuristic enum + hardcoded format
+//!   strings. Use when you only have a model id / family string and no vindex
+//!   bytes available (e.g. an OpenAI-shaped HTTP request whose model id picks
+//!   the renderer before any weights are loaded).
+//! - **[`crate::chat`]** — Jinja-driven rendering against a vindex's
+//!   `chat_template.jinja` / `tokenizer_config.json::chat_template`. The
+//!   canonical, model-faithful path when the vindex directory is on disk.
+//! - **[`crate::layer_graph::TurnRenderer`]** — incremental per-turn rendering
+//!   for the multi-turn [`ChatSession`](crate::layer_graph::ChatSession) token
+//!   buffer. [`ChatTemplate::render_messages`] delegates to these renderers
+//!   for Gemma / Llama / ChatML rather than re-implementing the format
+//!   strings, so the per-turn shape stays consistent across the two stacks.
+//!
+//! [`ChatTemplate::wrap`] still owns its own single-prompt format strings
+//! (slightly different shape — adds the assistant-open marker). Keep them
+//! aligned with the [`TurnRenderer`](crate::layer_graph::TurnRenderer) impls
+//! when adjusting either side.
 
 /// Chat-template format for instruction-tuned models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

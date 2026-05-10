@@ -92,8 +92,8 @@ impl<'a> LayerGraph for PipelinedLayerGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::ffn::WeightFfn;
+    use crate::test_utils::make_test_weights;
     use larql_models::ModelWeights;
     use ndarray::Array2;
     use std::sync::OnceLock;
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn pipelined_name() {
         let w = weights();
-        let idx = crate::engines::test_utils::make_test_vindex(w);
+        let idx = crate::test_utils::make_test_vindex(w);
         let g = PipelinedLayerGraph {
             index: &idx,
             backend: &larql_compute::CpuBackend,
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn pipelined_out_of_range_returns_none() {
         let w = weights();
-        let idx = crate::engines::test_utils::make_test_vindex(w);
+        let idx = crate::test_utils::make_test_vindex(w);
         let g = PipelinedLayerGraph {
             index: &idx,
             backend: &larql_compute::CpuBackend,
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn pipelined_in_range_produces_output() {
         let w = weights();
-        let idx = crate::engines::test_utils::make_test_vindex(w);
+        let idx = crate::test_utils::make_test_vindex(w);
         let g = PipelinedLayerGraph {
             index: &idx,
             backend: &larql_compute::CpuBackend,

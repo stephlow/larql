@@ -149,7 +149,7 @@ pub fn encode(
             // misinterprets the format (Q4_KF uses pre-baked half-scales)
             // and gets the threadgroup geometry wrong (4 rows / 64 threads),
             // leaving ~75% of output rows unwritten.
-            if std::env::var("LARQL_DBG_QM").is_ok() {
+            if crate::options::env_flag(crate::options::ENV_DBG_QM) {
                 eprintln!(
                     "[quant_matvec] Q4_K path — kh.rows_per_tg={} kh.threads_per_tg={} n={} k={}",
                     pipes.q4k_matvec_fallback.rows_per_tg,
@@ -184,7 +184,7 @@ pub fn encode(
                 MTLSize::new(kh.threads_per_tg, 1, 1),
             );
         }
-        crate::QuantFormat::Q4_0 | crate::QuantFormat::Q8_0 => {
+        crate::QuantFormat::Q4_0 => {
             // Q4_0 matvec expects Q8 input + Q8 scales (per-32 f16-scaled
             // blocks). Geometry travels with the kernel handle.
             let kernel = pipes.q4_matvec;
@@ -199,6 +199,24 @@ pub fn encode(
             enc.dispatch_thread_groups(
                 MTLSize::new(num_tgs, 1, 1),
                 MTLSize::new(kernel.threads_per_tg, 1, 1),
+            );
+        }
+        crate::QuantFormat::Q8_0 => {
+            // Q8_0 weights are NOT a Q4_0 kernel input — Q8_0 blocks are
+            // 34 bytes per 32 values while Q4_0 is 18. Pre-2026-05-09
+            // this branch shared the Q4_0 arm above, which read the
+            // wrong byte stride and produced garbage. Production decode
+            // routes Q8_0 weights through `quant.q8_matvec_pipeline` and
+            // `attention.q8_qkv_proj_pipeline` directly (see
+            // `metal/decode/encode_qkv.rs::encode_q4_0_norm_and_qkv`),
+            // not through this generic dispatcher. If a future caller
+            // wants Q8_0 inside the FFN-style `qmv::encode` path,
+            // extend `Pipelines` with `q8_matvec` and dispatch it here.
+            panic!(
+                "metal::stages::quant_matvec::encode: Q8_0 not yet routed \
+                 through this generic dispatcher. Use \
+                 `quant.q8_matvec_pipeline` directly, or extend the \
+                 `Pipelines` struct to carry a Q8 kernel."
             );
         }
         crate::QuantFormat::BF16 | crate::QuantFormat::F16 | crate::QuantFormat::F32 => {

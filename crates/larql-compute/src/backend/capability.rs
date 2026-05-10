@@ -38,8 +38,21 @@ pub enum Capability {
     DecodeToken,
     /// Decode with a remote-MoE callback (`decode_token_with_moe`).
     DecodeMoe,
+    /// Decode using local GPU dispatch for Q4_K per-layer expert tensors.
+    DecodeQ4KMoe,
     /// Per-stage timing decode (`decode_token_split_profile`).
     DecodeProfile,
     /// Multi-position prefill with KV cache population (`prefill_q4`).
     PrefillQ4,
+    /// Heterogeneous attention geometry: layers in the same model can
+    /// have different `head_dim`, `num_kv_heads`, `num_q_heads`,
+    /// `rope_base`, or sliding-window flags. Required by Gemma 4 31B
+    /// (50 sliding-attention layers at head_dim=256/16-kv plus 10
+    /// global-attention layers at head_dim=512/4-kv). A backend that
+    /// returns `false` here will be rejected by callers before decode
+    /// rather than silently corrupting KV state at the first
+    /// non-uniform layer. The dense-uniform case (every layer reports
+    /// the same geometry) is supported by every backend regardless of
+    /// this capability.
+    HeterogeneousAttention,
 }

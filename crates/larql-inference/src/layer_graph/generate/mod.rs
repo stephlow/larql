@@ -6,33 +6,40 @@
 //! - [`sampling`]: greedy / temperature / top-k / top-p sampler.
 
 pub mod chat_session;
+mod constrained;
 mod cpu;
 pub mod detok;
 pub mod eos;
 mod gpu;
+mod gpu_setup;
 mod lm_head;
+pub(crate) mod policy;
 pub mod sampling;
 mod types;
 
 pub use chat_session::{
     ChatMLRenderer, ChatSession, GemmaRenderer, Llama3Renderer, TurnRenderer, DEFAULT_MAX_CONTEXT,
 };
+pub use constrained::{
+    generate_constrained, generate_constrained_streaming, generate_constrained_streaming_sampled,
+    try_generate_constrained, try_generate_constrained_streaming,
+    try_generate_constrained_streaming_sampled,
+};
 pub use detok::Detokenizer;
 pub use eos::{EosConfig, BUILTIN_STOP_STRINGS, GENERATION_CONFIG_FILENAME};
 pub use gpu::{
-    generate, generate_constrained, generate_constrained_streaming,
-    generate_constrained_streaming_sampled, generate_streaming, generate_with_sampling,
-    stream_forced_full_logits, ForcedLogitsResult,
+    generate, generate_streaming, generate_with_sampling, stream_forced_full_logits, try_generate,
+    try_generate_streaming, try_generate_with_sampling, ForcedLogitsResult,
 };
 pub use lm_head::lm_head_topk;
 pub use sampling::{Sampler, SamplingConfig};
-pub use types::{GenerateResult, StageTimings};
+pub use types::{GenerateError, GenerateResult, StageTimings};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::layer_graph::CachedLayerGraph;
+    use crate::test_utils::make_test_weights;
 
     // ── lm_head / logit helpers (synthetic, no vindex) ────────────────────────
 
@@ -102,7 +109,7 @@ mod tests {
     //   cargo test -p larql-inference --lib layer_graph::generate::tests -- --ignored --nocapture
 
     fn load_test_vindex() -> Option<(larql_vindex::VectorIndex, larql_models::ModelWeights)> {
-        let vpath = std::env::var("LARQL_VINDEX_PATH").ok()?;
+        let vpath = std::env::var(crate::vindex::ENV_VINDEX_PATH).ok()?;
         let path = std::path::Path::new(&vpath);
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut index = larql_vindex::VectorIndex::load_vindex(path, &mut cb).ok()?;
@@ -118,7 +125,7 @@ mod tests {
         let (index, mut weights) =
             load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .expect("tokenizer load failed");
 
@@ -156,7 +163,7 @@ mod tests {
         let (index, mut weights) =
             load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .expect("tokenizer load failed");
 
@@ -200,7 +207,7 @@ mod tests {
     fn generate_prefill_ms_positive() {
         let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .unwrap();
         let prompt = "Hello";

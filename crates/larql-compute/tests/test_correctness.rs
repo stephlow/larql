@@ -1,4 +1,11 @@
 //! Correctness tests: verify all backends produce matching output.
+//!
+//! Gated on the `heavy_tests` feature — runtime is sub-second but the
+//! per-binary build is ~30 s, which dominates plain
+//! `cargo test -p larql-compute`. Run via `make
+//! larql-compute-test-integration` or `cargo test -p larql-compute
+//! --features heavy_tests`.
+#![cfg(feature = "heavy_tests")]
 
 extern crate blas_src;
 

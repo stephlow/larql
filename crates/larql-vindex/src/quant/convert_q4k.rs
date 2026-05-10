@@ -28,6 +28,7 @@ use crate::format::filenames::*;
 use crate::format::weights::{
     load_model_weights, write_model_weights_q4k_with_opts, Q4kWriteOptions,
 };
+use crate::index::storage::ffn_store::{FFN_COMPONENTS_PER_LAYER, FFN_DOWN};
 use crate::IndexLoadCallbacks;
 
 #[derive(Debug, Clone, Default)]
@@ -355,12 +356,12 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
 
     let config = crate::format::load::load_vindex_config(vindex_dir)?;
     let num_layers = config.num_layers;
-    if entries.len() < num_layers * 3 {
+    if entries.len() < num_layers * FFN_COMPONENTS_PER_LAYER {
         return Err(VindexError::Parse(format!(
             "{INTERLEAVED_Q4K_MANIFEST_JSON} has {} entries, expected {} \
-             (3 per layer for {num_layers} layers)",
+             ({FFN_COMPONENTS_PER_LAYER} per layer for {num_layers} layers)",
             entries.len(),
-            num_layers * 3,
+            num_layers * FFN_COMPONENTS_PER_LAYER,
         )));
     }
 
@@ -372,7 +373,7 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
 
     // Down is the third entry per layer ([gate, up, down] in the writer).
     for layer in 0..num_layers {
-        let down = &entries[layer * 3 + 2];
+        let down = &entries[layer * FFN_COMPONENTS_PER_LAYER + FFN_DOWN];
         let format = down.format;
         let info = crate::quant::registry::lookup(down.format_tag()).ok_or_else(|| {
             VindexError::Parse(format!(

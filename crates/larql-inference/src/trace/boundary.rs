@@ -327,21 +327,6 @@ impl BoundaryWriter {
 mod tests {
     use super::*;
 
-    fn write_and_open(path: &std::path::Path, hidden: usize) -> (BoundaryWriter, BoundaryStore) {
-        let mut writer = BoundaryWriter::create(path, hidden, 200, 100).expect("create");
-        let residual: Vec<f32> = (0..hidden).map(|i| i as f32).collect();
-        writer.append(0, 200, &residual).expect("append 0");
-        writer
-            .append(200, 200, &vec![99.0f32; hidden])
-            .expect("append 1");
-        writer.finish().expect("finish");
-        let store = BoundaryStore::open(path).expect("open");
-        (
-            BoundaryWriter::create(path, hidden, 200, 100).unwrap(),
-            store,
-        )
-    }
-
     // ── BoundaryWriter + BoundaryStore ────────────────────────────────────────
 
     #[test]
@@ -402,7 +387,7 @@ mod tests {
     fn out_of_range_residual_returns_none() {
         let path = std::env::temp_dir().join("larql_boundary_test_oob.bndx");
         let mut writer = BoundaryWriter::create(&path, 4, 100, 10).expect("create");
-        writer.append(0, 100, &vec![1.0f32; 4]).expect("append");
+        writer.append(0, 100, &[1.0f32; 4]).expect("append");
         writer.finish().expect("finish");
 
         let store = BoundaryStore::open(&path).expect("open");
@@ -415,8 +400,8 @@ mod tests {
     fn boundary_for_token_finds_correct_window() {
         let path = std::env::temp_dir().join("larql_boundary_test_tok.bndx");
         let mut writer = BoundaryWriter::create(&path, 4, 100, 10).expect("create");
-        writer.append(0, 100, &vec![0.0f32; 4]).expect("append 0");
-        writer.append(100, 100, &vec![1.0f32; 4]).expect("append 1");
+        writer.append(0, 100, &[0.0f32; 4]).expect("append 0");
+        writer.append(100, 100, &[1.0f32; 4]).expect("append 1");
         writer.finish().expect("finish");
 
         let store = BoundaryStore::open(&path).expect("open");
@@ -442,7 +427,7 @@ mod tests {
     fn token_range_returns_correct_bounds() {
         let path = std::env::temp_dir().join("larql_boundary_test_range.bndx");
         let mut writer = BoundaryWriter::create(&path, 4, 200, 5).expect("create");
-        writer.append(0, 200, &vec![0.0f32; 4]).expect("append");
+        writer.append(0, 200, &[0.0f32; 4]).expect("append");
         writer.finish().expect("finish");
 
         let store = BoundaryStore::open(&path).expect("open");
@@ -457,7 +442,7 @@ mod tests {
     fn wrong_residual_size_returns_error() {
         let path = std::env::temp_dir().join("larql_boundary_test_bad_size.bndx");
         let mut writer = BoundaryWriter::create(&path, 4, 100, 10).expect("create");
-        let result = writer.append(0, 100, &vec![1.0f32; 8]); // wrong size
+        let result = writer.append(0, 100, &[1.0f32; 8]); // wrong size
         assert!(result.is_err());
         let _ = std::fs::remove_file(&path);
     }

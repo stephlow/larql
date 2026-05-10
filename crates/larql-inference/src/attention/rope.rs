@@ -131,7 +131,7 @@ mod tests {
     fn apply_rope_different_positions_differ() {
         // Row 0 (position 0) and row 1 (position 1) should differ after RoPE
         // even if the original vectors were identical.
-        let data = vec![0.5f32; 3 * 1 * 8];
+        let data = vec![0.5f32; 3 * 8];
         let x = Array2::from_shape_vec((3, 8), data).unwrap();
         let out = apply_rope(&x, 1, 8, 10000.0);
         let row0: Vec<f32> = out.row(0).to_vec();

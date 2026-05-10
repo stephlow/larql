@@ -510,6 +510,8 @@ pub mod schemas {
     ),
     components(schemas(
         ErrorBody,
+        crate::routes::openai::error::OpenAIErrorBody,
+        crate::routes::openai::error::OpenAIErrorPayload,
         // browse
         schemas::DescribeEdge,
         schemas::DescribeResponse,

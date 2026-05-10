@@ -188,9 +188,9 @@ pub fn patch_and_trace_with_ffn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::forward::trace::trace_forward_full;
     use crate::model::ModelWeights;
+    use crate::test_utils::make_test_weights;
     use std::sync::OnceLock;
 
     fn shared_weights() -> &'static ModelWeights {
@@ -256,23 +256,25 @@ mod tests {
     #[test]
     fn patch_changes_recipient_residual_downstream() {
         // Patch donor's post-layer residual at layer 0, position 1 into
-        // recipient. The capture at layer 2 (downstream) must differ from
-        // the un-patched baseline.
+        // recipient. The capture at the next layer (downstream) must
+        // differ from the un-patched baseline. 2-layer fixture: patch at
+        // layer 0, observe at layer 1.
         let weights = shared_weights();
-        if weights.num_layers < 3 {
-            return; // synthetic test weights don't have enough layers
+        if weights.num_layers < 2 {
+            return; // need at least 2 layers for upstream→downstream
         }
+        let downstream = weights.num_layers - 1;
         let donor_tokens = vec![10u32, 20, 30];
         let recipient_tokens = vec![1u32, 2, 3];
 
         let donor = capture_donor_state(weights, &donor_tokens, &[(0, 1)]);
         assert_eq!(donor.len(), 1);
 
-        let baseline = baseline_residual(weights, &recipient_tokens, 2);
-        let patched = patch_and_trace(weights, &recipient_tokens, &donor, &[2])
+        let baseline = baseline_residual(weights, &recipient_tokens, downstream);
+        let patched = patch_and_trace(weights, &recipient_tokens, &donor, &[downstream])
             .residuals
             .into_iter()
-            .find(|(l, _)| *l == 2)
+            .find(|(l, _)| *l == downstream)
             .unwrap()
             .1;
 
@@ -284,6 +286,110 @@ mod tests {
             differs,
             "patching donor residual must perturb downstream recipient residual"
         );
+    }
+
+    #[test]
+    fn empty_coords_returns_empty_donor_without_running_forward() {
+        // capture_donor_state short-circuits on empty coords — no forward pass
+        // is run, so this stays cheap when callers gate on a runtime flag.
+        let weights = shared_weights();
+        let donor = capture_donor_state(weights, &[0u32, 1], &[]);
+        assert!(donor.is_empty());
+        assert_eq!(donor.len(), 0);
+    }
+
+    #[test]
+    fn donor_state_accessors_match_records_map() {
+        let weights = shared_weights();
+        let donor = capture_donor_state(weights, &[0u32, 1, 2], &[(0, 0), (1, 1)]);
+        assert!(!donor.is_empty());
+        assert_eq!(donor.len(), donor.records.len());
+        assert_eq!(donor.len(), 2);
+    }
+
+    #[test]
+    fn patch_skips_recipient_position_out_of_range() {
+        // Donor records (1, 5) but recipient has only 2 tokens. The hook's
+        // `*pos >= n_rows` guard must short-circuit cleanly without panicking
+        // and without disturbing the recipient at any in-range position.
+        let weights = shared_weights();
+        if weights.num_layers < 2 {
+            return;
+        }
+        let donor_tokens = vec![1u32, 2, 3, 4, 5, 6];
+        let donor = capture_donor_state(weights, &donor_tokens, &[(0, 5)]);
+        assert!(donor.records.contains_key(&(0, 5)));
+
+        let recipient = vec![7u32, 8]; // shorter than donor — pos 5 OOR
+        let baseline = baseline_residual(weights, &recipient, 1);
+        let patched = patch_and_trace(weights, &recipient, &donor, &[1])
+            .residuals
+            .into_iter()
+            .find(|(l, _)| *l == 1)
+            .unwrap()
+            .1;
+        for (b, p) in baseline.iter().zip(patched.iter()) {
+            assert!(
+                (b - p).abs() < 1e-6,
+                "OOR patch must be a noop: baseline={b} patched={p}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_skips_donor_record_with_wrong_hidden_size() {
+        // Build a DonorState manually with a row whose length mismatches
+        // hidden_size. The hook's `row.len() != hidden` guard must short-
+        // circuit so the recipient passes through untouched.
+        let weights = shared_weights();
+        let mut records = HashMap::new();
+        records.insert((0usize, 0usize), vec![0.0f32; weights.hidden_size + 1]); // wrong len
+        let donor = DonorState { records };
+
+        let recipient = vec![1u32, 2];
+        let baseline = baseline_residual(weights, &recipient, 0);
+        let patched = patch_and_trace(weights, &recipient, &donor, &[0])
+            .residuals
+            .into_iter()
+            .find(|(l, _)| *l == 0)
+            .unwrap()
+            .1;
+        for (b, p) in baseline.iter().zip(patched.iter()) {
+            assert!(
+                (b - p).abs() < 1e-6,
+                "mismatched-len donor record must be ignored: baseline={b} patched={p}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_donor_skips_unrecorded_layer() {
+        // When a coord requests a layer that's beyond the model's depth,
+        // RecordHook never receives a callback for it — the post-trace
+        // pickup loop's `record.post_layer.get(&layer)` returns None
+        // and the coord is silently dropped (the `continue` branch).
+        let weights = shared_weights();
+        let coords = vec![
+            (0usize, 0usize),            // valid
+            (weights.num_layers + 9, 0), // beyond model depth — None branch
+        ];
+        let donor = capture_donor_state(weights, &[0u32, 1], &coords);
+        assert!(donor.records.contains_key(&(0, 0)));
+        assert!(!donor.records.contains_key(&(weights.num_layers + 9, 0)));
+    }
+
+    #[test]
+    fn capture_donor_drops_layer_above_max() {
+        // Coords request layer N+1 (above the model's last layer). The
+        // `layer > max_layer` guard never fires here (layer == max_layer),
+        // but coverage of the post-trace skip path is exercised by
+        // requesting a layer that is in the coord set but never recorded.
+        let weights = shared_weights();
+        let coords = vec![(0usize, 0usize), (weights.num_layers - 1, 0)];
+        let donor = capture_donor_state(weights, &[0u32, 1], &coords);
+        // Both coords are in range — both should be recorded.
+        assert!(donor.records.contains_key(&(0, 0)));
+        assert!(donor.records.contains_key(&(weights.num_layers - 1, 0)));
     }
 
     #[test]

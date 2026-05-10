@@ -10,7 +10,7 @@
 //! - A per-layer NaN/Inf stat dump used by the caller when a `diag_stop_layer`
 //!   is supplied; see [`dump_layer_buffers`].
 
-use crate::FullPipelineLayer;
+use crate::{options, FullPipelineLayer};
 
 /// Print the one-line `DECODE_DEBUG` entry for the Nth decode call. No-op
 /// unless the env var is set and `call_n < 3` (caller's contract).
@@ -21,7 +21,7 @@ pub(super) fn log_decode_entry(
     inter: usize,
     layers: &[FullPipelineLayer],
 ) {
-    if std::env::var("DECODE_DEBUG").is_err() || call_n >= 3 {
+    if !options::env_flag(options::ENV_DECODE_DEBUG) || call_n >= 3 {
         return;
     }
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
@@ -225,9 +225,8 @@ pub(super) struct ResidualDump {
 impl ResidualDump {
     /// Create a dump sink if `LARQL_DUMP_RESIDUALS` is set, otherwise a no-op.
     pub(super) fn from_env() -> Self {
-        let path = match std::env::var("LARQL_DUMP_RESIDUALS") {
-            Ok(p) if !p.is_empty() => p,
-            _ => return Self { file: None },
+        let Some(path) = options::env_nonempty_value(options::ENV_DUMP_RESIDUALS) else {
+            return Self { file: None };
         };
         use std::io::Write;
         let mut f = match std::fs::File::create(&path) {

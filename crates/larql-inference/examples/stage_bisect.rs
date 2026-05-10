@@ -36,19 +36,19 @@
 //! (`cos≈0.97 / max_abs≈5.7`) — the bisect signature that pointed
 //! at the FFN gate+up shader.
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 extern crate blas_src;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_compute::DecodeBackend;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_inference::residual_diff::{compare_stages, ParityThreshold, StageCapture};
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_inference::wrap_chat_prompt;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer, QuantFormat,
     SilentLoadCallbacks, VectorIndex,
@@ -64,7 +64,7 @@ use larql_vindex::{
 /// in-place on a single buffer and only sees the post-everything
 /// `q_out`. The right comparison for the cached/decoded form is
 /// CPU's `q_out_after_rope` ↔ Metal's `q_out`.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 const STAGE_PAIRS: &[(&str, &str)] = &[
     // Pre-attention
     ("norm_out", "norm_out"),
@@ -80,7 +80,7 @@ const STAGE_PAIRS: &[(&str, &str)] = &[
     ("ffn_out_raw", "down_out"),
 ];
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let vindex_path = PathBuf::from(
@@ -238,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {
     eprintln!("stage_bisect requires `--features metal`.");
 }

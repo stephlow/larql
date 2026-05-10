@@ -10,12 +10,12 @@
 extern crate blas_src;
 
 fn main() {
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        println!("Run with --features metal");
+        println!("Run on macOS with --features metal");
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q4_kf, quantize_to_q8};
         use larql_compute::prelude::*;
@@ -580,7 +580,7 @@ fn main() {
                 let ko = metal_raw.bufs().output((kv_dim * 4) as u64);
                 let vo = metal_raw.bufs().output((kv_dim * 4) as u64);
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&metal_raw.q4k_qkv_proj_pipeline.state);
+                enc.set_compute_pipeline_state(&metal_raw.attention.q4k_qkv_proj_pipeline.state);
                 enc.set_buffer(0, Some(&buf_wq), 0);
                 enc.set_buffer(1, Some(&buf_wk), 0);
                 enc.set_buffer(2, Some(&buf_wv), 0);
@@ -610,7 +610,7 @@ fn main() {
                 let ko = metal_raw.bufs().output((kv_dim * 4) as u64);
                 let vo = metal_raw.bufs().output((kv_dim * 4) as u64);
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&metal_raw.q4k_qkv_proj_pipeline.state);
+                enc.set_compute_pipeline_state(&metal_raw.attention.q4k_qkv_proj_pipeline.state);
                 enc.set_buffer(0, Some(&buf_wq), 0);
                 enc.set_buffer(1, Some(&buf_wk), 0);
                 enc.set_buffer(2, Some(&buf_wv), 0);
@@ -651,7 +651,7 @@ fn main() {
                     let d_out = metal_raw.bufs().output((hidden * 4) as u64);
                     let enc = cmd.new_compute_command_encoder();
                     // fused gate+up
-                    enc.set_compute_pipeline_state(&metal_raw.q4kf_ffn_gate_up_pipeline.state);
+                    enc.set_compute_pipeline_state(&metal_raw.ffn.q4kf_ffn_gate_up_pipeline.state);
                     enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].g)), 0);
                     enc.set_buffer(1, Some(&metal_raw.bufs().get_bytes(&data_34[0].u)), 0);
                     enc.set_buffer(2, Some(&ffn_input), 0);
@@ -666,7 +666,7 @@ fn main() {
                         metal::MTLSize::new(q4kf_gu::THREADS_PER_TG, 1, 1),
                     );
                     // GEGLU
-                    enc.set_compute_pipeline_state(&metal_raw.geglu_pipeline);
+                    enc.set_compute_pipeline_state(&metal_raw.ffn.geglu_pipeline);
                     enc.set_buffer(0, Some(&go), 0);
                     enc.set_buffer(1, Some(&uo), 0);
                     enc.set_buffer(2, Some(&ao), 0);
@@ -676,7 +676,7 @@ fn main() {
                         metal::MTLSize::new(256, 1, 1),
                     );
                     // down
-                    enc.set_compute_pipeline_state(&metal_raw.q4kf_proj_pipeline.state);
+                    enc.set_compute_pipeline_state(&metal_raw.attention.q4kf_proj_pipeline.state);
                     enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].d)), 0);
                     enc.set_buffer(1, Some(&ao), 0);
                     enc.set_buffer(2, Some(&d_out), 0);
@@ -700,7 +700,7 @@ fn main() {
                     let ao = metal_raw.bufs().output((inter * 4) as u64);
                     let d_out = metal_raw.bufs().output((hidden * 4) as u64);
                     let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&metal_raw.q4kf_ffn_gate_up_pipeline.state);
+                    enc.set_compute_pipeline_state(&metal_raw.ffn.q4kf_ffn_gate_up_pipeline.state);
                     enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].g)), 0);
                     enc.set_buffer(1, Some(&metal_raw.bufs().get_bytes(&data_34[0].u)), 0);
                     enc.set_buffer(2, Some(&ffn_input), 0);
@@ -714,7 +714,7 @@ fn main() {
                         metal::MTLSize::new(n_tgs_gu * 2, 1, 1),
                         metal::MTLSize::new(q4kf_gu::THREADS_PER_TG, 1, 1),
                     );
-                    enc.set_compute_pipeline_state(&metal_raw.geglu_pipeline);
+                    enc.set_compute_pipeline_state(&metal_raw.ffn.geglu_pipeline);
                     enc.set_buffer(0, Some(&go), 0);
                     enc.set_buffer(1, Some(&uo), 0);
                     enc.set_buffer(2, Some(&ao), 0);
@@ -723,7 +723,7 @@ fn main() {
                         metal::MTLSize::new(inter as u64, 1, 1),
                         metal::MTLSize::new(256, 1, 1),
                     );
-                    enc.set_compute_pipeline_state(&metal_raw.q4kf_proj_pipeline.state);
+                    enc.set_compute_pipeline_state(&metal_raw.attention.q4kf_proj_pipeline.state);
                     enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].d)), 0);
                     enc.set_buffer(1, Some(&ao), 0);
                     enc.set_buffer(2, Some(&d_out), 0);
@@ -749,7 +749,9 @@ fn main() {
                     let cmd = metal_raw.queue().new_command_buffer();
                     for _ in 0..34 {
                         let enc = cmd.new_compute_command_encoder();
-                        enc.set_compute_pipeline_state(&metal_raw.q4kf_proj_pipeline.state);
+                        enc.set_compute_pipeline_state(
+                            &metal_raw.attention.q4kf_proj_pipeline.state,
+                        );
                         enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].wo)), 0);
                         enc.set_buffer(1, Some(&o_input), 0);
                         enc.set_buffer(2, Some(&o_output), 0);
@@ -771,7 +773,9 @@ fn main() {
                     let cmd = metal_raw.queue().new_command_buffer();
                     for _ in 0..34 {
                         let enc = cmd.new_compute_command_encoder();
-                        enc.set_compute_pipeline_state(&metal_raw.q4kf_proj_pipeline.state);
+                        enc.set_compute_pipeline_state(
+                            &metal_raw.attention.q4kf_proj_pipeline.state,
+                        );
                         enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].wo)), 0);
                         enc.set_buffer(1, Some(&o_input), 0);
                         enc.set_buffer(2, Some(&o_output), 0);
@@ -802,7 +806,7 @@ fn main() {
                     let cmd = metal_raw.queue().new_command_buffer();
                     let enc = cmd.new_compute_command_encoder();
                     for _ in 0..340 {
-                        enc.set_compute_pipeline_state(&metal_raw.residual_add_pipeline);
+                        enc.set_compute_pipeline_state(&metal_raw.norms.residual_add_pipeline);
                         enc.set_buffer(0, Some(&a_buf), 0);
                         enc.set_buffer(1, Some(&b_buf), 0);
                         enc.set_buffer(2, Some(&c_buf), 0);
@@ -821,7 +825,7 @@ fn main() {
                     let cmd = metal_raw.queue().new_command_buffer();
                     let enc = cmd.new_compute_command_encoder();
                     for _ in 0..340 {
-                        enc.set_compute_pipeline_state(&metal_raw.residual_add_pipeline);
+                        enc.set_compute_pipeline_state(&metal_raw.norms.residual_add_pipeline);
                         enc.set_buffer(0, Some(&a_buf), 0);
                         enc.set_buffer(1, Some(&b_buf), 0);
                         enc.set_buffer(2, Some(&c_buf), 0);

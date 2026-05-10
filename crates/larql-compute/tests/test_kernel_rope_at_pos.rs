@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `rope_at_pos` — the *single-head, single-vector*
 //! RoPE shader used by Metal prefill via `metal/stages/rope.rs`. Looped
@@ -95,7 +95,7 @@ fn run_rope_at_pos(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.rope_at_pos_pipeline);
+    enc.set_compute_pipeline_state(&metal.attention.rope_at_pos_pipeline);
     enc.set_buffer(0, Some(&buf), 0);
     enc.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(2, 4, &base as *const f32 as *const std::ffi::c_void);
@@ -247,7 +247,7 @@ fn rope_at_pos_matches_rope_at_pos_batched_one_head() {
     let pairs = (rotary_dim / 2) as u64;
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.rope_at_pos_batched_pipeline);
+    enc.set_compute_pipeline_state(&metal.attention.rope_at_pos_batched_pipeline);
     enc.set_buffer(0, Some(&buf), 0);
     enc.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(2, 4, &base as *const f32 as *const std::ffi::c_void);

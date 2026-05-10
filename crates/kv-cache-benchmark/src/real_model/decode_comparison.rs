@@ -17,7 +17,6 @@
 //!   L1/L32  → parametric routing (static for in-context queries)
 //!   L29/L30 → in-context comprehension (dynamic for in-context, static for parametric)
 
-use larql_compute::MatMul;
 use larql_inference::attention::run_attention_block_decode_step;
 use larql_inference::ffn::WeightFfn;
 use larql_inference::forward::{embed_tokens_pub, logits_to_predictions_pub, run_ffn};

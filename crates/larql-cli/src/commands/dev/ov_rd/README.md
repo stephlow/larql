@@ -121,7 +121,7 @@ is fine for summaries and small diagnostics.
 
 ## Documentation Boundary
 
-Use `experiments/38_ov_rate_distortion/RESULTS.md` as the lab notebook: commands
+Use `~/chris-source/chris-experiments/shannon/38_ov_rate_distortion/RESULTS.md` as the lab notebook: commands
 run, artifacts written, negative results, and interpretation.
 
 When a result becomes architectural rather than experimental, promote it to a

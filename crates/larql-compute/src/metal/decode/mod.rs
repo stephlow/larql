@@ -3,6 +3,7 @@ use super::*;
 mod diag;
 mod encode_attn;
 mod encode_ffn;
+mod encode_ple;
 mod encode_post_ffn;
 mod encode_qkv;
 pub mod gpu_timing;
@@ -17,6 +18,15 @@ pub(crate) const DEFAULT_KV_CACHE_MAX_SEQ: usize = 4096;
 
 impl MetalBackend {
     /// Create a KV cache for decode mode with uniform per-layer dims.
+    ///
+    /// Production decode/prefill should use [`Self::create_kv_cache_per_layer`]
+    /// (or, on the trait surface, `preallocate_kv_cache_per_layer`) so models
+    /// like Gemma 4 31B with sliding/global geometry alternation are sized
+    /// correctly. This uniform helper is retained for synthetic-architecture
+    /// tests and the lazy bootstrap inside `populate_kv_layer`, where the
+    /// caller passes a single layer's `(num_kv_heads, head_dim)` and any
+    /// subsequent layers are pushed via `kv.layers.push(...)` with their own
+    /// per-layer dims.
     pub fn create_kv_cache(
         &self,
         num_layers: usize,
@@ -232,6 +242,10 @@ impl MetalBackend {
             g
         };
         let mut h_buf = &h_init;
+        // Per-Layer Embeddings precomputed table (Gemma 4 E2B): snapshot
+        // once per token so the per-layer loop can read it without
+        // re-locking the mutex on every iteration. `None` for non-PLE archs.
+        let ple_inputs = self.ple_inputs_snapshot();
         // Split mode: when a fire+collect callback pair is present, defer
         // FFN encoding for MoE layers until *after* the remote MoE call has
         // been fired, so dense FFN runs on the GPU in parallel with the
@@ -245,9 +259,8 @@ impl MetalBackend {
         // Diagnostic: run only up to (and including) the specified layer,
         // then dump intermediates and exit. Pinpoints which sub-stage in
         // which layer first produces NaN on real-vindex decode.
-        let diag_stop_layer: Option<usize> = std::env::var("LARQL_DECODE_DIAG_LAYER")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+        let diag_stop_layer: Option<usize> =
+            crate::options::env_usize(crate::options::ENV_DECODE_DIAG_LAYER);
 
         for l in 0..num_layers {
             let layer = &layers[l];
@@ -263,7 +276,7 @@ impl MetalBackend {
                 None
             };
             let dump_l0_dir = if l == 0 {
-                std::env::var("LARQL_DUMP_L0").ok()
+                crate::options::env_value(crate::options::ENV_DUMP_L0)
             } else {
                 None
             };
@@ -276,6 +289,14 @@ impl MetalBackend {
             let uses_q4k = layer.wq.format.is_q4k_family();
             let layer_q_dim = layer_num_q_heads * layer_head_dim;
             let layer_kv_dim = layer_num_kv_heads * layer_head_dim;
+
+            // D-RMS-FUSE Phase 1: skip the input rms_norm dispatch when
+            // `LARQL_FUSED_PRELAYER_NORM=1` AND we're not the first layer
+            // AND the previous layer's `encode_post_ffn_residual` wrote
+            // the pre-normalized data into `norm_f32_buf` via
+            // `residual_norm_store` (only on the non-post-norms path).
+            let prelayer_norm_active =
+                l > 0 && !layers[l - 1].has_post_norms && self.decode_flags.fused_prelayer_norm;
 
             // ── Step 1: Input norm + Q/K/V projection ──
             // Format-aware: Q4_K family routes through fused QKV
@@ -310,6 +331,7 @@ impl MetalBackend {
                     norm_offset,
                 },
                 uses_q4k,
+                prelayer_norm_active,
             );
 
             // ── Steps 1.5–5: attention block ──
@@ -399,16 +421,31 @@ impl MetalBackend {
                     inter,
                     inter_padded,
                 };
-                let use_fused_post_ffn = !matches!(
-                    std::env::var("LARQL_FUSED_POST_FFN_NORM").as_deref(),
-                    Ok("0") | Ok("false") | Ok("off") | Ok("no")
-                );
+                let use_fused_post_ffn = self.decode_flags.fused_post_ffn_norm;
                 let post_ffn_bufs = encode_post_ffn::PostFfnBufs {
                     down_out: &down_out,
                     h_post_attn: &h_post_attn,
                     new_h,
                     normed_scratch: &normed_scratch,
                 };
+
+                // D-RMS-FUSE Phase 1: when env var on AND non-Gemma path
+                // (no post_norms) AND there's a next layer, hand the next
+                // layer's input_norm weight + the shared norm_f32_buf to
+                // `encode_post_ffn_residual` so it can fuse the residual
+                // add with the next layer's input rms_norm in one
+                // `residual_norm_store` dispatch. Saves 1 dispatch/layer.
+                let prelayer_fusion =
+                    if !layer.has_post_norms && self.decode_flags.fused_prelayer_norm {
+                        layers.get(l + 1).map(|next| {
+                            super::decode::encode_post_ffn::PreLayerNormFusion {
+                                next_input_norm: next.input_norm,
+                                next_norm_out: &norm_f32_buf,
+                            }
+                        })
+                    } else {
+                        None
+                    };
 
                 if stage_timing_split && !has_moe {
                     // Fine split: gate+up in one CB, act+down+residual in another.
@@ -420,7 +457,6 @@ impl MetalBackend {
                     gpu_time.record_stage(&cmd, gpu_timing::DecodeStage::GateUp);
                     cmd = self.queue.new_command_buffer().to_owned();
                     enc = cmd.new_compute_command_encoder().to_owned();
-                    encoder_ended = false;
                     // Step 6b + 7: activation+down + post-FFN residual
                     self.encode_ffn_down_phase(&enc, layer, &ffn_bufs, ffn_dims, ffn_uses_q4k);
                     self.encode_post_ffn_residual(
@@ -429,6 +465,7 @@ impl MetalBackend {
                         post_ffn_bufs,
                         hidden,
                         use_fused_post_ffn,
+                        prelayer_fusion.as_ref(),
                     );
                     enc.end_encoding();
                     cmd.commit();
@@ -446,7 +483,40 @@ impl MetalBackend {
                         post_ffn_bufs,
                         hidden,
                         use_fused_post_ffn,
+                        prelayer_fusion.as_ref(),
                     );
+                }
+
+                // ── Step 8: Per-Layer Embeddings (Gemma 4 E2B) ──
+                // Mirrors `crates/larql-inference/src/forward/ple.rs::apply_per_layer_embedding`.
+                // Activates only when (a) the layer has the three PLE
+                // weights wired and (b) the inference layer uploaded a
+                // precomputed per-layer-input table via
+                // `MetalBackend::prepare_ple_inputs` for this generation.
+                if let Some(pli) = ple_inputs.as_ref() {
+                    if layer.ple_spec().is_some() {
+                        // Reuse two scratches that are dead after the
+                        // post-FFN residual completes:
+                        //   - `gate_out_scratch` (`inter` f32) holds the
+                        //     `[ple_dim]` gate (ple_dim ≪ inter);
+                        //   - `down_out` (`hidden` f32) holds the projection
+                        //     output (`[hidden]`).
+                        // Both buffers' previous data is consumed by
+                        // `encode_post_ffn_residual` above.
+                        self.encode_per_layer_embed(
+                            &enc,
+                            layer,
+                            encode_ple::PleBufs {
+                                h: new_h,
+                                per_layer_input: &pli.buffer,
+                                per_layer_input_offset: pli.row_offset_bytes(0, l),
+                                gate_scratch: &gate_out_scratch,
+                                contrib_scratch: &down_out,
+                            },
+                            hidden,
+                            pli.ple_dim,
+                        );
+                    }
                 }
             }
 
@@ -455,7 +525,7 @@ impl MetalBackend {
 
             // Per-layer NaN diagnostic (LARQL_DEBUG_NAN_LAYERS=1).
             // Forces a commit+wait per layer — expensive, debug-only.
-            if std::env::var("LARQL_DEBUG_NAN_LAYERS").is_ok() {
+            if crate::options::env_flag(crate::options::ENV_DEBUG_NAN_LAYERS) {
                 if !encoder_ended {
                     enc.end_encoding();
                 }
@@ -523,7 +593,7 @@ impl MetalBackend {
                 if layer.layer_scalar != 0.0 {
                     crate::metal::stages::layer_scalar::encode(
                         &enc,
-                        &self.scale_vector_pipeline,
+                        &self.norms.scale_vector_pipeline,
                         new_h,
                         1,
                         hidden,
@@ -548,7 +618,7 @@ impl MetalBackend {
             // commit above is what makes these reads consistent — the
             // scratch buffers persist across layers, so without the
             // per-layer flush we'd be reading the *last* layer's value.
-            if let Ok(dir) = std::env::var("LARQL_DECODE_DUMP_LAYERS") {
+            if let Some(dir) = crate::options::env_value(crate::options::ENV_DECODE_DUMP_LAYERS) {
                 if !encoder_ended {
                     enc.end_encoding();
                     cmd.commit();
@@ -566,10 +636,8 @@ impl MetalBackend {
                 // `LARQL_STAGE_DUMP_LAYER` (default 0). Helper lives in
                 // `diag.rs`; the bundle of references is the same one
                 // the early-exit diag mode uses.
-                let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+                let stage_layer =
+                    crate::options::env_usize(crate::options::ENV_STAGE_DUMP_LAYER).unwrap_or(0);
                 if l == stage_layer {
                     let bufs = diag::LayerDiagBufs {
                         norm_f32_buf: &norm_f32_buf,
@@ -637,6 +705,51 @@ impl MetalBackend {
             cmd.commit();
             cmd.wait_until_completed();
             gpu_time.record(&cmd);
+        }
+
+        // Diagnostic: dump per-call h after each layer, gated on
+        // LARQL_PERCALL_LAYER_DUMP_DIR. Filename includes the call index
+        // and layer index. Useful for pinpointing which call+layer
+        // first diverges from CPU.
+        if let Ok(dir) = std::env::var("LARQL_PERCALL_LAYER_DUMP_DIR") {
+            for (idx, kv_layer) in kv_cache.layers.iter().enumerate() {
+                if kv_layer.current_len == 0 {
+                    continue;
+                }
+                let total = kv_layer.current_len * kv_layer.num_kv_heads * kv_layer.head_dim;
+                let k_floats = super::buffers::read_buffer_f32(&kv_layer.k_cache, total);
+                let k_bytes: Vec<u8> = k_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(
+                    format!("{dir}/metal_call{call_n:03}_L{idx:02}_K.f32"),
+                    &k_bytes,
+                );
+            }
+            // Dump h_buf (layer-output residual fed into next decode).
+            let h_floats = super::buffers::read_buffer_f32(h_buf, hidden);
+            let h_bytes: Vec<u8> = h_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/metal_call{call_n:03}_h_final.f32"), &h_bytes);
+            // Dump x (the input embed for this call) for comparison vs CPU
+            // batched-prefill embed at the same position.
+            let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/metal_call{call_n:03}_x_input.f32"), &x_bytes);
+        }
+        // Diagnostic: dump source-layer K/V caches when LARQL_KV_CACHE_DUMP_DIR
+        // is set. Fires at the end of every decode_token call (file gets
+        // overwritten — last call wins). Useful for byte-level comparison
+        // against CPU's k_rope/v_final output for the same prompt.
+        if let Ok(dir) = std::env::var("LARQL_KV_CACHE_DUMP_DIR") {
+            for (idx, kv_layer) in kv_cache.layers.iter().enumerate() {
+                if kv_layer.current_len == 0 {
+                    continue;
+                }
+                let total = kv_layer.current_len * kv_layer.num_kv_heads * kv_layer.head_dim;
+                let k_floats = super::buffers::read_buffer_f32(&kv_layer.k_cache, total);
+                let v_floats = super::buffers::read_buffer_f32(&kv_layer.v_cache, total);
+                let k_bytes: Vec<u8> = k_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let v_bytes: Vec<u8> = v_floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("{dir}/metal_L{idx:02}_K_cache.f32"), &k_bytes);
+                let _ = std::fs::write(format!("{dir}/metal_L{idx:02}_V_cache.f32"), &v_bytes);
+            }
         }
 
         let result = super::buffers::read_buffer_f32(h_buf, hidden);

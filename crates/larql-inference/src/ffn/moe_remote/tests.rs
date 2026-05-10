@@ -1,13 +1,13 @@
 use std::sync::{Arc, RwLock};
 
 use super::backend::RemoteMoeBackend;
-use super::config::{parse_unit_manifest, ShardConfig, UnitManifest, UnitShard};
+use super::config::{parse_unit_manifest, ShardConfig, UnitManifest};
 use super::router::MoeRouterWeights;
 use super::shard::{Shard, ShardTransport};
 use super::wire::{
-    decode_layer_batch_request, decode_layer_batch_request_f16, decode_layer_batch_response,
-    decode_layer_batch_response_f16, encode_layer_batch_request, encode_layer_batch_request_f16,
-    encode_layer_batch_response, encode_layer_batch_response_f16, f16_bits_to_f32, f32_to_f16_bits,
+    decode_layer_batch_request_f16, decode_layer_batch_response_f16,
+    encode_layer_batch_request_f16, encode_layer_batch_response_f16, f16_bits_to_f32,
+    f32_to_f16_bits,
 };
 
 /// f32→f16→f32 round-trip should preserve normal-range residual values
@@ -145,28 +145,11 @@ fn shard_config_strips_trailing_slash() {
     assert_eq!(s.url, "http://a.example.com:8081");
 }
 
-#[test]
-fn shard_owns() {
-    fn make_shard(start: usize, end: usize) -> Shard {
-        let config = ShardConfig::new(start, end, "http://localhost:8080");
-        let transport = ShardTransport::Http(reqwest::blocking::Client::new());
-        Shard { config, transport }
-    }
-    let s = make_shard(0, 31);
-    assert!(s.owns(0));
-    assert!(s.owns(31));
-    assert!(!s.owns(32));
-    let s2 = make_shard(32, 63);
-    assert!(s2.owns(32));
-    assert!(s2.owns(63));
-    assert!(!s2.owns(31));
-}
-
 // ── Per-(layer, expert) ownership ────────────────────────────────────
 //
 // Verify that:
-//   1. A shard built with `with_units` ignores layer-uniform `owns(...)`
-//      so layer-aware `owns_unit(...)` is the only source of truth.
+//   1. A shard built with `with_units` honours the explicit `(layer, expert_id)`
+//      set via the layer-aware `owns_unit(...)` check.
 //   2. Layer-uniform shards keep working unchanged via `owns_unit`
 //      (legacy `--moe-shards "0-63=URL"` configs).
 //   3. The manifest parser round-trips JSON → `Vec<ShardConfig>` with
@@ -182,11 +165,6 @@ fn make_unit_shard(units: &[(usize, usize)]) -> Shard {
 #[test]
 fn shard_with_units_only_owns_via_layer_aware_check() {
     let s = make_unit_shard(&[(0, 5), (3, 17)]);
-    // Legacy owns must return false in unit-set mode (forces layer-aware
-    // routing at all call sites).
-    assert!(!s.owns(5));
-    assert!(!s.owns(17));
-    // Layer-aware owns_unit honours the explicit set.
     assert!(s.owns_unit(0, 5));
     assert!(s.owns_unit(3, 17));
     assert!(!s.owns_unit(1, 5)); // wrong layer
@@ -271,6 +249,61 @@ fn parse_unit_manifest_reports_path_on_missing_file() {
         msg.contains(bogus.to_str().unwrap()),
         "msg should name path: {msg}"
     );
+}
+
+#[test]
+fn parse_unit_manifest_round_trips_from_file() {
+    // Happy path: write a manifest to a tempfile, parse it back into shards.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("units.json");
+    let json = r#"{
+        "shards": [
+            {"url": "grpc://h:9081", "layer_experts": {"0": [[0,3]]}}
+        ]
+    }"#;
+    std::fs::write(&path, json).unwrap();
+    let configs = parse_unit_manifest(&path).unwrap();
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].url, "grpc://h:9081");
+    let units = configs[0].unit_set.as_ref().unwrap();
+    assert_eq!(units.len(), 4);
+}
+
+#[test]
+fn parse_unit_manifest_reports_path_on_invalid_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("garbage.json");
+    std::fs::write(&path, b"not-json").unwrap();
+    let err = parse_unit_manifest(&path).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("parse"), "msg should mention parse: {msg}");
+    assert!(
+        msg.contains(path.to_str().unwrap()),
+        "msg should name path: {msg}"
+    );
+}
+
+#[test]
+fn shard_config_with_timeout_overrides_default() {
+    let s = ShardConfig::new(0, 31, "http://h:8081")
+        .with_timeout(std::time::Duration::from_millis(500));
+    assert_eq!(s.timeout, std::time::Duration::from_millis(500));
+}
+
+#[test]
+fn shard_config_with_units_empty_set_yields_zero_range() {
+    // Diagnostic min/max default to (0, 0) when the unit set is empty.
+    let empty: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let s = ShardConfig::with_units("http://h:9000", empty);
+    assert_eq!(s.start, 0);
+    assert_eq!(s.end, 0);
+    assert!(s.unit_set.unwrap().is_empty());
+}
+
+#[test]
+fn parse_range_missing_dash_returns_none() {
+    // "5" splits as a single part — second `parts.next()?` short-circuits.
+    assert_eq!(ShardConfig::parse_range("5"), None);
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //!   cargo run -p kv-cache-benchmark --example patch_propagation_q4k \
 //!     --features real-model --release -- \
 //!     --vindex output/gemma3-4b-q4k-v2.vindex \
-//!     --out experiments/36_patch_propagation/results/q4k_final_slot_bits.json
+//!     --out ~/chris-source/chris-experiments/shannon/36_patch_propagation/results/q4k_final_slot_bits.json
 
 #[cfg(feature = "real-model")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,10 +177,10 @@ mod runner {
     fn parse_args() -> Args {
         let mut args = Args {
             vindex: PathBuf::from("output/gemma3-4b-q4k-v2.vindex"),
-            prompts: PathBuf::from("experiments/36_patch_propagation/data/prompts.jsonl"),
-            out: PathBuf::from("experiments/36_patch_propagation/results/q4k_final_slot_bits.json"),
+            prompts: PathBuf::from("~/chris-source/chris-experiments/shannon/36_patch_propagation/data/prompts.jsonl"),
+            out: PathBuf::from("~/chris-source/chris-experiments/shannon/36_patch_propagation/results/q4k_final_slot_bits.json"),
             csv: PathBuf::from(
-                "experiments/36_patch_propagation/results/q4k_final_slot_summary.csv",
+                "~/chris-source/chris-experiments/shannon/36_patch_propagation/results/q4k_final_slot_summary.csv",
             ),
             alpha: 0.25,
             layer_start: 20,

@@ -8,6 +8,7 @@ mod formatting;
 mod utils;
 
 use commands::dev::*;
+use commands::diagnostics::*;
 use commands::extraction::*;
 use commands::primary::*;
 use commands::query::*;
@@ -47,6 +48,11 @@ enum Commands {
     /// Download a vindex from HuggingFace and cache it locally.
     Pull(pull_cmd::PullArgs),
 
+    /// Manage HuggingFace *model* repos (safetensors + tokenizer + config).
+    /// Companion to `pull` (which is vindex-only). Use `model pull` to
+    /// stage a raw HF model for `convert safetensors-to-vindex`.
+    Model(model_cmd::ModelArgs),
+
     /// Register a local vindex directory with the cache so `run` / `list`
     /// / `show` can find it by shorthand.
     Link(link_cmd::LinkArgs),
@@ -68,6 +74,10 @@ enum Commands {
 
     /// Benchmark decode throughput on a real vindex (Metal / CPU / Ollama).
     Bench(bench_cmd::BenchArgs),
+
+    /// Shannon-style next-token bit measurements and demo compression.
+    #[command(subcommand)]
+    Shannon(shannon_cmd::ShannonCommand),
 
     // ── Server ──────────────────────────────────────────────────────
     #[command(next_help_heading = "Server")]
@@ -111,6 +121,14 @@ enum Commands {
     #[command(next_help_heading = "Build")]
     /// Verify vindex file integrity (SHA256 checksums).
     Verify(verify_cmd::VerifyArgs),
+
+    #[command(next_help_heading = "Build")]
+    /// Engine diagnostic — print which kernel paths fire for a vindex.
+    Diag(diag_cmd::DiagArgs),
+
+    #[command(next_help_heading = "Build")]
+    /// Cross-backend numerical parity diff (CPU vs Metal vs reference).
+    Parity(parity::ParityArgs),
 
     // ── Query (legacy, pre-LQL graph-file surface) ──────────────────
     #[command(next_help_heading = "Query")]
@@ -486,7 +504,9 @@ fn main() {
         Commands::Run(args) => run_cmd::run(args),
         Commands::Chat(args) => run_cmd::run(args.into()),
         Commands::Bench(args) => bench_cmd::run(args),
+        Commands::Shannon(cmd) => shannon_cmd::run(cmd),
         Commands::Pull(args) => pull_cmd::run(args),
+        Commands::Model(args) => model_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
         Commands::List(args) => list_cmd::run(args),
         Commands::Show(args) => show_cmd::run(args),
@@ -502,6 +522,8 @@ fn main() {
         Commands::Convert(args) => convert_cmd::run(args),
         Commands::Hf(args) => hf_cmd::run(args),
         Commands::Verify(args) => verify_cmd::run(args),
+        Commands::Diag(args) => diag_cmd::run(args),
+        Commands::Parity(args) => parity::run(args),
 
         // ── Query (legacy graph-file surface) ──
         Commands::Query(args) => query_cmd::run(args),

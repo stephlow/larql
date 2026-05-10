@@ -58,9 +58,12 @@ Each subcommand has `--help`; most also surface as LQL statements through
 
 ## Layout
 
-- `src/main.rs` — clap dispatch
-- `src/commands/extraction/` — extraction + analysis subcommands (most of the binary)
-- `src/commands/query/` — graph query subcommands (`query`, `describe`, `stats`, etc.)
+- `src/main.rs` — clap dispatch + legacy argv trampoline (`larql walk` → `larql dev walk`)
+- `src/commands/primary/` — primary user verbs: `run`, `chat`, `pull`, `model`, `link`, `list`, `show`, `slice`, `publish`, `rm`, `bench`, `shannon`, `serve` glue
+- `src/commands/extraction/` — vindex build/extract/compile/convert/verify
+- `src/commands/diagnostics/` — `parity` (cross-backend numerical diff)
+- `src/commands/query/` — legacy graph-file query surface (`query`, `describe`, `stats`, `validate`, `merge`, `filter`)
+- `src/commands/dev/` — research / interpretability tools surfaced under `larql dev <subcmd>`
 
 The CLI has no feature flags of its own — Metal, CUDA, and BLAS variants
 are selected through the upstream `larql-compute` / `larql-inference`

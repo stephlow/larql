@@ -159,6 +159,27 @@ fn test_merge_source_priority() {
     );
 }
 
+#[test]
+fn test_merge_custom_source_priority() {
+    let mut target = Graph::new();
+    target.add_edge(Edge::new("A", "r", "B").with_source(SourceType::Parametric));
+
+    let mut other = Graph::new();
+    other.add_edge(Edge::new("A", "r", "B").with_source(SourceType::Document));
+
+    let updated = merge_graphs_with_source_priority(&mut target, &other, |source| match source {
+        SourceType::Document => 10,
+        SourceType::Parametric => 1,
+        _ => 0,
+    });
+
+    assert_eq!(updated, 1);
+    assert_eq!(
+        target.select("A", Some("r"))[0].source,
+        SourceType::Document
+    );
+}
+
 // ── PageRank ──
 
 #[test]

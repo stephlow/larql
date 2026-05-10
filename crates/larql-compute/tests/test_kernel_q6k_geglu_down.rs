@@ -16,7 +16,7 @@
 //! Fused: same expression in one dispatch with no intermediate
 //! `inter`-sized activation buffer write/read.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -76,9 +76,9 @@ fn metal_fused_q6k_geglu_down(
 ) -> Vec<f32> {
     use larql_compute::metal::shaders::q6k_geglu_down as gd;
     let kernel = if silu {
-        &metal.q6k_geglu_silu_down_pipeline
+        &metal.ffn.q6k_geglu_silu_down_pipeline
     } else {
-        &metal.q6k_geglu_gelu_tanh_down_pipeline
+        &metal.ffn.q6k_geglu_gelu_tanh_down_pipeline
     };
 
     let w_buf = metal.bufs().get_bytes(w_down_q6k);

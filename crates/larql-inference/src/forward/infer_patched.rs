@@ -378,4 +378,79 @@ mod tests {
         assert!(override_.is_some());
         assert_eq!(predictions.len(), 3);
     }
+
+    // ── infer_patched (full forward pass) ──────────────────────────────
+
+    #[test]
+    fn infer_patched_returns_top_k_predictions_and_residuals() {
+        use crate::test_utils::TestFixtures;
+        let fx = TestFixtures::build();
+        let tokens = vec![0u32, 1, 2];
+        let result = infer_patched(&fx.weights, &fx.tokenizer, &fx.index, None, &tokens, 5);
+        assert!(result.predictions.len() <= 5);
+        // Walk pass populates residuals at every layer.
+        assert!(!result.residuals.is_empty());
+        assert!(result.knn_override.is_none());
+        assert_eq!(result.model_top1, result.predictions.first().cloned());
+        assert!(result.walk_ms >= 0.0);
+    }
+
+    #[test]
+    fn walk_trace_from_residuals_returns_per_layer_walk_hits() {
+        use crate::test_utils::TestFixtures;
+        let fx = TestFixtures::build();
+        let patched = larql_vindex::PatchedVindex::new(fx.index);
+        let residuals = vec![
+            (0usize, vec![0.1f32; fx.weights.hidden_size]),
+            (1usize, vec![0.2f32; fx.weights.hidden_size]),
+        ];
+        let trace = walk_trace_from_residuals(&residuals, &patched);
+        // One entry per residual.
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].0, 0);
+        assert_eq!(trace[1].0, 1);
+        // Synthetic vindex returns no FeatureMeta, so walk_hits is empty
+        // — but the per-layer entry must still be present.
+    }
+
+    #[test]
+    fn walk_trace_from_residuals_empty_input_returns_empty() {
+        use crate::test_utils::TestFixtures;
+        let fx = TestFixtures::build();
+        let patched = larql_vindex::PatchedVindex::new(fx.index);
+        let trace = walk_trace_from_residuals(&[], &patched);
+        assert!(trace.is_empty());
+    }
+
+    #[test]
+    fn infer_patched_with_knn_store_override_routes_through() {
+        use crate::test_utils::TestFixtures;
+        let fx = TestFixtures::build();
+        let tokens = vec![0u32, 1];
+        // First, run without override to capture the residuals — then plant
+        // a key matching the L0 residual exactly so the override fires on
+        // the rerun.
+        let baseline = infer_patched(&fx.weights, &fx.tokenizer, &fx.index, None, &tokens, 3);
+        let (l0_layer, l0_residual) = baseline
+            .residuals
+            .first()
+            .expect("at least one residual captured");
+        let store = make_store_with_key(*l0_layer, l0_residual.clone(), "PLANTED");
+        let result = infer_patched(
+            &fx.weights,
+            &fx.tokenizer,
+            &fx.index,
+            Some(&store),
+            &tokens,
+            3,
+        );
+        let ovr = result
+            .knn_override
+            .expect("planted key matching residual must fire override");
+        assert_eq!(ovr.token, "PLANTED");
+        assert_eq!(result.predictions[0].0, "PLANTED");
+        assert!((result.predictions[0].1 - 1.0).abs() < 1e-6);
+        // model_top1 reflects the unoverridden walk pass.
+        assert_eq!(result.model_top1, baseline.predictions.first().cloned());
+    }
 }

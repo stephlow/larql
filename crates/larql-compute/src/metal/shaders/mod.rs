@@ -26,6 +26,7 @@ pub mod graph_walk_knn;
 pub mod kv_append_attend_fused;
 pub mod kv_attention;
 pub mod layer_norm;
+pub mod per_layer_embed;
 pub mod post_attn_residual_norm_store;
 pub mod post_ffn_norm_residual_add;
 pub mod q4_f32_matvec;
@@ -36,7 +37,6 @@ pub mod q4k_ffn_gate_up;
 pub mod q4k_ffn_gate_up_8sg;
 pub mod q4k_ffn_gate_up_coop;
 pub mod q4k_ffn_gate_up_f16acc;
-pub mod q4k_ffn_gate_up_nr2;
 pub mod q4k_geglu_down;
 pub mod q4k_matmul;
 pub mod q4k_matvec;
@@ -44,7 +44,6 @@ pub mod q4k_matvec_8sg;
 pub mod q4k_matvec_stride32;
 pub mod q4k_q6k_qkv_proj;
 pub mod q4k_qkv_proj;
-pub mod q4k_qkv_proj_v2;
 pub mod q4kf_ffn_gate_up;
 pub mod q4kf_qkv_proj;
 pub mod q6k_geglu_down;
@@ -103,14 +102,12 @@ pub fn all_shaders() -> String {
     src.push_str(q4k_matvec_stride32::SHADER);
     src.push_str(q4k_matmul::SHADER);
     src.push_str(q4k_qkv_proj::SHADER);
-    src.push_str(q4k_qkv_proj_v2::SHADER);
     src.push_str(q4k_q6k_qkv_proj::SHADER);
     src.push_str(q4kf_qkv_proj::SHADER);
     src.push_str(q4k_ffn_gate_up::SHADER);
     src.push_str(q4k_ffn_gate_up_f16acc::SHADER);
     src.push_str(q4k_ffn_gate_up_8sg::SHADER);
     src.push_str(q4k_ffn_gate_up_coop::SHADER);
-    src.push_str(q4k_ffn_gate_up_nr2::SHADER);
     src.push_str(q4k_q6k_qkv_proj::NORMED_SHADER);
     src.push_str(q4k_geglu_down::SHADER);
     src.push_str(q4kf_ffn_gate_up::SHADER);
@@ -129,6 +126,8 @@ pub fn all_shaders() -> String {
     src.push_str(qk_norm_rope_fused::SHADER);
     src.push_str(post_attn_residual_norm_store::SHADER);
     src.push_str(post_ffn_norm_residual_add::SHADER);
+    // Per-Layer Embeddings (Gemma 4 E2B)
+    src.push_str(per_layer_embed::SHADER);
     // TurboQuant (KV cache compression)
     src.push_str(turboquant_encode::SHADER);
     src.push_str(turboquant_decode::SHADER);

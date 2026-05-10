@@ -148,10 +148,8 @@ pub fn compare_captures(
             continue;
         }
         let s = layer_stat(l, av, bv);
-        if s.cos < thr.cos || s.rel_max_abs() > thr.rel_max_abs {
-            if first_bad.is_none() {
-                first_bad = Some(l);
-            }
+        if (s.cos < thr.cos || s.rel_max_abs() > thr.rel_max_abs) && first_bad.is_none() {
+            first_bad = Some(l);
         }
         stats.push(s);
     }

@@ -4,7 +4,7 @@
 //! threadgroup geometry changes (256 threads / 8 simdgroups / 8
 //! rows/TG vs the production 128 / 4 / 4). Output must be bit-equal.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -79,7 +79,7 @@ fn q6k_matvec_8sg_matches_4sg_bit_equal() {
     use larql_compute::metal::shaders::{q6k_matvec as p4, q6k_matvec_8sg as p8};
     let r4 = dispatch_q6k(
         &metal,
-        &metal.q6k_matvec_4sg_pipeline.state,
+        &metal.quant.q6k_matvec_4sg_pipeline.state,
         p4::ROWS_PER_TG,
         p4::THREADS_PER_TG,
         &w_q6k,
@@ -89,7 +89,7 @@ fn q6k_matvec_8sg_matches_4sg_bit_equal() {
     );
     let r8 = dispatch_q6k(
         &metal,
-        &metal.q6k_matvec_8sg_pipeline.state,
+        &metal.quant.q6k_matvec_8sg_pipeline.state,
         p8::ROWS_PER_TG,
         p8::THREADS_PER_TG,
         &w_q6k,
@@ -131,7 +131,7 @@ fn q6k_matvec_8sg_perf_vs_4sg() {
     for _ in 0..5 {
         let _ = dispatch_q6k(
             &metal,
-            &metal.q6k_matvec_4sg_pipeline.state,
+            &metal.quant.q6k_matvec_4sg_pipeline.state,
             p4::ROWS_PER_TG,
             p4::THREADS_PER_TG,
             &w_q6k,
@@ -141,7 +141,7 @@ fn q6k_matvec_8sg_perf_vs_4sg() {
         );
         let _ = dispatch_q6k(
             &metal,
-            &metal.q6k_matvec_8sg_pipeline.state,
+            &metal.quant.q6k_matvec_8sg_pipeline.state,
             p8::ROWS_PER_TG,
             p8::THREADS_PER_TG,
             &w_q6k,
@@ -156,7 +156,7 @@ fn q6k_matvec_8sg_perf_vs_4sg() {
     for _ in 0..iters {
         let _ = dispatch_q6k(
             &metal,
-            &metal.q6k_matvec_4sg_pipeline.state,
+            &metal.quant.q6k_matvec_4sg_pipeline.state,
             p4::ROWS_PER_TG,
             p4::THREADS_PER_TG,
             &w_q6k,
@@ -171,7 +171,7 @@ fn q6k_matvec_8sg_perf_vs_4sg() {
     for _ in 0..iters {
         let _ = dispatch_q6k(
             &metal,
-            &metal.q6k_matvec_8sg_pipeline.state,
+            &metal.quant.q6k_matvec_8sg_pipeline.state,
             p8::ROWS_PER_TG,
             p8::THREADS_PER_TG,
             &w_q6k,

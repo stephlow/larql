@@ -151,23 +151,31 @@ fn gguf_tensor_info(f: &mut impl Write, name: &str, dims: &[u64], ty: u32, offse
     f.write_all(&offset.to_le_bytes()).unwrap();
 }
 
+fn write_minimal_gguf(path: &Path) {
+    write_minimal_gguf_custom(path, 100, None, true, true);
+}
+
 /// Write a minimal but complete GGUF file that `load_gguf` can successfully parse.
 ///
-/// Architecture: llama, hidden=4, vocab=3000, 1 layer.
+/// Architecture: llama, hidden=4, 1 layer.
 /// Tensors: token_embd (embed), output (lm_head), output_norm (norm vector).
-fn write_minimal_gguf(path: &Path) {
-    // Tensor dimensions:
-    //   token_embd.weight  : [hidden=4, vocab=3000] F32  = 12000 × 4 = 48000 bytes
-    //   output.weight      : [hidden=4, vocab=3000] F32  = 12000 × 4 = 48000 bytes
-    //   output_norm.weight : [hidden=4]            F32  =     4 × 4 =    16 bytes
-    // Use vocab=100 to keep the file small.
-    const VOCAB: u64 = 100;
+fn write_minimal_gguf_custom(
+    path: &Path,
+    vocab: u64,
+    metadata_vocab_size: Option<u32>,
+    include_kv_heads: bool,
+    include_key_length: bool,
+) {
     const HIDDEN: u64 = 4;
-    let embed_elems = (HIDDEN * VOCAB) as usize;
+    let embed_elems = (HIDDEN * vocab) as usize;
     let norm_elems = HIDDEN as usize;
 
     let embed_bytes = (embed_elems * 4) as u64; // F32
     let norm_bytes = (norm_elems * 4) as u64;
+    let metadata_count: u64 = 6
+        + if include_kv_heads { 1 } else { 0 }
+        + if include_key_length { 1 } else { 0 }
+        + if metadata_vocab_size.is_some() { 1 } else { 0 };
 
     let mut f = std::fs::File::create(path).unwrap();
 
@@ -175,25 +183,31 @@ fn write_minimal_gguf(path: &Path) {
     f.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap();
     f.write_all(&3u32.to_le_bytes()).unwrap(); // version 3
     f.write_all(&3u64.to_le_bytes()).unwrap(); // n_tensors
-    f.write_all(&8u64.to_le_bytes()).unwrap(); // n_metadata
+    f.write_all(&metadata_count.to_le_bytes()).unwrap(); // n_metadata
 
-    // Metadata (8 entries)
+    // Metadata
     gguf_meta_str(&mut f, "general.architecture", "llama");
     gguf_meta_u32(&mut f, "llama.embedding_length", HIDDEN as u32);
     gguf_meta_u32(&mut f, "llama.block_count", 1);
     gguf_meta_u32(&mut f, "llama.feed_forward_length", 16);
     gguf_meta_u32(&mut f, "llama.attention.head_count", 2);
-    gguf_meta_u32(&mut f, "llama.attention.head_count_kv", 2);
-    gguf_meta_u32(&mut f, "llama.attention.key_length", 2);
+    if include_kv_heads {
+        gguf_meta_u32(&mut f, "llama.attention.head_count_kv", 2);
+    }
+    if include_key_length {
+        gguf_meta_u32(&mut f, "llama.attention.key_length", 2);
+    }
     gguf_meta_f32(&mut f, "llama.rope.freq_base", 10000.0);
-    // note: no llama.vocab_size → will use default 262144
+    if let Some(vocab_size) = metadata_vocab_size {
+        gguf_meta_u32(&mut f, "llama.vocab_size", vocab_size);
+    }
 
     // Tensor infos (offsets are relative to the data section start)
-    gguf_tensor_info(&mut f, "token_embd.weight", &[HIDDEN, VOCAB], GGUF_F32, 0);
+    gguf_tensor_info(&mut f, "token_embd.weight", &[HIDDEN, vocab], GGUF_F32, 0);
     gguf_tensor_info(
         &mut f,
         "output.weight",
-        &[HIDDEN, VOCAB],
+        &[HIDDEN, vocab],
         GGUF_F32,
         embed_bytes,
     );
@@ -857,6 +871,7 @@ fn load_gguf_via_load_model_dir() {
     let weights = load_model_dir(dir.path()).unwrap();
     // embed_tokens: dims=[4, 100] in GGUF → shape [100, 4] after GGUF dim swap
     assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.vocab_size, 100);
     assert_eq!(weights.num_layers, 1);
     assert_eq!(weights.hidden_size, 4);
 }
@@ -869,7 +884,45 @@ fn load_gguf_single_file() {
 
     let weights = load_model_dir(&path).unwrap();
     assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.vocab_size, 100);
     assert_eq!(weights.num_layers, 1);
+}
+
+#[test]
+fn load_gguf_preserves_explicit_small_vocab_metadata() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("small-vocab.gguf");
+    write_minimal_gguf_custom(&path, 128, Some(128), true, true);
+
+    let weights = load_model_dir(&path).unwrap();
+
+    assert_eq!(weights.embed.shape(), &[128, 4]);
+    assert_eq!(weights.vocab_size, 128);
+}
+
+#[test]
+fn load_gguf_uses_shape_vocab_when_metadata_and_tokenizer_are_absent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("shape-vocab.gguf");
+    write_minimal_gguf_custom(&path, 64, None, true, true);
+
+    let weights = load_model_dir(&path).unwrap();
+
+    assert_eq!(weights.embed.shape(), &[64, 4]);
+    assert_eq!(weights.vocab_size, 64);
+}
+
+#[test]
+fn load_gguf_defaults_missing_kv_heads_and_key_length() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("missing-attn-metadata.gguf");
+    write_minimal_gguf_custom(&path, 100, Some(100), false, false);
+
+    let weights = load_model_dir_validated(&path).unwrap();
+
+    assert_eq!(weights.num_q_heads, 2);
+    assert_eq!(weights.num_kv_heads, 2);
+    assert_eq!(weights.head_dim, 2);
 }
 
 #[test]

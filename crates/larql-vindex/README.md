@@ -119,13 +119,13 @@ weights are resident at a time. The rest stays on disk until touched.
 
 ## Crate Structure
 
-> **Note**: tree below reflects the layout after the 2026-05-01 round-4
-> cleanup (M6/M7/M8/M9 splits — see `ROADMAP.md` Completed). The
-> `index/compute/gate_knn/`, `index/storage/ffn_store/`,
-> `index/storage/lm_head/`, and `extract/build/` directories are
-> sibling-file modules: each child file holds an `impl VectorIndex`
-> (or `impl BuildContext`) block focused on one concern, and `mod.rs`
-> declares them and owns shared helpers.
+> **Note**: tree below reflects the layout after the 2026-05-09 round-5
+> cleanup (see `CHANGELOG.md`). All the directories under
+> `index/`, `format/weights/`, and `extract/` follow the same pattern:
+> a `mod.rs` declares siblings and owns the public surface; each
+> sibling carries one `impl <Type>` block, one trait, or one emitted
+> artefact. After round-5 no non-test source file in the crate exceeds
+> the soft 600-LOC threshold.
 
 ```
 larql-vindex/src/
@@ -143,9 +143,26 @@ larql-vindex/src/
 │   └── dtype.rs                StorageDtype (f32/f16), encode/decode/write_floats
 │
 ├── index/                      In-memory KNN engine (zero-copy mmap)
-│   ├── types.rs                FeatureMeta, DEFAULT_C_SCORE, GateIndex trait,
-│   │                           WalkHit, WalkTrace, StorageBucket
-│   ├── core.rs                 VectorIndex struct + Clone + constructors
+│   ├── types/                  Shared types + capability traits (round-5 split)
+│   │   ├── mod.rs              FeatureMeta, DEFAULT_C_SCORE, WalkHit, WalkTrace,
+│   │   │                       StorageBucket, GateLayerSlice, GateQ4Slice,
+│   │   │                       DownMetaMmap (binary record decoder),
+│   │   │                       IndexLoadCallbacks + SilentLoadCallbacks
+│   │   ├── gate_lookup.rs      GateLookup trait (gate KNN + feature meta)
+│   │   ├── patch_overrides.rs  PatchOverrides trait (overlay vector hooks)
+│   │   ├── native_ffn.rs       NativeFfnAccess trait (f32/f16 row access)
+│   │   ├── quantized_ffn.rs    QuantizedFfnAccess trait (Q4_0/Q4_K/Q6_K)
+│   │   ├── fp4_ffn.rs          Fp4FfnAccess trait (FP4/FP8, exp 26)
+│   │   └── ffn_row.rs          FfnRowAccess unified dispatch + GateIndex
+│   │                           (composed blanket impls — fp4 → native → q4k)
+│   ├── core/                   VectorIndex + capability impls (round-5 split)
+│   │   ├── mod.rs              VectorIndex struct + Clone + constructors +
+│   │   │                       cross-store regression tests
+│   │   ├── gate_lookup.rs      impl GateLookup for VectorIndex
+│   │   ├── patch_overrides.rs  impl PatchOverrides (real, against MetadataStore)
+│   │   ├── native_ffn.rs       impl NativeFfnAccess (delegation to inherent)
+│   │   ├── quantized_ffn.rs    impl QuantizedFfnAccess
+│   │   └── fp4_ffn.rs          impl Fp4FfnAccess
 │   ├── compute/                KNN dispatch + HNSW + GPU paths
 │   │   ├── gate_knn/
 │   │   │   ├── mod.rs          top_k_by_abs free fn + top_k_from_scores impl shim + tests
@@ -178,7 +195,11 @@ larql-vindex/src/
 │       │   └── knn.rs          lm_head_knn_backend (Q4/f16/f32) + skip_q4k variant +
 │       │                       top_k_sorted reduce + lm_head_knn (f32 fallback)
 │       ├── attn.rs             Attention weight loaders (Q8, Q4_K, Q4)
-│       ├── projection_store.rs ProjectionStore (lm_head, embed)
+│       ├── vindex_storage/     VindexStorage trait + MmapStorage impl
+│       │                       (single source of truth for every
+│       │                       file-backed mmap; loaders mutate via
+│       │                       Arc::make_mut + set_*; release_pages
+│       │                       madvise covers all tracked handles)
 │       ├── metadata_store.rs   MetadataStore (down_meta + overrides)
 │       ├── fp4_store.rs        Fp4Storage runtime store (exp 26)
 │       └── residency.rs        Adaptive layer pinning (memory → performance)
@@ -191,10 +212,23 @@ larql-vindex/src/
 │   ├── weights/
 │   │   ├── mod.rs              Re-exports
 │   │   ├── write_f32.rs        write_model_weights (f32/f16), WeightEntry/Source
-│   │   ├── write_q4k/          Q4_K / Q6_K streaming writer + feature-major down
+│   │   ├── write_q4k/          Q4_K / Q6_K streaming writer (round-5 split — one
+│   │   │                       sibling per emitted artefact)
+│   │   │   ├── mod.rs          Orchestrator + Q4kWriteOptions + QuantBlockFormat +
+│   │   │   │                   pad_rows_to_block + resolve_v_tensor + helper tests
+│   │   │   ├── attn.rs         attn_weights_q4k.bin + manifest
+│   │   │   ├── ffn.rs          interleaved_q4k.bin + opt down_features_q4k.bin
+│   │   │   ├── moe_layers.rs   layers/layer_{L:02}.weights (hybrid MoE)
+│   │   │   ├── norms.rs        norms.bin (norms + MoE router/scales)
+│   │   │   ├── ple.rs          ple_weights.bin (Gemma 4 E2B PLE, f16)
+│   │   │   ├── lm_head.rs      lm_head_q4.bin
+│   │   │   └── feature_major_down.rs  W2 down_features_q4k.bin state
 │   │   ├── write_layers.rs     Per-layer FFN file writer (§5.12)
 │   │   ├── manifest.rs         Q4kManifestEntry + format_tag
-│   │   └── load.rs             load_model_weights, find_tokenizer_path
+│   │   └── load/               load_model_weights, find_tokenizer_path
+│   │       ├── mod.rs          Public API + LoadWeightsOptions + expert_in_shard
+│   │       ├── f32.rs          load_model_weights_with_opts (f32/f16 path)
+│   │       └── q4k.rs          load_model_weights_q4k_shard (Q4_K path)
 │   ├── checksums.rs            SHA256 computation + verification
 │   ├── fp4_codec.rs            FP4 / FP8 codec (extraction-side)
 │   ├── huggingface/            HuggingFace Hub download/publish
@@ -204,12 +238,22 @@ larql-vindex/src/
 │   ├── build/
 │   │   ├── mod.rs              BuildContext struct + small stages + build_vindex + tests
 │   │   ├── down_meta.rs        Stage 3: per-feature top-k + cluster collection
-│   │   ├── index_json.rs       Stage 6: config + provenance + checksums
-│   │   └── resume.rs           build_vindex_resume (alt entry point)
+│   │   └── index_json.rs       Stage 6: config + provenance + checksums
 │   ├── build_helpers.rs        chrono_now, build_whole_word_vocab,
 │   │                           compute_gate_top_tokens, compute_offset_direction,
 │   │                           run_clustering_pipeline, ClusterData
-│   ├── streaming.rs            Streaming extraction (mmap, no full model load)
+│   ├── streaming/              Streaming extraction (mmap, no full model load)
+│   │   ├── mod.rs              Orchestrator (StreamingContext lifecycle)
+│   │   ├── context.rs          StreamingContext struct + new + finalize
+│   │   ├── tensor_io.rs        MmapShard, GateSink, get_tensor_f32, normalize_key
+│   │   └── stages/             One sibling per pipeline stage (round-5 split)
+│   │       ├── gate_vectors.rs    Stage 1 — gate_vectors.bin + layer_infos
+│   │       ├── router_weights.rs  Stage 1b — router_weights.bin (MoE only)
+│   │       ├── embeddings.rs      Stage 2 — embeddings.bin
+│   │       ├── down_meta.rs       Stage 3 — per-feature top-K → down_meta.bin
+│   │       ├── tokenizer.rs       Stage 4 — tokenizer.json
+│   │       ├── index_json.rs      Stage 5 — preliminary index.json
+│   │       └── model_weights.rs   Stage 6 — write_model_weights / _q4k dispatch
 │   ├── stage_labels.rs         15 labels for IndexBuildCallbacks (compile-time pinned)
 │   ├── callbacks.rs            IndexBuildCallbacks trait
 │   ├── checkpoint.rs           Phase-level resume checkpoint
@@ -658,7 +702,18 @@ grid intentionally, set `LARQL_BENCH_ALLOW_DAEMONS=1`.
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 457 tests (306 unit + 151 integration; all green as of 2026-04-26)
+# Local CI gate, matching the crate-specific Makefile surface.
+make larql-vindex-ci                                                            # fmt, clippy, tests, examples, bench tests, coverage policy
+make larql-vindex-test                                                          # cargo test -p larql-vindex
+make larql-vindex-fmt-check                                                     # cargo fmt -p larql-vindex -- --check
+make larql-vindex-lint                                                          # cargo clippy -p larql-vindex --all-targets -- -D warnings
+make larql-vindex-examples                                                      # cargo check -p larql-vindex --examples
+make larql-vindex-bench-test                                                    # cargo test -p larql-vindex --benches
+make larql-vindex-bench                                                         # cargo bench -p larql-vindex --bench vindex_ops
+make larql-vindex-coverage-summary                                              # aggregate + per-file coverage policy
+make larql-vindex-coverage-html                                                 # HTML report plus the same coverage policy
+
+cargo test -p larql-vindex                                                      # 857 lib tests listed as of 2026-05-10
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -691,6 +746,39 @@ cargo run --release -p larql-vindex --example build_gate_q4 -- <vindex>         
 cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      # Q4 logits projection
 ```
 
+### Quality gates
+
+`larql-vindex` has a crate-specific Makefile block rather than relying
+only on the workspace-wide `make ci`. The local gate is:
+
+- format: `cargo fmt -p larql-vindex -- --check`
+- lint: `cargo clippy -p larql-vindex --all-targets -- -D warnings`
+- tests: `cargo test -p larql-vindex`
+- examples: `cargo check -p larql-vindex --examples`
+- benches: `cargo test -p larql-vindex --benches`
+- coverage: `cargo llvm-cov --package larql-vindex` plus
+  `scripts/check_coverage_policy.py`
+
+The coverage policy lives in `coverage-policy.json`. The aggregate
+line-coverage floor is currently 71% from the 2026-05-08 local
+baseline of 71.56%; the 2026-05-10 round-6 push lifted measured
+aggregate to **88.90% lines** (24,886 lines instrumented). Source
+files default to **90% line coverage**; files below that have
+explicit debt baselines that should only ratchet upward. **85 of
+125 files at the 90% default** (was 41 on 2026-05-08, +44 across
+rounds 5-6). Remaining 40 debt baselines cluster in the
+integration-driven write/load paths
+(`format/weights/load/{f32,q4k}.rs`, `format/weights/write_q4k/{moe_layers,norms}.rs`,
+`format/load.rs`), the Q4_K codec dispatch family
+(`index/compute/q4k_dispatch.rs`, `index/storage/ffn_store/{interleaved_q4k,q4k_cache}.rs`),
+and a few HF HTTP happy-path corners that still need full mockito
+infrastructure (`format/huggingface/{download,publish/mod}.rs`).
+See `CHANGELOG.md` for round-by-round per-file deltas.
+
+GitHub Actions runs the same model-agnostic surface on Linux, Windows,
+and macOS. The examples step is compile-only because several tools
+need an external vindex path; CI must stay synthetic and portable.
+
 ### Bench measurements (typical machine, synthetic Gemma-like fixture)
 
 | Bench | Operation | Time |
@@ -701,7 +789,7 @@ cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex>      
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 
-Test coverage (328 tests):
+Test coverage (857 lib tests as of 2026-05-10 round-6, **88.90% aggregate lines**):
 - Construction, dimensions, layer counts, feature counts
 - Gate KNN: brute-force, f32, Q4 via compute backend, top-K ordering
 - Gate walk: BLAS gemv path matches brute-force KNN
@@ -713,6 +801,10 @@ Test coverage (328 tests):
 - Patching: apply, revert, bake down
 - Binary serialization: checksums, dtype, config
 - MoE: expert-scoped queries, multiple experts per layer
+- Router weights: dense-model absence, incomplete files, top-k routing
+- Down metadata: binary read/write, mmap lookup, malformed header rejection
+- Layer weights: per-layer file headers, offsets, dense/MoE quant helpers
+- Gate-score batch paths: heap, f32 mmap, f16 mmap decode cache, backend GEMV
 - Streaming extraction: safetensors mmap, one layer at a time
 - Adaptive residency: pin/evict, budget enforcement, auto_pin, pin_range, adaptive dispatch
 
@@ -808,7 +900,8 @@ pinned layers skip PCIe transfers and the gradient steepens.
 | Doc | Content |
 |-----|---------|
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmark data, scaling projections, compute integration |
-| [ROADMAP.md](ROADMAP.md) | Planned features, completed items |
+| [ROADMAP.md](ROADMAP.md) | Active P0/P1/P2 work + parked / won't-fix |
+| [CHANGELOG.md](CHANGELOG.md) | Reverse-chronological history of shipped work |
 | [docs/vindex-format.md](docs/vindex-format.md) | File format specification, directory layout, manifest schemas |
 | [docs/compute-integration.md](docs/compute-integration.md) | How vindex stores data and compute consumes it |
 | [docs/adr/001](docs/adr/001-weights-as-database.md) | Transformer weights as queryable database |

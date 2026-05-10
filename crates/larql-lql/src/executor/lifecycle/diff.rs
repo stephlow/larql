@@ -22,9 +22,9 @@ impl Session {
 
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let index_a = larql_vindex::VectorIndex::load_vindex(&path_a, &mut cb)
-            .map_err(|e| LqlError::exec(&format!("failed to load {}", path_a.display()), e))?;
+            .map_err(|e| LqlError::exec(format!("failed to load {}", path_a.display()), e))?;
         let index_b = larql_vindex::VectorIndex::load_vindex(&path_b, &mut cb)
-            .map_err(|e| LqlError::exec(&format!("failed to load {}", path_b.display()), e))?;
+            .map_err(|e| LqlError::exec(format!("failed to load {}", path_b.display()), e))?;
 
         let limit = limit.unwrap_or(20) as usize;
 
@@ -53,11 +53,13 @@ impl Session {
                 break;
             }
 
-            let metas_a = index_a.down_meta_at(*layer);
-            let metas_b = index_b.down_meta_at(*layer);
-
-            let len_a = metas_a.map(|m| m.len()).unwrap_or(0);
-            let len_b = metas_b.map(|m| m.len()).unwrap_or(0);
+            // `feature_meta` covers both heap (mutation overrides) and
+            // mmap (the production read path). The earlier `down_meta_at`
+            // version was heap-only, which made DIFF a no-op on the
+            // standard load_vindex output where down_meta lives in the
+            // mmap'd `down_meta.bin`.
+            let len_a = index_a.num_features(*layer);
+            let len_b = index_b.num_features(*layer);
             let max_features = len_a.max(len_b);
 
             for feat in 0..max_features {
@@ -65,10 +67,10 @@ impl Session {
                     break;
                 }
 
-                let meta_a = metas_a.and_then(|m| m.get(feat)).and_then(|m| m.as_ref());
-                let meta_b = metas_b.and_then(|m| m.get(feat)).and_then(|m| m.as_ref());
+                let meta_a = index_a.feature_meta(*layer, feat);
+                let meta_b = index_b.feature_meta(*layer, feat);
 
-                let status = match (meta_a, meta_b) {
+                let status = match (&meta_a, &meta_b) {
                     (Some(a), Some(b)) => {
                         if a.top_token != b.top_token || (a.c_score - b.c_score).abs() > 0.01 {
                             "modified"
@@ -81,8 +83,8 @@ impl Session {
                     (None, None) => continue,
                 };
 
-                let tok_a = meta_a.map(|m| m.top_token.as_str()).unwrap_or("-");
-                let tok_b = meta_b.map(|m| m.top_token.as_str()).unwrap_or("-");
+                let tok_a = meta_a.as_ref().map(|m| m.top_token.as_str()).unwrap_or("-");
+                let tok_b = meta_b.as_ref().map(|m| m.top_token.as_str()).unwrap_or("-");
 
                 out.push(format!(
                     "L{:<7} F{:<7} {:<20} {:<20} {:>10}",
@@ -112,19 +114,17 @@ impl Session {
                         continue;
                     }
                 }
-                let metas_a = index_a.down_meta_at(*layer);
-                let metas_b = index_b.down_meta_at(*layer);
-                let len_a = metas_a.map(|m| m.len()).unwrap_or(0);
-                let len_b = metas_b.map(|m| m.len()).unwrap_or(0);
+                let len_a = index_a.num_features(*layer);
+                let len_b = index_b.num_features(*layer);
 
                 for feat in 0..len_a.max(len_b) {
-                    let ma = metas_a.and_then(|m| m.get(feat)).and_then(|m| m.as_ref());
-                    let mb = metas_b.and_then(|m| m.get(feat)).and_then(|m| m.as_ref());
+                    let ma = index_a.feature_meta(*layer, feat);
+                    let mb = index_b.feature_meta(*layer, feat);
 
-                    match (ma, mb) {
-                        (Some(_a), Some(b))
-                            if _a.top_token != b.top_token
-                                || (_a.c_score - b.c_score).abs() > 0.01 =>
+                    match (&ma, &mb) {
+                        (Some(a_meta), Some(b))
+                            if a_meta.top_token != b.top_token
+                                || (a_meta.c_score - b.c_score).abs() > 0.01 =>
                         {
                             operations.push(larql_vindex::PatchOp::Update {
                                 layer: *layer,

@@ -37,8 +37,10 @@ impl ComputeBackend for MetalBackend {
                 | Capability::MultiLayerQ4Ffn
                 | Capability::DecodeToken
                 | Capability::DecodeMoe
+                | Capability::DecodeQ4KMoe
                 | Capability::DecodeProfile
                 | Capability::PrefillQ4
+                | Capability::HeterogeneousAttention
         )
     }
 }

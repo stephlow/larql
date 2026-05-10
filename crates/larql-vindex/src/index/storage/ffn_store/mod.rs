@@ -29,6 +29,23 @@ use std::sync::{Arc, Mutex};
 
 use crate::index::core::VectorIndex;
 
+/// Number of FFN component tensors per transformer layer: gate, up, down
+/// — in that order. Used everywhere the FFN manifest is indexed
+/// (`layer * FFN_COMPONENTS_PER_LAYER + component`) and as the inner
+/// array length on per-layer caches.
+pub(crate) const FFN_COMPONENTS_PER_LAYER: usize = 3;
+
+/// Component index for `down` inside per-layer FFN manifests / caches.
+/// Special-cased throughout the codebase because down is stored
+/// row-major `[hidden, intermediate]` (the native
+/// `nn.Linear(intermediate, hidden)` orientation) and needs a transpose
+/// to become feature-major like `gate` (component `0`) / `up`
+/// (component `1`).
+pub(crate) const FFN_DOWN: usize = 2;
+
+type Q4kFfnOnceSlot = std::sync::OnceLock<Option<Arc<Vec<f32>>>>;
+type Q4kFfnOnceLayer = [Q4kFfnOnceSlot; FFN_COMPONENTS_PER_LAYER];
+
 mod down;
 mod fp4;
 mod gate_q4;
@@ -43,7 +60,7 @@ mod up;
 /// Per-layer Q4_K/Q6_K FFN dequant cache: outer index = layer, inner array =
 /// `[gate, up, down]`. `Arc` shares the decoded matrix across `VectorIndex`
 /// clones; `Mutex` guards LRU eviction.
-pub type Q4kFfnCache = Mutex<Vec<[Option<Arc<Vec<f32>>>; 3]>>;
+pub type Q4kFfnCache = Mutex<Vec<[Option<Arc<Vec<f32>>>; FFN_COMPONENTS_PER_LAYER]>>;
 
 /// Per-layer manifest entry for `down_features_q4k.bin` (W2). Carries
 /// the padded row width so the row decoder doesn't have to back-derive
@@ -61,31 +78,6 @@ pub struct DownFeaturesQ4kEntry {
 }
 
 pub struct FfnStore {
-    /// Feature-major down projections (f32 mmap).
-    pub down_features_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Feature-major Q4_K-encoded down projections — W2 of perf round-4.
-    /// When present, lets per-feature down decode skip the
-    /// `q4k_ffn_layer` cache (which dequants the whole layer). See
-    /// `DOWN_FEATURES_Q4K_BIN` for the rationale.
-    pub down_features_q4k_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Per-layer entries for `down_features_q4k_mmap`. One entry per
-    /// layer (vs three for the interleaved manifest). `padded_width`
-    /// is the row stride after `pad_rows_to_block` — usually equal to
-    /// `hidden_size`, but on synthetic fixtures with `hidden % 256 != 0`
-    /// it's the next 256-multiple. Carrying it in the manifest avoids
-    /// rederiving it from `length` at every row decode.
-    pub down_features_q4k_manifest: Option<Vec<DownFeaturesQ4kEntry>>,
-    /// Feature-major up projections (f32 mmap).
-    pub up_features_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Interleaved [gate|up|down] FFN data (f32, packed per layer).
-    pub interleaved_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Q4_0 quantized interleaved FFN.
-    pub interleaved_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Q4_K / Q6_K quantized interleaved FFN (Ollama-compatible).
-    pub interleaved_q4k_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Per-matrix (offset, length, format) entries — 3 per layer in
-    /// `[gate, up, down]` order.
-    pub interleaved_q4k_manifest: Option<Vec<(usize, usize, String)>>,
     /// Per-layer lazy dequant cache for Q4_K/Q6_K FFN tensors.
     /// `q4k_ffn_cache[layer][c]` is the dequantised
     /// `[intermediate × hidden]` matrix for component `c`
@@ -108,7 +100,7 @@ pub struct FfnStore {
     /// In practice only the down component (component=2) is fetched from
     /// this cache; gate/up use the NEON Q4K×Q8K kernel directly on mmap
     /// bytes and never populate their slots here.
-    pub q4k_ffn_once: Vec<[std::sync::OnceLock<Option<Arc<Vec<f32>>>>; 3]>,
+    pub q4k_ffn_once: Vec<Q4kFfnOnceLayer>,
     /// FP4 / FP8 FFN storage (exp 26).
     pub fp4_storage: Option<Arc<crate::index::fp4_storage::Fp4Storage>>,
 }
@@ -116,14 +108,6 @@ pub struct FfnStore {
 impl FfnStore {
     pub fn empty(num_layers: usize) -> Self {
         Self {
-            down_features_mmap: None,
-            down_features_q4k_mmap: None,
-            down_features_q4k_manifest: None,
-            up_features_mmap: None,
-            interleaved_mmap: None,
-            interleaved_q4_mmap: None,
-            interleaved_q4k_mmap: None,
-            interleaved_q4k_manifest: None,
             q4k_ffn_cache: Mutex::new((0..num_layers).map(|_| [None, None, None]).collect()),
             q4k_ffn_cache_lru: Mutex::new(std::collections::VecDeque::new()),
             q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize::new(0),
@@ -140,14 +124,6 @@ impl Clone for FfnStore {
         use std::sync::atomic::Ordering;
         let nl = self.q4k_ffn_cache.lock().map(|c| c.len()).unwrap_or(0);
         Self {
-            down_features_mmap: self.down_features_mmap.clone(),
-            down_features_q4k_mmap: self.down_features_q4k_mmap.clone(),
-            down_features_q4k_manifest: self.down_features_q4k_manifest.clone(),
-            up_features_mmap: self.up_features_mmap.clone(),
-            interleaved_mmap: self.interleaved_mmap.clone(),
-            interleaved_q4_mmap: self.interleaved_q4_mmap.clone(),
-            interleaved_q4k_mmap: self.interleaved_q4k_mmap.clone(),
-            interleaved_q4k_manifest: self.interleaved_q4k_manifest.clone(),
             q4k_ffn_cache: Mutex::new((0..nl).map(|_| [None, None, None]).collect()),
             q4k_ffn_cache_lru: Mutex::new(std::collections::VecDeque::new()),
             q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize::new(

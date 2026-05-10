@@ -32,21 +32,34 @@ Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec
 ## Performance vs Ollama
 
 Live `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b`
-on M3 Max (2026-05-02, post dispatch-geometry fix):
+on M3 Max (2026-05-09, post QKV defuse):
 
 ```
-  larql-metal  83–84 tok/s   11.9ms/tok   (GPU fwd ~11.16ms, lm_head ~1.85ms)
-  ollama       98.5–99.7 tok/s  10.0ms/tok
-  gap          1.18×          ~2.0ms/tok
+  larql-metal  88 tok/s     11.4ms/tok   (GPU fwd ~11.40ms, lm_head ~1.85ms)
+  ollama       ~103 tok/s   ~9.7ms/tok
+  gap          1.17×        ~1.66ms/tok
 ```
 
 Reproduce: `larql bench <vindex> --backends metal --ollama <tag>`.
-See `PERFORMANCE.md` for the full breakdown, the "Decision: lm_head dispatch
-order" decision-log entry, and ADR-015 for the diagnostic order rule
-("dispatch-geometry first, kernel second, reduction tree last") that drove
-the 2026-05-02 fix.
+**Acceptance criterion (~85 tok/s, ~1.16×) effectively met.** See
+`PERFORMANCE.md` for the full breakdown, [ADR-015](docs/adr/015-isolated-vs-batched-kernel-perf.md)
+(iso-vs-batched diagnostic order), [ADR-016](docs/adr/016-defused-rms-norm-qkv.md)
+(QKV defuse rationale), [ADR-017](docs/adr/017-shader-retention-model-agnosticity.md)
+(shader retention under model agnosticity), [ADR-018](docs/adr/018-architecture-shader-routing.md)
+(architecture → shader routing), [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md)
+(kernel-architecture comparison vs llama.cpp), and
+[docs/architecture-shader-map.md](docs/architecture-shader-map.md)
+(per-architecture shader dispatch map).
 
 ### Key optimisations
+
+**2026-05-09 — QKV defuse (+1.6–1.8 tok/s on Gemma 3 4B; +0.4 on 26B MoE)**
+
+| Optimization | Savings | Technique |
+|---|---|---|
+| Default flipped from fused `q4k_q6k_qkv_proj_normed` to separate `rms_norm` + non-fused `q4k_q6k_qkv_proj` | **+1.6–1.8 tok/s, −0.30 ms/tok GPU fwd** on Gemma 3 4B; **+0.4 tok/s** confirmed on Gemma 4 26B A4B (MoE) post-thermal-cooldown cross-arch validation | The fused kernel rolled RMS norm into Phase 1 of the matmul to save 1 dispatch/layer (~0.24 ms/tok), but each TG's 4 simdgroups independently re-traverse H + norm_w in Phase 2 (different stride patterns for Q4_K Q/K vs Q6_K V), dropping the kernel from 287 → 199 GB/s. The 1.46 ms/tok kernel cost exceeds the 0.24 ms/tok dispatch saving. ADR-016. `LARQL_QKV_FUSED=1` opts back in to the old fused path. |
+| D-RMS-FUSE Phase 1 — `residual_norm_store` at post-FFN→next-input boundary on non-Gemma | **End-to-end NULL** (within drift). Predicted ~0.2 ms/tok; measured 0.0. | Fuses post-FFN `residual_add` + next layer's input rms_norm into one `residual_norm_store` dispatch. Bit-identical parity ✓ across Llama 2 7B / Mistral 7B / Gemma 3 4B (Gemma path untouched — already triple-fused via `post_ffn_norm_residual_add`). Kept opt-in `LARQL_FUSED_PRELAYER_NORM=1`. ADR-015 magnitude-compression at the extreme — the dispatch saving in layer N+1 is offset by `residual_norm_store` doing the RMS reduction inline where `residual_add` was just element-wise. |
+| `make bench-cross-arch` — multi-arch decode bench infrastructure | Infrastructure (no perf change) | `scripts/bench-cross-arch.sh` + `bench/baselines/cross-arch/`. Operationalises ADR-017's model-agnosticity check. Multi-arch sweep automatically surfaces thermal artifacts (every-arch-regresses-simultaneously signature). |
 
 **2026-05-02 — dispatch geometry fix (+8 tok/s on Gemma 3 4B, +14 tok/s on Gemma 4 26B A4B)**
 
@@ -80,7 +93,7 @@ the 2026-05-02 fix.
 | f32_gemv (legacy lm_head fallback) | ~387 GB/s | — | bandwidth (at peak) |
 
 Both big FFN kernels are bandwidth-bound at 74–84% of LPDDR5X peak; no
-single-kernel headroom remains. The remaining 1.18× gap to ollama is
+single-kernel headroom remains. The remaining ~1.17× gap to ollama is
 distributed across dispatch overhead + the ~30 ms/tok of CPU-side ops
 (routing, KV append, sampling) — not a hot kernel waiting to be tuned.
 
@@ -245,15 +258,67 @@ src/
 
 ## Tests
 
-```bash
-# CPU only
-cargo test -p larql-compute
+**Coverage (2026-05-09)**: 424 `#[test]` markers, **64.81% line coverage**
+on the Metal-feature build (`cargo llvm-cov --package larql-compute
+--features metal`). Up from **56.03%** at session start (+8.78 pp; 2,575
+newly-covered lines, 22.2% reduction in uncovered LoC). Three rounds of work:
 
-# CPU + Metal (full kernel + cross-backend coverage)
+1. **Deleted 591 LoC of dead code** in `metal/prefill.rs` (verified
+   orphan: `dispatch_prefill` was `#[allow(dead_code)]` with zero callers,
+   production prefill routes through `prefill_q4` → `dispatch_full_pipeline`).
+2. **Targeted tests on small helpers**: `tg_width` math (`stages/qk_norm.rs`
+   0% → 23%), `scale_vector` dispatch (`stages/layer_scalar.rs` 12% → 97%),
+   `residual_norm_store` shader parity (D-RMS-FUSE).
+3. **Synthetic end-to-end decode tests** (`tests/test_metal_decode_synthetic.rs`):
+   Llama-style + Gemma-3-style + D-RMS-FUSE off-vs-on parity. Lifted
+   `metal/decode/mod.rs` 7% → 61%, `encode_attn.rs` 0% → 46%, `encode_post_ffn.rs`
+   0% → 83%, `encode_qkv.rs` 0% → 30%, `encode_ffn.rs` 0% → 23%.
+
+**Coverage policy** (`coverage-policy.json`) sets a 90%-per-file / 93.5%-
+total target. Current state is well below — the policy is documentation-
+as-aspiration, not a CI gate today. Largest remaining gaps:
+- `metal/trait_impl/decode.rs` (627 LoC at 21%) — MoE / split-profile
+  trait method wrappers; 5-6 more focused tests would close this.
+- `metal/decode/encode_ffn.rs` (1008 LoC at 23%) — Q4_KF format paths,
+  fused-down opt-ins, MoE branches not exercised.
+- `metal/diag/*.rs` (~3000 LoC at 0%) — diagnostic / dev-only profiling
+  code; not load-bearing.
+
+```bash
+# Fast inner loop: library/unit tests only, no integration-binary crawl.
+make larql-compute-test-fast
+
+# Heavy integration sweep: every test binary under crates/larql-compute/tests.
+make larql-compute-test-integration
+
+# CPU + Metal on macOS (full kernel + cross-backend coverage)
 cargo test -p larql-compute --features metal
+
+# Cross-platform compile checks used before CI handoff.
+cargo check -p larql-compute --all-targets
+cargo check -p larql-compute --all-targets --features metal  # macOS only
+
+# Multi-arch perf regression gate (run on a cool machine first to save baselines)
+make bench-cross-arch                       # report current numbers
+make bench-cross-arch ARGS=--save-baseline  # save current as baseline
+make bench-cross-arch ARGS=--compare        # diff vs saved baseline
 ```
 
-**241 tests** with `--features metal` across 18 test files:
+`cargo test -p larql-compute` remains valid, but it still compiles and walks
+every integration test binary, including Metal-gated harnesses with zero
+runnable tests on default-feature builds. Prefer
+`make larql-compute-test-fast` while iterating on CPU MoE, backend traits,
+and quant dispatch.
+
+**Cross-model parity coverage**: integration tests in
+`crates/larql-inference/tests/test_logits_goldens.rs` cover Gemma 3 4B,
+Gemma 4 31B dense, Llama 2 7B, Mistral 7B end-to-end. Per-shader tests in
+`crates/larql-compute/tests/` are still mostly Gemma-3-4B-only — extending
+them to multiple model families is **D-CROSS-PARITY Phase 2** on the
+ROADMAP.
+
+The integration suite currently has 28 test binaries plus a shared helper
+module under `tests/common`. With `--features metal`, it covers:
 
 - `test_metal_shaders.rs` — compilation, Q4/Q6 matvec, fused attention smoke, LayerNorm, qk_norm, q4kf projection
 - `test_kernel_fused_ops_norms.rs` — rms_norm, residual ops, cooperative SIMD reduction, quantize_q8
@@ -284,7 +349,7 @@ The cross-backend / cross-stage parity layer lives in `larql-inference`:
 
 ## Examples
 
-Nine examples in three groups — see [`examples/README.md`](examples/README.md) for a one-line description of each.
+Eleven examples in three groups — see [`examples/README.md`](examples/README.md) for a one-line description of each.
 
 ```bash
 # Demos (teach the API)
@@ -300,7 +365,9 @@ cargo run --release --features metal -p larql-compute --example compare_pipeline
 cargo run --release --features metal -p larql-compute --example compare_ollama      # Head-to-head vs Ollama
 
 # Diagnostic
-cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
+cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
+cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+cargo run --release --features metal -p larql-compute --example diag_shader_bench
 ```
 
 The headline tok/s vs Ollama uses the CLI's `bench` subcommand against a real vindex:
@@ -320,13 +387,10 @@ Three Criterion benches — see [`benches/README.md`](benches/README.md):
 | `linalg` | Cholesky + ridge solve |
 
 ```bash
-make bench           # run all three
-make bench-save      # record a baseline named `main`
-make bench-check     # re-run; fail if any cell regressed
+make bench-compute   # quant_matvec Criterion bench with Metal
+cargo bench -p larql-compute --bench matmul
+cargo bench -p larql-compute --bench linalg
 ```
-
-The detector lives in `scripts/bench-regress.sh`; CI starter at
-`.github/workflows/bench-regress.yml`.
 
 ## Diagnostics: parity bisect
 
@@ -357,11 +421,15 @@ API; the same calls back the regression suite at
 | Doc | Content |
 |-----|---------|
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmark data, component profiling, optimization history |
-| [ROADMAP.md](ROADMAP.md) | Planned optimizations, performance targets |
-| [docs/adr/](docs/adr/) | 12 architectural decision records (design choices, algorithm origins, per-layer params, encoder merging) |
+| [ROADMAP.md](ROADMAP.md) | Planned optimizations, performance targets, open tracks (D-METAL-PLE, D-ATTN-MTG, D-PREFILL-MM2) |
+| [docs/adr/](docs/adr/) | 18 architectural decision records — recent additions: 015 (iso-vs-batched kernel perf), 016 (defused RMS norm + QKV), 017 (shader retention under model agnosticity), 018 (architecture → shader routing) |
+| [docs/shader-inventory.md](docs/shader-inventory.md) | **Per-shader retention rationale + applicability** — surveyed 2026-05-09. Read this before adding/deleting any shader |
+| [docs/architecture-shader-map.md](docs/architecture-shader-map.md) | **Per-architecture Metal dispatch map** — bridges `larql-models/architectures/` to which shaders each model family fires |
+| [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) | **Kernel-architecture comparison vs llama.cpp** — three concrete gaps (flash attention, simdgroup_matrix matmul, RMS-norm pre-fusion) explain remaining decode + prefill perf delta |
 | [docs/shaders.md](docs/shaders.md) | Metal kernels with origin, performance, parameters (may lag the source — see the Shaders table above for the current production set) |
 | [docs/quantization-formats.md](docs/quantization-formats.md) | Q4_0, Q4_K, Q4_KF, Q6_K, Q8_0 format specs |
 | [docs/decode-pipeline.md](docs/decode-pipeline.md) | Decode data flow, dual-path architecture, KV cache |
+| [`bench/baselines/cross-arch/README.md`](../../bench/baselines/cross-arch/README.md) | Cool-machine baseline workflow for `make bench-cross-arch` (post-D-CROSS-PARITY) |
 
 ## Design Principles
 

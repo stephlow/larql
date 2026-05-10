@@ -59,7 +59,8 @@ fn synth_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
             ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
         })
         .collect();
-    Array2::from_shape_vec((rows, cols), data).unwrap()
+    Array2::from_shape_vec((rows, cols), data)
+        .expect("synth_matrix: data length matches (rows, cols) by construction")
 }
 
 fn bench_median<F: FnMut()>(n: usize, mut f: F) -> u64 {

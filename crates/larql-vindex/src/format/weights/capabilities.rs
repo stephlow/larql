@@ -1,7 +1,9 @@
+use crate::config::ExtractLevel;
 use crate::error::VindexError;
 
 pub(super) const SURFACE_F32_WEIGHT_WRITER: &str = "f32 weight writer";
 pub(super) const SURFACE_Q4K_WEIGHT_WRITER: &str = "q4k weight writer";
+pub(crate) const SURFACE_EXTRACT_PIPELINE: &str = "extract pipeline";
 
 const FEATURE_MLA: &str = "multi-head latent attention (MLA)";
 
@@ -24,6 +26,24 @@ pub(super) fn ensure_standard_attention_supported(
         });
     }
 
+    Ok(())
+}
+
+/// Entry-point gate for the extract pipeline: reject unsupported attention
+/// layouts before any partial vindex output is written.
+///
+/// Browse-level extracts only emit gate / embed / down_meta / tokenizer —
+/// none of which depend on the attention layout — so this is a no-op there.
+/// Any tier that writes attention (Attention / Inference / All) must reject
+/// MLA-style architectures up front; failing inside the writer leaves a
+/// half-populated vindex on disk that the caller would have to clean up.
+pub(crate) fn ensure_extract_level_supported(
+    arch: &dyn larql_models::ModelArchitecture,
+    level: ExtractLevel,
+) -> Result<(), VindexError> {
+    if level.writes_attn() {
+        ensure_standard_attention_supported(arch, SURFACE_EXTRACT_PIPELINE)?;
+    }
     Ok(())
 }
 
@@ -79,5 +99,71 @@ mod tests {
         assert!(msg.contains(arch.family()), "{msg}");
         assert!(msg.contains(FEATURE_MLA), "{msg}");
         assert!(msg.contains(TEST_Q4K_SURFACE), "{msg}");
+    }
+
+    fn mla_arch() -> Box<dyn larql_models::ModelArchitecture> {
+        larql_models::detect_from_json(&serde_json::json!({
+            "model_type": MODEL_TYPE_DEEPSEEK_V2,
+            "hidden_size": HIDDEN_SIZE_TEST,
+            "intermediate_size": INTERMEDIATE_SIZE_TEST,
+            "num_hidden_layers": NUM_LAYERS_TEST,
+            "num_attention_heads": NUM_ATTENTION_HEADS_TEST,
+            "num_key_value_heads": NUM_KV_HEADS_TEST,
+            "head_dim": HEAD_DIM_TEST,
+            "kv_lora_rank": KV_LORA_RANK_TEST,
+            "q_lora_rank": Q_LORA_RANK_TEST
+        }))
+    }
+
+    fn llama_arch() -> Box<dyn larql_models::ModelArchitecture> {
+        larql_models::detect_from_json(&serde_json::json!({
+            "model_type": MODEL_TYPE_LLAMA,
+            "hidden_size": HIDDEN_SIZE_LLAMA_7B,
+            "num_hidden_layers": NUM_LAYERS_LLAMA_7B,
+            "num_attention_heads": NUM_ATTENTION_HEADS_LLAMA_7B
+        }))
+    }
+
+    #[test]
+    fn extract_level_browse_passes_for_mla() {
+        // Browse only emits gate / embed / down_meta / tokenizer — none
+        // of which need the attention layout. MLA must succeed here.
+        assert!(
+            ensure_extract_level_supported(&*mla_arch(), ExtractLevel::Browse).is_ok(),
+            "Browse-level extract should accept MLA architectures"
+        );
+    }
+
+    #[test]
+    fn extract_level_attention_rejects_mla() {
+        let err = ensure_extract_level_supported(&*mla_arch(), ExtractLevel::Attention)
+            .expect_err("Attention-level extract must reject MLA");
+        let msg = err.to_string();
+        assert!(msg.contains(FEATURE_MLA), "{msg}");
+        assert!(msg.contains(SURFACE_EXTRACT_PIPELINE), "{msg}");
+    }
+
+    #[test]
+    fn extract_level_inference_rejects_mla() {
+        assert!(
+            ensure_extract_level_supported(&*mla_arch(), ExtractLevel::Inference).is_err(),
+            "Inference-level extract must reject MLA"
+        );
+    }
+
+    #[test]
+    fn extract_level_all_rejects_mla() {
+        assert!(
+            ensure_extract_level_supported(&*mla_arch(), ExtractLevel::All).is_err(),
+            "All-level extract must reject MLA"
+        );
+    }
+
+    #[test]
+    fn extract_level_all_passes_for_llama() {
+        assert!(
+            ensure_extract_level_supported(&*llama_arch(), ExtractLevel::All).is_ok(),
+            "Llama models with standard Q/K/V/O attention must pass at every level"
+        );
     }
 }

@@ -19,6 +19,7 @@
 //! - Q4_K matvec: uint4 loads, 8 rows/TG, multi-row (nr0=2)
 //! - KV attention: simd_max/simd_sum reductions, float4 Q·K dot products
 
+mod attention_kernels; // AttentionKernels registry (M3 incremental — third of four)
 pub mod buffers;
 pub mod calibrate;
 mod decode;
@@ -28,13 +29,21 @@ mod decode_hybrid;
 pub mod diag;
 mod direct_ops;
 pub mod f32_ops;
+mod ffn_kernels; // FfnKernels registry (M3 incremental — fourth of four; M3 complete)
+mod flags; // cached env-var-derived backend flags (DecodeFlags)
 pub mod kernel; // KernelHandle: pipeline + dispatch geometry, bundled
 mod moe_dispatch;
+mod norm_kernels; // NormKernels registry (M3 incremental — first of four)
+mod quant_kernels; // QuantKernels registry (M3 incremental — second of four)
+pub use attention_kernels::AttentionKernels;
 pub use decode::profile::take_last_split_timings;
+pub use ffn_kernels::FfnKernels;
+pub use flags::{BackendOptions, DecodeFlags};
 pub use moe_dispatch::MoeScratch;
+pub use norm_kernels::NormKernels;
+pub use quant_kernels::QuantKernels;
 pub mod ops; // modular: ops/mod.rs → one file per operation
 mod pipeline;
-mod prefill;
 pub mod shaders; // modular: shaders/mod.rs → one file per shader
 pub mod stages; // modular: stages/mod.rs → one file per pipeline stage
 mod trait_impl;
@@ -79,173 +88,28 @@ pub struct MetalBackend {
     bufs: BufferCache,
     f32_ops: F32Ops,
     pub q4: Q4Pipelines,
-    causal_attn_pipeline: ComputePipelineState,
-    pub fused_attn_pipeline: ComputePipelineState,
-    pub geglu_pipeline: ComputePipelineState,
-    pub geglu_gelu_tanh_pipeline: ComputePipelineState,
-    q8_quant_pipeline: ComputePipelineState,
-    pub kv_attend_pipeline: ComputePipelineState,
-    pub kv_attend_long_pipeline: ComputePipelineState,
-    pub kv_append_pipeline: ComputePipelineState,
-    /// Fused KV-append + KV-attention. Each Q-head TG cooperatively
-    /// writes its kv_head's new K/V row to cache at position `pos`,
-    /// then proceeds with attention over T = pos + 1. Eliminates the
-    /// `kv_cache_append` dispatch (~1 dispatch/layer × 34 ≈ 0.24 ms/tok).
-    /// Default-on; opt out via `LARQL_FUSED_KV_APPEND_ATTEND=0`. See
-    /// `shaders/kv_append_attend_fused.rs`.
-    pub kv_append_attend_fused_pipeline: ComputePipelineState,
-    /// Fused **QK-norm + RoPE + KV-cache append + attention** —
-    /// collapses three dispatches (qk_norm_rope_fused +
-    /// kv_append_attend_fused, plus the implicit kv_append phase) into
-    /// one. Each Q-head TG normalises+ropes its Q (kept in TG memory),
-    /// normalises+ropes+writes its kv_head's K row to cache, streams V
-    /// to cache, then attends. Saves 1 dispatch/layer × 34 ≈ 0.2 ms/tok.
-    /// Default-on; opt out via `LARQL_FUSED_ATTN=0`. See
-    /// `shaders/attn_fused.rs`.
-    pub attn_fused_pipeline: ComputePipelineState,
-    pub q8_matvec_pipeline: KernelHandle,
-    pub rms_norm_pipeline: ComputePipelineState,
-    pub residual_add_pipeline: ComputePipelineState,
-    pub q8_qkv_proj_pipeline: KernelHandle,
-    /// Production-active Q4_K matvec pipeline. Holds 8sg by default
-    /// (2026-04-28; profiler showed 55% of LPDDR5X peak with 4sg).
-    /// All dispatch sites use this transparently. Tests reach the
-    /// explicit variants via `q4k_matvec_4sg_pipeline` /
-    /// `q4k_matvec_8sg_pipeline`.
-    pub q4k_matvec_pipeline: KernelHandle,
-    /// Always-4sg Q4_K matvec (production until 2026-04-28). Kept as
-    /// the explicit fallback / opt-out via `LARQL_Q4K_MATVEC_8SG=0`.
-    pub q4k_matvec_4sg_pipeline: KernelHandle,
-    /// Always-8sg Q4_K matvec (256 threads/TG, 8 rows/TG). Bit-identical
-    /// output to 4sg. Default-on for `q4k_matvec_pipeline`.
-    pub q4k_matvec_8sg_pipeline: KernelHandle,
-    /// Stride-32 Q4_K matvec — same Q4_K input format as `q4k_matvec`
-    /// but each lane accumulates the contribution of every element
-    /// `i where i % 32 == lane`, mirroring `f16_gemv`'s reduction tree.
-    /// Use this for the LM head when the regular `q4k_matvec`'s
-    /// block-aware lane split (`ix = lane & 1u`) drifts enough vs CPU
-    /// to flip top-1 on close-call tokens. See
-    /// `shaders/q4k_matvec_stride32.rs` for the rationale.
-    pub q4k_matvec_stride32_pipeline: KernelHandle,
-    /// Q4_K matmul (gemm) — `[N, K] × [M, K] → [M, N]`. Used by prefill
-    /// and seq>1 dispatch when amortising dequant across positions is
-    /// worth the per-thread accumulator footprint. Decode (M=1) still
-    /// routes through `q4k_matvec_pipeline` for minimal register pressure.
-    pub q4k_matmul_pipeline: KernelHandle,
-    pub q4k_ffn_gate_up_pipeline: KernelHandle,
-    /// Experimental Q4_K gate+up with f16 inner accumulators — opt-in
-    /// via `LARQL_F16_ACC=1` while precision is being validated.
-    /// Hypothesis: 2× f16 FMA throughput on Apple GPUs frees ALU cycles
-    /// even on bandwidth-bound kernels. See
-    /// `shaders/q4k_ffn_gate_up_f16acc.rs`.
-    pub q4k_ffn_gate_up_f16acc_pipeline: KernelHandle,
-    /// Experimental Q4_K gate+up with 8 simdgroups per TG (256 threads,
-    /// 8 rows/TG) instead of the production 4 simdgroups (128 threads,
-    /// 4 rows/TG). Same per-thread register footprint (nr0=1) so no
-    /// register pressure regression; doubled threads per TG should
-    /// improve within-TG latency hiding. Off by default; opt-in via
-    /// `LARQL_GATE_UP_8SG=1` while perf is being measured. See
-    /// `shaders/q4k_ffn_gate_up_8sg.rs`.
-    pub q4k_ffn_gate_up_8sg_pipeline: KernelHandle,
-    /// Cooperative-scale-load Q4_K gate+up — same Q4_K input as
-    /// `q4k_ffn_gate_up_pipeline`, but the per-super-block dequant
-    /// header (`d`/`dmin`/8 sub-block scales/mins) is decoded once
-    /// per simdgroup per super-block and broadcast via
-    /// `simd_broadcast`/`simd_shuffle`, eliminating 32× redundant
-    /// ALU on the production critical path. Aimed at the
-    /// 187 GB/s = 47%-of-peak ALU bottleneck flagged in
-    /// `metal/diag/kernel_profile.rs`. Opt-in via
-    /// `LARQL_GATE_UP_COOP=1` while perf is being measured. See
-    /// `shaders/q4k_ffn_gate_up_coop.rs`.
-    pub q4k_ffn_gate_up_coop_pipeline: KernelHandle,
-    /// NR0=2 multi-row + shared-X-vector Q4_K gate+up — same Q4_K
-    /// input as `q4k_ffn_gate_up_pipeline`, but each simdgroup handles
-    /// 2 output rows in parallel with `xl[16]` loaded once and reused
-    /// across both. Mirrors llama.cpp's `N_R0_Q4_K = 2` shape. Aimed
-    /// at the X-cache-traffic bottleneck diagnosed by step-by-step
-    /// vs-ollama comparison (2026-05-01). Opt-in via
-    /// `LARQL_GATE_UP_NR2=1`. See `shaders/q4k_ffn_gate_up_nr2.rs`.
-    pub q4k_ffn_gate_up_nr2_pipeline: KernelHandle,
-    pub q4kf_ffn_gate_up_pipeline: KernelHandle,
-    pub q4k_geglu_silu_down_pipeline: KernelHandle,
-    pub q4k_geglu_gelu_tanh_down_pipeline: KernelHandle,
-    /// Fused GEGLU activation + Q6_K down projection — production
-    /// FFN path on Gemma 3/4 / Llama 2 / Mistral (Ollama convention
-    /// is Q4_K gate/up + Q6_K down). Mirrors the Q4_K twins above.
-    pub q6k_geglu_silu_down_pipeline: KernelHandle,
-    pub q6k_geglu_gelu_tanh_down_pipeline: KernelHandle,
-    /// Cached-activation Q6_K GELU-tanh + down — TG memory holds
-    /// `tg_act[256]` (one fully-activated element per super-block
-    /// position) so the inner FMA loop reads pre-computed activations
-    /// instead of recomputing `tanh()` per row. Eliminates the 4×
-    /// `tanh()` redundancy that made the original
-    /// `q6k_geglu_gelu_tanh_down` regress on Gemma 3 4B (per the
-    /// 2026-04-26 finding documented in `encode_ffn.rs`). Saves
-    /// 1 dispatch per layer × 34 = ~34/tok plus the redundant
-    /// activation compute. Opt-in via `LARQL_FUSED_Q6K_DOWN=1`. See
-    /// `shaders/q6k_geglu_gelu_tanh_down_cached.rs`.
-    pub q6k_geglu_gelu_tanh_down_cached_pipeline: KernelHandle,
-    /// Production-active Q6_K matvec pipeline. Holds 8sg by default,
-    /// 4sg when `LARQL_Q6K_8SG=0` is set at startup. All dispatch
-    /// sites use this transparently; tests reach the explicit
-    /// variants via `q6k_matvec_4sg_pipeline` / `q6k_matvec_8sg_pipeline`.
-    pub q6k_matvec_pipeline: KernelHandle,
-    /// Always-4sg Q6_K matvec (production until 2026-04-28). Kept as
-    /// the explicit fallback / opt-out via `LARQL_Q6K_8SG=0`.
-    pub q6k_matvec_4sg_pipeline: KernelHandle,
-    /// Always-8sg Q6_K matvec (256 threads/TG, 8 rows/TG). Bit-identical
-    /// output to 4sg (same math, only TG dispatch geometry changed).
-    /// Default-on for `q6k_matvec_pipeline` as of 2026-04-28. See
-    /// `shaders/q6k_matvec_8sg.rs`.
-    pub q6k_matvec_8sg_pipeline: KernelHandle,
-    pub rope_at_pos_pipeline: ComputePipelineState,
-    pub rope_at_pos_batched_pipeline: ComputePipelineState,
-    pub q4k_qkv_proj_pipeline: KernelHandle,
-    /// Fused mixed-quant QKV: Q4_K Q/K rows + Q6_K V rows in one dispatch.
-    /// Gemma 3 4B / Gemma 4 ship `V` as Q6_K; without this shader decode
-    /// falls through to three per-projection dispatches per layer.
-    pub q4k_q6k_qkv_proj_pipeline: KernelHandle,
-    pub q4k_q6k_qkv_proj_normed_pipeline: KernelHandle,
-    pub q4k_proj_pipeline: KernelHandle,
-    pub q4kf_qkv_proj_pipeline: KernelHandle,
-    pub q4kf_proj_pipeline: KernelHandle,
-    // Standalone activations (non-gated FFN)
-    pub silu_pipeline: ComputePipelineState,
-    pub gelu_tanh_pipeline: ComputePipelineState,
-    // LayerNorm (StarCoder2)
-    pub layer_norm_pipeline: ComputePipelineState,
-    pub layer_norm_no_bias_pipeline: ComputePipelineState,
-    // V-norm (Gemma 4)
-    pub v_norm_pipeline: ComputePipelineState,
-    pub v_norm_batched_pipeline: ComputePipelineState,
-    pub qk_norm_pipeline: ComputePipelineState,
-    pub qk_norm_qk_pipeline: ComputePipelineState,
-    /// Fused QK-norm + RoPE — replaces the consecutive
-    /// `qk_norm_qk` + `rope_at_pos_batched_qk` dispatches with one
-    /// kernel: each TG handles one head, RMS-norms it, applies
-    /// per-d weight scale, then in-place RoPE. Saves 1 dispatch per
-    /// layer × 34 = ~34/tok. Opt-in via `LARQL_FUSED_QK_NORM_ROPE=1`.
-    /// See `shaders/qk_norm_rope_fused.rs`.
-    pub qk_norm_rope_fused_pipeline: ComputePipelineState,
-    /// Triple-fusion: post_attn_norm + residual + ffn_norm + h_post_attn
-    /// store. Replaces the 3-dispatch chain (rms_norm + residual_norm +
-    /// residual_add) for the `has_post_norms` decode path with a
-    /// single kernel doing two sequential RMS reductions and one
-    /// fused residual+norm+store. Saves ~34 dispatches/tok.
-    /// Opt-in via `LARQL_FUSED_POST_ATTN_NORM=1`.
-    /// See `shaders/post_attn_residual_norm_store.rs`.
-    pub post_attn_residual_norm_store_pipeline: ComputePipelineState,
-    /// Fused post-FFN norm + residual_add. Replaces the consecutive
-    /// `rms_norm(down_out)` + `residual_add(h_post_attn, normed_ffn)`
-    /// dispatches at the end of each layer in the
-    /// `has_post_norms + post_ffn_norm` decode path. Saves
-    /// 1 dispatch / layer × 34 ≈ 0.24 ms/tok.
-    /// Opt-in via `LARQL_FUSED_POST_FFN_NORM=1`.
-    /// See `shaders/post_ffn_norm_residual_add.rs`.
-    pub post_ffn_norm_residual_add_pipeline: ComputePipelineState,
-    pub rope_at_pos_batched_qk_pipeline: ComputePipelineState,
-    // Scale vector (per-layer scalar, Gemma 4)
-    pub scale_vector_pipeline: ComputePipelineState,
+    /// Norm + residual + scale-vector pipelines. See [`NormKernels`].
+    pub norms: NormKernels,
+    /// Format-primitive matvec / matmul / quantize pipelines (Q4_K
+    /// 4sg/8sg/stride32 + matmul, Q6_K 4sg/8sg, Q8 matvec, Q8 quant).
+    /// See [`QuantKernels`].
+    pub quant: QuantKernels,
+    /// Attention dispatch + RoPE + QKV-projection pipelines (KV
+    /// attend / append, fused-attn opt-in, RoPE variants, Q4_K /
+    /// Q4_KF / Q4_K-Q6K-V / Q8 QKV proj). See [`AttentionKernels`].
+    pub attention: AttentionKernels,
+    /// FFN dispatch pipelines: gate+up variants (Q4_K production +
+    /// `f16acc`/`8sg`/`coop` opt-ins, Q4_KF), activation kernels
+    /// (silu/gelu_tanh + their geglu twins), fused activation+down
+    /// (Q4_K and Q6_K). See [`FfnKernels`].
+    pub ffn: FfnKernels,
+    // (LayerNorm / V-norm / QK-norm / qk-norm-rope / post-norm fusions
+    //  / scale_vector — moved into `NormKernels` (the `norms` field).
+    //  RoPE / KV-attend / fused-attn / QKV-projection — moved into
+    //  `AttentionKernels` (the `attention` field).
+    //  geglu / silu / gelu_tanh / q4k_ffn_gate_up* / q4kf_ffn_gate_up
+    //  / q4k_geglu_*_down / q6k_geglu_*_down* — moved into
+    //  `FfnKernels` (the `ffn` field).)
     /// KV cache for decode mode — initialized on first decode_token call.
     kv_cache: std::sync::Mutex<Option<ops::kv_cache::KVCache>>,
     /// Pre-allocated MoE scratch for `decode_token_q4k_moe` — keyed
@@ -256,10 +120,20 @@ pub struct MetalBackend {
     /// pulled inside the backend so the local decode path benefits
     /// without each caller threading a cache through.
     moe_scratch: std::sync::Mutex<Option<moe_dispatch::MoeScratch>>,
-    pub rms_norm_q8_pipeline: ComputePipelineState,
-    pub residual_norm_pipeline: ComputePipelineState,
-    pub residual_norm_q8_pipeline: ComputePipelineState,
-    pub residual_norm_store_pipeline: ComputePipelineState,
+    /// Per-Layer Embeddings precomputed input table (Gemma 4 E2B).
+    ///
+    /// Set by [`prepare_ple_inputs`](Self::prepare_ple_inputs) before each
+    /// `decode_token*` / prefill call when the active arch needs PLE; the
+    /// per-layer Metal dispatch reads this buffer + offset for the active
+    /// (layer, position). `None` for non-PLE archs.
+    ///
+    /// Carried on the backend (rather than threaded through every decode
+    /// call) so the Metal-side trait surface and the per-layer dispatch
+    /// signatures don't grow an extra arg for a feature only Gemma 4 E2B
+    /// uses today.
+    ple_inputs: std::sync::Mutex<Option<PleInputBuffer>>,
+    // (rms_norm_q8 / residual_norm{,_q8,_store} — moved into
+    //  `NormKernels` (the `norms` field).)
     /// Dedicated row-per-simdgroup f32 gemv for the LM head. Used in
     /// autoregressive decode where `matmul_transb(query, lm_head)` shows
     /// up as the dominant per-token cost.
@@ -274,11 +148,33 @@ pub struct MetalBackend {
     /// lm_head would otherwise live as a 5.6 GB f32 clone on 31B.
     pub f16_gemv_pipeline: KernelHandle,
     flop_threshold: AtomicUsize,
+    /// Decode-path flag snapshot copied from
+    /// [`BackendOptions::decode_flags`] at construction. Captured once
+    /// so the hot path (encode_attn / encode_qkv / encode_ffn /
+    /// encode_post_ffn / decode/mod.rs) doesn't pay ~12 `getenv`
+    /// syscalls per layer per token. Construct a fresh backend (via
+    /// [`new`](Self::new) or [`with_options`](Self::with_options)) to
+    /// pick up flag changes.
+    pub decode_flags: DecodeFlags,
 }
 
 impl MetalBackend {
-    /// Create a Metal backend. Returns None if no Metal device is available.
+    /// Create a Metal backend with default options derived from the
+    /// process environment. Returns `None` if no Metal device is
+    /// available.
+    ///
+    /// The historical env-driven defaults (`LARQL_Q4K_MATVEC_8SG`,
+    /// `LARQL_Q6K_8SG`, `LARQL_FUSED_*`, etc.) keep working through
+    /// [`BackendOptions::from_env`]. Callers that want explicit,
+    /// shell-independent control should use
+    /// [`with_options`](Self::with_options) instead.
     pub fn new() -> Option<Self> {
+        Self::with_options(BackendOptions::from_env())
+    }
+
+    /// Create a Metal backend with explicit options. Returns `None` if
+    /// no Metal device is available.
+    pub fn with_options(backend_options: BackendOptions) -> Option<Self> {
         let device = Device::system_default()?;
         let queue = device.new_command_queue();
 
@@ -298,8 +194,7 @@ impl MetalBackend {
             )?,
         };
 
-        let causal_attn_pipeline =
-            get_shader_pipeline::<shaders::causal_attention::Kernel>(&device, &library)?;
+        // (causal_attn now lives inside `AttentionKernels`.)
 
         // Q4 family pipelines.
         //
@@ -321,111 +216,26 @@ impl MetalBackend {
 
         let bufs = BufferCache::new(&device);
 
-        let geglu_pipeline = get_shader_pipeline::<shaders::geglu::SiluKernel>(&device, &library)?;
-        let geglu_gelu_tanh_pipeline =
-            get_shader_pipeline::<shaders::geglu::GeluTanhKernel>(&device, &library)?;
-        let q8_quant_pipeline =
-            get_shader_pipeline::<shaders::quantize_q8::Kernel>(&device, &library)?;
+        // Norm + residual + scale-vector pipelines, bundled.
+        let norms = NormKernels::build(&device, &library)?;
 
-        // Q8 matvec for attention projections (KernelHandle — geometry travels with kernel).
-        let q8_matvec_pipeline =
-            KernelHandle::from_kernel::<shaders::q8_matvec::Kernel>(&device, &library)?;
+        // Format-primitive matvec / matmul / Q8-quantize pipelines,
+        // bundled. The production `q4k_matvec_pipeline` and
+        // `q6k_matvec_pipeline` aliases are picked from
+        // `backend_options` here (replaces the inline 4sg/8sg branches
+        // that previously lived between the per-variant pipeline
+        // constructors).
+        let quant = QuantKernels::build(&device, &library, &backend_options)?;
 
-        // Norm and residual ops
-        let rms_norm_pipeline =
-            get_shader_pipeline::<shaders::residual_inject::RmsNormKernel>(&device, &library)?;
-        let residual_add_pipeline =
-            get_shader_pipeline::<shaders::residual_inject::ResidualAddKernel>(&device, &library)?;
+        // FFN dispatch pipelines (gate+up variants, activations,
+        // fused activation+down for Q4_K and Q6_K), bundled.
+        let ffn = FfnKernels::build(&device, &library)?;
 
-        // Q4_K + Q6_K matvec (KernelHandle).
-        // Q4_K matvec: production default is 8sg (256 threads/TG, 8
-        // rows/TG) as of 2026-04-28 — production-batched profiler
-        // showed q4k_matvec at 220 GB/s = 55% of LPDDR5X peak, the
-        // most-under-utilised matvec by far. 8sg gives access to the
-        // remaining bandwidth slack the same way it did for gate+up.
-        // Set `LARQL_Q4K_MATVEC_8SG=0` at startup to opt out.
-        let q4k_matvec_4sg_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_matvec::Kernel>(&device, &library)?;
-        let q4k_matvec_8sg_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_matvec_8sg::Kernel>(&device, &library)?;
-        let q4k_matvec_stride32_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_matvec_stride32::Kernel>(&device, &library)?;
-        let q4k_matvec_use_4sg = matches!(
-            std::env::var("LARQL_Q4K_MATVEC_8SG").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
-        let q4k_matvec_pipeline = if q4k_matvec_use_4sg {
-            q4k_matvec_4sg_pipeline.clone()
-        } else {
-            q4k_matvec_8sg_pipeline.clone()
-        };
-        let q4k_matmul_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_matmul::Kernel>(&device, &library)?;
-        // Q6_K matvec: production default is the 4-simdgroup variant.
-        // Tried 8sg (256 threads/TG, 8 rows/TG, kernel-isolated 1.96×
-        // speedup) on 2026-04-28 — end-to-end was at parity, slightly
-        // worse on quiet GPU (77.6 → 77.1 tok/s, 0.08 ms/tok). q6k was
-        // already at 84% of LPDDR5X peak (vs gate+up's 68%), so the
-        // ALU/scheduling slack the 8sg variant exposes is too small
-        // to recover end-to-end. Both pipelines are kept — tests use
-        // them explicitly, opt-IN via `LARQL_Q6K_8SG=1` for callers
-        // who want to retry on different hardware.
-        let q6k_matvec_4sg_pipeline =
-            KernelHandle::from_kernel::<shaders::q6k_matvec::Kernel>(&device, &library)?;
-        let q6k_matvec_8sg_pipeline =
-            KernelHandle::from_kernel::<shaders::q6k_matvec_8sg::Kernel>(&device, &library)?;
-        let q6k_use_8sg = matches!(
-            std::env::var("LARQL_Q6K_8SG").as_deref(),
-            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-        );
-        let q6k_matvec_pipeline = if q6k_use_8sg {
-            q6k_matvec_8sg_pipeline.clone()
-        } else {
-            q6k_matvec_4sg_pipeline.clone()
-        };
-
-        // Fused Q4_K / Q4_KF FFN gate+up (KernelHandle).
-        let q4k_ffn_gate_up_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up::Kernel>(&device, &library)?;
-        let q4k_ffn_gate_up_f16acc_pipeline = KernelHandle::from_kernel::<
-            shaders::q4k_ffn_gate_up_f16acc::Kernel,
-        >(&device, &library)?;
-        let q4k_ffn_gate_up_8sg_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_8sg::Kernel>(&device, &library)?;
-        let q4k_ffn_gate_up_coop_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_coop::Kernel>(&device, &library)?;
-        let q4k_ffn_gate_up_nr2_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_ffn_gate_up_nr2::Kernel>(&device, &library)?;
-        let q4kf_ffn_gate_up_pipeline =
-            KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(&device, &library)?;
-        // Fused activation+down (KernelHandle).
-        let q4k_geglu_silu_down_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_geglu_down::SiluKernel>(&device, &library)?;
-        let q4k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<
-            shaders::q4k_geglu_down::GeluTanhKernel,
-        >(&device, &library)?;
-        let q6k_geglu_silu_down_pipeline =
-            KernelHandle::from_kernel::<shaders::q6k_geglu_down::SiluKernel>(&device, &library)?;
-        let q6k_geglu_gelu_tanh_down_cached_pipeline = KernelHandle::from_kernel::<
-            shaders::q6k_geglu_gelu_tanh_down_cached::Kernel,
-        >(&device, &library)?;
-        let q6k_geglu_gelu_tanh_down_pipeline = KernelHandle::from_kernel::<
-            shaders::q6k_geglu_down::GeluTanhKernel,
-        >(&device, &library)?;
-
-        // Fused Q8 QKV projection (KernelHandle).
-        let q8_qkv_proj_pipeline =
-            KernelHandle::from_kernel::<shaders::q8_attn_proj::QkvKernel>(&device, &library)?;
-
-        // Fused ops (norm+quantize, residual+norm, residual+norm+quantize)
-        let rms_norm_q8_pipeline =
-            get_shader_pipeline::<shaders::fused_ops::RmsNormQ8Kernel>(&device, &library)?;
-        let residual_norm_pipeline =
-            get_shader_pipeline::<shaders::fused_ops::ResidualNormKernel>(&device, &library)?;
-        let residual_norm_q8_pipeline =
-            get_shader_pipeline::<shaders::fused_ops::ResidualNormQ8Kernel>(&device, &library)?;
-        let residual_norm_store_pipeline =
-            get_shader_pipeline::<shaders::fused_ops::ResidualNormStoreKernel>(&device, &library)?;
+        // (Q8 QKV projection now lives inside `AttentionKernels`.)
+        // (Norm + residual + Q8-norm fusion pipelines now live inside
+        //  `NormKernels` — see the `norms` binding above.)
+        // Attention dispatch + RoPE + QKV projection pipelines, bundled.
+        let attention = AttentionKernels::build(&device, &library)?;
 
         // Dedicated f32 / f16 gemv for the LM head (KernelHandle).
         let f32_gemv_pipeline =
@@ -437,150 +247,30 @@ impl MetalBackend {
         let f16_gemv_pipeline =
             KernelHandle::from_kernel::<shaders::f16_gemv::Kernel>(&device, &library)?;
 
-        // RoPE at position (for KV-cached decode)
-        let rope_at_pos_pipeline =
-            get_shader_pipeline::<shaders::rope::RopeAtPosKernel>(&device, &library)?;
-        let rope_at_pos_batched_pipeline =
-            get_shader_pipeline::<shaders::rope::RopeAtPosBatchedKernel>(&device, &library)?;
-
-        // Fused Q4_K QKV projection (KernelHandle).
-        let q4k_qkv_proj_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_qkv_proj::QkvKernel>(&device, &library)?;
-        let q4k_q6k_qkv_proj_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_q6k_qkv_proj::Kernel>(&device, &library)?;
-        let q4k_q6k_qkv_proj_normed_pipeline = KernelHandle::from_kernel::<
-            shaders::q4k_q6k_qkv_proj::NormedKernel,
-        >(&device, &library)?;
-        let q4k_proj_pipeline =
-            KernelHandle::from_kernel::<shaders::q4k_qkv_proj::ProjKernel>(&device, &library)?;
-
-        // Q4_KF: pre-baked scales (faster inference) — KernelHandle.
-        let q4kf_qkv_proj_pipeline =
-            KernelHandle::from_kernel::<shaders::q4kf_qkv_proj::QkvKernel>(&device, &library)?;
-        let q4kf_proj_pipeline =
-            KernelHandle::from_kernel::<shaders::q4kf_qkv_proj::ProjKernel>(&device, &library)?;
-
-        // Fused attention (RoPE + GQA + softcap)
-        let fused_attn_pipeline =
-            get_shader_pipeline::<shaders::fused_attention::Kernel>(&device, &library)?;
-
-        // Standalone activations (non-gated FFN)
-        let silu_pipeline =
-            get_shader_pipeline::<shaders::activation::SiluKernel>(&device, &library)?;
-        let gelu_tanh_pipeline =
-            get_shader_pipeline::<shaders::activation::GeluTanhKernel>(&device, &library)?;
-
-        // LayerNorm (StarCoder2, GPT-2)
-        let layer_norm_pipeline =
-            get_shader_pipeline::<shaders::layer_norm::Kernel>(&device, &library)?;
-        let layer_norm_no_bias_pipeline =
-            get_shader_pipeline::<shaders::layer_norm::NoBiasKernel>(&device, &library)?;
-
-        // V-norm (parameter-free RMSNorm, Gemma 4)
-        let v_norm_pipeline = get_shader_pipeline::<shaders::v_norm::Kernel>(&device, &library)?;
-        let v_norm_batched_pipeline =
-            get_shader_pipeline::<shaders::v_norm::BatchedKernel>(&device, &library)?;
-
-        // QK-norm (learned-weight per-head RMSNorm, Gemma 3/4)
-        let qk_norm_pipeline = get_shader_pipeline::<shaders::qk_norm::Kernel>(&device, &library)?;
-        let qk_norm_rope_fused_pipeline =
-            get_shader_pipeline::<shaders::qk_norm_rope_fused::Kernel>(&device, &library)?;
-        let post_attn_residual_norm_store_pipeline = get_shader_pipeline::<
-            shaders::post_attn_residual_norm_store::Kernel,
-        >(&device, &library)?;
-        let post_ffn_norm_residual_add_pipeline =
-            get_shader_pipeline::<shaders::post_ffn_norm_residual_add::Kernel>(&device, &library)?;
-        let qk_norm_qk_pipeline =
-            get_shader_pipeline::<shaders::qk_norm::QkKernel>(&device, &library)?;
-        let rope_at_pos_batched_qk_pipeline =
-            get_shader_pipeline::<shaders::rope::RopeAtPosBatchedQkKernel>(&device, &library)?;
-
-        // Scale vector (per-layer scalar multiplier, Gemma 4)
-        let scale_vector_pipeline =
-            get_shader_pipeline::<shaders::residual_inject::ScaleVectorKernel>(&device, &library)?;
-
-        // KV cache attention
-        let kv_attend_pipeline =
-            get_shader_pipeline::<shaders::kv_attention::AttendKernel>(&device, &library)?;
-        let kv_attend_long_pipeline =
-            get_shader_pipeline::<shaders::kv_attention::AttendLongKernel>(&device, &library)?;
-        let kv_append_pipeline =
-            get_shader_pipeline::<shaders::kv_attention::AppendKernel>(&device, &library)?;
-        let kv_append_attend_fused_pipeline =
-            get_shader_pipeline::<shaders::kv_append_attend_fused::Kernel>(&device, &library)?;
-        let attn_fused_pipeline =
-            get_shader_pipeline::<shaders::attn_fused::Kernel>(&device, &library)?;
+        // (RoPE / QKV projection / fused-attn — moved into
+        //  `AttentionKernels` (the `attention` binding above).
+        //  geglu / silu / gelu_tanh / q4k_ffn_gate_up* /
+        //  q4kf_ffn_gate_up / q4k_geglu_*_down / q6k_geglu_*_down* —
+        //  moved into `FfnKernels` (the `ffn` binding above).)
 
         Some(Self {
             queue,
             bufs,
             f32_ops,
             q4,
-            causal_attn_pipeline,
-            fused_attn_pipeline,
-            geglu_pipeline,
-            geglu_gelu_tanh_pipeline,
-            q8_quant_pipeline,
-            kv_attend_pipeline,
-            kv_attend_long_pipeline,
-            kv_append_pipeline,
-            kv_append_attend_fused_pipeline,
-            attn_fused_pipeline,
-            q8_matvec_pipeline,
-            rms_norm_pipeline,
-            residual_add_pipeline,
-            q8_qkv_proj_pipeline,
-            q4k_matvec_pipeline,
-            q4k_matvec_4sg_pipeline,
-            q4k_matvec_8sg_pipeline,
-            q4k_matvec_stride32_pipeline,
-            q4k_matmul_pipeline,
-            q4k_ffn_gate_up_pipeline,
-            q4k_ffn_gate_up_f16acc_pipeline,
-            q4k_ffn_gate_up_8sg_pipeline,
-            q4k_ffn_gate_up_coop_pipeline,
-            q4k_ffn_gate_up_nr2_pipeline,
-            q4kf_ffn_gate_up_pipeline,
-            q4k_geglu_silu_down_pipeline,
-            q4k_geglu_gelu_tanh_down_pipeline,
-            q6k_geglu_silu_down_pipeline,
-            q6k_geglu_gelu_tanh_down_pipeline,
-            q6k_geglu_gelu_tanh_down_cached_pipeline,
-            q6k_matvec_pipeline,
-            q6k_matvec_4sg_pipeline,
-            q6k_matvec_8sg_pipeline,
-            rope_at_pos_pipeline,
-            rope_at_pos_batched_pipeline,
-            q4k_qkv_proj_pipeline,
-            q4k_q6k_qkv_proj_pipeline,
-            q4k_q6k_qkv_proj_normed_pipeline,
-            q4k_proj_pipeline,
-            q4kf_qkv_proj_pipeline,
-            q4kf_proj_pipeline,
-            silu_pipeline,
-            gelu_tanh_pipeline,
-            layer_norm_pipeline,
-            layer_norm_no_bias_pipeline,
-            v_norm_pipeline,
-            v_norm_batched_pipeline,
-            qk_norm_pipeline,
-            qk_norm_qk_pipeline,
-            qk_norm_rope_fused_pipeline,
-            post_attn_residual_norm_store_pipeline,
-            post_ffn_norm_residual_add_pipeline,
-            rope_at_pos_batched_qk_pipeline,
-            scale_vector_pipeline,
+            norms,
+            quant,
+            attention,
+            ffn,
             kv_cache: std::sync::Mutex::new(None),
             moe_scratch: std::sync::Mutex::new(None),
-            rms_norm_q8_pipeline,
-            residual_norm_pipeline,
-            residual_norm_q8_pipeline,
-            residual_norm_store_pipeline,
+            ple_inputs: std::sync::Mutex::new(None),
             f32_gemv_pipeline,
             f32_argmax_partial_pipeline,
             f32_topk_partial_pipeline,
             f16_gemv_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),
+            decode_flags: backend_options.decode_flags,
         })
     }
 
@@ -645,5 +335,69 @@ impl MetalBackend {
         let mut guard = self.kv_cache.lock().unwrap();
         self.ensure_kv_cache_for_shapes(&mut guard, shapes, decode::DEFAULT_KV_CACHE_MAX_SEQ);
         guard
+    }
+
+    /// Upload the precomputed Per-Layer Embeddings table for the next
+    /// decode / prefill call. `data` is `[positions × num_layers × ple_dim]`
+    /// f32 in position-major order — for one-token decode `positions = 1`,
+    /// for prefill `positions = seq_len`.
+    ///
+    /// Layout (offset for the (position, layer) row):
+    /// `((position * num_layers) + layer) * ple_dim` f32 elements from
+    /// the start of `data`. The decode loop computes the byte offset and
+    /// passes it through to the per-layer PLE dispatch.
+    ///
+    /// Set once before generation begins (decode reuses the same `[1 × num_layers × ple_dim]`
+    /// upload across positions if the inference layer is responsible for
+    /// re-computing per-token).  Call [`clear_ple_inputs`](Self::clear_ple_inputs)
+    /// when generation finishes.
+    pub fn prepare_ple_inputs(&self, data: &[f32], num_layers: usize, ple_dim: usize) {
+        debug_assert!(
+            data.len() % (num_layers * ple_dim) == 0,
+            "PLE input table size {} must be a multiple of num_layers * ple_dim ({} * {})",
+            data.len(),
+            num_layers,
+            ple_dim,
+        );
+        let positions = data.len() / (num_layers * ple_dim);
+        let buffer = self.bufs.transient_from_f32(data);
+        *self.ple_inputs.lock().unwrap() = Some(PleInputBuffer {
+            buffer,
+            num_layers,
+            ple_dim,
+            positions,
+        });
+    }
+
+    /// Drop the PLE input table.  No-op if none was set.
+    pub fn clear_ple_inputs(&self) {
+        *self.ple_inputs.lock().unwrap() = None;
+    }
+
+    /// Internal: snapshot the current PLE inputs (cloned `Buffer` handle —
+    /// Metal `Buffer` is refcounted) so the per-layer decode loop can
+    /// release the mutex while still holding a stable reference.
+    pub(crate) fn ple_inputs_snapshot(&self) -> Option<PleInputBuffer> {
+        self.ple_inputs.lock().unwrap().clone()
+    }
+}
+
+/// Precomputed Per-Layer Embeddings input table held on the Metal
+/// backend.  See [`MetalBackend::prepare_ple_inputs`].
+#[derive(Clone)]
+pub(crate) struct PleInputBuffer {
+    pub buffer: metal::Buffer,
+    pub num_layers: usize,
+    pub ple_dim: usize,
+    pub positions: usize,
+}
+
+impl PleInputBuffer {
+    /// Byte offset into [`Self::buffer`] for the `[ple_dim]` row at
+    /// `(position, layer)`. Position-major layout.
+    pub fn row_offset_bytes(&self, position: usize, layer: usize) -> u64 {
+        debug_assert!(position < self.positions);
+        debug_assert!(layer < self.num_layers);
+        ((position * self.num_layers + layer) * self.ple_dim * 4) as u64
     }
 }

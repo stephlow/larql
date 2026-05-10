@@ -432,7 +432,7 @@ impl GateIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
+    use crate::test_utils::make_test_weights;
 
     const TOP_TOKENS: usize = 3;
     const FEATURES_PER_TOK: usize = 4;
@@ -548,5 +548,128 @@ mod tests {
         assert_eq!(loaded.num_layers(), idx.num_layers());
         assert_eq!(loaded.features_per_token, idx.features_per_token);
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn fresh_path(name: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("larql_gate_idx_{name}_{pid}_{nanos}.ndjson"))
+    }
+
+    #[test]
+    fn build_streaming_writes_header_and_per_layer_entries() {
+        let weights = make_test_weights();
+        let path = fresh_path("streaming");
+        GateIndex::build_streaming(
+            &weights,
+            &[0usize, 1],
+            /*features_per_token=*/ 4,
+            /*top_tokens=*/ TOP_TOKENS,
+            &path,
+            &mut SilentIndexCallbacks,
+        )
+        .expect("streaming build must succeed");
+
+        // Round-trip: load the file back and verify structure.
+        let loaded = GateIndex::load(&path, TOP_TOKENS).expect("load must succeed");
+        assert_eq!(loaded.num_layers(), 2);
+        assert_eq!(loaded.features_per_token, 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn build_streaming_invokes_callbacks_per_layer() {
+        // Custom callback recorder: ensure on_layer_start and on_layer_done
+        // both fire once per requested layer in the right order.
+        struct RecorderCallbacks {
+            starts: Vec<usize>,
+            dones: Vec<usize>,
+        }
+        impl IndexBuildCallbacks for RecorderCallbacks {
+            fn on_layer_start(&mut self, layer: usize, _total: usize) {
+                self.starts.push(layer);
+            }
+            fn on_layer_done(&mut self, layer: usize, _ms: f64) {
+                self.dones.push(layer);
+            }
+        }
+        let weights = make_test_weights();
+        let path = fresh_path("callbacks");
+        let mut cb = RecorderCallbacks {
+            starts: Vec::new(),
+            dones: Vec::new(),
+        };
+        GateIndex::build_streaming(&weights, &[0usize, 1], 4, TOP_TOKENS, &path, &mut cb)
+            .expect("build must succeed");
+        assert_eq!(cb.starts, vec![0, 1]);
+        assert_eq!(cb.dones, vec![0, 1]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn precompute_entity_returns_per_layer_features() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        // Use any in-vocab token.
+        let token_ids = vec![0u32, 1, 2];
+        let features = idx.precompute_entity(&token_ids, 3);
+        // One Vec per cached layer, each containing up to top_k features.
+        assert_eq!(features.len(), idx.num_layers());
+        for f in &features {
+            assert!(f.len() <= 3);
+        }
+    }
+
+    #[test]
+    fn load_returns_err_for_missing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "larql_gate_index_missing_{}_{}.ndjson",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Path doesn't exist — load must error.
+        assert!(GateIndex::load(&path, TOP_TOKENS).is_err());
+    }
+
+    #[test]
+    fn lookup_returns_features_for_known_layer() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let scaled_embed = &weights.embed * weights.arch.embed_scale();
+        let residual = ndarray::Array1::<f32>::from_elem(weights.hidden_size, 0.05);
+        let features = idx.lookup(0, &residual.view(), &scaled_embed, 5);
+        // Either populated or empty — both are valid for the synthetic
+        // weights, but the call must not panic.
+        assert!(features.len() <= 5);
+    }
+
+    #[test]
+    fn lookup_unknown_layer_returns_empty() {
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let scaled_embed = &weights.embed * weights.arch.embed_scale();
+        let residual = ndarray::Array1::<f32>::zeros(weights.hidden_size);
+        // Layer 999 isn't in the small index → early return [].
+        let features = idx.lookup(999, &residual.view(), &scaled_embed, 5);
+        assert!(features.is_empty());
+    }
+
+    #[test]
+    fn lookup_top_k_zero_returns_features_unchanged() {
+        // total_k=0 → the truncate path's `k > 0 && k < features.len()`
+        // is false → returns whatever the union accumulated.
+        let weights = make_test_weights();
+        let idx = build_small_index(&weights);
+        let scaled_embed = &weights.embed * weights.arch.embed_scale();
+        let residual = ndarray::Array1::<f32>::from_elem(weights.hidden_size, 0.1);
+        let features = idx.lookup(0, &residual.view(), &scaled_embed, 0);
+        // No assertion on length — just exercise the branch.
+        assert!(features.len() <= weights.intermediate_size);
     }
 }

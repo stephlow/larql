@@ -239,6 +239,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_family_does_not_inherit_known_bands_by_string_prefix() {
+        // The fallback path is layer-count driven, not name driven.
+        // String prefixes like "gemma3-finetune" or "llama-clone" must
+        // NOT pick up the curated bands for the canonical family.
+        let gemma = LayerBands::for_family("gemma3", 34).unwrap();
+        let llama = LayerBands::for_family("llama", 32).unwrap();
+
+        let gemma_lookalike = LayerBands::for_family("gemma3-clone", 34).unwrap();
+        assert_ne!(
+            gemma_lookalike.knowledge, gemma.knowledge,
+            "fallback must not inherit canonical gemma3 knowledge band by name prefix"
+        );
+
+        let llama_lookalike = LayerBands::for_family("llamafied", 32).unwrap();
+        assert_ne!(
+            llama_lookalike.knowledge, llama.knowledge,
+            "fallback must not inherit canonical llama knowledge band by name prefix"
+        );
+
+        // The fraction-based fallback is structurally distinct: 2/5 syntax,
+        // 4/5 knowledge cutoff. For 32 layers that's syntax=(0, 11),
+        // knowledge=(12, 24), which is one layer off from canonical llama.
+        assert_eq!(llama_lookalike.syntax, (0, 11));
+        assert_eq!(llama_lookalike.knowledge, (12, 24));
+    }
+
+    #[test]
     fn too_few_layers_returns_none() {
         assert!(LayerBands::for_family("gpt2", 4).is_none());
         assert!(LayerBands::for_family("tiny", 1).is_none());

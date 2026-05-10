@@ -92,11 +92,26 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use larql_vindex::GateIndex as _;
+use larql_vindex::{PatchOverrides, QuantizedFfnAccess};
 use serde::Deserialize;
 
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
+
+/// RAII guard that decrements the requests_in_flight counter on drop (GT6 drain).
+struct RifGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
+impl Drop for RifGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Saturating sub to avoid wrapping if something incremented 0 and dropped twice.
+        let prev = self
+            .0
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        let _ = prev;
+    }
+}
 
 pub(crate) const BINARY_CT: &str = "application/x-larql-ffn";
 pub(crate) const BATCH_MARKER: u32 = 0xFFFF_FFFF;
@@ -128,7 +143,7 @@ pub struct WalkFfnRequest {
     /// When true, `residual` is `h_post_attn` (post-attention, pre-norm). The
     /// server runs the full hybrid MoE layer: dense-FFN + remote expert dispatch
     /// + combine + outer norm. Requires `full_output: true` and the server to
-    /// have `--moe-shards` configured.
+    ///   have `--moe-shards` configured.
     #[serde(default)]
     pub moe_layer: bool,
 }
@@ -243,6 +258,91 @@ pub(crate) fn encode_binary_output(out: &FfnOutput) -> Vec<u8> {
             buf.extend_from_slice(&(entry.output.len() as u32).to_le_bytes());
             for &v in &entry.output {
                 buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf
+    }
+}
+
+/// Encode an [`FfnOutput`] using f16 values for the residual/output arrays.
+///
+/// Wire layout: identical to the f32 format except every float in the output
+/// arrays is a `u16` LE (IEEE 754 half-precision). Header fields (layer,
+/// seq_len, latency_ms) remain f32/u32 LE. See ADR-0009.
+pub(crate) fn encode_binary_output_f16(out: &FfnOutput) -> Vec<u8> {
+    use half::f16;
+    if out.entries.len() == 1 {
+        let entry = &out.entries[0];
+        let mut buf = Vec::with_capacity(12 + entry.output.len() * 2);
+        buf.extend_from_slice(&(entry.layer as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.seq_len as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.latency_ms as f32).to_le_bytes());
+        for &v in &entry.output {
+            buf.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+        }
+        buf
+    } else {
+        let num = out.entries.len();
+        let total_floats: usize = out.entries.iter().map(|e| e.output.len()).sum();
+        let mut buf = Vec::with_capacity(12 + num * 12 + total_floats * 2);
+        buf.extend_from_slice(&BATCH_MARKER.to_le_bytes());
+        buf.extend_from_slice(&(num as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.latency_ms as f32).to_le_bytes());
+        for entry in &out.entries {
+            buf.extend_from_slice(&(entry.layer as u32).to_le_bytes());
+            buf.extend_from_slice(&(out.seq_len as u32).to_le_bytes());
+            buf.extend_from_slice(&(entry.output.len() as u32).to_le_bytes());
+            for &v in &entry.output {
+                buf.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+            }
+        }
+        buf
+    }
+}
+
+/// Encode an [`FfnOutput`] using i8 symmetric quantisation (ADR-0009).
+///
+/// Per position: `[scale f32 LE][zero_point f32 LE][data i8[hidden_size]]`.
+/// `scale = max(|x|) / 127.0`, `zero_point = 0.0` (symmetric).
+/// Header fields (layer, seq_len, latency_ms) remain f32/u32 LE.
+pub(crate) fn encode_binary_output_i8(out: &FfnOutput) -> Vec<u8> {
+    fn quantise_position(vals: &[f32], buf: &mut Vec<u8>) {
+        let max_abs = vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        buf.extend_from_slice(&scale.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes()); // zero_point = 0
+        for &v in vals {
+            let q = (v / scale).clamp(-127.0, 127.0).round() as i8;
+            buf.push(q as u8);
+        }
+    }
+
+    if out.entries.len() == 1 {
+        let entry = &out.entries[0];
+        let seq = out.seq_len.max(1);
+        let hidden = entry.output.len() / seq;
+        let mut buf = Vec::with_capacity(12 + seq * (8 + hidden));
+        buf.extend_from_slice(&(entry.layer as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.seq_len as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.latency_ms as f32).to_le_bytes());
+        for pos in 0..seq {
+            quantise_position(&entry.output[pos * hidden..(pos + 1) * hidden], &mut buf);
+        }
+        buf
+    } else {
+        let num = out.entries.len();
+        let mut buf = Vec::with_capacity(12 + num * 16);
+        buf.extend_from_slice(&BATCH_MARKER.to_le_bytes());
+        buf.extend_from_slice(&(num as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.latency_ms as f32).to_le_bytes());
+        for entry in &out.entries {
+            let seq = out.seq_len.max(1);
+            let hidden = entry.output.len() / seq;
+            buf.extend_from_slice(&(entry.layer as u32).to_le_bytes());
+            buf.extend_from_slice(&(out.seq_len as u32).to_le_bytes());
+            buf.extend_from_slice(&(entry.output.len() as u32).to_le_bytes());
+            for pos in 0..seq {
+                quantise_position(&entry.output[pos * hidden..(pos + 1) * hidden], &mut buf);
             }
         }
         buf
@@ -422,10 +522,10 @@ pub(crate) fn run_full_output_core(
             let h1 = &h_post_ffn_dense - &x;
 
             // Build router weights from model vectors.
-            fn get_vec<'a>(
-                vectors: &'a std::collections::HashMap<String, Vec<f32>>,
+            fn get_vec(
+                vectors: &std::collections::HashMap<String, Vec<f32>>,
                 k: Option<String>,
-            ) -> &'a [f32] {
+            ) -> &[f32] {
                 k.and_then(|k| vectors.get(&k))
                     .map(|v| v.as_slice())
                     .unwrap_or(&[])
@@ -581,6 +681,7 @@ pub(crate) fn run_full_output_core(
             None
         };
 
+        let layer_t0 = std::time::Instant::now();
         let out = if let Some(ref wf) = walk_ffn {
             wf.forward(layer, &x)
         } else {
@@ -591,6 +692,9 @@ pub(crate) fn run_full_output_core(
                 &x,
             )
         };
+        let layer_ms = layer_t0.elapsed().as_secs_f32() * 1000.0;
+        model.layer_latency_tracker.record(layer as u32, layer_ms);
+
         let output: Vec<f32> = out.into_iter().collect();
         debug_assert_eq!(output.len(), seq_len * hidden);
 
@@ -709,12 +813,16 @@ pub async fn handle_walk_ffn(
 ) -> Result<Response, ServerError> {
     state.bump_requests();
 
-    let is_binary = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.starts_with(BINARY_CT))
-        .unwrap_or(false);
+    // Track active requests for GT6 drain.
+    let _rif_guard = state.models.first().map(|m| {
+        use std::sync::atomic::Ordering;
+        m.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        RifGuard(m.requests_in_flight.clone())
+    });
+
+    let headers = request.headers();
+    let is_binary = crate::wire::has_content_type(headers, BINARY_CT);
+    let accept = crate::wire::accept_header(headers).map(str::to_owned);
 
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
@@ -727,6 +835,10 @@ pub async fn handle_walk_ffn(
                 "binary wire format requires full_output = true".into(),
             ));
         }
+
+        // Negotiate response content-type (ADR-0009): f16 if client accepts it.
+        let resp_ct = crate::wire::preferred_response_ct(accept.as_deref()).to_owned();
+
         let result = tokio::task::spawn_blocking(move || {
             let model = state
                 .model(None)
@@ -745,10 +857,16 @@ pub async fn handle_walk_ffn(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
 
-        let bytes = encode_binary_output(&result);
+        let bytes = if resp_ct == crate::wire::FFN_F16_CT {
+            encode_binary_output_f16(&result)
+        } else if resp_ct == crate::wire::FFN_I8_CT {
+            encode_binary_output_i8(&result)
+        } else {
+            encode_binary_output(&result)
+        };
         return Ok(Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, BINARY_CT)
+            .header(header::CONTENT_TYPE, resp_ct)
             .body(axum::body::Body::from(bytes))
             .unwrap());
     }
@@ -840,14 +958,14 @@ pub async fn handle_walk_ffn_q8k(
             ));
         }
 
-        let entries = decode_q8k_batch_request(&body)
-            .map_err(|e| crate::error::ServerError::BadRequest(e))?;
+        let entries =
+            decode_q8k_batch_request(&body).map_err(crate::error::ServerError::BadRequest)?;
 
         let patched = model.patched.blocking_read();
         let start = std::time::Instant::now();
 
         // ── Metal GPU dispatch path ───────────────────────────────────────
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         {
             let backend_opt = model
                 .metal_backend

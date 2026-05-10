@@ -55,8 +55,8 @@ pub(super) fn prefill_kv_cache_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{make_test_vindex, make_test_weights};
     use crate::forward::hidden_to_raw_logits;
+    use crate::test_utils::{make_test_vindex, make_test_weights};
     use larql_compute::CpuBackend;
     use larql_models::ModelWeights;
     use std::sync::OnceLock;
@@ -114,7 +114,7 @@ mod tests {
             w,
             &h.row(1)
                 .into_owned()
-                .into_shape((1, w.hidden_size))
+                .into_shape_with_order((1, w.hidden_size))
                 .unwrap(),
         );
         assert!(logits.iter().all(|v| v.is_finite()));

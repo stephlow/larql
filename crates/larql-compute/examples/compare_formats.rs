@@ -1,16 +1,16 @@
 //! Q4_KF decode benchmark: pre-baked scales vs Q4_K vs Q8.
 //!
-//! Usage: cargo run --release --features metal -p larql-compute --example bench_q4kf_decode
+//! Usage: cargo run --release --features metal -p larql-compute --example compare_formats
 
 extern crate blas_src;
 
 fn main() {
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        println!("Run with --features metal");
+        println!("Run on macOS with --features metal");
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use larql_compute::cpu::ops::q4_common::{q4k_to_q4kf, quantize_q4_0, quantize_q4_k};
         use larql_compute::prelude::*;

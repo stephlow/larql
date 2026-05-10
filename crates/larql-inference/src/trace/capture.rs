@@ -149,9 +149,9 @@ pub fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::ffn::FfnBackend;
     use crate::forward::{forward_raw_logits, hidden_to_raw_logits, trace_forward_with_ffn};
+    use crate::test_utils::make_test_weights;
     use larql_models::ModelWeights;
     use ndarray::Array2;
     use std::sync::OnceLock;
@@ -298,9 +298,8 @@ mod tests {
         }
 
         let traced_logits = hidden_to_raw_logits(w, &traced_h);
-        for i in 0..traced_logits.len() {
+        for (i, &got) in traced_logits.iter().enumerate() {
             let expected = raw.logits[i];
-            let got = traced_logits[i];
             assert!(
                 (got - expected).abs() < 1e-3,
                 "logit {i}: trace projection {got} != raw forward {expected}"
@@ -328,5 +327,45 @@ mod tests {
                 "custom backend final residual dim {i}: trace {got} != hooked forward {expected}"
             );
         }
+    }
+
+    #[test]
+    fn trace_with_capture_attention_records_per_layer_weights() {
+        // Exercises the `if let Some(w) = attn_weights` branch — captures the
+        // attention weight matrix at every layer so callers can analyse head
+        // patterns alongside the residual deltas.
+        let w = weights();
+        let tokens = &[0u32, 1, 2];
+        let ffn = WeightFfn { weights: w };
+        let t = trace_residuals(w, tokens, TracePositions::Last, true, &ffn);
+        assert_eq!(
+            t.attention.len(),
+            w.num_layers,
+            "expected one attention capture per layer when capture_attention=true"
+        );
+        for (layer, attn) in &t.attention {
+            for (head_idx, head) in attn.heads.iter().enumerate() {
+                assert!(
+                    head.iter().all(|v| v.is_finite()),
+                    "non-finite attention weight at layer {layer} head {head_idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trace_residuals_positions_clone_preserves_order() {
+        // Covers the `TracePositions::Positions(ref ps) => ps.clone()` arm
+        // with non-sorted, non-contiguous indices — guards against any
+        // future implementation that silently sorts/dedups.
+        let w = weights();
+        let t = trace(w, &[0u32, 1, 2, 3], TracePositions::Positions(vec![3, 0]));
+        let order: Vec<usize> = t
+            .nodes
+            .iter()
+            .filter(|n| n.layer == -1)
+            .map(|n| n.position)
+            .collect();
+        assert_eq!(order, vec![3, 0]);
     }
 }

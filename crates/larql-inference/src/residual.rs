@@ -158,11 +158,6 @@ pub fn rms_norm_heads_eps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
-
-    fn row_l2(m: &Array2<f32>, row: usize) -> f32 {
-        m.row(row).iter().map(|v| v * v).sum::<f32>().sqrt()
-    }
 
     // ── rms_norm ──────────────────────────────────────────────────────────────
 
@@ -246,11 +241,11 @@ mod tests {
     fn rms_norm_heads_normalises_each_head_independently() {
         // Two heads with very different magnitudes → both normalised
         let mut data = vec![0.0f32; 8];
-        for i in 0..4 {
-            data[i] = (i + 1) as f32;
+        for (i, slot) in data.iter_mut().enumerate().take(4) {
+            *slot = (i + 1) as f32;
         } // head 0: [1,2,3,4]
-        for i in 0..4 {
-            data[4 + i] = 100.0 * (i + 1) as f32;
+        for (i, slot) in data.iter_mut().enumerate().skip(4).take(4) {
+            *slot = 100.0 * (i - 4 + 1) as f32;
         } // head 1: [100,200,300,400]
         let x = Array2::from_shape_vec((1, 8), data).unwrap();
         let out = rms_norm_heads_no_weight(&x, 2, 4);

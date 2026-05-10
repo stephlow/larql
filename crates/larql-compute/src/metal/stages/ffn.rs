@@ -18,11 +18,60 @@ use std::ffi::c_void;
 
 use super::quant_matvec;
 
-/// Activation variant for this layer.
-#[derive(Clone, Copy)]
-pub enum Activation {
-    SiLU,
-    GeluTanh,
+pub use crate::pipeline::Activation;
+
+/// Whether the Metal backend ships a shader for `act`. SiLU and
+/// GELU-tanh are wired today; GeluExact and ReLU have no kernels.
+///
+/// Pure function — independent of any Metal pipeline. Used by the
+/// dispatch helpers below and exposed so callers (and tests) can
+/// validate a layer before opening a command encoder.
+pub fn metal_supports_activation(act: Activation) -> bool {
+    matches!(act, Activation::Silu | Activation::GeluTanh)
+}
+
+/// Panic with a clear message when `act` has no Metal shader.
+/// Production decode call sites use this to fail loud rather than
+/// silently routing GeluExact / ReLU layers to SiLU (the prior
+/// behaviour, which produced wrong logits with no signal).
+pub fn assert_metal_activation_supported(act: Activation, site: &'static str) {
+    if !metal_supports_activation(act) {
+        panic!(
+            "{site}: no shader for {act:?}. \
+             Add a kernel and pipeline before routing this activation, or \
+             route the layer through CPU. Silently falling back to SiLU is \
+             no longer supported."
+        );
+    }
+}
+
+/// Pick the GEGLU-style "act(gate) * up" kernel for this activation.
+fn geglu_pipeline_for<'a>(
+    activation: Activation,
+    silu: &'a ComputePipelineState,
+    gelu_tanh: &'a ComputePipelineState,
+) -> &'a ComputePipelineState {
+    assert_metal_activation_supported(activation, "metal::stages::ffn::geglu_pipeline_for");
+    match activation {
+        Activation::Silu => silu,
+        Activation::GeluTanh => gelu_tanh,
+        // assert above prevents reaching here.
+        Activation::GeluExact | Activation::ReLU => unreachable!(),
+    }
+}
+
+/// Pick the in-place activation kernel (Standard / non-gated FFN path).
+fn activation_pipeline_for<'a>(
+    activation: Activation,
+    silu: &'a ComputePipelineState,
+    gelu_tanh: &'a ComputePipelineState,
+) -> &'a ComputePipelineState {
+    assert_metal_activation_supported(activation, "metal::stages::ffn::activation_pipeline_for");
+    match activation {
+        Activation::Silu => silu,
+        Activation::GeluTanh => gelu_tanh,
+        Activation::GeluExact | Activation::ReLU => unreachable!(),
+    }
 }
 
 /// Optional fused activation+down kernels. When `down_format` matches
@@ -72,17 +121,22 @@ pub fn encode_gated(
     q8_stride_bytes: u64,    // Q8 input bytes per pos
     q8s_stride_bytes: u64,   // Q8 scales bytes per pos
 ) {
-    // Gate+up per position. (Tried wiring `q4k_matmul` here for
-    // seq_len>1 prefill — kernel-isolated 1.79× speedup did NOT
-    // translate end-to-end. Long-prompt prefill regressed 10%
-    // (~2933 → ~3268 ms on a 340-token prompt). Same failure mode as
-    // the f16 acc try: kernel was already bandwidth-bound, and on
-    // long prompts the matmul's [seq_len × hidden] X working set no
-    // longer fits in GPU L1, defeating the cache locality the
-    // matvec loop had. Reverted 2026-04-28. The matmul kernel ships
-    // with its parity tests and remains usable via the q4k_matmul
-    // method on `MetalBackend` but is not worth wiring into the
-    // production prefill path on this hardware.)
+    // Gate+up per position. `q4k_matmul` wiring tried twice on Gemma 3 4B,
+    // both falsified end-to-end:
+    //   - 2026-04-28: kernel-isolated 1.79× → long-prompt prefill regressed
+    //     10% (2933 → 3268 ms on 340 tokens).
+    //   - 2026-05-09: re-bench under post-dispatch-fix + post-QKV-defuse
+    //     state still regressed 5–7% across 10/50/150-token prompts
+    //     (e.g. 1392 → 1469 ms at 150 tokens).
+    // Diagnosis: the kernel is bandwidth-bound, and on long prompts the
+    // matmul's [seq_len × hidden] X working set thrashes GPU L1 — the
+    // dequant amortisation gain is paid back in DRAM↔L1 traffic.
+    // The matmul kernel + `q4k_matmul` backend method + parity tests
+    // remain shipped (useful for re-validation on future hardware), but
+    // wiring it into the production prefill path is empirically dead.
+    // Closing the prefill gap to ollama needs a different matmul kernel
+    // (e.g. K-dim tiled, or Apple `simdgroup_matrix` intrinsics), not a
+    // re-wiring of the current one.
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;
         let inter_off = pos as u64 * inter_stride_bytes;
@@ -143,10 +197,14 @@ pub fn encode_gated(
     // produces correct, generative output for the same weights, so default
     // is now SEPARATED. Set `LARQL_FUSED_DOWN=1` to re-enable the fused
     // path for benchmarking once the kernel is fixed.
-    let use_fused = std::env::var("LARQL_FUSED_DOWN").is_ok();
+    let use_fused = crate::options::env_flag(crate::options::ENV_FUSED_DOWN);
     let fused_kernel = if use_fused {
+        // Q6_K + non-tanh combos return None deliberately (no fused
+        // kernel exists). GeluExact / ReLU also return None — they
+        // hit the explicit panic in `geglu_pipeline_for` below if the
+        // separated path also reaches them.
         match (down_format, activation) {
-            (crate::QuantFormat::Q4_K, Activation::SiLU) => fused_down.q4k_silu,
+            (crate::QuantFormat::Q4_K, Activation::Silu) => fused_down.q4k_silu,
             (crate::QuantFormat::Q4_K, Activation::GeluTanh) => fused_down.q4k_gelu_tanh,
             _ => None,
         }
@@ -181,10 +239,8 @@ pub fn encode_gated(
     {
         let total_inter = (seq_len * inter) as u64;
         let total_inter_val = (seq_len * inter) as u32;
-        let geglu_pipe = match activation {
-            Activation::GeluTanh => geglu_gelu_tanh_pipeline,
-            Activation::SiLU => geglu_silu_pipeline,
-        };
+        let geglu_pipe =
+            geglu_pipeline_for(activation, geglu_silu_pipeline, geglu_gelu_tanh_pipeline);
         enc.set_compute_pipeline_state(geglu_pipe);
         enc.set_buffer(0, Some(gate_scratch), 0);
         enc.set_buffer(1, Some(up_scratch), 0);
@@ -269,10 +325,7 @@ pub fn encode_standard(
     {
         let total_inter = (seq_len * inter) as u64;
         let total_inter_val = (seq_len * inter) as u32;
-        let act_pipe = match activation {
-            Activation::GeluTanh => gelu_tanh_pipeline,
-            Activation::SiLU => silu_pipeline,
-        };
+        let act_pipe = activation_pipeline_for(activation, silu_pipeline, gelu_tanh_pipeline);
         enc.set_compute_pipeline_state(act_pipe);
         enc.set_buffer(0, Some(up_scratch), 0);
         enc.set_buffer(1, Some(act_scratch), 0);
@@ -301,5 +354,44 @@ pub fn encode_standard(
             hidden,
             inter,
         );
+    }
+}
+
+#[cfg(test)]
+mod activation_support_tests {
+    use super::*;
+
+    #[test]
+    fn metal_supports_silu_and_gelu_tanh() {
+        assert!(metal_supports_activation(Activation::Silu));
+        assert!(metal_supports_activation(Activation::GeluTanh));
+    }
+
+    #[test]
+    fn metal_does_not_support_gelu_exact_or_relu() {
+        assert!(!metal_supports_activation(Activation::GeluExact));
+        assert!(!metal_supports_activation(Activation::ReLU));
+    }
+
+    /// Pin the panic message — production decode reads this string when
+    /// a malformed model lands on Metal. Same message must mention the
+    /// activation variant (so logs are actionable) and the site (so
+    /// the reader knows where to look).
+    #[test]
+    #[should_panic(expected = "no shader for ReLU")]
+    fn assert_panics_on_relu_with_clear_message() {
+        assert_metal_activation_supported(Activation::ReLU, "test_site");
+    }
+
+    #[test]
+    #[should_panic(expected = "no shader for GeluExact")]
+    fn assert_panics_on_gelu_exact_with_clear_message() {
+        assert_metal_activation_supported(Activation::GeluExact, "test_site");
+    }
+
+    #[test]
+    fn assert_is_a_noop_on_supported() {
+        assert_metal_activation_supported(Activation::Silu, "test");
+        assert_metal_activation_supported(Activation::GeluTanh, "test");
     }
 }

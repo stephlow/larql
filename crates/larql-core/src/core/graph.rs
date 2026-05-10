@@ -6,6 +6,12 @@ use super::enums::{MergeStrategy, SourceType};
 use super::node::Node;
 use super::schema::Schema;
 
+const LARQL_JSON_VERSION: &str = "0.1.0";
+const JSON_KEY_VERSION: &str = "larql_version";
+const JSON_KEY_METADATA: &str = "metadata";
+const JSON_KEY_SCHEMA: &str = "schema";
+const JSON_KEY_EDGES: &str = "edges";
+
 /// Graph statistics.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphStats {
@@ -435,32 +441,44 @@ impl Graph {
 
     /// Serialize to .larql.json format — matches Python exactly.
     pub fn to_json_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "larql_version": "0.1.0",
-            "metadata": self.metadata,
-            "schema": self.schema.to_json_value(),
-            "edges": self.edges.iter()
-                .map(|e| serde_json::to_value(CompactEdge::from(e)).unwrap())
-                .collect::<Vec<_>>(),
-        })
+        let mut value = serde_json::Map::new();
+        value.insert(
+            JSON_KEY_VERSION.to_string(),
+            serde_json::Value::String(LARQL_JSON_VERSION.to_string()),
+        );
+        value.insert(
+            JSON_KEY_METADATA.to_string(),
+            serde_json::Value::Object(self.metadata.clone().into_iter().collect()),
+        );
+        value.insert(JSON_KEY_SCHEMA.to_string(), self.schema.to_json_value());
+        value.insert(
+            JSON_KEY_EDGES.to_string(),
+            serde_json::Value::Array(
+                self.edges
+                    .iter()
+                    .map(|e| serde_json::to_value(CompactEdge::from(e)).unwrap())
+                    .collect(),
+            ),
+        );
+        serde_json::Value::Object(value)
     }
 
     /// Deserialize from .larql.json format.
     pub fn from_json_value(v: &serde_json::Value) -> Result<Self, GraphError> {
         let schema = v
-            .get("schema")
+            .get(JSON_KEY_SCHEMA)
             .map(Schema::from_json_value)
             .unwrap_or_default();
 
         let metadata: HashMap<String, serde_json::Value> = v
-            .get("metadata")
+            .get(JSON_KEY_METADATA)
             .and_then(|m| serde_json::from_value(m.clone()).ok())
             .unwrap_or_default();
 
         let mut graph = Graph::new().with_schema(schema);
         graph.metadata = metadata;
 
-        if let Some(edges) = v.get("edges").and_then(|e| e.as_array()) {
+        if let Some(edges) = v.get(JSON_KEY_EDGES).and_then(|e| e.as_array()) {
             for edge_val in edges {
                 let compact: CompactEdge = serde_json::from_value(edge_val.clone())
                     .map_err(|e| GraphError::Deserialize(e.to_string()))?;

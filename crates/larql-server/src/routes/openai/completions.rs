@@ -56,6 +56,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
 use crate::error::ServerError;
+use crate::routes::openai::OpenAIError;
 use crate::state::{AppState, LoadedModel};
 
 use super::util::{contains_any, error_chunk, new_id_suffix, trim_at_stop, unix_now, StopSpec};
@@ -173,26 +174,26 @@ pub struct CompletionsResponse {
          body = crate::openapi::schemas::OpenAiCompletionsResponse),
         (status = 200, description = "SSE stream when `stream: true`. Each event is `data: <CompletionsChunk JSON>\\n\\n`, terminated by `data: [DONE]`.",
          content_type = "text/event-stream", body = String),
-        (status = 400, body = crate::error::ErrorBody),
-        (status = 500, body = crate::error::ErrorBody),
+        (status = 400, body = crate::routes::openai::error::OpenAIErrorBody),
+        (status = 500, body = crate::routes::openai::error::OpenAIErrorBody),
     ),
 )]
 pub async fn handle_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
-) -> Result<Response, ServerError> {
+) -> Result<Response, OpenAIError> {
     state.bump_requests();
 
     if req.n.unwrap_or(1) > 1 {
-        return Err(ServerError::BadRequest(
-            "n>1 not yet supported; only n=1 (single completion per prompt)".into(),
+        return Err(OpenAIError::invalid_request(
+            "n>1 not yet supported; only n=1 (single completion per prompt)",
         ));
     }
 
     let model = state.model_or_err(req.model.as_deref())?;
     if model.infer_disabled {
-        return Err(ServerError::InferenceUnavailable(
-            "inference disabled (--no-infer / --embed-only / --ffn-only)".into(),
+        return Err(OpenAIError::service_unavailable(
+            "inference disabled (--no-infer / --embed-only / --ffn-only)",
         ));
     }
 
@@ -201,7 +202,7 @@ pub async fn handle_completions(
         CompletionPrompt::Batch(v) => v,
     };
     if prompts.is_empty() {
-        return Err(ServerError::BadRequest("prompt is empty".into()));
+        return Err(OpenAIError::invalid_request("prompt is empty"));
     }
 
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
@@ -229,15 +230,14 @@ pub async fn handle_completions(
         // not supported in stream mode (OpenAI's stream contract is
         // one prompt → one stream of chunks).
         if echo {
-            return Err(ServerError::BadRequest(
-                "echo=true is not supported with stream=true".into(),
+            return Err(OpenAIError::invalid_request(
+                "echo=true is not supported with stream=true",
             ));
         }
         if prompts.len() > 1 {
-            return Err(ServerError::BadRequest(
+            return Err(OpenAIError::invalid_request(
                 "batched prompts (prompt: [...]) are not supported with stream=true; \
-                 send one prompt per request"
-                    .into(),
+                 send one prompt per request",
             ));
         }
         let prompt = prompts.into_iter().next().unwrap();

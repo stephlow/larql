@@ -25,6 +25,7 @@
 
 use crate::metal::buffers::BufferCache;
 use crate::FullPipelineLayer;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 use larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
 use metal::Buffer;
 
@@ -165,7 +166,7 @@ impl DecodeScratch {
         let h_post_attn = bufs.output((hidden * 4) as u64);
         let ffn_norm_out = bufs.output((hidden * 4) as u64);
         let ffn_q8 = bufs.output(hidden as u64);
-        let ffn_q8s = bufs.output((hidden / 32 * 4) as u64);
+        let ffn_q8s = bufs.output((hidden / LEGACY_BLOCK_ELEMS * 4) as u64);
         let up_out = bufs.output((inter * 4) as u64);
         let act_buf = bufs.output((inter_padded * 4) as u64);
         {
@@ -181,7 +182,7 @@ impl DecodeScratch {
         let gate_out_scratch = bufs.output((inter * 4) as u64);
         let normed_scratch = bufs.output((hidden * 4) as u64);
         let o_q8_scratch = bufs.output(max_q_dim as u64);
-        let o_q8s_scratch = bufs.output((max_q_dim / 32 * 4) as u64);
+        let o_q8s_scratch = bufs.output((max_q_dim / LEGACY_BLOCK_ELEMS * 4) as u64);
         let scaled_scratch = bufs.output((hidden * 4) as u64);
 
         let has_moe = layers.iter().any(|l| l.moe.is_some() || l.ffn_is_remote);

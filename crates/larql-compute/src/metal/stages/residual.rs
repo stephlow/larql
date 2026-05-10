@@ -13,6 +13,7 @@
 //! Pre-norm vs post-norm branching lives inside these helpers; callers
 //! pass `has_post_norms` and the appropriate weight buffers.
 
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
 
@@ -55,7 +56,7 @@ pub fn encode_post_attn(
     q8s_stride_bytes: u64,
 ) {
     let hidden_val = hidden as u32;
-    let tg_threads = 256.min(hidden as u64);
+    let tg_threads = crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64);
 
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;
@@ -108,7 +109,7 @@ pub fn encode_post_attn(
 
         // Q8-quantise ffn_norm_out when the FFN needs Q8 input (Q4_0 / Q8_0).
         if ffn_needs_q8 {
-            let blocks = (hidden as u64).div_ceil(32);
+            let blocks = (hidden as u64).div_ceil(LEGACY_BLOCK_ELEMS as u64);
             enc.set_compute_pipeline_state(q8_quant_pipeline);
             enc.set_buffer(0, Some(ffn_norm_out), h_off);
             enc.set_buffer(1, Some(ffn_q8_buf), q8_off);
@@ -116,7 +117,11 @@ pub fn encode_post_attn(
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(blocks, 1, 1),
-                MTLSize::new(256.min(blocks), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(blocks),
+                    1,
+                    1,
+                ),
             );
         }
     }
@@ -147,7 +152,7 @@ pub fn encode_post_ffn(
     h_stride_bytes: u64,
 ) {
     let hidden_val = hidden as u32;
-    let tg_threads = 256.min(hidden as u64);
+    let tg_threads = crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64);
 
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;

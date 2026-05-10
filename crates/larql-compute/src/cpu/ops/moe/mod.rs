@@ -23,62 +23,149 @@ pub use expert::{
 };
 pub use forward::cpu_moe_forward;
 
-/// CPU router: returns `(top_k_indices, renormalized_weights)` for the given
-/// hidden state. Used by GPU dispatch paths that route on CPU but run expert
-/// FFNs on GPU. Mirrors the routing logic in `forward::cpu_moe_forward`.
-pub fn cpu_moe_route(
-    h: &[f32],
-    moe: &crate::MoeLayerWeights<'_>,
-    eps: f32,
-) -> (Vec<usize>, Vec<f32>) {
-    use math::*;
-    let hidden = h.len();
-    let num_experts = moe.num_experts;
-    let top_k_val = moe.top_k;
+use crate::{
+    MoeExpertScalePolicy, MoeInputSource, MoeLayerWeights, MoePostExpertNormPolicy,
+    MoeRouterNormPolicy, MoeTopKWeightPolicy,
+};
 
-    let router_in_normed = if !moe.router_norm.is_empty() {
-        rms_norm(h, moe.router_norm, eps, 0.0)
-    } else if moe.router_norm_parameter_free {
-        rms_norm_no_weight(h, eps)
-    } else {
-        h.to_vec()
+/// Process-wide cached snapshot of `LARQL_DISABLE_Q4K_DIRECT`.
+///
+/// `cpu_moe_forward` (per layer) and `run_single_expert` (per expert
+/// per layer) used to read this env every call. On Gemma 4 26B-A4B
+/// (40 layers × top_k 4-8) that's ~120-300 `getenv` syscalls per token.
+/// Resolving once globally settles them all.
+///
+/// Trade-off: the env var is process-bound — flip it before the first
+/// MoE forward call, not at runtime. There is no production caller
+/// that toggles this mid-run; the var is a kernel-debug A/B switch.
+pub(crate) fn q4k_direct_disabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| crate::options::env_flag(crate::options::ENV_DISABLE_Q4K_DIRECT))
+}
+
+pub(crate) fn moe_expert_input(
+    h: &[f32],
+    moe: &MoeLayerWeights<'_>,
+    norm_offset: f32,
+    eps: f32,
+) -> Vec<f32> {
+    match moe.routing_policy.expert_input {
+        MoeInputSource::Residual => h.to_vec(),
+        MoeInputSource::PreExpertsNorm => math::rms_norm(h, moe.pre_experts_norm, eps, norm_offset),
+    }
+}
+
+pub(crate) fn moe_router_input(
+    h: &[f32],
+    expert_input: &[f32],
+    moe: &MoeLayerWeights<'_>,
+    norm_offset: f32,
+    eps: f32,
+) -> Vec<f32> {
+    let router_base = match moe.routing_policy.router_input {
+        MoeInputSource::Residual => h,
+        MoeInputSource::PreExpertsNorm => expert_input,
     };
+
+    let router_in_normed = match moe.routing_policy.router_norm {
+        MoeRouterNormPolicy::None => router_base.to_vec(),
+        MoeRouterNormPolicy::Learned => {
+            if moe.router_norm.is_empty() {
+                router_base.to_vec()
+            } else {
+                math::rms_norm(router_base, moe.router_norm, eps, norm_offset)
+            }
+        }
+        MoeRouterNormPolicy::ParameterFree => math::rms_norm_no_weight(router_base, eps),
+        MoeRouterNormPolicy::LearnedOrParameterFree => {
+            if !moe.router_norm.is_empty() {
+                math::rms_norm(router_base, moe.router_norm, eps, norm_offset)
+            } else if moe.router_norm_parameter_free {
+                math::rms_norm_no_weight(router_base, eps)
+            } else {
+                router_base.to_vec()
+            }
+        }
+    };
+
     let mut router_in: Vec<f32> = if !moe.router_scale.is_empty() {
         router_in_normed
             .iter()
-            .zip(moe.router_scale)
+            .zip(moe.router_scale.iter())
             .map(|(a, b)| a * b)
             .collect()
     } else {
         router_in_normed
     };
-    if moe.router_input_scalar != 1.0 && moe.router_input_scalar != 0.0 {
+    if moe.router_input_scalar != 1.0 {
         for v in &mut router_in {
             *v *= moe.router_input_scalar;
         }
     }
+    router_in
+}
 
-    let mut logits = matmul_vec(&router_in, moe.router_proj, num_experts, hidden);
-    softmax(&mut logits);
-    let (indices, mut weights) = top_k(&logits, top_k_val);
+pub(crate) fn moe_route_from_router_input(
+    router_in: &[f32],
+    moe: &MoeLayerWeights<'_>,
+) -> (Vec<usize>, Vec<f32>) {
+    let hidden = router_in.len();
+    let num_experts = moe.num_experts;
+    let top_k_val = moe.top_k;
 
-    // Renormalize selected weights → sum to 1 (gemma4_top_k_softmax).
-    let sum: f32 = weights.iter().sum();
-    if sum > 0.0 {
-        for w in &mut weights {
-            *w /= sum;
+    let mut logits = math::matmul_vec(router_in, moe.router_proj, num_experts, hidden);
+    math::softmax(&mut logits);
+    let (indices, mut weights) = math::top_k(&logits, top_k_val);
+
+    if moe.routing_policy.selected_weight == MoeTopKWeightPolicy::RenormalizedSoftmax {
+        let sum: f32 = weights.iter().sum();
+        if sum > 0.0 {
+            for w in &mut weights {
+                *w /= sum;
+            }
         }
     }
 
-    // Per-expert output scale (Gemma 4 learned per-expert multiplier).
-    if !moe.router_per_expert_scale.is_empty() {
+    if moe.routing_policy.expert_scale == MoeExpertScalePolicy::PerExpert
+        && !moe.router_per_expert_scale.is_empty()
+    {
         for (i, &ei) in indices.iter().enumerate() {
             if ei < moe.router_per_expert_scale.len() {
                 weights[i] *= moe.router_per_expert_scale[ei];
             }
         }
     }
+
     (indices, weights)
+}
+
+pub(crate) fn moe_post_expert_output(
+    expert_out: &[f32],
+    moe: &MoeLayerWeights<'_>,
+    norm_offset: f32,
+    eps: f32,
+) -> Vec<f32> {
+    match moe.routing_policy.post_expert_norm {
+        MoePostExpertNormPolicy::None => expert_out.to_vec(),
+        MoePostExpertNormPolicy::RmsNorm => {
+            math::rms_norm(expert_out, moe.post_experts_norm, eps, norm_offset)
+        }
+    }
+}
+
+/// CPU router: returns `(top_k_indices, selected_weights)` for the given
+/// hidden state. Used by GPU dispatch paths that route on CPU but run expert
+/// FFNs on GPU. Mirrors the policy-driven routing logic in
+/// `forward::cpu_moe_forward`.
+pub fn cpu_moe_route(
+    h: &[f32],
+    moe: &crate::MoeLayerWeights<'_>,
+    eps: f32,
+) -> (Vec<usize>, Vec<f32>) {
+    let expert_input = moe_expert_input(h, moe, 0.0, eps);
+    let router_in = moe_router_input(h, &expert_input, moe, 0.0, eps);
+    moe_route_from_router_input(&router_in, moe)
 }
 
 #[cfg(test)]
@@ -106,6 +193,8 @@ mod tests {
         MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
             expert_data_format: crate::QuantFormat::BF16,
             router_proj: router,
             router_scale: &[],
@@ -154,7 +243,8 @@ mod tests {
                 // Vary content slightly so the allocator can't trivially reuse the slot,
                 // but the key guarantee is unique heap pointer per live Vec.
                 let data = vec![i as u8, 0x3Fu8, 0x00u8, 0x3Fu8]; // 2 BF16 values
-                let _ = cache::cached_dequant(&data, crate::QuantFormat::BF16, data.len() / 2);
+                let _ = cache::try_cached_dequant(&data, crate::QuantFormat::BF16, data.len() / 2)
+                    .unwrap();
                 data
             })
             .collect();
@@ -166,12 +256,92 @@ mod tests {
     fn cache_hit_returns_same_arc() {
         // Same byte slice pointer → second call hits the cache, no new allocation.
         let data = vec![0x80u8, 0x3Fu8, 0x80u8, 0x3Fu8]; // BF16 1.0 × 2
-        let first = cache::cached_dequant(&data, crate::QuantFormat::BF16, 2);
-        let second = cache::cached_dequant(&data, crate::QuantFormat::BF16, 2);
+        let first = cache::try_cached_dequant(&data, crate::QuantFormat::BF16, 2).unwrap();
+        let second = cache::try_cached_dequant(&data, crate::QuantFormat::BF16, 2).unwrap();
         // Both Arcs should point to the same allocation (same pointer).
         assert!(
             std::sync::Arc::ptr_eq(&first, &second),
             "cache hit should return the same Arc"
+        );
+    }
+
+    #[test]
+    fn router_input_scalar_zero_is_applied() {
+        let hidden = 4;
+        let num_experts = 2;
+        let top_k = 2;
+        let h = vec![1.0f32; hidden];
+        let router = vec![
+            0.0, 0.0, 0.0, 0.0, // expert 0
+            2.0, 2.0, 2.0, 2.0, // expert 1
+        ];
+
+        let moe_no_scale = MoeLayerWeights {
+            experts_gate_up: Vec::new(),
+            experts_down: Vec::new(),
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
+            expert_data_format: crate::QuantFormat::BF16,
+            router_proj: &router,
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts,
+            top_k,
+            intermediate_size: 1,
+            activation: crate::Activation::Silu,
+        };
+        let (_, no_scale_weights) = cpu_moe_route(&h, &moe_no_scale, 1e-6);
+        let moe_zero_scale = MoeLayerWeights {
+            router_input_scalar: 0.0,
+            ..moe_no_scale
+        };
+        let (_, zero_scale_weights) = cpu_moe_route(&h, &moe_zero_scale, 1e-6);
+
+        assert_ne!(no_scale_weights, zero_scale_weights);
+        assert!(zero_scale_weights.iter().all(|w| (*w - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn top_k_softmax_policy_keeps_raw_selected_weight() {
+        let num_experts = 2;
+        let h = [1.0f32, 0.0];
+        let router = [
+            2.0, 0.0, // expert 0 logit = 2
+            0.0, 0.0, // expert 1 logit = 0
+        ];
+        let moe = MoeLayerWeights {
+            experts_gate_up: Vec::new(),
+            experts_down: Vec::new(),
+            routing_policy: crate::MoeRoutingPolicy::top_k_softmax(),
+            weight_layout: crate::MoeWeightLayout::default(),
+            expert_data_format: crate::QuantFormat::BF16,
+            router_proj: &router,
+            router_scale: &[],
+            router_per_expert_scale: &[10.0, 10.0],
+            router_norm: &[],
+            router_norm_parameter_free: true,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[2.0, 2.0],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts,
+            top_k: 1,
+            intermediate_size: 1,
+            activation: crate::Activation::Silu,
+        };
+
+        let (indices, weights) = cpu_moe_route(&h, &moe, 1e-6);
+
+        assert_eq!(indices, vec![0]);
+        assert!(
+            weights[0] < 1.0 && weights[0] > 0.5,
+            "top_k_softmax policy should keep the selected softmax probability"
         );
     }
 
@@ -271,6 +441,8 @@ mod tests {
         let moe = MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
             expert_data_format: crate::QuantFormat::Q4_K,
             router_proj: &router,
             router_scale: &[],
@@ -356,6 +528,8 @@ mod tests {
         let moe = MoeLayerWeights {
             experts_gate_up: vec![&e0_gu, &e1_gu],
             experts_down: vec![&e0_dn, &e1_dn],
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
             expert_data_format: crate::QuantFormat::BF16,
             router_proj: &router,
             router_scale: &[],
@@ -439,6 +613,8 @@ mod tests {
         let moe = MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: crate::MoeRoutingPolicy::default(),
+            weight_layout: crate::MoeWeightLayout::default(),
             expert_data_format: crate::QuantFormat::BF16,
             router_proj: &router_proj,
             router_scale: &[],
@@ -463,27 +639,31 @@ mod tests {
             .map(|i| if i == 0 || i == 7 { 1.0 } else { 0.1 })
             .collect();
 
-        // What top-K does `cpu_moe_route` pick? It applies router_norm to
-        // **whatever h is passed in**. Metal's `gpu_moe_dispatch` calls
-        // `cpu_moe_route(&h_norm, ...)`, so this is the canonical answer.
-        let h_norm = math::rms_norm(&h, &pre_norm, 1e-6, 0.0);
-        let (route_indices, _) = cpu_moe_route(&h_norm, &moe, 1e-6);
-        let (route_raw, _) = cpu_moe_route(&h, &moe, 1e-6);
+        let expert_input = moe_expert_input(&h, &moe, 0.0, 1e-6);
+        let router_in = moe_router_input(&h, &expert_input, &moe, 0.0, 1e-6);
+        let (route_from_shared_steps, _) = moe_route_from_router_input(&router_in, &moe);
+        let (route_indices, _) = cpu_moe_route(&h, &moe, 1e-6);
+
+        let mut raw_logits = math::matmul_vec(&h, &router_proj, num_experts, hidden);
+        math::softmax(&mut raw_logits);
+        let (route_raw, _) = math::top_k(&raw_logits, top_k);
 
         // Sanity: the fixture is engineered so the two conventions disagree.
         assert_ne!(
             route_indices, route_raw,
             "fixture is broken — h_norm and raw-h routing must give different \
              top-K, otherwise this test can't catch a regression. \
-             route_norm={route_indices:?} route_raw={route_raw:?}"
+             route_policy={route_indices:?} route_raw={route_raw:?}"
         );
 
-        // Pin the convention that callers (Metal dispatch, gRPC remote,
-        // cpu_moe_forward) currently pass: pre_experts_norm'd h.
+        // Pin one policy implementation for callers (Metal dispatch,
+        // gRPC remote, cpu_moe_forward): public routing and forward's
+        // shared steps must agree on the policy-derived router input.
+        assert_eq!(route_indices, route_from_shared_steps);
         assert_eq!(
             route_indices.len(),
             top_k,
-            "cpu_moe_route on h_norm should return top_k={top_k} indices"
+            "cpu_moe_route should return top_k={top_k} indices"
         );
     }
 

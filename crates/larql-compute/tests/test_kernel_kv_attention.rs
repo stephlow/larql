@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `kv_attention` — KV-cached single-token decode
 //! attention. Companion to the prefill-side `fused_attention` tests.
@@ -112,9 +112,9 @@ fn run_kv_attention(
     let enc = cmd.new_compute_command_encoder();
     let span = larql_compute::metal::ops::kv_cache::attention_span(t_val, window_size);
     let pipeline = if span > larql_compute::metal::ops::kv_cache::SHORT_ATTENTION_SPAN {
-        &metal.kv_attend_long_pipeline
+        &metal.attention.kv_attend_long_pipeline
     } else {
-        &metal.kv_attend_pipeline
+        &metal.attention.kv_attend_pipeline
     };
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(&q_buf), 0);

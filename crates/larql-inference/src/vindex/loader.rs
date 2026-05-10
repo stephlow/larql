@@ -16,8 +16,8 @@
 //!      via `backend_lm_head_topk`, so missing lm_head files don't
 //!      fail the load.
 //!   3. **Attention weights** — exactly one of:
-//!        a. `attn_weights_q4k.bin` (preferred) — strict load.
-//!        b. `attn_weights_q8.bin` — strict load when (a) absent.
+//!      a. `attn_weights_q4k.bin` (preferred) — strict load.
+//!      b. `attn_weights_q8.bin` — strict load when (a) absent.
 //!      If neither exists, return an error: GPU prefill needs them.
 //!   4. **FFN weights** — `interleaved_q4k.bin` (preferred) or
 //!      `interleaved_q4.bin` — at least one required, strict load.
@@ -41,6 +41,12 @@ use larql_vindex::format::filenames::{
     INTERLEAVED_Q4_BIN, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
 };
 use larql_vindex::{SilentLoadCallbacks, VectorIndex, VindexError};
+
+/// Env var pointing at a real `*.vindex` directory. Real-model
+/// integration tests (`#[ignore]` in `layer_graph::generate::tests` and
+/// `forward::memit::tests`) honour this; if unset they no-op. Single
+/// source of truth so the literal isn't repeated across test fixtures.
+pub const ENV_VINDEX_PATH: &str = "LARQL_VINDEX_PATH";
 
 /// Open a vindex for inference: load core, lm_head (best-effort),
 /// attention weights (strict), FFN weights (strict).

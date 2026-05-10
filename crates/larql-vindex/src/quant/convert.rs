@@ -90,7 +90,11 @@ impl Default for Fp4ConvertConfig {
     fn default() -> Self {
         Self {
             policy: Policy::B,
+            // Per docs/fp4-precision-policy.md §3: 99% of per-feature
+            // blocks must satisfy R<threshold or the projection falls
+            // back to FP8. Empirically tuned against gemma3-4b.
             compliance_floor: 0.99,
+            // R = max_abs / mean_abs cutoff for FP4-friendly blocks.
             threshold: 16.0,
             strict: false,
             force: false,
@@ -329,8 +333,8 @@ pub fn vindex_to_fp4(
 
         // Output file naming.
         let out_file = match chosen {
-            Precision::Fp4 => format!("{}_fp4.bin", fs_prefix(name)),
-            Precision::Fp8 => format!("{}_fp8.bin", fs_prefix(name)),
+            Precision::Fp4 => format!("{}_fp4.bin", fs_prefix(name)?),
+            Precision::Fp8 => format!("{}_fp8.bin", fs_prefix(name)?),
             Precision::F16 | Precision::F32 => src_file.to_string(),
         };
         let out_path = dst_tmp.join(&out_file);
@@ -523,12 +527,12 @@ fn describe_out_backend(dst: &Path) -> Result<String, VindexError> {
     Ok(index.describe_ffn_backend())
 }
 
-fn fs_prefix(name: &str) -> &'static str {
+fn fs_prefix(name: &str) -> Result<&'static str, VindexError> {
     match name {
-        "gate" => "gate_vectors",
-        "up" => "up_features",
-        "down" => "down_features",
-        _ => panic!("unknown projection {name}"),
+        "gate" => Ok("gate_vectors"),
+        "up" => Ok("up_features"),
+        "down" => Ok("down_features"),
+        _ => Err(VindexError::Parse(format!("unknown projection {name}"))),
     }
 }
 
@@ -626,5 +630,26 @@ mod tests {
         assert!(!c.strict);
         assert!(!c.force);
         assert!(c.emit_sidecar);
+    }
+
+    #[test]
+    fn fs_prefix_known_projections() {
+        assert_eq!(fs_prefix("gate").unwrap(), "gate_vectors");
+        assert_eq!(fs_prefix("up").unwrap(), "up_features");
+        assert_eq!(fs_prefix("down").unwrap(), "down_features");
+    }
+
+    #[test]
+    fn fs_prefix_unknown_returns_parse_error() {
+        // Was a panic before; library code must surface this as an
+        // error so callers can recover or report cleanly.
+        let err = fs_prefix("attention").expect_err("unknown projection");
+        match err {
+            VindexError::Parse(msg) => assert!(
+                msg.contains("attention"),
+                "error should name the bad projection: {msg}",
+            ),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
     }
 }

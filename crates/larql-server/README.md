@@ -1331,8 +1331,22 @@ Sessions expire after 1 hour of inactivity. Without an `X-Session-Id` header, pa
 | 503 | Inference unavailable (`--no-infer` or no model weights) |
 | 500 | Internal server error |
 
-All HTTP errors return `{"error": "message"}`, including embed-service
-endpoints and binary-protocol parse errors.
+There are **two error envelope shapes**, split by endpoint family
+(documented in `docs/server-spec.md §8.3.1`):
+
+- **LARQL paradigm endpoints** (`/v1/describe`, `/v1/walk`,
+  `/v1/select`, `/v1/relations`, `/v1/stats`, `/v1/infer`,
+  `/v1/patches/*`, `/v1/walk-ffn`, `/v1/insert`, `/v1/embed`,
+  `/v1/logits`, `/v1/token/*`) — flat: `{"error": "message"}`.
+- **OpenAI-compatible endpoints** (`/v1/embeddings`,
+  `/v1/completions`, `/v1/chat/completions`) — nested
+  `{"error": {"message", "type", "param", "code"}}` so the OpenAI
+  Python and JS SDKs parse errors without special-casing.
+
+Canonical OpenAI `type` values: `invalid_request_error` (400),
+`not_found_error` (404), `server_error` (500),
+`service_unavailable_error` (503). `param` and `code` are always
+present (possibly `null`).
 
 ## Layer Bands
 
@@ -1474,7 +1488,7 @@ larql-server/
         │   │                   (POST /v1/experts/layer-batch[-f16])
         │   ├── cpu.rs          run_experts_cpu_batch (rayon CPU dispatch)
         │   ├── metal.rs        run_experts_metal_batch
-        │   │                   (#[cfg(feature = "metal-experts")])
+        │   │                   (#[cfg(all(feature = "metal-experts", target_os = "macos"))])
         │   └── warmup.rs       warmup_hnsw_unit_cache,
         │                       warmup_metal_expert_cache
         ├── topology.rs         GET /v1/expert/topology (shard advertisement)
@@ -1501,8 +1515,23 @@ larql-server/
 ## Testing
 
 ```bash
-# Unit + integration tests (~595 tests across lib + 14 test files; all green)
+# Unit + integration tests (~660 tests across lib + 14 test files; all green)
 cargo test -p larql-server
+
+# Or via Make (workspace conventions match the other crates):
+make larql-server-test
+make larql-server-fmt-check
+make larql-server-lint                    # clippy --all-targets -D warnings
+make larql-server-ci                      # fmt-check + lint + test
+
+# Coverage (cargo-llvm-cov + per-file 90% policy)
+make larql-server-coverage-summary        # text summary + summary.json + policy
+make larql-server-coverage-html           # writes coverage/larql-server/html/
+make larql-server-coverage-policy         # re-run policy check on existing report
+
+# 2026-05-10 measured baseline: 65.68% line / 72.18% function. Per-file
+# debt + the 90% default floor live in `coverage-policy.json`; baselines
+# only ratchet upward. New / split files must hit 90% on first commit.
 
 # Synthetic demos (no real vindex)
 cargo run -p larql-server --example server_demo

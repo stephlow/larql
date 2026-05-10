@@ -12,12 +12,12 @@ pub mod gate_accessors;
 pub mod gate_store;
 pub mod lm_head;
 pub mod metadata_store;
-pub mod projection_store;
 pub mod residency;
+pub mod vindex_storage;
 
 pub use ffn_store::FfnStore;
 pub use gate_store::GateStore;
 pub use metadata_store::MetadataStore;
-pub use projection_store::ProjectionStore;
+pub use vindex_storage::{GateLayerView, MmapStorage, VindexStorage};
 
 pub use residency::{LayerState, ResidencyManager};

@@ -1,6 +1,62 @@
 # Roadmap — larql-inference
 
-## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines
+## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 904 lib tests | 65.67% line cov (64 of 127 files at ≥90% line cov)
+
+## Recommended next (priority order, 2026-05-10)
+
+Curated from the open work below. Each item links to the section that owns the
+detail.
+
+1. ~~**A1-A3 — heterogeneous attention geometry**~~ — **shipped 2026-05-10**.
+   Reproduced 31B end-to-end first: it generates correctly. The "L5
+   immediate-EOS" claim was stale — heterogeneous-attention safety had
+   quietly landed via per-layer reads in
+   `metal/decode/setup.rs:DecodeScratch::new`, `LayerBuffers::allocate`,
+   and `ensure_kv_cache_for_layers`. A1 (`Capability::HeterogeneousAttention`
+   runtime gate), A2 (drop vestigial scalar geometry from `DecodeBackend`),
+   and A3 (KV cache audit) landed as the deferred cleanup pass. See
+   `CHANGELOG.md` and "Open: Model architecture independence hardening"
+   below (now ✅ shipped section).
+
+2. **G-3 (= G-4) — flash-attention-style fused attention kernel** — highest
+   GPU-fwd lever after G-1/G-2 missed. Stub at
+   `crates/larql-compute/src/metal/shaders/fused_attention.rs`; collapse
+   RoPE + QK_norm + KV_append + KV_attend into 1-2 dispatches → ~0.85 ms/tok
+   recoverable, projects to 95-105 tok/s on Gemma 3 4B (ollama parity). See
+   "Open: GPU-forward kernel utilization" → G-3 / G-4 (canonical entry: G-3).
+
+3. **H12 closed** (2026-05-10) — H8/H9/H11 + all three orchestration-file
+   splits shipped: `layer_graph/predict.rs`, `ffn/moe_remote/shard.rs`,
+   `layer_graph/generate/gpu.rs` (999 LOC → 5-file `gpu/` directory, max
+   534 LOC; 646 lib tests pass). Inference-crate-hardening backlog is now
+   empty of file-split items. See `CHANGELOG.md` entry.
+
+4. **R4 — research trace export contract** — only remaining R-item from the
+   mech-interp engine surface; unblocks MI4 onwards. See "Open: Mechanistic
+   research engine surface" → R4.
+
+5. **MI4 — golden parity tests for WalkFfn + patched-vindex** — dense and
+   custom-backend parity already pinned; add the same for vindex-backed paths
+   so MI5/6/7 attribution and patching work has a regression net. See "P0:
+   Best-in-class mechanistic interpretability engine".
+
+6. **P1 mechanical backlog** (parallelisable, low risk) — synthetic e2e test
+   for `generate()` (currently `#[ignore]` only); per-file 90% floor work
+   for the **63 files still below** (was 84; coverage push 2026-05-10 lifted 34 files past
+   the floor — see CHANGELOG.md); the deferred structure moves (`capture.rs →
+   trace/`, `residual.rs → forward/norm.rs`). See
+   "P1: Test coverage gaps", "P1: Structure & file layout", "P1: Quality bugs".
+
+7. **Coverage push: synthetic-Q4K vindex fixture** (parallelisable, ~2-3 hr,
+   line cov +1-1.5 pp) — would unlock the ~30 files at 0% line cov that
+   are gated on a Q4K vindex on disk: `vindex/q4k_forward/{metal, hidden,
+   interventions, walk_ffn, …}.rs`, `layer_graph/generate/gpu/{decode_loop,
+   prefill}.rs` deeper paths, `forward/predict/honest.rs`. The fixture
+   needs valid Q4_K bytes (144B per 256-element block) for attention +
+   FFN + lm_head, written to a tempdir matching the vindex file layout.
+   The companion `MockComputeBackend` (advertising `Capability::PrefillQ4`
+   + `DecodeToken`, returning `Some` from those methods) is the smaller
+   half of the work.
 
 ## Open: Mechanistic research engine surface — Q4K interventions for OV/RD
 
@@ -28,37 +84,73 @@ runtime contracts are stable.
 
 ---
 
-## Open: Model architecture independence hardening
+## Open: inference crate hardening — correctness, API boundaries, model agnosticity
 
-**Status**: Planned as of 2026-05-02.
+**Status**: Started 2026-05-09 after `larql-inference` review.
 
-The forward stack already routes most behavior through `ModelArchitecture` and
-`FullPipelineLayer`, but a few paths still assume standard decoder attention
-or pass first-layer scalar geometry into backends that now support per-layer
-shape variation.
-
-**Confirmed blocker (2026-05-04):** Gemma 4 31B Q4K has 60 layers split into two
-geometry classes: 50 sliding-attention layers (head_dim=256, num_kv_heads=16,
-sliding_window=1024) and 10 full-attention layers at L5, L11, L17, L23, L29,
-L35, L41, L47, L53, L59 (head_dim=512, num_kv_heads=4). The Metal backend
-currently uses L0's sliding-attention geometry for all 60 layers. This produces
-corrupted KV state at L5 (the first global layer) and causes immediate EOS in
-`larql bench --metal`. A1-A3 are the direct fix path. Until they land, 31B local
-Metal is blocked; remote-FFN batch (§ run_dense_ffn_q4k) gives 6.5 tok/s on the
-same machine.
+The crate now carries stable serving/generation paths, mechanistic-interpretability
+research surfaces, Q4K/vindex-backed execution, and remote expert dispatch. The
+review found two classes of work: immediate correctness fixes and longer-term
+cleanup to keep the crate model-agnostic and maintainable.
 
 Work items:
 
 | # | Item | Status |
 |---|------|--------|
-| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path; first priority is Gemma 4 31B heterogeneous sliding/global attention (L0 geometry ≠ all-layer geometry) | planned |
-| A2 | Remove scalar `num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base` assumptions from decode/prefill call sites where `FullPipelineLayer` already carries per-layer values | planned |
-| A3 | Ensure all KV cache allocation paths use `layers[*].num_kv_heads` and `layers[*].head_dim`, not the caller's first-layer geometry fallback | planned |
+| H1 | Restore `cargo test -p larql-inference` after the `GateIndex` trait split by updating walk-FFN test mocks to implement `GateLookup` / `PatchOverrides` / FFN storage traits | shipped 2026-05-09 |
+| H2 | Make generation honor `max_tokens == 0` across GPU, CPU fallback, constrained, and streaming paths | shipped 2026-05-09 |
+| H3 | Check EOS on the first generated token in unconstrained GPU generation, including special-token raw decode via `EosConfig::is_eos_with_tokenizer` | shipped 2026-05-09 |
+| H4 | Stop discarding `EosConfig` in constrained generation and CPU fallbacks; use caller-supplied EOS IDs and stop strings instead of only `vindex::is_end_of_turn` | shipped 2026-05-09 |
+| H5 | Convert `optimise_target_delta` invalid inputs (`target_id >= vocab`, empty prompt, unsupported shapes) from panics into early `Err` results | shipped 2026-05-09 |
+| H6 | Harden remote FFN/Q8K wire decoders against untrusted length fields with checked arithmetic and bounded allocation | shipped 2026-05-09 |
+| H7 | Replace ad hoc `Result<_, String>` / silent empty `GenerateResult` failures in generation paths with typed errors where public callers need to distinguish unsupported backend vs. empty output | shipped 2026-05-09 — `GenerateError` variants added with fallible `try_generate*` wrappers |
+| H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | shipped 2026-05-10 — added `forward::dump_config::DumpConfig` (lifted 7 inline reads of `LARQL_CPU_DUMP_LAYERS` / `LARQL_CPU_STAGE_DUMP` / `LARQL_STAGE_DUMP_LAYER`) and `ffn::moe_remote::runtime::RemoteMoeRuntime` (lifted 6 inline reads of `LARQL_HTTP_TIMING` / `LARQL_MOE_WIRE_F16` / `LARQL_DISABLE_Q8K_WIRE` / `LARQL_VERBOSE`); both `OnceLock` singletons. Earlier 2026-05-09 work covered generation/grid token policy, profiling, LM-head, and MoE config |
+| H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | shipped 2026-05-10 — dropped 17 `forward::*` + 7 `layer_graph::*` root re-exports with zero external use AND zero in-crate example/test use; `research` module rewritten to source from subpaths (survives further root trims). Earlier 2026-05-09 work added `prelude` and `research` grouped surfaces |
+| H10 | Remove backend-name probes and concrete `MetalBackend` downcasts from generic generation dispatch; replace with explicit compute-backend capability methods | shipped 2026-05-09 for generation dispatch |
+| H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | shipped 2026-05-10 — verified no hardcoded `family() == "..."` branches remain in generic generation/decode/forward paths. The single remaining family-named match (`pipeline_layer.rs::moe_routing_policy`) reads the architecture trait's `router_type` metadata, which is the policy-object pattern this item asks for |
+| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | shipped 2026-05-10 — `layer_graph/predict.rs` (881) → `predict/` directory (mod 376 + split 285 + honest 261); `ffn/moe_remote/shard.rs` (924) → `shard/` directory (mod 376 + layer_batch 215 + multi_layer 140 + expert_batch 136 + stream 123); `layer_graph/generate/gpu.rs` (999) → `gpu/` directory (mod 534 + decode_loop 329 + forced_logits 211 + prefill 193 + sampling_step 56). All earlier 2026-05-09 extractions (token selection policy, GPU setup, constrained generation, grid config/timing/remote-MoE/remote-FFN) preserved. 646 lib tests green |
+
+Acceptance:
+
+- `cargo test -p larql-inference` compiles and passes in a clean target dir.
+- Public generation APIs obey token budgets and EOS config deterministically.
+- Unsupported model/backend combinations fail with precise errors rather than
+  silent empty output, zero-vector substitution, or process panic.
+- Model-family-specific behavior is expressed through architecture/tokenizer
+  policy, not hardcoded in generic decode loops.
+
+---
+
+## ✅ Model architecture independence hardening — A1-A3 shipped 2026-05-10
+
+**Status**: A1, A2, A3 shipped 2026-05-10 (see CHANGELOG.md). A4 remains
+planned. Original "L5 immediate-EOS" framing turned out to be stale — when
+the work item was reopened, Gemma 4 31B Q4K Metal already generated
+coherent text end-to-end (verified via `larql run gemma4-31b-q4k.vindex`).
+The heterogeneous-attention safety had landed quietly via per-layer reads
+in `metal/decode/setup.rs:DecodeScratch::new` (sized to
+`max(layers[*].q_dim)`), `metal/ops/full_pipeline/buffers.rs` (prefill
+same), and `MetalBackend::ensure_kv_cache_for_layers`. A1-A3 then landed as
+the deferred API/capability cleanup.
+
+Gemma 4 31B Q4K has 60 layers split into two geometry classes: 50
+sliding-attention layers (head_dim=256, num_kv_heads=16,
+sliding_window=1024) and 10 full-attention layers at L5, L11, L17, L23,
+L29, L35, L41, L47, L53, L59 (head_dim=512, num_kv_heads=4). Both classes
+now flow correctly through GPU decode and prefill.
+
+Work items:
+
+| # | Item | Status |
+|---|------|--------|
+| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path | shipped 2026-05-10 — `Capability::HeterogeneousAttention` + `gpu_setup::ensure_attention_supported` (see CHANGELOG) |
+| A2 | Remove scalar `num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base` assumptions from decode/prefill call sites | shipped 2026-05-10 — dropped from 10 `DecodeBackend` methods + every `larql-inference` call site; `AttentionGeometry` deleted; bonus: latent `PipelineIntervention` head_dim bug fixed (now per-target-layer) |
+| A3 | Ensure all KV cache allocation paths use `layers[*].num_kv_heads` and `layers[*].head_dim`, not the caller's first-layer geometry fallback | already shipped pre-A1/A2; documented + audited 2026-05-10 — production paths all reach `preallocate_kv_cache_per_layer`; legacy uniform `create_kv_cache` retained only for synthetic tests + `populate_kv_layer` lazy bootstrap |
 | A4 | Add architecture fixtures for heterogeneous geometry and unsupported-attention failures so GPU, CPU, trace, and vindex-backed paths agree | planned |
 
-Acceptance: a heterogeneous model should either run through every selected
-path using per-layer geometry, or fail before decode/extraction with a precise
-unsupported capability error.
+Acceptance (met for A1-A3): a heterogeneous model runs through every
+selected path using per-layer geometry, or fails before decode/extraction
+with a precise unsupported capability error (`GenerateError::UnsupportedBackend`).
 
 ---
 
@@ -106,8 +198,9 @@ Near-term order:
 > `pipeline.threads_per_tg`, the production `q4k_matvec` is correct AND
 > ~1.10 ms/tok faster than stride-32. **Stride-32 is now the diagnostic
 > fallback; production default is `lm_head_knn_backend` with
-> `q4k_matvec` first.** End-to-end: 76.3 → 84.0 tok/s on Gemma 3 4B,
-> gap to ollama 1.30× → 1.18×. Diagnostic A/B via
+> `q4k_matvec` first.** End-to-end: 76.3 → 84.0 → **88.1** tok/s on
+> Gemma 3 4B (last step is the 2026-05-09 QKV defuse), gap to ollama
+> 1.30× → 1.18× → **1.17×**. Diagnostic A/B via
 > `LARQL_LM_HEAD_SKIP_Q4K=1`. The historical bisect below is preserved
 > for context.
 
@@ -359,9 +452,11 @@ profiler) to localise — kernel-isolated GB/s alone isn't enough.
 ### G-2 — NR0=2 + shared-X-vector port from llama.cpp
 
 **Status**: ❌ Tried 2026-05-01, **slight regression** (~3% slower).
-Kernel kept opt-in (`LARQL_GATE_UP_NR2=1` →
-`q4k_ffn_gate_up_nr2_pipeline`, `shaders/q4k_ffn_gate_up_nr2.rs`) for
-future exploration on different shapes / hardware.
+Re-benched 2026-05-09 (8sg 86.3 / 86.2 tok/s vs NR2 83.4 tok/s on
+quiet M3 Max, 0.07 ms baseline drift), regression reconfirmed.
+**Kernel + `LARQL_GATE_UP_NR2` env var removed 2026-05-09**;
+the candidate had two failed benches against it. See ADR-015 for
+the iso-vs-batched lesson the kernel pinned.
 
 **Result** (3 runs each, thermal-mixed):
 - NR2:           68.6 / 69.2 / 68.3 tok/s, GPU fwd 12.76/12.56/12.84 ms
@@ -452,9 +547,15 @@ Stretch goal: **~95-100 tok/s, ollama parity**.
 
 ### G-3 — Flash-attention-style fused attention kernel (HIGH PRIORITY)
 
-**Status**: Open. Larger lift than G-2 but orthogonal — attacks
-**dispatch overhead** (~1.0 ms/tok savings) rather than per-kernel
-utilization.
+**Status**: Open. Canonical entry for the flash-attention work — see
+also `G-3' DEPRECATED` below (preserved cross-reference) and `G-4`
+which restates the same task with newer dispatch-count framing after
+the 2026-05-01 fusion experiments shipped. Treat this entry as the
+plan of record; the duplicate `G-4` block exists because the dispatch-
+count diagnosis was rewritten after G-1/G-2/G-2' all missed.
+
+Larger lift than G-2 but orthogonal — attacks **dispatch overhead**
+(~1.0 ms/tok savings) rather than per-kernel utilization.
 
 **Current decode dispatch chain per layer**: ~11 dispatches × 34
 layers = ~374 dispatches/tok × ~5 µs each = **1.87 ms/tok overhead**.
@@ -982,9 +1083,15 @@ skip. Defaults configurable via `LARQL_SMOKE_PROMPT` / `LARQL_SMOKE_EXPECTED`.
 ## P0: MoE inference completions
 
 ### MoE-aware CPU forward pass
-**Status**: Not started  
-`predict_q4k` / `WeightFfn::forward` has no MoE branch. Wire `cpu_moe_forward`
-(already in `larql-compute/src/cpu/ops/moe.rs`) into `forward/layer.rs`.
+**Status**: Partial — vindex Q4K hidden-forward path shipped; dense `WeightFfn` path not started
+**Files**: `vindex/q4k_forward/hidden.rs:169` (shipped), `forward/layer.rs` (open)
+The Q4K vindex hidden-forward path already calls
+`larql_compute::cpu::ops::moe::cpu_moe_forward`, so any MoE model loaded
+through the vindex path has a working CPU MoE branch (this is what the
+gRPC grid loopback and `M-CPU-1..6` were measured against). What's still
+missing is the dense `WeightFfn::forward` path: non-vindex MoE forward
+panics or no-ops. Wire `cpu_moe_forward` into `forward/layer.rs` so dense
+loaders also work.
 
 ### Wire `RouterIndex` client-side
 **Status**: Not started  
@@ -1402,9 +1509,9 @@ architecturally tied to `mod.rs` as the parent. Requires changing visibility to
 `pub(in crate::vindex::walk_ffn)` across 6 files — low risk/reward compared to
 other P1 items. Backlog.
 
-**`layer_graph/predict.rs` (700 LOC) — split**  
-Five `predict_*` variant functions sharing a shell. Extract to `predict/base.rs`
-(shared embed→loop→logits shell) + `predict/variants.rs` (per-strategy overloads).
+**`layer_graph/predict.rs` (881 LOC) — split** ✅ Done 2026-05-10 (H12)
+Split into `predict/{mod.rs 376, split.rs 285, honest.rs 261}`. See
+CHANGELOG.md `[2026-05-10] — Hardening pass`.
 
 **`residual.rs` at crate root → `forward/norm.rs`**  
 It's a collection of norm primitives used exclusively by the forward pass. Moving
@@ -1430,8 +1537,8 @@ inconsistent.
 `MarkovResidualEngine` and `UnlimitedContextEngine` are re-exported; the other
 two engines are not. Either export all four or none.
 
-**`walker/` and `experts/` have no module-level docs**  
-Add `//!` headers explaining purpose and entry points.
+**`experts/` has no module-level docs**  
+Add a `//!` header explaining purpose and entry points. (Walkers live in `larql-vindex`, not here.)
 
 **`vindex/` module doc is vague**  
 "Vindex integration" says nothing to a new reader. Expand to explain what the
@@ -1479,7 +1586,13 @@ Added `# Diagnostics` section to module doc.
 
 ## P1: Test coverage gaps
 
-From 2026-04-26 coverage review (50.45% line coverage).
+Baseline 2026-04-26: 50.45% line coverage.
+Current 2026-05-09: **53.11% line coverage, 631 lib tests, 32/116 files at ≥90% per-file floor (84 below).**
+
+Most of the remaining gap is concentrated in:
+- 33 files at **0% line coverage** — GPU dispatch (`generate/gpu.rs`), Q4_K integration paths (`vindex/q4k_forward/*`), remote-shard orchestration (`grid/remote_*`, `ffn/moe_remote/*`). Mostly need real model fixtures or running services to cover.
+- 9 files at 1-29% — `attention/gpu.rs`, `forward/memit.rs`, `ffn/remote/http.rs`, `vindex/walk_ffn/sparse.rs`. Reachable with synthetic weights + tempfile fixtures.
+- 17 files at 70-89% — mechanical floor lifts (the 80-89% bucket cleared 2026-05-09).
 
 ### Critical
 
@@ -1536,6 +1649,25 @@ Add a synthetic CPU-backend integration test using `make_test_weights()`.
 
 ---
 
+## P2: Spec'd and queued (sequenced behind P0 validation)
+
+Two implementation tracks have shipped specs at
+`crates/larql-inference/docs/specs/` but are deliberately queued behind
+V1–V4 / R6 / MTP / BR4. Detail and gating preconditions live in the
+top-level `ROADMAP.md` § "P1 — Spec'd implementations, sequenced behind
+P0 validation" (SQ1, SQ2). Re-promotion conditions are recorded there.
+
+| # | Spec | Status | Why queued |
+|---|------|--------|------------|
+| SQ1 | [`markov-residual-engine.md`](docs/specs/markov-residual-engine.md) | reviewed, impl not started | Reference impl already works in `kv-cache-benchmark`; lifting it without first resolving the trait-vs-sibling shape against `UnlimitedContextEngine` / `ApolloEngine` risks forcing the other two engines into a shape that doesn't fit. V1/V2 also produce the measurement infrastructure that proves the migration didn't regress. |
+| SQ2 | [`vindex-as-ffn.md`](docs/specs/vindex-as-ffn.md) | reviewed, impl not started | §5.4 cost model says it's a wash on typical decode K (256–1024) without large compiled-fact corpora. R6 (depth-fraction probe) needs to land before the per-arch layer policy is automated rather than hand-calibrated. No current video / research workflow needs the paraphrase-reach the lookup buys above the existing L1 i16 cos≥0.999 cache. |
+
+These are not P0/P1-active. Top-level roadmap is the source of truth
+for sequencing; this entry exists so the specs are findable from inside
+the crate that owns them.
+
+---
+
 ## P2: Research
 
 ### Hybrid head caching (RS+CA)
@@ -1561,104 +1693,16 @@ bottleneck.
 
 ---
 
-## Completed
+## Completed work
 
-| Item | Date | Impact |
-|------|------|--------|
-| Forward pass (CPU BLAS) | 2026-03 | Foundation |
-| BLAS-fused attention | 2026-04-03 | Online softmax, O(seq) memory |
-| WalkFfn (sparse FFN via vindex) | 2026-04-03 | Gate KNN + top-K |
-| CachedLayerGraph | 2026-04-04 | Skip L0-12, 0.999 cosine |
-| LayerGraph trait | 2026-04-04 | Pluggable per-layer routing |
-| predict_honest | 2026-04-06 | Production path, GPU+CPU hybrid |
-| GPU prefill pipeline | 2026-04-06 | seq>1 on GPU (pre-norm models) |
-| Q4_K FFN format wiring | 2026-04-07 | Vindex Q4_K FFN → FullPipelineLayer |
-| GELU-tanh activation | 2026-04-07 | Gemma3 correct on GPU |
-| Post-norm guard | 2026-04-07 | Gemma3 falls to CPU correctly |
-| KvEngine trait + EngineKind | 2026-04-25 | Pluggable engine selector + CLI params |
-| MarkovResidualEngine | 2026-04-25 | Residual-based KV (exact, 287×) |
-| UnlimitedContextEngine | 2026-04-25 | Window checkpoints (exact within window, 254×) |
-| BackendFfn (Q4K FFN dispatch) | 2026-04-25 | WalkFfn + Metal for FFN in all engines |
-| cold_kv cache (MarkovRS) | 2026-04-25 | Skip cold-tier recompute; 8.5× decode speedup |
-| Profiler (per-stage timing) | 2026-04-25 | `larql bench --engine --profile` breakdown |
-| TurboQuantEngine | 2026-04-26 | 4-bit WHT+Lloyd-Max K/V compression (4×, cos≈0.991) |
-| ApolloEngine | 2026-04-26 | Retrieval+injection (20,000×, compressed path) |
-| `forward_from_layer` | 2026-04-26 | Start forward at crystal_layer; 8.5× Apollo speedup |
-| Metal Q4K path for all engines | 2026-04-26 | ~95 tok/s across all 4 engines |
-| `generate/` split (cpu/gpu/lm_head/types) | 2026-04-26 | Structured generation directory |
-| `markov_residual/` split (store/engine/compute/q4k) | 2026-04-26 | Structured engine directory |
-| `forward/predict/` split (types/raw/dense/ffn) | 2026-04-26 | Forward predict directory |
-| `forward/ops.rs` extracted | 2026-04-26 | Shared math primitives |
-| `graph_ffn.rs` → `ffn/graph_backend.rs` | 2026-04-26 | Correct placement in ffn/ |
-| 400+ unit tests | 2026-04-26 | Synthetic weights, no disk I/O |
-| 49% line coverage (llvm-cov) | 2026-04-26 | Baseline measured |
-| Code quality review (3-agent) | 2026-04-26 | Unsafe removed, LCG fixed, OnceLock added |
-| P1 code quality fixes (magic strings, duplication) | 2026-04-25 | env-var names, GELU constants |
-| `ffn/remote.rs` → `remote/codec.rs` + `remote/http.rs` | 2026-04-26 | No magic strings; codec/HTTP separation |
-| `turbo_quant/mod.rs` → `engine.rs` | 2026-04-26 | Consistent engine layout; thin mod.rs |
-| Tests: `markov_residual/` (store, engine, compute) | 2026-04-26 | 0 → 15 tests; prefill/decode/clip coverage |
-| Tests: `ffn/sparse_compute.rs` + `ffn/sparse.rs` | 2026-04-26 | 0 → 14 tests; sparse FFN validated |
-| Tests: `ffn/graph_backend.rs` | 2026-04-26 | 0 → 10 tests; GateIndex build/lookup/save |
-| Tests: `forward/ops.rs` | 2026-04-26 | 0 → 8 tests; dot_proj/add_bias/apply_norm |
-| 457 unit tests total | 2026-04-26 | +~50 tests vs previous session |
-| Bug: `eos_id = 1` in grid.rs | 2026-04-26 | Correct EOS on all models, not just Gemma |
-| Softmax unified to `forward/ops.rs` | 2026-04-26 | 2 duplicate impls removed |
-| `forward/ple.rs` norm_eps fixed | 2026-04-26 | Uses `arch.norm_eps()` not hardcoded 1e-6 |
-| Tests: `unlimited_context/extend.rs` | 2026-04-26 | 0 → 8 tests; checkpoint, RoPE, chained extends |
-| Tests: `layer_graph/dense.rs` | 2026-04-26 | 0 → 8 tests; shape, capture, PerLayerGraph bounds |
-| Tests: `layer_graph/walk.rs` | 2026-04-26 | 0 → 7 tests; Walk + Pipelined layer range |
-| Tests: `layer_graph/mod.rs` | 2026-04-26 | 0 → 3 tests; trait dispatch, name distinctness |
-| Tests: `forward/ple.rs` | 2026-04-26 | 0 → 6 tests; guard paths + softmax |
-| Tests: GQA reps>1 | 2026-04-26 | 3 tests; shape, finiteness, KV-head sharing |
-| Tests: RoPE property tests | 2026-04-26 | 4 tests; base sensitivity, offset=position, fractions |
-| 499 unit tests total | 2026-04-26 | +42 tests; all passing |
-| Tests: `layer_graph/prefill.rs` | 2026-04-26 | 6 tests; CPU path shape/finiteness/logits |
-| Tests: `layer_graph/template.rs` | 2026-04-26 | 12 tests; detect_template + TemplateUniverse + GuidedWalk |
-| Tests: `layer_graph/pipeline_layer.rs` | 2026-04-26 | 6 tests; arch params, attn weights, FFN stride |
-| Tests: `layer_graph/grid.rs` | 2026-04-26 | 1 test; error path for missing Q4K mmap |
-| Integration tests: `test_layer_graph_integration.rs` | 2026-04-26 | 7 ignored tests; real vindex prefill/pipeline/template |
-| Fix: `residual_diff/capture.rs` missing PathBuf import | 2026-04-26 | Pre-existing bug; broke lib test compilation |
-| 525 unit tests total | 2026-04-26 | All passing |
-| `generate/eos.rs` — `EosConfig` | 2026-04-26 | Built-in stops + `generation_config.json`; fixes Gemma 4 `<end_of_turn>` bug |
-| `generate/detok.rs` — `Detokenizer` | 2026-04-26 | Cumulative-decode delta; preserves HF `▁` leading-space across SP and BPE |
-| `generate/sampling.rs` — `Sampler` + `SamplingConfig` | 2026-04-26 | Greedy / temp / top-k / top-p + seed; <2µs/call sparse path |
-| `generate_with_sampling` wired into GPU path | 2026-04-26 | Greedy `generate` is a thin wrapper; backward compatible |
-| Examples: `sampling_demo`, `eos_demo`, `detok_demo` | 2026-04-26 | End-to-end demos; detok runs without a model |
-| `bench_sampling` benchmark | 2026-04-26 | Per-call cost across 4 configs × 3 vocab sizes; results in PERFORMANCE.md |
-| 35 sampling/eos/detok tests | 2026-04-26 | All passing; 613 lib tests total |
-| `generate_streaming(... on_token)` callback | 2026-04-26 | Per-token streaming; `generate_with_sampling` is thin no-op wrapper |
-| `chat_session.rs` — `ChatSession` + `TurnRenderer` | 2026-04-26 | Multi-turn buffer with whole-turn eviction; Gemma/ChatML/Llama-3 renderers |
-| Examples: `streaming_demo`, `chat_demo` | 2026-04-26 | Live token streaming + 3-turn chat over `ChatSession` |
-| Smoke test: `test_gemma3_smoke.rs` | 2026-04-26 | One-token greedy regression; CI_INTEGRATION fail-loud mode |
-| 13 ChatSession tests + streaming integration | 2026-04-26 | All passing; 626 lib tests total |
-| Q4_K stride validation in `load_attn_q4k` | 2026-04-27 | Catches stale 148-byte vindexes; clear "rebuild" error vs silent NaN |
-| `QuantFormatInfo::expected_bytes(&shape)` helper | 2026-04-27 | Single source of truth for stride math; used by loader validation |
-| 11 stride-validation tests (registry + loader) | 2026-04-27 | 144 vs 148-byte stride; arbitrary lengths; Q4_K & Q6_K shapes |
-| Q4_K vs Q4_KF kernel routing fix in `quant_matvec::encode` | 2026-04-27 | Q4_K weights now dispatch the Q4_K kernel; `FusedQkvKernel` enum carries TG geometry |
-| `vindex::open_inference_vindex` strict loader | 2026-04-27 | Single entry point; propagates stride errors instead of silently degrading |
-| Demos switched to `open_inference_vindex` | 2026-04-27 | sampling/streaming/eos/chat now error loudly with rebuild guidance on stale vindexes |
+Dated entries live in [`CHANGELOG.md`](CHANGELOG.md). Headline milestones:
 
-### 2026-04-30 — gRPC grid accuracy + dense Metal chat template + Gemma 4 model coverage
-
-End-to-end accuracy work across Gemma 4's three production variants (26B-A4B
-MoE via gRPC grid, 31B dense via Metal, E2B with PLE). Started from the gRPC
-grid producing semantically wrong text ("not specified in the text") and
-ended with all four Gemma 4 vindexes producing correct answers. Per-layer
-CPU vs Metal residual parity (cos ≥ 0.9999 across all 60 layers of the 31B)
-confirmed the inference math itself was always correct — every remaining
-gap was somewhere in the wrapping, sampling, or routing logic.
-
-| What | Date | Notes |
-|------|------|-------|
-| `grid.rs` uses `Detokenizer` + `EosConfig::from_vindex_dir` | 2026-04-30 | Was per-token decode losing SP `▁` leading-space + falling back to `<{id}>` for special tokens; output looked like "Thecapital of France is**not specified...**" |
-| Special-token suppression in grid `pick_next_filtered` | 2026-04-30 | Built from `tokenizer.get_added_tokens_decoder()` + structural-marker scan (`<unused…>`, HTML tags, `[multimodal]`). Top-K=256 fallback finds a real word when many candidates are markers. Q4_K quantisation noise was lifting `<mask>` (id 4) over the intended next word at the first answer position |
-| `chat::render_user_prompt` shared helper | 2026-04-30 | Centralises `LARQL_RAW_PROMPT` / `LARQL_THINKING` / `LARQL_SYSTEM` / `LARQL_NO_DEFAULT_SYSTEM` + auto Gemma 4 default system prompt. Used by both `run_with_moe_shards` (gRPC) and `walk_cmd::run_predict_q4k` (dense Metal) |
-| Built-in Gemma 4 fallback chat template | 2026-04-30 | Vindexes extracted before `chat_template.jinja` was snapshotted (early 31B and E2B) silently sent raw prompts and looped "The answer is:". `family_default_template("gemma4")` plugs the gap |
-| Dense Metal path now applies chat templates | 2026-04-30 | `walk_cmd::run_predict_q4k` was sending the raw user string to `encode_prompt`; the chat-template machinery only ran for gRPC. Both paths now go through `render_user_prompt` |
-| `lm_head_topk` falls back to backend GEMV when KNN is all-zero | 2026-04-30 | At the prefill→decode boundary the Metal `q4k_matvec` for lm_head occasionally returned 256/256 zero scores while h_1d was healthy (rms ≈ 4, max_abs ≈ 60). Detect + retry via `backend_lm_head_topk` recovers a non-zero distribution immediately |
-| PLE auto-route for Gemma 4 E2B | 2026-04-30 | E2B has `hidden_size_per_layer_input=256` (per-layer-input gate + projection + norm + global PLE embedding). The CPU dense path implements PLE; Metal does not. `generate_streaming` now checks `arch.has_per_layer_embeddings()` and delegates to `generate_via_cpu_q4k` for those models so the residual stream gets the per-layer per-position contribution. Without this E2B emitted multilingual gibberish; with it, "The capital of France is Paris" |
-| Diagnostic env vars: `LARQL_DEBUG_TOKEN_IDS`, `LARQL_DEBUG_TOPK` | 2026-04-30 | Per-step token-id + raw top-K scores in both `grid.rs` (gRPC) and `gpu.rs` (dense). Surfaced the "all logits == 0.000" smoking gun that localised the lm_head KNN bug |
-| `larql parity --component layer` extended to dense | 2026-04-30 | Was MoE-only (`LARQL_DUMP_RESIDUALS`). Now uses `LARQL_METAL_DUMP_LAYERS` for dense models — wrote per-layer `metal_layer_NN_h_out.f32` and CPU dump files. Gave us the cos ≥ 0.9999 confirmation across 60 layers that ruled out the inference math as the bug source |
-| `larql parity --component lm-head` works on dense | 2026-04-30 | Dropped the MoE-only gate for `lm-head` (Q4_K vs f32 reference is backend-agnostic) |
-| `test_logits_goldens.rs` compile fix + 5 new entries | 2026-04-30 | Added missing `None` for `predict_q4k_hidden`'s `Option<&RemoteMoeBackend>`; refreshed stale 5 goldens to match current kernel state; added `gemma3-4b-q4k-downq4k` (Q4_K-down regression test), `gemma4-31b-q4k-q6kdown` (Q6_K-down dense), `gemma4-e2b-q4k` (PLE auto-route) — 13/13 passing |
-| Discovered: in-process Metal MoE path (`gpu_moe_dispatch_with_scratch`) shares the bug | 2026-04-30 | Until now nobody had run `larql run --metal` on Gemma 4 26B-A4B (the gRPC grid was the only tested path). It produces the same wrong text as the server's Metal expert dispatch ("answer is in the context" instead of "Paris"). The gRPC-with-CPU-experts path has been the only working route all along — the in-process Metal MoE was always broken for this model. See `larql-compute/ROADMAP.md` "Open: Metal MoE expert kernel — accuracy bug at inter=704" for the kernel-side fix plan |
+- **2026-05-10** — Hardening pass H8/H9/H11 shipped; H12 down to one file (`generate/gpu.rs`); 639 lib tests.
+- **2026-05-09** — Cleanup pass: blanket allows dropped, f16 codec via `half`, `forward/predict/raw.rs` dedup, 8 files crossed 90% coverage floor.
+- **2026-05-02** — Mechanistic interpretability engine surface MI0–MI3 + dense/custom-backend MI4 parity.
+- **2026-04-30** — gRPC grid + dense Metal chat templates + Gemma 4 four-variant accuracy.
+- **2026-04-27** — Q4_K stride validation, strict vindex loader.
+- **2026-04-26** — Generation quality (EOS, detok, sampling, streaming, ChatSession) + structural splits + ~100 new tests.
+- **2026-04-25** — `KvEngine` trait, MarkovResidual, UnlimitedContext, BackendFfn, profiler.
+- **2026-04** — `WalkFfn`, `LayerGraph` trait, `predict_honest`, GPU prefill, Q4_K FFN format wiring, TurboQuant, Apollo, Metal Q4K parity.
+- **2026-03** — Forward pass (CPU BLAS) foundation.

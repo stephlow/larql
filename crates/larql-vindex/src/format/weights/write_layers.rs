@@ -17,6 +17,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::format::filenames::{layer_weights_filename, LAYERS_DIR};
 use crate::VindexError;
 use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 
@@ -43,6 +44,13 @@ impl LayerWeightFormat {
 
 const MAGIC: u32 = u32::from_le_bytes(*b"LYRW");
 const FORMAT_VERSION: u32 = 1;
+const U32_FIELD_BYTES: usize = std::mem::size_of::<u32>();
+const U64_FIELD_BYTES: usize = std::mem::size_of::<u64>();
+const HEADER_FIELDS: usize = 6;
+const OFFSET_FIELDS_PER_ENTRY: usize = 4;
+const HEADER_BYTES: usize = HEADER_FIELDS * U32_FIELD_BYTES;
+const OFFSET_ENTRY_BYTES: usize = OFFSET_FIELDS_PER_ENTRY * U64_FIELD_BYTES;
+const BF16_BYTES: usize = std::mem::size_of::<u16>();
 
 /// One quantized entry: gate+up bytes and down bytes, both in the same format.
 pub struct LayerEntry {
@@ -65,10 +73,10 @@ pub fn write_layer_weights(
     inter: usize,
     hidden: usize,
 ) -> Result<(), VindexError> {
-    let layers_dir = dir.join("layers");
+    let layers_dir = dir.join(LAYERS_DIR);
     std::fs::create_dir_all(&layers_dir)?;
 
-    let filename = format!("layers/layer_{layer:02}.weights");
+    let filename = layer_weights_filename(layer);
     let path = dir.join(&filename);
     let mut f = BufWriter::new(std::fs::File::create(&path)?);
 
@@ -83,9 +91,9 @@ pub fn write_layer_weights(
     f.write_all(&(hidden as u32).to_le_bytes())?;
 
     // ── Offset table (num_entries × 4 × u64) ──
-    // Compute offsets: header=24 bytes, table=num_entries*32 bytes, then data.
-    let header_bytes: u64 = 24;
-    let table_bytes: u64 = num_entries as u64 * 32;
+    // Compute offsets: header, table, then data.
+    let header_bytes: u64 = HEADER_BYTES as u64;
+    let table_bytes: u64 = num_entries as u64 * OFFSET_ENTRY_BYTES as u64;
     let mut cursor: u64 = header_bytes + table_bytes;
 
     let mut offsets: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(entries.len());
@@ -127,22 +135,24 @@ pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Quantize an f32 slice to the specified format.
-/// Returns the quantized byte Vec.
-///
-/// The `block_width` is the number of columns (used for padding to the
-/// nearest block boundary when required by the format).
-pub fn quantize_f32(data: &[f32], format: LayerWeightFormat) -> Vec<u8> {
-    match format {
+/// Returns an error for declared-but-unimplemented formats instead of
+/// silently writing Q4_K bytes under the wrong header tag.
+pub fn quantize_f32(data: &[f32], format: LayerWeightFormat) -> Result<Vec<u8>, VindexError> {
+    let bytes = match format {
         LayerWeightFormat::Q4_K => quantize_q4_k(data),
         LayerWeightFormat::Q6_K => quantize_q6_k(data),
         LayerWeightFormat::F32 => bytemuck_f32_to_bytes(data),
-        LayerWeightFormat::F16 | LayerWeightFormat::BF16 => {
-            // Store as f32 — f16/bf16 conversion not yet implemented here.
-            // Caller should use F32 format for now.
-            bytemuck_f32_to_bytes(data)
+        LayerWeightFormat::F16
+        | LayerWeightFormat::BF16
+        | LayerWeightFormat::Q4_0
+        | LayerWeightFormat::Q8_0
+        | LayerWeightFormat::FP4 => {
+            return Err(VindexError::Parse(format!(
+                "per-layer FFN writer does not implement quantization for {format:?}"
+            )));
         }
-        _ => quantize_q4_k(data), // fallback: Q4_K for unimplemented formats
-    }
+    };
+    Ok(bytes)
 }
 
 fn bytemuck_f32_to_bytes(data: &[f32]) -> Vec<u8> {
@@ -177,18 +187,18 @@ pub fn quantize_dense_entry(
     inter: usize,
     hidden: usize,
     format: LayerWeightFormat,
-) -> LayerEntry {
+) -> Result<LayerEntry, VindexError> {
     // gate+up interleaved: [gate rows, up rows] = [2*inter, hidden]
     let mut gate_up_f32 = Vec::with_capacity(2 * inter * hidden);
     gate_up_f32.extend_from_slice(gate_f32);
     gate_up_f32.extend_from_slice(up_f32);
-    let gate_up = quantize_f32(&gate_up_f32, format);
+    let gate_up = quantize_f32(&gate_up_f32, format)?;
 
     // down: [hidden, inter] padded to 256-element column boundary
     let (down_padded, _) = pad_cols_to_256(down_f32, hidden, inter);
-    let down = quantize_f32(&down_padded, format);
+    let down = quantize_f32(&down_padded, format)?;
 
-    LayerEntry { gate_up, down }
+    Ok(LayerEntry { gate_up, down })
 }
 
 /// Build quantized entries for one MoE layer from BF16-packed expert tensors.
@@ -203,23 +213,23 @@ pub fn quantize_moe_entries(
     moe_inter: usize,
     hidden: usize,
     format: LayerWeightFormat,
-) -> Vec<LayerEntry> {
-    let gate_up_stride = 2 * moe_inter * hidden * 2; // bytes per expert (BF16)
-    let down_stride = hidden * moe_inter * 2; // bytes per expert (BF16)
+) -> Result<Vec<LayerEntry>, VindexError> {
+    let gate_up_stride = 2 * moe_inter * hidden * BF16_BYTES; // bytes per expert
+    let down_stride = hidden * moe_inter * BF16_BYTES; // bytes per expert
 
     (0..num_experts)
         .map(|e| {
             let gu_bytes = &gate_up_bf16[e * gate_up_stride..(e + 1) * gate_up_stride];
             let gate_up_f32 = bf16_bytes_to_f32(gu_bytes);
-            let gate_up = quantize_f32(&gate_up_f32, format);
+            let gate_up = quantize_f32(&gate_up_f32, format)?;
 
             let dn_bytes = &down_bf16[e * down_stride..(e + 1) * down_stride];
             let down_f32_src = bf16_bytes_to_f32(dn_bytes);
             // Pad inter → 256-element boundary (required for block formats like Q4_K)
             let (down_padded, _) = pad_cols_to_256(&down_f32_src, hidden, moe_inter);
-            let down = quantize_f32(&down_padded, format);
+            let down = quantize_f32(&down_padded, format)?;
 
-            LayerEntry { gate_up, down }
+            Ok(LayerEntry { gate_up, down })
         })
         .collect()
 }
@@ -229,7 +239,7 @@ pub fn quantize_moe_entries(
 /// Returns `(format, num_entries, inter, hidden, offsets)` where
 /// `offsets[e] = (gate_up_offset, gate_up_bytes, down_offset, down_bytes)`.
 pub fn parse_layer_weights_header(data: &[u8]) -> Option<LayerWeightsHeader> {
-    if data.len() < 24 {
+    if data.len() < HEADER_BYTES {
         return None;
     }
     let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
@@ -253,15 +263,15 @@ pub fn parse_layer_weights_header(data: &[u8]) -> Option<LayerWeightsHeader> {
     let inter = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
     let hidden = u32::from_le_bytes(data[20..24].try_into().ok()?) as usize;
 
-    let table_start = 24usize;
-    let table_end = table_start + num_entries * 32;
+    let table_start = HEADER_BYTES;
+    let table_end = table_start + num_entries * OFFSET_ENTRY_BYTES;
     if data.len() < table_end {
         return None;
     }
 
     let mut offsets = Vec::with_capacity(num_entries);
     for e in 0..num_entries {
-        let base = table_start + e * 32;
+        let base = table_start + e * OFFSET_ENTRY_BYTES;
         let gate_up_off = u64::from_le_bytes(data[base..base + 8].try_into().ok()?) as usize;
         let gate_up_bytes = u64::from_le_bytes(data[base + 8..base + 16].try_into().ok()?) as usize;
         let down_off = u64::from_le_bytes(data[base + 16..base + 24].try_into().ok()?) as usize;

@@ -9,6 +9,7 @@
 use metal::Buffer;
 
 use crate::metal::buffers::BufferCache;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Per-position byte-stride for the shared Q8 staging buffers.
 ///
@@ -39,7 +40,7 @@ pub(crate) fn q8_staging_size(
         .max()
         .unwrap_or(q_dim_fallback);
     let q8_row_max = hidden.max(max_layer_q_dim);
-    let q8s_row_bytes = q8_row_max.div_ceil(32) * 4;
+    let q8s_row_bytes = q8_row_max.div_ceil(LEGACY_BLOCK_ELEMS) * 4;
     (q8_row_max, q8s_row_bytes)
 }
 
@@ -183,7 +184,7 @@ impl LayerBuffers {
             q8.push(bufs.output((seq_len * q8_row_max) as u64));
             q8s.push(bufs.output((seq_len * q8s_row_bytes) as u64));
             ffn_q8.push(bufs.output((seq_len * hidden) as u64));
-            ffn_q8s.push(bufs.output((seq_len * hidden.div_ceil(32) * 4) as u64));
+            ffn_q8s.push(bufs.output((seq_len * hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64));
         }
 
         Self {
@@ -228,6 +229,7 @@ impl LayerBuffers {
 mod tests {
     use super::*;
     use crate::pipeline::*;
+    use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
     const HIDDEN_SMALL: usize = 1024;
     const HIDDEN_GEMMA3_4B: usize = 2560;
@@ -266,7 +268,7 @@ mod tests {
             post_attn_norm_bias: None,
             norm_offset: 1.0,
             qk_norm_offset: 1.0,
-            eps: 1e-6,
+            eps: RMSNORM_EPSILON_DEFAULT,
             has_post_norms: false,
             norm_type: NormType::RmsNorm,
             ffn_type: FfnType::Gated,
@@ -275,7 +277,7 @@ mod tests {
             head_dim,
             num_q_heads,
             num_kv_heads,
-            rope_base: 10000.0,
+            rope_base: ROPE_BASE_DEFAULT,
             rotary_dim: 0,
             sliding_window: 0,
             has_v_norm: false,
@@ -288,6 +290,10 @@ mod tests {
             ffn_is_remote: false,
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
+            kv_shared_source: None,
         }
     }
 
@@ -312,14 +318,17 @@ mod tests {
         let (q8_row_max, q8s_row_bytes) =
             q8_staging_size(&layers, HIDDEN_GEMMA3_4B, Q_DIM_SMALLER_THAN_HIDDEN);
         assert_eq!(q8_row_max, HIDDEN_GEMMA3_4B); // hidden wins
-        assert_eq!(q8s_row_bytes, HIDDEN_GEMMA3_4B / 32 * 4); // 80 blocks × 4 bytes = 320
+        assert_eq!(q8s_row_bytes, HIDDEN_GEMMA3_4B / LEGACY_BLOCK_ELEMS * 4); // 80 blocks × 4 bytes = 320
 
         // Larger Q than hidden: q_dim wins.
         let layers = synth_layers(4, 16, 4, 256); // q_dim = 16*256 = 4096
         let (q8_row_max, q8s_row_bytes) =
             q8_staging_size(&layers, HIDDEN_GEMMA3_4B, Q_DIM_LARGER_THAN_HIDDEN);
         assert_eq!(q8_row_max, Q_DIM_LARGER_THAN_HIDDEN);
-        assert_eq!(q8s_row_bytes, Q_DIM_LARGER_THAN_HIDDEN / 32 * 4); // 512
+        assert_eq!(
+            q8s_row_bytes,
+            Q_DIM_LARGER_THAN_HIDDEN / LEGACY_BLOCK_ELEMS * 4
+        ); // 512
     }
 
     /// Mixed sliding/global geometry (Gemma 4 31B): different layers

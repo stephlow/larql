@@ -66,7 +66,9 @@ Key pattern methods:
 - `layer_prefix(layer)` → `"layers.5."` (base for all layer keys)
 - `key_prefixes_to_strip()` → `&["model."]` (stripped during loading)
 - `embed_key()`, `final_norm_key()` → embedding and final norm
+- `position_embed_key()` → learned absolute positional embedding (`Some("wpe.weight")` for GPT-2; `None` for rotary models). When present the loader populates `ModelWeights::position_embed`.
 - `attn_q_key(layer)`, `attn_k_key(layer)`, ... → attention projections
+- `fused_qkv_key(layer)`, `fused_qkv_bias_key(layer)` → fused Conv1D-style QKV (`Some(...)` for GPT-2; the loader splits this into the per-projection q/k/v keys above so downstream code stays family-agnostic)
 - `ffn_gate_key(layer)`, `ffn_up_key(layer)`, `ffn_down_key(layer)` → FFN
 - `input_layernorm_key(layer)`, `post_attention_layernorm_key(layer)` → norms
 
@@ -101,6 +103,15 @@ Control how attention is computed at each layer:
 - `qk_norm_weight_offset()` — same for QK norms (Gemma 2/3: 1.0, Gemma 4: 0.0)
 - `has_post_norms()` — 4 norms per layer (Gemma 2/3/4) vs 2 (Llama)
 - `attn_q_norm_key(layer)`, `attn_k_norm_key(layer)` — QK norm weights (None if unused)
+
+### Biases
+
+GPT-2 / StarCoder2 carry a bias on every projection; RMSNorm-family models
+generally don't. Override these to surface the bias keys; loaders use them to
+populate `ModelWeights::vectors` and inference reads them post-matmul.
+
+- `attn_q_bias_key(layer)`, `attn_k_bias_key(layer)`, `attn_v_bias_key(layer)`, `attn_o_bias_key(layer)`
+- `ffn_up_bias_key(layer)`, `ffn_down_bias_key(layer)`
 
 ### MoE (~12 methods)
 

@@ -72,13 +72,19 @@ pub struct VindexConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fp4: Option<Fp4Config>,
 
-    /// FFN weight storage layout (§5.12). When `"per_layer"`, FFN weights live
-    /// in `layers/layer_{L:02}.weights` — one file per layer, format declared
-    /// in each file's header. Works for both dense (num_entries=1) and MoE
-    /// (num_entries=num_experts). Absent → legacy flat-file layout
-    /// (`interleaved_q4k.bin` / `experts_packed.bin`).
+    /// FFN weight storage layout (§5.12). When `PerLayer`, FFN weights
+    /// live in `layers/layer_{L:02}.weights` — one file per layer, format
+    /// declared in each file's header. Works for both dense
+    /// (num_entries=1) and MoE (num_entries=num_experts). Absent → legacy
+    /// flat-file layout (`interleaved_q4k.bin` / `experts_packed.bin`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ffn_layout: Option<String>,
+    pub ffn_layout: Option<FfnLayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FfnLayout {
+    PerLayer,
 }
 
 /// Provenance: which model checkpoint this vindex was built from.
@@ -288,6 +294,16 @@ mod fp4_schema_tests {
         // And still deserialises when the key is absent (default).
         let parsed: VindexConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.fp4.is_none());
+    }
+
+    #[test]
+    fn ffn_layout_round_trips_as_snake_case_enum() {
+        let parsed: VindexConfig =
+            serde_json::from_str(r#"{"version":2,"model":"x","family":"gemma3","num_layers":0,"hidden_size":0,"intermediate_size":0,"vocab_size":0,"embed_scale":1.0,"layers":[],"down_top_k":0,"ffn_layout":"per_layer"}"#)
+                .unwrap();
+        assert_eq!(parsed.ffn_layout, Some(FfnLayout::PerLayer));
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"ffn_layout\":\"per_layer\""));
     }
 
     #[test]

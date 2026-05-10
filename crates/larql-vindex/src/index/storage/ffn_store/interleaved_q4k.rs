@@ -20,9 +20,10 @@ use crate::format::filenames::{
 };
 use crate::format::weights::Q4kManifestEntry;
 use crate::index::core::VectorIndex;
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::mmap_util::mmap_demand_paged;
 
-use super::DownFeaturesQ4kEntry;
+use super::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER, FFN_DOWN};
 
 /// Read + typed-deserialise a Q4_K manifest JSON file. Validates each
 /// entry's format tag against `quant::registry`. `display_name` is the
@@ -66,32 +67,34 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: the q4k forward walk reads only the activated features'
         // byte ranges per layer, not the entire 13 GB file.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.interleaved_q4k_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
         let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
-        if manifest_path.exists() {
+        let manifest = if manifest_path.exists() {
             // Typed deserialise — `Q4kManifestEntry` matches the writer's
             // shape, so a renamed field on either side fails loudly here
             // instead of silently producing zero-byte slices.
             let raw = read_q4k_manifest(&manifest_path, INTERLEAVED_Q4K_MANIFEST_JSON)?;
-            let entries: Vec<(usize, usize, String)> = raw
-                .into_iter()
-                .map(|e| {
-                    (
-                        e.offset as usize,
-                        e.length as usize,
-                        e.format_tag().to_string(),
-                    )
-                })
-                .collect();
-            self.ffn.interleaved_q4k_manifest = Some(entries);
-        }
+            Some(
+                raw.into_iter()
+                    .map(|e| {
+                        (
+                            e.offset as usize,
+                            e.length as usize,
+                            e.format_tag().to_string(),
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Arc::make_mut(&mut self.storage).set_interleaved_q4k(mmap, manifest);
         Ok(())
     }
 
     pub fn has_interleaved_q4k(&self) -> bool {
-        self.ffn.interleaved_q4k_mmap.is_some()
+        self.storage.has_interleaved_q4k()
     }
 
     /// Load `down_features_q4k.bin` if present (W2 feature-major down).
@@ -111,8 +114,7 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only the activated features' byte ranges per
         // layer get read in. Same access pattern as `interleaved_q4k.bin`.
-        let mmap = unsafe { mmap_demand_paged(&file)? };
-        self.ffn.down_features_q4k_mmap = Some(Arc::new(mmap));
+        let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
         let raw = read_q4k_manifest(&manifest_path, DOWN_FEATURES_Q4K_MANIFEST_JSON)?;
         let entries: Vec<DownFeaturesQ4kEntry> = raw
@@ -131,13 +133,13 @@ impl VectorIndex {
                 })
             })
             .collect::<Result<Vec<_>, VindexError>>()?;
-        self.ffn.down_features_q4k_manifest = Some(entries);
+        Arc::make_mut(&mut self.storage).set_down_features_q4k(mmap, entries);
         Ok(())
     }
 
     /// Whether feature-major Q4_K-encoded down vectors are loaded.
     pub fn has_down_features_q4k(&self) -> bool {
-        self.ffn.down_features_q4k_mmap.is_some() && self.ffn.down_features_q4k_manifest.is_some()
+        self.storage.has_down_features_q4k()
     }
 
     /// Per-layer slice of `down_features_q4k.bin` plus the format tag
@@ -146,52 +148,35 @@ impl VectorIndex {
     /// `[intermediate, padded_width]`, Q4_K/Q6_K-encoded — feature
     /// `feat` lives at byte offset
     /// `feat * bytes_per_row(padded_width)` inside the slice.
+    /// Per-layer slice of `down_features_q4k.bin` plus the format tag
+    /// and the padded row width. Forwarded through
+    /// [`VectorIndex::storage`] (step 4 of the `VindexStorage`
+    /// migration).
     pub fn down_features_q4k_layer_data(&self, layer: usize) -> Option<(&[u8], &str, usize)> {
-        let mmap = self.ffn.down_features_q4k_mmap.as_ref()?;
-        let manifest = self.ffn.down_features_q4k_manifest.as_ref()?;
-        let entry = manifest.get(layer)?;
-        // Defensive: a corrupt or stale manifest can describe a slice
-        // outside the mmap. Returning None lets callers fall back to the
-        // uniform-stride path; panicking here would abort load/query.
-        let end = entry.offset.checked_add(entry.length)?;
-        if end > mmap.len() {
-            return None;
-        }
-        Some((
-            &mmap[entry.offset..end],
-            entry.format.as_str(),
-            entry.padded_width,
-        ))
+        let (view, fmt, padded_width) = self.storage.down_features_q4k_layer_data(layer)?;
+        Some((view.as_slice(), fmt, padded_width))
     }
 
     /// Per-layer Q4_K/Q6_K FFN slices — [gate, up, down] with formats.
     ///
     /// Returns `None` when the FFN manifest wasn't present at load time
-    /// (caller should fall back to uniform-stride). Returns `Some` iff the
-    /// manifest has 3 entries for `layer`; downstream kernels dispatch on
-    /// the format string (`"Q4_K"` or `"Q6_K"`).
-    pub fn interleaved_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 3]> {
-        let mmap = self.ffn.interleaved_q4k_mmap.as_ref()?;
-        let manifest = self.ffn.interleaved_q4k_manifest.as_ref()?;
-        let base = layer * 3;
-        if base + 2 >= manifest.len() {
-            return None;
-        }
-        // Bounds-check each slice against the mmap before forming the
-        // output. A stale/corrupt manifest can name an offset+length
-        // outside the file; returning None here lets the caller fall back
-        // to the uniform-stride path instead of panicking on the slice.
-        for i in 0..3 {
-            let (offset, length, _) = &manifest[base + i];
-            let end = offset.checked_add(*length)?;
-            if end > mmap.len() {
-                return None;
-            }
-        }
-        let mut out: [(&[u8], &str); 3] = [(&[], ""); 3];
-        for i in 0..3 {
-            let (offset, length, ref format) = manifest[base + i];
-            out[i] = (&mmap[offset..offset + length], format.as_str());
+    /// (caller should fall back to uniform-stride). Returns `Some` iff
+    /// the manifest has `FFN_COMPONENTS_PER_LAYER` entries for `layer`;
+    /// downstream kernels dispatch on the format string (`"Q4_K"` or
+    /// `"Q6_K"`).
+    pub fn interleaved_q4k_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(&[u8], &str); FFN_COMPONENTS_PER_LAYER]> {
+        // Forwarded through `self.storage` (step 4 of the
+        // `VindexStorage` migration). Public signature unchanged so
+        // existing callers don't move.
+        let arr = self.storage.interleaved_q4k_layer_data(layer)?;
+        let mut out: [(&[u8], &str); FFN_COMPONENTS_PER_LAYER] =
+            [(&[], ""); FFN_COMPONENTS_PER_LAYER];
+        for i in 0..FFN_COMPONENTS_PER_LAYER {
+            let (view, fmt) = arr[i];
+            out[i] = (view.as_slice(), fmt);
         }
         Some(out)
     }
@@ -208,23 +193,30 @@ impl VectorIndex {
     /// matrices) — matches the build_q4k_weights writer.
     pub fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
         #[cfg(unix)]
-        if let Some(ref mmap) = self.ffn.interleaved_q4k_mmap {
+        if let Some(bytes) = self.storage.interleaved_q4k_whole_buffer_view() {
+            let mmap: &[u8] = bytes.as_ref();
             let intermediate = self.num_features(layer);
             if intermediate == 0 {
                 return;
             }
-            let (start, len) = if let Some(ref manifest) = self.ffn.interleaved_q4k_manifest {
-                let base = layer * 3;
-                if base + 2 >= manifest.len() {
+            // The trait gives us the layer view directly when a
+            // manifest is loaded — that's the correct (start, end)
+            // span. Without the per-layer view we fall back to the
+            // legacy uniform-Q4_K stride.
+            let (start, len) = if let Some(arr) = self.storage.interleaved_q4k_layer_data(layer) {
+                // Span = first component's start to last component's end.
+                let first_start = {
+                    let (view, _) = arr[0];
+                    view.offset
+                };
+                let last_end = {
+                    let (view, _) = arr[FFN_DOWN];
+                    view.offset + view.length
+                };
+                if first_start >= mmap.len() || last_end <= first_start {
                     return;
                 }
-                let s = manifest[base].0;
-                let (last_off, last_len, _) = &manifest[base + 2];
-                let e = (last_off + last_len).min(mmap.len());
-                if s >= mmap.len() || e <= s {
-                    return;
-                }
-                (s, e - s)
+                (first_start, last_end - first_start)
             } else {
                 // Uniform-stride fallback: matches build_q4k_weights's
                 // Q4_K-only writer. Q4_K is 144 bytes per 256 elements.

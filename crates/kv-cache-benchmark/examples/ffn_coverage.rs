@@ -1,6 +1,6 @@
 //! FFN Graph Walk Coverage — Stage 1 decoupled-mode runner.
 //!
-//! Spec: `experiments/25_ffn_coverage/SPEC.md`
+//! Spec: `~/chris-source/chris-experiments/routing/25_ffn_coverage/SPEC.md`
 //!
 //! For each prompt, runs one forward pass. At each FFN layer, the instrumented
 //! backend computes BOTH the dense WeightFfn output and the WalkFfn output for
@@ -12,7 +12,7 @@
 //!   cargo run --example ffn_coverage --features real-model --release -- \
 //!     google/gemma-3-4b-it output/gemma3-4b-q4k-v2.vindex \
 //!     --k full \
-//!     --output experiments/25_ffn_coverage/results/factual_narrow.json
+//!     --output ~/chris-source/chris-experiments/routing/25_ffn_coverage/results/factual_narrow.json
 
 #[cfg(feature = "real-model")]
 fn main() {
@@ -53,7 +53,9 @@ mod ffn_coverage {
     fn parse_args() -> Args {
         let mut raw: Vec<String> = std::env::args().skip(1).collect();
         let mut k: Option<usize> = None;
-        let mut output = String::from("experiments/25_ffn_coverage/results/factual_narrow.json");
+        let mut output = String::from(
+            "~/chris-source/chris-experiments/routing/25_ffn_coverage/results/factual_narrow.json",
+        );
         let mut limit: Option<usize> = None;
 
         let mut i = 0;

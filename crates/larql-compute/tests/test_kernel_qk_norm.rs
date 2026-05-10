@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for `qk_norm` — per-head learned-weight RMSNorm.
 //!
@@ -109,7 +109,7 @@ fn run_qk_norm(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.qk_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.qk_norm_pipeline);
     enc.set_buffer(0, Some(in_buf), 0);
     enc.set_buffer(1, Some(out_buf), 0);
     enc.set_buffer(2, Some(weight_buf), 0);
@@ -140,7 +140,7 @@ fn run_v_norm_batched(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.v_norm_batched_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.v_norm_batched_pipeline);
     enc.set_buffer(0, Some(in_buf), 0);
     enc.set_buffer(1, Some(out_buf), 0);
     enc.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);
@@ -407,7 +407,7 @@ fn assert_qk_norm_qk_matches_separate(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.qk_norm_qk_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.qk_norm_qk_pipeline);
     enc.set_buffer(0, Some(&q_buf), 0);
     enc.set_buffer(1, Some(&k_buf), 0);
     enc.set_buffer(2, Some(&q_wt_buf), 0);

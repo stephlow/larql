@@ -20,9 +20,10 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::net::TcpListener;
 
+use larql_compute::cpu::ops::moe::cpu_moe_forward;
+use larql_compute::MoeLayerWeights;
 use larql_inference::{
-    cpu_moe_forward, ndarray::ArcArray2, MoeLayerWeights, MoeRouterWeights, RemoteMoeBackend,
-    RemoteMoeError, ShardConfig,
+    ndarray::ArcArray2, MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig,
 };
 use larql_models::weights::ModelWeights;
 use larql_models::{ModelArchitecture, ModelConfig};
@@ -244,6 +245,7 @@ fn make_loaded_model(
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
         lm_head: embed,
+        position_embed: None,
         arch: Box::new(TestMoeArch::new()),
         num_layers: 1,
         hidden_size: HIDDEN,
@@ -274,14 +276,18 @@ fn make_loaded_model(
         weights: lock,
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         moe_scratches: std::sync::Mutex::new(HashMap::new()),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     }
 }
@@ -326,6 +332,8 @@ fn local_output(
         &MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: larql_compute::MoeRoutingPolicy::default(),
+            weight_layout: larql_compute::MoeWeightLayout::default(),
             expert_data_format: larql_compute::QuantFormat::BF16,
             router_proj,
             router_scale: &[],

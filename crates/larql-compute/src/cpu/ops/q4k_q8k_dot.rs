@@ -32,11 +32,12 @@
 //! only the inner i8×i8 → i32 dot differs.
 
 use crate::cpu::ops::q4_common::f16_to_f32;
+use larql_models::quant::ggml::{Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS};
 
 /// Q4_K super-block layout: 144 bytes per 256 values.
-const BLOCK_BYTES: usize = 144;
+const BLOCK_BYTES: usize = Q4_K_BLOCK_BYTES;
 /// Number of f32 / i8 elements per Q4_K (and Q8_K) super-block.
-const ELEMS_PER_BLOCK: usize = 256;
+const ELEMS_PER_BLOCK: usize = Q4_K_BLOCK_ELEMS;
 /// Number of 32-element sub-blocks per super-block.
 const SUBBLOCKS_PER_BLOCK: usize = 8;
 /// Sub-block size (matches Q4_K's per-32 nibble groups).
@@ -205,7 +206,9 @@ pub fn q4k_q8k_matvec_scalar(
             let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
             let (scales, mins) = unpack_scales_mins(&block[4..16]);
-            let quants = &block[16..144];
+            // 16 = 2 (d) + 2 (dmin) + 12 (packed scales/mins).
+            // The remaining BLOCK_BYTES-16 = 128 bytes are nibble-packed quants.
+            let quants = &block[16..BLOCK_BYTES];
 
             let q8_base = sb * ELEMS_PER_BLOCK;
             let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
@@ -597,7 +600,9 @@ unsafe fn q4k_q8k_matvec_avx2(
             let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
             let (scales, mins) = unpack_scales_mins(&block[4..16]);
-            let quants = &block[16..144];
+            // 16 = 2 (d) + 2 (dmin) + 12 (packed scales/mins).
+            // The remaining BLOCK_BYTES-16 = 128 bytes are nibble-packed quants.
+            let quants = &block[16..BLOCK_BYTES];
             let q8_base = sb * ELEMS_PER_BLOCK;
             let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
             let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
@@ -831,8 +836,8 @@ pub fn q4k_q8k_gate_up_neon(
 // The -(raw6 - 32) sign matches llama.cpp's `ggml_vec_dot_q6_K_q8_K`.
 // No `mins` term (Q6_K doesn't have per-group mins — it's symmetric around 32).
 
-/// Q6_K super-block size in bytes.
-const Q6K_BLOCK_BYTES: usize = 210;
+/// Q6_K super-block size in bytes (re-export of the wire-format constant).
+const Q6K_BLOCK_BYTES: usize = larql_models::quant::ggml::Q6_K_BLOCK_BYTES;
 
 /// Scalar reference: Q6_K weights × Q8_K activation matvec.
 /// Correctness oracle for the NEON implementation below.
@@ -852,7 +857,7 @@ pub fn q6k_q8k_matvec_scalar(
     if rows == 0 || cols == 0 || w.len() < rows * row_bytes {
         return;
     }
-    for r in 0..rows {
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -866,9 +871,9 @@ pub fn q6k_q8k_matvec_scalar(
             let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
 
             let mut sum1: i32 = 0;
-            for g in 0..16usize {
+            for (g, scale_byte) in sc.iter().enumerate().take(16usize) {
                 // 16-element group g, using scale sc[g].
-                let scale = sc[g] as i8 as i32;
+                let scale = *scale_byte as i8 as i32;
                 let mut dot_g: i32 = 0;
                 for k in 0..16usize {
                     let i = g * 16 + k;
@@ -886,18 +891,19 @@ pub fn q6k_q8k_matvec_scalar(
             }
             acc += d_w * d_y * sum1 as f32;
         }
-        out[r] = acc;
+        *out_r = acc;
     }
 }
 
 /// NEON-accelerated Q6_K × Q8_K matvec for `aarch64`.
 ///
 /// Per 16-element scale group:
-///   1. Vectorised dequant: 8 ql bytes → lo4[16] via nibble-unpack + vzip.
-///                          4 qh bytes → hi2[16] via byte-replicate + vshlq_s8 + mask.
-///                          raw6 = lo4 | (hi2 << 4); signed = raw6 - 32 → int8.
-///   2. One SDOT over the 16 int8 weight × int8 activation products.
-///   3. scale * dot_g accumulated into sum1.
+/// 1. Vectorised dequant: 8 ql bytes → lo4[16] via nibble-unpack + vzip.
+///    4 qh bytes → hi2[16] via byte-replicate + vshlq_s8 + mask.
+///    raw6 = lo4 | (hi2 << 4); signed = raw6 - 32 → int8.
+/// 2. One SDOT over the 16 int8 weight × int8 activation products.
+/// 3. scale * dot_g accumulated into sum1.
+///
 /// Final: acc += d_w * d_y * sum1.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub fn q6k_q8k_matvec_neon(
@@ -927,7 +933,7 @@ pub fn q6k_q8k_matvec_neon(
     let mask_03 = unsafe { vdupq_n_u8(0x03) };
     let sub32 = unsafe { vdupq_n_s8(32) };
 
-    for r in 0..rows {
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
         let row_base = r * row_bytes;
         let mut acc = 0.0f32;
         for sb in 0..n_blocks {
@@ -949,7 +955,7 @@ pub fn q6k_q8k_matvec_neon(
                 let ql_g = unsafe { ql_base.add(g * 8) };
                 let qh_g = unsafe { qh_base.add(g * 4) };
                 let q8_g = unsafe { q8_ptr.add(q8_base + g * 16) };
-                let scale = unsafe { *sc_base.add(g) as i8 as i32 };
+                let scale = unsafe { *sc_base.add(g) as i32 };
 
                 // ── Lo4 extraction (8 ql bytes → 16 uint4 values, in element order) ──
                 // ql_v[j] holds lo4 of element 2j (low nibble) and 2j+1 (high nibble).
@@ -1002,7 +1008,7 @@ pub fn q6k_q8k_matvec_neon(
 
             acc += d_w * d_y * sum1 as f32;
         }
-        out[r] = acc;
+        *out_r = acc;
     }
 }
 
@@ -1028,7 +1034,7 @@ pub fn q6k_q8k_matvec_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::ops::q4_common::{q4k_matvec_into, quantize_q4_k};
+    use crate::cpu::ops::q4_common::{q4k_matvec_into, quantize_q4_k, quantize_q6_k};
 
     /// Q8_K round-trip should reconstruct within 0.5% of absmax (1 LSB on
     /// the 127-step scale).  Sums must equal the literal i32 sums of the
@@ -1314,6 +1320,67 @@ mod tests {
         let mut out = vec![1.0f32; rows];
         q4k_q8k_matvec_scalar(&mut out, &q, &w, rows, cols);
         assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q6k_q8k_matvec_matches_q6k_f32_dispatch_within_noise() {
+        let cols = 512;
+        let rows = 5;
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin() * 1.5).collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.006).cos() * 0.7)
+            .collect();
+        let w_q6 = quantize_q6_k(&w_f32);
+
+        let f32_path = crate::cpu::ops::q6k_matvec::dispatch(&w_q6, &x, rows, cols);
+        let q8 = quantize_x_to_q8k(&x);
+        let mut q8_path = vec![0.0f32; rows];
+        q6k_q8k_matvec_scalar(&mut q8_path, &q8, &w_q6, rows, cols);
+
+        for r in 0..rows {
+            let diff = (f32_path[r] - q8_path[r]).abs();
+            assert!(
+                diff < 1.2e-1,
+                "row {r}: f32={} q8={} diff={diff}",
+                f32_path[r],
+                q8_path[r]
+            );
+        }
+    }
+
+    #[test]
+    fn q6k_q8k_public_entrypoint_matches_scalar() {
+        let cols = 256;
+        let rows = 3;
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.031).cos()).collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.011).sin() * 0.4)
+            .collect();
+        let w_q6 = quantize_q6_k(&w_f32);
+        let q8 = quantize_x_to_q8k(&x);
+        let mut scalar = vec![0.0f32; rows];
+        let mut dispatched = vec![0.0f32; rows];
+
+        q6k_q8k_matvec_scalar(&mut scalar, &q8, &w_q6, rows, cols);
+        q6k_q8k_matvec_into(&mut dispatched, &q8, &w_q6, rows, cols);
+
+        for (a, b) in scalar.iter().zip(dispatched.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn q6k_q8k_zero_dims_and_short_weights_zero_output() {
+        let q = Q8KActivation::with_capacity(0);
+        let mut out = vec![1.0f32; 4];
+        q6k_q8k_matvec_scalar(&mut out, &q, &[], 4, 0);
+        assert_eq!(out, vec![0.0f32; 4]);
+
+        let x = vec![1.0f32; 256];
+        let q = quantize_x_to_q8k(&x);
+        let mut out = vec![1.0f32; 2];
+        q6k_q8k_matvec_scalar(&mut out, &q, &vec![0u8; 210], 2, 256);
+        assert_eq!(out, vec![0.0f32; 2]);
     }
 
     /// AVX2 must produce bit-identical output to the scalar reference.

@@ -1,5 +1,31 @@
 //! Fused Q4_K gate+up — cooperative scale-loading variant.
 //!
+//! ## Retention rationale (post 2026-05-09 model-agnosticity audit)
+//!
+//! - **Tried**: 2026-05-01 on Gemma 3 4B (K=2560). Result: kernel-isolated
+//!   neutral, end-to-end null. Pinned as ADR-015 instance #2.
+//! - **Status**: Opt-in via `LARQL_GATE_UP_COOP=1`. Not deleted despite
+//!   Gemma A/B loss because:
+//!   - **Larger K dimensions could win.** Gemma 3 4B's K=2560 has only 8
+//!     sub-blocks per super-block — the cooperative scale-load amortises
+//!     across lanes but the lane-0..7 specialisation overhead dominates
+//!     when there are few super-blocks. Llama 3 70B (K=8192), Gemma 4 31B
+//!     (K=4096), or future larger architectures change this math.
+//!   - **Different ALU/bandwidth balance** on M5+/A19 silicon could shift
+//!     the trade — production is currently bandwidth-bound at 47% peak;
+//!     a wider DRAM bus would expose more compute headroom for the
+//!     scale-decode amortisation to matter.
+//! - **Re-validation gate**: A/B against `q4k_ffn_gate_up_8sg` on a vindex
+//!   with K ≥ 4096 (Gemma 4 31B or Llama 70B). Promote if batched-diag
+//!   GB/s improves AND end-to-end shows direction-match (per ADR-015).
+//! - **Deletion criterion**: if a clean cross-K bench shows null on every
+//!   K ∈ {2560, 4096, 8192} on quiet hardware, the kernel can be deleted
+//!   — but no such bench has been run yet.
+//!
+//! See `docs/shader-inventory.md` for the full retention rationale framework.
+//!
+//! ## Original kernel description
+//!
 //! Same Q4_K input format and output as [`q4k_ffn_gate_up`], but the
 //! per-super-block sub-block scales/mins (`d * sc[0..7]` and
 //! `dmin * mn[0..7]`) are computed once per simdgroup per super-block

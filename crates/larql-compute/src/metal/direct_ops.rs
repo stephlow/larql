@@ -84,7 +84,7 @@ impl MetalBackend {
             &self.queue,
             &self.bufs,
             &self.f32_ops.transb_pipeline,
-            &self.causal_attn_pipeline,
+            &self.attention.causal_attn_pipeline,
             &self.q4,
             w_q,
             w_k,

@@ -1,5 +1,105 @@
 # Roadmap — larql-compute
 
+## Open: compute modularity and model-agnostic cleanup
+
+**Status**: Started 2026-05-08.
+
+Review focus: modularity, magic strings / magic numbers, and model-family
+agnosticity in `larql-compute`.
+
+Findings now tracked here so follow-up work does not live only in review notes:
+
+- [x] Centralize CPU MoE env-var names and parsing in `src/options.rs`, with
+  namespaced `LARQL_*` names and temporary compatibility for legacy
+  `SKIP_MOE` / `MOE_DEBUG`.
+- [x] Make unsupported CPU MoE dequant formats return a typed error internally
+  instead of silently becoming an empty expert vector.
+- [x] Add crate-specific fast and integration test targets:
+  `make larql-compute-test-fast` now runs library/unit tests only for the
+  inner loop, while `make larql-compute-test-integration` walks the heavier
+  integration binaries explicitly.
+- [x] Harden cross-platform Metal gates in compute, inference, vindex benches,
+  and CLI call sites so non-macOS `--all-features` builds do not import the
+  macOS-only `metal::` module.
+- [x] Add `.github/workflows/larql-compute.yml` for Linux, Windows, and macOS
+  fast compute checks, including non-macOS `--all-features` coverage and macOS
+  `--features metal` coverage.
+- [x] Add compute coverage targets and a 90%-default per-file policy with
+  current debt baselines in `crates/larql-compute/coverage-policy.json`.
+- [x] Raise default-feature line coverage from 56.76% to 93.59% with targeted
+  tests for backend default contracts, compute option parsing, Q4K kernels, and
+  MoE helpers. Remaining per-file debt is now concentrated in
+  `cpu/ops/moe/expert.rs` and `cpu/ops/moe/forward.rs`.
+- [x] Replace remaining direct `std::env::var` reads in Metal decode/stage
+  code with the same options surface, so env names and parsing live in
+  `src/options.rs`.
+- [x] Thread explicit options through backend construction for non-debug
+  behavior, keeping env-backed debug toggles as a compatibility bridge.
+  Shipped 2026-05-09 (M1): `BackendOptions` + `MetalBackend::with_options`,
+  `default_backend_with_options` in lib.rs. Env reads still flow through
+  `BackendOptions::from_env` for compatibility.
+- [ ] Split `FullPipelineLayer` into smaller architecture and runtime specs.
+  Compatibility views now exist for `AttentionSpec`, `FfnSpec`, `MoeSpec`,
+  `LayerWeights`, `LayerNorms`, and remote-FFN settings; remaining work is to
+  migrate inference/vindex/backend call sites off the flat field bag and then
+  make the wrapper private or narrower.
+  **Compute-side prep shipped 2026-05-09 (M2 partial)**: the four
+  hottest decode entry points (`encode_input_norm_and_qkv`,
+  `encode_q4k_qkv`, `encode_q4k_input_norm`, `encode_q4_0_norm_and_qkv`,
+  `encode_attention_block`, `encode_post_ffn_residual`) now read
+  `layer.<flat-field>` through `layer.weights().attention`,
+  `layer.attention_spec()`, `layer.norms()` views. Pattern
+  established: `let view = layer.method();` at the top of each
+  function, then `view.field` throughout. Remaining work for vindex
+  / inference call sites + final wrapper-narrowing is unchanged.
+  Also fixed an additional Q8_0 hybrid-path dispatch-geometry hardcode
+  in `encode_q4_0_norm_and_qkv` (same bug class as decode_hybrid Q4_K).
+- [x] Promote Gemma-style MoE assumptions into an explicit `MoeRoutingPolicy`:
+  router input source, router norm policy, selected-weight renormalization,
+  per-expert scale policy, post-expert norm policy, softmax/top-k semantics,
+  and expert down-padding layout.
+- [x] Group `MetalBackend` kernel handles into cohesive registries
+  (`AttentionKernels`, `FfnKernels`, `NormKernels`, `QuantKernels`) and pass a
+  compact dispatch context into full-pipeline execution instead of large
+  positional argument lists. Shipped 2026-05-09 (M3) — 57 fields moved off
+  `MetalBackend` into the four registries; ~150 call sites updated. End-to-end
+  tok/s within noise of pre-M3 baseline (86.1 vs ~83 tok/s on Gemma 3 4B
+  Q4_K v2; the registry pattern is zero-cost — `&self.norms.foo` lowers to
+  the same load as `&self.foo`).
+- [x] Replace hard-coded QKV quant-format branches with a descriptor/table keyed
+  by `(q_format, k_format, v_format)` so new model-format combinations do not
+  add another inline conditional. Shipped 2026-05-09 (M4): `QkvFormatRoute`
+  enum + `pick_qkv_route` table in `metal/stages/qkv_proj.rs`; encode_qkv +
+  decode_hybrid both read the route through it.
+- [x] Fix the trait-level `QuantMatVec` dispatch for `QuantFormat::Q8_0`.
+  Shipped 2026-05-09 (M-Q8): split the `Q4_0 | Q8_0` arms in
+  `backend/quant_matvec.rs::quant_matvec` and `quant_matvec_q8_input`; added
+  a `q8_matvec` trait method (default `None`); the Metal-side
+  `metal/stages/quant_matvec.rs::encode` panics loud on Q8_0 with a clear
+  message pointing at `quant.q8_matvec_pipeline`. Production decode reaches
+  Q8_0 weights via dedicated kernels (`q8_qkv_proj_pipeline` /
+  `q8_matvec_pipeline`), so the dead generic dispatch was lying rather than
+  load-bearing. 3 new unit tests pin the contract (Q4_0 still routes through
+  `q4_matvec`, Q8_0 returns `None` not silent garbage, float-input formats
+  stay `None`).
+- [x] Align Metal FFN activation handling with public `pipeline::Activation`;
+  unsupported activations should fail explicitly or use a known fallback.
+  Shipped 2026-05-09 (M5): `metal_supports_activation` /
+  `assert_metal_activation_supported` in `metal/stages/ffn.rs`; the three
+  silent `_ => silu` fallback sites now panic clearly on `GeluExact` / `ReLU`.
+- [x] Name and validate remaining format/kernel constants (`256`, `144`, `210`,
+  `8192`, `16384`, debug layer modulo values) at the format or kernel-descriptor
+  boundary instead of scattering them through CPU/Metal paths. Shipped
+  2026-05-09 (M6): cpu/ops sites pull `Q4_K_BLOCK_BYTES` /
+  `Q6_K_BLOCK_BYTES` / `Q4_K_BLOCK_ELEMS` from `larql_models::quant::ggml`;
+  `MAX_FUSED_GEGLU_DOWN_INTER = 16384` named in `metal/decode/encode_ffn.rs`.
+
+Acceptance: adding a new supported architecture or quant layout should require
+declaring its layer specs and format routes, not editing Gemma-specific branches
+inside hot-path execution code.
+
+---
+
 ## ✅ Metal GPU dense FFN server — `run_dense_ffn_q4k` (2026-05-04)
 
 **Status**: Shipped.
@@ -156,7 +256,7 @@ backend decode path.
 | **Gap** | LARQL is **~1.18×** slower | ~2.0ms/tok | per-stage decomposition below |
 | **LARQL Metal** (gemma4-26B-A4B, MoE Q4K, confirmed 2026-05-04) | **18.9** | ~53ms | MoE experts on CPU NEON; output coherent multilingual |
 | **LARQL Metal** (gemma4-26B-A4B, pre 2026-05-02) | 5.1 | ~194ms | bug-locked under dispatch-geometry mismatch; degraded output |
-| **LARQL Metal** (gemma4-26B-A4B, `SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; remaining ~37ms expert work |
+| **LARQL Metal** (gemma4-26B-A4B, `LARQL_SKIP_MOE=1` ceiling) | **56.8** | ~15ms | GPU-only baseline; remaining ~37ms expert work |
 | **Remote-FFN batch, Metal GPU server** (gemma4-31B Q4K, 2026-05-04) | **6.5** | 153ms | `run_dense_ffn_q4k`; 92ms attn local + 60ms FFN remote Metal GPU |
 | **Remote-FFN batch, CPU server** (gemma4-31B Q4K) | 1.6 | ~625ms | same HTTP path, server uses CPU NEON |
 | **Remote-FFN streaming** (gemma4-31B Q4K) | 0.6 | ~1670ms | Q8K wire via `/v1/walk-ffn-q8k`; 60 sequential HTTP round-trips |
@@ -278,9 +378,13 @@ Concrete next investigation: try different threadgroup configurations (more simd
 
 ## P0: Production gap closers
 
-Remaining gap: **~1.18×** (~84 vs ~99 tok/s, ~2ms/tok) post 2026-05-02
-dispatch geometry fix. Was ~1.30× pre-fix. The historical diagnosis
-below was on the pre-fix baseline — kept for context.
+Remaining gap: **~1.17×** (~88 vs ~103 tok/s, ~1.66 ms/tok) post 2026-05-09
+QKV defuse. Was ~1.18× pre-defuse, ~1.30× pre 2026-05-02 dispatch
+geometry fix. The historical diagnosis below was on the pre-fix baseline —
+kept for context. Acceptance criterion (`~85 tok/s, ~1.16×`) is effectively
+met; remaining work is closing the last ~14% via the multi-TG `attn_fused`
+retry (D-ATTN-MTG below) or accepting the M3 Max ceiling for matvec
+without `simdgroup_matrix`.
 
 ### Open decode-side levers (post 2026-05-02)
 
@@ -289,18 +393,236 @@ below was on the pre-fix baseline — kept for context.
 | **D-ATTN-MTG** | Multi-TG `attn_fused` retry — preserve 12 TGs while fusing qk_norm_rope + kv_append + attend | 0.2–0.4 ms/tok within the 3.48 ms attention bucket | Open. First attempt regressed −1.45 ms because the merge collapsed TG count 12→8; the multi-TG-per-head variant (split QKV+attend across 2 TGs/head, total ≥12) is untried. ADR-015 § "Lesson — diagnostic order" applies. | `metal/shaders/attn_fused.rs` rewrite; gated on `LARQL_FUSED_ATTN=1` until verified |
 | **D-FFN-PROFILE** | Split `encode_ffn` profiler boundary (gate_up vs activation+down) | Diagnostic, not perf. | **SHIPPED 2026-05-04.** `LARQL_PROFILE_SPLIT=1` + `--profile` bench now shows three separate GPU buckets per step. Measured on Gemma 3 4B (10-token steady state): **attn=3.3ms (34%), gate+up=3.5ms (36%), act+down=2.8ms (29%)** — all three roughly equal thirds. Gate+up is the largest single kernel. See `metal/decode/encode_ffn.rs` (split helpers) + `profile.rs` (GateUp/Down stages) + `bench_cmd.rs` (sub-rows). | `metal/decode/encode_ffn.rs` + `metal/decode/profile.rs` |
 | **D-FFN-FUSE** | Q6_K geglu+down fusion with cheaper-activation variant | ~0.2 ms/tok | **BLOCKED — all-NaN bug with production weights.** Kernel passes unit parity tests (synthetic data, production geometry). On real vindex decode: `down_out` = all 2560 NaN even in a fresh encoder with valid gate/up inputs (max±12). Metal API validation reports no errors. Bug not found by static analysis. Possible cause: interaction between production Q6_K block values and the fused kernel's inner-loop accumulation. Needs Metal shader debugger. Wired behind `LARQL_FUSED_Q6K_DOWN=1` (opt-in, broken). | `metal/shaders/q6k_geglu_down.rs` + `encode_ffn.rs` |
-| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | 3–4× prefill speedup on long prompts (closes 4–14× prefill gap to ollama) | Open. Kernel + parity tests shipped; only O-proj wired (within-noise impact). FFN sites are clean per-position matvec → matmul swaps; QKV requires a fused QKV matmul or fallback to per-projection matmul. | `metal/ops/full_pipeline/{stages,ffn}.rs` |
+| **D-PREFILL-MM** | Wire `q4k_matmul` into FFN gate/up/down + QKV (prefill only) | Was estimated 3–4× prefill speedup. **FALSIFIED twice end-to-end.** | **CLOSED 2026-05-09.** Wiring tried at O-proj (2026-04-28: −10% on long prompts), at FFN gate+up (2026-04-28: 2933 → 3268 ms on 340 tokens), and re-validated FFN gate+up under post-defuse state (2026-05-09: 5–7% regression at 10/50/150-token prompts). Diagnosis: the `q4k_matmul` kernel is bandwidth-bound; the [seq_len × hidden] X working set thrashes GPU L1 on long prompts and the dequant amortisation gain is paid back in DRAM↔L1 traffic. See **D-PREFILL-MM2** below for the kernel-rewrite track. The current `q4k_matmul` shader + `MetalBackend::q4k_matmul` method + parity tests stay shipped for re-validation on future hardware; production prefill stays per-position matvec. | (closed) |
+| **D-PREFILL-MM2** | Rewrite `q4k_matmul` using Apple `simdgroup_matrix` intrinsics (mirrors llama.cpp's `kernel_mul_mm_*`) | Closes the 4–14× prefill gap to ollama (per [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §2). | **Open.** Confirmed via dylib-symbol diff that llama.cpp's prefill matmul uses `simdgroup_matrix` 8×8 register-tile fused-multiply-add — the same hardware feature that's load-bearing for their flash-attn. Our scalar-accumulator `q4k_matmul` can't hold the working set in registers on long prompts. M3 Max satisfies the `MTLGPUFamilyMetal3` device-family check; this is purely a kernel-implementation gap. **Multi-day kernel research project.** | New shader `metal/shaders/q4k_matmul_simdgroup.rs`; gated on `LARQL_PREFILL_MATMUL2=1` until verified; existing `q4k_matmul` retained as fallback |
+| **D-RMS-FUSE** | RMS-norm pre-fusion with surrounding scalar mul/add (mirrors llama.cpp's `kernel_rms_norm_mul_f32` / `kernel_rms_norm_mul_add_f32`) | Predicted ~0.1-0.2 ms decode on non-Gemma. **Measured null end-to-end** (within drift). | **IMPLEMENTED + FALSIFIED 2026-05-09 (Phase 1).** Most of `_mul_f32` / `_mul_add_f32` was already shipped: our `rms_norm` shader already does norm + scalar mul, and `residual_norm_store` / `post_attn_residual_norm_store` / `post_ffn_norm_residual_add` already fuse norm + residual add at all the load-bearing boundaries except the post-FFN→next-layer-input step on non-Gemma archs. Phase 1 implemented that last gap via `LARQL_FUSED_PRELAYER_NORM=1` opt-in (Llama 2 7B / Mistral 7B). Parity preserved (bit-identical output across 3 archs). End-to-end A/B: Llama 2 7B `+0.0 tok/s within drift`, Mistral 7B `−0.3 tok/s within drift`. The dispatch-overhead saving from skipping rms_norm in layer N+1 is offset by the heavier `residual_norm_store` (does the RMS reduction inline) replacing the lighter `residual_add` in layer N. Per ADR-015 magnitude-compression at the extreme. | `metal/decode/encode_post_ffn.rs` (`PreLayerNormFusion` struct + branch), `metal/decode/encode_qkv.rs` (`input_already_normed` skip flag), `metal/decode/mod.rs` (call sites + `prelayer_norm_active` plumbing). Kept opt-in per ADR-017 retention rules; revival scenario: different K dimensions or future hardware where the rms_norm dispatch overhead vs `residual_norm_store` extra reduction balance shifts. |
+| **D-GEMMA4-E2B** | Investigate Gemma 4 E2B decode 30× pathology surfaced by 2026-05-09 cross-arch bench | (diagnosed) | **DIAGNOSED 2026-05-09.** Cross-arch bench captured `gemma4-e2b-q4k` at 4205 ms/tok GPU fwd vs Gemma 3 4B at 140 ms/tok. **Root cause**: E2B has Per-Layer Embeddings (PLE, `hidden_size_per_layer_input: 256`) which **the Metal pipeline does not implement**. `larql-inference/src/layer_graph/generate/gpu.rs:372-374` explicitly checks `weights.arch.has_per_layer_embeddings()` and routes to `generate_via_cpu_q4k` when true — the entire decode path falls back to CPU. The `LARQL_GPU_TIMING=1` line never fires for E2B because Metal's `decode_token_with_moe_split_fn` is never called. Documented in `gpu.rs` comment: "Without this routing the model produces multilingual gibberish." Diagnosis confirmed by reading the dispatch code and checking E2B's vindex `index.json` (`per_layer_embed_dim: 256`). Llama 2 / Mistral / Gemma 4 31B don't have PLE so route through Metal normally. | Closes the bug as "expected behaviour given PLE-not-in-Metal limitation". The actual perf fix is **D-METAL-PLE** (next row) which implements PLE on Metal. |
+| **D-METAL-PLE** | Implement Per-Layer Embeddings in the Metal decode path | Brings Gemma 4 E2B / future-PLE-models from CPU fallback (~1670 ms/tok) onto Metal (target: ~10-20 ms/tok at E2B's compute scale = **80-150× speedup for E2B**). | **IMPLEMENTED 2026-05-10, but E2B end-to-end blocked on a SECOND missing feature (D-METAL-KV-SHARED below).** Wired per-layer PLE block as 4 dispatches: f32_gemv (gate proj) → new `ple_gate_apply` shader (fused gelu_tanh + multiply against precomputed per-layer-input) → f32_gemv (output proj) → reuses `post_ffn_norm_residual_add` (in-place via `h_post_attn`/`new_h` aliasing) for the closing rms_norm + residual add. Precompute stays on CPU (`precompute_per_layer_inputs`); inference uploads the `[num_layers × ple_dim]` table once per generation step via new `MetalBackend::prepare_ple_inputs`. PLE block fires inside `decode_token_with_moe_split_fn` after `encode_post_ffn_residual` and reuses `gate_out_scratch` / `down_out` (dead by post-FFN) for scratch, so no new persistent buffers. Routing: when `LARQL_METAL_PLE=1`, gpu.rs runs prefill via per-token `decode_token` calls and per-step decode with PLE upload before each call (batched-prefill via `dispatch_full_pipeline` is a follow-up after parity passes). Kernel-level parity for `ple_gate_apply` passes 5/5 against CPU reference (`tests/test_kernel_per_layer_embed.rs`, max abs diff < 1e-5). **End-to-end E2B output is still gibberish with `LARQL_METAL_PLE=1`** because Metal also lacks KV-cache sharing — see D-METAL-KV-SHARED below. PLE wiring is complete and correct in isolation; will deliver the predicted speedup once KV sharing lands. | Files: `metal/shaders/per_layer_embed.rs`, `metal/decode/encode_ple.rs`, `metal/decode/mod.rs` (call site), `metal/mod.rs` (`PleInputBuffer` + `prepare_ple_inputs` / `clear_ple_inputs` / `ple_inputs_snapshot`), `metal/ffn_kernels.rs` (`ple_gate_apply_pipeline`), `pipeline.rs` (`PleSpec` + 3 PLE fields on `FullPipelineLayer`), `larql-inference/src/layer_graph/pipeline_layer.rs` (populate from arch keys), `larql-inference/src/layer_graph/generate/gpu/mod.rs` (per-token PLE upload + routing). E2B fixture added to `scripts/bench-cross-arch.sh`. Gated on `LARQL_METAL_PLE=1`; flip the default once D-METAL-KV-SHARED also lands and end-to-end parity passes. |
+| **D-METAL-KV-SHARED** | Implement cross-layer KV cache sharing in the Metal decode path | E2B's last 20 of 35 layers reuse K/V from earlier "source" layers (last non-shared sliding / global layer of the same type). Without this, layers 15-34 compute their own (wrong) K/V → attention is broken from L15 → garbage output. Same mechanism likely needed for any future KV-shared model. | **PARTIALLY IMPLEMENTED 2026-05-10 — routing correct, source-cache contents byte-identical to CPU, but L15+ shared-layer dispatch chain still produces wrong residuals.** See "D-METAL-KV-SHARED bisection 2026-05-10" section below for the bisection record and remaining diagnostic plan. | (see section below) |
+| **D-CROSS-PARITY** | Cross-architecture decode bench (Gemma 3 4B, Gemma 4 31B dense, Gemma 4 26B A4B MoE, Llama 2 7B, Mistral 7B) | Operationalises ADR-017 model-agnosticity check; surfaces thermal artifacts (every-arch-regresses-simultaneously signature). | **SHIPPED 2026-05-09 (Phase 1).** `scripts/bench-cross-arch.sh` + `bench/baselines/cross-arch/` + `make bench-cross-arch[ ARGS=--save-baseline\|--compare]`. Captured first under-load run; cool-machine baseline pending. **Phase 2 (per-shader)** still open — current sweep is end-to-end-only; per-shader parity tests (e.g. dispatching `q4k_ffn_gate_up_8sg` against synthetic input on multiple K dimensions to surface kernel-specific arch sensitivities) would catch deeper regressions earlier. | `scripts/bench-cross-arch.sh`, `bench/baselines/cross-arch/README.md`. Phase 2: parametrised tests in `crates/larql-compute/tests/`. |
+| **D-ROPE-VARIANTS** | Add `rope_neox` and `rope_multi` shader variants | Coverage for non-split-half RoPE models (GPT-NeoX, Pythia, some Falcon, multi-frequency long-context) | Open. We have one `rope` shader (split-half). llama.cpp ships `kernel_rope_norm_*`, `kernel_rope_neox_*`, `kernel_rope_multi_*`, `kernel_rope_vision_*`. Currently no architectures in `larql-models/architectures/` need NeoX (all use split-half), so this is **deferred until a NeoX-using model is brought into scope**. TODO documented in `metal/shaders/rope.rs`. | `metal/shaders/rope.rs` extension. See [llama-cpp-comparison.md](docs/llama-cpp-comparison.md) §3 |
 
-**Sequencing rationale (updated 2026-05-04)**: D-FFN-PROFILE shipped; data
+**Sequencing rationale (updated 2026-05-09)**: D-FFN-PROFILE shipped; data
 shows all three buckets roughly equal thirds (~34/36/29%). Gate+up is the
 largest but already bandwidth-bound at 74% LPDDR5X peak — no headroom left.
 D-FFN-FUSE targets act+down (~0.24 ms from GEGLU dispatch overhead) but is
-blocked by an unexplained production NaN. **Next unblocked levers:**
-D-ATTN-MTG (attention bucket, 0.2–0.4 ms, requires TG-count fix) or
-D-PREFILL-MM (prefill only, independent). D-PREFILL-MM is the cleanest
-because it's isolated to the prefill path and its kernel + parity tests
-are already shipped.
-**D-PREFILL-MM** is independent (prefill-only, doesn't touch decode).
+blocked by an unexplained production NaN. D-PREFILL-MM is closed (twice-
+falsified) and superseded by D-PREFILL-MM2. The 2026-05-09 dylib-symbol
+diff against llama.cpp ([llama-cpp-comparison.md](docs/llama-cpp-comparison.md))
+confirms three concrete kernel-architecture gaps: flash attention (covered
+by D-ATTN-MTG), `simdgroup_matrix` prefill matmul (D-PREFILL-MM2), and
+scalar-op RMS-norm pre-fusion (D-RMS-FUSE).
+
+**Open levers ordered by leverage and risk**:
+
+- **High-impact, multi-day kernel research:** D-PREFILL-MM2 (closes
+  4–14× prefill gap), D-ATTN-MTG (+5–8 tok/s decode).
+- **Concrete agnosticity bug:** D-GEMMA4-E2B (real 30× per-arch slowdown
+  needs investigation).
+- **Smaller perf wins:** D-RMS-FUSE (~0.1 ms decode), D-FFN-FUSE
+  (~0.2 ms but NaN-blocked).
+- **Infrastructure:** D-CROSS-PARITY (per-shader cross-model tests),
+  D-ROPE-VARIANTS (deferred until needed).
+
+**Recommended next pull**: D-GEMMA4-E2B (concrete bug, bounded
+investigation, immediately empirically grounded — the 30× slowdown
+surfaced by the cross-arch bench is the kind of thing that should be
+investigated before more multi-day kernel work goes in). After that,
+D-CROSS-PARITY to harden the test surface, then D-PREFILL-MM2 or
+D-ATTN-MTG as the bigger swing.
+
+**Documentation entry points** for new contributors:
+
+- [docs/shader-inventory.md](docs/shader-inventory.md) — per-shader retention rationale and applicability across model families.
+- [docs/architecture-shader-map.md](docs/architecture-shader-map.md) — which Metal shaders each model architecture dispatches.
+- [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) — kernel-architecture comparison vs llama.cpp; documents the three load-bearing gaps.
+- [docs/adr/017-shader-retention-model-agnosticity.md](docs/adr/017-shader-retention-model-agnosticity.md) — when to add/keep/delete shaders.
+- [docs/adr/018-architecture-shader-routing.md](docs/adr/018-architecture-shader-routing.md) — when to add a new architecture.
+
+### D-METAL-KV-SHARED bisection 2026-05-10
+
+End-to-end E2B output was still gibberish ("တ initialState eTo aud ανhiokin
+initial است류 …") after the routing-and-plumbing landed. This section is the
+diagnostic record.
+
+**What was implemented**
+
+Field plumbing — `kv_shared_source: Option<usize>` added to
+`FullPipelineLayer`, populated in `pipeline_layer.rs::build_arch_params`
+from `arch.kv_shared_source_layer(layer)`. Three literal-constructor
+sites updated.
+
+Dispatch — in `metal/decode/encode_attn.rs`:
+
+- `did_fused_attn` and `use_fused_kv_aa` are gated on
+  `kv_shared_source.is_none()`. Shared layers can't use the fused
+  attn / fused kv_append_attend kernels because both write the
+  layer's own K/V cache and would corrupt the source's cache.
+- Shared layers fall through to a new `else if let Some(src) =
+  kv_shared_source` branch that picks `kv_attention` or
+  `kv_attention_long` based on `attention_span(t_val, window_size)`,
+  binds `kv_cache.layers[src].k_cache` / `v_cache`, and passes
+  `t_val = source.current_len`. Source's `current_len` has already
+  incremented past the new token by the time the shared layer runs
+  (layers process in order, `current_len += 1` fires at the end of
+  source's Step 4).
+- `current_len += 1` for the shared layer is gated on
+  `kv_shared_source.is_none()`. Shared layers leave their own
+  cache pointer at 0 forever; the source's pointer is the
+  source-of-truth.
+- Q is computed at the shared layer (own `W_q`, own
+  `q_norm_weight`, RoPE'd at `pos = source.current_len.saturating_sub(1)`).
+  K/V projections still run at the shared layer but the results
+  are discarded — wasted work that's harmless and was preserved
+  for first-pass simplicity.
+
+The routing path was sanity-checked with a `LARQL_KV_SHARED_DEBUG=1`
+print (since removed) — source mapping is correct (sliding L15-L18
+→ L13, global L19 → L14, etc.), `src.current_len` advances 1, 2, 3, …
+per decode_token call, `t_val` matches.
+
+**Bisection**
+
+Two diagnostic env vars added to `metal/decode/mod.rs` for the
+bisection (kept; trivial to use again):
+
+- `LARQL_KV_CACHE_DUMP_DIR=<dir>` — at end of each `decode_token` call,
+  dumps `metal_L{NN}_K_cache.f32` / `_V_cache.f32` for every layer
+  with `current_len > 0`. Last call wins (file overwritten).
+- `LARQL_PERCALL_LAYER_DUMP_DIR=<dir>` — at end of each call, dumps
+  `metal_call{NNN}_h_final.f32` (residual after L34 +
+  layer_scalar), `metal_call{NNN}_x_input.f32` (the per-token
+  embed input), and per-layer K caches with the call counter in
+  the filename. Counter is process-global (`CALL_COUNT`
+  `AtomicUsize`).
+
+**Bisection results** (E2B prompt "Hi" with chat-template wrap →
+seq_len=29 prompt tokens, `-n 2`):
+
+| stage | result |
+|---|---|
+| Token IDs identical CPU vs Metal | ✓ (`token_ids.len() == 29` in both via `LARQL_TOKEN_DEBUG=1`) |
+| Per-call input embed `metal_call{n}_x_input` | ✓ cosine 1.0000 vs CPU's `cpu_h_embed.f32` row n for all prefill positions 0-28 |
+| Source K cache contents at L0, L13, L14 | ✓ cosine 1.0000 for all 29 prompt positions vs CPU's `cpu_L0_k_out_after_rope.f32` |
+| Source V cache contents at L13 | ✓ cosine 1.0000 for all 29 prompt positions vs CPU's `cpu_L0_v_out.f32` |
+| Per-call `h_final` (after L34, before final_norm) | ✗ cosine **0.18-0.48** vs CPU's `cpu_layer_34.f32[pos]` at every prompt position |
+
+So everything that's a function of source layers' weights, RoPE,
+qk_norm, and V-norm produces byte-perfect cache contents. The bug
+is downstream of the source-layer write.
+
+A telling artifact: Metal's `h_final` magnitude across all 29
+prompt positions is roughly **constant** at ~17, while CPU's
+varies 9-39. The Metal residual stream is being **compressed** —
+losing per-position information — which is the signature of
+attention not differentiating positions (uniform softmax over
+identical-magnitude logits). This is consistent with shared
+layers' attention dispatch returning a near-constant output
+regardless of Q.
+
+**What's been ruled out**
+
+- Source layer correctness: K/V cache is byte-identical CPU vs
+  Metal. Source projections (W_q, W_k, W_v), qk_norm, RoPE,
+  V-norm all produce identical bytes through L14.
+- Routing: `kv_shared_source` populates correctly,
+  `t_val`/`pos` math is correct, layer→source mapping is
+  correct, `current_len` advances correctly.
+- Tokenization: `encode_prompt` produces identical
+  `token_ids` in both code paths (verified via
+  `LARQL_TOKEN_DEBUG=1`).
+- Embed: `embed_tokens_pub` produces identical embeds at every
+  position (cosine 1.000).
+- Q at shared layer: computed with the layer's own W_q against
+  correct h_input. RoPE'd at `pos = N` (matches source's K
+  rotation at position N).
+- PLE math: kernel-level parity passes (5/5 tests at <1e-5 abs
+  diff vs CPU), and turning PLE off does not change the gibberish
+  symptom in any way that reveals PLE as the culprit.
+- Fused-kernel interaction: same gibberish under
+  `LARQL_FUSED_KV_APPEND_ATTEND=0`,
+  `LARQL_FUSED_QK_NORM_ROPE=0`, `LARQL_FUSED_POST_ATTN_NORM=0`,
+  `LARQL_FUSED_POST_FFN_NORM=0`, `LARQL_FUSED_PRELAYER_NORM=0`
+  — all simultaneously and individually. Bug isn't in any
+  fused kernel.
+
+**What's left to check** (next session's plan)
+
+1. **Stage-level dump inside the per-call loop.** Extend
+   `LARQL_PERCALL_LAYER_DUMP_DIR` to also capture L15..L34 stage
+   outputs (`q_out_after_rope`, `attn_out_buf`, `o_out_buf`,
+   `h_post_attn`, post-PLE `h`, post-`layer_scalar` `h`) at the
+   end of each call, gated on a layer-allowlist env var.
+   Compare to CPU's `cpu_L{N}_*.f32` for the same prompt position.
+   The first stage that diverges is the bug.
+2. **Memory hazard tracking on the source cache.** Try inserting
+   `enc.memory_barrier_with_resources(&[source_k_cache,
+   source_v_cache], MTLBarrierScope::Buffers)` at the start of
+   the shared-layer attend dispatch. Apple's compute encoder
+   auto-tracks RAW hazards across dispatches in the same encoder,
+   but the source's `kv_append_attend_fused` writes via
+   `threadgroup_barrier(mem_device)` rather than ending its
+   dispatch — possible the auto-barrier doesn't see the writes.
+3. **Force unfused source path.** Make source layers (those that
+   are themselves a `kv_shared_source` for some later layer) use
+   the unfused `kv_cache_append` + `kv_attention` chain instead
+   of `kv_append_attend_fused`. This forces a hard dispatch
+   boundary so the writes are flushed before any read by a
+   shared layer. Slower but eliminates the hazard hypothesis.
+4. **Single-position end-to-end check.** With a 1-token raw
+   prompt (set `LARQL_RAW_PROMPT=1`), the shared-layer attention
+   collapses to attend(Q, K[0..1], V[0..1]) — softmax over a
+   single position is identity, attn_out = V[0]. Compare
+   Metal's L15 attn_out to CPU's L15 attn_out at this position.
+   Diverging there isolates the bug to Q computation or
+   attention output write; matching there pushes it downstream
+   (FFN, PLE, layer_scalar, or the next shared layer's input).
+
+**Tests landed for regression protection**
+
+- `crates/larql-inference/src/layer_graph/pipeline_layer.rs::tests`
+  (3 new tests, all green):
+  - `build_arch_params_populates_kv_shared_source_for_e2b_like_arch`
+    pins the `kv_shared_source` field's contract end-to-end:
+    builds a synthetic Gemma-4-E2B-shaped arch via
+    `detect_from_json` (4 layers, 2 sliding non-shared + 2
+    shared) and asserts that L0/L1 → None, L2 → Some(0),
+    L3 → Some(1).  Catches any future regression where someone
+    removes the
+    `kv_shared_source: arch.kv_shared_source_layer(layer)`
+    line in `build_arch_params`.
+  - `build_arch_params_populates_ple_fields_for_e2b_like_arch`
+    pins the `ple_input_gate` / `ple_projection` /
+    `ple_post_norm` field contract.  Builds the synthetic
+    arch with PLE keys and tensors, runs `build_arch_params`
+    for each layer, asserts all three slices populate and
+    `ple_spec()` returns Some.
+  - `build_arch_params_leaves_ple_and_kv_shared_fields_none_for_tinymodel`
+    pins the negative case: non-PLE / non-shared archs leave
+    every new field as None.  Prevents spurious population.
+- `crates/larql-compute/tests/test_kernel_per_layer_embed.rs`
+  (5 tests, all green): `ple_gate_apply` shader vs CPU
+  reference at <1e-5 abs diff — smooth inputs, zero inputs,
+  large negatives, E2B production shape.
+
+These tests don't catch the current bug (which is a
+dispatch-level issue beyond field plumbing), but they do
+prevent the entire field-plumbing regression class — the
+"someone refactored the trait and silently dropped a populate
+line" failure mode that's hit larql-models / larql-inference
+multiple times during this work.
+
+**Out of scope for this section but flagged**
+
+- Per-layer Metal-vs-CPU stage parity tests (D-METAL-KV-SHARED
+  Phase B test infrastructure): take a tiny synthetic
+  Gemma-4-E2B-shaped vindex with 4-layer / hidden=8 weights,
+  run a 3-token prompt through both paths, assert
+  byte-equivalence for every per-stage scratch buffer at every
+  layer.  Would have caught the current bug in CI.  Blocked on
+  not yet having a small-vindex builder; cross-arch bench
+  fixture is the closest existing analogue but uses real
+  E2B-scale models.
 
 ### Decode gap diagnosis (2026-04-28, 3-iter median)
 
@@ -358,7 +680,7 @@ Reproduction: `cargo run --release --features metal -p larql-cli --bin larql -- 
 
 **Lesson for future kernel work**: the kernel-isolated profiler can be misleading. A 1.79× isolated speedup ≠ 1.79× end-to-end if the kernel was bandwidth-bound or part of a longer pipeline where other resources serialise the GPU. Always validate end-to-end on a quiet system before adopting.
 
-#### Track C — `q4k_ffn_gate_up_nr2` candidate ROUND-TRIPPED 2026-05-02 (opt-in, regressed end-to-end)
+#### Track C — `q4k_ffn_gate_up_nr2` candidate ROUND-TRIPPED 2026-05-02, REMOVED 2026-05-09
 
 NR2 (2 rows / simdgroup variant of `q4k_ffn_gate_up`) was a strong isolated profiler candidate after the 8sg landing — `diag_profile_kernels` showed:
 
@@ -367,14 +689,26 @@ NR2 (2 rows / simdgroup variant of `q4k_ffn_gate_up`) was a strong isolated prof
 | 8sg (default) | 0.591 | 51.4 | 0.106 | **278.9** |
 | NR2 (candidate) | 0.401 | 76.8 | 0.110 | **267.0** |
 
-End-to-end A/B (warmup 8, decode 30, quiet GPU, three runs):
+End-to-end A/B (warmup 8, decode 30, quiet GPU, three runs, 2026-05-02):
 
 | config | tok/s | GPU fwd | lm_head | output |
 |---|---|---|---|---|
 | baseline (8sg) | **75.9** | **11.19 ms** | 2.99 ms | "Paris" ✓ |
 | NR2 (`LARQL_GATE_UP_NR2=1`) | 72.9 | 11.80 ms (**+0.62 ms**) | 2.96 ms | "Paris" ✓ |
 
-NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the batched number, not the isolated one — the 1.47× iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. **Not promoted; kept as opt-in only.**
+NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the batched number, not the isolated one — the 1.47× iso win was dispatch-overhead amortisation that disappears once n_layers calls share one cmd buffer. **Initial outcome (2026-05-02): not promoted; kept as opt-in.**
+
+**Re-benched 2026-05-09** alongside the QKV-gap investigation:
+
+| config | tok/s | GPU fwd |
+|---|---|---|
+| 8sg baseline (run 1) | 86.3 | 11.71 ms |
+| NR2 (`LARQL_GATE_UP_NR2=1`) | 83.4 | 12.05 ms (**+0.34 ms**) |
+| 8sg baseline (run 2, drift check) | 86.2 | 11.64 ms |
+
+The 0.07 ms baseline drift between runs 1 and 2 confirms the −0.34 ms NR2 regression is real signal, not thermal noise (unlike the f16_acc story where a +23% measurement turned out to be thermal artifact). Direction matched the batched-diag prediction; magnitude was ~3× the predicted delta but the ordering held — exactly the contract ADR-015 makes.
+
+**Outcome (2026-05-09): kernel and `LARQL_GATE_UP_NR2` env var removed.** The candidate had two independent benches against it; leaving it as opt-in dead code was inviting re-litigation. Shader (`shaders/q4k_ffn_gate_up_nr2.rs`), pipeline field, env-var constant, dispatch-branch in `encode_ffn`, diag-profile entry, and shader-bench inventory entry all deleted. Historical record preserved here, in `PERFORMANCE.md`, and in ADR-015.
 
 **Same A/B run also confirmed** that the v5 stride-32 lm_head is the *fast* path, not just the correct one: `LARQL_LM_HEAD_STRIDE32=0` regressed lm_head 2.99 → 4.08 ms (+1.09 ms, 75.9 → 69.5 tok/s). The "+0.7 ms cost" framing in PERFORMANCE.md is relative to the pre-fix broken-output kernel, not the current fallback. No tradeoff to chase.
 
@@ -382,22 +716,53 @@ NR2 wins isolated by 1.47× and **loses batched by 4%**. End-to-end tracks the b
 
 `f16_acc` (2026-04-28) + `attn_fused` (2026-05-01) + `nr2` (2026-05-02) all showed isolated wins that failed end-to-end. Pattern pinned in `docs/adr/015-isolated-vs-batched-kernel-perf.md`. **Promotion criterion going forward**: a candidate must win the *batched* `diag_profile_kernels` column AND end-to-end bench. Isolated-only wins do not justify a session of end-to-end measurement on their own — three sessions burned on this so far.
 
-#### Remaining decode gap (after f16 acc, attn_fused, NR2 ruled out)
+#### Track D — QKV defuse PROMOTED 2026-05-09 (+1.6 tok/s, magnitude undershoot)
 
-Decode at ~76 tok/s vs ollama ~99 tok/s steady-state, ~1.30×. The "isolated-only" candidates are exhausted on the FFN gate+up path. Remaining options, ordered:
+The fused `q4k_q6k_qkv_proj_normed` kernel had been the production default for Gemma 3/4 layers since the QKV-stage fusion landed earlier in the year. It saved ~0.24 ms/tok of dispatch overhead but ran at 199 GB/s vs the non-fused `q4k_q6k_qkv_proj`'s 287 GB/s — the per-TG H + norm_w reread (3× redundant device traffic across the 4 simdgroups) was costing ~1.46 ms/tok in the per-kernel batched diag.
+
+Diag prediction: defusing recovers 1.46 ms − 0.24 ms = **−1.22 ms/tok** end-to-end.
+
+End-to-end A/B (warmup 8, n=100, drift 0.02 ms):
+
+| config | tok/s | mean ms | GPU fwd | output |
+|---|---|---|---|---|
+| baseline (fused, default) | 84.8 / 85.0 | 11.79 / 11.77 | 11.79 / 11.86 | "Paris" ✓ |
+| defused (`LARQL_QKV_DEFUSED=1` at the time) | **86.5** | **11.57** | **11.52** | "Paris" ✓ |
+
+**Measured Δ: +1.6 tok/s, −0.30 ms/tok GPU fwd** — direction matched the diag prediction but **magnitude was 18% of predicted**.
+
+**Promoted to default** 2026-05-09; env var renamed to `LARQL_QKV_FUSED=1` (opts back in to fused). Fused shader + `encode_normed_q4k_q6k_qkv` retained as the opt-in fallback. The +1.6 tok/s landing matches the +1.6-tok/s gap that existed at the time of investigation between us and the next-best decode milestone.
+
+**Why magnitude undershot.** The non-fused kernel's 287 GB/s peak is a single-kernel-isolated number. In the production decode pipeline, the candidate shares the LPDDR5X bus with attention, FFN gate+up, FFN down, lm_head — all also bandwidth-bound. The candidate doesn't get to *claim* its kernel-isolated headroom because the surrounding pipeline already saturates the same bus. Predicted batched-diag deltas should be discounted ~3-5× for bandwidth-headroom candidates; cycle-headroom or dispatch-count candidates don't show this discount as severely. Pinned as the first magnitude-compression case study in ADR-015.
+
+**Cross-arch validation 2026-05-09 (post-thermal-cooldown)**: A/B on Gemma 4 26B A4B (60 layers, hidden=5376, MoE) confirms defuse is also net-positive on the larger MoE arch:
+
+| config | tok/s | GPU fwd | mean ms |
+|---|---|---|---|
+| defused (current default, run 1) | 14.3 | 62.90 ms | 69.92 |
+| Fused (`LARQL_QKV_FUSED=1`) | 13.9 | 65.91 ms | 71.82 |
+| defused (drift check, run 2) | 13.9 | 64.53 ms | 71.94 |
+
+**Δ defused vs fused: +0.4 tok/s, −2.19 ms GPU fwd** (median across both defused runs vs fused). Drift between defused runs is 1.6 ms; signal is 2.19 ms — at the noise floor but directionally consistent with the Gemma 3 4B finding (+1.6 tok/s defused). **No arch-specific dispatch path needed** — the same defused default works for both 4B and 26B. (Smaller win on 26B reflects the larger absolute GPU-fwd budget; the fixed dispatch-overhead saving is a smaller fraction of the total.) Same A/B also confirmed there's no QKV-defuse-driven regression on 26B; the earlier "2.4× regression vs 19.4 tok/s baseline" was a thermal artifact from sustained load (`feedback_thermal_perf_artifacts.md` memory entry).
+
+#### Remaining decode gap (after f16 acc, attn_fused, NR2 ruled out; QKV defuse landed)
+
+Decode at ~86 tok/s vs ollama ~99-101 tok/s steady-state, ~1.16-1.18×. The "isolated-only" candidates are exhausted on the FFN gate+up path. Remaining options, ordered:
 
 1. **Multi-TG `attn_fused` retry** — the standalone `qk_norm_rope_fused` runs 12 TGs; the fused variant collapses to 8 because of register pressure. A multi-TG-per-head fused variant (split the QKV+attend work across 2 TGs, keep total ≥12) would preserve parallelism while saving the dispatch. **This is the one remaining iso-win-prone candidate that is *also* batched-friendly** — the dispatch saving lives in the cmd-buffer count, not the per-kernel ALU. Estimated +0.2–0.4 ms recovery if successful.
-2. **f16 lm_head wiring** — `MetalBackend::f16_gemv` shipped with a passing test 2026-04-18; `backend_lm_head_topk` still goes f32. ~50 LOC: expose embeddings.bin f16 bytes from `VectorIndex` and prefer the f16 path. Could claw back some of the +0.7 ms paid for v5 stride-32 correctness. Bonus: removes the 5.6 GB f32 clone on 31B.
+2. ~~f16 lm_head wiring~~ — **falsified 2026-05-09**. Production lm_head is already on `q4k_matvec` (1.85 ms/tok) since the 2026-05-02 dispatch-geometry fix; f16_gemv fallback measures 3.88 ms/tok, so wiring f16 ahead of Q4_K would regress lm_head by ~2 ms/tok. The "+0.7 ms paid for v5 stride-32 correctness" framing was itself stale — stride-32 is no longer the production path, the dispatch fix superseded it. 31B memory-footprint concern (5.6 GB f32 clone) is a separate issue addressable independently.
 3. **Wire `ProfileTimings.gate_up_ms` / `down_ms` producer** (#12 in P0 structural cleanup) — without it, the remaining ~2 ms in GPU fwd is unattributed. Diagnostic, not perf — but it points the next swing.
-4. **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis likely applies; expected to also wash out end-to-end. Lower priority unless gate+up finding turns out to be situational.
+4. **Apply f16 to other Q4_K matvecs** (Wo, QKV) — same diagnosis applies as #2: Q4_K is already the fast path on these. Drop unless a specific dispatch-geometry bug surfaces.
 5. **Dispatch overhead reduction** (~100-dispatch gap to ollama) — closing this means more aggressive kernel fusion. The fused FFN gate+up + GEGLU + down for Q6_K models was tried (#1 below) and regressed — re-enable might require a cheaper activation variant.
-6. **Accept ~1.30× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 25% likely requires fundamental architecture changes.
+6. **Accept ~1.17× as the M3 Max ceiling** for our pipeline architecture. ollama's hand-tuned llama.cpp kernels have years of tuning; closing the last 15% likely requires fundamental architecture changes (`simdgroup_matrix` for matvec).
 
 **Effort**: multi-TG attn_fused retry is ~2 days (split the kernel, keep parity tests, batched bench). f16 lm_head wiring is ~half a day. Other tracks are larger.
 
 #### Acceptance criterion
 
 **Close 1.5 ms of the 3 ms decode gap to reach ~12 tok/s (~85 tok/s, 1.16× of ollama)**. Closing the full 3 ms requires `simdgroup_matrix` for matvec (no llama.cpp precedent for matvec — they use it for matmul/prefill only). Above that ceiling we're chasing Apple-specific intrinsics not exposed publicly.
+
+**Status (2026-05-09)**: QKV defuse landed +1.6–1.8 tok/s → **88 tok/s, 1.17× of ollama** on a fair-thermal session bench. **Acceptance threshold reached** on the tok/s axis (target was ~85), one notch off on the gap-ratio axis (target 1.16×, ollama drift is itself ~±15% session-to-session so this is effectively at the threshold). Closing the remaining ~14% means **multi-TG `attn_fused` retry** (~+0.2-0.4 ms, ~2 days work) — the only known-viable swing left. ~~f16 lm_head wiring~~ was on the table but **falsified 2026-05-09**: production lm_head is already on `q4k_matvec` at 1.85 ms/tok, and f16_gemv fallback measures 3.88 ms/tok — wiring f16 ahead of Q4_K would *regress* lm_head by ~2 ms/tok. The "v5 stride-32 correctness tax" the f16 plan referenced was itself stale: the 2026-05-02 dispatch-geometry fix removed that tax. See `project_f16_gemv_wiring_todo.md` memory entry for the falsification record.
 
 ### #0 — Decode kernel optimisation (NEW, 2026-04-28)
 
@@ -414,7 +779,7 @@ See "Decode kernel optimization" section above. Replaces the older "#6 — Q4_K 
 | 18 tok (chat) | 196 ms (10.9 ms/tok) | 50 ms (2.8 ms/tok) | **3.9×** |
 | 340 tok (long) | 2933 ms (8.6 ms/tok) | 210 ms (0.62 ms/tok) | **14×** |
 
-The widening ratio is the smoking gun: larql is per-position linear (`prefill ≈ seq_len × decode_per_tok`); ollama is sublinear via gemm. Decode itself (seq=1) is only 1.30× behind.
+The widening ratio is the smoking gun: larql is per-position linear (`prefill ≈ seq_len × decode_per_tok`); ollama is sublinear via gemm. Decode itself (seq=1) is only ~1.17× behind (was 1.30× when this diagnosis was written; subsequent dispatch-geometry fix and QKV defuse closed it).
 
 **Root cause** (verified 2026-04-27 by reading `metal/ops/full_pipeline/dispatch.rs`): `prefill_q4 → dispatch_full_pipeline` IS already wired and IS allocating `[seq_len × hidden]` buffers, but every per-stage compute step issues per-position matvec dispatches. For an 18-token × 34-layer prefill that's ~600+ matvec calls vs ollama's ~34 gemm calls per stage.
 
@@ -777,7 +1142,7 @@ fusion was attempted but regressed due to GELU-tanh recomputation cost
 Diagnostics were previously scattered across three locations:
 - `src/metal/decode/diag.rs` — NaN detection, residual dumps, per-layer bisect
 - `src/metal/decode/profile.rs` — stage-level `ProfileTimings`
-- `examples/debug_decode_pipeline.rs` — decode pipeline stage bisect entry point
+- `examples/diag_decode_pipeline.rs` — decode pipeline stage bisect entry point
 
 Now consolidated under `src/metal/diag/`:
 - `diag/mod.rs` — public API, re-exports `ProfileTimings`, documents all tools
@@ -1001,7 +1366,7 @@ buffer contents — no `bufs.output(...)` calls in the hot path.
   the dispatch-geometry mismatch in the same `moe_dispatch.rs` sites; the
   "Phase 1 shipped 5.1 tok/s" baseline was attributing the bug-locked
   number to Phase 1, which was wrong).
-- GPU-only ceiling (`SKIP_MOE=1`): **56.8 tok/s**.
+- GPU-only ceiling (`LARQL_SKIP_MOE=1`): **56.8 tok/s**.
 - Remaining headroom (19.4 → 56.8): genuine expert dispatch work
   (240/token = 8 experts × 30 layers × 1 fused gate+up + 1 GEGLU + 1 down)
   + 30 commit/wait syncs. Real shader/dispatch work, not allocation.
@@ -1146,31 +1511,34 @@ so platform users start with a competitive baseline.
 
 ### Linux support
 **Effort**: Medium  
-**Status**: Not started
+**Status**: In progress — compute crate CI added; downstream crate CI still open.
 
-larql-compute is Metal-only. The `ComputeBackend` trait and CPU fallback
-already compile on Linux (no Metal dependency at the trait level). Gaps:
+larql-compute has a CPU baseline plus a macOS-only Metal backend. The
+`ComputeBackend` trait and CPU fallback compile without Metal at the trait
+level. Current guardrail: tests, examples, benches, and the exported
+`metal::` module are gated on `#[cfg(all(feature = "metal", target_os =
+"macos"))]`, so Linux `--all-features` checks do not try to import Metal.
+Done for `larql-compute`: Linux CI installs OpenBLAS, checks default and
+all-feature builds, runs clippy, and runs the fast compute test split. Gaps:
 
-- `larql-compute` feature-gates: `#[cfg(feature = "metal")]` guards the
-  entire `metal::` module; the CPU path is the Linux baseline today.
 - `larql-cli` / `larql-inference`: a small number of `metal`-feature
-  entrypoints need `#[cfg(...)]` guards to build without Metal.
-- No build-system CI: add a GitHub Actions Linux matrix that builds all
-  crates without `--features metal` and runs the CPU test suite.
+  entrypoints have been guarded, but they still need native Linux CI coverage.
+- Add build-system CI for the downstream CPU stack (`larql-inference`,
+  `larql-cli`) once the OpenBLAS setup is proven stable in compute CI.
 
 Expected result: `cargo build -p larql-cli` (no features) works on
 Ubuntu 22.04 / 24.04 x86_64 and aarch64, with CPU-only decode.
 
 ### Windows support
 **Effort**: Medium  
-**Status**: Not started
+**Status**: In progress — compute crate CI added; full CLI/inference support still open.
 
 Similar to Linux plus:
 - Path handling: a small number of `std::fs::File::create` /
   `PathBuf::join` calls use `/tmp/` or Unix paths — audit and fix.
 - Symbol visibility: `extern "C"` symbols from BLAS need checked on
-  MSVC (MKL) and MinGW (OpenBLAS).
-- CI: Windows matrix in GitHub Actions using `windows-2022`.
+  MSVC with vcpkg OpenBLAS. `larql-compute` CI now exercises this first.
+- Extend Windows CI beyond compute after native OpenBLAS linking is confirmed.
 
 Expected result: `cargo build -p larql-cli` works on Windows 11
 x86_64 (MSVC toolchain) with CPU-only decode.

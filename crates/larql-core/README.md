@@ -90,6 +90,26 @@ and costs stay consistent for multiedges with different relations or weights.
 nodes. `diff()` reports same-triple changes to confidence, source, metadata,
 and injection.
 
+`filter_graph()` is metadata-key agnostic. Use `MetadataPredicate` for any
+domain-specific edge metadata instead of relying on model-specific field names:
+
+```rust
+let filtered = filter_graph(
+    &graph,
+    &FilterConfig {
+        metadata: vec![
+            MetadataPredicate::u64_min("layer", 20),
+            MetadataPredicate::f64_min("selectivity", 0.7),
+        ],
+        ..Default::default()
+    },
+);
+```
+
+`MergeStrategy::SourcePriority` uses `default_source_priority()` for backward
+compatibility. Call `merge_graphs_with_source_priority()` when a product,
+dataset, or import pipeline needs a different source ordering.
+
 ## LLM Integration
 
 | Component | Purpose |
@@ -100,6 +120,12 @@ and injection.
 | `chain_tokens()` | Multi-token answer extraction |
 | `extract_bfs()` | BFS knowledge graph extraction from LLM |
 | `TemplateRegistry` | Relation-specific prompt templates |
+
+The engine layer is model-architecture agnostic. `ModelProvider` exposes token
+predictions only; it has no dependency on model families, tensor shapes,
+vindex internals, or GPU backends. Extraction policy that is domain-specific,
+such as edge provenance and whether a generated entity should be followed,
+lives in `BfsConfig` and can be replaced by callers.
 
 ## Serialization
 
@@ -113,9 +139,12 @@ and injection.
 
 Packed binary uses string interning — repeated relation names stored once.
 Packed decoding validates header offsets, record bounds, string indexes, and
-metadata ranges before reading. CSV import/export supports quoted commas,
-quotes, CRLF/LF newlines, and multiline fields for the five graph columns:
-`subject,relation,object,confidence,source`.
+metadata ranges before reading. It also rejects invalid source tags, malformed
+metadata JSON, and inconsistent metadata/injection flags instead of silently
+dropping flagged data. Packed encoding rejects values that cannot fit in the
+on-disk u32 fields instead of truncating them. CSV import/export supports
+quoted commas, quotes, CRLF/LF newlines, and multiline fields for the five graph
+columns: `subject,relation,object,confidence,source`.
 
 ## Crate Structure
 
@@ -156,36 +185,54 @@ larql-core/src/
 ## Testing
 
 ```bash
-cargo test -p larql-core                                  # 183 tests
-cargo test -p larql-core --no-default-features --features msgpack
-cargo clippy -p larql-core --tests -- -D warnings
-cargo llvm-cov -p larql-core --summary-only
-cargo run --release -p larql-core --example bench_graph   # Benchmark
-cargo run -p larql-core --example graph_demo              # Feature showcase
-cargo run -p larql-core --example algorithm_demo          # Algorithm examples
+make larql-core-ci             # fmt + clippy + tests + feature matrix + benches + examples
+make larql-core-test           # default feature tests
+make larql-core-feature-test   # no-default and msgpack-only tests
+make larql-core-lint           # clippy --all-targets -D warnings
+make larql-core-coverage       # cargo-llvm-cov summary
+make larql-core-bench-test     # compile/smoke benchmark harness
+make larql-core-bench          # Criterion benchmark
+make larql-core-examples       # run callable examples
 ```
 
-### Benchmarks (100K edges, release build)
+Equivalent cargo commands:
+
+```bash
+cargo test -p larql-core
+cargo test -p larql-core --no-default-features
+cargo test -p larql-core --no-default-features --features msgpack
+cargo clippy -p larql-core --all-targets -- -D warnings
+cargo llvm-cov --package larql-core --summary-only
+cargo test -p larql-core --benches
+cargo bench -p larql-core --bench graph
+```
+
+GitHub Actions runs the same core checks on Ubuntu, Windows, and macOS via
+`.github/workflows/larql-core.yml`. The workflow is cargo-native rather than
+Makefile-driven so it works with the default shell on every runner.
+
+### Benchmarks (release build)
 
 | Operation | Latency |
 |-----------|---------|
-| Insert (100K edges) | 154ms (1.5us/edge) |
-| select(entity, relation) | 0.1us |
-| exists(s, r, o) | 0.1us |
-| search(keyword, 10) | 0.7us |
-| shortest_path (1K nodes) | 19.3us |
-| connected_components (1K nodes) | 478us |
-| are_connected (1K nodes) | 14.7us |
-| walk_all_paths (3 hops) | 1.3us |
-| bfs_traversal (depth=5) | 12.2us |
-| pagerank (1K nodes) | 13.80ms |
-| filter (100K, confidence) | 71.61ms |
-| JSON serialize / deserialize (100K) | 152.75ms / 380.47ms |
-| MsgPack serialize / deserialize (100K) | 150.63ms / 356.58ms |
-| Packed binary serialize / deserialize (100K) | 24.23ms / 271.03ms |
-| stats (100K edges) | 65.36ms |
+| select subject + relation (25K edges) | 55.85 ns |
+| exists exact triple (25K edges) | 113.23 ns |
+| keyword search (25K edges) | 584.95 ns |
+| shortest path ring (1K nodes) | 282.92 us |
+| connected components ring (1K nodes) | 410.96 us |
+| BFS traversal depth 5 (1K nodes) | 3.07 us |
+| JSON encode / decode (1K edges) | 635.08 us / 2.49 ms |
+| Packed encode / decode (1K edges) | 209.41 us / 1.68 ms |
+| JSON encode / decode (25K edges) | 20.94 ms / 93.62 ms |
+| Packed encode / decode (25K edges) | 6.55 ms / 50.58 ms |
 
-### Test Coverage (183 tests)
+Criterion reports changes relative to the runner's local baseline under
+`target/criterion`; those relative “improved/regressed” labels are not a CI
+failure unless a separate regression gate is added. The benchmark harness uses
+a longer measurement window for serialization so larger decode cases complete
+without noisy sample warnings.
+
+### Test Coverage
 
 - Graph: construction, queries, walk, search, subgraph, stats, dedupe
 - Accessors: deterministic entities, relations, nodes, search tie-breaks, exact edge and multiedge lookup
@@ -200,22 +247,28 @@ cargo run -p larql-core --example algorithm_demo          # Algorithm examples
 - Serialization: JSON/MsgPack/Packed roundtrips, metadata preservation, corrupt packed input
 - CSV: quoted commas, escaped quotes, multiline fields, confidence/source roundtrips
 - Diff: confidence, source, metadata, and injection changes
-- BFS extraction: mock provider, depth, multi-seed, max_entities
-- Token chaining: multi-token, stop tokens, probability threshold
+- BFS extraction: mock provider, depth, multi-seed, max_entities, template stop tokens
+- Token chaining: multi-token, stop tokens, probability threshold, model-call accounting
 - Templates: registry, JSON load/save
 - Checkpoint: append, replay, persistence
 - Python compatibility: format interop
+- Feature matrix: default features, no default features, msgpack-only
+- Examples: edge, graph, algorithm, filter, serialization
+- Benches: Criterion graph/query/algorithm/serialization harness compile-smoke
 
-Current `cargo llvm-cov` summary:
+Current default coverage:
 
 | Command | Line coverage | Region coverage |
 |---------|---------------|-----------------|
-| `cargo llvm-cov -p larql-core --summary-only` | 77.92% | 78.60% |
-| `cargo llvm-cov -p larql-core --no-default-features --features msgpack --summary-only` | 79.84% | 79.91% |
+| `cargo llvm-cov --package larql-core --summary-only` | 89.33% | 90.41% |
 
-Default coverage includes the optional HTTP provider. The no-default/msgpack
-profile is a better signal for the core graph/serialization surface until
-`HttpProvider` has a local mock-server test.
+Coverage should stay high for `larql-core` because the crate is pure Rust and
+does not require model weights. Use `make larql-core-coverage` for the current
+summary and `make larql-core-coverage-html` for a browsable report.
+
+The default coverage profile includes the optional HTTP provider. The
+no-default/msgpack profile is a useful second signal for the graph and
+serialization surface when HTTP is intentionally excluded.
 
 ## Design Principles
 
@@ -226,6 +279,8 @@ profile is a better signal for the core graph/serialization surface until
 5. **Multi-format** — JSON (human), MsgPack (compact), Packed (fast), CSV (interchange)
 6. **Crash-safe** — CheckpointLog for long-running extractions
 7. **Zero unsafe** — all safe Rust, minimal dependencies
+8. **Platform-neutral** — little-endian on-disk formats, standard filesystem APIs, CI on Linux/Windows/macOS
+9. **No hidden model assumptions** — graph algorithms and serialization never depend on model architecture, tensor layout, or fixed metadata keys
 
 ## Features
 

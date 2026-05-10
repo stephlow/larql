@@ -125,7 +125,7 @@ COMPILE CURRENT INTO VINDEX "out.vindex"
 | `HIGHEST_CONFIDENCE` | Accepted for forward compatibility. Currently resolves like `LAST_WINS` for down vectors — see spec §3.5. |
 | `FAIL` | Abort if any slot has a conflicting write. |
 
-> **Status:** validated end-to-end on Gemma 3 4B in `experiments/14_vindex_compilation`.
+> **Status:** validated end-to-end on Gemma 3 4B in `~/chris-source/chris-experiments/compilation/14_vindex_compilation`.
 > 10/10 retrieval, 0/4 regression bleed, standalone baked vindex (no overlay needed at runtime).
 > The online refine pass (Gram-Schmidt against cached decoy residuals) runs at INSERT time, so
 > no compile-time refine step is needed — INSERT already handles bleed defense.

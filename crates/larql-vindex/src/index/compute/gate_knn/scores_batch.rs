@@ -10,6 +10,7 @@ use ndarray::{Array2, ArrayView2};
 
 use crate::index::core::VectorIndex;
 use crate::index::storage::gate_store::{gate_gemv_gpu, gate_matmul};
+use crate::index::storage::vindex_storage::VindexStorage;
 
 impl VectorIndex {
     /// Compute gate scores for all features × all positions in one BLAS gemm.
@@ -68,9 +69,8 @@ impl VectorIndex {
             let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
                 let nf = self
-                    .gate
-                    .gate_mmap_slices
-                    .get(layer)
+                    .storage
+                    .gate_layer_slice(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
                 if nf > 0 {
@@ -83,26 +83,25 @@ impl VectorIndex {
             }
         }
         // f32 mmap (zero-copy, the production path for f32 gate vectors).
-        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                    if slice.num_features == 0 {
-                        return None;
-                    }
-                    let byte_offset = slice.float_offset * 4;
-                    let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
-                    if byte_end > mmap.len() {
-                        return None;
-                    }
-                    let data = unsafe {
-                        let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
-                        std::slice::from_raw_parts(ptr, slice.num_features * self.hidden_size)
-                    };
-                    let view = ArrayView2::from_shape((slice.num_features, self.hidden_size), data)
-                        .unwrap();
-                    if let Some(scores) = gate_gemv_gpu(&view, &x.view(), backend) {
-                        return Some(scores);
-                    }
+        if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F32 {
+            if let Some(view) = self.storage.gate_layer_view(layer) {
+                if view.slice.num_features == 0 {
+                    return None;
+                }
+                let byte_offset = view.slice.float_offset * 4;
+                let byte_end = byte_offset + view.slice.num_features * self.hidden_size * 4;
+                let mmap: &[u8] = view.bytes.as_ref();
+                if byte_end > mmap.len() {
+                    return None;
+                }
+                let data = unsafe {
+                    let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
+                    std::slice::from_raw_parts(ptr, view.slice.num_features * self.hidden_size)
+                };
+                let arr = ArrayView2::from_shape((view.slice.num_features, self.hidden_size), data)
+                    .unwrap();
+                if let Some(scores) = gate_gemv_gpu(&arr, &x.view(), backend) {
+                    return Some(scores);
                 }
             }
         }
@@ -111,23 +110,26 @@ impl VectorIndex {
         // an ~18 K × 5376 gate matrix (387 MB f32, 194 MB f16) halving
         // the memory bandwidth is the difference between hitting the
         // CPU-BLAS ceiling and going faster on Metal.
-        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F16 && x.shape()[0] == 1
+        if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F16 && x.shape()[0] == 1
         {
-            let slice = self.gate.gate_mmap_slices.get(layer)?;
-            if slice.num_features == 0 {
+            let view = self.storage.gate_layer_view(layer)?;
+            if view.slice.num_features == 0 {
                 return None;
             }
-            let mmap = self.gate.gate_mmap_bytes.as_ref()?;
-            let byte_offset = slice.float_offset * 2;
-            let byte_end = byte_offset + slice.num_features * self.hidden_size * 2;
+            let mmap: &[u8] = view.bytes.as_ref();
+            let byte_offset = view.slice.float_offset * 2;
+            let byte_end = byte_offset + view.slice.num_features * self.hidden_size * 2;
             if byte_end <= mmap.len() {
                 let raw = &mmap[byte_offset..byte_end];
                 let x_row = x.row(0);
                 if let Some(x_slice) = x_row.as_slice() {
-                    if let Some(scores) =
-                        backend.f16_gemv_force(raw, x_slice, slice.num_features, self.hidden_size)
-                    {
-                        return Array2::from_shape_vec((slice.num_features, 1), scores).ok();
+                    if let Some(scores) = backend.f16_gemv_force(
+                        raw,
+                        x_slice,
+                        view.slice.num_features,
+                        self.hidden_size,
+                    ) {
+                        return Array2::from_shape_vec((view.slice.num_features, 1), scores).ok();
                     }
                 }
             }
@@ -142,9 +144,8 @@ impl VectorIndex {
             let warmed = self.gate.warmed_gates.read().unwrap();
             if let Some(Some(ref data)) = warmed.get(layer) {
                 let nf = self
-                    .gate
-                    .gate_mmap_slices
-                    .get(layer)
+                    .storage
+                    .gate_layer_slice(layer)
                     .map(|s| s.num_features)
                     .unwrap_or(0);
                 if nf > 0 {
@@ -155,44 +156,43 @@ impl VectorIndex {
             }
         }
         // f32 mmap
-        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F32 {
-            if let Some(ref mmap) = self.gate.gate_mmap_bytes {
-                if let Some(slice) = self.gate.gate_mmap_slices.get(layer) {
-                    if slice.num_features == 0 {
-                        return None;
-                    }
-                    let byte_offset = slice.float_offset * 4;
-                    let byte_end = byte_offset + slice.num_features * self.hidden_size * 4;
-                    if byte_end > mmap.len() {
-                        return None;
-                    }
-                    let data = unsafe {
-                        let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
-                        std::slice::from_raw_parts(ptr, slice.num_features * self.hidden_size)
-                    };
-                    let view = ArrayView2::from_shape((slice.num_features, self.hidden_size), data)
-                        .unwrap();
-                    return Some(gate_matmul(&view, &x.view()));
+        if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F32 {
+            if let Some(view) = self.storage.gate_layer_view(layer) {
+                if view.slice.num_features == 0 {
+                    return None;
                 }
+                let byte_offset = view.slice.float_offset * 4;
+                let byte_end = byte_offset + view.slice.num_features * self.hidden_size * 4;
+                let mmap: &[u8] = view.bytes.as_ref();
+                if byte_end > mmap.len() {
+                    return None;
+                }
+                let data = unsafe {
+                    let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
+                    std::slice::from_raw_parts(ptr, view.slice.num_features * self.hidden_size)
+                };
+                let arr = ArrayView2::from_shape((view.slice.num_features, self.hidden_size), data)
+                    .unwrap();
+                return Some(gate_matmul(&arr, &x.view()));
             }
         }
         // f16 mmap — lazy decode into cache, then borrow (no per-call clone).
         // Holding the Mutex for the matmul is fine: forward passes are serial
         // per-layer, and this replaces a 462MB clone with a direct view.
-        if self.gate.gate_mmap_dtype == crate::config::dtype::StorageDtype::F16 {
-            let slice = self.gate.gate_mmap_slices.get(layer)?;
-            if slice.num_features == 0 {
+        if self.storage.gate_dtype() == crate::config::dtype::StorageDtype::F16 {
+            let view = self.storage.gate_layer_view(layer)?;
+            if view.slice.num_features == 0 {
                 return None;
             }
-            let mmap = self.gate.gate_mmap_bytes.as_ref()?;
+            let mmap: &[u8] = view.bytes.as_ref();
             let mut cache = self.gate.f16_decode_cache.lock().unwrap();
             if cache.len() <= layer {
                 cache.resize(layer + 1, None);
             }
             let miss = cache[layer].is_none();
             if miss {
-                let byte_offset = slice.float_offset * 2;
-                let byte_end = byte_offset + slice.num_features * self.hidden_size * 2;
+                let byte_offset = view.slice.float_offset * 2;
+                let byte_end = byte_offset + view.slice.num_features * self.hidden_size * 2;
                 if byte_end > mmap.len() {
                     return None;
                 }
@@ -201,11 +201,211 @@ impl VectorIndex {
             }
             self.touch_gate_cache_lru(layer, miss, &mut cache);
             let data = cache[layer].as_ref().unwrap();
-            let view =
-                ArrayView2::from_shape((slice.num_features, self.hidden_size), data.as_slice())
-                    .unwrap();
-            return Some(gate_matmul(&view, &x.view()));
+            let arr = ArrayView2::from_shape(
+                (view.slice.num_features, self.hidden_size),
+                data.as_slice(),
+            )
+            .unwrap();
+            return Some(gate_matmul(&arr, &x.view()));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline coverage of `gate_scores_batch`. Heap and f16-mmap
+    //! happy paths plus the empty-input + missing-data fall-throughs.
+    //! The f32-mmap fast path is exercised by the integration test
+    //! in `tests/compute_storage_regressions.rs`; here we focus on
+    //! the branches that aren't reached from there.
+
+    use crate::index::core::VectorIndex;
+    use crate::index::types::GateLayerSlice;
+    use ndarray::array;
+
+    fn heap_idx() -> VectorIndex {
+        let gate = ndarray::Array2::from_shape_vec(
+            (3, 4),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
+        )
+        .unwrap();
+        VectorIndex::new(vec![Some(gate)], vec![None], 1, 4)
+    }
+
+    /// `gate_scores_batch` rejects an empty seq.
+    #[test]
+    fn empty_seq_returns_none() {
+        let v = heap_idx();
+        let x = ndarray::Array2::<f32>::zeros((0, 4));
+        assert!(v.gate_scores_batch(0, &x).is_none());
+    }
+
+    /// Past-end layer falls through (no gate data) and returns None.
+    #[test]
+    fn out_of_range_layer_returns_none() {
+        let v = heap_idx();
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        assert!(v.gate_scores_batch(99, &x).is_none());
+    }
+
+    /// Heap-mode happy path — falls through the fast paths and lands
+    /// on `resolve_gate` + `gate_matmul`.
+    #[test]
+    fn heap_path_returns_seq_x_features_scores() {
+        let v = heap_idx();
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        let scores = v.gate_scores_batch(0, &x).expect("heap path");
+        // [seq_len=1, num_features=3]
+        assert_eq!(scores.shape(), &[1, 3]);
+        // f0 dot = 1, f1 dot = 4, f2 dot = 9 (3*3).
+        assert_eq!(scores[[0, 0]], 1.0);
+        assert_eq!(scores[[0, 1]], 4.0);
+        assert_eq!(scores[[0, 2]], 9.0);
+    }
+
+    /// f16 mmap fast path — populates storage with f16 bytes + slice
+    /// meta, then exercises `gate_scores_2d_fast`'s f16 lazy-decode
+    /// branch (which populates the f16 decode cache as a side effect).
+    #[test]
+    fn f16_mmap_fast_path_populates_decode_cache() {
+        // 3 features × 4 hidden, encoded as f16.
+        let gate_floats: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, 0.0, //
+            0.0, 0.0, 3.0, 0.0, //
+        ];
+        let f16_bytes = larql_models::quant::half::encode_f16(&gate_floats);
+        let mut anon = memmap2::MmapOptions::new()
+            .len(f16_bytes.len())
+            .map_anon()
+            .expect("anon mmap");
+        anon.copy_from_slice(&f16_bytes);
+        let mmap = anon.make_read_only().expect("freeze");
+
+        let v = VectorIndex::new_mmap(
+            mmap,
+            vec![GateLayerSlice {
+                float_offset: 0,
+                num_features: 3,
+            }],
+            crate::config::dtype::StorageDtype::F16,
+            None,
+            1,
+            4,
+        );
+
+        // Cache should be empty before the call.
+        assert!(v.gate.f16_decode_cache.lock().unwrap()[0].is_none());
+
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        let scores = v.gate_scores_batch(0, &x).expect("f16 fast path");
+        assert_eq!(scores.shape(), &[1, 3]);
+        // Within f16 quant noise: f0≈1, f1≈4, f2≈9.
+        assert!((scores[[0, 0]] - 1.0).abs() < 0.01);
+        assert!((scores[[0, 1]] - 4.0).abs() < 0.01);
+        assert!((scores[[0, 2]] - 9.0).abs() < 0.05);
+
+        // Cache should be populated as a side effect.
+        assert!(v.gate.f16_decode_cache.lock().unwrap()[0].is_some());
+    }
+
+    /// Empty layer slice (`num_features == 0`) on the f16 path
+    /// short-circuits without panicking.
+    #[test]
+    fn f16_path_returns_none_when_layer_unowned() {
+        let mmap = memmap2::MmapOptions::new()
+            .len(0)
+            .map_anon()
+            .unwrap()
+            .make_read_only()
+            .unwrap();
+        let v = VectorIndex::new_mmap(
+            mmap,
+            vec![GateLayerSlice {
+                float_offset: 0,
+                num_features: 0,
+            }],
+            crate::config::dtype::StorageDtype::F16,
+            None,
+            1,
+            4,
+        );
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        assert!(v.gate_scores_batch(0, &x).is_none());
+    }
+
+    /// `gate_scores_batch_backend` with a CPU backend on a heap index
+    /// — exercises the backend path's fall-through to BLAS when the
+    /// backend doesn't have `f32_gemv_force` for the heap shape.
+    #[test]
+    fn backend_path_heap_falls_back_to_blas() {
+        let v = heap_idx();
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        let cpu = larql_compute::CpuBackend;
+        let scores = v
+            .gate_scores_batch_backend(0, &x, Some(&cpu))
+            .expect("backend + heap");
+        assert_eq!(scores.shape(), &[1, 3]);
+    }
+
+    /// `gate_scores_batch_backend` short-circuits on empty seq.
+    #[test]
+    fn backend_path_empty_seq_returns_none() {
+        let v = heap_idx();
+        let x = ndarray::Array2::<f32>::zeros((0, 4));
+        let cpu = larql_compute::CpuBackend;
+        assert!(v.gate_scores_batch_backend(0, &x, Some(&cpu)).is_none());
+    }
+
+    /// Multi-position seq exercises the gemm path (vs single-row gemv).
+    #[test]
+    fn heap_path_multi_position_returns_correct_shape() {
+        let v = heap_idx();
+        let x = array![
+            [1.0, 2.0, 3.0, 4.0],
+            [4.0, 3.0, 2.0, 1.0],
+            [0.5, 0.5, 0.5, 0.5],
+        ];
+        let scores = v.gate_scores_batch(0, &x).expect("multi-pos");
+        assert_eq!(scores.shape(), &[3, 3]);
+    }
+
+    /// Warmed-cache fast path: pre-populate `warmed_gates` and
+    /// install matching gate slice metadata so `gate_scores_2d_fast`
+    /// hits the warmed branch.
+    #[test]
+    fn warmed_cache_path_returns_scores() {
+        // Build a dummy mmap so the storage's gate_layer_slice is
+        // populated; the warmed cache will short-circuit before any
+        // mmap data is read.
+        let mmap = memmap2::MmapOptions::new()
+            .len(24) // 3 features × 4 hidden × 2 bytes (f16)
+            .map_anon()
+            .unwrap()
+            .make_read_only()
+            .unwrap();
+        let v = VectorIndex::new_mmap(
+            mmap,
+            vec![GateLayerSlice {
+                float_offset: 0,
+                num_features: 3,
+            }],
+            crate::config::dtype::StorageDtype::F16,
+            None,
+            1,
+            4,
+        );
+        // Populate warmed cache directly.
+        v.gate.warmed_gates.write().unwrap()[0] = Some(vec![
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, 0.0, //
+            0.0, 0.0, 3.0, 0.0, //
+        ]);
+
+        let x = array![[1.0, 2.0, 3.0, 4.0]];
+        let scores = v.gate_scores_batch(0, &x).expect("warmed path");
+        assert_eq!(scores.shape(), &[1, 3]);
+        assert_eq!(scores[[0, 2]], 9.0);
     }
 }

@@ -109,16 +109,11 @@ fn build_minimal_f32_vindex(dir: &Path) -> (usize, usize, Vec<usize>) {
     )
     .unwrap();
 
-    // Minimal down_meta.bin (just the header the loader expects).
-    let mut down_meta = Vec::<u8>::new();
-    down_meta.extend_from_slice(b"DMET");
-    down_meta.extend_from_slice(&1u32.to_le_bytes());
-    down_meta.extend_from_slice(&(num_layers as u32).to_le_bytes());
-    down_meta.extend_from_slice(&1u32.to_le_bytes());
-    for &n in &per_layer_features {
-        down_meta.extend_from_slice(&(n as u32).to_le_bytes());
-    }
-    std::fs::write(dir.join("down_meta.bin"), down_meta).unwrap();
+    let down_meta: Vec<Option<Vec<Option<larql_vindex::FeatureMeta>>>> = per_layer_features
+        .iter()
+        .map(|&n| Some(vec![None; n]))
+        .collect();
+    larql_vindex::down_meta::write_binary(dir, &down_meta, 1).unwrap();
 
     // Zero-filled embeddings (so the loader's opportunistic-embed
     // reader has something to look at — not strictly required).

@@ -6,7 +6,7 @@
 //! wide-head regression case (head_dim=512) that exposed a tg_q
 //! population bug in earlier versions.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 

@@ -41,7 +41,7 @@ pub(super) fn apply_outer_combine(
     // Diagnostic bypass: leave `new_h` as `h_post_attn + _1(dense) + _2(moe)`
     // without outer norm OR layer_scalar — useful for isolating whether
     // this combine step is the broken piece.
-    if std::env::var("SKIP_OUTER_NORM").is_ok() {
+    if crate::options::env_flag(crate::options::ENV_SKIP_OUTER_NORM) {
         return;
     }
 

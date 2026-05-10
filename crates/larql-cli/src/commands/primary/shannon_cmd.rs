@@ -43,6 +43,12 @@ pub enum ShannonCommand {
     /// Score repeated occurrences of a needle in a passage.
     Repeat(RepeatArgs),
 
+    /// Per-layer Shannon bits via the final-norm logit lens.
+    /// At every layer L (embed plus each post-block residual), project through
+    /// `final_norm + lm_head` and report bits/token, KL-to-final, and the
+    /// adjacent `bits_saved[L] = bits_via_lens[L-1] - bits_via_lens[L]` deltas.
+    Layers(LayersArgs),
+
     /// Encode a short text file with model-driven arithmetic coding.
     Encode(EncodeArgs),
 
@@ -117,6 +123,28 @@ pub struct RepeatArgs {
 }
 
 #[derive(Args)]
+pub struct LayersArgs {
+    /// Model path or HuggingFace model ID.
+    model: String,
+
+    /// UTF-8 corpus file to score.
+    #[arg(long, value_name = "FILE")]
+    corpus: PathBuf,
+
+    /// Limit input to the first N bytes, truncated on a UTF-8 boundary.
+    #[arg(long)]
+    bytes: Option<usize>,
+
+    /// Maximum tokens in each scoring forward window.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT)]
+    context: usize,
+
+    /// Newly-scored target tokens per forward window.
+    #[arg(long, default_value_t = DEFAULT_STRIDE)]
+    stride: usize,
+}
+
+#[derive(Args)]
 pub struct EncodeArgs {
     /// Model path or HuggingFace model ID.
     model: String,
@@ -174,6 +202,7 @@ pub fn run(cmd: ShannonCommand) -> Result<(), Box<dyn std::error::Error>> {
         ShannonCommand::Score(args) => run_score(args),
         ShannonCommand::Slot(args) => run_slot(args),
         ShannonCommand::Repeat(args) => run_repeat(args),
+        ShannonCommand::Layers(args) => run_layers(args),
         ShannonCommand::Encode(args) => run_encode(args),
         ShannonCommand::Decode(args) => run_decode(args),
     }
@@ -203,6 +232,102 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     print_score_summary(&summary, text.len(), text.chars().count());
+    Ok(())
+}
+
+fn run_layers(args: LayersArgs) -> Result<(), Box<dyn std::error::Error>> {
+    validate_window(args.context, args.stride)?;
+    let text = read_text(&args.corpus, args.bytes)?;
+    let model = load_model(&args.model)?;
+    let ids = encode_prompt(model.tokenizer(), &*model.weights().arch, &text)?;
+    if ids.len() < 2 {
+        return Err("corpus must tokenize to at least one scored token".into());
+    }
+    let weights = model.weights();
+    let n_layers = weights.num_layers;
+    let n_captures = n_layers + 1;
+
+    eprintln!(
+        "scoring {} target tokens over {} bytes across {} layers...",
+        ids.len() - 1,
+        text.len(),
+        n_layers,
+    );
+
+    let mut layer_summaries: Vec<LayerSummary> =
+        (0..n_captures).map(|_| LayerSummary::default()).collect();
+
+    let pb = progress_bar((ids.len() - 1) as u64, "layers");
+    let mut target_start = 1usize;
+    while target_start < ids.len() {
+        let target_end = (target_start + args.stride).min(ids.len());
+        let prefix_start = target_end
+            .saturating_sub(args.context)
+            .min(target_start.saturating_sub(1));
+        let chunk_ids = &ids[prefix_start..target_end];
+
+        let captures = forward_hidden_all_layers(weights, chunk_ids)?;
+        if captures.len() != n_captures {
+            return Err(format!(
+                "expected {} captures, got {}",
+                n_captures,
+                captures.len()
+            )
+            .into());
+        }
+
+        let row_start = target_start - prefix_start - 1;
+        let row_end = target_end - prefix_start - 1;
+        let n_targets = target_end - target_start;
+
+        // Final log-probs at scoring positions, used as the KL reference.
+        let final_normed = final_norm(weights, captures.last().unwrap());
+        let final_rows = final_normed.slice(s![row_start..row_end, ..]);
+        let final_raw = dot_proj(&final_rows, &weights.lm_head);
+        let final_log_probs: Vec<Vec<f32>> = (0..n_targets)
+            .map(|t| compute_log_probs_row(weights, final_raw.row(t)))
+            .collect();
+
+        for (layer_idx, hidden) in captures.iter().enumerate() {
+            let normed = final_norm(weights, hidden);
+            let rows = normed.slice(s![row_start..row_end, ..]);
+            let raw = dot_proj(&rows, &weights.lm_head);
+            for offset in 0..n_targets {
+                let target = ids[target_start + offset] as usize;
+                let layer_lp = compute_log_probs_row(weights, raw.row(offset));
+                if target >= layer_lp.len() {
+                    return Err(format!("target token {target} out of vocab").into());
+                }
+                let bits = -(layer_lp[target] as f64) / LN_2;
+                let final_lp = &final_log_probs[offset];
+                let mut kl_nats = 0.0_f64;
+                for v in 0..layer_lp.len() {
+                    let lp_l = layer_lp[v] as f64;
+                    if !lp_l.is_finite() {
+                        continue;
+                    }
+                    let p_l = lp_l.exp();
+                    if p_l <= 0.0 || !p_l.is_finite() {
+                        continue;
+                    }
+                    let lp_f = final_lp[v] as f64;
+                    if !lp_f.is_finite() {
+                        continue;
+                    }
+                    kl_nats += p_l * (lp_l - lp_f);
+                }
+                layer_summaries[layer_idx].total_bits += bits;
+                layer_summaries[layer_idx].total_kl_bits += kl_nats / LN_2;
+                layer_summaries[layer_idx].n_tokens += 1;
+            }
+        }
+
+        pb.inc(n_targets as u64);
+        target_start = target_end;
+    }
+    pb.finish_and_clear();
+
+    print_layers_summary(&layer_summaries, text.len(), text.chars().count());
     Ok(())
 }
 
@@ -759,6 +884,45 @@ fn forward_hidden(
     Ok(h)
 }
 
+fn forward_hidden_all_layers(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+) -> Result<Vec<Array2<f32>>, Box<dyn std::error::Error>> {
+    if token_ids.is_empty() {
+        return Err("empty token window".into());
+    }
+    let ffn = WeightFfn { weights };
+    let h0 = larql_inference::forward::embed_tokens_pub(weights, token_ids);
+    let ple_inputs =
+        larql_inference::forward::ple::precompute_per_layer_inputs(weights, &h0, token_ids);
+    let mut captures: Vec<Array2<f32>> = Vec::with_capacity(weights.num_layers + 1);
+    captures.push(h0.clone());
+    let mut h = h0;
+    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
+    for layer in 0..weights.num_layers {
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| kv_cache.get(&src));
+        if let Some((h_new, _, kv_out)) = larql_inference::forward::run_layer_with_ffn(
+            weights,
+            &h,
+            layer,
+            &ffn,
+            false,
+            ple_inputs.get(layer),
+            shared_kv,
+        ) {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        }
+        captures.push(h.clone());
+    }
+    Ok(captures)
+}
+
 fn final_norm(weights: &ModelWeights, h: &Array2<f32>) -> Array2<f32> {
     apply_norm(
         weights,
@@ -860,6 +1024,133 @@ fn bits_for_raw_row(
 
 fn prob_for_target(logits: &[f32], target: u32) -> Result<f64, Box<dyn std::error::Error>> {
     Ok(2.0_f64.powf(-bits_for_target(logits, target)?))
+}
+
+/// Apply per-arch logit scaling/softcap and return natural-log probabilities
+/// over the full vocabulary for one position. Length matches the input row.
+fn compute_log_probs_row(
+    weights: &ModelWeights,
+    row: ndarray::ArrayView1<'_, f32>,
+) -> Vec<f32> {
+    let inv_scale = 1.0 / weights.arch.logits_scaling();
+    let final_softcap = weights.arch.final_logit_softcapping();
+    let transform = |v: f32| {
+        if !v.is_finite() {
+            return v;
+        }
+        let mut logit = v * inv_scale;
+        if let Some(cap) = final_softcap {
+            logit = (logit / cap).tanh() * cap;
+        }
+        logit
+    };
+    let scaled: Vec<f32> = row.iter().copied().map(transform).collect();
+    let max_logit = scaled
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f64 = scaled
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .map(|v| ((v - max_logit) as f64).exp())
+        .sum();
+    let logsumexp = (max_logit as f64) + exp_sum.ln();
+    scaled
+        .iter()
+        .map(|&v| {
+            if v.is_finite() {
+                ((v as f64) - logsumexp) as f32
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct LayerSummary {
+    total_bits: f64,
+    total_kl_bits: f64,
+    n_tokens: usize,
+}
+
+impl LayerSummary {
+    fn bits_per_token(&self) -> f64 {
+        if self.n_tokens == 0 {
+            0.0
+        } else {
+            self.total_bits / self.n_tokens as f64
+        }
+    }
+
+    fn kl_per_token(&self) -> f64 {
+        if self.n_tokens == 0 {
+            0.0
+        } else {
+            self.total_kl_bits / self.n_tokens as f64
+        }
+    }
+}
+
+fn layer_label(idx: usize) -> String {
+    if idx == 0 {
+        "embed".to_string()
+    } else {
+        format!("L{:02}", idx - 1)
+    }
+}
+
+fn print_layers_summary(layer_summaries: &[LayerSummary], bytes: usize, chars: usize) {
+    let n = layer_summaries.len();
+    let scored = layer_summaries.first().map(|s| s.n_tokens).unwrap_or(0);
+    println!("done.");
+    println!("tokens scored:  {:>10}", scored);
+    println!("bytes:          {:>10}", bytes);
+    println!("chars:          {:>10}", chars);
+    println!();
+    println!("per-layer bit contribution (final-norm lens):");
+    println!();
+    println!(
+        "  {:<6} {:<6}  {:>11}  {:>11}  {:>11}",
+        "from", "to", "bits saved", "bits/token", "KL->final"
+    );
+    println!("  {:-<55}", "");
+
+    let mut layers_only_total = 0.0_f64;
+    for to_idx in 1..n {
+        let from = &layer_summaries[to_idx - 1];
+        let to = &layer_summaries[to_idx];
+        let bits_saved = from.bits_per_token() - to.bits_per_token();
+        let kl_reduction = from.kl_per_token() - to.kl_per_token();
+        println!(
+            "  {:<6} {:<6}  {:>11.3}  {:>11.3}  {:>11.3}",
+            layer_label(to_idx - 1),
+            layer_label(to_idx),
+            bits_saved,
+            to.bits_per_token(),
+            kl_reduction,
+        );
+        if to_idx > 1 {
+            // Skip the embed -> L0 transition: that's lens warm-up, not layer
+            // labour. Match exp 34's `summary_layers_only` view.
+            layers_only_total += bits_saved;
+        }
+    }
+
+    if let (Some(first), Some(last)) = (layer_summaries.first(), layer_summaries.last()) {
+        println!();
+        println!(
+            "embed bits/token: {:>10.3}    final bits/token: {:>10.3}",
+            first.bits_per_token(),
+            last.bits_per_token()
+        );
+    }
+    println!(
+        "total layers-only bits saved: {:>8.2} / token  (excludes embed -> L0)",
+        layers_only_total
+    );
 }
 
 fn finite_max(values: &[f32]) -> Result<f32, Box<dyn std::error::Error>> {

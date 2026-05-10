@@ -2,7 +2,7 @@
 //! identical to the production 4sg kernel; only TG geometry changes.
 //! Output must be bit-equal.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -43,7 +43,7 @@ fn q4k_matvec_stride32_matches_cpu() {
     use larql_compute::metal::shaders::q4k_matvec_stride32 as p;
     let metal_out = dispatch(
         &metal,
-        &metal.q4k_matvec_stride32_pipeline.state,
+        &metal.quant.q4k_matvec_stride32_pipeline.state,
         p::ROWS_PER_TG,
         p::THREADS_PER_TG,
         &w_q4k,
@@ -117,7 +117,7 @@ fn q4k_matvec_8sg_matches_4sg_bit_equal() {
     use larql_compute::metal::shaders::{q4k_matvec as p4, q4k_matvec_8sg as p8};
     let r4 = dispatch(
         &metal,
-        &metal.q4k_matvec_4sg_pipeline.state,
+        &metal.quant.q4k_matvec_4sg_pipeline.state,
         p4::ROWS_PER_TG,
         p4::THREADS_PER_TG,
         &w_q4k,
@@ -127,7 +127,7 @@ fn q4k_matvec_8sg_matches_4sg_bit_equal() {
     );
     let r8 = dispatch(
         &metal,
-        &metal.q4k_matvec_8sg_pipeline.state,
+        &metal.quant.q4k_matvec_8sg_pipeline.state,
         p8::ROWS_PER_TG,
         p8::THREADS_PER_TG,
         &w_q4k,

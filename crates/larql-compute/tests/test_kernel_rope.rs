@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Per-kernel tests for the three RoPE shader variants
 //! (`metal/shaders/rope.rs`):
@@ -99,7 +99,7 @@ fn run_rope_at_pos_batched(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.rope_at_pos_batched_pipeline);
+    enc.set_compute_pipeline_state(&metal.attention.rope_at_pos_batched_pipeline);
     enc.set_buffer(0, Some(&buf), 0);
     enc.set_bytes(1, 4, &hd_val as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(2, 4, &base as *const f32 as *const std::ffi::c_void);
@@ -283,7 +283,7 @@ fn assert_rope_batched_qk_matches_separate(
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.rope_at_pos_batched_qk_pipeline);
+    enc.set_compute_pipeline_state(&metal.attention.rope_at_pos_batched_qk_pipeline);
     enc.set_buffer(0, Some(&q_buf), 0);
     enc.set_buffer(1, Some(&k_buf), 0);
     enc.set_bytes(2, 4, &hd as *const u32 as *const std::ffi::c_void);

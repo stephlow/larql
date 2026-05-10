@@ -78,14 +78,18 @@ LM-head path resolution (which kernel fires per next-token):
 |--------|---------|
 | `attention/` | BLAS-fused GQA attention: block, GQA, GPU dispatch, RoPE |
 | `forward/` | Forward pass: embed, layer, predict, PLE (per-layer embeddings), trace |
-| `ffn/` | FFN evaluation: dense, sparse, highway, route-guided (experimental backends deprecated) |
-| `layer_graph/` | Layer graphs + generation: `pipeline_layer`, `predict`, `prefill`, plus `generate/` (eos, detok, sampling, chat_session, gpu/cpu loops, lm_head, types) |
+| `ffn/` | FFN evaluation: `WeightFfn`, `SparseFfn`, plus `remote/` (HTTP single-shard) and `moe_remote/` (gRPC expert grid) |
+| `layer_graph/` | Layer graphs + generation: `pipeline_layer`, `predict`, `prefill`, plus `generate/` (eos, detok, sampling, chat_session, gpu/cpu loops, lm_head, types) and `grid/` (remote MoE/FFN orchestration) |
 | `residual.rs` | RMS norm, layer norm |
 | `trace/` | Residual stream decomposition and tiered storage |
-| `vindex/` | `open_inference_vindex` (strict loader) + `WalkFfn` (mmap'd FFN, faster than dense at 517ms vs 535ms) |
-| `capture.rs` | Residual stream vector capture for probing |
-| `walker/` | Weight-level graph walkers (no forward pass) |
+| `vindex/` | `open_inference_vindex` (strict loader) + `WalkFfn` (mmap'd FFN) + `q4k_forward/` |
+| `engines/` | KV-cache engines: `MarkovResidualEngine`, `UnlimitedContextEngine`, `Apollo`, `TurboQuant` (behind the `KvEngine` trait) |
+| `experts/` | WASM expert dispatcher and registry |
+| `chat/` | Jinja-driven chat templates loaded from vindex |
+| `capture.rs` | Residual-stream vector capture for probing |
 | `model.rs` | Model loading (re-exports from larql-models) |
+
+> Weight-level graph walkers live in the `larql-vindex` crate (`walker/`), not here.
 
 ## Compute Backend
 
@@ -233,7 +237,7 @@ cargo run --release -p larql-vindex --example build_down_features -- path/to/vin
 ## Tests
 
 ```bash
-# Inference lib tests (631 tests)
+# Inference lib tests (904 tests, 65.67% line coverage)
 cargo test -p larql-inference --lib
 
 # Gemma 3 4B regression smoke test (set the env var):
@@ -247,25 +251,31 @@ cargo test -p larql-inference
 cargo test -p larql-vindex --test test_hnsw --release
 
 # Individual test suites
-cargo test -p larql-inference --test test_fused_attention   # 23 tests
-cargo test -p larql-inference --test test_backend           # 13 tests
-cargo test -p larql-inference --test test_modules           # 15 tests
-cargo test -p larql-inference --test test_trace             # 14 tests
-cargo test -p larql-inference --test test_walkers           # 12 tests
-cargo test -p larql-inference --test test_walker_utils      # 10 tests
+cargo test -p larql-inference --test test_fused_attention             # 23 tests
+cargo test -p larql-inference --test test_backend                     # 19 tests
+cargo test -p larql-inference --test test_modules                     # 15 tests
+cargo test -p larql-inference --test test_trace                       # 14 tests
+cargo test -p larql-inference --test test_logits_goldens              # 13 tests
+cargo test -p larql-inference --test test_arch_golden                 # 10 tests
+cargo test -p larql-inference --test test_layer_graph_integration     #  7 tests
+cargo test -p larql-inference --test test_decode_consistency          #  5 tests
 ```
+
+Walker tests live in `larql-vindex`; weight-level walkers moved out of this crate.
 
 | Area | Tests | Coverage |
 |------|-------|----------|
 | Generation: EOS / detok / sampling / chat session | 38 | Builtin stops, special-token EOS via tokenizer fallback, leading-space, seed reproducibility, top-k/top-p truncation, whole-turn eviction |
 | Vindex strict loader | 2 | open_inference_vindex error paths |
-| Backend (ComputeBackend) | 13 | Shape, correctness, batch, Metal vs CPU |
+| Backend (ComputeBackend) | 19 | Shape, correctness, batch, Metal vs CPU |
 | Fused attention | 23 | GQA, softcap, capture, reference agreement, edge cases |
 | FFN + modules | 15 | SiLU, GELU, dense, highway, multi-position |
 | Trace stores | 14 | Write/read, tiers, boundaries, additive property |
-| Walkers | 12 | Weight/attention walkers, vector extractor |
-| Utils | 10 | Top-k, rounding, entity sorting |
-| Unit (lib) | total 631 | Core module tests + everything above |
+| Logits goldens | 13 | LM-head dispatch correctness across Q4_K / f16 / f32 paths |
+| Arch goldens | 10 | Per-arch fingerprint (Gemma 2/3/4, Llama, Mistral, Qwen) |
+| Layer-graph integration | 7 | DenseLayerGraph + WalkLayerGraph + cached graph round-trip |
+| Decode consistency | 5 | CPU-decode equality across batch sizes / KV-cache states |
+| Unit (lib) | total 904 | Core module tests + everything above. **65.67% line / 67.69% region / 72.96% function coverage; 64 of 127 files at ≥90% line cov.** See [CHANGELOG.md](CHANGELOG.md) for the per-file lift table. |
 | Gemma 3 4B smoke (`#[ignore]`) | 1 | First-token regression — gated on `LARQL_VINDEX_PATH` + `CI_INTEGRATION=1` |
 
 ## Crate Dependencies
@@ -300,7 +310,8 @@ larql-inference   Forward pass, attention, backends, WalkFfn
 | Doc | Content |
 |-----|---------|
 | [PERFORMANCE.md](PERFORMANCE.md) | Component breakdown, cross-crate comparison, Ollama reference |
-| [ROADMAP.md](ROADMAP.md) | Planned optimizations, completed items |
+| [ROADMAP.md](ROADMAP.md) | Forward-looking work + open frontiers |
+| [CHANGELOG.md](CHANGELOG.md) | Dated ship log (coverage push, bug fixes, H12 splits, MockArch fixtures, magic-strings cleanup) |
 | [docs/adr/001](docs/adr/001-fused-attention.md) | BLAS-fused online softmax attention |
 | [docs/adr/002](docs/adr/002-walk-ffn.md) | WalkFfn — zero-copy mmap'd down projection |
 | [docs/adr/003](docs/adr/003-cached-layer-graph.md) | Cached layer graph for template-fixed layers |

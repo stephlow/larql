@@ -1,7 +1,7 @@
 //! Q4K FFN raw-output bridge for exp35.
 //!
 //! Reads LARQLF32 matrices exported by
-//! `experiments/35_ffn_functional_fidelity/ffn_functional_fidelity.py`, runs
+//! `~/chris-source/chris-experiments/shannon/35_ffn_functional_fidelity/ffn_functional_fidelity.py`, runs
 //! the production `q4k_ffn_forward_layer` path for one layer, and writes the
 //! resulting raw FFN outputs back as LARQLF32 matrices.
 //!
@@ -9,8 +9,8 @@
 //!   cargo run -p kv-cache-benchmark --example q4k_ffn_raw_bridge \
 //!     --features real-model --release -- \
 //!     output/gemma3-4b-q4k-v2.vindex \
-//!     experiments/35_ffn_functional_fidelity/results/q4k_bridge_inputs_l30_seed \
-//!     experiments/35_ffn_functional_fidelity/results/q4k_bridge_outputs_l30_seed \
+//!     ~/chris-source/chris-experiments/shannon/35_ffn_functional_fidelity/results/q4k_bridge_inputs_l30_seed \
+//!     ~/chris-source/chris-experiments/shannon/35_ffn_functional_fidelity/results/q4k_bridge_outputs_l30_seed \
 //!     --layer 30 --k full
 
 #[cfg(feature = "real-model")]

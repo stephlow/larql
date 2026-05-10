@@ -14,6 +14,7 @@ path = "src/main.rs"
 larql-core = { path = "../larql-core" }
 larql-compute = { path = "../larql-compute" }
 larql-inference = { path = "../larql-inference" }
+larql-kv = { path = "../larql-kv" }
 larql-models = { path = "../larql-models" }
 larql-lql = { path = "../larql-lql" }
 larql-vindex = { path = "../larql-vindex" }
@@ -36,6 +37,7 @@ default = ["metal"]
 metal = [
     "larql-compute/metal",
     "larql-inference/metal",
+    "larql-kv/metal",
     "larql-vindex/metal",
 ]
 

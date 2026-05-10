@@ -15,7 +15,7 @@
 //! skip) since timing is system-load sensitive and not worth the 2-3
 //! seconds it adds to `cargo test`.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -61,7 +61,7 @@ fn dispatch_f16acc(
     let uo = bufs.output((n * 4) as u64);
     let n_val = n as u32;
     let k_val = k as u32;
-    let kh = &metal.q4k_ffn_gate_up_f16acc_pipeline;
+    let kh = &metal.ffn.q4k_ffn_gate_up_f16acc_pipeline;
     let tgs = (n as u64).div_ceil(f16acc::ROWS_PER_TG);
 
     let cmd = metal.queue().new_command_buffer();
@@ -106,7 +106,7 @@ fn dispatch_f32(
     let uo = bufs.output((n * 4) as u64);
     let n_val = n as u32;
     let k_val = k as u32;
-    let kh = &metal.q4k_ffn_gate_up_pipeline;
+    let kh = &metal.ffn.q4k_ffn_gate_up_pipeline;
     let tgs = (n as u64).div_ceil(f32acc::ROWS_PER_TG);
 
     let cmd = metal.queue().new_command_buffer();

@@ -29,7 +29,7 @@ pub(crate) const VINDEX_CORE_FILES: &[&str] = &[
     GATE_VECTORS_BIN,
     EMBEDDINGS_BIN,
     DOWN_META_BIN,
-    "down_meta.jsonl",
+    DOWN_META_JSONL,
     RELATION_CLUSTERS_JSON,
     FEATURE_LABELS_JSON,
 ];
@@ -54,7 +54,8 @@ pub use discovery::{
     repo_exists, CollectionItem,
 };
 pub use download::{
-    download_hf_weights, resolve_hf_vindex, resolve_hf_vindex_with_progress, DownloadProgress,
+    download_hf_weights, resolve_hf_model_with_progress, resolve_hf_vindex,
+    resolve_hf_vindex_with_progress, DownloadProgress,
 };
 pub use publish::{
     publish_vindex, publish_vindex_with_opts, PublishCallbacks, PublishOptions,

@@ -1256,3 +1256,126 @@ async fn http_openai_completions_sampling_params_accepted() {
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+// ══════════════════════════════════════════════════════════════
+// REV4 — OpenAI error envelope shape.
+//
+// /v1/embeddings, /v1/completions, /v1/chat/completions must return
+// the nested `{error: {message, type, param, code}}` shape so the
+// OpenAI Python and JS SDKs parse errors without special-casing.
+// LARQL paradigm endpoints keep the flat `{error: "msg"}` shape
+// (covered by other tests in this file).
+// ══════════════════════════════════════════════════════════════
+
+fn assert_openai_error_envelope(v: &serde_json::Value, expected_type: &str) {
+    let err = v
+        .get("error")
+        .and_then(|e| e.as_object())
+        .expect("response body must be {\"error\": {...}} (nested)");
+    assert!(
+        err.get("message").and_then(|m| m.as_str()).is_some(),
+        "error.message must be a non-null string; got {:?}",
+        err.get("message")
+    );
+    assert_eq!(
+        err.get("type").and_then(|t| t.as_str()),
+        Some(expected_type),
+        "error.type mismatch"
+    );
+    assert!(
+        err.contains_key("param"),
+        "error.param key must be present (even if null) — SDKs hard-key on it"
+    );
+    assert!(
+        err.contains_key("code"),
+        "error.code key must be present (even if null) — SDKs hard-key on it"
+    );
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_400_uses_nested_envelope() {
+    let app = single_model_router(state(vec![model("test")]));
+    let resp = post_json(
+        app,
+        "/v1/embeddings",
+        serde_json::json!({"input": [0u32, 1u32], "encoding_format": "binary"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp.into_body()).await;
+    assert_openai_error_envelope(&v, "invalid_request_error");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("encoding_format='binary'"),
+        "message should reference the bad input; got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn http_openai_embeddings_empty_uses_nested_envelope() {
+    let app = single_model_router(state(vec![model("test")]));
+    let resp = post_json(app, "/v1/embeddings", serde_json::json!({"input": []})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp.into_body()).await;
+    assert_openai_error_envelope(&v, "invalid_request_error");
+}
+
+#[tokio::test]
+async fn http_openai_completions_400_uses_nested_envelope() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"prompt": "hi", "stream": true, "echo": true, "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp.into_body()).await;
+    assert_openai_error_envelope(&v, "invalid_request_error");
+}
+
+#[tokio::test]
+async fn http_openai_completions_503_uses_nested_envelope() {
+    // model has infer_disabled = true → ServiceUnavailable.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({"prompt": "hi", "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_json(resp.into_body()).await;
+    assert_openai_error_envelope(&v, "service_unavailable_error");
+}
+
+#[tokio::test]
+async fn http_openai_chat_completions_400_uses_nested_envelope() {
+    let app = single_model_router(state(vec![model_infer_enabled("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({"messages": []}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp.into_body()).await;
+    assert_openai_error_envelope(&v, "invalid_request_error");
+}
+
+#[tokio::test]
+async fn http_openai_chat_completions_503_uses_nested_envelope() {
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_json(resp.into_body()).await;
+    assert_openai_error_envelope(&v, "service_unavailable_error");
+}

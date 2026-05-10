@@ -17,6 +17,7 @@ use std::ffi::c_void;
 
 use crate::metal::buffers::BufferCache;
 use crate::metal::ops::q4_common::Q4Pipelines;
+use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
 /// Weights for one transformer layer — ALL Q4 + norm weights.
 /// Matches `crate::FullPipelineLayer` but with borrowed Metal-friendly data.
@@ -52,7 +53,11 @@ pub fn encode_rms_norm(
     // Single threadgroup — cooperative SIMD reduction requires all threads in one TG.
     enc.dispatch_thread_groups(
         MTLSize::new(1, 1, 1),
-        MTLSize::new(256.min(len as u64), 1, 1),
+        MTLSize::new(
+            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(len as u64),
+            1,
+            1,
+        ),
     );
 }
 
@@ -72,7 +77,11 @@ pub fn encode_residual_add(
     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
     enc.dispatch_threads(
         MTLSize::new(len as u64, 1, 1),
-        MTLSize::new(256.min(len as u64), 1, 1),
+        MTLSize::new(
+            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(len as u64),
+            1,
+            1,
+        ),
     );
 }
 
@@ -94,6 +103,35 @@ pub fn encode_residual_add(
 ///   Q8_0 takes Q8 input via fused norm+Q8 shader)
 ///
 /// QK-norm ordering: when `use_qk_norm` is true and `qk_norm_pipeline` is
+/// Residual-delta intervention for a specific head at a specific layer.
+///
+/// When passed to `dispatch_full_pipeline`, the dispatch:
+///   1. After fused attention at `target_layer`: CPU-zeros head `target_head`'s
+///      slice in `attn_outs[target_layer]` (shared memory write, no GPU copy).
+///   2. After the post-attention residual add: CPU-adds `replacement_delta` to
+///      `h_post_attns[target_layer]`, then re-runs just the pre-FFN norm.
+///
+/// This replaces the head's actual W_O contribution with `replacement_delta`
+/// in the residual stream, which is the Mode D injection operation.
+/// On Apple Silicon with unified memory, the CPU reads/writes to shared Metal
+/// buffers are zero-copy; each intervention adds one command-buffer commit+wait
+/// per intervention point.
+pub struct PipelineIntervention<'a> {
+    pub target_layer: usize,
+    pub target_head: usize,
+    pub head_dim: usize,
+    pub num_q_heads: usize,
+    /// Replacement residual delta, shape `[seq_len × hidden_size]`.
+    pub replacement_delta: &'a [f32],
+    /// Capture the target head's pre-W_O output BEFORE hook A zeros it.
+    /// Filled with `[seq_len × head_dim]` floats. Initialize to empty Vec.
+    pub pre_wo_capture: std::cell::RefCell<Vec<f32>>,
+    /// If true, stop dispatch immediately after capture (before O-proj).
+    /// Used for oracle code computation — caller only needs pre_wo_capture.
+    /// The returned Vec<f32> from dispatch will be empty when true.
+    pub stop_after_capture: bool,
+}
+
 /// supplied, QK-norm is applied **before** RoPE (matching `decode_token` and
 /// the Gemma 3/4 reference implementations). `fused_attention` is then called
 /// with `use_qk_norm = 0` to avoid a second normalisation.
@@ -160,6 +198,7 @@ pub fn dispatch_full_pipeline(
     // fires so the closure can apply it correctly after combining dense + MoE.
     // Pass `None` for models without MoE — behaviour is identical to the prior API.
     mut moe_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>,
+    intervention: Option<&PipelineIntervention<'_>>,
 ) -> Vec<f32> {
     let num_layers = layers.len();
 
@@ -208,7 +247,7 @@ pub fn dispatch_full_pipeline(
     let needs_per_layer_commit = moe_fn.is_some() && layers.iter().any(|l| l.moe.is_some());
 
     let mut cmd = queue.new_command_buffer().to_owned();
-    let dump_path = std::env::var("LARQL_METAL_DUMP_LAYERS").ok();
+    let dump_path = crate::options::env_value(crate::options::ENV_METAL_DUMP_LAYERS);
     super::dump::dump_h_embed(dump_path.as_deref(), &lb, seq_len, hidden);
 
     for l in 0..num_layers {
@@ -357,7 +396,10 @@ pub fn dispatch_full_pipeline(
         );
 
         // ── 3b. Apply RoPE separately when populating KV cache ──
-        let use_separate_rope = kv_cache.is_some() && rope_at_pos_pipeline.is_some();
+        // Enable per-position RoPE whenever the pipeline is provided, regardless of
+        // KV cache. This makes `full_pipeline_q4` prefill-correct when
+        // rope_at_pos_pipeline is passed — needed for multi-position AHORD evaluation.
+        let use_separate_rope = rope_at_pos_pipeline.is_some();
         if use_separate_rope {
             let enc = cmd.new_compute_command_encoder();
             crate::metal::stages::rope::encode(
@@ -403,6 +445,55 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
+        // ── Intervention hook A: capture + zero target head in attn_outs[l] ──
+        //
+        // Commit+wait for fused attention. Then:
+        //   A.1 Capture pre-W_O output for oracle code computation (before zeroing).
+        //   A.2 Zero head H's slice so O-projection excludes head H.
+        //   A.3 If stop_after_capture, return early (pre_wo filled, no O-proj needed).
+        if let Some(iv) = intervention {
+            if l == iv.target_layer {
+                cmd.commit();
+                cmd.wait_until_completed();
+                let q_dim = iv.num_q_heads * iv.head_dim;
+
+                // A.1: Capture pre-W_O for oracle code computation.
+                {
+                    let attn_ro = attn_outs[l].contents() as *const f32;
+                    let mut cap = iv.pre_wo_capture.borrow_mut();
+                    cap.clear();
+                    cap.reserve(seq_len * iv.head_dim);
+                    for pos in 0..seq_len {
+                        let head_start = pos * q_dim + iv.target_head * iv.head_dim;
+                        unsafe {
+                            cap.extend_from_slice(std::slice::from_raw_parts(
+                                attn_ro.add(head_start),
+                                iv.head_dim,
+                            ));
+                        }
+                    }
+                }
+
+                // A.2: Zero head H's slice.
+                let attn_ptr = attn_outs[l].contents() as *mut f32;
+                for pos in 0..seq_len {
+                    let head_start = pos * q_dim + iv.target_head * iv.head_dim;
+                    unsafe {
+                        std::ptr::write_bytes(attn_ptr.add(head_start), 0u8, iv.head_dim);
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                attn_outs[l].did_modify_range(metal::NSRange::new(0, attn_outs[l].length()));
+
+                // A.3: Early return for oracle capture (stop before O-proj + FFN + remaining layers).
+                if iv.stop_after_capture {
+                    return vec![];
+                }
+
+                cmd = queue.new_command_buffer().to_owned();
+            }
+        }
+
         // ── 5. O projection. Per position, coalesced into a single
         // encoder so we pay one encoder-create + end_encoding for the
         // whole stage. (Tried wiring `q4k_matmul` here for seq_len>1
@@ -436,6 +527,36 @@ pub fn dispatch_full_pipeline(
                 );
             }
             enc.end_encoding();
+        }
+
+        // ── Intervention hook B: add replacement_delta to o_outs[l] ──
+        //
+        // Must run AFTER O-projection (step 5) and BEFORE post-attn residual + norm
+        // (step 6). Adding to o_outs[l] (not h_post_attns) means step 6 computes
+        //   h_post_attn = h + norm(o_without_H + delta)   [post-norm model]
+        //   h_post_attn = h + o_without_H + delta         [pre-norm model]
+        // matching the CPU path which uses rms_norm(attn_projected_with_replacement).
+        // Doing this AFTER step 6 would add delta outside the norm — wrong for post-norm.
+        if let Some(iv) = intervention {
+            if l == iv.target_layer {
+                cmd.commit();
+                cmd.wait_until_completed();
+                debug_assert_eq!(
+                    iv.replacement_delta.len(),
+                    seq_len * hidden,
+                    "PipelineIntervention replacement_delta length mismatch"
+                );
+                // CPU-add replacement_delta to o_outs[l] via shared memory.
+                let o_ptr = o_outs[l].contents() as *mut f32;
+                for i in 0..(seq_len * hidden) {
+                    unsafe {
+                        *o_ptr.add(i) += iv.replacement_delta[i];
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                o_outs[l].did_modify_range(metal::NSRange::new(0, o_outs[l].length()));
+                cmd = queue.new_command_buffer().to_owned();
+            }
         }
 
         // ── 6. Post-attention residual + pre-FFN norm (+ optional Q8 quant). ──
@@ -484,7 +605,7 @@ pub fn dispatch_full_pipeline(
                 ffn_needs_q8,
                 (hidden * 4) as u64,
                 hidden as u64,
-                (hidden.div_ceil(32) * 4) as u64,
+                (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64,
             );
             enc.end_encoding();
         }
@@ -492,14 +613,15 @@ pub fn dispatch_full_pipeline(
         // ── 7-9. FFN: gate+up → activation → down. Format-aware per position. ──
         {
             use crate::metal::stages::ffn;
-            let act = match layers[l].activation {
-                crate::Activation::GeluTanh => ffn::Activation::GeluTanh,
-                _ => ffn::Activation::SiLU,
-            };
+            // `ffn::Activation` is now a re-export of `crate::Activation`; the
+            // FFN dispatch panics on activations the Metal backend doesn't have
+            // a shader for (GeluExact, ReLU). The previous translation silently
+            // routed all unknown variants to SiLU and produced wrong output.
+            let act: ffn::Activation = layers[l].activation;
             let h_stride = (hidden * 4) as u64;
             let inter_stride = (inter * 4) as u64;
             let q8_stride = hidden as u64;
-            let q8s_stride = (hidden.div_ceil(32) * 4) as u64;
+            let q8s_stride = (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64;
 
             let enc = cmd.new_compute_command_encoder();
             if layers[l].ffn_type == crate::FfnType::Standard {

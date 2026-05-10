@@ -278,5 +278,5 @@ Estimated total: **1.5 days of focused work**.
 - `patch/knn_store.rs` — KnnStore (will be deleted)
 - `larql-lql/src/executor/mutation.rs` `exec_insert` (will be rewritten)
 - `larql-lql/src/executor/query.rs` `exec_infer` (KNN override branch deleted)
-- `experiments/15_v11_model/TWO_LEVEL_ARCHITECTURE_SPEC.md` — the architectural context that motivates this unification
+- `~/chris-source/chris-experiments/compilation/15_v11_model/TWO_LEVEL_ARCHITECTURE_SPEC.md` — the architectural context that motivates this unification
 - `arch_b_RESULTS.md` — the 189/189 WASM arithmetic result that the unified path must match

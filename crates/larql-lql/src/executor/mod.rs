@@ -8,10 +8,12 @@ mod compact;
 mod helpers;
 mod introspection;
 mod lifecycle;
+mod memit_persist;
 mod mutation;
 mod query;
 mod remote;
 mod trace;
+mod tuning;
 
 #[cfg(test)]
 mod tests;

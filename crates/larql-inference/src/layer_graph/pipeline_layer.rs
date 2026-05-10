@@ -5,50 +5,11 @@
 //! Both GPU and CPU paths use this — no duplicated param extraction.
 
 use crate::model::ModelWeights;
-use larql_compute::{FullPipelineLayer, MoeLayerWeights, QuantFormat, QuantWeight};
+use larql_compute::{
+    FullPipelineLayer, MoeLayerWeights, MoeRoutingPolicy, MoeWeightLayout, QuantFormat, QuantWeight,
+};
 
-pub(crate) const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct AttentionGeometry {
-    pub q_dim: usize,
-    pub kv_dim: usize,
-    pub num_q_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub rope_base: f32,
-}
-
-pub(crate) fn attention_geometry_for_arch_layer(
-    weights: &ModelWeights,
-    layer: usize,
-) -> AttentionGeometry {
-    let arch = &*weights.arch;
-    let head_dim = arch.head_dim_for_layer(layer);
-    let num_q_heads = arch.num_q_heads_for_layer(layer);
-    let num_kv_heads = arch.num_kv_heads_for_layer(layer);
-    AttentionGeometry {
-        q_dim: num_q_heads * head_dim,
-        kv_dim: num_kv_heads * head_dim,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        rope_base: arch.rope_base_for_layer(layer) as f32,
-    }
-}
-
-pub(crate) fn attention_geometry_for_pipeline_layer(
-    layer: &FullPipelineLayer<'_>,
-) -> AttentionGeometry {
-    AttentionGeometry {
-        q_dim: layer.num_q_heads * layer.head_dim,
-        kv_dim: layer.num_kv_heads * layer.head_dim,
-        num_q_heads: layer.num_q_heads,
-        num_kv_heads: layer.num_kv_heads,
-        head_dim: layer.head_dim,
-        rope_base: layer.rope_base,
-    }
-}
+pub const DEFAULT_GPU_KV_CACHE_MAX_SEQ: usize = 4096;
 
 pub(crate) fn kv_cache_shapes_for_arch(weights: &ModelWeights) -> Vec<(usize, usize)> {
     let arch = &*weights.arch;
@@ -181,6 +142,19 @@ pub fn build_arch_params<'a>(
             .moe_post_outer_norm_key(layer)
             .and_then(|k| weights.vectors.get(&k))
             .map(|v| v.as_slice()),
+        ple_input_gate: arch
+            .per_layer_input_gate_key(layer)
+            .and_then(|k| weights.tensors.get(&k))
+            .and_then(|t| t.as_slice()),
+        ple_projection: arch
+            .per_layer_projection_key(layer)
+            .and_then(|k| weights.tensors.get(&k))
+            .and_then(|t| t.as_slice()),
+        ple_post_norm: arch
+            .post_per_layer_input_norm_key(layer)
+            .and_then(|k| weights.vectors.get(&k))
+            .map(|v| v.as_slice()),
+        kv_shared_source: arch.kv_shared_source_layer(layer),
     }
 }
 
@@ -268,6 +242,8 @@ pub(crate) fn build_moe_weights<'a>(
     Some(MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        routing_policy: moe_routing_policy(arch.moe_router_type()),
+        weight_layout: MoeWeightLayout::default(),
         expert_data_format,
         router_proj,
         router_scale,
@@ -515,6 +491,8 @@ fn build_moe_stub<'a>(
     MoeLayerWeights {
         experts_gate_up: vec![],
         experts_down: vec![],
+        routing_policy: moe_routing_policy(arch.moe_router_type()),
+        weight_layout: MoeWeightLayout::default(),
         expert_data_format,
         router_proj: &[],
         router_scale: sl(arch.moe_router_scale_key(layer)),
@@ -535,11 +513,19 @@ fn build_moe_stub<'a>(
     }
 }
 
+fn moe_routing_policy(router_type: &str) -> MoeRoutingPolicy {
+    match router_type {
+        "gemma4_top_k_softmax" => MoeRoutingPolicy::gemma4_hybrid(),
+        _ => MoeRoutingPolicy::top_k_softmax(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::{make_test_vindex, make_test_weights};
+    use crate::test_utils::{make_test_vindex, make_test_weights};
     use larql_models::ModelWeights;
+    use std::collections::HashMap;
     use std::sync::OnceLock;
 
     fn weights() -> &'static ModelWeights {
@@ -657,5 +643,288 @@ mod tests {
         assert_eq!(gate.data, &[12, 13, 14, 15]);
         assert_eq!(up.data, &[16, 17, 18, 19]);
         assert_eq!(down.data, &[20, 21, 22, 23]);
+    }
+
+    // ── KV-shared / PLE field plumbing (D-METAL-PLE / D-METAL-KV-SHARED) ──
+    //
+    // These tests pin the contract between `arch.kv_shared_source_layer(layer)`
+    // /  PLE-key arch methods and the `FullPipelineLayer.kv_shared_source` /
+    // `ple_*` fields.  They were introduced after the D-METAL-KV-SHARED
+    // implementation surfaced a class of "field plumbing silently went None"
+    // bugs that only show up at decode-time as multilingual gibberish output
+    // — the kind of regression a one-line type-rename in build_arch_params
+    // would re-introduce.
+
+    /// Tiny synthetic Gemma-4-E2B-shaped arch with PLE + KV sharing.
+    /// Same shape as `crates/larql-models/tests/test_architectures.rs::gemma4_e2b_arch`
+    /// but smaller (4 layers, hidden=8) so weights fit in-memory cheaply.
+    fn synthetic_e2b_like_arch_json() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "global_head_dim": 8,
+                "vocab_size": 32,
+                "sliding_window": 4,
+                // PLE: 4-dim per-layer embed
+                "hidden_size_per_layer_input": 4,
+                // KV sharing: last 2 layers (L2, L3) share K/V from earlier layers
+                "num_kv_shared_layers": 2,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0
+                    },
+                    "sliding_attention": {"rope_theta": 10000.0}
+                },
+                "layer_types": [
+                    "sliding_attention",  // 0 — last sliding non-shared
+                    "full_attention",     // 1 — last global non-shared
+                    "sliding_attention",  // 2 — shared, source = L0
+                    "full_attention"      // 3 — shared, source = L1
+                ]
+            }
+        })
+    }
+
+    /// Build minimal ModelWeights for the synthetic E2B-like arch.  Tensors
+    /// are zero-filled (the tests only assert presence/absence and which
+    /// arch keys produced them, not numerical correctness).
+    fn synthetic_e2b_like_weights() -> ModelWeights {
+        use larql_models::{detect_from_json, WeightArray};
+        use ndarray::Array2;
+
+        let arch = detect_from_json(&synthetic_e2b_like_arch_json());
+        let num_layers = 4;
+        let hidden = 8;
+        let intermediate = 16;
+        let head_dim = 4;
+        let global_head_dim = 8;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        let vocab_size = 32;
+        let ple_dim = 4;
+
+        let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+        let zeros = |rows: usize, cols: usize| -> WeightArray {
+            Array2::<f32>::zeros((rows, cols)).into_shared()
+        };
+
+        let embed = zeros(vocab_size, hidden);
+        let lm_head = zeros(vocab_size, hidden);
+        tensors.insert(arch.embed_key().to_string(), embed.clone());
+        vectors.insert(arch.final_norm_key().to_string(), vec![1.0; hidden]);
+
+        // Shared PLE tensors (Stream 1 + Stream 2 sources).
+        if let Some(k) = arch.per_layer_model_projection_key() {
+            tensors.insert(k, zeros(num_layers * ple_dim, hidden));
+        }
+        if let Some(k) = arch.per_layer_embed_key() {
+            tensors.insert(k, zeros(vocab_size, num_layers * ple_dim));
+        }
+        if let Some(k) = arch.per_layer_projection_norm_key() {
+            vectors.insert(k, vec![1.0; ple_dim]);
+        }
+
+        for layer in 0..num_layers {
+            let layer_head_dim = if arch.is_sliding_window_layer(layer) {
+                head_dim
+            } else {
+                global_head_dim
+            };
+            let q_dim = num_q_heads * layer_head_dim;
+            let kv_dim = num_kv_heads * layer_head_dim;
+            tensors.insert(arch.attn_q_key(layer), zeros(q_dim, hidden));
+            tensors.insert(arch.attn_k_key(layer), zeros(kv_dim, hidden));
+            tensors.insert(arch.attn_v_key(layer), zeros(kv_dim, hidden));
+            tensors.insert(arch.attn_o_key(layer), zeros(hidden, q_dim));
+            tensors.insert(arch.ffn_gate_key(layer), zeros(intermediate, hidden));
+            tensors.insert(arch.ffn_up_key(layer), zeros(intermediate, hidden));
+            tensors.insert(arch.ffn_down_key(layer), zeros(hidden, intermediate));
+            vectors.insert(arch.input_layernorm_key(layer), vec![1.0; hidden]);
+            vectors.insert(arch.post_attention_layernorm_key(layer), vec![1.0; hidden]);
+            // Per-layer PLE tensors.
+            if let Some(k) = arch.per_layer_input_gate_key(layer) {
+                tensors.insert(k, zeros(ple_dim, hidden));
+            }
+            if let Some(k) = arch.per_layer_projection_key(layer) {
+                tensors.insert(k, zeros(hidden, ple_dim));
+            }
+            if let Some(k) = arch.post_per_layer_input_norm_key(layer) {
+                vectors.insert(k, vec![1.0; hidden]);
+            }
+        }
+
+        ModelWeights {
+            tensors,
+            vectors,
+            raw_bytes: HashMap::new(),
+            packed_mmaps: HashMap::new(),
+            skipped_tensors: Vec::new(),
+            packed_byte_ranges: HashMap::new(),
+            embed,
+            lm_head,
+            position_embed: None,
+            arch,
+            num_layers,
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            vocab_size,
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
+            rope_base: 10_000.0,
+        }
+    }
+
+    /// `kv_shared_source` must propagate from `arch.kv_shared_source_layer(l)`.
+    /// L0/L1 are non-shared, L2 → L0 (last sliding), L3 → L1 (last global).
+    /// This is the test that would catch a bug where someone removes the
+    /// `kv_shared_source: arch.kv_shared_source_layer(layer)` line in
+    /// `build_arch_params` (or where `arch.kv_shared_source_layer` itself
+    /// regresses on Gemma 4's per-layer-type matching logic).
+    #[test]
+    fn build_arch_params_populates_kv_shared_source_for_e2b_like_arch() {
+        let weights = synthetic_e2b_like_weights();
+        let l0 = build_arch_params(
+            &weights,
+            0,
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+        );
+        let l1 = build_arch_params(
+            &weights,
+            1,
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+        );
+        let l2 = build_arch_params(
+            &weights,
+            2,
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+        );
+        let l3 = build_arch_params(
+            &weights,
+            3,
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+            empty_qw(),
+        );
+        assert_eq!(l0.kv_shared_source, None, "L0 (non-shared) → None");
+        assert_eq!(l1.kv_shared_source, None, "L1 (non-shared) → None");
+        // L2 is sliding; last sliding non-shared layer in [0..first_shared) = L0.
+        assert_eq!(
+            l2.kv_shared_source,
+            Some(0),
+            "L2 (shared sliding) → L0 (last sliding non-shared)"
+        );
+        // L3 is global; last global non-shared layer = L1.
+        assert_eq!(
+            l3.kv_shared_source,
+            Some(1),
+            "L3 (shared global) → L1 (last global non-shared)"
+        );
+    }
+
+    /// `ple_input_gate` / `ple_projection` / `ple_post_norm` must populate
+    /// when the arch reports PLE keys AND the corresponding tensors exist
+    /// in the weights map.  Catches the bug class where someone changes the
+    /// `arch.per_layer_input_gate_key(layer).and_then(|k| ...)` chain in
+    /// `build_arch_params` and silently breaks PLE for E2B.
+    #[test]
+    fn build_arch_params_populates_ple_fields_for_e2b_like_arch() {
+        let weights = synthetic_e2b_like_weights();
+        for layer in 0..weights.num_layers {
+            let params = build_arch_params(
+                &weights,
+                layer,
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+            );
+            assert!(
+                params.ple_input_gate.is_some(),
+                "L{layer} ple_input_gate must be Some when arch declares PLE"
+            );
+            assert!(
+                params.ple_projection.is_some(),
+                "L{layer} ple_projection must be Some when arch declares PLE"
+            );
+            assert!(
+                params.ple_post_norm.is_some(),
+                "L{layer} ple_post_norm must be Some when arch declares PLE"
+            );
+            // Sanity: ple_spec() returns Some when all three are present.
+            assert!(
+                params.ple_spec().is_some(),
+                "L{layer} ple_spec() must be Some when all three PLE fields populate"
+            );
+        }
+    }
+
+    /// Non-PLE / non-KV-shared archs (TinyModel, etc) must leave the new
+    /// fields as `None` — no spurious population.
+    #[test]
+    fn build_arch_params_leaves_ple_and_kv_shared_fields_none_for_tinymodel() {
+        let w = weights();
+        for layer in 0..w.num_layers {
+            let params = build_arch_params(
+                w,
+                layer,
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+                empty_qw(),
+            );
+            assert_eq!(
+                params.kv_shared_source, None,
+                "L{layer} kv_shared_source must be None for non-shared arch"
+            );
+            assert_eq!(
+                params.ple_input_gate, None,
+                "L{layer} ple_input_gate must be None for non-PLE arch"
+            );
+            assert_eq!(params.ple_projection, None);
+            assert_eq!(params.ple_post_norm, None);
+            assert!(
+                params.ple_spec().is_none(),
+                "L{layer} ple_spec() must be None for non-PLE arch"
+            );
+        }
     }
 }

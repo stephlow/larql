@@ -167,6 +167,17 @@ impl Session {
         }
     }
 
+    /// Readonly access to the active backend's MEMIT store. Returns
+    /// `None` for non-Vindex backends (Weight, Remote, Empty) so
+    /// `SHOW COMPACT STATUS` can render a single zero line without an
+    /// error path.
+    pub(crate) fn memit_store(&self) -> Option<&larql_vindex::MemitStore> {
+        match &self.backend {
+            Backend::Vindex { memit_store, .. } => Some(memit_store),
+            _ => None,
+        }
+    }
+
     /// Mutable access to the patch overlay of the current vindex backend,
     /// for tests and benchmarks that need to inject patches without going
     /// through the full INSERT pipeline (which would require a real

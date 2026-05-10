@@ -40,44 +40,11 @@
 //! See `examples/mech_interp_demo.rs` for an end-to-end walkthrough on
 //! synthetic weights (no vindex required).
 
-#![allow(
-    deprecated,
-    dead_code,
-    private_interfaces,
-    unused_imports,
-    unused_mut,
-    unused_variables,
-    clippy::doc_nested_refdefs,
-    clippy::duplicated_attributes,
-    clippy::blocks_in_conditions,
-    clippy::collapsible_if,
-    clippy::doc_overindented_list_items,
-    clippy::erasing_op,
-    clippy::if_same_then_else,
-    clippy::identity_op,
-    clippy::items_after_test_module,
-    clippy::large_enum_variant,
-    clippy::let_and_return,
-    clippy::manual_find,
-    clippy::map_identity,
-    clippy::needless_borrow,
-    clippy::needless_borrows_for_generic_args,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::question_mark,
-    clippy::single_char_add_str,
-    clippy::too_many_arguments,
-    clippy::type_complexity,
-    clippy::unnecessary_cast,
-    clippy::useless_vec
-)]
-
 extern crate blas_src;
 
 pub mod attention;
 pub mod capture;
 pub mod chat;
-pub mod engines;
 pub mod error;
 pub mod experts;
 pub mod ffn;
@@ -87,11 +54,10 @@ pub mod model;
 pub mod prompt;
 pub mod residual;
 pub mod residual_diff;
+pub mod test_utils;
 pub mod tokenizer;
 pub mod trace;
-pub mod trie;
 pub mod vindex;
-pub mod walker;
 
 // Re-export dependencies for downstream crates.
 pub use larql_models;
@@ -100,17 +66,12 @@ pub use ndarray;
 pub use safetensors;
 pub use tokenizers;
 
-// Backend re-exports (from larql-compute).
-pub use larql_compute::cpu::ops::moe::{
-    cpu_moe_forward, run_single_expert, run_single_expert_with_norm,
-};
-pub use larql_compute::Activation as ComputeActivation;
-pub use larql_compute::CpuBackend;
-pub use larql_compute::MoeLayerWeights;
+// Backend re-exports — only the names with external consumers via
+// `larql_inference::*`. Callers wanting other compute types should
+// `use larql_compute::...` directly.
+pub use larql_compute::cpu::ops::moe::{run_single_expert, run_single_expert_with_norm};
 pub use larql_compute::QuantFormat;
-pub use larql_compute::{
-    cpu_backend, default_backend, dot_proj_gpu, matmul_gpu, ComputeBackend, MatMulOp,
-};
+pub use larql_compute::{cpu_backend, default_backend, ComputeBackend};
 
 /// Map a model's activation function to the compute-layer `Activation` enum.
 pub fn activation_from_arch(
@@ -121,8 +82,6 @@ pub fn activation_from_arch(
         _ => larql_compute::Activation::Silu,
     }
 }
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub use larql_compute::MetalBackend;
 
 // Re-export essentials at crate root.
 pub use attention::AttentionWeights;
@@ -136,21 +95,37 @@ pub use ffn::graph_backend::{GateIndex, IndexBuildCallbacks, SilentIndexCallback
 pub use ffn::{
     BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
-    ShardConfig, SparseFfn, WeightFfn,
+    ShardConfig, SparseFfn, WeightFfn, WirePreference,
 };
+// Crate-root forward re-exports — kept for any name with external use OR
+// in-crate examples/tests/benches that already import from the root. The
+// curated `research` module (below) re-sources these from subpaths so it
+// keeps working when individual root re-exports are dropped.
+//
+// Truly-unused root re-exports (no external + no inference example/test
+// usage) were dropped 2026-05-09: `capture_ffn_activation_matrix`,
+// `estimate_ffn_covariance`, `forward_raw_logits`, `infer_patched_q4k`,
+// `predict_from_hidden_with_ffn`, `predict_with_ffn_trace`,
+// `trace_forward_with_ffn`, `InferPatchedResult`, `LayerMode`,
+// `MemitFactResult`, `PredictResultWithAttention`,
+// `PredictResultWithResiduals`, `RawForward`, `SpecCapture`,
+// `TargetDelta`, `TraceResult`, `KNN_COSINE_THRESHOLD`. They remain
+// accessible via `larql_inference::forward::*` and `research::*`.
 pub use forward::{
-    apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,
-    capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals,
-    estimate_ffn_covariance, forward_from_layer, forward_raw_logits, forward_to_layer,
-    generate_cached_constrained, hidden_to_raw_logits, infer_patched, infer_patched_q4k,
-    logit_lens_top1, predict, predict_from_hidden, predict_from_hidden_with_ffn, predict_with_ffn,
-    predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router, predict_with_strategy,
+    apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals, capture_residuals,
+    capture_spec_residuals, forward_from_layer, forward_to_layer, generate_cached_constrained,
+    hidden_to_raw_logits, infer_patched, logit_lens_top1, predict, predict_from_hidden,
+    predict_with_ffn, predict_with_ffn_attention, predict_with_router, predict_with_strategy,
     run_memit, run_memit_with_target_opt, trace_forward, trace_forward_full,
-    trace_forward_with_ffn, walk_trace_from_residuals, InferPatchedResult, InferenceWeights,
-    KnnOverride, LayerAttentionCapture, LayerMode, MemitFact, MemitFactResult, MemitResult,
-    PredictResult, PredictResultWithAttention, PredictResultWithResiduals, RawForward, SpecCapture,
-    TargetDelta, TargetDeltaOpts, TraceResult, KNN_COSINE_THRESHOLD,
+    walk_trace_from_residuals, InferenceWeights, KnnOverride, LayerAttentionCapture, MemitFact,
+    MemitResult, PredictResult, TargetDeltaOpts,
 };
+// Crate-root layer_graph re-exports — kept for any name with external use
+// OR in-crate examples/tests/benches that import via the root. Truly-unused
+// names (no external + no inference example/test usage) dropped 2026-05-09:
+// `GridGenerateResult`, `ChatMLRenderer`, `GemmaRenderer`, `LayerOutput`,
+// `Llama3Renderer`, `PerLayerGraph`, `TurnRenderer`. They remain reachable
+// via `larql_inference::layer_graph::*`.
 pub use layer_graph::{
     build_adaptive_graph,
     detect_template,
@@ -160,7 +135,7 @@ pub use layer_graph::{
     // Expert grid generation
     grid::{
         generate_with_remote_ffn, generate_with_remote_ffn_batch, generate_with_remote_moe,
-        generate_with_remote_moe_batch, GridGenerateResult,
+        generate_with_remote_moe_batch,
     },
     hybrid::predict_hybrid,
     predict_honest,
@@ -170,30 +145,28 @@ pub use layer_graph::{
     predict_with_graph,
     predict_with_graph_vindex_logits,
     trace_with_graph,
+    try_generate,
+    try_generate_streaming,
+    try_generate_with_sampling,
     AttentionCache,
     CachedLayerGraph,
     // Multi-turn chat session
-    ChatMLRenderer,
     ChatSession,
     DenseLayerGraph,
     // Generation building blocks (EOS, detok, sampling)
     Detokenizer,
     EosConfig,
-    GemmaRenderer,
+    GenerateError,
     GenerateResult,
     GuidedWalkLayerGraph,
     // Production
     LayerGraph,
-    LayerOutput,
-    Llama3Renderer,
-    PerLayerGraph,
     PipelinedLayerGraph,
     Sampler,
     SamplingConfig,
     // Analysis/validation
     TemplatePattern,
     TemplateUniverse,
-    TurnRenderer,
     WalkLayerGraph,
 };
 pub use model::{load_model_dir, resolve_model_path, ModelWeights};
@@ -205,19 +178,58 @@ pub use trace::{
 };
 pub use vindex::{open_inference_vindex, predict_q4k, FfnL1Cache, WalkFfn, WalkFfnConfig};
 
-// Engine re-exports.
-pub use engines::accuracy::{
-    compare_hidden, cosine_similarity, js_divergence, kl_divergence, mse, softmax, HiddenAccuracy,
-};
-pub use engines::markov_residual::MarkovResidualEngine;
-pub use engines::unlimited_context::UnlimitedContextEngine;
-pub use engines::{EngineInfo, EngineKind, KvEngine};
+/// Stable, application-facing inference imports.
+///
+/// New downstream code should prefer this module over broad crate-root
+/// glob imports. The crate root remains source-compatible while the public
+/// surface is gradually narrowed.
+pub mod prelude {
+    pub use crate::{
+        default_backend, generate, generate_streaming, generate_with_sampling, load_model_dir,
+        load_tokenizer, open_inference_vindex, predict, predict_q4k, resolve_model_path,
+        try_generate, try_generate_streaming, try_generate_with_sampling, wrap_chat_prompt,
+        wrap_prompt_raw, wrap_with_vindex_template, ChatWrap, ComputeBackend, Detokenizer,
+        EosConfig, GenerateError, GenerateResult, InferenceError, ModelWeights, Sampler,
+        SamplingConfig, WalkFfn, WalkFfnConfig,
+    };
+    pub use larql_compute::CpuBackend;
+}
 
-// Walker re-exports.
-pub use walker::attention_walker::{AttentionLayerResult, AttentionWalker};
-pub use walker::vector_extractor::{
-    ExtractCallbacks, ExtractConfig, ExtractSummary, VectorExtractor,
-};
-pub use walker::weight_walker::{
-    walk_model, LayerResult, LayerStats, WalkCallbacks, WalkConfig, WeightWalker,
-};
+/// Mechanistic-interpretability and research-facing imports.
+///
+/// These APIs are intentionally more experimental than [`prelude`]. Grouping
+/// them here makes that boundary visible without breaking existing crate-root
+/// users in one large move.
+///
+/// KV-cache engines (`MarkovResidualEngine`, `UnlimitedContextEngine`,
+/// `EngineKind`, `KvEngine`) and accuracy helpers (`compare_hidden`,
+/// `cosine_similarity`, `kl_divergence`, …) now live in the `larql-kv`
+/// crate — depend on it directly.
+pub mod research {
+    // Source directly from subpaths so this curated surface keeps working
+    // even when individual root re-exports are dropped. Kept as a single
+    // import block per source module so the surface is easy to scan.
+    pub use crate::forward::{
+        apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,
+        capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals,
+        estimate_ffn_covariance, forward_from_layer, forward_raw_logits, forward_to_layer,
+        generate_cached_constrained, hidden_to_raw_logits, infer_patched, infer_patched_q4k,
+        logit_lens_top1, predict_from_hidden, predict_from_hidden_with_ffn, predict_with_ffn,
+        predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router,
+        predict_with_strategy, run_memit, run_memit_with_target_opt, trace_forward,
+        trace_forward_full, trace_forward_with_ffn, walk_trace_from_residuals, InferPatchedResult,
+        InferenceWeights, KnnOverride, LayerAttentionCapture, LayerMode, MemitFact,
+        MemitFactResult, MemitResult, PredictResult, PredictResultWithAttention,
+        PredictResultWithResiduals, RawForward, SpecCapture, TargetDelta, TargetDeltaOpts,
+        TraceResult, KNN_COSINE_THRESHOLD,
+    };
+    pub use crate::layer_graph::{
+        predict_honest, predict_pipeline, predict_with_graph, predict_with_graph_vindex_logits,
+        trace_with_graph, AttentionCache, TemplatePattern, TemplateUniverse,
+    };
+    pub use crate::trace::{
+        trace as trace_decomposed, trace_residuals, AnswerWaypoint, BoundaryStore, BoundaryWriter,
+        ContextStore, ContextTier, ContextWriter, LayerSummary, ResidualTrace, TraceNode,
+        TracePositions, TraceStore, TraceWriter,
+    };
+}

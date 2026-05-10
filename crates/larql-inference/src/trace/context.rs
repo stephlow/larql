@@ -523,4 +523,168 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    fn fresh_path(name: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("larql_ctx_{name}_{pid}_{nanos}.ctxt"))
+    }
+
+    #[test]
+    fn ffn_deltas_tier_round_trips_per_critical_layer() {
+        let path = fresh_path("ffn_deltas");
+        let hidden = 4;
+        let critical = vec![0usize, 1, 2];
+        let mut w =
+            ContextWriter::create(&path, hidden, 3, 10, ContextTier::FfnDeltas, &critical, 5)
+                .unwrap();
+        let residual = vec![1.0f32; hidden];
+        let ffn_deltas: Vec<Vec<f32>> = (0..critical.len())
+            .map(|i| (0..hidden).map(|j| (i * 10 + j) as f32).collect())
+            .collect();
+        w.append(0, 10, &residual, &ffn_deltas, &[]).unwrap();
+        w.finish().unwrap();
+
+        let store = ContextStore::open(&path).unwrap();
+        assert_eq!(store.tier(), ContextTier::FfnDeltas);
+        assert_eq!(store.critical_layers(), critical);
+        for cl in 0..critical.len() {
+            let d = store.ffn_delta(0, cl).expect("ffn delta");
+            assert_eq!(d.len(), hidden);
+            for (j, &v) in d.iter().enumerate().take(hidden) {
+                assert!((v - (cl * 10 + j) as f32).abs() < 1e-6);
+            }
+        }
+        // Out-of-range cl_idx → None.
+        assert!(store.ffn_delta(0, critical.len()).is_none());
+        // attn_delta on FfnDeltas tier → None (Tier < Full).
+        assert!(store.attn_delta(0, 0).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_tier_round_trips_attn_and_ffn_deltas() {
+        let path = fresh_path("full");
+        let hidden = 4;
+        let critical = vec![0usize, 1];
+        let mut w =
+            ContextWriter::create(&path, hidden, 2, 10, ContextTier::Full, &critical, 5).unwrap();
+        let residual = vec![2.0f32; hidden];
+        let ffn: Vec<Vec<f32>> = (0..critical.len())
+            .map(|i| (0..hidden).map(|j| (100 + i * 10 + j) as f32).collect())
+            .collect();
+        let attn: Vec<Vec<f32>> = (0..critical.len())
+            .map(|i| (0..hidden).map(|j| (200 + i * 10 + j) as f32).collect())
+            .collect();
+        w.append(0, 10, &residual, &ffn, &attn).unwrap();
+        w.finish().unwrap();
+
+        let store = ContextStore::open(&path).unwrap();
+        for cl in 0..critical.len() {
+            let f = store.ffn_delta(0, cl).unwrap();
+            let a = store.attn_delta(0, cl).unwrap();
+            assert!((f[0] - (100 + cl * 10) as f32).abs() < 1e-6);
+            assert!((a[0] - (200 + cl * 10) as f32).abs() < 1e-6);
+        }
+        assert!(store.attn_delta(0, critical.len()).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn token_range_and_boundary_for_token() {
+        let path = fresh_path("ranges");
+        let hidden = 4;
+        let mut w =
+            ContextWriter::create(&path, hidden, 1, 100, ContextTier::Residual, &[], 50).unwrap();
+        // Two windows: [0..50) and [50..100).
+        w.append(0, 50, &vec![0.0; hidden], &[], &[]).unwrap();
+        w.append(50, 50, &vec![0.0; hidden], &[], &[]).unwrap();
+        w.finish().unwrap();
+
+        let store = ContextStore::open(&path).unwrap();
+        assert_eq!(store.token_range(0), Some((0, 50)));
+        assert_eq!(store.token_range(1), Some((50, 100)));
+        assert!(store.token_range(2).is_none());
+
+        assert_eq!(store.boundary_for_token(0), Some(0));
+        assert_eq!(store.boundary_for_token(49), Some(0));
+        assert_eq!(store.boundary_for_token(50), Some(1));
+        assert_eq!(store.boundary_for_token(99), Some(1));
+        assert!(store.boundary_for_token(200).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn n_boundaries_and_metadata_accessors() {
+        let path = fresh_path("meta");
+        let hidden = 8;
+        let critical = vec![3usize];
+        let mut w = ContextWriter::create(
+            &path,
+            hidden,
+            5,
+            1000,
+            ContextTier::FfnDeltas,
+            &critical,
+            128,
+        )
+        .unwrap();
+        let r = vec![0.0f32; hidden];
+        let ffn = vec![vec![0.0f32; hidden]; critical.len()];
+        w.append(0, 100, &r, &ffn, &[]).unwrap();
+        w.finish().unwrap();
+
+        let s = ContextStore::open(&path).unwrap();
+        assert_eq!(s.n_boundaries(), 1);
+        assert_eq!(s.total_tokens(), 100);
+        assert_eq!(s.hidden_size(), hidden);
+        assert_eq!(s.window_size(), 1000);
+        assert_eq!(s.tier(), ContextTier::FfnDeltas);
+        assert_eq!(s.critical_layers(), critical);
+        // bytes_per_boundary = vectors_per_boundary * hidden * 4
+        assert_eq!(s.bytes_per_boundary(), 2 * hidden * 4);
+        assert!(s.file_size() >= s.data_size());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn out_of_range_boundary_returns_none() {
+        let path = fresh_path("oob");
+        let hidden = 4;
+        let mut w =
+            ContextWriter::create(&path, hidden, 1, 10, ContextTier::Residual, &[], 5).unwrap();
+        w.append(0, 10, &vec![1.0f32; hidden], &[], &[]).unwrap();
+        w.finish().unwrap();
+
+        let s = ContextStore::open(&path).unwrap();
+        assert!(s.residual(99).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_truncated_file() {
+        let path = fresh_path("truncated");
+        std::fs::write(&path, [0u8; 8]).unwrap(); // smaller than HEADER_SIZE
+        match ContextStore::open(&path) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected truncated file rejection"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let path = fresh_path("bad_magic");
+        let mut buf = vec![0u8; HEADER_SIZE];
+        buf[..4].copy_from_slice(b"XXXX"); // wrong magic
+        std::fs::write(&path, &buf).unwrap();
+        match ContextStore::open(&path) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected bad-magic rejection"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

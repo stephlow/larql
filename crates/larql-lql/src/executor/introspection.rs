@@ -38,7 +38,16 @@ impl Session {
             l1_layers.len(),
         ));
         if memit_supported {
-            out.push("  L2 (MEMIT):      0 facts across 0 cycles".to_string());
+            // Read live counts from the session-resident MemitStore so
+            // post-`COMPACT MAJOR` cycles surface here (the previous
+            // hardcoded "0 facts across 0 cycles" masked stale state).
+            let (facts, cycles) = self
+                .memit_store()
+                .map(|s| (s.total_facts(), s.num_cycles()))
+                .unwrap_or((0, 0));
+            out.push(format!(
+                "  L2 (MEMIT):      {facts} fact(s) across {cycles} cycle(s)"
+            ));
         } else {
             out.push(format!(
                 "  L2 (MEMIT):      not available (hidden_dim={} < 1024)",

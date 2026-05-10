@@ -85,7 +85,14 @@ where
         }
     }
 
-    let mut heap: BinaryHeap<AbsScore> = BinaryHeap::with_capacity(top_k);
+    // Cap the heap pre-allocation so callers passing `usize::MAX`
+    // (the unlimited walk path) don't request a TB-sized allocation.
+    // The loop pushes at most `min(top_k, scores.len())` entries; we
+    // size to the practical max (any vindex with > 1M features per
+    // layer would need a different data structure anyway).
+    const HEAP_CAP_LIMIT: usize = 1 << 20;
+    let cap = top_k.min(HEAP_CAP_LIMIT);
+    let mut heap: BinaryHeap<AbsScore> = BinaryHeap::with_capacity(cap);
     for (i, v) in scores.into_iter().enumerate() {
         if heap.len() < top_k {
             heap.push(AbsScore { idx: i, val: v });

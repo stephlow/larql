@@ -24,6 +24,9 @@
 
 pub const MULTI_LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-multi-layer";
 
+/// HTTP path served by the multi-layer batch endpoint.
+pub const MULTI_LAYER_BATCH_PATH: &str = "/v1/experts/multi-layer-batch";
+
 /// Q8K-prenormed variant: client sends `h_norm` pre-quantised to Q8_K
 /// (already computed during routing — zero extra client compute).  Server
 /// skips `pre_experts_norm` + `quantize_h_norm_for_q4k` and calls the
@@ -41,6 +44,9 @@ pub const MULTI_LAYER_BATCH_CONTENT_TYPE: &str = "application/x-larql-experts-mu
 ///     u32[num_experts]  expert_ids
 ///     f32[num_experts]  weights
 pub const MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE: &str = "application/x-larql-experts-multi-layer-q8k";
+
+/// HTTP path served by the Q8K-prenormed multi-layer batch endpoint.
+pub const MULTI_LAYER_BATCH_Q8K_PATH: &str = "/v1/experts/multi-layer-batch-q8k";
 
 pub struct MultiLayerTask {
     pub layer: usize,
@@ -149,7 +155,7 @@ pub fn decode_multi_layer_response(bytes: &[u8]) -> Option<Vec<MultiLayerResult>
 
 // ── Q8K-prenormed wire ────────────────────────────────────────────────────────
 
-const ELEMS_PER_Q8K_BLOCK: usize = 256;
+use crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS as ELEMS_PER_Q8K_BLOCK;
 const SUMS_PER_Q8K_BLOCK: usize = 8;
 
 pub fn encode_multi_layer_request_q8k(tasks: &[MultiLayerTaskQ8K]) -> Vec<u8> {
@@ -346,5 +352,209 @@ mod tests {
         assert!(decode_multi_layer_request(&[]).is_none());
         assert!(decode_multi_layer_request(&[0, 0, 0, 1]).is_none()); // claims 1 task but no body
         assert!(decode_multi_layer_response(&[]).is_none());
+    }
+
+    #[test]
+    fn empty_request_round_trips_to_zero_tasks() {
+        let encoded = encode_multi_layer_request(&[]);
+        // Just the [u32 num_tasks=0] header.
+        assert_eq!(encoded.len(), 4);
+        let decoded = decode_multi_layer_request(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn empty_response_round_trips_to_zero_results() {
+        let encoded = encode_multi_layer_response(&[]);
+        assert_eq!(encoded.len(), 4);
+        let decoded = decode_multi_layer_response(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn request_with_zero_experts_round_trips() {
+        // Skip-vote pattern: a layer that routed nothing — encoder must
+        // still emit the header so the layer index isn't lost.
+        let tasks = vec![MultiLayerTask {
+            layer: 9,
+            residual: vec![0.0, 0.0, 0.0, 0.0],
+            expert_ids: vec![],
+            weights: vec![],
+        }];
+        let encoded = encode_multi_layer_request(&tasks);
+        let decoded = decode_multi_layer_request(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].layer, 9);
+        assert_eq!(decoded[0].residual.len(), 4);
+        assert!(decoded[0].expert_ids.is_empty());
+        assert!(decoded[0].weights.is_empty());
+    }
+
+    #[test]
+    fn truncated_response_returns_none() {
+        let encoded = encode_multi_layer_response(&[MultiLayerResult {
+            layer: 1,
+            h2: vec![1.0; 4],
+        }]);
+        // Drop the last byte → truncated f32; decoder must reject.
+        assert!(decode_multi_layer_response(&encoded[..encoded.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn truncated_request_returns_none_at_each_field() {
+        let encoded = encode_multi_layer_request(&[MultiLayerTask {
+            layer: 0,
+            residual: vec![1.0, 2.0],
+            expert_ids: vec![0],
+            weights: vec![1.0],
+        }]);
+        for cut in 1..encoded.len() {
+            // Every prefix shorter than the full encoding must be rejected
+            // — there's no valid framing to recover from.
+            assert!(
+                decode_multi_layer_request(&encoded[..cut]).is_none(),
+                "decode succeeded on prefix len={cut}, expected None"
+            );
+        }
+    }
+
+    // ── Q8K-prenormed wire ──────────────────────────────────────────────
+
+    fn make_q8k_task(layer: usize, hidden: usize, ne: usize) -> MultiLayerTaskQ8K {
+        let nb = hidden / ELEMS_PER_Q8K_BLOCK;
+        MultiLayerTaskQ8K {
+            layer,
+            hidden,
+            qs: (0..hidden)
+                .map(|i| ((i % 256) as i32 - 128) as i8)
+                .collect(),
+            d: (0..nb).map(|i| 0.01 * (i as f32 + 1.0)).collect(),
+            sums: (0..nb * SUMS_PER_Q8K_BLOCK)
+                .map(|i| (i as i16) - 64)
+                .collect(),
+            expert_ids: (0..ne).map(|i| (i as u32) * 17).collect(),
+            weights: (0..ne)
+                .map(|i| 1.0 / ne.max(1) as f32 * (i as f32 + 1.0))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn q8k_request_round_trip_single_block() {
+        let tasks = vec![make_q8k_task(3, ELEMS_PER_Q8K_BLOCK, 4)];
+        let encoded = encode_multi_layer_request_q8k(&tasks);
+        let decoded = decode_multi_layer_request_q8k(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let t = &decoded[0];
+        assert_eq!(t.layer, 3);
+        assert_eq!(t.hidden, ELEMS_PER_Q8K_BLOCK);
+        assert_eq!(t.qs, tasks[0].qs);
+        assert_eq!(t.d, tasks[0].d);
+        assert_eq!(t.sums, tasks[0].sums);
+        assert_eq!(t.expert_ids, tasks[0].expert_ids);
+        assert_eq!(t.weights, tasks[0].weights);
+    }
+
+    #[test]
+    fn q8k_request_round_trip_multi_block_multi_task() {
+        // Two tasks, different hidden sizes → both nb counts must be
+        // independently respected by the decoder.
+        let tasks = vec![
+            make_q8k_task(0, ELEMS_PER_Q8K_BLOCK, 2),
+            make_q8k_task(11, ELEMS_PER_Q8K_BLOCK * 3, 8),
+        ];
+        let encoded = encode_multi_layer_request_q8k(&tasks);
+        let decoded = decode_multi_layer_request_q8k(&encoded).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (orig, got) in tasks.iter().zip(decoded.iter()) {
+            assert_eq!(orig.layer, got.layer);
+            assert_eq!(orig.hidden, got.hidden);
+            assert_eq!(orig.qs, got.qs);
+            assert_eq!(orig.d, got.d);
+            assert_eq!(orig.sums, got.sums);
+            assert_eq!(orig.expert_ids, got.expert_ids);
+            assert_eq!(orig.weights, got.weights);
+        }
+    }
+
+    #[test]
+    fn q8k_request_with_zero_experts_round_trips() {
+        let tasks = vec![make_q8k_task(2, ELEMS_PER_Q8K_BLOCK, 0)];
+        let encoded = encode_multi_layer_request_q8k(&tasks);
+        let decoded = decode_multi_layer_request_q8k(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].expert_ids.is_empty());
+        assert!(decoded[0].weights.is_empty());
+        // Activation payload still present.
+        assert_eq!(decoded[0].qs.len(), ELEMS_PER_Q8K_BLOCK);
+    }
+
+    #[test]
+    fn empty_q8k_request_round_trips() {
+        let encoded = encode_multi_layer_request_q8k(&[]);
+        assert_eq!(encoded.len(), 4);
+        let decoded = decode_multi_layer_request_q8k(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn truncated_q8k_request_returns_none_at_each_field() {
+        let encoded = encode_multi_layer_request_q8k(&[make_q8k_task(0, ELEMS_PER_Q8K_BLOCK, 1)]);
+        for cut in 1..encoded.len() {
+            assert!(
+                decode_multi_layer_request_q8k(&encoded[..cut]).is_none(),
+                "Q8K decode succeeded on prefix len={cut}, expected None"
+            );
+        }
+    }
+
+    #[test]
+    fn read_i8_slice_handles_signed_bytes() {
+        // i8 round-trip via u8 byte storage: 0xff (255) must surface as -1.
+        let bytes = [0u8, 0x7f, 0x80, 0xff];
+        let mut pos = 0;
+        let v = read_i8_slice(&bytes, &mut pos, 4).unwrap();
+        assert_eq!(v, vec![0i8, 127, -128, -1]);
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn read_i16_slice_handles_negative_values() {
+        // Three i16 little-endian: 0, 32767, -1.
+        let bytes = [0x00, 0x00, 0xff, 0x7f, 0xff, 0xff];
+        let mut pos = 0;
+        let v = read_i16_slice(&bytes, &mut pos, 3).unwrap();
+        assert_eq!(v, vec![0i16, 32767, -1]);
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn read_helpers_reject_overruns() {
+        let bytes = [0u8; 4];
+        let mut pos = 0;
+        // Asking for one past the end is None; pos unchanged.
+        assert!(read_u32(&bytes, &mut 1).is_none());
+        assert!(read_f32(&bytes, &mut 1).is_none());
+        assert!(read_f32_slice(&bytes, &mut pos, 2).is_none());
+        assert!(read_i8_slice(&bytes, &mut pos, 5).is_none());
+        assert!(read_i16_slice(&bytes, &mut pos, 3).is_none());
+    }
+
+    #[test]
+    fn content_type_and_path_consts_pin_wire_strings() {
+        // Renaming any of these breaks deployed clients/servers.
+        assert_eq!(
+            MULTI_LAYER_BATCH_CONTENT_TYPE,
+            "application/x-larql-experts-multi-layer"
+        );
+        assert_eq!(MULTI_LAYER_BATCH_PATH, "/v1/experts/multi-layer-batch");
+        assert_eq!(
+            MULTI_LAYER_BATCH_Q8K_CONTENT_TYPE,
+            "application/x-larql-experts-multi-layer-q8k"
+        );
+        assert_eq!(
+            MULTI_LAYER_BATCH_Q8K_PATH,
+            "/v1/experts/multi-layer-batch-q8k"
+        );
     }
 }

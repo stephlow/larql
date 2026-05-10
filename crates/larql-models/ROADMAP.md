@@ -1,10 +1,15 @@
 # Roadmap — larql-models
 
-## Current: 12 architectures, 282 tests, safetensors + GGUF loading, 81.41% line / 82.06% function coverage
+## Current: 12 architectures, 286 tests, safetensors + GGUF loading, 77.86% line / 78.30% function coverage
 
 ## Roadmap Review 2026-04-26
 
 The 2026-04-26 quality pass closed the known P0 items for `larql-models`: walk-only filtering, silent dtype reporting, quant test gaps, loader string constants, MXFP4 consolidation, config validation adoption, clippy, examples, benchmark coverage, and coverage refresh are complete. The 2026-04-30 follow-up fixed packed BF16 expert ownership, GGUF matrix layout/config-default handling, and refreshed coverage to the current baseline.
+
+The 2026-05-07 follow-up fixed small-vocab GGUF handling, explicit embedding
+orientation, missing GGUF attention metadata defaults, and checked mmap packed
+byte ranges. It also added targeted regression coverage and refreshed CI to
+run rustfmt plus a crate-scoped coverage summary.
 
 Recommended next sequence:
 - Add Phi-3 / Phi-4 architecture support first. It is low effort, exercises the new validation path, and expands coverage without changing the trait.
@@ -18,6 +23,17 @@ Recommended next sequence:
 **Status**: Not started
 
 `larql-models` now exposes validated APIs. Update downstream inference, vindex extraction, CLI, and server entry points to use `detect_*_validated` or `load_*_validated` where invalid configs should fail fast.
+
+### Deterministic HuggingFace cache resolution
+**Effort**: Low
+**Status**: Not started
+
+`loading/safetensors.rs::resolve_model_path` scans cached snapshot
+directories and returns the first snapshot with safetensors. `read_dir` order
+is not stable and the resolver ignores `refs/main`, so the same model ID can
+resolve to an old or arbitrary cached revision. Prefer the commit recorded in
+`models--.../refs/main` when no explicit revision is provided, then fall back
+to a deterministic snapshot ordering.
 
 ### Architecture capability contracts
 **Effort**: Medium  
@@ -134,3 +150,5 @@ Current sliding window is boolean per layer. Future models may have more complex
 | Packed BF16 mmap retention | 2026-04-30 | Gemma 4 A4B packed BF16 expert tensors are retained as mmap byte ranges instead of heap-cloned raw bytes |
 | GGUF loader correctness fixes | 2026-04-30 | 2D tensors load as standard `[rows, cols]`; absent optional RoPE/vocab metadata falls back through architecture/tokenizer defaults |
 | Coverage baseline refresh | 2026-04-30 | 282 tests; 81.41% line / 82.06% function coverage |
+| GGUF loader regression fixes | 2026-05-07 | Small vocab metadata, shape-derived vocab fallback, missing KV/head-dim defaults, checked packed mmap ranges |
+| Coverage baseline refresh | 2026-05-07 | 286 tests; 77.86% line / 78.30% function coverage |

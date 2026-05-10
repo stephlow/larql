@@ -43,6 +43,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
+use crate::routes::openai::OpenAIError;
 use crate::state::{AppState, LoadedModel};
 
 use crate::routes::embed::embed_tokens;
@@ -126,21 +127,21 @@ pub struct EmbeddingsResponse {
     responses(
         (status = 200, description = "Mean-pooled embeddings (not contrastively trained — use at your own risk).",
          body = crate::openapi::schemas::OpenAiEmbeddingsResponse),
-        (status = 400, body = crate::error::ErrorBody),
-        (status = 500, body = crate::error::ErrorBody),
+        (status = 400, body = crate::routes::openai::error::OpenAIErrorBody),
+        (status = 500, body = crate::routes::openai::error::OpenAIErrorBody),
     ),
 )]
 pub async fn handle_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingsRequest>,
-) -> Result<Json<EmbeddingsResponse>, ServerError> {
+) -> Result<Json<EmbeddingsResponse>, OpenAIError> {
     state.bump_requests();
 
     let encoding = match req.encoding_format.as_deref() {
         None | Some("float") => EncodingFormat::Float,
         Some("base64") => EncodingFormat::Base64,
         Some(fmt) => {
-            return Err(ServerError::BadRequest(format!(
+            return Err(OpenAIError::invalid_request(format!(
                 "encoding_format='{fmt}' is not supported (expected 'float' or 'base64')"
             )));
         }
@@ -162,14 +163,14 @@ pub async fn handle_embeddings(
     };
 
     if token_seqs.iter().all(|s| s.is_empty()) {
-        return Err(ServerError::BadRequest("input is empty".into()));
+        return Err(OpenAIError::invalid_request("input is empty"));
     }
 
     let mut data = Vec::with_capacity(token_seqs.len());
     let mut total_tokens = 0usize;
     for (idx, ids) in token_seqs.iter().enumerate() {
         if ids.is_empty() {
-            return Err(ServerError::BadRequest(format!(
+            return Err(OpenAIError::invalid_request(format!(
                 "input[{idx}] is empty — every input must have ≥1 token"
             )));
         }

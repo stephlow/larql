@@ -175,14 +175,14 @@ impl ExpertService for ExpertGrpcService {
                 // K × q4k_matvec).  Falls through to the per-expert rayon
                 // CPU path otherwise — preserves identical wire output.
                 let path_used: &str;
-                #[cfg(feature = "metal-experts")]
+                #[cfg(all(feature = "metal-experts", target_os = "macos"))]
                 let metal_h2 = tokio::task::block_in_place(|| -> Result<Option<Vec<f32>>, Status> {
                     crate::routes::expert::run_experts_metal_batch(
                         &state2, layer, &residual, &expert_ids, &expert_weights,
                     )
                     .map_err(|e| Status::internal(e.to_string()))
                 })?;
-                #[cfg(not(feature = "metal-experts"))]
+                #[cfg(not(all(feature = "metal-experts", target_os = "macos")))]
                 let metal_h2: Option<Vec<f32>> = None;
 
                 let h2 = if let Some(h2_metal) = metal_h2 {

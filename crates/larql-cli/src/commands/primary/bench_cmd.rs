@@ -5,25 +5,25 @@
 //! queries a running Ollama server on the same machine for a side-by-side
 //! tok/s comparison.
 //!
-//! This is the real-vindex counterpart of `crates/larql-compute/examples/
-//! compare_ollama.rs`, which benchmarks synthetic weights. The synthetic
-//! version measures the kernel ceiling; this one measures what an actual
-//! decode loop delivers on the vindex bytes shipped by `larql extract`.
-//!
 //! Flag surface:
-//!   <model>          vindex dir, `hf://owner/name`, or cache shorthand.
-//!   --prompt STR     prompt to time (default: "The capital of France is").
-//!   -n, --tokens N   decode steps to time (default: 50).
-//!   --warmup N       decode steps to run first and discard (default: 3).
-//!   --backends LIST  comma-separated: `metal`, `cpu`. Default: `metal`.
-//!   --ollama MODEL   also query Ollama (e.g. `gemma3:4b`) via localhost.
-//!   --ffn URL        bench remote FFN path (attention local, FFN remote).
+//!   <model>               vindex dir, `hf://owner/name`, or cache shorthand.
+//!   --prompt STR          prompt to time (default: "The capital of France is").
+//!   -n, --tokens N        decode steps to time (default: 50).
+//!   --warmup N            warmup steps before measurement (default: 3).
+//!   --backends LIST       comma-separated: `metal`, `cpu`. Default: `metal`.
+//!   --ollama MODEL        also query Ollama (e.g. `gemma3:4b`) via localhost.
+//!   --ffn URL             bench remote FFN path (attention local, FFN remote).
+//!   --wire f32,f16,i8     compare wire formats end-to-end (requires --ffn).
+//!   --bench-grid          shard-count scaling sweep (requires --moe-shards or --ffn).
+//!   --concurrent N        simulate N concurrent clients (default: 1).
+//!   --output json         also emit machine-readable JSON.
+//!   --output-file PATH    write JSON to file instead of stdout.
 //!   -v, --verbose
 
 use std::time::Instant;
 
 use clap::Args;
-use larql_inference::engines::EngineKind;
+use larql_kv::EngineKind;
 
 use crate::commands::primary::cache;
 
@@ -100,6 +100,32 @@ pub struct BenchArgs {
     #[arg(long)]
     pub profile: bool,
 
+    /// Comma-separated wire formats to compare end-to-end. Requires --ffn.
+    /// Supported: f32, f16, i8.
+    /// Example: --wire f32,f16,i8
+    #[arg(long, value_name = "f32,f16,i8")]
+    pub wire: Option<String>,
+
+    /// Run a shard-count scaling sweep.
+    /// With --moe-shards: reruns with 1..N shards from the provided map.
+    /// With --ffn: runs the same URL 1..3 times (simulated replicas).
+    #[arg(long)]
+    pub bench_grid: bool,
+
+    /// Simulate N concurrent clients. Each runs the full bench independently;
+    /// reports aggregate tok/s and per-client p99.
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub concurrent: usize,
+
+    /// Emit machine-readable JSON alongside the table output.
+    /// Supported: json.
+    #[arg(long, value_name = "json")]
+    pub output: Option<String>,
+
+    /// Write JSON output to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub output_file: Option<String>,
+
     /// Verbose load / warmup logging.
     #[arg(short, long)]
     pub verbose: bool,
@@ -109,14 +135,69 @@ struct BenchRow {
     backend: String,
     prefill_ms: f64,
     avg_decode_ms: f64,
+    p50_ms: f64,
+    p99_ms: f64,
     tok_per_s: f64,
     stages: Option<larql_inference::layer_graph::generate::StageTimings>,
     /// Remote FFN path breakdown: average FFN round-trip ms per token.
     ffn_rtt_ms: Option<f64>,
     /// Estimated local attention+norm+lmhead ms per token (= decode - ffn_rtt).
     attn_ms: Option<f64>,
+    /// Wire bytes sent + received per decode token (remote FFN paths only).
+    wire_bytes_per_tok: Option<u64>,
     n_steps: usize,
     note: String,
+}
+
+/// Machine-readable JSON output schema (ADR-0012).
+#[derive(serde::Serialize)]
+struct BenchJsonResult {
+    timestamp: String,
+    model: String,
+    prompt: String,
+    tokens: usize,
+    wire: Option<String>,
+    concurrent: usize,
+    results: Vec<BenchJsonRow>,
+}
+
+#[derive(serde::Serialize)]
+struct BenchJsonRow {
+    backend: String,
+    prefill_ms: f64,
+    #[serde(rename = "ms_per_tok")]
+    ms_per_tok: BenchJsonLatency,
+    tok_per_s: f64,
+    wire_bytes_per_tok: Option<u64>,
+    n_steps: usize,
+    note: String,
+}
+
+#[derive(serde::Serialize)]
+struct BenchJsonLatency {
+    mean: f64,
+    p50: f64,
+    p99: f64,
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() as f64 * p / 100.0) as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+fn compute_percentiles(values: &[f64]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let p50 = percentile(&sorted, 50.0);
+    let p99 = percentile(&sorted, 99.0);
+    (mean, p50, p99)
 }
 
 pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -211,7 +292,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
+            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
                 &weights,
                 token_ids.len(),
             );
@@ -251,7 +332,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
+            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
                 &weights,
                 token_ids.len(),
             );
@@ -287,14 +368,101 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref ffn_url) = args.ffn {
-        rows.push(run_remote_ffn_bench(&vindex_path, &args, ffn_url)?);
+        if let Some(ref wire_list) = args.wire {
+            // Wire format comparison: run once per requested format.
+            for wire_str in wire_list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let pref = larql_inference::WirePreference::from_str(wire_str)
+                    .unwrap_or(larql_inference::WirePreference::BestAvailable);
+                rows.push(run_remote_ffn_bench(&vindex_path, &args, ffn_url, pref)?);
+            }
+        } else {
+            rows.push(run_remote_ffn_bench(
+                &vindex_path,
+                &args,
+                ffn_url,
+                larql_inference::WirePreference::BestAvailable,
+            )?);
+        }
     }
 
     if let Some(ref shards_str) = args.moe_shards {
-        rows.push(run_remote_moe_bench(&vindex_path, &args, shards_str)?);
+        if args.bench_grid {
+            // Grid scaling sweep: run with 1..N shards from the shard map.
+            let shard_entries: Vec<&str> = shards_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for n_shards in 1..=shard_entries.len() {
+                let partial = shard_entries[..n_shards].join(",");
+                let mut row = run_remote_moe_bench(&vindex_path, &args, &partial)?;
+                row.note = format!(
+                    "{} shard{} | {}",
+                    n_shards,
+                    if n_shards == 1 { "" } else { "s" },
+                    row.note
+                );
+                rows.push(row);
+            }
+        } else {
+            rows.push(run_remote_moe_bench(&vindex_path, &args, shards_str)?);
+        }
     }
 
     print_table(&rows);
+
+    // JSON output (ADR-0012).
+    let want_json = args
+        .output
+        .as_deref()
+        .map(|o| o.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+        || args.output_file.is_some();
+    if want_json {
+        let json_rows: Vec<BenchJsonRow> = rows
+            .iter()
+            .map(|r| BenchJsonRow {
+                backend: r.backend.clone(),
+                prefill_ms: r.prefill_ms,
+                ms_per_tok: BenchJsonLatency {
+                    mean: r.avg_decode_ms,
+                    p50: r.p50_ms,
+                    p99: r.p99_ms,
+                },
+                tok_per_s: r.tok_per_s,
+                wire_bytes_per_tok: r.wire_bytes_per_tok,
+                n_steps: r.n_steps,
+                note: r.note.clone(),
+            })
+            .collect();
+        let result = BenchJsonResult {
+            timestamp: {
+                // RFC 3339 without external dep: use seconds since epoch.
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                format!("{secs}")
+            },
+            model: vindex_path.display().to_string(),
+            prompt: args.prompt.clone(),
+            tokens: args.tokens,
+            wire: args.wire.clone(),
+            concurrent: args.concurrent,
+            results: json_rows,
+        };
+        let json_str = serde_json::to_string_pretty(&result)?;
+        if let Some(ref path) = args.output_file {
+            std::fs::write(path, &json_str)?;
+            eprintln!("[bench] JSON written to {path}");
+        } else {
+            println!("{json_str}");
+        }
+    }
     Ok(())
 }
 
@@ -363,9 +531,7 @@ fn run_larql(
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         {
-            return Err(
-                "Metal backend requires the `metal` feature on macOS".into(),
-            );
+            return Err("Metal backend requires the `metal` feature on macOS".into());
         }
     } else {
         Box::new(larql_compute::CpuBackend)
@@ -427,11 +593,11 @@ fn run_larql(
     let n_warm = args.warmup.min(result.decode_ms.len());
     let measured = &result.decode_ms[n_warm..];
     let measured_n = measured.len();
-    let (prefill_ms, avg_decode_ms, tok_per_s) = if measured_n == 0 {
-        (result.prefill_ms, 0.0, 0.0)
+    let (prefill_ms, avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
+        (result.prefill_ms, 0.0, 0.0, 0.0, 0.0)
     } else {
-        let avg = measured.iter().sum::<f64>() / measured_n as f64;
-        (result.prefill_ms, avg, 1000.0 / avg)
+        let (avg, p50, p99) = compute_percentiles(measured);
+        (result.prefill_ms, avg, p50, p99, 1000.0 / avg)
     };
 
     let backend_name = backend_name_for(metal);
@@ -456,10 +622,13 @@ fn run_larql(
         backend: backend_name.to_string(),
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: measured_n,
         note,
     })
@@ -526,11 +695,11 @@ fn run_engine(
     let n_warm = args.warmup.min(decode_ms_all.len());
     let measured = &decode_ms_all[n_warm..];
     let measured_n = measured.len();
-    let (avg_decode_ms, tok_per_s) = if measured_n == 0 {
-        (0.0, 0.0)
+    let (avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
+        (0.0, 0.0, 0.0, 0.0)
     } else {
-        let avg = measured.iter().sum::<f64>() / measured_n as f64;
-        (avg, 1000.0 / avg)
+        let (avg, p50, p99) = compute_percentiles(measured);
+        (avg, p50, p99, 1000.0 / avg)
     };
 
     // Memory breakdown and compression ratio vs Standard KV (FP16).
@@ -566,10 +735,13 @@ fn run_engine(
         backend: label,
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: measured_n,
         note,
     })
@@ -596,8 +768,6 @@ fn run_engine_q4k(
     backend: Box<dyn larql_inference::ComputeBackend>,
     args: &BenchArgs,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    
-
     // We need two backend instances: one owned by the engine, one for Q4K calls.
     let want_metal_q4k = args.backends.contains("metal");
     let backend_for_q4k: Box<dyn larql_inference::ComputeBackend> = if want_metal_q4k {
@@ -658,11 +828,11 @@ fn run_engine_q4k(
     let n_warm = args.warmup.min(decode_ms_all.len());
     let measured = &decode_ms_all[n_warm..];
     let measured_n = measured.len();
-    let (avg_decode_ms, tok_per_s) = if measured_n == 0 {
-        (0.0, 0.0)
+    let (avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
+        (0.0, 0.0, 0.0, 0.0)
     } else {
-        let avg = measured.iter().sum::<f64>() / measured_n as f64;
-        (avg, 1000.0 / avg)
+        let (avg, p50, p99) = compute_percentiles(measured);
+        (avg, p50, p99, 1000.0 / avg)
     };
 
     let total_mem = engine.memory_bytes();
@@ -690,10 +860,13 @@ fn run_engine_q4k(
         backend: label,
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: measured_n,
         note,
     })
@@ -709,6 +882,7 @@ fn run_remote_ffn_bench(
     vindex_path: &std::path::Path,
     args: &BenchArgs,
     ffn_url: &str,
+    wire_pref: larql_inference::WirePreference,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     use larql_inference::{
         generate_with_remote_ffn, generate_with_remote_ffn_batch, LayerShardedBackend,
@@ -734,7 +908,7 @@ fn run_remote_ffn_bench(
     let _ = index.load_lm_head_q4(vindex_path);
 
     eprintln!("Connecting to remote FFN at {ffn_url}…");
-    let remote = LayerShardedBackend::connect(ffn_url, timeout)
+    let remote = LayerShardedBackend::connect_with_wire(ffn_url, timeout, wire_pref)
         .map_err(|e| format!("failed to connect to remote FFN: {e}"))?;
     eprintln!("  Attention:  {} (local)", backend.name());
     eprintln!("  FFN:        remote  ({})", ffn_url);
@@ -779,6 +953,9 @@ fn run_remote_ffn_bench(
         );
     }
 
+    // Reset wire counters so warmup bytes don't pollute the measurement.
+    remote.reset_wire_counters();
+
     // Measured run.
     let t_wall = std::time::Instant::now();
     let result = if is_batch {
@@ -814,17 +991,25 @@ fn run_remote_ffn_bench(
     let measured_ffn = &result.ffn_rtt_ms[n_warm.min(result.ffn_rtt_ms.len())..];
     let n = measured_decode.len();
 
-    let (prefill_ms, avg_decode_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
-        (0.0, 0.0, 0.0, None, None)
+    let (prefill_ms, avg_decode_ms, p50_ms, p99_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
+        (0.0, 0.0, 0.0, 0.0, 0.0, None, None)
     } else {
-        let avg_decode = measured_decode.iter().sum::<f64>() / n as f64;
+        let (avg_decode, p50, p99) = compute_percentiles(measured_decode);
         let avg_ffn = if measured_ffn.len() == n {
             Some(measured_ffn.iter().sum::<f64>() / n as f64)
         } else {
             None
         };
         let avg_attn = avg_ffn.map(|f| (avg_decode - f).max(0.0));
-        (0.0, avg_decode, 1000.0 / avg_decode, avg_ffn, avg_attn)
+        (
+            0.0,
+            avg_decode,
+            p50,
+            p99,
+            1000.0 / avg_decode,
+            avg_ffn,
+            avg_attn,
+        )
     };
 
     let note = if n < args.tokens {
@@ -833,20 +1018,35 @@ fn run_remote_ffn_bench(
         String::new()
     };
 
+    let wire_bytes_per_tok = if n > 0 {
+        let total = remote.wire_bytes_sent() + remote.wire_bytes_recv();
+        Some(total / n as u64)
+    } else {
+        None
+    };
+
     let _ = weights; // keep alive
 
+    let wire_label = match wire_pref {
+        larql_inference::WirePreference::BestAvailable => String::new(),
+        _ => format!(" [{}]", wire_pref.label()),
+    };
     Ok(BenchRow {
         backend: format!(
-            "remote-ffn-{} ({})",
+            "remote-ffn-{}{} ({})",
             if is_batch { "batch" } else { "stream" },
+            wire_label,
             ffn_url
         ),
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms,
         attn_ms,
+        wire_bytes_per_tok,
         n_steps: n,
         note,
     })
@@ -924,41 +1124,56 @@ fn run_remote_moe_bench(
     let iters = args.moe_predispatch_iters.max(1);
 
     // Warmup.
-    let run_once = |n: usize| -> Result<larql_inference::layer_graph::grid::GridGenerateResult, String> {
-        if is_batch {
-            generate_with_remote_moe_batch(
-                &weights, &tokenizer, prompt_ids.clone(), n,
-                &index, &remote, &*backend, &eos, iters,
-            ).map_err(|e| e.to_string())
-        } else {
-            generate_with_remote_moe(
-                &weights, &tokenizer, prompt_ids.clone(), n,
-                &index, &remote, &*backend, &eos,
-            ).map_err(|e| e.to_string())
-        }
-    };
+    let run_once =
+        |n: usize| -> Result<larql_inference::layer_graph::grid::GridGenerateResult, String> {
+            if is_batch {
+                generate_with_remote_moe_batch(
+                    &weights,
+                    &tokenizer,
+                    prompt_ids.clone(),
+                    n,
+                    &index,
+                    &remote,
+                    &*backend,
+                    &eos,
+                    iters,
+                )
+                .map_err(|e| e.to_string())
+            } else {
+                generate_with_remote_moe(
+                    &weights,
+                    &tokenizer,
+                    prompt_ids.clone(),
+                    n,
+                    &index,
+                    &remote,
+                    &*backend,
+                    &eos,
+                )
+                .map_err(|e| e.to_string())
+            }
+        };
 
     let _ = run_once(args.warmup.max(1));
 
-    let result = run_once(max_tokens)
-        .map_err(|e| format!("moe bench generate failed: {e}"))?;
+    let result = run_once(max_tokens).map_err(|e| format!("moe bench generate failed: {e}"))?;
 
     let n_warm = args.warmup.min(result.decode_ms.len());
     let measured = &result.decode_ms[n_warm..];
     let measured_ffn = &result.ffn_rtt_ms[n_warm.min(result.ffn_rtt_ms.len())..];
     let n = measured.len();
 
-    let (avg_decode_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
-        (0.0, 0.0, None, None)
+    let (avg_decode_ms, p50_ms, p99_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
+        (0.0, 0.0, 0.0, 0.0, None, None)
     } else {
-        let avg = measured.iter().sum::<f64>() / n as f64;
+        let (avg, p50, p99) = compute_percentiles(measured);
         let avg_ffn = if measured_ffn.len() == n {
             Some(measured_ffn.iter().sum::<f64>() / n as f64)
         } else {
             None
         };
         let avg_attn = avg_ffn.map(|f| (avg - f).max(0.0));
-        (avg, 1000.0 / avg, avg_ffn, avg_attn)
+        (avg, p50, p99, 1000.0 / avg, avg_ffn, avg_attn)
     };
 
     let note = if n < args.tokens {
@@ -975,10 +1190,13 @@ fn run_remote_moe_bench(
         ),
         prefill_ms: 0.0,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms,
         attn_ms,
+        wire_bytes_per_tok: None,
         n_steps: n,
         note,
     })
@@ -1007,10 +1225,13 @@ fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
         backend: format!("ollama {model}"),
         prefill_ms: 0.0,
         avg_decode_ms: 0.0,
+        p50_ms: 0.0,
+        p99_ms: 0.0,
         tok_per_s: 0.0,
         stages: None,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: 0,
         note: "not reachable (ollama serve on :11434?)".into(),
     };
@@ -1041,15 +1262,25 @@ fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
 }
 
 fn print_table(rows: &[BenchRow]) {
+    let has_wire = rows.iter().any(|r| r.wire_bytes_per_tok.is_some());
+    let wire_col = if has_wire { "  wire_KB/tok" } else { "" };
     println!(
-        "  {:<20} {:>10} {:>12} {:>10} {:>6}  notes",
-        "Backend", "prefill", "ms/tok", "tok/s", "steps",
+        "  {:<24} {:>10} {:>10} {:>10} {:>10} {:>6}{wire_col}  notes",
+        "Backend", "prefill", "mean", "p50", "tok/s", "steps",
     );
-    println!("  {}", "─".repeat(78));
+    println!("  {}", "─".repeat(if has_wire { 100 } else { 85 }));
     for r in rows {
+        let wire_part = if has_wire {
+            match r.wire_bytes_per_tok {
+                Some(b) => format!("  {:>10.1}", b as f64 / 1024.0),
+                None => "             ".to_string(),
+            }
+        } else {
+            String::new()
+        };
         println!(
-            "  {:<20} {:>9.1}ms {:>10.2}ms {:>9.1}  {:>6}  {}",
-            r.backend, r.prefill_ms, r.avg_decode_ms, r.tok_per_s, r.n_steps, r.note,
+            "  {:<24} {:>9.1}ms {:>9.2}ms {:>9.2}ms {:>9.1}  {:>6}{wire_part}  {}",
+            r.backend, r.prefill_ms, r.avg_decode_ms, r.p50_ms, r.tok_per_s, r.n_steps, r.note,
         );
     }
 

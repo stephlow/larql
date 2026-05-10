@@ -33,23 +33,25 @@
 //!
 //! # Module layout (post-2026-05-02 split from a 2,691-line single file):
 //!
-//! - [`error`]: `RemoteMoeError`.
-//! - [`config`]: `ShardConfig`, `UnitManifest`, `UnitShard`,
+//! - [`error`][] — `RemoteMoeError`.
+//! - [`config`][] — `ShardConfig`, `UnitManifest`, `UnitShard`,
 //!   `parse_unit_manifest`.
-//! - [`wire`]: binary encode/decode helpers + `ExpertCallItem` /
+//! - [`wire`][] — binary encode/decode helpers + `ExpertCallItem` /
 //!   `ExpertResultItem` payload types.
-//! - [`router`]: client-side routing math (`MoeRouterWeights`, `rms_norm`).
-//! - [`shard`]: internal `Shard` struct + per-transport (HTTP / UDS /
+//! - [`router`][] — client-side routing math (`MoeRouterWeights`, `rms_norm`).
+//! - [`shard`][] — internal `Shard` struct + per-transport (HTTP / UDS /
 //!   gRPC) dispatch logic.
-//! - [`stream`]: `ShardStream` (gRPC bi-di) + `InflightMoe` (the fire /
+//! - [`stream`][] — `ShardStream` (gRPC bi-di) + `InflightMoe` (the fire /
 //!   collect handle).
-//! - [`backend`]: the public `RemoteMoeBackend`.
+//! - [`backend`][] — the public `RemoteMoeBackend`.
 
 mod backend;
 mod config;
 mod error;
+pub(crate) mod metrics;
 pub mod multi_layer_wire;
 mod router;
+pub(crate) mod runtime;
 mod shard;
 mod stream;
 mod wire;

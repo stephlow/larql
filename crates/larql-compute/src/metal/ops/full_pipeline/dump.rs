@@ -109,10 +109,7 @@ pub(super) fn dump_layer_snapshots(
     // Per-stage snapshots for layer 0 by default, or the layer named
     // by `LARQL_STAGE_DUMP_LAYER` — useful for bisecting drift at a
     // specific later layer (e.g. Gemma 4 global L5).
-    let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    let stage_layer = crate::options::env_usize(crate::options::ENV_STAGE_DUMP_LAYER).unwrap_or(0);
     if l == stage_layer {
         layer_dump("norm_out", &lb.norm_out[l], seq_len * hidden);
         layer_dump("q_out", &lb.q_out[l], seq_len * layer_q_dim);

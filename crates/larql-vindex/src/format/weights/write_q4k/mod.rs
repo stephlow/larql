@@ -2,24 +2,42 @@
 //! the Q4_K pipeline owns its own QuantBlockFormat manifest, padding
 //! helpers, and per-tensor quantisation policy.
 //!
-//! Carved out of the monolithic `write.rs` in the 2026-04-25 reorg.
+//! Carved out of the monolithic `write.rs` in the 2026-04-25 reorg,
+//! and re-decomposed in 2026-05-09 round-5 into one sibling per
+//! emitted artefact:
+//!
+//! - [`attn`] — `attn_weights_q4k.bin` (+ manifest)
+//! - [`ffn`] — `interleaved_q4k.bin` (+ opt `down_features_q4k.bin`)
+//! - [`moe_layers`] — `layers/layer_{L:02}.weights` (hybrid MoE)
+//! - [`norms`] — `norms.bin` (norms + MoE router/scales)
+//! - [`ple`] — `ple_weights.bin` (Gemma 4 E2B PLE, f16)
+//! - [`lm_head`] — `lm_head_q4.bin`
+//!
+//! The orchestrator below threads the running `Vec<WeightEntry>`
+//! manifest through the norms → ple → lm_head trio, then emits a
+//! single `weight_manifest.json` and patches `index.json`.
 
-use crate::extract::stage_labels::*;
-use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{VindexConfig, VindexModelConfig};
+use crate::config::{FfnLayout, VindexConfig, VindexModelConfig};
 use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
+use crate::extract::stage_labels::*;
 use crate::format::filenames::*;
 
 use super::capabilities::{ensure_standard_attention_supported, SURFACE_Q4K_WEIGHT_WRITER};
-use super::write_f32::{kind, WeightEntry, WeightSource};
+use super::write_f32::WeightSource;
 
-// ── Q4_K / Q6_K streaming writer ──────────────────────────────────────────
+mod attn;
+mod ffn;
+mod lm_head;
+mod moe_layers;
+mod norms;
+mod ple;
+
+pub mod feature_major_down;
 
 /// Per-block quantisation format for a single tensor in the Q4_K pipeline.
 /// Serde writes / reads the literal strings `"Q4_K"` and `"Q6_K"` to match
@@ -31,14 +49,6 @@ pub enum QuantBlockFormat {
     #[serde(rename = "Q6_K")]
     Q6K,
 }
-
-// Manifest entry shape moved to `super::manifest::Q4kManifestEntry`
-// so the loaders in `index/storage/ffn_store.rs` can deserialise into
-// it directly instead of poking `serde_json::Value` with string keys.
-use super::manifest::Q4kManifestEntry as Q4kAttnEntry;
-
-pub mod feature_major_down;
-use feature_major_down::FeatureMajorDownState;
 
 /// Pad a row-major f32 buffer to the next multiple of 256 with zeros
 /// (Q4_K/Q6_K super-blocks require length % 256 == 0).
@@ -87,6 +97,21 @@ pub(super) fn pad_rows_to_block(data: &[f32], rows: usize, cols: usize) -> (Vec<
         out.extend(std::iter::repeat_n(0.0f32, pad));
     }
     (out, padded_cols)
+}
+
+/// Resolve the V tensor for a layer in the Q4_K writer.
+///
+/// When `v_proj` is absent from the source (e.g. Gemma 4 31B global
+/// layers ship without one), fall back to K's tensor if the
+/// architecture advertises `v_shares_k(layer) == true`. This keeps
+/// the 4-per-layer attn manifest contiguous: each layer emits exactly
+/// Q / K / V / O even when V physically reuses K's bytes.
+pub(super) fn resolve_v_tensor<T: Clone>(
+    v: Option<T>,
+    k: &Option<T>,
+    v_shares_k: bool,
+) -> Option<T> {
+    v.or_else(|| if v_shares_k { k.clone() } else { None })
 }
 
 /// Options for [`write_model_weights_q4k_with_opts`].
@@ -139,7 +164,8 @@ pub fn write_model_weights_q4k(
 }
 
 /// Like [`write_model_weights_q4k`] but accepts a [`Q4kWriteOptions`] knob
-/// to toggle the FFN down-proj quantisation format.
+/// to toggle the FFN down-proj quantisation format and the
+/// feature-major-down emit.
 pub fn write_model_weights_q4k_with_opts(
     source: &dyn WeightSource,
     dir: &Path,
@@ -153,505 +179,18 @@ pub fn write_model_weights_q4k_with_opts(
     ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
 
-    // ── attn_weights_q4k.bin ──
-    let attn_path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
-    let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
-    let mut attn_offset: u64 = 0;
-    let mut attn_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 4);
+    attn::write_attn_weights_q4k(source, dir, num_layers, callbacks)?;
+    ffn::write_interleaved_ffn_q4k(source, dir, num_layers, opts, callbacks)?;
+    moe_layers::write_per_layer_moe_q4k(source, dir, num_layers)?;
+    let mut entries = norms::write_norms_and_router(source, dir, num_layers)?;
+    ple::write_ple_weights(source, dir, num_layers, &mut entries)?;
+    lm_head::write_lm_head_q4k(source, dir, &mut entries)?;
 
-    for layer in 0..num_layers {
-        callbacks.on_layer_start(COMP_ATTN_Q4K, layer, num_layers);
-
-        // Resolve each tensor. For V, fall back to K when v_shares_k=true or
-        // v_proj simply isn't present (global layers on 31B).
-        let q_key = arch.attn_q_key(layer);
-        let k_key = arch.attn_k_key(layer);
-        let v_key = arch.attn_v_key(layer);
-        let o_key = arch.attn_o_key(layer);
-
-        let q = source.get_tensor(&q_key);
-        let k = source.get_tensor(&k_key);
-        let v = resolve_v_tensor(source.get_tensor(&v_key), &k, arch.v_shares_k(layer));
-        let o = source.get_tensor(&o_key);
-
-        // Q, K, V, O in that order — use the same key string for V even when
-        // the data is K's, so loaders that look up by position still work.
-        #[allow(clippy::type_complexity)]
-        let slots: [(&str, Option<(Vec<f32>, usize, usize)>); 4] = [
-            (q_key.as_str(), q),
-            (k_key.as_str(), k),
-            (v_key.as_str(), v),
-            (o_key.as_str(), o),
-        ];
-
-        for (i, (key, tensor)) in slots.iter().enumerate() {
-            let (data, rows, cols) = match tensor {
-                Some(t) => t.clone(),
-                None => continue, // tensor genuinely absent — skip
-            };
-
-            // V (index 2) gets Q6_K, others get Q4_K.
-            let is_v = i == 2;
-            // Row-pad to 256 so each row aligns to a super-block boundary.
-            // Critical for models with non-256 inner dims (e.g. Gemma 4 26B A4B
-            // where the dense intermediate is 2112). `padded_cols` is what the
-            // matvec shader must use as `K`; callers also need to zero-pad the
-            // input vector to the same width.
-            let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-            let q_bytes = if is_v {
-                quantize_q6_k(&padded)
-            } else {
-                quantize_q4_k(&padded)
-            };
-            let format = if is_v {
-                QuantBlockFormat::Q6K
-            } else {
-                QuantBlockFormat::Q4K
-            };
-
-            attn_file.write_all(&q_bytes)?;
-            let length = q_bytes.len() as u64;
-            attn_manifest.push(Q4kAttnEntry {
-                key: key.to_string(),
-                shape: vec![rows, padded_cols],
-                format,
-                offset: attn_offset,
-                length,
-            });
-            attn_offset += length;
-        }
-
-        callbacks.on_layer_done(COMP_ATTN_Q4K, layer, 0.0);
-    }
-    attn_file.flush()?;
-    drop(attn_file);
-
-    let manifest_json = serde_json::to_string_pretty(&attn_manifest)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON), manifest_json)?;
-
-    // ── interleaved_q4k.bin (FFN gate/up/down) + manifest ──
-    //
-    // Layer-major: for each layer, `gate Q4_K + up Q4_K + down Q6_K`
-    // concatenated. Stride is regular across layers but block sizes
-    // depend on the architecture's hidden / intermediate, so we emit a
-    // sidecar manifest symmetric with `attn_weights_q4k_manifest.json`.
-    // Downstream readers resolve by key + layer instead of recomputing
-    // byte offsets; a shape/stride mismatch now fails at load rather
-    // than silently corrupting.
-    let ff_path = dir.join(INTERLEAVED_Q4K_BIN);
-    let mut ff_file = BufWriter::new(std::fs::File::create(&ff_path)?);
-    let mut ff_offset: u64 = 0;
-    let mut ff_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 3);
-
-    // ── down_features_q4k.bin (W2 feature-major down, opt-in) ──
-    //
-    // Captures the same down-proj data as interleaved_q4k.bin's down
-    // slot, but transposed to [intermediate, hidden] orientation and
-    // re-quantised at the same precision. Lets per-feature decode at
-    // load time skip the cache. Allocated lazily so non-opt-in
-    // extracts pay nothing.
-    let mut fm_state: Option<FeatureMajorDownState> = if opts.feature_major_down {
-        Some(FeatureMajorDownState::new(
-            &dir.join(DOWN_FEATURES_Q4K_BIN),
-            num_layers,
-        )?)
-    } else {
-        None
-    };
-
-    for layer in 0..num_layers {
-        callbacks.on_layer_start(COMP_FFN_Q4K, layer, num_layers);
-        for (i, key) in [
-            arch.ffn_gate_key(layer),
-            arch.ffn_up_key(layer),
-            arch.ffn_down_key(layer),
-        ]
-        .iter()
-        .enumerate()
-        {
-            if let Some((data, rows, cols)) = source.get_tensor(key) {
-                // Row-pad to 256 so each row aligns to a super-block boundary.
-                // Without this, matrices with `cols % 256 != 0` (e.g. Gemma 4
-                // 26B A4B's down_proj with inner dim 2112) store contiguous
-                // quantisation that every row past row 0 reads wrong. See
-                // `pad_rows_to_block` docs.
-                let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-                // Gate (i=0) and up (i=1) always Q4_K. Down (i=2) defaults
-                // to Q6_K for llama.cpp compatibility, Q4_K when opts.down_q4k.
-                let is_down = i == 2;
-                let use_q6 = is_down && !opts.down_q4k;
-                let q_bytes = if use_q6 {
-                    quantize_q6_k(&padded)
-                } else {
-                    quantize_q4_k(&padded)
-                };
-                let format = if use_q6 {
-                    QuantBlockFormat::Q6K
-                } else {
-                    QuantBlockFormat::Q4K
-                };
-                ff_file.write_all(&q_bytes)?;
-                let length = q_bytes.len() as u64;
-                ff_manifest.push(Q4kAttnEntry {
-                    key: key.clone(),
-                    shape: vec![rows, padded_cols],
-                    format,
-                    offset: ff_offset,
-                    length,
-                });
-                ff_offset += length;
-
-                if is_down {
-                    if let Some(state) = fm_state.as_mut() {
-                        state.append_layer(key.clone(), &padded, rows, padded_cols, format)?;
-                    }
-                }
-            }
-        }
-        callbacks.on_layer_done(COMP_FFN_Q4K, layer, 0.0);
-    }
-    ff_file.flush()?;
-    drop(ff_file);
-
-    let ff_manifest_json = serde_json::to_string_pretty(&ff_manifest)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join(INTERLEAVED_Q4K_MANIFEST_JSON), ff_manifest_json)?;
-
-    if let Some(state) = fm_state.take() {
-        state.finalize(&dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON))?;
-    }
-
-    // ── layers/ — per-layer FFN weights (§5.12) ──────────────────────────
-    //
-    // For MoE models (hybrid MoE PackedBF16, e.g. Gemma 4 26B A4B):
-    //   Source BF16 tensors are quantized to Q4_K per expert, written to
-    //   layers/layer_{L:02}.weights with num_entries=num_experts.
-    //
-    // For dense models: interleaved_q4k.bin remains the primary FFN store.
-    // Per-layer format for dense is a future migration (--ffn-layout flag).
-    //
-    // Replaces the old BF16 experts_packed.bin monolithic blob.
-    if arch.is_hybrid_moe() && arch.expert_format() == larql_models::ExpertFormat::PackedBF16 {
-        use super::write_layers::{quantize_moe_entries, write_layer_weights, LayerWeightFormat};
-
-        let num_experts = arch.num_experts();
-        let moe_inter = arch.moe_intermediate_size();
-        let hidden = arch.config().hidden_size;
-
-        for layer in 0..num_layers {
-            let gu_key = arch.packed_experts_gate_up_key(layer);
-            let dn_key = arch.packed_experts_down_key(layer);
-            let gu_bytes = gu_key.as_ref().and_then(|k| source.get_packed_bf16(k));
-            let dn_bytes = dn_key.as_ref().and_then(|k| source.get_packed_bf16(k));
-
-            if let (Some(gu), Some(dn)) = (gu_bytes, dn_bytes) {
-                // Default: Q4_K for the whole file. Format is uniform — no mixing.
-                let fmt = LayerWeightFormat::Q4_K;
-                let entries = quantize_moe_entries(&gu, &dn, num_experts, moe_inter, hidden, fmt);
-                write_layer_weights(dir, layer, fmt, &entries, moe_inter, hidden)?;
-            }
-        }
-    }
-
-    // ── norms.bin (f32, small) ──
-    let norms_path = dir.join(NORMS_BIN);
-    let mut norms_file = BufWriter::new(std::fs::File::create(&norms_path)?);
-    let norms_dtype = crate::config::dtype::StorageDtype::F32;
-    let mut norms_offset: u64 = 0;
-    let mut norm_entries: Vec<WeightEntry> = Vec::new();
-
-    for layer in 0..num_layers {
-        let keys: Vec<String> = [
-            Some(arch.input_layernorm_key(layer)),
-            Some(arch.post_attention_layernorm_key(layer)),
-            arch.pre_feedforward_layernorm_key(layer),
-            arch.post_feedforward_layernorm_key(layer),
-            arch.attn_q_norm_key(layer),
-            arch.attn_k_norm_key(layer),
-            // Gemma 4 per-layer scalar multiplier. Stored as a 0-D scalar
-            // in safetensors, surfaced through WeightSource as a 1-element
-            // vector. The forward path multiplies h by this value after
-            // FFN; omitting it silently produced garbage on 31B.
-            arch.layer_scalar_key(layer),
-            // Gemma 4 E2B per-layer embedding post-norm.
-            if arch.has_per_layer_embeddings() {
-                arch.post_per_layer_input_norm_key(layer)
-            } else {
-                None
-            },
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        for key in keys {
-            if let Some(data) = source.get_vector(&key) {
-                let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
-                norms_file.write_all(&bytes)?;
-                norm_entries.push(WeightEntry {
-                    key: key.clone(),
-                    kind: kind::VECTOR.into(),
-                    shape: vec![data.len()],
-                    offset: norms_offset,
-                    length: bytes.len() as u64,
-                    file: NORMS_BIN.into(),
-                });
-                norms_offset += bytes.len() as u64;
-            }
-        }
-
-        // MoE router + norms (hybrid MoE, e.g. Gemma 4 26B A4B).
-        // router.proj.weight is 2D [num_experts, hidden] — flatten and store as "vector".
-        // All other MoE keys are 1D vectors.
-        if arch.is_hybrid_moe() {
-            // 2D router projection — flatten
-            if let Some(key) = arch.moe_router_key(layer) {
-                if let Some((data, _, _)) = source.get_tensor(&key) {
-                    let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
-                    norms_file.write_all(&bytes)?;
-                    norm_entries.push(WeightEntry {
-                        key: key.clone(),
-                        kind: kind::VECTOR.into(),
-                        shape: vec![data.len()],
-                        offset: norms_offset,
-                        length: bytes.len() as u64,
-                        file: NORMS_BIN.into(),
-                    });
-                    norms_offset += bytes.len() as u64;
-                }
-            }
-            // 1D MoE vectors
-            let moe_vec_keys: Vec<String> = [
-                arch.moe_router_scale_key(layer),
-                arch.moe_router_per_expert_scale_key(layer),
-                arch.moe_router_norm_key(layer),
-                arch.moe_pre_experts_norm_key(layer),
-                arch.moe_post_ffn1_norm_key(layer),
-                arch.moe_post_experts_norm_key(layer),
-                // Outer post-FFN norm used to re-normalise (h1 + h2) before
-                // the residual add in hybrid MoE (HF Gemma 4). Distinct from
-                // post_ffn1_norm, which is the dense-branch norm.
-                arch.moe_post_outer_norm_key(layer),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            for key in moe_vec_keys {
-                if let Some(data) = source.get_vector(&key) {
-                    let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
-                    norms_file.write_all(&bytes)?;
-                    norm_entries.push(WeightEntry {
-                        key: key.clone(),
-                        kind: kind::VECTOR.into(),
-                        shape: vec![data.len()],
-                        offset: norms_offset,
-                        length: bytes.len() as u64,
-                        file: NORMS_BIN.into(),
-                    });
-                    norms_offset += bytes.len() as u64;
-                }
-            }
-        }
-    }
-
-    // Final model norm (after last layer)
-    if let Some(data) = source.get_vector("norm.weight") {
-        let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
-        norms_file.write_all(&bytes)?;
-        norm_entries.push(WeightEntry {
-            key: "norm.weight".into(),
-            kind: kind::VECTOR.into(),
-            shape: vec![data.len()],
-            offset: norms_offset,
-            length: bytes.len() as u64,
-            file: NORMS_BIN.into(),
-        });
-        norms_offset += bytes.len() as u64;
-    }
-
-    // Gemma 4 E2B PLE global projection norm (small vector).
-    if arch.has_per_layer_embeddings() {
-        if let Some(data) = source.get_vector("per_layer_projection_norm.weight") {
-            let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
-            norms_file.write_all(&bytes)?;
-            norm_entries.push(WeightEntry {
-                key: "per_layer_projection_norm.weight".into(),
-                kind: kind::VECTOR.into(),
-                shape: vec![data.len()],
-                offset: norms_offset,
-                length: bytes.len() as u64,
-                file: NORMS_BIN.into(),
-            });
-        }
-    }
-    norms_file.flush()?;
-    drop(norms_file);
-
-    // ── ple_weights.bin — Per-Layer Embedding tensors (Gemma 4 E2B only) ──
-    //
-    // Stored as f16 — NOT Q4_K. The two globals (`per_layer_model_projection`,
-    // `embed_tokens_per_layer`) and the per-layer input_gate/projection
-    // matrices behave like embedding tables: each super-block of 256 values
-    // spans a wide dynamic range with a handful of outliers, and Q4_K's
-    // per-super-block (d, dmin) calibration zeros out the majority of cells
-    // to accommodate those outliers. PLE contributions are additive into
-    // every layer's residual, so the cell-level noise compounds across 35
-    // layers — the observable result was "arrays" / "amphibians" instead
-    // of "Paris" on Gemma 4 E2B. f16 halves the BF16 footprint (~4.7 GB for
-    // the big lookup on E2B) and preserves enough precision for accurate
-    // per-token PLE retrieval.
-    if arch.has_per_layer_embeddings() {
-        let ple_path = dir.join("ple_weights.bin");
-        let mut ple_file = BufWriter::new(std::fs::File::create(&ple_path)?);
-        let mut ple_offset: u64 = 0;
-        let ple_dtype = crate::config::dtype::StorageDtype::F16;
-
-        let write_tensor = |file: &mut BufWriter<std::fs::File>,
-                            manifest: &mut Vec<WeightEntry>,
-                            offset: &mut u64,
-                            key: String,
-                            data: Option<(Vec<f32>, usize, usize)>|
-         -> Result<(), VindexError> {
-            if let Some((floats, rows, cols)) = data {
-                let bytes = crate::config::dtype::encode_floats(&floats, ple_dtype);
-                file.write_all(&bytes)?;
-                manifest.push(WeightEntry {
-                    key,
-                    kind: kind::TENSOR_F16.into(),
-                    shape: vec![rows, cols],
-                    offset: *offset,
-                    length: bytes.len() as u64,
-                    file: "ple_weights.bin".into(),
-                });
-                *offset += bytes.len() as u64;
-            }
-            Ok(())
-        };
-
-        // Global: model projection [ple_dim·num_layers, hidden]
-        write_tensor(
-            &mut ple_file,
-            &mut norm_entries,
-            &mut ple_offset,
-            "per_layer_model_projection.weight".into(),
-            source.get_tensor("per_layer_model_projection.weight"),
-        )?;
-
-        // Global: big embedding table [vocab, ple_dim·num_layers]
-        if let Some(key) = arch.per_layer_embed_key() {
-            write_tensor(
-                &mut ple_file,
-                &mut norm_entries,
-                &mut ple_offset,
-                key.clone(),
-                source.get_tensor(&key),
-            )?;
-        }
-
-        // Per-layer: input_gate + projection
-        for layer in 0..num_layers {
-            if let Some(k) = arch.per_layer_input_gate_key(layer) {
-                write_tensor(
-                    &mut ple_file,
-                    &mut norm_entries,
-                    &mut ple_offset,
-                    k.clone(),
-                    source.get_tensor(&k),
-                )?;
-            }
-            if let Some(k) = arch.per_layer_projection_key(layer) {
-                write_tensor(
-                    &mut ple_file,
-                    &mut norm_entries,
-                    &mut ple_offset,
-                    k.clone(),
-                    source.get_tensor(&k),
-                )?;
-            }
-        }
-
-        ple_file.flush()?;
-    }
-
-    // ── lm_head_q4.bin ──
-    if let Some((data, rows, cols)) = source.lm_head() {
-        let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-        let q_bytes = quantize_q4_k(&padded);
-        std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
-        // Record in norms manifest so a single weight_manifest.json references
-        // everything non-quantised-via-layout. Shape records the stored
-        // `padded_cols` — callers route through the matvec dispatch which
-        // uses shape[1] as `K`, so the padding stays invisible provided the
-        // input activation buffer is zero-padded to match.
-        norm_entries.push(WeightEntry {
-            key: "lm_head.weight".into(),
-            kind: kind::TENSOR_Q4K.into(),
-            shape: vec![rows, padded_cols],
-            offset: 0,
-            length: q_bytes.len() as u64,
-            file: LM_HEAD_Q4_BIN.into(),
-        });
-    }
-
-    // norms + lm_head manifest (expert weights now in layers/ files, not manifest)
-    let all_entries = norm_entries;
-    let manifest_json = serde_json::to_string_pretty(&all_entries)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let manifest_json =
+        serde_json::to_string_pretty(&entries).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
 
-    // ── Update index.json: has_model_weights=true, quant=q4k ──
-    let config_path = dir.join(INDEX_JSON);
-    let config_text = std::fs::read_to_string(&config_path)?;
-    let mut config: VindexConfig =
-        serde_json::from_str(&config_text).map_err(|e| VindexError::Parse(e.to_string()))?;
-
-    config.has_model_weights = true;
-    config.quant = crate::QuantFormat::Q4K;
-    if arch.is_hybrid_moe() {
-        config.ffn_layout = Some("per_layer".into());
-    }
-
-    let cfg = arch.config();
-    config.model_config = Some(VindexModelConfig {
-        model_type: cfg.model_type.clone(),
-        head_dim: cfg.head_dim,
-        num_q_heads: cfg.num_q_heads,
-        num_kv_heads: cfg.num_kv_heads,
-        rope_base: cfg.rope_base,
-        sliding_window: cfg.sliding_window,
-        moe: if arch.is_moe() {
-            Some(crate::MoeConfig {
-                num_experts: arch.num_experts(),
-                top_k: arch.num_experts_per_token(),
-                shared_expert: arch.num_shared_experts() > 0,
-                router_type: arch.moe_router_type().into(),
-                moe_intermediate_size: if arch.moe_intermediate_size() > 0 {
-                    Some(arch.moe_intermediate_size())
-                } else {
-                    None
-                },
-                hybrid: arch.is_hybrid_moe(),
-            })
-        } else {
-            None
-        },
-        global_head_dim: cfg.global_head_dim,
-        num_global_kv_heads: cfg.num_global_kv_heads,
-        partial_rotary_factor: cfg.partial_rotary_factor,
-        sliding_window_pattern: cfg.sliding_window_pattern,
-        layer_types: cfg.layer_types.clone(),
-        attention_k_eq_v: cfg.attention_k_eq_v,
-        num_kv_shared_layers: cfg.num_kv_shared_layers,
-        per_layer_embed_dim: cfg.per_layer_embed_dim,
-        rope_local_base: cfg.rope_local_base,
-        query_pre_attn_scalar: cfg.query_pre_attn_scalar,
-        final_logit_softcapping: cfg.final_logit_softcapping,
-    });
-
-    let config_json =
-        serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(&config_path, config_json)?;
+    update_index_json(dir, source.arch())?;
 
     callbacks.on_stage_done(
         STAGE_MODEL_WEIGHTS_Q4K,
@@ -660,15 +199,29 @@ pub fn write_model_weights_q4k_with_opts(
     Ok(())
 }
 
-/// Resolve the V tensor for a layer in the Q4_K writer.
-///
-/// When `v_proj` is absent from the source (e.g. Gemma 4 31B global
-/// layers ship without one), fall back to K's tensor if the
-/// architecture advertises `v_shares_k(layer) == true`. This keeps
-/// the 4-per-layer attn manifest contiguous: each layer emits exactly
-/// Q / K / V / O even when V physically reuses K's bytes.
-fn resolve_v_tensor<T: Clone>(v: Option<T>, k: &Option<T>, v_shares_k: bool) -> Option<T> {
-    v.or_else(|| if v_shares_k { k.clone() } else { None })
+/// Patch `index.json` after all weight artefacts have landed:
+/// `has_model_weights=true`, `quant=Q4K`, optional `ffn_layout` for
+/// hybrid MoE, and a refreshed `model_config` from the architecture.
+fn update_index_json(
+    dir: &Path,
+    arch: &dyn larql_models::ModelArchitecture,
+) -> Result<(), VindexError> {
+    let config_path = dir.join(INDEX_JSON);
+    let config_text = std::fs::read_to_string(&config_path)?;
+    let mut config: VindexConfig =
+        serde_json::from_str(&config_text).map_err(|e| VindexError::Parse(e.to_string()))?;
+
+    config.has_model_weights = true;
+    config.quant = crate::QuantFormat::Q4K;
+    if arch.is_hybrid_moe() {
+        config.ffn_layout = Some(FfnLayout::PerLayer);
+    }
+    config.model_config = Some(VindexModelConfig::from_arch(arch));
+
+    let config_json =
+        serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
+    std::fs::write(&config_path, config_json)?;
+    Ok(())
 }
 
 #[cfg(test)]

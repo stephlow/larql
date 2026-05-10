@@ -100,22 +100,14 @@ impl Session {
                 .map_err(|e| LqlError::exec("tokenize error", e))?;
             target_id = target_encoding.get_ids().first().copied().unwrap_or(0);
 
-            let entity_encoding = tokenizer
-                .encode(entity, false)
-                .map_err(|e| LqlError::exec("tokenize error", e))?;
-            let entity_ids: Vec<u32> = entity_encoding.get_ids().to_vec();
-            let mut ev = vec![0.0f32; hidden];
-            for &tok in &entity_ids {
-                let row = embed.row(tok as usize);
-                for j in 0..hidden {
-                    ev[j] += row[j] * embed_scale;
-                }
-            }
-            let n = entity_ids.len().max(1) as f32;
-            for v in &mut ev {
-                *v /= n;
-            }
-            residual_key = ev;
+            residual_key = crate::executor::helpers::entity_query_vec(
+                &tokenizer,
+                &embed,
+                embed_scale,
+                entity,
+            )?
+            .map(|a| a.to_vec())
+            .unwrap_or_else(|| vec![0.0f32; hidden]);
         }
 
         // ── Phase 3: Store in KnnStore ──

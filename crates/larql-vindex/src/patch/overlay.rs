@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use ndarray::Array1;
 
+use crate::index::storage::vindex_storage::VindexStorage;
 use crate::index::{FeatureMeta, VectorIndex, WalkHit, WalkTrace};
 
 use super::format::VindexPatch;
@@ -280,7 +281,9 @@ impl PatchedVindex {
         residual: &Array1<f32>,
         top_k: usize,
     ) -> Vec<(usize, f32)> {
-        let mut hits = self.base.gate_knn(layer, residual, top_k * 2); // oversample
+        // `saturating_mul` so callers that pass `usize::MAX` (e.g. the
+        // unlimited walk helpers) don't overflow the oversample factor.
+        let mut hits = self.base.gate_knn(layer, residual, top_k.saturating_mul(2));
 
         // Apply gate vector overrides
         for (&(l, f), gate_vec) in &self.overrides_gate {
@@ -342,34 +345,30 @@ impl PatchedVindex {
             // Get base gate vectors (from heap or mmap)
             let base_gate = if let Some(g) = self.base.gate_vectors_at(layer) {
                 Some(g.clone())
-            } else if let Some(ref mmap) = self.base.gate.gate_mmap_bytes {
+            } else if let Some(view) = self.base.storage.gate_layer_view(layer) {
                 // Mmap mode — decode this layer's slice to an Array2
-                self.base
-                    .gate
-                    .gate_mmap_slices
-                    .get(layer)
-                    .and_then(|slice| {
-                        if slice.num_features == 0 {
-                            return None;
-                        }
-                        let bpf =
-                            crate::config::dtype::bytes_per_float(self.base.gate.gate_mmap_dtype);
-                        let byte_offset = slice.float_offset * bpf;
-                        let byte_count = slice.num_features * self.base.hidden_size * bpf;
-                        let byte_end = byte_offset + byte_count;
-                        if byte_end > mmap.len() {
-                            return None;
-                        }
+                if view.slice.num_features == 0 {
+                    None
+                } else {
+                    let bpf = crate::config::dtype::bytes_per_float(view.dtype);
+                    let byte_offset = view.slice.float_offset * bpf;
+                    let byte_count = view.slice.num_features * self.base.hidden_size * bpf;
+                    let byte_end = byte_offset + byte_count;
+                    let mmap: &[u8] = view.bytes.as_ref();
+                    if byte_end > mmap.len() {
+                        None
+                    } else {
                         let floats = crate::config::dtype::decode_floats(
                             &mmap[byte_offset..byte_end],
-                            self.base.gate.gate_mmap_dtype,
+                            view.dtype,
                         );
                         ndarray::Array2::from_shape_vec(
-                            (slice.num_features, self.base.hidden_size),
+                            (view.slice.num_features, self.base.hidden_size),
                             floats,
                         )
                         .ok()
-                    })
+                    }
+                }
             } else {
                 None
             };

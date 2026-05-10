@@ -5,7 +5,7 @@
 //!
 //! All tests compare Metal shader output to a CPU reference implementation.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -509,4 +509,163 @@ fn residual_norm_matches_separate_ops() {
     let metal_result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
     let diff = max_diff(&cpu_result, &metal_result);
     assert!(diff < 1e-4, "residual_norm max diff {diff}");
+}
+
+/// `residual_norm_store` is the kernel D-RMS-FUSE Phase 1 dispatches at
+/// the post-FFN→next-input boundary on non-Gemma archs. It writes both
+/// `sum_out = a + b` (raw, for the residual base used by next layer's
+/// post-attn) and `norm_out = rms_norm(a + b, weight)` (the next
+/// layer's pre-normed input). This test pins both outputs against the
+/// separated CPU reference.
+#[test]
+fn residual_norm_store_matches_separate_ops() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
+    let fused = device
+        .new_compute_pipeline_state_with_function(
+            &lib.get_function("residual_norm_store", None).unwrap(),
+        )
+        .unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 64usize;
+    let a: Vec<f32> = (0..len).map(|i| i as f32 * 0.07 - 1.5).collect();
+    let b: Vec<f32> = (0..len).map(|i| i as f32 * 0.04 + 0.2).collect();
+    let weight: Vec<f32> = (0..len).map(|i| 0.6 + i as f32 * 0.003).collect();
+    let eps = 1e-6f32;
+    let offset = 0.0f32;
+
+    // CPU reference: sum_out = a+b, norm_out = rms_norm(a+b, weight)
+    let cpu_sum: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+    let sum_sq: f32 = cpu_sum.iter().map(|v| v * v).sum();
+    let rms = 1.0 / (sum_sq / len as f32 + eps).sqrt();
+    let cpu_norm: Vec<f32> = cpu_sum
+        .iter()
+        .zip(weight.iter())
+        .map(|(s, w)| s * (w + offset) * rms)
+        .collect();
+
+    // Metal fused
+    let buf_a = bufs.transient_from_f32(&a);
+    let buf_b = bufs.transient_from_f32(&b);
+    let buf_w = bufs.transient_from_f32(&weight);
+    let buf_norm = bufs.output((len * 4) as u64);
+    let buf_sum = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&fused);
+    enc.set_buffer(0, Some(&buf_a), 0);
+    enc.set_buffer(1, Some(&buf_b), 0);
+    enc.set_buffer(2, Some(&buf_w), 0);
+    enc.set_buffer(3, Some(&buf_norm), 0);
+    enc.set_buffer(4, Some(&buf_sum), 0);
+    enc.set_bytes(5, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(256.min(len as u64), 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let norm_ptr = buf_norm.contents() as *const f32;
+    let sum_ptr = buf_sum.contents() as *const f32;
+    let metal_norm: Vec<f32> = unsafe { std::slice::from_raw_parts(norm_ptr, len).to_vec() };
+    let metal_sum: Vec<f32> = unsafe { std::slice::from_raw_parts(sum_ptr, len).to_vec() };
+
+    let diff_norm = max_diff(&cpu_norm, &metal_norm);
+    assert!(
+        diff_norm < 1e-4,
+        "residual_norm_store norm_out max diff {diff_norm}"
+    );
+    let diff_sum = max_diff(&cpu_sum, &metal_sum);
+    assert!(
+        diff_sum < 1e-6,
+        "residual_norm_store sum_out max diff {diff_sum} (must be exact)"
+    );
+}
+
+/// D-RMS-FUSE Phase 1 with a non-zero `offset` (Gemma-style HF norm
+/// where the saved norm weight already has +1 baked in). Pins the
+/// shader's `(weight[i] + offset) * rms` formula.
+#[test]
+fn residual_norm_store_with_norm_offset() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
+    let fused = device
+        .new_compute_pipeline_state_with_function(
+            &lib.get_function("residual_norm_store", None).unwrap(),
+        )
+        .unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 128usize;
+    let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.11).sin() * 0.4).collect();
+    let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.09).cos() * 0.3).collect();
+    let weight: Vec<f32> = (0..len).map(|i| (i as f32 * 0.02).sin() * 0.05).collect();
+    let eps = 1e-6f32;
+    let offset = 1.0f32; // Gemma-style HF norm offset
+
+    let cpu_sum: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+    let sum_sq: f32 = cpu_sum.iter().map(|v| v * v).sum();
+    let rms = 1.0 / (sum_sq / len as f32 + eps).sqrt();
+    let cpu_norm: Vec<f32> = cpu_sum
+        .iter()
+        .zip(weight.iter())
+        .map(|(s, w)| s * (w + offset) * rms)
+        .collect();
+
+    let buf_a = bufs.transient_from_f32(&a);
+    let buf_b = bufs.transient_from_f32(&b);
+    let buf_w = bufs.transient_from_f32(&weight);
+    let buf_norm = bufs.output((len * 4) as u64);
+    let buf_sum = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&fused);
+    enc.set_buffer(0, Some(&buf_a), 0);
+    enc.set_buffer(1, Some(&buf_b), 0);
+    enc.set_buffer(2, Some(&buf_w), 0);
+    enc.set_buffer(3, Some(&buf_norm), 0);
+    enc.set_buffer(4, Some(&buf_sum), 0);
+    enc.set_bytes(5, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(256.min(len as u64), 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let norm_ptr = buf_norm.contents() as *const f32;
+    let sum_ptr = buf_sum.contents() as *const f32;
+    let metal_norm: Vec<f32> = unsafe { std::slice::from_raw_parts(norm_ptr, len).to_vec() };
+    let metal_sum: Vec<f32> = unsafe { std::slice::from_raw_parts(sum_ptr, len).to_vec() };
+
+    let diff_norm = max_diff(&cpu_norm, &metal_norm);
+    assert!(
+        diff_norm < 1e-4,
+        "residual_norm_store with offset norm_out max diff {diff_norm}"
+    );
+    let diff_sum = max_diff(&cpu_sum, &metal_sum);
+    assert!(
+        diff_sum < 1e-6,
+        "residual_norm_store with offset sum_out max diff {diff_sum}"
+    );
 }

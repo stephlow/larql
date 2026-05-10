@@ -1,8 +1,8 @@
 //! Demo: auto-detect backend and run basic operations.
 //!
 //! Usage:
-//!   cargo run --release -p larql-compute --example demo
-//!   cargo run --release -p larql-compute --features metal --example demo
+//!   cargo run --release -p larql-compute --example demo_basic
+//!   cargo run --release -p larql-compute --features metal --example demo_basic
 
 extern crate blas_src;
 

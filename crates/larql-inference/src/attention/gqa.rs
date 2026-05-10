@@ -259,9 +259,6 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
-    fn zeros(rows: usize, cols: usize) -> Array2<f32> {
-        Array2::zeros((rows, cols))
-    }
     fn ones(rows: usize, cols: usize) -> Array2<f32> {
         Array2::ones((rows, cols))
     }
@@ -408,6 +405,226 @@ mod tests {
     }
 
     #[test]
+    fn gqa_softcap_keeps_output_finite_and_within_cap() {
+        // softcap=Some(cap) routes through `(s/cap).tanh() * cap` — must
+        // produce finite output AND attention weights still summing to 1.
+        let seq = 4usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 0.5); // large enough to push raw scores >> cap
+        let k = small(seq, hd, 0.5);
+        let v = small(seq, hd, 0.1);
+        let cap = 5.0f32;
+        let (out, weights) = gqa_attention_with_weights(
+            &q,
+            &k,
+            &v,
+            1,
+            hd,
+            1,
+            1.0 / (hd as f64).sqrt(),
+            seq,
+            true,
+            Some(cap),
+        );
+        assert!(out.iter().all(|v| v.is_finite()));
+        let w = weights.unwrap();
+        // Last-position weights must still be a valid distribution.
+        let sum: f32 = w.heads[0].iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "softcap weights should sum to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn gqa_softcap_differs_from_no_cap_when_cap_binds() {
+        // With small softcap and large logits, output should differ from
+        // the no-cap version — confirms the softcap branch is actually
+        // running rather than being a no-op.
+        let seq = 3usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 1.0); // big logits
+        let k = small(seq, hd, 1.0);
+        let v = small(seq, hd, 1.0);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let out_nocap = gqa_attention(&q, &k, &v, 1, hd, 1, scale, seq);
+        let (out_cap, _) =
+            gqa_attention_with_weights(&q, &k, &v, 1, hd, 1, scale, seq, false, Some(0.5));
+        let mut max_diff = 0.0f32;
+        for (a, b) in out_nocap.iter().zip(out_cap.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        assert!(
+            max_diff > 1e-3,
+            "softcap should change output when cap binds, max_diff={max_diff}"
+        );
+    }
+
+    // ── gqa_attention_with_all_weights — every-position capture ────────
+
+    #[test]
+    fn gqa_with_all_weights_captures_every_position() {
+        let seq = 3usize;
+        let hd = 4usize;
+        let num_q = 2usize;
+        let q = small(seq, num_q * hd, 0.1);
+        let k = small(seq, hd, 0.1);
+        let v = small(seq, hd, 0.1);
+        let (out, all) = gqa_attention_with_all_weights(
+            &q,
+            &k,
+            &v,
+            num_q,
+            hd,
+            num_q, // reps so 1 KV head
+            1.0 / (hd as f64).sqrt(),
+            seq,
+            None,
+        );
+        assert_eq!(out.shape(), &[seq, num_q * hd]);
+        // Every Q-head x every Q-position must have a captured distribution.
+        assert_eq!(all.heads.len(), num_q);
+        for head in &all.heads {
+            assert_eq!(head.len(), seq);
+            for (qi, dist) in head.iter().enumerate() {
+                assert_eq!(dist.len(), seq);
+                // Causal: positions > qi are zero; positions ≤ qi sum to 1.
+                let causal_sum: f32 = dist[..=qi].iter().sum();
+                assert!(
+                    (causal_sum - 1.0).abs() < 1e-3,
+                    "qi={qi} causal weights should sum to 1, got {causal_sum}"
+                );
+                for &future in &dist[qi + 1..] {
+                    assert_eq!(future, 0.0, "qi={qi} non-causal weight non-zero");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gqa_with_all_weights_softcap_keeps_distribution_valid() {
+        let seq = 2usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 1.0);
+        let k = small(seq, hd, 1.0);
+        let v = small(seq, hd, 1.0);
+        let (_, all) = gqa_attention_with_all_weights(
+            &q,
+            &k,
+            &v,
+            1,
+            hd,
+            1,
+            1.0 / (hd as f64).sqrt(),
+            seq,
+            Some(0.5),
+        );
+        for head in &all.heads {
+            for (qi, dist) in head.iter().enumerate() {
+                let causal_sum: f32 = dist[..=qi].iter().sum();
+                assert!((causal_sum - 1.0).abs() < 1e-3);
+            }
+        }
+    }
+
+    // ── gqa_reduced_qk_all_weights — diagnostic reduced-rank capture ────
+
+    #[test]
+    fn reduced_qk_all_weights_returns_per_head_per_position_distributions() {
+        let seq = 3usize;
+        let hd = 8usize;
+        let num_q = 2usize;
+        let q = small(seq, num_q * hd, 0.1);
+        let k = small(seq, hd, 0.1);
+        let all = gqa_reduced_qk_all_weights(
+            &q,
+            &k,
+            num_q,
+            hd,
+            num_q, // reps
+            1.0 / (hd as f64).sqrt(),
+            seq,
+            None,
+            4, // qk_rank — half of head_dim
+        );
+        assert_eq!(all.heads.len(), num_q);
+        for head in &all.heads {
+            assert_eq!(head.len(), seq);
+            for (qi, dist) in head.iter().enumerate() {
+                let causal_sum: f32 = dist[..=qi].iter().sum();
+                assert!((causal_sum - 1.0).abs() < 1e-3);
+                for &future in &dist[qi + 1..] {
+                    assert_eq!(future, 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_qk_clamps_rank_above_head_dim() {
+        // qk_rank > head_dim should clamp to head_dim and behave like
+        // the full-rank capture.
+        let seq = 2usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 0.1);
+        let k = small(seq, hd, 0.1);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let all_full = gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, scale, seq, None, hd);
+        let all_clamped = gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, scale, seq, None, hd * 4);
+        for (a, b) in all_full.heads[0].iter().zip(all_clamped.heads[0].iter()) {
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-6,
+                    "qk_rank > head_dim must clamp: {x} vs {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_qk_clamps_rank_zero_to_one() {
+        // qk_rank=0 clamps to 1 — a 1-dim QK projection still produces
+        // a valid distribution.
+        let seq = 3usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 0.1);
+        let k = small(seq, hd, 0.1);
+        let all =
+            gqa_reduced_qk_all_weights(&q, &k, 1, hd, 1, 1.0 / (hd as f64).sqrt(), seq, None, 0);
+        for (qi, dist) in all.heads[0].iter().enumerate() {
+            let causal_sum: f32 = dist[..=qi].iter().sum();
+            assert!(
+                (causal_sum - 1.0).abs() < 1e-3,
+                "qi={qi} dist must still be valid distribution"
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_qk_softcap_branch() {
+        // Hit the `Some(cap)` arm in the reduced-QK function.
+        let seq = 2usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 1.0);
+        let k = small(seq, hd, 1.0);
+        let all = gqa_reduced_qk_all_weights(
+            &q,
+            &k,
+            1,
+            hd,
+            1,
+            1.0 / (hd as f64).sqrt(),
+            seq,
+            Some(0.5),
+            hd,
+        );
+        for (qi, dist) in all.heads[0].iter().enumerate() {
+            let causal_sum: f32 = dist[..=qi].iter().sum();
+            assert!((causal_sum - 1.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
     fn gqa_reps_2_head_pairs_share_kv() {
         // Q-heads 0,1 use KV-head 0; Q-heads 2,3 use KV-head 1.
         // With Q equal to each other within a pair, output should also match.
@@ -420,8 +637,8 @@ mod tests {
         let mut q_data = vec![0.0f32; seq * num_q * hd];
         for s in 0..seq {
             for d in 0..hd {
-                q_data[s * num_q * hd + 0 * hd + d] = 0.1; // head 0
-                q_data[s * num_q * hd + 1 * hd + d] = 0.1; // head 1 (same as 0)
+                q_data[s * num_q * hd + d] = 0.1; // head 0
+                q_data[s * num_q * hd + hd + d] = 0.1; // head 1 (same as 0)
                 q_data[s * num_q * hd + 2 * hd + d] = 0.5; // head 2
                 q_data[s * num_q * hd + 3 * hd + d] = 0.5; // head 3 (same as 2)
             }
@@ -431,8 +648,8 @@ mod tests {
         let v = small(seq, num_kv * hd, 0.1);
         let out = gqa_attention(&q, &k, &v, num_q, hd, reps, 1.0 / (hd as f64).sqrt(), seq);
         // heads 0 and 1 should produce identical output rows (same Q, same KV)
-        let h0: Vec<f32> = out.row(0).iter().skip(0 * hd).take(hd).copied().collect();
-        let h1: Vec<f32> = out.row(0).iter().skip(1 * hd).take(hd).copied().collect();
+        let h0: Vec<f32> = out.row(0).iter().take(hd).copied().collect();
+        let h1: Vec<f32> = out.row(0).iter().skip(hd).take(hd).copied().collect();
         for (a, b) in h0.iter().zip(h1.iter()) {
             assert!(
                 (a - b).abs() < 1e-5,

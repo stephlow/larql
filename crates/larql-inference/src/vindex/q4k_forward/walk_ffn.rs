@@ -125,9 +125,10 @@ pub fn q4k_ffn_forward_layer_q8k(
     // Down projection: Q4K×Q8K NEON — quantise the f32 activation once,
     // then call the NEON matvec directly on the mmap Q4K bytes.
     // No dequant, no large f32 allocation, no BLAS thread-pool collision.
-    // Guard: intermediate must be Q8K-block-aligned (multiple of 256).
+    // Guard: intermediate must be Q8K-block-aligned (multiple of the
+    // Q4_K/Q8_K super-block size).
     // For non-aligned sizes (rare, non-production) fall back to OnceLock cache.
-    if intermediate % 256 == 0 {
+    if intermediate.is_multiple_of(crate::ffn::Q4K_Q8K_SUPERBLOCK_ELEMS) {
         let activation_flat = activation.as_slice().expect("activation contiguous");
         let act_q8k = quantize_x_to_q8k(activation_flat);
         let mut out = vec![0.0f32; hidden];

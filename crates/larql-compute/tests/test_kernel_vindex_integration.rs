@@ -10,7 +10,7 @@
 //! `quant_matvec::encode` helpers and compare against CPU references,
 //! pinning down composition bugs that individual shader tests miss.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -106,7 +106,7 @@ fn q4kf_proj_matches_cpu_on_real_vindex_bytes() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4kf_proj_pipeline.state);
     enc.set_buffer(0, Some(&w_buf), 0);
     enc.set_buffer(1, Some(&x_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -826,7 +826,7 @@ fn q4k_qkv_proj_matches_per_proj_dispatch() {
     let hidden_u = hidden as u32;
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_qkv_proj_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4k_qkv_proj_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);
@@ -927,7 +927,7 @@ fn q4k_q6k_qkv_proj_matches_per_proj_dispatch() {
     let hidden_u = hidden as u32;
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4k_q6k_qkv_proj_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);

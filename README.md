@@ -98,6 +98,21 @@ larql convert gguf-to-vindex model.gguf -o model.vindex
 larql serve gemma3-4b.vindex --port 8080
 ```
 
+Grid traffic uses **f16 wire format** by default (50% bandwidth vs f32). Opt out with `LARQL_F16_WIRE_DISABLE=1`. Enable i8 symmetric quantised residuals (75% bandwidth, opt-in) with `LARQL_I8_WIRE=1`. Wire format is negotiated per-request via `Accept`/`Content-Type` headers — non-grid clients receive f32 unchanged.
+
+**WebSocket streaming** on `WS /v1/stream`:
+```json
+// Token-by-token generation — send:
+{"type": "generate", "prompt": "The capital of France is", "max_tokens": 50}
+// Receive one frame per token:
+{"type": "token", "text": " Paris", "index": 0}
+// Final frame:
+{"type": "done", "tokens": 1, "latency_ms": 48.2}
+// Abort mid-generation:
+{"type": "cancel"}
+```
+SSE token streaming is also available on `POST /v1/chat/completions` with `"stream": true`.
+
 ### Run attention locally, FFN on another machine
 
 ```bash
@@ -496,9 +511,17 @@ Input formats: **safetensors** (HuggingFace), **GGUF** (llama.cpp, dequantized t
 | Phi | Phi 2/3 (2.7B-14B) | Gated |
 | DeepSeek | DeepSeek V2/V3 | MoE (shared + routed) |
 | GPT-OSS | GPT-OSS-120B | MoE (128 experts, MXFP4) |
-| GPT-2 | GPT-2 (117M-1.5B) | Dense (GELU) |
+| GPT-2 | GPT-2 (117M-1.5B) | Standard (GELU-tanh, vindex extraction only) |
 
 Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFER). MXFP4-quantized MoE models (GPT-OSS) can be extracted and served but DESCRIBE/WALK produce noisy results due to 4-bit weight precision — use INFER for accurate knowledge queries. See [operations spec](docs/specs/vindex-operations-spec.md) for details.
+
+GPT-2 status: GGUF conversion (`larql convert gguf-to-vindex`) lands canonical
+weights — the loader transparently re-orients non-standard FFN layouts, splits
+the fused `attn_qkv` projection into per-head q/k/v, and surfaces learned
+`wpe` positional embeddings on `ModelWeights::position_embed`. Forward-pass
+inference still requires wiring `position_embed` into the residual init and
+the LayerNorm-with-bias / FFN-with-bias paths through the run-time stack;
+extraction-only flows (DESCRIBE, KNN, vindex publish) work today.
 
 ## Benchmarks
 
@@ -517,21 +540,23 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 
 | Operation | Latency | tok/s |
 |---|---|---|
-| **GPU Q4K decode (Metal, 34L, KV cache)** | **12.0ms** | **83.2** |
+| **GPU Q4K decode (Metal, 34L, KV cache)** | **11.4ms** | **88.1** |
 | Walk prediction (CPU, no attention) | 33ms | 30 |
 | INFER walk (CPU, with attention, mmap FFN) | 517ms | 1.9 |
 | INFER dense (CPU, all matmul) | 535ms | 1.9 |
 | DESCRIBE (knowledge browse) | 33ms | — |
 
-GPU decode per-stage breakdown (post 2026-05-02 dispatch geometry fix):
+GPU decode per-stage breakdown (post 2026-05-09 QKV defuse, ADR-016):
 
 | Component | Time | % of total |
 |---|---|---|
-| GPU forward (34 layers, Q4K/Q6K) | 11.16 ms | 86% |
-| LM head (Q4_K stride-32 + correctness fix) | 1.85 ms | 14% |
+| GPU forward (34 layers, Q4K/Q6K, defused norm+QKV) | 11.40 ms | 86% |
+| LM head (Q4_K production path) | 1.85 ms | 14% |
 | Embed + norm + detokenize | <0.1ms | <1% |
 
-vs ollama gemma3:4b on the same machine: 99 tok/s steady → **gap 1.18×**, was 1.30× before the fix.
+vs ollama gemma3:4b on the same machine: ~103 tok/s steady → **gap 1.17×**, was 1.18× pre QKV defuse, 1.30× pre 2026-05-02 dispatch fix. Acceptance criterion (~85 tok/s, ~1.16×) effectively met.
+
+**Cross-arch coverage (2026-05-09)**: Gemma 3, Gemma 4 31B dense, Llama 2 7B, Mistral 7B all dispatch correctly through Metal. Gemma 4 E2B currently falls back to CPU (Per-Layer Embeddings not yet in Metal — ROADMAP D-METAL-PLE). See [crates/larql-compute/docs/architecture-shader-map.md](crates/larql-compute/docs/architecture-shader-map.md) for the per-architecture shader dispatch table.
 
 CPU walk breakdown:
 
@@ -550,7 +575,9 @@ Walk is **faster than dense** (517ms vs 535ms). GPU Q4K decode is **23× faster*
 | **Local Metal MoE** | **18.9** | Measured 2026-05-04; MoE experts on CPU NEON. |
 | 1-shard CPU/grid (loopback) | 18.3 | NEON Q4_K matvec on shard server, gRPC fan-in |
 | 2-shard CPU/grid (loopback) | 17.3 | Parallel collect + parallel fire (`std::thread::scope` + `rayon::par_iter`) |
-| SKIP_MOE ceiling | 56.8 | Attention + dense FFN only; theoretical max |
+| `LARQL_SKIP_MOE=1` ceiling | 56.8 | Attention + dense FFN only; theoretical max |
+
+**Wire format (2026-05-07)**: grid traffic uses f16 by default (50% bandwidth). Set `LARQL_I8_WIRE=1` for i8 symmetric quantisation (75% bandwidth, opt-in). Both are architecture-agnostic — `hidden_size` is read from vindex config at runtime. Per-layer latency is tracked via `HeartbeatMsg.layer_stats` (EMA + p99); the router uses it to route replicated layers to the lowest-latency server. Use `make bench-wire` to measure codec throughput and `make bench-routing` for routing hot-path.
 
 ### Dense remote-FFN (Gemma 4 31B Q4K, M3 Max, localhost)
 
@@ -695,6 +722,10 @@ The full surface is documented in `crates/larql-inference/ROADMAP.md` §
 | [docs/residual-trace.md](docs/residual-trace.md) | Residual stream trace — decomposition, storage, tiered context |
 | [docs/mech-interp.md](docs/mech-interp.md) | Mechanistic interp surface — hooks, lens, vocab proj, patching, KV surgery (Rust + Python) |
 | [docs/specs/trace-format-spec.md](docs/specs/trace-format-spec.md) | Trace file format specification (.bin, .bndx, .ctxt) |
+| [docs/adr/0009-wire-format-evolution.md](docs/adr/0009-wire-format-evolution.md) | Wire format: f16 default, i8 opt-in, Accept/Content-Type negotiation |
+| [docs/adr/0010-quic-grid-transport.md](docs/adr/0010-quic-grid-transport.md) | QUIC transport for grid (planned) |
+| [docs/adr/0011-grid-self-balancing.md](docs/adr/0011-grid-self-balancing.md) | Grid Mode B + dynamic rebalancing (planned) |
+| [docs/adr/0012-grid-benchmarking.md](docs/adr/0012-grid-benchmarking.md) | Grid benchmarking infrastructure — criterion + CLI + CI gate |
 
 ## Platform Support
 
@@ -715,7 +746,17 @@ cargo test                               # all tests across all crates
 cargo test -p larql-inference            # inference engine tests (109 tests)
 cargo test -p larql-inference --features metal  # + Metal GPU tests (115 tests)
 cargo test -p larql-lql                  # LQL parser + executor tests (272 tests)
-cargo test -p larql-vindex               # vindex storage + patch tests (104 tests)
+cargo test -p larql-vindex               # vindex storage + patch tests (525 tests as of 2026-05-08)
+
+# Crate-local CI shortcuts
+make larql-vindex-ci                     # fmt, clippy, tests, examples, benches, coverage policy
+make larql-vindex-test                   # cargo test -p larql-vindex
+make larql-vindex-fmt-check              # cargo fmt -p larql-vindex -- --check
+make larql-vindex-lint                   # cargo clippy -p larql-vindex --all-targets -- -D warnings
+make larql-vindex-examples               # cargo check -p larql-vindex --examples
+make larql-vindex-bench-test             # cargo test -p larql-vindex --benches
+make larql-vindex-coverage-summary       # aggregate + per-file coverage ratchet
+make larql-vindex-coverage-html          # HTML report plus the same policy gate
 
 # Inference engine examples
 cargo run --release -p larql-inference --example attention_demo    # fused attention demo
@@ -757,11 +798,15 @@ cargo bench -p larql-lql    --bench parser               # parse_single × 18 + 
 cargo bench -p larql-lql    --bench executor             # SELECT, SHOW, DELETE, UPDATE, patch lifecycle
 cargo bench -p larql-lql    --bench compile              # COMPILE INTO VINDEX bake cost
 cargo bench -p larql-vindex --bench vindex_ops           # KNN, walk, save/load, mutate, MoE
+make larql-vindex-bench                                  # shortcut for vindex_ops
 cargo bench -p larql-vindex --bench vindex_scaling       # production-dim KNN (Gemma/Llama/Mixtral)
 cargo bench -p larql-vindex --bench memit_solve          # ridge decomposition throughput
 cargo bench -p larql-vindex --bench extract_throughput   # streaming extract: f32 vs Q4K write-path
 cargo bench -p larql-vindex --bench q4k_vs_f32           # per-layer attn retrieval: f32 memcpy vs Q4K dequant
 cargo bench -p larql-compute --bench matmul              # CPU/Metal matmul backends
+cargo bench -p larql-inference --bench wire_codec        # f32/f16/i8 encode+decode throughput (MB/s)
+cargo bench -p larql-router --bench routing              # route/heartbeat/rebuild hot-path (ns/op)
+make bench-all                                           # all of the above in one shot
 ```
 
 The `compile_demo` example proves the full flow on a real Gemma 4B

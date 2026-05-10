@@ -61,20 +61,19 @@ impl VectorIndex {
                 }
             }
         }
-        self.projections.lm_head_q4_mmap = Some(Arc::new(mmap));
+        Arc::make_mut(&mut self.storage).set_lm_head_q4_mmap(Arc::new(mmap));
         Ok(())
     }
 
     /// Whether Q4 lm_head is loaded (from file or synthesized from f16 embeddings).
     pub fn has_lm_head_q4(&self) -> bool {
-        self.projections.lm_head_q4_mmap.is_some() || self.projections.lm_head_q4_synth.is_some()
+        self.storage.has_lm_head_q4()
     }
 
     /// Synthesize Q4_0 lm_head in RAM from the f16 embeddings mmap.
     /// No-op if a Q4 source already exists or preconditions are not met.
     pub fn synthesize_lm_head_q4(&mut self) {
-        if self.projections.lm_head_q4_mmap.is_some() || self.projections.lm_head_q4_synth.is_some()
-        {
+        if self.storage.has_lm_head_q4() {
             return;
         }
         let vocab = self.vocab_size;
@@ -90,12 +89,13 @@ impl VectorIndex {
         if vocab == 0 || hidden == 0 || !hidden.is_multiple_of(K_QUANT_BLOCK_ELEMS) {
             return;
         }
-        let f16_mmap = match self.projections.lm_head_f16_mmap.as_ref() {
-            Some(m) => m.clone(),
+        let f16_bytes: bytes::Bytes = match self.storage.lm_head_f16_view() {
+            Some(b) => b.clone(),
             None => return,
         };
+        let f16_buf: &[u8] = f16_bytes.as_ref();
         let expected = vocab * hidden * 2;
-        if f16_mmap.len() < expected {
+        if f16_buf.len() < expected {
             return;
         }
         // Decode the whole f16 mmap to f32 in one pass, then Q4_K-quantise
@@ -106,11 +106,11 @@ impl VectorIndex {
         let mut all_f32 = vec![0.0f32; vocab * hidden];
         for (i, slot) in all_f32.iter_mut().enumerate() {
             let off = i * 2;
-            let bits = u16::from_le_bytes([f16_mmap[off], f16_mmap[off + 1]]);
+            let bits = u16::from_le_bytes([f16_buf[off], f16_buf[off + 1]]);
             *slot = larql_models::quant::half::f16_to_f32(bits);
         }
         let q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(&all_f32);
-        self.projections.lm_head_q4_synth = Some(Arc::new(q4k));
+        Arc::make_mut(&mut self.storage).set_lm_head_q4_synth(Arc::new(q4k));
     }
 
     /// Adopt the vindex's f16 `embeddings.bin` mmap as an f16 view of the
@@ -121,12 +121,12 @@ impl VectorIndex {
     /// When set, `lm_head_knn_backend` prefers `ComputeBackend::f16_gemv`
     /// on the mmap'd bytes, avoiding the 5.6 GB f32 clone on Gemma 4 31B.
     pub fn set_lm_head_f16_mmap(&mut self, mmap: Arc<memmap2::Mmap>) {
-        self.projections.lm_head_f16_mmap = Some(mmap);
+        Arc::make_mut(&mut self.storage).set_lm_head_f16(mmap);
     }
 
     /// Whether an f16 mmap view of the LM head is available.
     pub fn has_lm_head_f16(&self) -> bool {
-        self.projections.lm_head_f16_mmap.is_some() && self.vocab_size > 0
+        self.storage.has_lm_head_f16() && self.vocab_size > 0
     }
 
     // ── LM head (output projection) for vindex logits ──
@@ -142,12 +142,12 @@ impl VectorIndex {
         // Detect vocab size from file size: vocab = file_bytes / (hidden_size * 4)
         let vocab = mmap.len() / (self.hidden_size * 4);
         self.vocab_size = vocab;
-        self.projections.lm_head_mmap = Some(Arc::new(mmap));
+        Arc::make_mut(&mut self.storage).set_lm_head_f32(Arc::new(mmap));
         Ok(())
     }
 
     /// Whether lm_head is loaded for vindex logits.
     pub fn has_lm_head(&self) -> bool {
-        self.projections.lm_head_mmap.is_some() && self.vocab_size > 0
+        self.storage.has_lm_head_f32() && self.vocab_size > 0
     }
 }

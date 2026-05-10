@@ -10,6 +10,8 @@ use std::path::Path;
 
 use ndarray::{Array1, Array2};
 
+use crate::format::filenames::ROUTER_WEIGHTS_BIN;
+
 /// MoE router weights for all layers.
 pub struct RouterIndex {
     /// Per-layer router weight matrices: `[num_experts, hidden_size]`
@@ -37,7 +39,7 @@ impl RouterIndex {
     /// Load router weights from a vindex directory.
     /// Returns None if router_weights.bin doesn't exist (dense model).
     pub fn load(dir: &Path, config: &crate::config::VindexConfig) -> Option<Self> {
-        let path = dir.join("router_weights.bin");
+        let path = dir.join(ROUTER_WEIGHTS_BIN);
         if !path.exists() {
             return None;
         }
@@ -62,7 +64,7 @@ impl RouterIndex {
         for layer in 0..num_layers {
             let base = layer * per_layer;
             if base + per_layer > floats.len() {
-                break;
+                return None;
             }
 
             let w_data = &floats[base..base + weight_size];

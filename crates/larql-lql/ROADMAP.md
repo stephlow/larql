@@ -11,6 +11,12 @@ overlays, not yet materialized into FFN features. `COMPILE INTO MODEL` applies
 MEMIT (opt-in via `LARQL_MEMIT_ENABLE=1`). `ALPHA` and `MODE` clauses are
 accepted on `INSERT`; `ALPHA` only affects `MODE COMPOSE`.
 
+Test coverage stands at **87.7% lines / 86.5% regions / 80.7% functions**
+(679 lib tests, 2026-05-10 — see [`CHANGELOG.md`](CHANGELOG.md)). Two
+real bugs were fixed during the coverage push: DIFF and MERGE were both
+heap-only on down_meta, so they silently no-op'd against any
+production-loaded mmap-backed vindex.
+
 ---
 
 ## P0: Review cleanup — correctness and persistence
@@ -143,3 +149,37 @@ additional refine passes that re-capture residuals under the live install
 and re-orthogonalise, lifting `self_scores` when the first pass undershoots.
 Validated manually in Python (`compile_facts.py refine(rounds=2)` lifts 5/5);
 needs to be wired into the Rust executor path.
+
+---
+
+## P1: Coverage — close the remaining gaps
+
+### `infer_trace.rs` rendering branches
+**Status**: Planned
+**Files**: `src/executor/query/infer_trace.rs`, `src/executor/tests.rs`
+Currently 63% line coverage. The dense Backend::Weight short-circuit and
+KNN-override formatter are now covered, but the per-layer rendering
+loop (`render_trace_layer`) only fires when `walk_trace_from_residuals`
+produces non-empty hits. The synthetic random-init fixture rarely
+triggers gate-KNN matches above the threshold, so most rendering
+branches are unreachable from the existing fixture. Build a richer
+fixture (rich-tokenizer + has_model_weights + RICH_GATE_MAG-scale
+gate vectors) so the trace produces real hits, or expose a
+seed-residuals knob on the test harness.
+
+### `lifecycle/extract.rs` happy path
+**Status**: Planned
+**Files**: `src/executor/lifecycle/extract.rs`, `src/executor/tests.rs`
+51% line coverage; the rest is `InferenceModel::load` + `build_vindex`
++ auto-load. Needs a tiny on-disk fake-model fixture (config.json +
+safetensors) cheap enough to ship in tests. ~80–100 lines for a 2-layer
+4-hidden synthetic.
+
+### `repl.rs` interactive paths
+**Status**: Planned
+**Files**: `src/repl.rs`, `tests/`
+62% line coverage; the rest is `run_repl` and `run_repl_basic` which
+need stdin simulation. A `rexpect` or `expectrl`-style harness in
+`tests/` would unblock these. Lower priority since the helpers
+(`split_statements`, `is_complete_statement`, `run_batch`,
+`run_statement`) are fully covered.

@@ -6,7 +6,7 @@
 //! - `q4k_q6k_qkv_proj_normed`: fused input-norm + QKV projection for
 //!   the Q4_K Q/K + Q6_K V mixed-format path (Gemma 3 4B production).
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -55,7 +55,7 @@ fn residual_norm_store_matches_residual_norm_and_raw_sum() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.residual_norm_store_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.residual_norm_store_pipeline);
     enc.set_buffer(0, Some(&buf_a), 0);
     enc.set_buffer(1, Some(&buf_b), 0);
     enc.set_buffer(2, Some(&buf_w), 0);
@@ -165,7 +165,7 @@ fn q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_normed_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4k_q6k_qkv_proj_normed_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);
@@ -306,7 +306,7 @@ fn q4k_q6k_qkv_proj_normed_matches_at_production_hidden() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4k_q6k_qkv_proj_normed_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4k_q6k_qkv_proj_normed_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);

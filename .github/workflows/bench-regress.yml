@@ -3,7 +3,7 @@
 # in the criterion bench suite regresses past Criterion's noise
 # threshold.
 #
-# Surface covered (`make bench` = `make bench-quant + bench-matmul + bench-linalg`):
+# Surface covered (`make bench-save` / `make bench-check`):
 #   - `quant_matvec`: Q4_0 / Q4_K / Q4_KF / Q6_K × 3 shapes × cpu/metal
 #   - `matmul`: f32 matmul + f32_gemv (lm-head) — cpu vs metal
 #   - `linalg`: cholesky + ridge solve (cpu only)

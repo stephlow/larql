@@ -22,6 +22,14 @@
 //! is the API surface that carryover would later plug into without
 //! changing the caller's code.
 //!
+//! ## Sibling chat-template machinery
+//!
+//! - [`crate::chat`] — Jinja-driven, vindex-faithful rendering (preferred
+//!   when a vindex directory is on disk).
+//! - [`crate::prompt::ChatTemplate`] — heuristic enum + single-prompt
+//!   wrapping for callers without vindex bytes; its `render_messages`
+//!   delegates to the renderers below for Gemma / Llama / ChatML.
+//!
 //! [`generate_with_sampling`]: super::gpu::generate_with_sampling
 //! [`generate_streaming`]: super::gpu::generate_streaming
 

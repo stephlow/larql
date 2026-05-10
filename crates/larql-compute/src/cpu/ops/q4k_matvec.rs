@@ -5,8 +5,13 @@
 //! `dequantize_q4_k`). Not optimised — scalar code intended as a correctness
 //! reference.
 
-/// Q4_K super-block size: 144 bytes per 256 values (GGUF layout).
-const Q4K_BLOCK_SIZE: usize = 144;
+use larql_models::quant::ggml::Q4_K_BLOCK_BYTES as Q4K_BLOCK_SIZE;
+
+/// Offset to the start of the 128-byte nibble-packed quants region inside
+/// a Q4_K block: 2 bytes `d` + 2 bytes `dmin` + 12 packed `(scale, min)`
+/// bytes = 16. Pinning this so `[Q4K_HEADER_BYTES..Q4K_BLOCK_SIZE]`
+/// reads as "the quants section" instead of `[16..144]`.
+const Q4K_HEADER_BYTES: usize = 16;
 
 /// Decode f16 bits to f32, preserving subnormals (matches Metal's
 /// `decode_f16_metal`, which uses the hardware `half` → `float` cast).
@@ -77,7 +82,7 @@ pub fn dispatch(q4k_data: &[u8], x: &[f32], num_rows: usize, hidden: usize) -> V
             let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
 
             let (scales, mins) = unpack_scales_mins(&block[4..16]);
-            let qs = &block[16..144];
+            let qs = &block[Q4K_HEADER_BYTES..Q4K_BLOCK_SIZE];
             let x_base = sb * 256;
 
             // Four groups × 32 bytes; each group pairs two sub-blocks
@@ -124,8 +129,8 @@ mod tests {
         let q4k = quantize_q4_k(&matrix);
         assert_eq!(
             q4k.len(),
-            144,
-            "single superblock should pack into 144 bytes"
+            Q4K_BLOCK_SIZE,
+            "single superblock should pack into Q4_K_BLOCK_BYTES"
         );
 
         let dequant = dequantize_q4_k(&q4k, hidden).unwrap();

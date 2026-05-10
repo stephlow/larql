@@ -867,16 +867,48 @@ Excess requests receive `429 Too Many Requests`.
 
 ### 8.3.1 Error Envelope
 
-HTTP errors use one JSON shape across REST and embed-service endpoints:
+There are **two** error envelopes, split by endpoint family:
+
+**LARQL paradigm endpoints** (`/v1/describe`, `/v1/walk`, `/v1/select`,
+`/v1/relations`, `/v1/stats`, `/v1/infer`, `/v1/patches/*`,
+`/v1/walk-ffn`, `/v1/insert`, `/v1/explain-infer`, `/v1/embed`,
+`/v1/logits`, `/v1/token/*`) use a **flat** envelope:
 
 ```json
 {"error": "message"}
 ```
 
-This includes JSON parsing failures, binary protocol validation failures, token
-ID bounds errors, model lookup failures, and internal load errors. WebSocket
-messages retain their streaming protocol shape:
-`{"type": "error", "message": "..."}`.
+**OpenAI-compatible endpoints** (`/v1/embeddings`, `/v1/completions`,
+`/v1/chat/completions`) use the **nested** OpenAI-canonical envelope so
+the OpenAI Python and JS SDKs parse errors without special-casing:
+
+```json
+{
+  "error": {
+    "message": "the encoding_format 'foo' is not supported",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}
+```
+
+`type` values used by this server:
+
+| HTTP status | OpenAI `type`              |
+|-------------|----------------------------|
+| 400         | `invalid_request_error`    |
+| 404         | `not_found_error`          |
+| 500         | `server_error`             |
+| 503         | `service_unavailable_error`|
+
+Both `param` and `code` are always present (possibly `null`) — some SDKs
+hard-key on those fields.
+
+WebSocket messages keep their streaming protocol shape:
+`{"type": "error", "message": "..."}`. Mid-stream SSE errors on the
+OpenAI endpoints emit `data: {"error": {"message": "...", "type": "server_error"}}`
+chunks (see `routes/openai/util.rs::error_chunk`).
 
 ### 8.4 DESCRIBE Cache (implemented)
 
@@ -1040,7 +1072,7 @@ tree. Highlights for spec readers:
   `batch_legacy.rs`, `layer_batch.rs`, `cpu.rs`, `metal.rs`,
   `warmup.rs`, plus a `mod.rs` that re-exports the historical public
   surface (`run_expert`, `run_experts_cpu_batch`, `handle_*`,
-  `warmup_*`). `metal.rs` is `#[cfg(feature = "metal-experts")]`.
+  `warmup_*`). `metal.rs` is `#[cfg(all(feature = "metal-experts", target_os = "macos"))]`.
 - `http.rs` carries shared protocol constants:
   `BINARY_FFN_CONTENT_TYPE`, `JSON_CONTENT_TYPE`,
   `REQUEST_BODY_LIMIT_BYTES` (64 MB), `REQUEST_BODY_LIMIT_LARGE_BYTES`
