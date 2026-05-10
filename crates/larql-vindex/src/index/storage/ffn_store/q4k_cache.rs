@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use super::FFN_DOWN;
 use crate::index::core::VectorIndex;
 
 impl VectorIndex {
@@ -139,14 +140,14 @@ impl VectorIndex {
             * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         let info = crate::quant::registry::lookup(format)?;
         let decoded = (info.dequantize)(bytes, padded).ok()?;
-        // Gate (0) and up (1) are stored row-major [intermediate, hidden] — row
+        // Gate and up are stored row-major [intermediate, hidden] — row
         // `feat` already contains that feature's weight vector.
         //
-        // Down (2) is stored row-major [hidden, intermediate] (the native PyTorch
+        // Down is stored row-major [hidden, intermediate] (the native PyTorch
         // nn.Linear(intermediate, hidden) orientation). To give callers a
         // feature-major view matching gate/up, we transpose here: after the flip
         // arc[feat*hidden..(feat+1)*hidden] is feature `feat`'s down vector.
-        let final_data: Vec<f32> = if component == 2 {
+        let final_data: Vec<f32> = if component == FFN_DOWN {
             let mut t = vec![0.0f32; n];
             for h in 0..hidden {
                 let src_row = &decoded[h * intermediate..(h + 1) * intermediate];
@@ -238,7 +239,7 @@ impl VectorIndex {
             let info = crate::quant::registry::lookup(format)?;
             let decoded = (info.dequantize)(bytes, padded).ok()?;
 
-            let final_data: Vec<f32> = if component == 2 {
+            let final_data: Vec<f32> = if component == FFN_DOWN {
                 // Transpose on-disk [hidden, intermediate] → feature-major
                 // [intermediate, hidden] so callers can use activation.dot(&view)
                 // directly (matches layout produced by q4k_ffn_layer).

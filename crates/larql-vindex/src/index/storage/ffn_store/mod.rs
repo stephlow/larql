@@ -29,8 +29,22 @@ use std::sync::{Arc, Mutex};
 
 use crate::index::core::VectorIndex;
 
+/// Number of FFN component tensors per transformer layer: gate, up, down
+/// — in that order. Used everywhere the FFN manifest is indexed
+/// (`layer * FFN_COMPONENTS_PER_LAYER + component`) and as the inner
+/// array length on per-layer caches.
+pub(crate) const FFN_COMPONENTS_PER_LAYER: usize = 3;
+
+/// Component index for `down` inside per-layer FFN manifests / caches.
+/// Special-cased throughout the codebase because down is stored
+/// row-major `[hidden, intermediate]` (the native
+/// `nn.Linear(intermediate, hidden)` orientation) and needs a transpose
+/// to become feature-major like `gate` (component `0`) / `up`
+/// (component `1`).
+pub(crate) const FFN_DOWN: usize = 2;
+
 type Q4kFfnOnceSlot = std::sync::OnceLock<Option<Arc<Vec<f32>>>>;
-type Q4kFfnOnceLayer = [Q4kFfnOnceSlot; 3];
+type Q4kFfnOnceLayer = [Q4kFfnOnceSlot; FFN_COMPONENTS_PER_LAYER];
 
 mod down;
 mod fp4;
@@ -46,7 +60,7 @@ mod up;
 /// Per-layer Q4_K/Q6_K FFN dequant cache: outer index = layer, inner array =
 /// `[gate, up, down]`. `Arc` shares the decoded matrix across `VectorIndex`
 /// clones; `Mutex` guards LRU eviction.
-pub type Q4kFfnCache = Mutex<Vec<[Option<Arc<Vec<f32>>>; 3]>>;
+pub type Q4kFfnCache = Mutex<Vec<[Option<Arc<Vec<f32>>>; FFN_COMPONENTS_PER_LAYER]>>;
 
 /// Per-layer manifest entry for `down_features_q4k.bin` (W2). Carries
 /// the padded row width so the row decoder doesn't have to back-derive

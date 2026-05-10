@@ -181,7 +181,7 @@ larql-kv-fmt-check:
 	cargo fmt -p larql-kv -- --check
 
 larql-kv-lint:
-	cargo clippy -p larql-kv --all-targets -- -D warnings
+	cargo clippy -p larql-kv --all-targets --no-deps -- -D warnings
 
 larql-kv-examples:
 	cargo check -p larql-kv --examples

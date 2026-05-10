@@ -138,7 +138,11 @@ impl MetalBackend {
             enc_a.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
             enc_a.dispatch_threads(
                 MTLSize::new(hidden as u64, 1, 1),
-                MTLSize::new(256.min(hidden as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                    1,
+                    1,
+                ),
             );
 
             let total_rows = (q_dim + kv_dim + kv_dim) as u32;
@@ -359,7 +363,11 @@ impl MetalBackend {
             enc_c.set_bytes(3, 4, &dim_val as *const u32 as *const std::ffi::c_void);
             enc_c.dispatch_threads(
                 MTLSize::new(blocks as u64, 1, 1),
-                MTLSize::new(256.min(blocks as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(blocks as u64),
+                    1,
+                    1,
+                ),
             );
 
             let o_rows = hidden as u32;

@@ -317,10 +317,16 @@ N > 2 * h_ref * K_layer
 ```
 
 at engine construction, with `h_ref = 0.20` baked in as the reference
-hit rate from Exp 52 fact-domain measurements. The refusal message
-must surface the inequality, the chosen `h_ref`, and a one-line
-reminder that operators measuring a higher `h` in their own deployment
-should raise `h_ref` accordingly. Operators with stronger-than-Exp-52
+hit rate from Exp 52 fact-domain measurements. The inequality is
+strict (`>`, not `≥`): the rule refuses configurations that are
+strictly *wall-clock-negative* against `WalkFfn`-only. Net-zero
+configurations sitting exactly at break-even are admitted, on the
+assumption that the operator chose lookup for reasons beyond wall-clock
+(paraphrase reach above the L1 i16 threshold, deterministic answer-
+shape on compiled facts, network-shard offloading via §9). The
+refusal message must surface the inequality, the chosen `h_ref`, and a
+one-line reminder that operators measuring a higher `h` in their own
+deployment should raise `h_ref` accordingly. Operators with stronger-than-Exp-52
 hit-rate evidence may override; the override is a deliberate "I have
 my own h measurement" knob, not "I know this costs more wall-clock"
 (which is a different override and not in this spec).

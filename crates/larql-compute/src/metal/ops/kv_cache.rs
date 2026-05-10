@@ -162,7 +162,11 @@ pub fn encode_kv_append(
     enc.set_bytes(6, 4, &hd as *const u32 as *const c_void);
     enc.dispatch_threads(
         MTLSize::new(total as u64, 1, 1),
-        MTLSize::new(256.min(total as u64), 1, 1),
+        MTLSize::new(
+            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(total as u64),
+            1,
+            1,
+        ),
     );
 }
 
@@ -204,7 +208,11 @@ pub fn encode_kv_attend(
     enc.set_bytes(9, 4, &window_size as *const u32 as *const c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(num_q_heads as u64, 1, 1),
-        MTLSize::new(256.min(cache.head_dim as u64), 1, 1),
+        MTLSize::new(
+            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(cache.head_dim as u64),
+            1,
+            1,
+        ),
     );
 }
 

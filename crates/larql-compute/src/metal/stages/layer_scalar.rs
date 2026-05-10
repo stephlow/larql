@@ -42,7 +42,11 @@ pub fn encode(
         // element, not a single 256-thread threadgroup.
         enc.dispatch_threads(
             MTLSize::new(hidden as u64, 1, 1),
-            MTLSize::new(256.min(hidden as u64), 1, 1),
+            MTLSize::new(
+                crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                1,
+                1,
+            ),
         );
     }
 }

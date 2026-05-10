@@ -856,6 +856,56 @@ directly.
 
 ---
 
+## P1 — Spec'd implementations, sequenced behind P0 validation
+
+Driver: two implementation tracks have shipped specs and review cycles but
+are deliberately queued behind V1–V4 / R6 / MTP / BR4. Recording the
+sequencing here so they don't drift to the front of the queue on momentum
+alone, and so the gating preconditions are written down in one place.
+Both specs live at `crates/larql-inference/docs/specs/`.
+
+| # | Item | Crate(s) | Status | Gating preconditions | Effort |
+|---|------|----------|--------|----------------------|--------|
+| SQ1 | **Markov-residual engine migration** — lift existing reference impl from `kv-cache-benchmark::real_model::markov_layer` into `larql-inference::engines::markov_residual` per the contract in `markov-residual-engine.md`. | larql-inference (+ kv-cache-benchmark adapter) | spec shipped, review-passed; impl not started | (a) V1/V2 in flight (need measurement infrastructure to verify migration didn't regress); (b) trait-vs-sibling decision against `UnlimitedContextEngine` / `ApolloEngine` resolved before locking the API shape — see spec §10 + open question; (c) Q4_K and FP8 same-tier comparison fixtures landed (spec §10 quantisation gate). | ~1–2 weeks once unblocked. Engineering, not research — code already works. |
+| SQ2 | **Vindex-as-FFN compiled-fact lookup** — implement the cosine-thresholded FFN backend per `vindex-as-ffn.md`, with §5.4 cost-model refusal rule (`N > 2 * h_ref * K_layer`, `h_ref = 0.20`) at engine construction. | larql-inference + larql-vindex + larql-server (+ larql-router for /v1/ffn-lookup endpoint) | spec shipped, review-passed (incl. WalkFfn-substrate framing + corrected break-even algebra); impl not started | (a) **R6 must land first** — the spec's per-arch layer-policy table (§7) currently has TBD entries for gemma-3-1b/llama-2-7b/mistral-7b; with R6 these become probe calls instead of three separate Exp 52 re-runs. (b) **A video script or research workflow that needs paraphrase-reach compiled facts above the L1 i16 cos≥0.999 threshold.** None currently does — VID1/Act 3/VID4 all use different mechanisms. (c) Optionally: a deployment scenario where K_layer is large enough that the §5.4 break-even is comfortable (current decode K is 256–1024; at K=1024, h=0.20, crossover is N<410 — admissible but not a clear wall-clock win on small fact corpora). | ~2 weeks once unblocked. Greenfield (decorator + cache + endpoint + COMPILE wiring). |
+
+**Why these are queued, not P0/P1-active**
+
+- **SQ1 (Markov)**: contract is sound, reference impl already works, but
+  it's engineering not research — and the open trait-shape question
+  means migrating Markov first risks forcing
+  `UnlimitedContextEngine`/`ApolloEngine` into a shape that doesn't fit.
+  Designing the trait once across all three engines (or at least
+  resolving sibling-vs-trait before SQ1 lands) is cheaper than migrating
+  one and refactoring twice. V1/V2 also produce the measurement
+  infrastructure that lets the migration prove parity.
+- **SQ2 (FFN lookup)**: the §5.4 cost model says it's a wash on the
+  configurations LARQL actually runs at typical K (256–1024) without
+  large compiled-fact corpora (>410 entries at K=1024, h=0.20). Building
+  it now means it sits unused until a future video script needs
+  paraphrase-reach. R6 also unblocks the per-arch layer-policy table —
+  building SQ2 before R6 means re-doing the layer calibration manually
+  for each architecture.
+
+**Re-promotion conditions** (any one promotes that item to active P1):
+
+- SQ1: V1/V2 land **and** trait-vs-sibling decision recorded in an ADR.
+- SQ2: R6 lands **and** a specific video/experiment requires
+  paraphrase-reach compiled facts (i.e. the L1 cos≥0.999 cache is
+  measurably leaving paraphrases on the floor in that workflow).
+
+**The fact that the specs are written is itself the work**
+
+Both specs went through 2–3 review cycles and caught real issues that
+would otherwise have surfaced as wall-clock surprises (the §5.4 algebra
+error in particular: a refusal rule of `N > 2K` instead of
+`N > 2*h*K` would have green-lit configurations that are net-negative
+by ~5× at typical hit rates). The remaining work is implementation
+under contract, not design — so when SQ1 or SQ2 do become active P1,
+they start from a much better place than typical greenfield work.
+
+---
+
 ## P1 — Generation UX (parallel to critical path)
 
 Details in `larql-inference/ROADMAP.md` and `larql-cli/ROADMAP.md`.

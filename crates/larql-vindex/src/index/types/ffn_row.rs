@@ -10,6 +10,7 @@
 
 use super::StorageBucket;
 use super::{Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess};
+use crate::index::storage::ffn_store::FFN_DOWN;
 
 /// Unified FFN row operations over native, Q4K/Q6K, and FP4/FP8 storage.
 pub trait FfnRowAccess: NativeFfnAccess + QuantizedFfnAccess + Fp4FfnAccess {
@@ -152,7 +153,7 @@ pub trait FfnRowAccess: NativeFfnAccess + QuantizedFfnAccess + Fp4FfnAccess {
             _ => return false,
         }
         if self.has_interleaved_q4k() {
-            if component == 2 {
+            if component == FFN_DOWN {
                 // W2: prefer the feature-major down file when present —
                 // a single row decode beats the whole-layer dequant +
                 // transpose path. Fall back to the cache for vindexes

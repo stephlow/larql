@@ -341,7 +341,11 @@ impl MetalBackend {
             enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(inter as u64, 1, 1),
-                MTLSize::new(256.min(inter as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                    1,
+                    1,
+                ),
             );
         }
 
@@ -544,7 +548,11 @@ impl MetalBackend {
             enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(inter as u64, 1, 1),
-                MTLSize::new(256.min(inter as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                    1,
+                    1,
+                ),
             );
         }
 
@@ -669,7 +677,11 @@ impl MetalBackend {
         enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
         enc.dispatch_threads(
             MTLSize::new(inter as u64, 1, 1),
-            MTLSize::new(256.min(inter as u64), 1, 1),
+            MTLSize::new(
+                crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                1,
+                1,
+            ),
         );
 
         // 3. q4k_matvec down projection.
@@ -840,7 +852,11 @@ impl MetalBackend {
             enc.set_bytes(3, 4, &inter_u32 as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(inter as u64, 1, 1),
-                MTLSize::new(256.min(inter as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(inter as u64),
+                    1,
+                    1,
+                ),
             );
         }
 

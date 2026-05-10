@@ -61,6 +61,11 @@ fn synth_weight_f32(len: usize, seed: f32) -> Vec<f32> {
         .collect()
 }
 
+// Test helper: 7 quant tensor slices + 1 norm slice = 8 args. Mirrors
+// the production `FullPipelineLayer` constructor surface; collapsing to
+// a single struct just for the test would obscure the per-tensor
+// fixture-builder pattern callers actually want.
+#[allow(clippy::too_many_arguments)]
 fn build_synth_layer<'a>(
     wq_data: &'a [u8],
     wk_data: &'a [u8],
@@ -471,17 +476,22 @@ fn decode_token_multi_layer_synthetic_smoke() {
 
     use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k};
 
+    // (wq, wk, wv, wo, gate, up, down) packed bytes for one synthetic
+    // layer. Named alias keeps the per-layer Vec literal readable and
+    // shuts up clippy::type_complexity.
+    type SynthLayerWeights = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+
     // Build 3 distinct layers with different seeds so the layer loop
     // genuinely advances state.
-    let mut layers_data: Vec<(
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-    )> = Vec::with_capacity(3);
+    let mut layers_data: Vec<SynthLayerWeights> = Vec::with_capacity(3);
     for l in 0..3usize {
         let s = l as f32 * 0.1;
         layers_data.push((

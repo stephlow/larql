@@ -325,7 +325,11 @@ impl MetalBackend {
             enc.set_buffer(11, Some(bufs.v_out), 0);
             enc.dispatch_thread_groups(
                 MTLSize::new(layer_num_q_heads as u64, 1, 1),
-                MTLSize::new(256.min(layer_head_dim as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(layer_head_dim as u64),
+                    1,
+                    1,
+                ),
             );
         } else {
             ops::kv_cache::encode_kv_append(
@@ -391,7 +395,11 @@ impl MetalBackend {
             enc.set_bytes(3, 4, &dim_val as *const u32 as *const std::ffi::c_void);
             enc.dispatch_threads(
                 MTLSize::new(blocks as u64, 1, 1),
-                MTLSize::new(256.min(blocks as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(blocks as u64),
+                    1,
+                    1,
+                ),
             );
 
             let o_rows = hidden as u32;
@@ -433,7 +441,11 @@ impl MetalBackend {
                 enc.set_bytes(8, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new(1, 1, 1),
-                    MTLSize::new(256.min(hidden as u64), 1, 1),
+                    MTLSize::new(
+                        crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                        1,
+                        1,
+                    ),
                 );
             } else {
                 use crate::metal::ops::full_pipeline::encode_rms_norm;
@@ -459,7 +471,11 @@ impl MetalBackend {
                     enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(
                         MTLSize::new(1, 1, 1),
-                        MTLSize::new(256.min(hidden as u64), 1, 1),
+                        MTLSize::new(
+                            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                            1,
+                            1,
+                        ),
                     );
                 } else {
                     enc.set_compute_pipeline_state(&self.norms.residual_norm_q8_pipeline);
@@ -474,7 +490,11 @@ impl MetalBackend {
                     enc.set_bytes(8, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(
                         MTLSize::new(1, 1, 1),
-                        MTLSize::new(256.min(hidden as u64), 1, 1),
+                        MTLSize::new(
+                            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                            1,
+                            1,
+                        ),
                     );
                 }
             }
@@ -490,7 +510,11 @@ impl MetalBackend {
             enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
-                MTLSize::new(256.min(hidden as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                    1,
+                    1,
+                ),
             );
         } else {
             enc.set_compute_pipeline_state(&self.norms.residual_norm_q8_pipeline);
@@ -505,7 +529,11 @@ impl MetalBackend {
             enc.set_bytes(8, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
-                MTLSize::new(256.min(hidden as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                    1,
+                    1,
+                ),
             );
         }
     }

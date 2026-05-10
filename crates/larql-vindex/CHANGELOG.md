@@ -6,6 +6,69 @@ The format follows the conventions of [Keep a Changelog](https://keepachangelog.
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-10] — Coverage push (round-6)
+
+The day after round-5's large-file decomp. Closed all five 2026-05-09
+follow-ups, then walked the remaining ≥10%-below-90 files one by one
+until the aggregate cleared 88. Plus a workspace-wide `cargo fmt` +
+`clippy --all-targets -D warnings` pass at the end.
+
+| Metric | 2026-05-09 end | 2026-05-10 end |
+|---|---|---|
+| Aggregate line coverage | 78.40% | **88.90%** |
+| Files at ≥90% default | ~46 | **85** |
+| Debt baselines | ~46 | **40** |
+| Lib tests | 505 | **857** |
+
+### 2026-05-09 follow-ups — closed
+
+| Item | Outcome |
+|------|---------|
+| **Task #1 — Extract `reconstruct_architecture` + `load_embeddings` helpers** | New `load/arch.rs` (100% lines) + `load/embeddings.rs` (96.6%); ~70 LOC duplication removed from `f32.rs` / `q4k.rs`. Centralises Gemma-4 per-layer-geometry forwarding so future fields land in one place. |
+| **Task #2 — `ffn_store/{down,up}.rs` coverage** | Pivoted from archaeological bisect to direct fixtures. Both files now **100% lines** (was 41% / 55%); 19 inline tests around `load_*` / `*_layer_matrix` / `*_feature_vector` / `has_full_mmap_ffn` with synthetic mmap'd `down_features.bin` / `up_features.bin` round-trips. |
+| **Task #3 — `streaming/stages.rs` synthetic-safetensors fixture (partial)** | New `tests/test_streaming_stages_moe.rs` with a Mixtral-shaped model builder. Lifted `index_json.rs` 85% → 97%, `router_weights.rs` 13% → 87%, `down_meta.rs` 60% → 65%, `gate_vectors.rs` 38% → 52%. Two of four arms cleared the 90% default. |
+| **Task #4 — Pure-function tests for `download.rs`** | 18 tests for `strip_etag_quoting` / `want_model_file` / `hf_cache_repo_dir` (env-var-driven, serial). `download.rs` 1.9% → 39.3%. |
+| **Task #5 — Cool-machine Phase 2 rerun** | Cannot be automated. Runbook captured in `ROADMAP.md` open follow-ups: `cargo run --release -p larql-cli -- bench --warmup 3 -n 30 <vindex>`, smallest model first, ≥80 tok/s on 4B and ≥17 tok/s on 26B reproduces the 88.1 / 19.4 baselines. |
+
+### Round-6 follow-ups (spawned by task #3 + #4) — closed
+
+| Item | Outcome |
+|------|---------|
+| **PackedBF16 + PackedMxfp4 streaming fixtures** | Added Gemma 4 hybrid-MoE (PackedBF16) and gpt-oss (PackedMxfp4 with U8 blocks + e8m0 scales=127) fixtures to `test_streaming_stages_moe.rs`. **`gate_vectors.rs` 52% → 93.25%** (cleared 90% default), `down_meta.rs` 65% → 85%, `index_json.rs` → 98%, `router_weights.rs` 87%. All 4 expert-format arms now exercised end-to-end. |
+| **HF_ENDPOINT-mocked download paths** | Widened `protocol::hf_base()` to `pub(in crate::format::huggingface)` and routed `head_etag_and_size` + 4 hf_hub-bound functions through it. 11 mockito-backed tests covering all 4 hf_hub-bound entry points (`resolve_hf_vindex`, `download_hf_weights`, `resolve_hf_vindex_with_progress`, `resolve_hf_model_with_progress`) on the `not-an-hf-path` early-return + 404/500 error paths. download.rs **39.3% → 74.5%**. |
+
+### Per-file coverage push (chained 11 files past 90%)
+
+`clustering/mod.rs` 0% → 100% (`classify_direction` + `ClusterResult` serde) ·
+`ffn_store/interleaved.rs` 21.5% → **99.5%** ✓ ·
+`ffn_store/interleaved_q4.rs` 12.9% → **99.0%** ✓ ·
+`ffn_store/q4k_cache.rs` 31.5% → 80.9% (LRU + cache-hit + invalid-component paths) ·
+`clustering/probe.rs` 29.1% → 87.2% (`extract_probe_entities` filters + `build_confirmed_pairs` cluster-meta join) ·
+`index/mutate/loaders.rs` 35.1% → **97.9%** ✓ (NDJSON gate + down-meta loader round-trips) ·
+`vindexfile/mod.rs` 44.8% → 72.2% (`resolve_vindexfile_path` + `build_from_vindexfile` early-returns) ·
+`index/compute/q4k_dispatch.rs` 48.1% → 61.0% (early-return guards on every dispatch entry) ·
+`index/storage/lm_head/knn.rs` 53.9% → 70.2% (f32 BLAS fallback + `Stride32Mode` env-var dispatch) ·
+`clustering/pair_matching/database.rs` 30.3% → 83.9% (RelationDatabase add/lookup, Wikidata + WordNet JSON loaders) ·
+`extract/build_helpers.rs` 22% → **98.75%** ✓ (`chrono_now` ISO-8601 format, `build_whole_word_vocab` filtering, `compute_offset_direction` 6 paths, `compute_gate_top_tokens` argmax + batched chunks, `run_clustering_pipeline` shape-mismatch + happy path) ·
+`format/huggingface/discovery.rs` 5.9% → **96.5%** ✓ (re-introduced `hf_base()` indirection across 7 sites; 21 mockito tests for `repo_exists`, `fetch_collection_items`, `add_collection_item`, `ensure_collection`, `find_collection_slug`, `create_collection`) ·
+`index/storage/gate_accessors.rs` 59.6% → **94.7%** ✓ (34 tests: heap+mmap branches of every accessor + `warmup` f16-decode + `describe_ffn_backend`).
+
+### Test infrastructure added
+
+- `vocab_tokenizer(&["word", ...])` — JSON-backed `WordLevel` builder that avoids the `AHashMap` dep on the in-memory builder. Reusable across `extract/build_helpers.rs` and `clustering/probe.rs` tests.
+- `weights_with_embed(embed, vocab_size)` — minimal `ModelWeights` factory (just `embed` + arch detected from a tiny llama JSON). Used wherever a function only needs `weights.embed`.
+- `f16_mmap_from(floats: &[f32])` — anonymous `MmapMut` + `encode_f16` + `make_read_only`. Reusable for any future mmap-decode test.
+- `TestEnvGuard { TEST_BASE_ENV, HF_TOKEN }` — RAII env-var guard pattern for mockito-mocked HF tests, restored on drop. Used in `discovery.rs` and `download.rs`.
+- `write_synthetic_gemma4_hybrid_moe` and `write_synthetic_gpt_oss_model` builders in `test_streaming_stages_moe.rs` complement the existing Mixtral builder for the four expert-format arms.
+
+### Misc
+
+- **`cargo fmt -p larql-vindex` clean** across the crate (25 files reformatted in the day's coverage push, mostly chained-method indentation in tests).
+- **`cargo clippy -p larql-vindex --all-targets -- -D warnings` clean.** Fixed `manual_RangeInclusive::contains` (build_helpers chrono asserts), `too_many_arguments` (`#[allow]` on the 8-arg gemma4 fixture builder), 6 `err_expect` sites (`.err().expect()` → `expect_err`), one `useless_vec` (`&[0u8; 16]` → `[0u8; 16]`).
+- **Walker `on_checkpoint(&mut g)` → `on_checkpoint(&g)`** in `walker/weight_walker.rs` — the trait method takes `&Graph`, so the `&mut` was unnecessary. Last clippy nit in the crate; clean across the full target tree now.
+- **`mmap_demo`, `demo_memit_solve`, `q4k_demo`, `walker_demo` examples all run end-to-end.** mmap_demo verifies zero-copy demand-paging live (544 MB file → 242 MB RSS growth at 41% of layers walked); q4k_demo round-trips Q4_K dequant on a synthetic safetensors fixture.
+- **Bench surface intact.** `cargo bench -p larql-vindex --bench vindex_ops -- --quick` reports "No change in performance detected" on every measured bench (criterion p<0.05).
+
 ## [2026-05-09] — Modularity round-5
 
 A multi-pass session that closed the lingering items from the

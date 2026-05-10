@@ -13,6 +13,7 @@ use crate::format::filenames::{
     INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
     TOKENIZER_JSON,
 };
+use crate::index::storage::ffn_store::FFN_COMPONENTS_PER_LAYER;
 use crate::index::{IndexLoadCallbacks, VectorIndex};
 
 impl VectorIndex {
@@ -305,7 +306,7 @@ fn synthesize_gate_from_q4k(
             continue;
         }
         // Manifest entries per layer are [gate, up, down] in order.
-        let base = info.layer * 3;
+        let base = info.layer * FFN_COMPONENTS_PER_LAYER;
         let gate_entry = manifest_json.get(base).ok_or_else(|| {
             VindexError::Parse(format!(
                 "q4k manifest missing gate entry for layer {}",

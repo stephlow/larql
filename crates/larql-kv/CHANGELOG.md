@@ -50,7 +50,29 @@ reverted a `kv_dim.is_multiple_of(hd)` clippy-fix in
 `turbo_quant/engine.rs` (1.87.0 stable, MSRV 1.80), and reordered
 `apollo/engine.rs` so the `KvEngine` impl precedes the test module
 (satisfies clippy's `items-after-test-module`). `cargo clippy -p
-larql-kv --all-targets` is now clean.
+larql-kv --all-targets --no-deps` is now clean.
+
+### Cross-platform CI
+
+Added `.github/workflows/larql-kv.yml` modelled on
+`.github/workflows/larql-vindex.yml`. Test matrix runs on
+`ubuntu-latest`, `windows-latest`, and `macos-14` covering fmt check,
+`cargo check --all-targets`, examples, clippy, unit tests, and
+bench-compile/test. Coverage job runs on Ubuntu only and gates on
+`make larql-kv-coverage-policy` (the per-file 90 % floor + the 6
+inherited debt baselines). OpenBLAS gets installed via apt on Linux
+and via vcpkg on Windows; macOS uses the Accelerate framework — same
+matrix the larql-vindex workflow already exercises.
+
+`cargo fmt -p larql-kv` was run to bring three files (benches,
+examples, an apollo test fixture) into conformance with the rest of
+the workspace.
+
+The Makefile's `larql-kv-lint` uses `--no-deps` so it doesn't trip on
+pre-existing clippy debt in the larql-inference dependency. Other
+crates' lint targets don't need this because they don't depend on
+larql-inference.
+
 ## [2026-05-09] — Initial extraction from larql-inference
 
 Genesis commit. The crate was carved out of

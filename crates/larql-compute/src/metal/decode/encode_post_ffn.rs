@@ -65,11 +65,9 @@ impl MetalBackend {
         // env var is on, dispatch `residual_norm_store` to fuse the
         // residual-add with the next layer's input rms_norm in one kernel.
         // Saves 1 dispatch per layer × num_layers (~7 µs each).
-        if !norms_view.has_post_norms
-            && prelayer_fusion.is_some()
-            && self.decode_flags.fused_prelayer_norm
+        if let Some(fusion) = prelayer_fusion
+            .filter(|_| !norms_view.has_post_norms && self.decode_flags.fused_prelayer_norm)
         {
-            let fusion = prelayer_fusion.unwrap();
             let next_input_norm_buf = self.bufs.get_f32(fusion.next_input_norm);
             let hidden_val = hidden as u32;
             let eps = norms_view.eps;
@@ -85,7 +83,11 @@ impl MetalBackend {
             enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
-                MTLSize::new(256.min(hidden as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                    1,
+                    1,
+                ),
             );
             return;
         }
@@ -107,7 +109,11 @@ impl MetalBackend {
                     enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(
                         MTLSize::new(1, 1, 1),
-                        MTLSize::new(256.min(hidden as u64), 1, 1),
+                        MTLSize::new(
+                            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                            1,
+                            1,
+                        ),
                     );
                 } else {
                     encode_rms_norm(

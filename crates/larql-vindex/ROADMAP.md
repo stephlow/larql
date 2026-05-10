@@ -1,11 +1,13 @@
 # Roadmap — larql-vindex
 
-## Current state (as of 2026-05-09)
+## Current state (as of 2026-05-10)
 
-- **625 tests listed** on `larql-vindex` (`cargo test -p
-  larql-vindex -- --list`). Crate-local checks are wired through
-  `make larql-vindex-ci`: fmt, clippy `-D warnings`, tests, example
-  compile checks, bench compile/tests, and coverage policy.
+- **857 lib tests** on `larql-vindex` (`cargo test -p larql-vindex
+  --lib`). Crate-local checks are wired through `make larql-vindex-ci`:
+  fmt, clippy `-D warnings`, tests, example compile checks, bench
+  compile/tests, and coverage policy. All four self-contained examples
+  (`mmap_demo`, `demo_memit_solve`, `q4k_demo`, `walker_demo`) run
+  end-to-end; the rest compile clean via `cargo check --examples`.
 - **Folder layout decomposed**:
   - `index/{storage,compute,mutate}/` — substores, KNN dispatch, mutation
   - `index/compute/gate_knn/{mod,dispatch,scores_batch,hnsw_lifecycle}.rs`
@@ -30,10 +32,11 @@
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
   - `config/{index,quantization,model,compliance,dtype}.rs` — was the
     624-line `types.rs` monolith
-  - Large-file debt now concentrated in
-    `format/weights/write_q4k/mod.rs` (734),
-    `extract/streaming/mod.rs` (717 — phase 2 still pending), and
-    the 644-LOC `extract/streaming/stages.rs` once phase 2 lands.
+  - Large-file debt **closed 2026-05-10**: every non-test file in the
+    crate is under the soft 600-LOC threshold. The four largest
+    are now `format/weights/write_q4k/mod.rs` (318 L after split),
+    `index/storage/lm_head/knn.rs` (~525), `index/storage/attn.rs`,
+    and `quant/convert_q4k.rs` — all comfortably below the threshold.
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
   one table entry plus codec functions; ~3-file edit. Block sizes flow
   through `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS` (round-4 M4).
@@ -67,14 +70,13 @@
   larql-vindex-coverage-html` (cargo-llvm-cov) enforce both the
   aggregate line floor and `coverage-policy.json`.
 - **Coverage ratchet**: aggregate floor is 71% lines from the
-  2026-05-08 baseline of 71.56%; current measured **76.46% lines**
-  as of 2026-05-09 round-3. Per-source-file default is 90%; files
-  below that are explicit debt baselines (47 entries) and should
-  only move upward. The 2026-05-09 publish-trio HTTP mocking lifted
-  `publish/{lfs,remote,upload}.rs` to 96-98% (from the earlier
-  pure-function-only floor of 34-59%). The phase-2 streaming
-  refactor added two new debt baselines (`streaming/context.rs`
-  88%, `streaming/stages.rs` 56%).
+  2026-05-08 baseline of 71.56%; current measured **88.90% lines**
+  as of 2026-05-10 round-6. Per-source-file default is 90%; files
+  below that are explicit debt baselines (40 entries) and should
+  only move upward. **85 of 125 files at the 90% default**, up from
+  41 on 2026-05-08. Today's round-6 push lifted 13 files past the
+  default — see `CHANGELOG.md` for the per-file deltas. Aggregate
+  gap to 90%: **1.1 points**.
 - **Cross-platform CI**: `.github/workflows/larql-vindex.yml` runs
   format, check, examples, clippy, tests, and bench compile/tests on
   Linux, Windows, and macOS. Coverage policy runs on Ubuntu.

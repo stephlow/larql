@@ -22,7 +22,7 @@ use crate::format::weights::Q4kManifestEntry;
 use crate::index::core::VectorIndex;
 use crate::mmap_util::mmap_demand_paged;
 
-use super::DownFeaturesQ4kEntry;
+use super::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER, FFN_DOWN};
 
 /// Read + typed-deserialise a Q4_K manifest JSON file. Validates each
 /// entry's format tag against `quant::registry`. `display_name` is the
@@ -167,29 +167,34 @@ impl VectorIndex {
     /// Per-layer Q4_K/Q6_K FFN slices — [gate, up, down] with formats.
     ///
     /// Returns `None` when the FFN manifest wasn't present at load time
-    /// (caller should fall back to uniform-stride). Returns `Some` iff the
-    /// manifest has 3 entries for `layer`; downstream kernels dispatch on
-    /// the format string (`"Q4_K"` or `"Q6_K"`).
-    pub fn interleaved_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 3]> {
+    /// (caller should fall back to uniform-stride). Returns `Some` iff
+    /// the manifest has `FFN_COMPONENTS_PER_LAYER` entries for `layer`;
+    /// downstream kernels dispatch on the format string (`"Q4_K"` or
+    /// `"Q6_K"`).
+    pub fn interleaved_q4k_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(&[u8], &str); FFN_COMPONENTS_PER_LAYER]> {
         let mmap = self.ffn.interleaved_q4k_mmap.as_ref()?;
         let manifest = self.ffn.interleaved_q4k_manifest.as_ref()?;
-        let base = layer * 3;
-        if base + 2 >= manifest.len() {
+        let base = layer * FFN_COMPONENTS_PER_LAYER;
+        if base + FFN_COMPONENTS_PER_LAYER > manifest.len() {
             return None;
         }
         // Bounds-check each slice against the mmap before forming the
         // output. A stale/corrupt manifest can name an offset+length
         // outside the file; returning None here lets the caller fall back
         // to the uniform-stride path instead of panicking on the slice.
-        for i in 0..3 {
+        for i in 0..FFN_COMPONENTS_PER_LAYER {
             let (offset, length, _) = &manifest[base + i];
             let end = offset.checked_add(*length)?;
             if end > mmap.len() {
                 return None;
             }
         }
-        let mut out: [(&[u8], &str); 3] = [(&[], ""); 3];
-        for i in 0..3 {
+        let mut out: [(&[u8], &str); FFN_COMPONENTS_PER_LAYER] =
+            [(&[], ""); FFN_COMPONENTS_PER_LAYER];
+        for i in 0..FFN_COMPONENTS_PER_LAYER {
             let (offset, length, ref format) = manifest[base + i];
             out[i] = (&mmap[offset..offset + length], format.as_str());
         }
@@ -214,12 +219,12 @@ impl VectorIndex {
                 return;
             }
             let (start, len) = if let Some(ref manifest) = self.ffn.interleaved_q4k_manifest {
-                let base = layer * 3;
-                if base + 2 >= manifest.len() {
+                let base = layer * FFN_COMPONENTS_PER_LAYER;
+                if base + FFN_COMPONENTS_PER_LAYER > manifest.len() {
                     return;
                 }
                 let s = manifest[base].0;
-                let (last_off, last_len, _) = &manifest[base + 2];
+                let (last_off, last_len, _) = &manifest[base + FFN_DOWN];
                 let e = (last_off + last_len).min(mmap.len());
                 if s >= mmap.len() || e <= s {
                     return;

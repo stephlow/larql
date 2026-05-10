@@ -13,6 +13,10 @@ use crate::mmap_util::mmap_optimized;
 
 use crate::index::core::VectorIndex;
 
+/// Number of attention projection tensors recorded per layer in every
+/// `attn_weights_*.bin` manifest: Q, K, V, O — in that order.
+pub(crate) const ATTN_TENSORS_PER_LAYER: usize = 4;
+
 impl VectorIndex {
     /// Load Q8 attention weights + manifest for GPU full pipeline.
     pub fn load_attn_q8(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
@@ -51,13 +55,26 @@ impl VectorIndex {
         let mmap = self.projections.attn_q8_mmap.as_ref()?;
         let manifest = self.projections.attn_q8_manifest.as_ref()?;
 
-        let base = layer * 4;
-        if base + 3 >= manifest.len() {
+        let base = layer * ATTN_TENSORS_PER_LAYER;
+        if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
             return None;
         }
 
-        let mut result = [(&[] as &[u8], &[] as &[f32]); 4];
-        for i in 0..4 {
+        // Bounds-check every (offset + vals_len + scales_len) span against
+        // the mmap before forming the output. A stale/corrupt manifest can
+        // describe a slice outside the file; returning None here lets the
+        // caller fall back instead of panicking on the slice.
+        for i in 0..ATTN_TENSORS_PER_LAYER {
+            let (offset, vals_len, scales_len) = manifest[base + i];
+            let vals_end = offset.checked_add(vals_len)?;
+            let scales_end = vals_end.checked_add(scales_len)?;
+            if scales_end > mmap.len() {
+                return None;
+            }
+        }
+
+        let mut result = [(&[] as &[u8], &[] as &[f32]); ATTN_TENSORS_PER_LAYER];
+        for i in 0..ATTN_TENSORS_PER_LAYER {
             let (offset, vals_len, scales_len) = manifest[base + i];
             let vals = &mmap[offset..offset + vals_len];
             let scales_start = offset + vals_len;
@@ -149,13 +166,26 @@ impl VectorIndex {
     pub fn attn_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 4]> {
         let mmap = self.projections.attn_q4k_mmap.as_ref()?;
         let manifest = self.projections.attn_q4k_manifest.as_ref()?;
-        let base = layer * 4;
-        if base + 3 >= manifest.len() {
+        let base = layer * ATTN_TENSORS_PER_LAYER;
+        if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
             return None;
         }
 
-        let mut result: [(&[u8], &str); 4] = [(&[], ""); 4];
-        for i in 0..4 {
+        // Bounds-check each (offset + length) span against the mmap before
+        // forming the output. A stale/corrupt manifest can name a slice
+        // outside the file; returning None here lets the caller fall back
+        // to a uniform-stride path instead of panicking.
+        for i in 0..ATTN_TENSORS_PER_LAYER {
+            let (offset, length, _) = &manifest[base + i];
+            let end = offset.checked_add(*length)?;
+            if end > mmap.len() {
+                return None;
+            }
+        }
+
+        let mut result: [(&[u8], &str); ATTN_TENSORS_PER_LAYER] =
+            [(&[], ""); ATTN_TENSORS_PER_LAYER];
+        for i in 0..ATTN_TENSORS_PER_LAYER {
             let (offset, length, ref format) = manifest[base + i];
             result[i] = (&mmap[offset..offset + length], format.as_str());
         }
@@ -209,10 +239,21 @@ impl VectorIndex {
         let mmap = self.projections.attn_q4_mmap.as_ref()?;
         let manifest = self.projections.attn_q4_manifest.as_ref()?;
 
-        // Each layer has 4 tensors: Q, K, V, O
-        let base = layer * 4;
-        if base + 3 >= manifest.len() {
+        let base = layer * ATTN_TENSORS_PER_LAYER;
+        if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
             return None;
+        }
+
+        // Bounds-check each (offset + length) span against the mmap before
+        // forming the output. A stale/corrupt manifest can name a slice
+        // outside the file; returning None here lets the caller fall back
+        // instead of panicking.
+        for i in 0..ATTN_TENSORS_PER_LAYER {
+            let (offset, length) = &manifest[base + i];
+            let end = offset.checked_add(*length)?;
+            if end > mmap.len() {
+                return None;
+            }
         }
 
         let q = &manifest[base];
@@ -385,5 +426,112 @@ mod tests {
         let mut idx = empty_vindex();
         idx.load_attn_q4k(tmp.path())
             .expect_err("Q6_K tensor with Q4_K length must be rejected");
+    }
+
+    /// A stale or corrupt Q4_K manifest entry whose `offset + length`
+    /// runs past the mmap end must produce `None` from
+    /// `attn_q4k_layer_data`, not a slice-bounds panic. Mirrors the
+    /// defensive behavior already in `interleaved_q4k_layer_data`.
+    #[test]
+    fn attn_q4k_layer_data_returns_none_on_out_of_bounds_manifest() {
+        use larql_models::quant::ggml::{K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES};
+        // Load a real, valid Q4_K vindex first…
+        let len = 2048 * (2560 / K_QUANT_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES;
+        let payload = vec![0u8; len];
+        let manifest = serde_json::json!([
+            {
+                "key": "layers.0.self_attn.q_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": len,
+            },
+            {
+                "key": "layers.0.self_attn.k_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": len,
+            },
+            {
+                "key": "layers.0.self_attn.v_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": len,
+            },
+            {
+                "key": "layers.0.self_attn.o_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": len,
+            },
+        ]);
+        let tmp = make_vindex_with_attn_q4k(&payload, manifest);
+        let mut idx = empty_vindex();
+        idx.load_attn_q4k(tmp.path()).expect("clean load");
+
+        // …then corrupt the manifest so the V entry's slice would walk
+        // off the end of the mmap. The bounds check should turn this
+        // into `None` rather than a panic.
+        let m = idx
+            .projections
+            .attn_q4k_manifest
+            .as_mut()
+            .expect("manifest");
+        m[2] = (len, 1, "Q4_K".to_string()); // offset = len → end = len + 1 > mmap.len()
+        assert!(idx.attn_q4k_layer_data(0).is_none());
+    }
+
+    /// `attn_q8_layer_data` must reject a manifest entry where
+    /// `offset + vals_len + scales_len` overflows the mmap.
+    #[test]
+    fn attn_q8_layer_data_returns_none_on_out_of_bounds_manifest() {
+        let mmap_len = 1024;
+        let payload = vec![0u8; mmap_len];
+        let manifest = serde_json::json!([
+            { "q8_offset": 0,   "q8_vals_len": 64, "q8_scales_len": 16 },
+            { "q8_offset": 100, "q8_vals_len": 64, "q8_scales_len": 16 },
+            { "q8_offset": 200, "q8_vals_len": 64, "q8_scales_len": 16 },
+            { "q8_offset": mmap_len - 32, "q8_vals_len": 64, "q8_scales_len": 16 },
+            // Total = mmap_len + 48 > mmap_len.
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(ATTN_WEIGHTS_Q8_BIN), &payload).unwrap();
+        std::fs::write(
+            tmp.path().join(ATTN_WEIGHTS_Q8_MANIFEST_JSON),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        let mut idx = empty_vindex();
+        idx.load_attn_q8(tmp.path())
+            .expect("Q8 has no load-time len check");
+        assert!(idx.attn_q8_layer_data(0).is_none());
+    }
+
+    /// `attn_q4_layer_slices` must reject a manifest entry whose
+    /// `offset + length` runs past the mmap.
+    #[test]
+    fn attn_q4_layer_slices_returns_none_on_out_of_bounds_manifest() {
+        let mmap_len = 1024;
+        let payload = vec![0u8; mmap_len];
+        let manifest = serde_json::json!([
+            { "q4_offset": 0,   "q4_length": 128 },
+            { "q4_offset": 128, "q4_length": 128 },
+            { "q4_offset": 256, "q4_length": 128 },
+            { "q4_offset": mmap_len, "q4_length": 1 }, // end = mmap_len + 1
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(ATTN_WEIGHTS_Q4_BIN), &payload).unwrap();
+        std::fs::write(
+            tmp.path().join(ATTN_WEIGHTS_Q4_MANIFEST_JSON),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        let mut idx = empty_vindex();
+        idx.load_attn_q4(tmp.path())
+            .expect("Q4 has no load-time len check");
+        assert!(idx.attn_q4_layer_slices(0).is_none());
     }
 }

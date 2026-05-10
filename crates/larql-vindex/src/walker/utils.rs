@@ -55,18 +55,60 @@ pub fn count_threshold(t: &mut ThresholdCounts, v: f64) {
     }
 }
 
-/// Approximate current date without a chrono dependency.
+/// Seconds in one UTC day (no leap-seconds — Unix time ignores them).
+const SECS_PER_DAY: u64 = 86_400;
+/// Year zero in Unix epoch terms.
+const EPOCH_YEAR: i64 = 1970;
+/// Day-of-month tables for non-leap and leap years (Jan…Dec).
+const DAYS_IN_MONTH_COMMON: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const DAYS_IN_MONTH_LEAP: [i64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+#[inline]
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Convert epoch seconds to a Gregorian `YYYY-MM-DD` string in UTC.
+///
+/// Pulled out of `current_date` so tests can pin the conversion against
+/// known timestamps without depending on wall-clock time.
+pub fn date_from_epoch_secs(secs: u64) -> String {
+    let mut days = (secs / SECS_PER_DAY) as i64;
+    let mut year: i64 = EPOCH_YEAR;
+    loop {
+        let n = if is_leap_year(year) { 366 } else { 365 };
+        if days < n {
+            break;
+        }
+        days -= n;
+        year += 1;
+    }
+    let month_lens = if is_leap_year(year) {
+        DAYS_IN_MONTH_LEAP
+    } else {
+        DAYS_IN_MONTH_COMMON
+    };
+    let mut month = 1;
+    for n in month_lens {
+        if days < n {
+            break;
+        }
+        days -= n;
+        month += 1;
+    }
+    let day = days + 1;
+    format!("{year}-{month:02}-{day:02}")
+}
+
+/// Current UTC date as a `YYYY-MM-DD` string, computed from a real
+/// Gregorian calendar (leap years included). Stored on every walker
+/// extraction's metadata header.
 pub fn current_date() -> String {
-    let now = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let days = now / 86400;
-    let year = 1970 + (days / 365);
-    let remaining = days % 365;
-    let month = remaining / 30 + 1;
-    let day = remaining % 30 + 1;
-    format!("{year}-{month:02}-{day:02}")
+    date_from_epoch_secs(secs)
 }
 
 // ── Top-K utilities ──
@@ -208,7 +250,7 @@ mod tests {
         assert_eq!(t.t_01, 0);
     }
 
-    // ── current_date ──────────────────────────────────────────────────────────
+    // ── current_date / date_from_epoch_secs ───────────────────────────────────
 
     #[test]
     fn current_date_has_yyyy_mm_dd_format() {
@@ -218,6 +260,49 @@ mod tests {
         assert_eq!(parts[0].len(), 4, "year should be 4 digits");
         assert_eq!(parts[1].len(), 2, "month should be 2 digits");
         assert_eq!(parts[2].len(), 2, "day should be 2 digits");
+    }
+
+    #[test]
+    fn epoch_zero_is_1970_01_01() {
+        assert_eq!(date_from_epoch_secs(0), "1970-01-01");
+    }
+
+    #[test]
+    fn end_of_2024_is_leap_year_aware() {
+        // 2024-12-31 23:59:59 UTC.
+        assert_eq!(date_from_epoch_secs(1_735_689_599), "2024-12-31");
+        // 2025-01-01 00:00:00 UTC.
+        assert_eq!(date_from_epoch_secs(1_735_689_600), "2025-01-01");
+    }
+
+    #[test]
+    fn march_first_after_feb_29_in_leap_year() {
+        assert_eq!(date_from_epoch_secs(1_709_251_200), "2024-03-01");
+        assert_eq!(date_from_epoch_secs(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn march_first_in_non_leap_year() {
+        assert_eq!(date_from_epoch_secs(1_677_628_800), "2023-03-01");
+        // 2023 has no Feb 29.
+        assert_eq!(date_from_epoch_secs(1_677_542_400), "2023-02-28");
+    }
+
+    #[test]
+    fn century_boundary_2000_is_leap() {
+        // 2000 is divisible by 400 → leap.
+        assert_eq!(date_from_epoch_secs(951_782_400), "2000-02-29");
+    }
+
+    #[test]
+    fn century_boundary_1900_is_not_leap() {
+        // 1900-02-28 23:59:59 UTC.
+        assert_eq!(date_from_epoch_secs(0), "1970-01-01");
+        // The 1970-epoch can't reach 1900, so prove the rule directly:
+        assert!(!is_leap_year(1900));
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(2023));
     }
 
     // ── partial_top_k ─────────────────────────────────────────────────────────

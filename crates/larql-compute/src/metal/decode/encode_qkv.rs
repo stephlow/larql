@@ -175,7 +175,11 @@ impl MetalBackend {
             }
             enc.dispatch_threads(
                 MTLSize::new(hidden as u64, 1, 1),
-                MTLSize::new(256.min(hidden as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                    1,
+                    1,
+                ),
             );
         } else {
             encode_rms_norm(
@@ -361,7 +365,11 @@ impl MetalBackend {
         enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(1, 1, 1),
-            MTLSize::new(256.min(hidden as u64), 1, 1),
+            MTLSize::new(
+                crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64),
+                1,
+                1,
+            ),
         );
 
         // M2: read the per-projection format triple once, through the

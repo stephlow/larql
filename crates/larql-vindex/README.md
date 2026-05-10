@@ -709,7 +709,7 @@ make larql-vindex-bench                                                         
 make larql-vindex-coverage-summary                                              # aggregate + per-file coverage policy
 make larql-vindex-coverage-html                                                 # HTML report plus the same coverage policy
 
-cargo test -p larql-vindex                                                      # 614 lib tests listed as of 2026-05-09
+cargo test -p larql-vindex                                                      # 857 lib tests listed as of 2026-05-10
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -757,16 +757,19 @@ only on the workspace-wide `make ci`. The local gate is:
 
 The coverage policy lives in `coverage-policy.json`. The aggregate
 line-coverage floor is currently 71% from the 2026-05-08 local
-baseline of 71.56%; the 2026-05-09 round-5 push lifted measured
-aggregate to **81.13% lines** (38,453 instrumented). Source files
-default to **90% line coverage**; files below that have explicit
-debt baselines that should only ratchet upward. After round-5 every
-file in `index/core/` and `index/types/` is at ≥93% (most at 100%).
-Remaining debt is concentrated in the integration-driven write/load
-paths (`extract/streaming/stages/`, `format/weights/load/`,
-`format/weights/write_q4k/{moe_layers,norms}.rs`) which need
-synthetic-safetensors fixture coverage — tracked under the round-5
-follow-ups in `ROADMAP.md`.
+baseline of 71.56%; the 2026-05-10 round-6 push lifted measured
+aggregate to **88.90% lines** (24,886 lines instrumented). Source
+files default to **90% line coverage**; files below that have
+explicit debt baselines that should only ratchet upward. **85 of
+125 files at the 90% default** (was 41 on 2026-05-08, +44 across
+rounds 5-6). Remaining 40 debt baselines cluster in the
+integration-driven write/load paths
+(`format/weights/load/{f32,q4k}.rs`, `format/weights/write_q4k/{moe_layers,norms}.rs`,
+`format/load.rs`), the Q4_K codec dispatch family
+(`index/compute/q4k_dispatch.rs`, `index/storage/ffn_store/{interleaved_q4k,q4k_cache}.rs`),
+and a few HF HTTP happy-path corners that still need full mockito
+infrastructure (`format/huggingface/{download,publish/mod}.rs`).
+See `CHANGELOG.md` for round-by-round per-file deltas.
 
 GitHub Actions runs the same model-agnostic surface on Linux, Windows,
 and macOS. The examples step is compile-only because several tools
@@ -782,7 +785,7 @@ need an external vindex path; CI must stay synthetic and portable.
 | `q4k_vs_f32` | f32 per-layer Q retrieval (mmap → Vec<f32>) | ~880 µs |
 | `q4k_vs_f32` | **Q4K** per-layer Q retrieval (mmap → dequant → Vec<f32>) | ~3.3 ms (3.7× slower per-layer to save 6.26× on disk) |
 
-Test coverage (614 lib tests as of 2026-05-09 round-5):
+Test coverage (857 lib tests as of 2026-05-10 round-6, **88.90% aggregate lines**):
 - Construction, dimensions, layer counts, feature counts
 - Gate KNN: brute-force, f32, Q4 via compute backend, top-K ordering
 - Gate walk: BLAS gemv path matches brute-force KNN

@@ -712,7 +712,7 @@ impl DecodeBackend for MetalBackend {
             head_dim,
             rope_base,
             norm_eps,
-            |layer_idx, expert_idx| get_expert(layer_idx, expert_idx),
+            get_expert,
         )
     }
 

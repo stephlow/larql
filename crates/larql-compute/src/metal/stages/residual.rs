@@ -56,7 +56,7 @@ pub fn encode_post_attn(
     q8s_stride_bytes: u64,
 ) {
     let hidden_val = hidden as u32;
-    let tg_threads = 256.min(hidden as u64);
+    let tg_threads = crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64);
 
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;
@@ -117,7 +117,11 @@ pub fn encode_post_attn(
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(blocks, 1, 1),
-                MTLSize::new(256.min(blocks), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(blocks),
+                    1,
+                    1,
+                ),
             );
         }
     }
@@ -148,7 +152,7 @@ pub fn encode_post_ffn(
     h_stride_bytes: u64,
 ) {
     let hidden_val = hidden as u32;
-    let tg_threads = 256.min(hidden as u64);
+    let tg_threads = crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(hidden as u64);
 
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;

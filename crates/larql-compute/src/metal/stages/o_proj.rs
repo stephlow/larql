@@ -53,7 +53,11 @@ pub fn encode(
         enc.set_bytes(3, 4, &dim_val as *const u32 as *const c_void);
         enc.dispatch_threads(
             MTLSize::new(blocks, 1, 1),
-            MTLSize::new(256.min(blocks), 1, 1),
+            MTLSize::new(
+                crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(blocks),
+                1,
+                1,
+            ),
         );
     }
 

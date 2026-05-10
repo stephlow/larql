@@ -421,18 +421,17 @@ impl MetalBackend {
                 // `encode_post_ffn_residual` so it can fuse the residual
                 // add with the next layer's input rms_norm in one
                 // `residual_norm_store` dispatch. Saves 1 dispatch/layer.
-                let next_layer = layers.get(l + 1);
-                let prelayer_fusion = if !layer.has_post_norms
-                    && next_layer.is_some()
-                    && self.decode_flags.fused_prelayer_norm
-                {
-                    Some(super::decode::encode_post_ffn::PreLayerNormFusion {
-                        next_input_norm: next_layer.unwrap().input_norm,
-                        next_norm_out: &norm_f32_buf,
-                    })
-                } else {
-                    None
-                };
+                let prelayer_fusion =
+                    if !layer.has_post_norms && self.decode_flags.fused_prelayer_norm {
+                        layers.get(l + 1).map(|next| {
+                            super::decode::encode_post_ffn::PreLayerNormFusion {
+                                next_input_norm: next.input_norm,
+                                next_norm_out: &norm_f32_buf,
+                            }
+                        })
+                    } else {
+                        None
+                    };
 
                 if stage_timing_split && !has_moe {
                     // Fine split: gate+up in one CB, act+down+residual in another.

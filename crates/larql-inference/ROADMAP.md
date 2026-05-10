@@ -1,6 +1,6 @@
 # Roadmap — larql-inference
 
-## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 631 lib tests | 53.11% line cov
+## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 639 lib tests | 53.11% line cov
 
 ## Recommended next (priority order, 2026-05-09)
 
@@ -19,12 +19,13 @@ detail.
    recoverable, projects to 95-105 tok/s on Gemma 3 4B (ollama parity). See
    "Open: GPU-forward kernel utilization" → G-3 / G-4 (canonical entry: G-3).
 
-3. **Finish hardening H8/H9/H11/H12** — the four partial items from the
-   2026-05-09 cleanup pass: more env-vars behind typed config (H8), narrower
-   crate root surface (H9), more model-family branching pushed into
-   architecture/tokenizer policy (H11), and continued split of large
-   orchestration files (H12: `layer_graph/grid.rs`, `generate/gpu.rs`,
-   `moe_remote/shard.rs`). See "Open: inference crate hardening".
+3. **Finish hardening H12** — H8/H9/H11 shipped 2026-05-10 (typed
+   `DumpConfig` + `RemoteMoeRuntime` for env toggles, root surface trimmed
+   by 24 names with `research` re-sourced from subpaths, no hardcoded
+   family branches remain in generic generation paths). H12 still partial:
+   three orchestration files > 800 LOC remain (`layer_graph/generate/gpu.rs`,
+   `ffn/moe_remote/shard.rs`, `layer_graph/predict.rs`) — each is a focused
+   1-day split along clear in-file section seams. See "Open: inference crate hardening".
 
 4. **R4 — research trace export contract** — only remaining R-item from the
    mech-interp engine surface; unblocks MI4 onwards. See "Open: Mechanistic
@@ -87,11 +88,11 @@ Work items:
 | H5 | Convert `optimise_target_delta` invalid inputs (`target_id >= vocab`, empty prompt, unsupported shapes) from panics into early `Err` results | shipped 2026-05-09 |
 | H6 | Harden remote FFN/Q8K wire decoders against untrusted length fields with checked arithmetic and bounded allocation | shipped 2026-05-09 |
 | H7 | Replace ad hoc `Result<_, String>` / silent empty `GenerateResult` failures in generation paths with typed errors where public callers need to distinguish unsupported backend vs. empty output | shipped 2026-05-09 — `GenerateError` variants added with fallible `try_generate*` wrappers |
-| H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | partial 2026-05-09 — generation/grid token, profiling, LM-head, and MoE runtime env reads now route through typed policy/config structs |
-| H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | partial 2026-05-09 — added explicit `prelude` and `research` grouped surfaces; crate-root compatibility retained |
+| H8 | Move runtime env toggles (`LARQL_PROFILE_*`, `LARQL_MOE_*`, `SKIP_MOE`, `LARQL_LM_HEAD_*`) behind typed debug/config structs passed into hot paths | shipped 2026-05-10 — added `forward::dump_config::DumpConfig` (lifted 7 inline reads of `LARQL_CPU_DUMP_LAYERS` / `LARQL_CPU_STAGE_DUMP` / `LARQL_STAGE_DUMP_LAYER`) and `ffn::moe_remote::runtime::RemoteMoeRuntime` (lifted 6 inline reads of `LARQL_HTTP_TIMING` / `LARQL_MOE_WIRE_F16` / `LARQL_DISABLE_Q8K_WIRE` / `LARQL_VERBOSE`); both `OnceLock` singletons. Earlier 2026-05-09 work covered generation/grid token policy, profiling, LM-head, and MoE config |
+| H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | shipped 2026-05-10 — dropped 17 `forward::*` + 7 `layer_graph::*` root re-exports with zero external use AND zero in-crate example/test use; `research` module rewritten to source from subpaths (survives further root trims). Earlier 2026-05-09 work added `prelude` and `research` grouped surfaces |
 | H10 | Remove backend-name probes and concrete `MetalBackend` downcasts from generic generation dispatch; replace with explicit compute-backend capability methods | shipped 2026-05-09 for generation dispatch |
-| H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | partial 2026-05-09 — token suppression moved to generation policy; PLE tensor keys moved to architecture trait; chat default policy isolated |
-| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial 2026-05-09 — token selection policy, GPU setup/prefill helpers, constrained generation, and grid config/timing/setup/remote-MoE/remote-FFN modules extracted |
+| H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | shipped 2026-05-10 — verified no hardcoded `family() == "..."` branches remain in generic generation/decode/forward paths. The single remaining family-named match (`pipeline_layer.rs::moe_routing_policy`) reads the architecture trait's `router_type` metadata, which is the policy-object pattern this item asks for |
+| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial — 2026-05-09 extracted token selection policy, GPU setup/prefill helpers, constrained generation, and grid config/timing/setup/remote-MoE/remote-FFN modules. 2026-05-10 split `layer_graph/predict.rs` (881) → `predict/` directory (mod.rs 376 + split.rs 285 + honest.rs 261; no file > 400 LOC). Two files still > 800 LOC: `layer_graph/generate/gpu.rs` (902 — `generate_streaming` is a single 497-LOC fn, splittable into prefill/decode-loop/sampling-step), `ffn/moe_remote/shard.rs` (924 — Http/Uds/Grpc transport branches splittable per transport). Each is one focused session |
 
 Acceptance:
 
@@ -1627,6 +1628,25 @@ Add a synthetic CPU-backend integration test using `make_test_weights()`.
 
 ---
 
+## P2: Spec'd and queued (sequenced behind P0 validation)
+
+Two implementation tracks have shipped specs at
+`crates/larql-inference/docs/specs/` but are deliberately queued behind
+V1–V4 / R6 / MTP / BR4. Detail and gating preconditions live in the
+top-level `ROADMAP.md` § "P1 — Spec'd implementations, sequenced behind
+P0 validation" (SQ1, SQ2). Re-promotion conditions are recorded there.
+
+| # | Spec | Status | Why queued |
+|---|------|--------|------------|
+| SQ1 | [`markov-residual-engine.md`](docs/specs/markov-residual-engine.md) | reviewed, impl not started | Reference impl already works in `kv-cache-benchmark`; lifting it without first resolving the trait-vs-sibling shape against `UnlimitedContextEngine` / `ApolloEngine` risks forcing the other two engines into a shape that doesn't fit. V1/V2 also produce the measurement infrastructure that proves the migration didn't regress. |
+| SQ2 | [`vindex-as-ffn.md`](docs/specs/vindex-as-ffn.md) | reviewed, impl not started | §5.4 cost model says it's a wash on typical decode K (256–1024) without large compiled-fact corpora. R6 (depth-fraction probe) needs to land before the per-arch layer policy is automated rather than hand-calibrated. No current video / research workflow needs the paraphrase-reach the lookup buys above the existing L1 i16 cos≥0.999 cache. |
+
+These are not P0/P1-active. Top-level roadmap is the source of truth
+for sequencing; this entry exists so the specs are findable from inside
+the crate that owns them.
+
+---
+
 ## P2: Research
 
 ### Hybrid head caching (RS+CA)
@@ -1767,3 +1787,18 @@ Source surgery + targeted test work that doesn't change behaviour. All public AP
 | `lib.rs` re-exports trimmed | 2026-05-09 | Dropped 8 `larql_compute::*` proxies with no external consumers via `larql_inference::*`: `cpu_moe_forward`, `ComputeActivation`, `CpuBackend`, `MoeLayerWeights`, `dot_proj_gpu`, `matmul_gpu`, `MatMulOp`, `MetalBackend`. Callers `use larql_compute::*` directly |
 | Chat-template stack cross-references | 2026-05-09 | `prompt.rs` (heuristic enum), `chat/` (Jinja+vindex), `chat_session::TurnRenderer` (incremental) are complementary, not redundant — added module-level docs cross-referencing each so the boundary is discoverable. Original review's "collapse" recommendation was incorrect (3 external consumers depend on `prompt::ChatTemplate`) |
 | Coverage: 80-89% bucket → ≥90% | 2026-05-09 | 8 files lifted across the per-file 90% floor: `chat/render.rs` 82.64→99.44%, `experts/session.rs` 85.15→95.22%, `ffn/moe_remote/config.rs` 86.90→100%, `ffn/moe_remote/wire.rs` 81.76→99.75%, `forward/patching.rs` 83.77→89.96% (last gap is unreachable defensive guard), `layer_graph/logits.rs` 82.52→96.83% (inline tempfile fixture for `lm_head.bin`), `trace/capture.rs` 89.87→90.55%, `trace/store.rs` 85.22→98.37%. +56 tests, 575→631 lib tests |
+
+### 2026-05-10 — Hardening pass: H8/H9/H11 shipped, H12 deferred
+
+Continued the inference crate hardening from 2026-05-09. Three of four
+remaining H-items now shipped; H12 (file splits) deferred as too invasive
+for an incremental pass.
+
+| Item | Date | Impact |
+|------|------|--------|
+| H8: `forward::dump_config::DumpConfig` | 2026-05-10 | New `OnceLock`-backed typed config consolidates 7 inline `LARQL_CPU_DUMP_LAYERS` / `LARQL_CPU_STAGE_DUMP` / `LARQL_STAGE_DUMP_LAYER` env reads (in `attention/block.rs`, `forward/layer.rs`, `forward/layer_interventions.rs`, `vindex/q4k_forward/hidden.rs`) into a single read at first access. 5 new tests pinning `from_env`, `stage_dir(layer)`, `layer_dir`, singleton stability, default fallback |
+| H8: `ffn::moe_remote::runtime::RemoteMoeRuntime` | 2026-05-10 | New `OnceLock`-backed runtime config consolidates 6 inline reads (`LARQL_HTTP_TIMING`, `LARQL_MOE_WIRE_F16`, `LARQL_DISABLE_Q8K_WIRE`, `LARQL_VERBOSE`) across `moe_remote/shard.rs` (HTTP + UDS transports) and `moe_remote/backend.rs`. Replaces two `thread_local!` block caches that fragmented the toggle state per worker thread. 3 new tests |
+| H9: trim crate-root re-exports | 2026-05-10 | Dropped 17 `forward::*` (e.g. `RawForward`, `LayerMode`, `forward_raw_logits`, `infer_patched_q4k`, `KNN_COSINE_THRESHOLD`) + 7 `layer_graph::*` (`GridGenerateResult`, `ChatMLRenderer`, `GemmaRenderer`, `LayerOutput`, `Llama3Renderer`, `PerLayerGraph`, `TurnRenderer`) re-exports with zero external consumers AND zero in-crate example/test usage. `research` module rewritten to source from full subpaths (`crate::forward::*`, `crate::layer_graph::*`, `crate::trace::*`) so it survives further root trims. Crate-root surface narrowed from ~120 to ~96 names |
+| H11: verified — no hardcoded family branches | 2026-05-10 | Audit found one remaining `match router_type { "gemma4_top_k_softmax" => ... }` at `pipeline_layer.rs:546`. That's the architecture trait's `router_type` metadata signal — the policy-object pattern this item asks for, not a hardcoded family check. H11 done |
+| H12: deferred with rationale | 2026-05-10 | Three orchestration files still > 800 LOC: `layer_graph/generate/gpu.rs` (902), `ffn/moe_remote/shard.rs` (924), `layer_graph/predict.rs` (881). Each splits into 3-5 sub-modules along in-file `// ───` section seams; needs a focused dedicated session per file (cross-module visibility changes, public API stability work) |
+| Lib tests: 631 → 639 | 2026-05-10 | 8 new tests for the two new typed configs; all 639 lib tests pass clean |

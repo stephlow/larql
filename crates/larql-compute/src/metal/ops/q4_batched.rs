@@ -219,7 +219,11 @@ pub fn multi_layer_ffn(
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(n_blocks as u64, 1, 1),
-                MTLSize::new(256.min(n_blocks as u64), 1, 1),
+                MTLSize::new(
+                    crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(n_blocks as u64),
+                    1,
+                    1,
+                ),
             );
             enc.end_encoding();
         }

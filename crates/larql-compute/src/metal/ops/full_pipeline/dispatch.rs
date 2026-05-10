@@ -53,7 +53,11 @@ pub fn encode_rms_norm(
     // Single threadgroup — cooperative SIMD reduction requires all threads in one TG.
     enc.dispatch_thread_groups(
         MTLSize::new(1, 1, 1),
-        MTLSize::new(256.min(len as u64), 1, 1),
+        MTLSize::new(
+            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(len as u64),
+            1,
+            1,
+        ),
     );
 }
 
@@ -73,7 +77,11 @@ pub fn encode_residual_add(
     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
     enc.dispatch_threads(
         MTLSize::new(len as u64, 1, 1),
-        MTLSize::new(256.min(len as u64), 1, 1),
+        MTLSize::new(
+            crate::metal::kernel::DISPATCH_TG_MAX_THREADS.min(len as u64),
+            1,
+            1,
+        ),
     );
 }
 

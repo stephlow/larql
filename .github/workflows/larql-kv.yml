@@ -101,7 +101,12 @@ jobs:
         run: cargo check -p larql-kv --examples
 
       - name: Clippy
-        run: cargo clippy -p larql-kv --all-targets -- -D warnings
+        # `--no-deps` keeps lints scoped to larql-kv itself; otherwise
+        # any pre-existing clippy debt in larql-inference (a transitive
+        # dep) would surface here even though it's not this crate's
+        # concern. Other crates' workflows don't need this because they
+        # don't depend on larql-inference.
+        run: cargo clippy -p larql-kv --all-targets --no-deps -- -D warnings
 
       - name: Tests
         run: cargo test -p larql-kv

@@ -749,7 +749,9 @@ fn main() {
                     let cmd = metal_raw.queue().new_command_buffer();
                     for _ in 0..34 {
                         let enc = cmd.new_compute_command_encoder();
-                        enc.set_compute_pipeline_state(&metal_raw.attention.q4kf_proj_pipeline.state);
+                        enc.set_compute_pipeline_state(
+                            &metal_raw.attention.q4kf_proj_pipeline.state,
+                        );
                         enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].wo)), 0);
                         enc.set_buffer(1, Some(&o_input), 0);
                         enc.set_buffer(2, Some(&o_output), 0);
@@ -771,7 +773,9 @@ fn main() {
                     let cmd = metal_raw.queue().new_command_buffer();
                     for _ in 0..34 {
                         let enc = cmd.new_compute_command_encoder();
-                        enc.set_compute_pipeline_state(&metal_raw.attention.q4kf_proj_pipeline.state);
+                        enc.set_compute_pipeline_state(
+                            &metal_raw.attention.q4kf_proj_pipeline.state,
+                        );
                         enc.set_buffer(0, Some(&metal_raw.bufs().get_bytes(&data_34[0].wo)), 0);
                         enc.set_buffer(1, Some(&o_input), 0);
                         enc.set_buffer(2, Some(&o_output), 0);

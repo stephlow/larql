@@ -74,45 +74,6 @@ fn activation_pipeline_for<'a>(
     }
 }
 
-#[cfg(test)]
-mod activation_support_tests {
-    use super::*;
-
-    #[test]
-    fn metal_supports_silu_and_gelu_tanh() {
-        assert!(metal_supports_activation(Activation::Silu));
-        assert!(metal_supports_activation(Activation::GeluTanh));
-    }
-
-    #[test]
-    fn metal_does_not_support_gelu_exact_or_relu() {
-        assert!(!metal_supports_activation(Activation::GeluExact));
-        assert!(!metal_supports_activation(Activation::ReLU));
-    }
-
-    /// Pin the panic message — production decode reads this string when
-    /// a malformed model lands on Metal. Same message must mention the
-    /// activation variant (so logs are actionable) and the site (so
-    /// the reader knows where to look).
-    #[test]
-    #[should_panic(expected = "no shader for ReLU")]
-    fn assert_panics_on_relu_with_clear_message() {
-        assert_metal_activation_supported(Activation::ReLU, "test_site");
-    }
-
-    #[test]
-    #[should_panic(expected = "no shader for GeluExact")]
-    fn assert_panics_on_gelu_exact_with_clear_message() {
-        assert_metal_activation_supported(Activation::GeluExact, "test_site");
-    }
-
-    #[test]
-    fn assert_is_a_noop_on_supported() {
-        assert_metal_activation_supported(Activation::Silu, "test");
-        assert_metal_activation_supported(Activation::GeluTanh, "test");
-    }
-}
-
 /// Optional fused activation+down kernels. When `down_format` matches
 /// (`Q4_K` → `q4k`, `Q6_K` → `q6k`) and the matching kernel is
 /// supplied, [`encode_gated`] skips the separate GEGLU dispatch and
@@ -393,5 +354,44 @@ pub fn encode_standard(
             hidden,
             inter,
         );
+    }
+}
+
+#[cfg(test)]
+mod activation_support_tests {
+    use super::*;
+
+    #[test]
+    fn metal_supports_silu_and_gelu_tanh() {
+        assert!(metal_supports_activation(Activation::Silu));
+        assert!(metal_supports_activation(Activation::GeluTanh));
+    }
+
+    #[test]
+    fn metal_does_not_support_gelu_exact_or_relu() {
+        assert!(!metal_supports_activation(Activation::GeluExact));
+        assert!(!metal_supports_activation(Activation::ReLU));
+    }
+
+    /// Pin the panic message — production decode reads this string when
+    /// a malformed model lands on Metal. Same message must mention the
+    /// activation variant (so logs are actionable) and the site (so
+    /// the reader knows where to look).
+    #[test]
+    #[should_panic(expected = "no shader for ReLU")]
+    fn assert_panics_on_relu_with_clear_message() {
+        assert_metal_activation_supported(Activation::ReLU, "test_site");
+    }
+
+    #[test]
+    #[should_panic(expected = "no shader for GeluExact")]
+    fn assert_panics_on_gelu_exact_with_clear_message() {
+        assert_metal_activation_supported(Activation::GeluExact, "test_site");
+    }
+
+    #[test]
+    fn assert_is_a_noop_on_supported() {
+        assert_metal_activation_supported(Activation::Silu, "test");
+        assert_metal_activation_supported(Activation::GeluTanh, "test");
     }
 }
