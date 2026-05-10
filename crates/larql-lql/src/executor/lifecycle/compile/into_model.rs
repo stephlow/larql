@@ -131,7 +131,7 @@ impl Session {
         }
 
         let mut build_cb = larql_vindex::SilentBuildCallbacks;
-        larql_vindex::write_model_weights(&weights, &output_dir, &mut build_cb)
+        larql_vindex::write_model_weights(&weights, output_dir, &mut build_cb)
             .map_err(|e| LqlError::exec("failed to write model", e))?;
 
         let tok_src = vindex_path.join(TOKENIZER_JSON);
@@ -150,7 +150,7 @@ impl Session {
             ),
         );
         out.push(format!("Model: {}", config.model));
-        out.push(format!("Size: {}", format_bytes(dir_size(&output_dir))));
+        out.push(format!("Size: {}", format_bytes(dir_size(output_dir))));
         Ok(out)
     }
 }

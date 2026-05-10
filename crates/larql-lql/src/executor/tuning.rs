@@ -31,6 +31,12 @@
 /// Multiplier on the unit gate direction at install time.
 pub(crate) const GATE_SCALE: f32 = 30.0;
 
+/// Default per-layer down-vector alpha when the user doesn't pass
+/// an `ALPHA` clause to `INSERT … MODE COMPOSE`. Empirically tuned
+/// in exp-14: lands inside the `[PROB_FLOOR, PROB_CEILING]` band
+/// for ~70% of single-fact installs without further balance.
+pub(crate) const DEFAULT_INSERT_ALPHA_MUL: f32 = 0.1;
+
 // ── Section: per-INSERT BALANCE pass (`mutation::insert::balance`) ──
 //
 // These bound the greedy amplify/shrink loop that tunes a single
@@ -123,6 +129,59 @@ pub(crate) const MEMIT_MIN_RECONSTRUCTION_COS: f32 = 0.95;
 
 /// Minimum gate score for a feature to be reported in DESCRIBE.
 pub(crate) const DESCRIBE_GATE_THRESHOLD: f32 = 5.0;
+
+/// `top_k` for the FFN walk inside DESCRIBE. Smaller than SELECT
+/// EDGES because DESCRIBE wants high-precision per-token edges; the
+/// `gate_threshold` filter then drops weak hits below the floor.
+pub(crate) const DESCRIBE_WALK_TOP_K: usize = 20;
+
+/// Synthetic gate score assigned to KNN-store entries surfaced by
+/// DESCRIBE (`entry.confidence × this`). Scaling the [0, 1] confidence
+/// up to roughly the same magnitude as walk-derived gate scores so
+/// the signal-strength heuristic and per-band ranking stay calibrated.
+pub(crate) const DESCRIBE_KNN_GATE_SCALE: f32 = 10.0;
+
+/// Signal-strength bands for the DESCRIBE banner ("clean", "moderate",
+/// "diffuse"). A max-gate ≥ `CLEAN` says we have at least one
+/// high-confidence concept-level edge; ≥ `MODERATE` says we have
+/// usable but noisy signal; below that we warn the user.
+pub(crate) const DESCRIBE_SIGNAL_CLEAN: f32 = 20.0;
+pub(crate) const DESCRIBE_SIGNAL_MODERATE: f32 = 10.0;
+
+/// DESCRIBE coherence-filter floor: when a feature's also-tokens
+/// don't survive content filtering and its gate score is below this,
+/// drop the edge as "noisy weak signal".
+pub(crate) const DESCRIBE_COHERENCE_FLOOR: f32 = 20.0;
+
+/// Per-band edge cap for DESCRIBE output, by mode.
+pub(crate) const DESCRIBE_MAX_EDGES_BRIEF: usize = 10;
+pub(crate) const DESCRIBE_MAX_EDGES_VERBOSE: usize = 30;
+/// Output band cap in BRIEF mode — strictly tighter than the syntax
+/// and knowledge bands because output-band edges are mostly tokenisation
+/// shadow rather than knowledge content.
+pub(crate) const DESCRIBE_MAX_OUTPUT_BRIEF: usize = 5;
+
+/// MoE-DESCRIBE per-expert summary cap, by verbosity.
+pub(crate) const DESCRIBE_MAX_EXPERTS_VERBOSE: usize = 15;
+pub(crate) const DESCRIBE_MAX_EXPERTS_BRIEF: usize = 6;
+
+/// MoE-DESCRIBE: number of top experts to mine co-routed entities for.
+pub(crate) const DESCRIBE_TOP_EXPERTS_FOR_COROUTED: usize = 3;
+
+/// MoE-DESCRIBE: number of co-routed tokens to surface per expert.
+pub(crate) const DESCRIBE_COROUTED_TOKENS_PER_EXPERT: usize = 10;
+
+/// MoE-DESCRIBE: target sample size for the vocab scan when looking
+/// for co-routed entities. The actual step is `vocab / this` so a
+/// 256k vocab gets sampled at ~1 token in 128.
+pub(crate) const DESCRIBE_COROUTED_SAMPLE_SIZE: usize = 2000;
+
+/// DESCRIBE: maximum number of "also" tokens kept on an edge after
+/// readability filtering, before further filtering down to content
+/// tokens for display.
+pub(crate) const DESCRIBE_ALSO_READABLE_TAKE: usize = 5;
+/// Number of "also" tokens shown per edge in the rendered output.
+pub(crate) const DESCRIBE_ALSO_CONTENT_TAKE: usize = 3;
 
 // ── Section: canonical MEMIT prompt template ──
 //

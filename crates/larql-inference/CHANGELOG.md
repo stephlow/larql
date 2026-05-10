@@ -9,6 +9,57 @@ pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 Entries migrated from ROADMAP.md on 2026-05-10; pre-2026-05-10 entries
 preserve the date and voice they were originally written in.
 
+## [2026-05-10] — `forced_logits` synthetic tests
+
+The H12 `gpu/` split landed three new files at 0% coverage. `forced_logits.rs`
+is the only one of the three that doesn't need a live Metal backend or a
+fully-loaded vindex to drive — the two private helpers (`final_norm_row`,
+`full_logits_from_vindex`) are pure-ish over `ModelWeights` + `VectorIndex`,
+and the public entry point has 4 early-return guards reachable without
+running any compute.
+
+| Test | What it pins |
+|------|--------------|
+| `forced_logits_result_default_is_empty` | `ForcedLogitsResult::default()` produces empty fields. |
+| `target_steps_zero_returns_empty_without_calling_backend` | `target_steps == 0` short-circuits before any backend call (the `on_logits` callback panics if invoked — proves the early return). |
+| `rejects_non_fused_q4_backend` | `CpuBackend` (no `Capability::PrefillQ4`) is rejected with a "fused Q4 backend" error message before any vindex access. |
+| `final_norm_row_short_input_errors` | `h_vec.len() < hidden` returns the "too short" error instead of panicking. |
+| `final_norm_row_returns_hidden_length_finite_values` | Exact-length input produces a finite `hidden`-length output. |
+| `final_norm_row_uses_last_hidden_chunk_when_seq_len_gt_one` | Multi-position `h_vec` slices the last `hidden` floats — pin against single-position equivalent. |
+| `final_norm_row_zero_hidden_succeeds_with_empty_output` | Edge case `hidden == 0` no-ops without panicking. |
+| `full_logits_returns_err_when_lm_head_knn_yields_nothing` | Empty hits from `lm_head_knn_backend_skip_q4k` surface as a "no scores" error. |
+
+Coverage delta: `forced_logits.rs` 0% → **47.58% line / 51.28% region**.
+Crate total 52.80% → **53.13% line**. Net of the whole day's H12 splits +
+forced_logits tests: +0.02 pp from 53.11% baseline (the splits added ~750 LOC
+of orchestration code mostly uncovered by unit tests; this round of tests
+clawed it back).
+
+## [2026-05-10] — H12 closed: `layer_graph/generate/gpu.rs` (999 LOC) split
+
+The last orchestration file flagged by H12 split into a `gpu/` directory:
+
+| File | LOC | Contents |
+|------|-----|---------|
+| `gpu/mod.rs` | 534 | Public surface (`generate`, `try_generate`, `generate_with_sampling`, `try_generate_with_sampling`, `generate_streaming`, `try_generate_streaming`, `LMHEAD_TOPK_*` consts, `lmhead_k_for_sampling`, `diag_compare_cpu_topk`) — `generate_streaming` is now an orchestrator that calls into the three phase modules below. |
+| `gpu/forced_logits.rs` | 211 | Shannon-codec `stream_forced_full_logits` + `ForcedLogitsResult` + `final_norm_row` + `full_logits_from_vindex` (independent of sampling — moved out as its own module). |
+| `gpu/prefill.rs` | 193 | `prefill_for_streaming` covering the three prefill branches (PLE / per-layer Q4_K MoE / standard fused) + `prefill_q4k_moe` helper. Cfg-gated PLE backend signature handled with two parallel `pub(super) fn` definitions so non-metal builds don't pay for the `MetalBackend` parameter. |
+| `gpu/decode_loop.rs` | 329 | `run_decode_loop` (the 245-LOC step body extracted) + per-step `run_one_decode_step` dispatcher (split-profile / Q4K-MoE / standard) + two diagnostic loggers (`log_step_diagnostic`, `log_h_1d_diagnostic`). Returns `DecodeLoopOutcome` carrying tokens + per-stage timings. Takes `&ModelWeights` immutably (the original `&mut` was incidental — every call is read-only) so the caller's `setup.layers` immutable borrow doesn't conflict at the call site. |
+| `gpu/sampling_step.rs` | 56 | `sample_and_emit` helper + `PickedToken` outcome — shared by the first-token path (in `mod.rs`) and the decode-loop step (in `decode_loop.rs`). Collapses the duplicated `sample → detok → softmax_prob → on_token → eos check` block from two sites into one. |
+
+Net: 999 LOC → 1,323 LOC across 5 files (overhead is per-file headers + the
+context parameters that previously rode along as locals). Largest file is
+now `mod.rs` at 534 LOC; no file > 600. Full lib test suite green
+(646 passed, 0 failed, 4 ignored). Public API unchanged — every external
+caller (`src/{lib,layer_graph/{mod, generate/{mod, chat_session}}}.rs`,
+`examples/{chat_demo,streaming_demo}.rs`, `tests/test_logits_goldens.rs`)
+sees the same `pub use` surface.
+
+H12 is now closed. The remaining `> 800 LOC` files in the crate
+(`ffn/moe_remote/backend.rs` 867, `layer_graph/grid/remote_moe.rs` 878)
+were never in scope for H12 (which targeted the orchestration files
+named in the H12 row).
+
 ## [2026-05-10] — Magic-strings + magic-numbers cleanup
 
 Code-vs-roadmap audit also flagged scattered env-var literals, HTTP path

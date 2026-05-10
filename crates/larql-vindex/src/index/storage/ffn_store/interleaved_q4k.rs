@@ -87,6 +87,7 @@ impl VectorIndex {
                 .collect();
             self.ffn.interleaved_q4k_manifest = Some(entries);
         }
+        self.refresh_storage();
         Ok(())
     }
 
@@ -132,6 +133,7 @@ impl VectorIndex {
             })
             .collect::<Result<Vec<_>, VindexError>>()?;
         self.ffn.down_features_q4k_manifest = Some(entries);
+        self.refresh_storage();
         Ok(())
     }
 
@@ -146,22 +148,13 @@ impl VectorIndex {
     /// `[intermediate, padded_width]`, Q4_K/Q6_K-encoded — feature
     /// `feat` lives at byte offset
     /// `feat * bytes_per_row(padded_width)` inside the slice.
+    /// Per-layer slice of `down_features_q4k.bin` plus the format tag
+    /// and the padded row width. Forwarded through
+    /// [`VectorIndex::storage`] (step 4 of the `VindexStorage`
+    /// migration).
     pub fn down_features_q4k_layer_data(&self, layer: usize) -> Option<(&[u8], &str, usize)> {
-        let mmap = self.ffn.down_features_q4k_mmap.as_ref()?;
-        let manifest = self.ffn.down_features_q4k_manifest.as_ref()?;
-        let entry = manifest.get(layer)?;
-        // Defensive: a corrupt or stale manifest can describe a slice
-        // outside the mmap. Returning None lets callers fall back to the
-        // uniform-stride path; panicking here would abort load/query.
-        let end = entry.offset.checked_add(entry.length)?;
-        if end > mmap.len() {
-            return None;
-        }
-        Some((
-            &mmap[entry.offset..end],
-            entry.format.as_str(),
-            entry.padded_width,
-        ))
+        let (view, fmt, padded_width) = self.storage.down_features_q4k_layer_data(layer)?;
+        Some((view.as_slice(), fmt, padded_width))
     }
 
     /// Per-layer Q4_K/Q6_K FFN slices — [gate, up, down] with formats.
@@ -175,28 +168,15 @@ impl VectorIndex {
         &self,
         layer: usize,
     ) -> Option<[(&[u8], &str); FFN_COMPONENTS_PER_LAYER]> {
-        let mmap = self.ffn.interleaved_q4k_mmap.as_ref()?;
-        let manifest = self.ffn.interleaved_q4k_manifest.as_ref()?;
-        let base = layer * FFN_COMPONENTS_PER_LAYER;
-        if base + FFN_COMPONENTS_PER_LAYER > manifest.len() {
-            return None;
-        }
-        // Bounds-check each slice against the mmap before forming the
-        // output. A stale/corrupt manifest can name an offset+length
-        // outside the file; returning None here lets the caller fall back
-        // to the uniform-stride path instead of panicking on the slice.
-        for i in 0..FFN_COMPONENTS_PER_LAYER {
-            let (offset, length, _) = &manifest[base + i];
-            let end = offset.checked_add(*length)?;
-            if end > mmap.len() {
-                return None;
-            }
-        }
+        // Forwarded through `self.storage` (step 4 of the
+        // `VindexStorage` migration). Public signature unchanged so
+        // existing callers don't move.
+        let arr = self.storage.interleaved_q4k_layer_data(layer)?;
         let mut out: [(&[u8], &str); FFN_COMPONENTS_PER_LAYER] =
             [(&[], ""); FFN_COMPONENTS_PER_LAYER];
         for i in 0..FFN_COMPONENTS_PER_LAYER {
-            let (offset, length, ref format) = manifest[base + i];
-            out[i] = (&mmap[offset..offset + length], format.as_str());
+            let (view, fmt) = arr[i];
+            out[i] = (view.as_slice(), fmt);
         }
         Some(out)
     }

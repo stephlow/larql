@@ -22,9 +22,9 @@ impl Session {
 
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let index_a = larql_vindex::VectorIndex::load_vindex(&path_a, &mut cb)
-            .map_err(|e| LqlError::exec(&format!("failed to load {}", path_a.display()), e))?;
+            .map_err(|e| LqlError::exec(format!("failed to load {}", path_a.display()), e))?;
         let index_b = larql_vindex::VectorIndex::load_vindex(&path_b, &mut cb)
-            .map_err(|e| LqlError::exec(&format!("failed to load {}", path_b.display()), e))?;
+            .map_err(|e| LqlError::exec(format!("failed to load {}", path_b.display()), e))?;
 
         let limit = limit.unwrap_or(20) as usize;
 

@@ -166,6 +166,39 @@ mmap path becomes one impl among several.
 top of the trait once it's stable). Same for GPU-resident storage —
 the trait surface should leave room for it but we don't implement.
 
+**Migration steps:**
+
+- [x] Step 1 — sealed trait skeleton in
+  `index/storage/vindex_storage/mod.rs`. 14 byte-yielding methods
+  covering hot-path substore reaches; FP4 + DownMeta deliberately
+  not behind the trait (richer per-feature decoders).
+- [x] Step 2 — `MmapStorage` parity impl
+  (`from_substores(&FfnStore, &GateStore, &ProjectionStore, hidden)`).
+- [x] Step 3 — Criterion perf gate
+  (`benches/vindex_storage_dispatch.rs`). Initial `Bytes`-returning
+  shape paid 6 atomic ops per fetch (12× direct); redesigned
+  per-layer accessors to return `BytesView<'a>` with
+  `as_slice() -> &'a [u8]` zero-atomic / `to_owned_bytes()` opt-in.
+  Final: `Arc<dyn>` within ~5% of direct on both layer-fetch and
+  per-row.
+- [x] Step 4 — `storage: Arc<dyn VindexStorage>` field on
+  `VectorIndex`, populated by `refresh_storage()` at the end of
+  every loader that mutates substore mmaps. Per-layer
+  byte-yielding accessors forward through `self.storage`
+  (`attn_q4k_layer_data` / `attn_q8_layer_data` /
+  `attn_q4_layer_slices` / `interleaved_q4k_layer_data` /
+  `down_features_q4k_layer_data` / `gate_q4_data`). Whole-buffer
+  accessors (`attn_q4_data`, `interleaved_q4*_mmap_ref`) deferred
+  to step 5 — they need an API-shape decision once substore mmap
+  fields drop.
+- [ ] Step 5 — drop `Arc<Mmap>` fields from substores; compiler
+  flags any remaining `pub` field reach (~155 sites across 19
+  files in vindex per the 2026-05-10 audit). Whole-buffer
+  accessor reshape happens here.
+
+See `CHANGELOG.md` 2026-05-10 entry for the full step 1-3 writeup
+plus bench numbers.
+
 ## P1: Active
 
 ### Architecture-independent extraction and weight writing

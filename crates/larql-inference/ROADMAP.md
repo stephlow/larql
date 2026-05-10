@@ -19,15 +19,11 @@ detail.
    recoverable, projects to 95-105 tok/s on Gemma 3 4B (ollama parity). See
    "Open: GPU-forward kernel utilization" → G-3 / G-4 (canonical entry: G-3).
 
-3. **Finish hardening H12** — H8/H9/H11 shipped 2026-05-10 (typed
-   `DumpConfig` + `RemoteMoeRuntime` for env toggles, root surface trimmed
-   by 24 names with `research` re-sourced from subpaths, no hardcoded
-   family branches remain in generic generation paths). H12 partial:
-   `layer_graph/predict.rs` and `ffn/moe_remote/shard.rs` both split into
-   directories. One orchestration file still > 800 LOC remains:
-   - `layer_graph/generate/gpu.rs` (902) — `generate_streaming` is a single
-     497-LOC fn; cleavable into prefill / decode-loop / sampling-step.
-     See "Open: inference crate hardening".
+3. **H12 closed** (2026-05-10) — H8/H9/H11 + all three orchestration-file
+   splits shipped: `layer_graph/predict.rs`, `ffn/moe_remote/shard.rs`,
+   `layer_graph/generate/gpu.rs` (999 LOC → 5-file `gpu/` directory, max
+   534 LOC; 646 lib tests pass). Inference-crate-hardening backlog is now
+   empty of file-split items. See `CHANGELOG.md` entry.
 
 4. **R4 — research trace export contract** — only remaining R-item from the
    mech-interp engine surface; unblocks MI4 onwards. See "Open: Mechanistic
@@ -94,7 +90,7 @@ Work items:
 | H9 | Narrow the crate root public surface: stop re-exporting experimental/internal modules by default, and distinguish stable inference APIs from research/dev surfaces | shipped 2026-05-10 — dropped 17 `forward::*` + 7 `layer_graph::*` root re-exports with zero external use AND zero in-crate example/test use; `research` module rewritten to source from subpaths (survives further root trims). Earlier 2026-05-09 work added `prelude` and `research` grouped surfaces |
 | H10 | Remove backend-name probes and concrete `MetalBackend` downcasts from generic generation dispatch; replace with explicit compute-backend capability methods | shipped 2026-05-09 for generation dispatch |
 | H11 | Move model-family workarounds and tokenizer suppression policy out of generic generation loops into architecture/tokenizer policy objects | shipped 2026-05-10 — verified no hardcoded `family() == "..."` branches remain in generic generation/decode/forward paths. The single remaining family-named match (`pipeline_layer.rs::moe_routing_policy`) reads the architecture trait's `router_type` metadata, which is the policy-object pattern this item asks for |
-| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | partial — 2026-05-09 extracted token selection policy, GPU setup/prefill helpers, constrained generation, and grid config/timing/setup/remote-MoE/remote-FFN modules. 2026-05-10 split `layer_graph/predict.rs` (881) → `predict/` directory (mod.rs 376 + split.rs 285 + honest.rs 261). `ffn/moe_remote/shard.rs` (924) → `shard/` directory (mod.rs 376 + layer_batch 215 + multi_layer 140 + expert_batch 136 + stream 123). One file still > 800 LOC: `layer_graph/generate/gpu.rs` (902 — `generate_streaming` is a single 497-LOC fn, splittable into prefill/decode-loop/sampling-step) |
+| H12 | Split large orchestration modules (`layer_graph/grid.rs`, `layer_graph/generate/gpu.rs`, remote MoE backend/shard code) into policy, backend dispatch, wire protocol, timing, and token selection units | shipped 2026-05-10 — `layer_graph/predict.rs` (881) → `predict/` directory (mod 376 + split 285 + honest 261); `ffn/moe_remote/shard.rs` (924) → `shard/` directory (mod 376 + layer_batch 215 + multi_layer 140 + expert_batch 136 + stream 123); `layer_graph/generate/gpu.rs` (999) → `gpu/` directory (mod 534 + decode_loop 329 + forced_logits 211 + prefill 193 + sampling_step 56). All earlier 2026-05-09 extractions (token selection policy, GPU setup, constrained generation, grid config/timing/remote-MoE/remote-FFN) preserved. 646 lib tests green |
 
 Acceptance:
 

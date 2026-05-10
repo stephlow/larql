@@ -1,184 +1,44 @@
-//! Remote executor — forwards LQL queries to a larql-server via HTTP.
+//! Read-side remote forwarders: DESCRIBE, WALK, INFER, EXPLAIN INFER,
+//! STATS, SHOW RELATIONS, SELECT.
 
-use super::Backend;
-use super::Session;
-use crate::ast::*;
+use crate::ast::{LayerBand, Range};
 use crate::error::LqlError;
+use crate::executor::{Backend, Session};
 
-/// Require an explicit `layer = N AND feature = M` predicate from a
-/// remote DELETE / UPDATE WHERE clause.
-///
-/// The previous shape silently defaulted missing fields to `0`, so a
-/// malformed `DELETE FROM EDGES WHERE foo = 1` would delete `L0 F0` on
-/// the remote vindex. We require both keys, both as positive integers,
-/// and error otherwise.
-fn require_layer_feature(
-    conditions: &[Condition],
-    verb: &str,
-) -> Result<(usize, usize), LqlError> {
-    let layer = lookup_usize_condition(conditions, "layer").ok_or_else(|| {
-        LqlError::Execution(format!(
-            "remote {verb} requires `layer = <int>` in WHERE clause"
-        ))
-    })?;
-    let feature = lookup_usize_condition(conditions, "feature").ok_or_else(|| {
-        LqlError::Execution(format!(
-            "remote {verb} requires `feature = <int>` in WHERE clause"
-        ))
-    })?;
-    Ok((layer, feature))
+use super::{
+    ENDPOINT_DESCRIBE, ENDPOINT_EXPLAIN_INFER, ENDPOINT_INFER, ENDPOINT_RELATIONS, ENDPOINT_SELECT,
+    ENDPOINT_STATS, ENDPOINT_WALK,
+};
+
+/// Default `top` for `WALK` when the user doesn't specify one.
+const REMOTE_WALK_DEFAULT_TOP: u32 = 10;
+/// Default `TOP N` for INFER and EXPLAIN INFER.
+const REMOTE_INFER_DEFAULT_TOP: u32 = 5;
+/// Default per-layer features for EXPLAIN INFER.
+const REMOTE_EXPLAIN_PER_LAYER_DEFAULT: u32 = 3;
+/// Default `LIMIT` for remote SELECT.
+const REMOTE_SELECT_DEFAULT_LIMIT: u32 = 20;
+
+fn band_str(band: Option<LayerBand>, default_when_none: &'static str) -> &'static str {
+    match band {
+        Some(LayerBand::Syntax) => "syntax",
+        Some(LayerBand::Knowledge) => "knowledge",
+        Some(LayerBand::Output) => "output",
+        Some(LayerBand::All) => "all",
+        None => default_when_none,
+    }
 }
 
-fn lookup_usize_condition(conditions: &[Condition], field: &str) -> Option<usize> {
-    conditions
-        .iter()
-        .find(|c| c.field == field)
-        .and_then(|c| match &c.value {
-            Value::Integer(n) if *n >= 0 => Some(*n as usize),
-            _ => None,
-        })
+fn band_label(band: Option<LayerBand>) -> &'static str {
+    match band {
+        Some(LayerBand::Syntax) => " (syntax)",
+        Some(LayerBand::Knowledge) => " (knowledge)",
+        Some(LayerBand::Output) => " (output)",
+        _ => "",
+    }
 }
 
 impl Session {
-    /// Connect to a remote larql-server.
-    pub(crate) fn exec_use_remote(&mut self, url: &str) -> Result<Vec<String>, LqlError> {
-        let url = url.trim_end_matches('/').to_string();
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| LqlError::exec("failed to create HTTP client", e))?;
-
-        // Verify the server is reachable by hitting /v1/stats.
-        let stats_url = format!("{url}/v1/stats");
-        let resp = client
-            .get(&stats_url)
-            .send()
-            .map_err(|e| LqlError::exec(format!("failed to connect to {url}"), e))?;
-
-        if !resp.status().is_success() {
-            return Err(LqlError::Execution(format!(
-                "server returned {}: {}",
-                resp.status(),
-                resp.text().unwrap_or_default()
-            )));
-        }
-
-        let stats: serde_json::Value = resp
-            .json()
-            .map_err(|e| LqlError::exec("invalid response from server", e))?;
-
-        let model = stats["model"].as_str().unwrap_or("unknown");
-        let layers = stats["layers"].as_u64().unwrap_or(0);
-        let features = stats["features"].as_u64().unwrap_or(0);
-
-        // Generate a unique session ID for this connection
-        let session_id = format!(
-            "larql-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        );
-
-        self.backend = Backend::Remote {
-            url: url.clone(),
-            client,
-            local_patches: Vec::new(),
-            session_id,
-        };
-        self.patch_recording = None;
-        self.auto_patch = false;
-
-        Ok(vec![format!(
-            "Connected: {} ({} layers, {} features)\n  Remote: {}",
-            model, layers, features, url,
-        )])
-    }
-
-    /// Check if the backend is remote.
-    pub(crate) fn is_remote(&self) -> bool {
-        matches!(&self.backend, Backend::Remote { .. })
-    }
-
-    /// Get the remote URL, client, and session ID, or error.
-    fn require_remote(&self) -> Result<(&str, &reqwest::blocking::Client, &str), LqlError> {
-        match &self.backend {
-            Backend::Remote {
-                url,
-                client,
-                session_id,
-                ..
-            } => Ok((url, client, session_id)),
-            _ => Err(LqlError::Execution(
-                "not connected to a remote server".into(),
-            )),
-        }
-    }
-
-    // ── Generic HTTP forwarding helpers ──
-    //
-    // Every `remote_*` method ends up doing the same `build URL → send →
-    // status check → parse JSON` dance. These helpers consolidate the
-    // pattern so the per-statement methods only have to assemble the
-    // request shape and process the response body.
-
-    /// GET `{remote_url}{endpoint}` with optional query parameters,
-    /// check the response status, and parse the body as JSON.
-    fn remote_get_json(
-        &self,
-        endpoint: &str,
-        query: &[(&str, &str)],
-    ) -> Result<serde_json::Value, LqlError> {
-        let (url, client, _sid) = self.require_remote()?;
-        let resp = client
-            .get(format!("{url}{endpoint}"))
-            .query(query)
-            .send()
-            .map_err(|e| LqlError::exec("request failed", e))?;
-        Self::check_and_parse(endpoint, resp)
-    }
-
-    /// POST `{remote_url}{endpoint}` with a JSON body, check status,
-    /// and parse the response. When `with_session` is true, the
-    /// `x-session-id` header is added (server-side patch sessions).
-    fn remote_post_json(
-        &self,
-        endpoint: &str,
-        body: &serde_json::Value,
-        with_session: bool,
-    ) -> Result<serde_json::Value, LqlError> {
-        let (url, client, sid) = self.require_remote()?;
-        let mut req = client.post(format!("{url}{endpoint}")).json(body);
-        if with_session {
-            req = req.header("x-session-id", sid);
-        }
-        let resp = req
-            .send()
-            .map_err(|e| LqlError::exec("request failed", e))?;
-        Self::check_and_parse(endpoint, resp)
-    }
-
-    /// Validate the response status, parse the body as JSON, and turn
-    /// any failure into a tagged `LqlError`.
-    fn check_and_parse(
-        endpoint: &str,
-        resp: reqwest::blocking::Response,
-    ) -> Result<serde_json::Value, LqlError> {
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().unwrap_or_default();
-            return Err(LqlError::Execution(format!(
-                "{endpoint} failed ({status}): {text}"
-            )));
-        }
-        resp.json::<serde_json::Value>()
-            .map_err(|e| LqlError::exec("invalid response", e))
-    }
-
-    // ── Remote query forwarding ──
-
     pub(crate) fn remote_describe(
         &self,
         entity: &str,
@@ -191,19 +51,11 @@ impl Session {
             crate::ast::DescribeMode::Verbose | crate::ast::DescribeMode::Raw
         );
 
-        let band_str = match band {
-            Some(LayerBand::Syntax) => "syntax",
-            Some(LayerBand::Knowledge) => "knowledge",
-            Some(LayerBand::Output) => "output",
-            Some(LayerBand::All) => "all",
-            None => "knowledge",
-        };
-
         let body = self.remote_get_json(
-            "/v1/describe",
+            ENDPOINT_DESCRIBE,
             &[
                 ("entity", entity),
-                ("band", band_str),
+                ("band", band_str(band, "knowledge")),
                 ("verbose", if verbose { "true" } else { "false" }),
             ],
         )?;
@@ -315,7 +167,7 @@ impl Session {
         top: Option<u32>,
         layers: Option<&Range>,
     ) -> Result<Vec<String>, LqlError> {
-        let top_k = top.unwrap_or(10).to_string();
+        let top_k = top.unwrap_or(REMOTE_WALK_DEFAULT_TOP).to_string();
         let layers_str = layers.map(|r| format!("{}-{}", r.start, r.end));
 
         let mut params: Vec<(&str, &str)> = vec![("prompt", prompt), ("top", top_k.as_str())];
@@ -323,7 +175,7 @@ impl Session {
             params.push(("layers", s.as_str()));
         }
 
-        let body = self.remote_get_json("/v1/walk", &params)?;
+        let body = self.remote_get_json(ENDPOINT_WALK, &params)?;
 
         let mut out = Vec::new();
         out.push(format!("Feature scan for {:?}", prompt));
@@ -359,11 +211,11 @@ impl Session {
         let mode = if compare { "compare" } else { "walk" };
         let request = serde_json::json!({
             "prompt": prompt,
-            "top": top.unwrap_or(5),
+            "top": top.unwrap_or(REMOTE_INFER_DEFAULT_TOP),
             "mode": mode,
         });
 
-        let result = self.remote_post_json("/v1/infer", &request, true)?;
+        let result = self.remote_post_json(ENDPOINT_INFER, &request, true)?;
 
         let mut out = Vec::new();
 
@@ -414,35 +266,25 @@ impl Session {
         relations_only: bool,
         with_attention: bool,
     ) -> Result<Vec<String>, LqlError> {
-        let per_layer = top.unwrap_or(3);
-        let band_str = match band {
-            Some(LayerBand::Syntax) => "syntax",
-            Some(LayerBand::Knowledge) => "knowledge",
-            Some(LayerBand::Output) => "output",
-            Some(LayerBand::All) => "all",
-            None => "all",
-        };
+        let per_layer = top.unwrap_or(REMOTE_EXPLAIN_PER_LAYER_DEFAULT);
 
         let request = serde_json::json!({
             "prompt": prompt,
-            "top": top.unwrap_or(5),
+            "top": top.unwrap_or(REMOTE_INFER_DEFAULT_TOP),
             "per_layer": per_layer,
-            "band": band_str,
+            "band": band_str(band, "all"),
             "relations_only": relations_only,
             "with_attention": with_attention,
         });
 
-        let result = self.remote_post_json("/v1/explain-infer", &request, false)?;
-
-        let band_label = match band {
-            Some(LayerBand::Syntax) => " (syntax)",
-            Some(LayerBand::Knowledge) => " (knowledge)",
-            Some(LayerBand::Output) => " (output)",
-            _ => "",
-        };
+        let result = self.remote_post_json(ENDPOINT_EXPLAIN_INFER, &request, false)?;
 
         let mut out = Vec::new();
-        out.push(format!("Inference trace for {:?}{}:", prompt, band_label));
+        out.push(format!(
+            "Inference trace for {:?}{}:",
+            prompt,
+            band_label(band)
+        ));
 
         if let Some(override_obj) = result["knn_override"].as_object() {
             let tok = override_obj
@@ -473,7 +315,6 @@ impl Session {
                 let features = layer_obj["features"].as_array();
 
                 if with_attention {
-                    // Compact single-line format
                     let feat = features.and_then(|f| f.first());
                     let feature_str = if let Some(feat) = feat {
                         let relation = feat["relation"]
@@ -524,39 +365,36 @@ impl Session {
                             layer, feature_part, attn_part, lens_part,
                         ));
                     }
-                } else {
-                    // Standard multi-line format
-                    if let Some(features) = features {
-                        for feat in features {
-                            let feature = feat["feature"].as_u64().unwrap_or(0);
-                            let gate = feat["gate_score"].as_f64().unwrap_or(0.0);
-                            let relation = feat["relation"]
-                                .as_str()
-                                .or_else(|| feat["relation"].as_null().map(|_| ""))
-                                .unwrap_or("");
-                            if relations_only && relation.is_empty() {
-                                continue;
-                            }
-                            let label_str = if relation.is_empty() {
-                                format!("{:14}", "")
-                            } else {
-                                format!("{:<14}", relation)
-                            };
-                            let top_token = feat["top_token"].as_str().unwrap_or("?");
-                            let top_tokens: String = feat["top_tokens"]
-                                .as_array()
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default();
-                            out.push(format!(
-                                "  L{:2}: {} F{:<5} gate={:+.1}  → {:15} [{}]",
-                                layer, label_str, feature, gate, top_token, top_tokens,
-                            ));
+                } else if let Some(features) = features {
+                    for feat in features {
+                        let feature = feat["feature"].as_u64().unwrap_or(0);
+                        let gate = feat["gate_score"].as_f64().unwrap_or(0.0);
+                        let relation = feat["relation"]
+                            .as_str()
+                            .or_else(|| feat["relation"].as_null().map(|_| ""))
+                            .unwrap_or("");
+                        if relations_only && relation.is_empty() {
+                            continue;
                         }
+                        let label_str = if relation.is_empty() {
+                            format!("{:14}", "")
+                        } else {
+                            format!("{:<14}", relation)
+                        };
+                        let top_token = feat["top_token"].as_str().unwrap_or("?");
+                        let top_tokens: String = feat["top_tokens"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        out.push(format!(
+                            "  L{:2}: {} F{:<5} gate={:+.1}  → {:15} [{}]",
+                            layer, label_str, feature, gate, top_token, top_tokens,
+                        ));
                     }
                 }
             }
@@ -570,7 +408,7 @@ impl Session {
     }
 
     pub(crate) fn remote_stats(&self) -> Result<Vec<String>, LqlError> {
-        let body = self.remote_get_json("/v1/stats", &[])?;
+        let body = self.remote_get_json(ENDPOINT_STATS, &[])?;
         let url = match &self.backend {
             Backend::Remote { url, .. } => url.as_str(),
             _ => "?",
@@ -629,11 +467,10 @@ impl Session {
         with_examples: bool,
     ) -> Result<Vec<String>, LqlError> {
         use crate::ast::DescribeMode;
-        let body = self.remote_get_json("/v1/relations", &[])?;
+        let body = self.remote_get_json(ENDPOINT_RELATIONS, &[])?;
 
         let mut out = Vec::new();
 
-        // Probe-confirmed relations (skip for Raw mode)
         if mode != DescribeMode::Raw {
             if let Some(probes) = body["probe_relations"].as_array() {
                 if !probes.is_empty() {
@@ -651,7 +488,6 @@ impl Session {
             }
         }
 
-        // Raw token relations (show for Verbose, Raw, or when no probes)
         let show_raw = mode == DescribeMode::Raw || mode == DescribeMode::Verbose || out.is_empty();
 
         if show_raw {
@@ -695,150 +531,16 @@ impl Session {
         Ok(out)
     }
 
-    // ── Remote mutations (forwarded to server as patches) ──
-
-    pub(crate) fn remote_insert(
-        &self,
-        entity: &str,
-        relation: &str,
-        target: &str,
-        layer: Option<u32>,
-        confidence: Option<f32>,
-    ) -> Result<Vec<String>, LqlError> {
-        let request = serde_json::json!({
-            "entity": entity,
-            "relation": relation,
-            "target": target,
-            "layer": layer,
-            "confidence": confidence.unwrap_or(0.9),
-        });
-
-        let result = self.remote_post_json("/v1/insert", &request, true)?;
-
-        let inserted = result["inserted"].as_u64().unwrap_or(0);
-        let mode = result["mode"].as_str().unwrap_or("unknown");
-        let ms = result["latency_ms"].as_f64().unwrap_or(0.0);
-
-        let mut out = Vec::new();
-        out.push(format!(
-            "Inserted: {} —[{}]→ {} ({} layers, mode: {})",
-            entity, relation, target, inserted, mode,
-        ));
-        out.push(format!("{:.0}ms (remote)", ms));
-
-        Ok(out)
-    }
-
-    pub(crate) fn remote_delete(
-        &self,
-        conditions: &[crate::ast::Condition],
-    ) -> Result<Vec<String>, LqlError> {
-        let (layer, feature) = require_layer_feature(conditions, "DELETE")?;
-
-        let ops = vec![larql_vindex::PatchOp::Delete {
-            layer,
-            feature,
-            reason: Some("remote DELETE".into()),
-        }];
-
-        let patch = larql_vindex::VindexPatch {
-            version: 1,
-            base_model: String::new(),
-            base_checksum: None,
-            created_at: String::new(),
-            description: Some(format!("DELETE L{layer} F{feature}")),
-            author: None,
-            tags: vec![],
-            operations: ops,
-        };
-
-        let _ = self.remote_post_json(
-            "/v1/patches/apply",
-            &serde_json::json!({"patch": patch}),
-            false,
-        )?;
-
-        Ok(vec![format!(
-            "Deleted: L{layer} F{feature} → remote server"
-        )])
-    }
-
-    pub(crate) fn remote_update(
-        &self,
-        set: &[crate::ast::Assignment],
-        conditions: &[crate::ast::Condition],
-    ) -> Result<Vec<String>, LqlError> {
-        let (layer, feature) = require_layer_feature(conditions, "UPDATE")?;
-
-        // Build down_meta from SET assignments.
-        let target = set
-            .iter()
-            .find(|a| a.field == "target" || a.field == "top_token")
-            .and_then(|a| match &a.value {
-                crate::ast::Value::String(s) => Some(s.clone()),
-                _ => None,
-            });
-        let confidence = set
-            .iter()
-            .find(|a| a.field == "confidence" || a.field == "c_score")
-            .and_then(|a| match &a.value {
-                crate::ast::Value::Number(n) => Some(*n as f32),
-                crate::ast::Value::Integer(n) => Some(*n as f32),
-                _ => None,
-            });
-
-        let down_meta = target
-            .as_ref()
-            .map(|t| larql_vindex::patch::core::PatchDownMeta {
-                top_token: t.clone(),
-                top_token_id: 0,
-                c_score: confidence.unwrap_or(0.9),
-            });
-
-        let op = larql_vindex::PatchOp::Update {
-            layer,
-            feature,
-            gate_vector_b64: None,
-            up_vector_b64: None,
-            down_vector_b64: None,
-            down_meta,
-        };
-
-        let patch = larql_vindex::VindexPatch {
-            version: 1,
-            base_model: String::new(),
-            base_checksum: None,
-            created_at: String::new(),
-            description: Some(format!("UPDATE L{layer} F{feature}")),
-            author: None,
-            tags: vec![],
-            operations: vec![op],
-        };
-
-        let _ = self.remote_post_json(
-            "/v1/patches/apply",
-            &serde_json::json!({"patch": patch}),
-            false,
-        )?;
-
-        let desc = target
-            .as_deref()
-            .map(|t| format!(" target={t}"))
-            .unwrap_or_default();
-        Ok(vec![format!(
-            "Updated: L{layer} F{feature}{desc} → remote server"
-        )])
-    }
-
-    // ── Remote SELECT ──
-
     pub(crate) fn remote_select(
         &self,
         conditions: &[crate::ast::Condition],
         limit: Option<u32>,
     ) -> Result<Vec<String>, LqlError> {
         let mut body = serde_json::Map::new();
-        body.insert("limit".into(), serde_json::json!(limit.unwrap_or(20)));
+        body.insert(
+            "limit".into(),
+            serde_json::json!(limit.unwrap_or(REMOTE_SELECT_DEFAULT_LIMIT)),
+        );
 
         for cond in conditions {
             match cond.field.as_str() {
@@ -870,8 +572,7 @@ impl Session {
             }
         }
 
-        let result =
-            self.remote_post_json("/v1/select", &serde_json::Value::Object(body), false)?;
+        let result = self.remote_post_json(ENDPOINT_SELECT, &serde_json::Value::Object(body), false)?;
 
         let mut out = Vec::new();
 
@@ -904,97 +605,13 @@ impl Session {
 
         Ok(out)
     }
-
-    // ── Local patch management (client-side overlay) ──
-
-    pub(crate) fn remote_apply_local_patch(&mut self, path: &str) -> Result<Vec<String>, LqlError> {
-        let patch_path = std::path::PathBuf::from(path);
-        if !patch_path.exists() {
-            return Err(LqlError::Execution(format!("patch not found: {path}")));
-        }
-
-        let patch = larql_vindex::VindexPatch::load(&patch_path)
-            .map_err(|e| LqlError::exec("failed to load patch", e))?;
-
-        let (ins, upd, del) = patch.counts();
-        let total = patch.len();
-
-        match &mut self.backend {
-            Backend::Remote { local_patches, .. } => {
-                local_patches.push(patch);
-                Ok(vec![format!(
-                    "Applied locally: {path} ({total} ops: {ins} ins, {upd} upd, {del} del)\n\
-                     Patch stays client-side — server never sees it."
-                )])
-            }
-            _ => Err(LqlError::Execution(
-                "not connected to a remote server".into(),
-            )),
-        }
-    }
-
-    pub(crate) fn remote_show_patches(&self) -> Result<Vec<String>, LqlError> {
-        let local_patches = match &self.backend {
-            Backend::Remote { local_patches, .. } => local_patches,
-            _ => {
-                return Err(LqlError::Execution(
-                    "not connected to a remote server".into(),
-                ))
-            }
-        };
-
-        let mut out = Vec::new();
-        if local_patches.is_empty() {
-            out.push("  (no local patches)".into());
-        } else {
-            out.push("Local patches (client-side only):".into());
-            for (i, patch) in local_patches.iter().enumerate() {
-                let (ins, upd, del) = patch.counts();
-                let name = patch.description.as_deref().unwrap_or("(unnamed)");
-                out.push(format!(
-                    "  {}. {:<40} {} ops ({} ins, {} upd, {} del)",
-                    i + 1,
-                    name,
-                    patch.len(),
-                    ins,
-                    upd,
-                    del,
-                ));
-            }
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn remote_remove_local_patch(
-        &mut self,
-        name: &str,
-    ) -> Result<Vec<String>, LqlError> {
-        let local_patches = match &mut self.backend {
-            Backend::Remote { local_patches, .. } => local_patches,
-            _ => {
-                return Err(LqlError::Execution(
-                    "not connected to a remote server".into(),
-                ))
-            }
-        };
-
-        let pos = local_patches
-            .iter()
-            .position(|p| p.description.as_deref().unwrap_or("unnamed") == name);
-
-        match pos {
-            Some(i) => {
-                local_patches.remove(i);
-                Ok(vec![format!("Removed local patch: {name}")])
-            }
-            None => Err(LqlError::Execution(format!(
-                "local patch not found: {name}"
-            ))),
-        }
-    }
 }
 
-fn remote_knn_override_line(override_obj: &serde_json::Map<String, serde_json::Value>) -> String {
+// ── KNN-override formatters ──────────────────────────────────────
+
+pub(super) fn remote_knn_override_line(
+    override_obj: &serde_json::Map<String, serde_json::Value>,
+) -> String {
     let tok = override_obj
         .get("token")
         .and_then(|v| v.as_str())
@@ -1006,7 +623,7 @@ fn remote_knn_override_line(override_obj: &serde_json::Map<String, serde_json::V
     )
 }
 
-fn remote_knn_override_summary(
+pub(super) fn remote_knn_override_summary(
     override_obj: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
     let cosine = override_obj
@@ -1035,68 +652,78 @@ fn remote_knn_override_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{CompareOp, Condition, Value};
 
-    fn cond(field: &str, value: Value) -> Condition {
-        Condition {
-            field: field.into(),
-            op: CompareOp::Eq,
-            value,
-        }
+    fn mk_obj(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
-    fn require_layer_feature_accepts_explicit_pair() {
-        let conds = vec![
-            cond("layer", Value::Integer(7)),
-            cond("feature", Value::Integer(42)),
-        ];
-        let (l, f) = require_layer_feature(&conds, "DELETE").unwrap();
-        assert_eq!((l, f), (7, 42));
+    fn band_str_maps_each_variant() {
+        assert_eq!(band_str(Some(LayerBand::Syntax), "x"), "syntax");
+        assert_eq!(band_str(Some(LayerBand::Knowledge), "x"), "knowledge");
+        assert_eq!(band_str(Some(LayerBand::Output), "x"), "output");
+        assert_eq!(band_str(Some(LayerBand::All), "x"), "all");
+        assert_eq!(band_str(None, "fallback"), "fallback");
     }
 
     #[test]
-    fn require_layer_feature_errors_when_layer_missing() {
-        // Regression: prior shape silently coerced missing fields to 0,
-        // turning `WHERE foo = 1` into a destructive `DELETE L0 F0`.
-        let conds = vec![cond("feature", Value::Integer(1))];
-        let err = require_layer_feature(&conds, "DELETE").unwrap_err();
-        assert!(err.to_string().contains("layer"));
-        assert!(err.to_string().contains("DELETE"));
+    fn band_label_brackets_known_bands_and_skips_all_or_none() {
+        assert_eq!(band_label(Some(LayerBand::Syntax)), " (syntax)");
+        assert_eq!(band_label(Some(LayerBand::Knowledge)), " (knowledge)");
+        assert_eq!(band_label(Some(LayerBand::Output)), " (output)");
+        assert_eq!(band_label(Some(LayerBand::All)), "");
+        assert_eq!(band_label(None), "");
     }
 
     #[test]
-    fn require_layer_feature_errors_when_feature_missing() {
-        let conds = vec![cond("layer", Value::Integer(0))];
-        let err = require_layer_feature(&conds, "UPDATE").unwrap_err();
-        assert!(err.to_string().contains("feature"));
-        assert!(err.to_string().contains("UPDATE"));
+    fn knn_override_summary_baseline_no_top1() {
+        let obj = mk_obj(&[
+            ("cosine", serde_json::json!(0.987)),
+            ("layer", serde_json::json!(26)),
+        ]);
+        let s = remote_knn_override_summary(&obj);
+        assert!(s.contains("source=knn_override/post_logits"));
+        assert!(s.contains("cos=0.99"));
+        assert!(s.contains("L26"));
+        assert!(!s.contains("model_top1"));
     }
 
     #[test]
-    fn require_layer_feature_rejects_non_integer_value() {
-        let conds = vec![
-            cond("layer", Value::String("oops".into())),
-            cond("feature", Value::Integer(1)),
-        ];
-        let err = require_layer_feature(&conds, "DELETE").unwrap_err();
-        assert!(err.to_string().contains("layer"));
+    fn knn_override_summary_appends_model_top1_when_present() {
+        let obj = mk_obj(&[
+            ("cosine", serde_json::json!(0.50)),
+            ("layer", serde_json::json!(10)),
+            (
+                "model_top1",
+                serde_json::json!({"token": "London", "probability": 0.42}),
+            ),
+        ]);
+        let s = remote_knn_override_summary(&obj);
+        assert!(s.contains("model_top1=London (42.00%)"));
     }
 
     #[test]
-    fn require_layer_feature_rejects_negative_value() {
-        let conds = vec![
-            cond("layer", Value::Integer(-1)),
-            cond("feature", Value::Integer(0)),
-        ];
-        let err = require_layer_feature(&conds, "DELETE").unwrap_err();
-        assert!(err.to_string().contains("layer"));
+    fn knn_override_line_combines_token_and_summary() {
+        let obj = mk_obj(&[
+            ("token", serde_json::json!("Paris")),
+            ("cosine", serde_json::json!(0.95)),
+            ("layer", serde_json::json!(26)),
+        ]);
+        let s = remote_knn_override_line(&obj);
+        assert!(s.starts_with("KNN override: Paris"));
+        assert!(s.contains("cos=0.95"));
     }
 
     #[test]
-    fn lookup_usize_condition_finds_field() {
-        let conds = vec![cond("layer", Value::Integer(3))];
-        assert_eq!(lookup_usize_condition(&conds, "layer"), Some(3));
-        assert_eq!(lookup_usize_condition(&conds, "feature"), None);
+    fn knn_override_line_handles_missing_token() {
+        let obj = mk_obj(&[
+            ("cosine", serde_json::json!(0.0)),
+            ("layer", serde_json::json!(0)),
+        ]);
+        let s = remote_knn_override_line(&obj);
+        assert!(s.starts_with("KNN override: ?"));
     }
 }

@@ -233,6 +233,83 @@ mod tests {
     }
 
     #[test]
+    fn staging_dir_for_falls_back_when_basename_missing() {
+        // Root path has no file_name — fallback to the literal "compile"
+        // so we still produce a deterministic staging name.
+        let staging = staging_dir_for(Path::new("/"));
+        let name = staging.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.contains("compile"));
+        assert!(name.contains(".tmp."));
+    }
+
+    #[test]
+    fn staging_dir_for_handles_relative_path_without_parent() {
+        // `Path::new("foo").parent()` returns `Some("")`; we still
+        // produce a usable staging dir by joining a sentinel name.
+        let staging = staging_dir_for(Path::new("foo"));
+        let name = staging.file_name().unwrap().to_string_lossy();
+        assert!(name.contains("foo"));
+        assert!(name.contains(".tmp."));
+    }
+
+    #[test]
+    fn run_atomic_compile_propagates_work_error() {
+        // The error variant should bubble unchanged (we don't swap it out
+        // with a generic "compile failed" wrapper).
+        let source = unique_tmp("atomic_propagates_src");
+        let final_dir = unique_tmp("atomic_propagates_dst");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let err = run_atomic_compile(&final_dir, &source, |_staging| {
+            Err::<Vec<String>, _>(LqlError::Execution(
+                "specific failure that callers will recognise".into(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("specific failure"));
+
+        let _ = std::fs::remove_dir_all(&source);
+    }
+
+    #[test]
+    fn paths_collide_canonicalises_dot_segments() {
+        // `/tmp/foo/./.` and `/tmp/foo` should collide once both
+        // canonicalise via `std::path::absolute`.
+        let dir = unique_tmp("paths_collide_dot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dotted = dir.join(".").join(".");
+        assert!(paths_collide(&dir, &dotted).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_atomic_compile_errors_when_staging_create_fails() {
+        // Force `create_dir_all(staging)` to fail by parking the staging
+        // dir under a path whose parent is a regular file. The failure
+        // message must mention "staging dir" so the operator can tell
+        // setup blew up rather than the bake itself.
+        let source = unique_tmp("atomic_staging_fail_src");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let parent_as_file = unique_tmp("atomic_parent_is_file");
+        std::fs::write(&parent_as_file, b"definitely not a directory").unwrap();
+        let final_dir = parent_as_file.join("never_created");
+
+        let err = run_atomic_compile(&final_dir, &source, |_staging| {
+            unreachable!("work should not run when staging cannot be created")
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("staging dir"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_file(&parent_as_file);
+        let _ = std::fs::remove_dir_all(&source);
+    }
+
+    #[test]
     fn run_atomic_compile_replaces_existing_final_dir() {
         let source = unique_tmp("atomic_replace_src");
         let final_dir = unique_tmp("atomic_replace_dst");

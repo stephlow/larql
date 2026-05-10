@@ -94,7 +94,7 @@ pub struct SilentLoadCallbacks;
 impl IndexLoadCallbacks for SilentLoadCallbacks {}
 
 /// Per-layer gate vector offset info for mmap mode.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct GateLayerSlice {
     pub float_offset: usize,
     pub num_features: usize,

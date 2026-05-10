@@ -2,6 +2,7 @@
 target/
 coverage/
 **/*.rs.bk
+.cargo/
 
 # Python / maturin
 .venv/

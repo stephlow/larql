@@ -47,44 +47,35 @@ impl VectorIndex {
                 .collect();
             self.projections.attn_q8_manifest = Some(entries);
         }
+        self.refresh_storage();
         Ok(())
     }
 
     /// Get per-layer Q8 attention slices: (q_vals, q_scales, k_vals, k_scales, v_vals, v_scales, o_vals, o_scales)
+    ///
+    /// Forwarded through [`VectorIndex::storage`] (step 4 of the
+    /// `VindexStorage` migration). Public signature unchanged so
+    /// existing callers don't move; the returned `&[u8]` / `&[f32]`
+    /// borrow from the storage façade's `Bytes` (zero-copy).
     pub fn attn_q8_layer_data(&self, layer: usize) -> Option<[(&[u8], &[f32]); 4]> {
-        let mmap = self.projections.attn_q8_mmap.as_ref()?;
-        let manifest = self.projections.attn_q8_manifest.as_ref()?;
-
-        let base = layer * ATTN_TENSORS_PER_LAYER;
-        if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
-            return None;
-        }
-
-        // Bounds-check every (offset + vals_len + scales_len) span against
-        // the mmap before forming the output. A stale/corrupt manifest can
-        // describe a slice outside the file; returning None here lets the
-        // caller fall back instead of panicking on the slice.
+        let arr = self.storage.attn_q8_layer_data(layer)?;
+        let mut out = [(&[] as &[u8], &[] as &[f32]); ATTN_TENSORS_PER_LAYER];
         for i in 0..ATTN_TENSORS_PER_LAYER {
-            let (offset, vals_len, scales_len) = manifest[base + i];
-            let vals_end = offset.checked_add(vals_len)?;
-            let scales_end = vals_end.checked_add(scales_len)?;
-            if scales_end > mmap.len() {
-                return None;
-            }
-        }
-
-        let mut result = [(&[] as &[u8], &[] as &[f32]); ATTN_TENSORS_PER_LAYER];
-        for i in 0..ATTN_TENSORS_PER_LAYER {
-            let (offset, vals_len, scales_len) = manifest[base + i];
-            let vals = &mmap[offset..offset + vals_len];
-            let scales_start = offset + vals_len;
-            let scales_data = &mmap[scales_start..scales_start + scales_len];
+            let (vals_view, scales_view) = arr[i];
+            let vals = vals_view.as_slice();
+            let scales_bytes = scales_view.as_slice();
+            // Same `slice::from_raw_parts` reinterpretation today's
+            // accessor used; preserves the alignment-and-padding
+            // contract enforced by the writer.
             let scales = unsafe {
-                std::slice::from_raw_parts(scales_data.as_ptr() as *const f32, scales_len / 4)
+                std::slice::from_raw_parts(
+                    scales_bytes.as_ptr() as *const f32,
+                    scales_bytes.len() / 4,
+                )
             };
-            result[i] = (vals, scales);
+            out[i] = (vals, scales);
         }
-        Some(result)
+        Some(out)
     }
 
     /// Load Q4_K/Q6_K attention weights for Ollama-compatible GPU pipeline.
@@ -159,37 +150,22 @@ impl VectorIndex {
             self.projections.attn_q4k_manifest = Some(entries);
         }
         self.projections.attn_q4k_mmap = Some(Arc::new(mmap));
+        self.refresh_storage();
         Ok(())
     }
 
     /// Get per-layer Q4_K/Q6_K attention slices: (data, format) for Q, K, V, O.
+    ///
+    /// Forwarded through [`VectorIndex::storage`] (step 4 of the
+    /// `VindexStorage` migration). Public signature unchanged.
     pub fn attn_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 4]> {
-        let mmap = self.projections.attn_q4k_mmap.as_ref()?;
-        let manifest = self.projections.attn_q4k_manifest.as_ref()?;
-        let base = layer * ATTN_TENSORS_PER_LAYER;
-        if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
-            return None;
-        }
-
-        // Bounds-check each (offset + length) span against the mmap before
-        // forming the output. A stale/corrupt manifest can name a slice
-        // outside the file; returning None here lets the caller fall back
-        // to a uniform-stride path instead of panicking.
+        let arr = self.storage.attn_q4k_layer_data(layer)?;
+        let mut out: [(&[u8], &str); ATTN_TENSORS_PER_LAYER] = [(&[], ""); ATTN_TENSORS_PER_LAYER];
         for i in 0..ATTN_TENSORS_PER_LAYER {
-            let (offset, length, _) = &manifest[base + i];
-            let end = offset.checked_add(*length)?;
-            if end > mmap.len() {
-                return None;
-            }
+            let (view, fmt) = arr[i];
+            out[i] = (view.as_slice(), fmt);
         }
-
-        let mut result: [(&[u8], &str); ATTN_TENSORS_PER_LAYER] =
-            [(&[], ""); ATTN_TENSORS_PER_LAYER];
-        for i in 0..ATTN_TENSORS_PER_LAYER {
-            let (offset, length, ref format) = manifest[base + i];
-            result[i] = (&mmap[offset..offset + length], format.as_str());
-        }
-        Some(result)
+        Some(out)
     }
 
     /// Load Q4 attention weights + manifest for GPU full pipeline.
@@ -221,6 +197,7 @@ impl VectorIndex {
                 .collect();
             self.projections.attn_q4_manifest = Some(entries);
         }
+        self.refresh_storage();
         Ok(())
     }
 
@@ -234,39 +211,18 @@ impl VectorIndex {
 
     /// Get per-layer Q4 attention weight slices (Q, K, V, O) using the manifest.
     /// Returns None if manifest or Q4 attn data is not loaded.
+    ///
+    /// Forwarded through [`VectorIndex::storage`] (step 4 of the
+    /// `VindexStorage` migration).
     #[allow(clippy::type_complexity)]
     pub fn attn_q4_layer_slices(&self, layer: usize) -> Option<(&[u8], &[u8], &[u8], &[u8])> {
-        let mmap = self.projections.attn_q4_mmap.as_ref()?;
-        let manifest = self.projections.attn_q4_manifest.as_ref()?;
-
-        let base = layer * ATTN_TENSORS_PER_LAYER;
-        if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
-            return None;
-        }
-
-        // Bounds-check each (offset + length) span against the mmap before
-        // forming the output. A stale/corrupt manifest can name a slice
-        // outside the file; returning None here lets the caller fall back
-        // instead of panicking.
-        for i in 0..ATTN_TENSORS_PER_LAYER {
-            let (offset, length) = &manifest[base + i];
-            let end = offset.checked_add(*length)?;
-            if end > mmap.len() {
-                return None;
-            }
-        }
-
-        let q = &manifest[base];
-        let k = &manifest[base + 1];
-        let v = &manifest[base + 2];
-        let o = &manifest[base + 3];
-
-        let q_data = &mmap[q.0..q.0 + q.1];
-        let k_data = &mmap[k.0..k.0 + k.1];
-        let v_data = &mmap[v.0..v.0 + v.1];
-        let o_data = &mmap[o.0..o.0 + o.1];
-
-        Some((q_data, k_data, v_data, o_data))
+        let arr = self.storage.attn_q4_layer_slices(layer)?;
+        Some((
+            arr[0].as_slice(),
+            arr[1].as_slice(),
+            arr[2].as_slice(),
+            arr[3].as_slice(),
+        ))
     }
 }
 
@@ -474,13 +430,17 @@ mod tests {
 
         // …then corrupt the manifest so the V entry's slice would walk
         // off the end of the mmap. The bounds check should turn this
-        // into `None` rather than a panic.
+        // into `None` rather than a panic. Call `refresh_storage` so
+        // the trait facade picks up the corrupted manifest — direct
+        // substore mutation is a test-only pattern (production goes
+        // through loaders, which refresh automatically).
         let m = idx
             .projections
             .attn_q4k_manifest
             .as_mut()
             .expect("manifest");
         m[2] = (len, 1, "Q4_K".to_string()); // offset = len → end = len + 1 > mmap.len()
+        idx.refresh_storage();
         assert!(idx.attn_q4k_layer_data(0).is_none());
     }
 

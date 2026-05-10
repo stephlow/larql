@@ -46,6 +46,7 @@ impl VectorIndex {
 
         self.gate.gate_q4_mmap = Some(Arc::new(mmap));
         self.gate.gate_q4_slices = slices;
+        self.refresh_storage();
         Ok(())
     }
 
@@ -55,16 +56,10 @@ impl VectorIndex {
     }
 
     /// Get Q4 data slice for a layer's gate vectors. Returns the raw Q4_0 bytes.
+    ///
+    /// Forwarded through [`VectorIndex::storage`] (step 4 of the
+    /// `VindexStorage` migration).
     pub fn gate_q4_data(&self, layer: usize) -> Option<&[u8]> {
-        let mmap = self.gate.gate_q4_mmap.as_ref()?;
-        let slice = self.gate.gate_q4_slices.get(layer)?;
-        if slice.byte_len == 0 {
-            return None;
-        }
-        let end = slice.byte_offset + slice.byte_len;
-        if end > mmap.len() {
-            return None;
-        }
-        Some(&mmap[slice.byte_offset..end])
+        Some(self.storage.gate_q4_layer_data(layer)?.as_slice())
     }
 }

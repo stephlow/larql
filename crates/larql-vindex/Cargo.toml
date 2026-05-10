@@ -98,3 +98,11 @@ harness = false
 [[bench]]
 name = "walker_throughput"
 harness = false
+
+# Step 3 of the VindexStorage migration — perf gate before any
+# substore migration in step 4. Compares direct vs trait-static vs
+# trait-dyn dispatch on `interleaved_q4k_layer_data`. See the bench
+# file for the acceptance bar.
+[[bench]]
+name = "vindex_storage_dispatch"
+harness = false

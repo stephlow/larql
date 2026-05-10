@@ -62,6 +62,7 @@ impl VectorIndex {
             }
         }
         self.projections.lm_head_q4_mmap = Some(Arc::new(mmap));
+        self.refresh_storage();
         Ok(())
     }
 
@@ -111,6 +112,7 @@ impl VectorIndex {
         }
         let q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(&all_f32);
         self.projections.lm_head_q4_synth = Some(Arc::new(q4k));
+        self.refresh_storage();
     }
 
     /// Adopt the vindex's f16 `embeddings.bin` mmap as an f16 view of the
@@ -122,6 +124,7 @@ impl VectorIndex {
     /// on the mmap'd bytes, avoiding the 5.6 GB f32 clone on Gemma 4 31B.
     pub fn set_lm_head_f16_mmap(&mut self, mmap: Arc<memmap2::Mmap>) {
         self.projections.lm_head_f16_mmap = Some(mmap);
+        self.refresh_storage();
     }
 
     /// Whether an f16 mmap view of the LM head is available.
@@ -143,6 +146,7 @@ impl VectorIndex {
         let vocab = mmap.len() / (self.hidden_size * 4);
         self.vocab_size = vocab;
         self.projections.lm_head_mmap = Some(Arc::new(mmap));
+        self.refresh_storage();
         Ok(())
     }
 

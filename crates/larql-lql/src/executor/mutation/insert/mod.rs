@@ -25,7 +25,13 @@ mod plan;
 
 use crate::ast::InsertMode;
 use crate::error::LqlError;
+use crate::executor::tuning::DEFAULT_INSERT_ALPHA_MUL;
 use crate::executor::Session;
+
+/// Default `c_score` (confidence) for an INSERT without an explicit
+/// `CONFIDENCE` clause. 0.9 lands above the retrieval floor for both
+/// KNN and compose-mode installs.
+const DEFAULT_INSERT_CONFIDENCE: f32 = 0.9;
 
 impl Session {
     // Arg count mirrors the `Statement::Insert` AST variant 1:1 — each
@@ -52,14 +58,10 @@ impl Session {
 
         // ALPHA is the dimensionless multiplier on the layer's median
         // down-vector norm — the actual down vector written into the
-        // overlay is `target_embed_unit * d_ref * alpha_mul`. Default
-        // 0.1 matches the validated Python `install_compiled_slot`
-        // pipeline (`experiments/14_vindex_compilation`). Larger values
-        // push the new fact harder but dilute neighbours; smaller values
-        // reduce neighbour degradation. Validated range ~0.05–0.30.
-        const DEFAULT_ALPHA_MUL: f32 = 0.1;
-        let alpha_mul = alpha_override.unwrap_or(DEFAULT_ALPHA_MUL);
-        let c_score = confidence.unwrap_or(0.9);
+        // overlay is `target_embed_unit * d_ref * alpha_mul`. The
+        // default lives in `executor::tuning` (DEFAULT_INSERT_ALPHA_MUL).
+        let alpha_mul = alpha_override.unwrap_or(DEFAULT_INSERT_ALPHA_MUL);
+        let c_score = confidence.unwrap_or(DEFAULT_INSERT_CONFIDENCE);
 
         // ── Phase 1: plan ──
         let plan = self.plan_install(target, layer_hint)?;

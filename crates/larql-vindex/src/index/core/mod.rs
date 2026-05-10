@@ -24,9 +24,13 @@
 //! in a sibling module. Adding a new capability is one new sibling
 //! plus one `mod` line here.
 
+use std::sync::Arc;
+
 use ndarray::Array2;
 
-use super::storage::{FfnStore, GateStore, MetadataStore, ProjectionStore};
+use super::storage::{
+    FfnStore, GateStore, MetadataStore, MmapStorage, ProjectionStore, VindexStorage,
+};
 // Re-export all shared types from types.rs so external callers can
 // keep using `crate::index::core::{VectorIndex, FeatureMeta, …}` paths.
 pub use super::types::*;
@@ -61,11 +65,21 @@ pub struct VectorIndex {
     pub projections: ProjectionStore,
     /// down_meta + per-feature overrides.
     pub metadata: MetadataStore,
+
+    /// Mmap-agnostic byte-handle façade. Held as `Arc<dyn VindexStorage>`
+    /// so future Redis / S3 backends can plug in without rippling
+    /// through every `Arc<VectorIndex>` consumer in the workspace.
+    /// Today the only impl is [`MmapStorage`], rebuilt by
+    /// [`Self::refresh_storage`] after any loader mutates a substore
+    /// mmap field. Step 4 of the migration in `ROADMAP.md` (P0).
+    pub storage: Arc<dyn VindexStorage>,
 }
 
 impl Clone for VectorIndex {
     /// Each substore owns its own Clone semantics — Arc'd mmaps share,
     /// mutex/rwlock caches reset, atomics carry their values across.
+    /// `storage` is `Arc<dyn VindexStorage>` so cloning is a single
+    /// refcount bump.
     fn clone(&self) -> Self {
         Self {
             num_layers: self.num_layers,
@@ -76,6 +90,7 @@ impl Clone for VectorIndex {
             ffn: self.ffn.clone(),
             projections: self.projections.clone(),
             metadata: self.metadata.clone(),
+            storage: Arc::clone(&self.storage),
         }
     }
 }
@@ -94,6 +109,7 @@ impl VectorIndex {
             ffn: FfnStore::empty(num_layers),
             projections: ProjectionStore::empty(),
             metadata: MetadataStore::empty(num_layers),
+            storage: Arc::new(MmapStorage::empty(hidden_size)),
         }
     }
 
@@ -107,6 +123,9 @@ impl VectorIndex {
         let mut v = Self::empty(num_layers, hidden_size);
         v.gate.gate_vectors = gate_vectors;
         v.metadata.down_meta = down_meta;
+        // Heap mode — no mmap fields populated, but be consistent and
+        // refresh anyway.
+        v.refresh_storage();
         v
     }
 
@@ -125,7 +144,23 @@ impl VectorIndex {
         v.gate.gate_mmap_dtype = dtype;
         v.gate.gate_mmap_slices = gate_slices;
         v.metadata.down_meta_mmap = down_meta_mmap.map(std::sync::Arc::new);
+        v.refresh_storage();
         v
+    }
+
+    /// Rebuild [`Self::storage`] from the current substore state.
+    /// Loaders that mutate substore mmap or manifest fields call this
+    /// after the mutation completes, so the storage façade always
+    /// reflects what the substores hold.
+    ///
+    /// Cheap — every substore field clone is an `Arc` refcount bump
+    /// (or a `Vec` clone for manifests, which are small). The whole
+    /// rebuild is one allocation for the new `MmapStorage` plus a few
+    /// `Bytes::from_owner` calls.
+    pub(crate) fn refresh_storage(&mut self) {
+        let snapshot =
+            MmapStorage::from_substores(&self.ffn, &self.gate, &self.projections, self.hidden_size);
+        self.storage = Arc::new(snapshot);
     }
 
     /// Returns true if this index uses mmap'd gate vectors (zero heap copy).
@@ -224,6 +259,11 @@ mod refactor_tests {
         assert!(v.metadata.down_meta_mmap.is_none());
         assert!(v.metadata.down_overrides.is_empty());
         assert!(v.metadata.up_overrides.is_empty());
+
+        // Storage façade — empty MmapStorage on a freshly-empty index.
+        assert!(v.storage.interleaved_q4k_whole_buffer().is_none());
+        assert!(v.storage.attn_q4k_layer_data(0).is_none());
+        assert!(v.storage.lm_head_q4_bytes().is_none());
     }
 
     #[test]
@@ -260,6 +300,14 @@ mod refactor_tests {
         assert!(v.ffn.fp4_storage.is_none());
         assert_eq!(v.vocab_size, 0);
         assert_eq!(v.gate.f16_decode_cache.lock().unwrap().len(), 4);
+
+        // `new_mmap` calls `refresh_storage`, so the gate buffer is
+        // reachable through the storage façade.
+        let view = v.storage.gate_layer_view(0);
+        // No layer slices supplied → `gate_layer_view` is None
+        // (matches the empty-gate-mmap case in MmapStorage).
+        assert!(view.is_none());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

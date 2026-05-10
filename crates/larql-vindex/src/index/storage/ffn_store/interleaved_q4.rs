@@ -21,6 +21,7 @@ impl VectorIndex {
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_demand_paged(&file)? };
         self.ffn.interleaved_q4_mmap = Some(Arc::new(mmap));
+        self.refresh_storage();
         Ok(())
     }
 

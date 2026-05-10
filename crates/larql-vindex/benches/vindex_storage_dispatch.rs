@@ -14,25 +14,34 @@
 //!    vtable pointer. This is the shape `VectorIndex.storage` will
 //!    eventually hold.
 //!
-//! ## Acceptance bar
+//! ## Acceptance bar (met 2026-05-10 with `BytesView` redesign)
 //!
-//! `dyn` should be **within ~20% of direct** on this synthetic shape.
-//! Production hot paths fetch one layer of bytes and reuse the slice
-//! for every row in the inner decode loop, so any per-row trait cost
-//! is amortised away — the bench measures the per-layer-fetch
-//! overhead, which is the real cost. A blowout here (>2× of direct)
-//! says step 4 needs `impl VindexStorage` (generic) on hot paths
-//! instead of `dyn`.
+//! `dyn` is **within ~5% of direct** on layer-fetch and per-row.
+//! Last measured (M3 Max, release):
+//!
+//! | Path | Layer-fetch (3 layers) | Per-row (3 layers × 64 rows) |
+//! |---|---|---|
+//! | direct (`&[u8]` from `Arc<Mmap>`) | 9.49 ns | 69.30 ns |
+//! | mmap_storage_concrete (`BytesView`) | 10.10 ns (1.06×) | — |
+//! | mmap_storage_dyn (`BytesView`)      | 9.34 ns (0.98×)  | 71.13 ns (1.03×) |
+//!
+//! The `dyn` path matches direct because `BytesView::as_slice` is
+//! pure pointer arithmetic — no atomic touches per layer fetch. The
+//! earlier `Bytes`-returning shape paid 6 atomic ops per fetch
+//! (3× `Bytes::slice` increments + 3× `Bytes::drop` decrements) and
+//! measured 12× the direct cost; that prompted the redesign.
+//!
+//! `to_owned_bytes()` is the explicit opt-in for callers that need
+//! the bytes to outlive the borrow (Redis emit, cross-thread).
 //!
 //! Run: `cargo bench -p larql-vindex --bench vindex_storage_dispatch`
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::MmapOptions;
 
-use larql_vindex::index::storage::vindex_storage::{MmapStorage, VindexStorage};
+use larql_vindex::index::storage::vindex_storage::{BytesView, MmapStorage, VindexStorage};
 
 /// Build a synthetic `VectorIndex` with a populated FFN Q4_K manifest +
 /// matching anonymous mmap. Shape mimics a small real model:
@@ -78,8 +87,14 @@ fn build_fixture(
     // Construct an inert `VectorIndex` then poke the FFN substore
     // fields — same pattern the production loader uses (see
     // `ffn_store/interleaved_q4k.rs::load_interleaved_q4k`), minus
-    // the on-disk read.
-    let mut index = larql_vindex::index::VectorIndex::empty(num_layers, hidden);
+    // the on-disk read. `VectorIndex::new` (vs the crate-private
+    // `empty`) is the public constructor for in-memory builds.
+    let mut index = larql_vindex::index::VectorIndex::new(
+        vec![None; num_layers],
+        vec![None; num_layers],
+        num_layers,
+        hidden,
+    );
     index.ffn.interleaved_q4k_mmap = Some(Arc::new(mmap));
     index.ffn.interleaved_q4k_manifest = Some(manifest);
 
@@ -133,8 +148,8 @@ fn bench_layer_data_dispatch(c: &mut Criterion) {
                 let arr = storage_concrete
                     .interleaved_q4k_layer_data(layer)
                     .expect("layer present");
-                for (bytes, fmt) in arr.iter() {
-                    sink ^= bytes.len() ^ fmt.len();
+                for (view, fmt) in arr.iter() {
+                    sink ^= view.len() ^ fmt.len();
                 }
             }
             black_box(sink);
@@ -148,8 +163,8 @@ fn bench_layer_data_dispatch(c: &mut Criterion) {
                 let arr = storage_dyn
                     .interleaved_q4k_layer_data(layer)
                     .expect("layer present");
-                for (bytes, fmt) in arr.iter() {
-                    sink ^= bytes.len() ^ fmt.len();
+                for (view, fmt) in arr.iter() {
+                    sink ^= view.len() ^ fmt.len();
                 }
             }
             black_box(sink);
@@ -198,9 +213,10 @@ fn bench_per_row_amortisation(c: &mut Criterion) {
                 let arr = storage_dyn
                     .interleaved_q4k_layer_data(layer)
                     .expect("layer present");
-                let gate: &Bytes = &arr[0].0;
+                let gate: BytesView<'_> = arr[0].0;
+                let gate_slice = gate.as_slice();
                 for row in 0..rows_per_layer {
-                    sink = sink.wrapping_add(gate[row * 16] as usize);
+                    sink = sink.wrapping_add(gate_slice[row * 16] as usize);
                 }
             }
             black_box(sink);
@@ -209,5 +225,9 @@ fn bench_per_row_amortisation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_layer_data_dispatch, bench_per_row_amortisation);
+criterion_group!(
+    benches,
+    bench_layer_data_dispatch,
+    bench_per_row_amortisation
+);
 criterion_main!(benches);

@@ -18,16 +18,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::config::dtype::StorageDtype;
-use crate::index::storage::ffn_store::{
-    DownFeaturesQ4kEntry, FfnStore, FFN_COMPONENTS_PER_LAYER,
-};
 use crate::index::storage::attn::ATTN_TENSORS_PER_LAYER;
+use crate::index::storage::ffn_store::{DownFeaturesQ4kEntry, FfnStore, FFN_COMPONENTS_PER_LAYER};
 use crate::index::storage::gate_store::GateStore;
 use crate::index::storage::projection_store::ProjectionStore;
 use crate::index::types::{GateLayerSlice, GateQ4Slice};
 
 use super::sealed::Sealed;
-use super::{GateLayerView, VindexStorage};
+use super::{BytesView, GateLayerView, VindexStorage};
 
 /// Parity wrapper over today's substore mmaps. Implements
 /// `VindexStorage` by cloning each substore's `Arc<Mmap>` (or
@@ -104,10 +102,7 @@ impl MmapStorage {
             interleaved_q4k: ffn.interleaved_q4k_mmap.as_ref().map(arc_mmap_to_bytes),
             interleaved_q4k_manifest: ffn.interleaved_q4k_manifest.clone(),
             interleaved_q4: ffn.interleaved_q4_mmap.as_ref().map(arc_mmap_to_bytes),
-            down_features_q4k: ffn
-                .down_features_q4k_mmap
-                .as_ref()
-                .map(arc_mmap_to_bytes),
+            down_features_q4k: ffn.down_features_q4k_mmap.as_ref().map(arc_mmap_to_bytes),
             down_features_q4k_manifest: ffn.down_features_q4k_manifest.clone(),
 
             // Attention
@@ -120,10 +115,7 @@ impl MmapStorage {
 
             // lm_head
             lm_head_f32: projections.lm_head_mmap.as_ref().map(arc_mmap_to_bytes),
-            lm_head_f16: projections
-                .lm_head_f16_mmap
-                .as_ref()
-                .map(arc_mmap_to_bytes),
+            lm_head_f16: projections.lm_head_f16_mmap.as_ref().map(arc_mmap_to_bytes),
             lm_head_q4,
 
             // Gate
@@ -186,15 +178,15 @@ impl<T: AsRef<[u8]> + Send + Sync + 'static> AsRef<[u8]> for ArcAsBytes<T> {
     }
 }
 
-/// Bounds-check (`offset + length <= mmap.len()`) before slicing a
-/// `Bytes`. Matches the defensive helper used by every substore
-/// accessor that consults a stale-or-corrupt manifest.
-fn checked_slice(bytes: &Bytes, offset: usize, length: usize) -> Option<Bytes> {
+/// Bounds-check (`offset + length <= bytes.len()`) and build a
+/// borrowed `BytesView`. Matches the defensive behavior of every
+/// substore accessor that consults a stale-or-corrupt manifest.
+fn checked_view<'a>(bytes: &'a Bytes, offset: usize, length: usize) -> Option<BytesView<'a>> {
     let end = offset.checked_add(length)?;
     if end > bytes.len() {
         return None;
     }
-    Some(bytes.slice(offset..end))
+    Some(BytesView::new(bytes, offset, length))
 }
 
 impl VindexStorage for MmapStorage {
@@ -203,21 +195,21 @@ impl VindexStorage for MmapStorage {
     fn interleaved_q4k_layer_data(
         &self,
         layer: usize,
-    ) -> Option<[(Bytes, &str); FFN_COMPONENTS_PER_LAYER]> {
+    ) -> Option<[(BytesView<'_>, &str); FFN_COMPONENTS_PER_LAYER]> {
         let bytes = self.interleaved_q4k.as_ref()?;
         let manifest = self.interleaved_q4k_manifest.as_ref()?;
         let base = layer * FFN_COMPONENTS_PER_LAYER;
         if base + FFN_COMPONENTS_PER_LAYER > manifest.len() {
             return None;
         }
-        // Validate every entry's bytes range before forming the array.
+        // Validate every entry's range before forming the array.
         for i in 0..FFN_COMPONENTS_PER_LAYER {
             let (offset, length, _) = &manifest[base + i];
-            checked_slice(bytes, *offset, *length)?;
+            checked_view(bytes, *offset, *length)?;
         }
-        let out: [(Bytes, &str); FFN_COMPONENTS_PER_LAYER] = std::array::from_fn(|i| {
+        let out: [(BytesView<'_>, &str); FFN_COMPONENTS_PER_LAYER] = std::array::from_fn(|i| {
             let (offset, length, format) = &manifest[base + i];
-            (bytes.slice(*offset..*offset + *length), format.as_str())
+            (BytesView::new(bytes, *offset, *length), format.as_str())
         });
         Some(out)
     }
@@ -230,21 +222,21 @@ impl VindexStorage for MmapStorage {
         self.interleaved_q4.clone()
     }
 
-    fn down_features_q4k_layer_data(&self, layer: usize) -> Option<(Bytes, &str, usize)> {
+    fn down_features_q4k_layer_data(&self, layer: usize) -> Option<(BytesView<'_>, &str, usize)> {
         let bytes = self.down_features_q4k.as_ref()?;
         let manifest = self.down_features_q4k_manifest.as_ref()?;
         let entry = manifest.get(layer)?;
-        let slice = checked_slice(bytes, entry.offset, entry.length)?;
-        Some((slice, entry.format.as_str(), entry.padded_width))
+        let view = checked_view(bytes, entry.offset, entry.length)?;
+        Some((view, entry.format.as_str(), entry.padded_width))
     }
 
-    fn gate_q4_layer_data(&self, layer: usize) -> Option<Bytes> {
+    fn gate_q4_layer_data(&self, layer: usize) -> Option<BytesView<'_>> {
         let bytes = self.gate_q4_bytes.as_ref()?;
         let entry = self.gate_q4_slices.get(layer)?;
         if entry.byte_len == 0 {
             return None;
         }
-        checked_slice(bytes, entry.byte_offset, entry.byte_len)
+        checked_view(bytes, entry.byte_offset, entry.byte_len)
     }
 
     // ── Attention ─────────────────────────────────────────────────
@@ -252,7 +244,7 @@ impl VindexStorage for MmapStorage {
     fn attn_q4k_layer_data(
         &self,
         layer: usize,
-    ) -> Option<[(Bytes, &str); ATTN_TENSORS_PER_LAYER]> {
+    ) -> Option<[(BytesView<'_>, &str); ATTN_TENSORS_PER_LAYER]> {
         let bytes = self.attn_q4k.as_ref()?;
         let manifest = self.attn_q4k_manifest.as_ref()?;
         let base = layer * ATTN_TENSORS_PER_LAYER;
@@ -261,11 +253,11 @@ impl VindexStorage for MmapStorage {
         }
         for i in 0..ATTN_TENSORS_PER_LAYER {
             let (offset, length, _) = &manifest[base + i];
-            checked_slice(bytes, *offset, *length)?;
+            checked_view(bytes, *offset, *length)?;
         }
-        let out: [(Bytes, &str); ATTN_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
+        let out: [(BytesView<'_>, &str); ATTN_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
             let (offset, length, format) = &manifest[base + i];
-            (bytes.slice(*offset..*offset + *length), format.as_str())
+            (BytesView::new(bytes, *offset, *length), format.as_str())
         });
         Some(out)
     }
@@ -277,7 +269,7 @@ impl VindexStorage for MmapStorage {
     fn attn_q4_layer_slices(
         &self,
         layer: usize,
-    ) -> Option<[Bytes; ATTN_TENSORS_PER_LAYER]> {
+    ) -> Option<[BytesView<'_>; ATTN_TENSORS_PER_LAYER]> {
         let bytes = self.attn_q4.as_ref()?;
         let manifest = self.attn_q4_manifest.as_ref()?;
         let base = layer * ATTN_TENSORS_PER_LAYER;
@@ -286,11 +278,11 @@ impl VindexStorage for MmapStorage {
         }
         for i in 0..ATTN_TENSORS_PER_LAYER {
             let (offset, length) = &manifest[base + i];
-            checked_slice(bytes, *offset, *length)?;
+            checked_view(bytes, *offset, *length)?;
         }
-        let out: [Bytes; ATTN_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
+        let out: [BytesView<'_>; ATTN_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
             let (offset, length) = &manifest[base + i];
-            bytes.slice(*offset..*offset + *length)
+            BytesView::new(bytes, *offset, *length)
         });
         Some(out)
     }
@@ -298,7 +290,7 @@ impl VindexStorage for MmapStorage {
     fn attn_q8_layer_data(
         &self,
         layer: usize,
-    ) -> Option<[(Bytes, Bytes); ATTN_TENSORS_PER_LAYER]> {
+    ) -> Option<[(BytesView<'_>, BytesView<'_>); ATTN_TENSORS_PER_LAYER]> {
         let bytes = self.attn_q8.as_ref()?;
         let manifest = self.attn_q8_manifest.as_ref()?;
         let base = layer * ATTN_TENSORS_PER_LAYER;
@@ -313,12 +305,13 @@ impl VindexStorage for MmapStorage {
                 return None;
             }
         }
-        let out: [(Bytes, Bytes); ATTN_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
-            let (offset, vals_len, scales_len) = manifest[base + i];
-            let vals = bytes.slice(offset..offset + vals_len);
-            let scales = bytes.slice(offset + vals_len..offset + vals_len + scales_len);
-            (vals, scales)
-        });
+        let out: [(BytesView<'_>, BytesView<'_>); ATTN_TENSORS_PER_LAYER] =
+            std::array::from_fn(|i| {
+                let (offset, vals_len, scales_len) = manifest[base + i];
+                let vals = BytesView::new(bytes, offset, vals_len);
+                let scales = BytesView::new(bytes, offset + vals_len, scales_len);
+                (vals, scales)
+            });
         Some(out)
     }
 
@@ -338,14 +331,14 @@ impl VindexStorage for MmapStorage {
 
     // ── Gate ──────────────────────────────────────────────────────
 
-    fn gate_layer_view(&self, layer: usize) -> Option<GateLayerView> {
+    fn gate_layer_view(&self, layer: usize) -> Option<GateLayerView<'_>> {
         let bytes = self.gate_bytes.as_ref()?;
-        let slice = self.gate_slices.get(layer)?.clone();
+        let slice = *self.gate_slices.get(layer)?;
         if slice.num_features == 0 {
             return None;
         }
         Some(GateLayerView {
-            bytes: bytes.clone(),
+            bytes,
             dtype: self.gate_dtype,
             slice,
         })
@@ -393,10 +386,10 @@ mod tests {
 
         for layer in 0..3 {
             let arr = s.interleaved_q4k_layer_data(layer).expect("layer present");
-            for (c, (b, fmt)) in arr.iter().enumerate() {
+            for (c, (view, fmt)) in arr.iter().enumerate() {
                 let global = layer * FFN_COMPONENTS_PER_LAYER + c;
                 let expected: &[u8] = &payload[global * 16..(global + 1) * 16];
-                assert_eq!(b.as_ref(), expected, "layer {layer} comp {c}");
+                assert_eq!(view.as_slice(), expected, "layer {layer} comp {c}");
                 assert_eq!(*fmt, "Q4_K");
             }
         }
@@ -434,9 +427,9 @@ mod tests {
         assert!(s.attn_q8_layer_data(0).is_none());
     }
 
-    /// `GateLayerView` carries the dtype + slice + bytes together.
-    /// Cloning the view is refcount-only; the underlying buffer
-    /// pointer doesn't change.
+    /// `GateLayerView<'_>` borrows the dtype + slice + bytes
+    /// together. The view is `Copy`, so multiple holders share the
+    /// same borrow without refcount touches.
     #[test]
     fn gate_layer_view_round_trip() {
         let mut s = MmapStorage::empty(4);
@@ -455,8 +448,8 @@ mod tests {
         let v0 = s.gate_layer_view(0).expect("layer 0 present");
         assert_eq!(v0.dtype, StorageDtype::F16);
         assert_eq!(v0.slice.num_features, 1);
-        let v0_clone = v0.clone();
-        assert_eq!(v0.bytes.as_ptr(), v0_clone.bytes.as_ptr());
+        let v0_copy = v0; // `Copy`, no clone needed.
+        assert_eq!(v0.bytes.as_ptr(), v0_copy.bytes.as_ptr());
     }
 
     /// `gate_layer_view` returns `None` when the layer's

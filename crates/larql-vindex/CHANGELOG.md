@@ -6,6 +6,130 @@ The format follows the conventions of [Keep a Changelog](https://keepachangelog.
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-10] — `VindexStorage` trait skeleton + `MmapStorage` parity wrapper
+
+Steps 1–3 of the `VindexStorage` migration (P0 active in
+`ROADMAP.md`).
+
+### Step 1 — sealed trait skeleton
+- New `index/storage/vindex_storage/mod.rs`: `VindexStorage` trait
+  sealed via private `sealed::Sealed` supertrait, 14 byte-yielding
+  methods covering all hot-path substore reaches (FFN Q4_K +
+  whole-buffer, attn Q4_K/Q4/Q8, lm_head Q4/f16/f32, gate views,
+  W2 down). FP4 + DownMeta deliberately not behind the trait:
+  both carry richer per-feature decoders that aren't a clean fit
+  for the byte-handle abstraction. Documented inline.
+- `bytes = "1"` added to vindex Cargo.toml (already transitive via
+  reqwest / hf-hub).
+
+### Step 2 — `MmapStorage` parity impl
+- Sibling `mmap_storage.rs` with the production
+  `VindexStorage` impl backed by cloned substore mmap fields.
+  `from_substores(&FfnStore, &GateStore, &ProjectionStore, hidden_size)`
+  for prod wiring; `empty(hidden)` for tests / inert indices.
+- `Arc<Mmap>` and `Arc<Vec<u8>>` (synth lm_head) bridge to
+  `Bytes::from_owner` via a generic `ArcAsBytes<T: AsRef<[u8]>>`
+  newtype.
+- 7 inline tests (parity, out-of-bounds rejection, refcount-clone).
+
+### Step 3 — `BytesView<'_>` redesign + Criterion bench gate
+First pass returned `Bytes` from per-layer accessors. Bench showed
+that scheme paid **6 atomic ops per fetch** (3× `Bytes::slice` +
+3× `Bytes::drop`) — measured 12× the direct cost on layer-fetch,
+2.4× on per-row. That's a no-go for the `Arc<dyn VindexStorage>`
+hot path.
+
+Redesign: per-layer accessors return `BytesView<'a>` — a borrowed
+`(&'a Bytes, offset, length)` triple with `as_slice() -> &'a [u8]`
+(zero atomics, pure pointer arithmetic) and `to_owned_bytes()` as
+the opt-in refcounted handle for callers that need the bytes to
+outlive the borrow. Whole-file accessors keep `Bytes` (one-time
+fetch, not hot).
+
+Numbers after the redesign (M3 Max, release):
+
+| Path | Layer-fetch (3 layers) | Per-row (3 layers × 64 rows) |
+|---|---|---|
+| direct (`&[u8]`) | 9.49 ns | 69.30 ns |
+| `MmapStorage` concrete | 10.10 ns (1.06×) | — |
+| `MmapStorage` via `Arc<dyn>` | 9.34 ns (0.98×) | 71.13 ns (1.03×) |
+
+Both gaps within noise. `dyn` even slightly faster than direct on
+layer-fetch (the optimizer hoists `BytesView` construction). Step 4
+(substore migration) clear to proceed without anxiety.
+
+`GateLayerView` made borrowed for consistency: `Copy` instead of
+`Clone`, `bytes: &'a Bytes` instead of `bytes: Bytes`. Replaces the
+three-field substore reach (`gate_mmap_bytes` +
+`gate_mmap_slices[layer]` + `gate_mmap_dtype`).
+
+### Tests + tooling
+- Lib tests **866 → 877** (+11: trait skeleton ×3, MmapStorage ×7,
+  BytesView round-trip ×1).
+- New bench `benches/vindex_storage_dispatch.rs` registered in
+  Cargo.toml — runnable via
+  `cargo bench -p larql-vindex --bench vindex_storage_dispatch`.
+- `cargo clippy --lib --tests --benches -- -D warnings`: clean.
+- No callsite changes — purely additive.
+
+### Step 4 — `storage` field on `VectorIndex` + accessor migration
+
+- New `storage: Arc<dyn VindexStorage>` field on `VectorIndex`.
+  Initialized in `empty` / `new` / `new_mmap` to
+  `Arc::new(MmapStorage::empty(hidden))`; populated state captured
+  by a new `pub(crate) fn refresh_storage(&mut self)` that rebuilds
+  via `MmapStorage::from_substores(...)`.
+- Loaders that mutate substore mmap or manifest fields call
+  `refresh_storage()` at the end:
+  `load_attn_q8` / `load_attn_q4k` / `load_attn_q4`,
+  `load_lm_head_q4` / `synthesize_lm_head_q4` / `set_lm_head_f16_mmap`
+  / `load_lm_head`, `load_interleaved_q4k` / `load_down_features_q4k`,
+  `load_interleaved_q4`, `load_gate_q4`. `Clone for VectorIndex`
+  also clones the `Arc<dyn VindexStorage>` (single refcount bump).
+- Per-layer byte-yielding accessors migrated to forward through
+  `self.storage` — public signatures unchanged so no callsites
+  move:
+  - `attn_q4k_layer_data` / `attn_q8_layer_data` /
+    `attn_q4_layer_slices` (attn.rs)
+  - `interleaved_q4k_layer_data` / `down_features_q4k_layer_data`
+    (ffn_store/interleaved_q4k.rs)
+  - `gate_q4_data` (ffn_store/gate_q4.rs)
+- Whole-buffer accessors (`attn_q4_data`, `interleaved_q4k_mmap_ref`,
+  `interleaved_q4_mmap_ref`) **not migrated in this step** — they
+  return `&[u8]` borrowing from the substore mmap, which doesn't
+  cleanly reshape through the `Bytes`-returning whole-buffer trait
+  methods. Step 5 (which drops the substore mmap fields) will
+  address this with an API-shape decision.
+
+### Coverage
+
+- `vindex_storage/mod.rs`: **98.00%** (49/50 lines) — clears the
+  90% per-file default.
+- `vindex_storage/mmap_storage.rs`: **93.69%** (297/317 lines) —
+  clears the 90% per-file default.
+- `attn.rs`: 56.1% → **83.29%** (forwarder shrunk the file;
+  baseline raised in `coverage-policy.json` per the
+  ratchet-up-only rule).
+- `ffn_store/interleaved_q4k.rs`: 56.7% → **62.86%** (same
+  pattern; baseline raised).
+- `lm_head/loaders.rs`: 90.59% (clears 90%).
+- `core/mod.rs`: 97.05% (clears 90%).
+
+### Tests + tooling
+- Lib tests stay at **877** (one attn bounds test updated to call
+  `refresh_storage` after the simulated stale-manifest poke —
+  direct substore mutation is a test-only pattern; production goes
+  through loaders that refresh automatically).
+- `cargo clippy --lib --tests --benches -- -D warnings`: clean.
+- No external API change — public `&[u8]` / `&[f32]` accessor
+  signatures unchanged.
+
+### Open
+- Step 5: drop substore `Arc<Mmap>` fields; compiler flags any
+  remaining `pub` field reach (~155 sites across 19 files per the
+  2026-05-10 audit). Whole-buffer accessor API shape resolved at
+  the same time.
+
 ## [2026-05-10] — Per-layer FFN Phase 2 closed
 
 Cool-machine bench rerun reproduced both baselines (4B ≥ 80 tok/s,
