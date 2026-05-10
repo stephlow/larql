@@ -15,7 +15,7 @@ use crate::error::VindexError;
 use crate::format::filenames::*;
 
 use super::publish::get_hf_token;
-use super::{VINDEX_CORE_FILES, VINDEX_WEIGHT_FILES};
+use super::{vindex_core_files, VINDEX_METADATA_FILES, VINDEX_WEIGHT_FILES};
 use helpers::{hf_cache_repo_dir, strip_etag_quoting, want_model_file};
 
 /// Which side of the HF API a repo lives on. Datasets are how vindexes
@@ -135,8 +135,13 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
         .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
         .to_path_buf();
 
-    // Download core files (needed for browse)
-    for filename in VINDEX_CORE_FILES {
+    // Download METADATA-only by default. Big tensor files
+    // (`gate_vectors.bin`, `embeddings.bin`) are deferred — `larql show`
+    // and similar metadata-only commands shouldn't pay for a multi-GB
+    // download. Callers that actually need the tensors (run / walk) use
+    // `resolve_hf_vindex_with_progress` (which still pulls them eagerly)
+    // or `download_hf_weights`.
+    for filename in VINDEX_METADATA_FILES {
         if *filename == INDEX_JSON {
             continue; // already downloaded
         }
@@ -349,7 +354,9 @@ where
 
     // Probe each repo kind in publish-default order. The first kind that
     // returns index.json (cache hit or download) is the winner; we then
-    // fetch the rest of `VINDEX_CORE_FILES` from that same handle.
+    // fetch the rest of `vindex_core_files()` (metadata + big tensor
+    // files) from that same handle. Callers here have committed to
+    // displaying a progress bar — they accept the wait.
     for kind in HF_PULL_REPO_KINDS {
         let repo = hf_repo(&api, &repo_id, revision.as_deref(), kind);
 
@@ -385,8 +392,8 @@ where
             .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
             .to_path_buf();
 
-        for filename in VINDEX_CORE_FILES {
-            if *filename == INDEX_JSON {
+        for filename in vindex_core_files() {
+            if filename == INDEX_JSON {
                 continue;
             }
             // Optional files — ignore failures (missing from repo is fine).

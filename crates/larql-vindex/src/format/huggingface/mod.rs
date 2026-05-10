@@ -15,24 +15,38 @@
 //! - [`discovery`] — collections, repo existence, item fetch
 //!
 //! Shared constants live here. Each submodule re-imports them via
-//! `use super::{VINDEX_CORE_FILES, VINDEX_WEIGHT_FILES}`.
+//! `use super::{VINDEX_METADATA_FILES, VINDEX_BIN_FILES, vindex_core_files,
+//! VINDEX_WEIGHT_FILES}`.
 
 use crate::format::filenames::*;
 
-/// The files that make up a vindex, in priority order for lazy
-/// loading. Used by `download` to decide which pieces a partial
-/// fetch should include first, and by `publish` to walk the upload
-/// list deterministically.
-pub(crate) const VINDEX_CORE_FILES: &[&str] = &[
+/// Small metadata files needed to describe a vindex (`larql show`,
+/// browse-tier UIs, schema introspection). All of these together stay
+/// well under a few MB on a typical vindex, so they're safe to fetch
+/// eagerly even on slow links.
+pub(crate) const VINDEX_METADATA_FILES: &[&str] = &[
     INDEX_JSON,
     TOKENIZER_JSON,
-    GATE_VECTORS_BIN,
-    EMBEDDINGS_BIN,
     DOWN_META_BIN,
     DOWN_META_JSONL,
     RELATION_CLUSTERS_JSON,
     FEATURE_LABELS_JSON,
 ];
+
+/// Big tensor files lazy-pulled on first walk/run. These can be
+/// hundreds of MB to multiple GB; metadata-only commands like
+/// `larql show` shouldn't pay for them. Callers that actually need
+/// the tensors (run / walk / extract) use the progress-aware
+/// entrypoint that pulls METADATA + BIN together.
+pub(crate) const VINDEX_BIN_FILES: &[&str] = &[GATE_VECTORS_BIN, EMBEDDINGS_BIN];
+
+/// Union of metadata + bin — preserves prior CORE behavior for the
+/// progress-aware entrypoint that is willing to wait on big files.
+pub(crate) fn vindex_core_files() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = VINDEX_METADATA_FILES.to_vec();
+    v.extend_from_slice(VINDEX_BIN_FILES);
+    v
+}
 
 pub(crate) const VINDEX_WEIGHT_FILES: &[&str] = &[
     ATTN_WEIGHTS_BIN,
