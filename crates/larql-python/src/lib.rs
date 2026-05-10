@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use larql_core as lq;
-use larql_inference as li;
+use larql_vindex as lv;
 
 mod session;
 mod trace_py;
@@ -647,7 +647,7 @@ fn weight_walk(
     top_k: usize,
     min_score: f32,
 ) -> PyResult<PyGraph> {
-    let config = li::WalkConfig { top_k, min_score };
+    let config = lv::WalkConfig { top_k, min_score };
     let layers: Option<Vec<usize>> = layer.map(|l| vec![l]);
 
     let mut graph = lq::Graph::new();
@@ -660,9 +660,9 @@ fn weight_walk(
         serde_json::Value::String("weight-walk".to_string()),
     );
 
-    let mut callbacks = li::walker::weight_walker::SilentWalkCallbacks;
+    let mut callbacks = lv::walker::weight_walker::SilentWalkCallbacks;
 
-    li::walk_model(
+    lv::walk_model(
         model_path,
         layers.as_deref(),
         &config,
@@ -688,10 +688,10 @@ fn attention_walk(
     top_k: usize,
     min_score: f32,
 ) -> PyResult<PyGraph> {
-    let walker = li::AttentionWalker::load(model_path)
+    let walker = lv::AttentionWalker::load(model_path)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-    let config = li::WalkConfig { top_k, min_score };
+    let config = lv::WalkConfig { top_k, min_score };
 
     let mut graph = lq::Graph::new();
     graph.metadata.insert(
@@ -708,7 +708,7 @@ fn attention_walk(
         None => (0..walker.num_layers()).collect(),
     };
 
-    let mut callbacks = li::walker::weight_walker::SilentWalkCallbacks;
+    let mut callbacks = lv::walker::weight_walker::SilentWalkCallbacks;
     for &l in &layers {
         walker
             .walk_layer(l, &config, &mut graph, &mut callbacks)
