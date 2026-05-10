@@ -130,7 +130,7 @@ fn write_synthetic_mixtral_model(
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
 
     // Minimal BPE tokenizer — enough for safetensors-backed extracts
@@ -367,7 +367,7 @@ fn write_synthetic_gemma4_hybrid_moe(
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
 
     let tok_json =
@@ -622,7 +622,7 @@ fn write_synthetic_gpt_oss_model(
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
 
     let tok_json =

@@ -111,7 +111,7 @@ fn make_model(dir: &Path, hidden: usize, intermediate: usize, num_layers: usize,
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(dir.join("model.safetensors"), &serialized).unwrap();
 }
 

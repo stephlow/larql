@@ -244,7 +244,7 @@ fn write_synthetic_llama_model(
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
     let tok_json =
         r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;

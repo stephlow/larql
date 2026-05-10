@@ -216,7 +216,7 @@ fn write_safetensors(dir: &Path, tensors: &HashMap<String, (Vec<f32>, Vec<usize>
             .unwrap(),
         );
     }
-    let serialized = safetensors::tensor::serialize(&data_map, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(&data_map, None).unwrap();
     std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
 }
 

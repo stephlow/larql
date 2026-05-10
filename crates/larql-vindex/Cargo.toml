@@ -32,7 +32,7 @@ sha2 = "0.10"
 base64 = "0.22"
 
 # Model weights (for safetensors loading during extract)
-safetensors = "0.5"
+safetensors = "0.7"
 memmap2 = "0.9"
 
 # Refcounted, slice-cheap byte handle returned by the `VindexStorage`

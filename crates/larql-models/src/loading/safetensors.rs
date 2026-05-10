@@ -584,8 +584,98 @@ fn tensor_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>,
         }
         safetensors::Dtype::F16 => Ok(half::decode_f16(view.data())),
         safetensors::Dtype::BF16 => Ok(half::decode_bf16(view.data())),
+
+        // ── FP8 / I8 — used by DeepSeek-V4 (MXFP4 experts), GPT-OSS, etc. ──
+        // Decoded bit-pattern → f32 in isolation. MXFP4 unpacking proper (where
+        // an I8 packed-nibble weight is paired with its F8_E8M0 scale companion)
+        // happens at the FFN tensor loading layer — `tensor_to_f32` sees one
+        // tensor at a time and can't look at companions.
+        safetensors::Dtype::F8_E4M3 => Ok(decode_f8_e4m3(view.data())),
+        safetensors::Dtype::F8_E5M2 => Ok(decode_f8_e5m2(view.data())),
+        safetensors::Dtype::F8_E8M0 => Ok(decode_f8_e8m0(view.data())),
+        safetensors::Dtype::I8 => Ok(view.data().iter().map(|&b| (b as i8) as f32).collect()),
+
         other => Err(ModelError::UnsupportedDtype(format!("{other:?}"))),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// FP8 / E8M0 decoders — bit-pattern → f32. Operate per-byte on the raw view.
+// Standard Open Compute Project encodings; verified against the F8_E*M* table
+// in the safetensors crate (≥ 0.7).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// FP8 E4M3 (FN, finite-only): 1 sign + 4 exponent + 3 mantissa bits, bias 7.
+/// NaN encoded at 0x7F / 0xFF (Open Compute convention).
+#[inline]
+fn decode_f8_e4m3(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .iter()
+        .map(|&b| {
+            let sign = (b >> 7) & 1;
+            let exp_bits = (b >> 3) & 0x0F;
+            let mant_bits = b & 0x07;
+            let v = if exp_bits == 0 {
+                (mant_bits as f32) / 8.0 * 2f32.powi(1 - 7)
+            } else if exp_bits == 0x0F && mant_bits == 0x07 {
+                f32::NAN
+            } else {
+                let m = 1.0 + (mant_bits as f32) / 8.0;
+                m * 2f32.powi(exp_bits as i32 - 7)
+            };
+            if sign == 1 {
+                -v
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// FP8 E5M2: 1 sign + 5 exponent + 2 mantissa bits, bias 15.
+#[inline]
+fn decode_f8_e5m2(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .iter()
+        .map(|&b| {
+            let sign = (b >> 7) & 1;
+            let exp_bits = (b >> 2) & 0x1F;
+            let mant_bits = b & 0x03;
+            let v = if exp_bits == 0 {
+                (mant_bits as f32) / 4.0 * 2f32.powi(1 - 15)
+            } else if exp_bits == 0x1F {
+                if mant_bits == 0 {
+                    f32::INFINITY
+                } else {
+                    f32::NAN
+                }
+            } else {
+                let m = 1.0 + (mant_bits as f32) / 4.0;
+                m * 2f32.powi(exp_bits as i32 - 15)
+            };
+            if sign == 1 {
+                -v
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// FP8 E8M0 (Open Compute Microscaling MX format scale): 8 exponent bits, no
+/// sign or mantissa. Value = 2^(byte - 127). Byte 0xFF reserved as NaN.
+#[inline]
+fn decode_f8_e8m0(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b == 0xFF {
+                f32::NAN
+            } else {
+                2f32.powi(b as i32 - 127)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

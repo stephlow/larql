@@ -111,7 +111,7 @@ fn write_synth_model(model_dir: &Path) {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =

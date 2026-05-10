@@ -346,7 +346,7 @@ fn make_synthetic_model(
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(dir.join("model.safetensors"), &serialized).unwrap();
 }
 

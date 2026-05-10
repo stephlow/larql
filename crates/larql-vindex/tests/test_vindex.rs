@@ -2561,7 +2561,7 @@ fn streaming_extract_from_safetensors() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     // Write tokenizer
@@ -2765,7 +2765,7 @@ fn streaming_extract_q4k_from_safetensors() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =
@@ -3729,7 +3729,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =
@@ -4018,7 +4018,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =

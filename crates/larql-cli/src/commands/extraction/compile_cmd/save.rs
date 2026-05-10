@@ -110,7 +110,7 @@ pub fn write_safetensors(
         );
     }
 
-    let serialized = serialize(&views, &None)?;
+    let serialized = serialize(&views, None)?;
     std::fs::write(path, serialized)?;
     Ok(())
 }
