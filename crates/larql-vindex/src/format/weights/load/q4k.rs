@@ -262,4 +262,3 @@ pub fn load_model_weights_q4k_shard(
         arch,
     })
 }
-

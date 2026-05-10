@@ -13,7 +13,7 @@
 //!                    PUT + `CountingReader`
 
 mod lfs;
-mod protocol;
+pub(super) mod protocol;
 mod remote;
 mod upload;
 

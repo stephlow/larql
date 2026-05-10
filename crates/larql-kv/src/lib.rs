@@ -469,4 +469,81 @@ mod compliance_tests {
             );
         }
     }
+
+    /// Synthetic engine that does not override `prefill_q4k` /
+    /// `decode_step_q4k`. Exercises the default trait methods that route to
+    /// the f32 fallback — every shipped engine overrides these, so without
+    /// this fixture they sit at 0% line coverage.
+    struct DefaultMethodsEngine {
+        /// Counts calls to `prefill` to confirm the q4k → prefill fallback
+        /// path actually dispatches through the f32 method.
+        prefill_calls: usize,
+        decode_calls: usize,
+    }
+
+    impl KvEngine for DefaultMethodsEngine {
+        fn name(&self) -> &str {
+            "default-methods-test"
+        }
+        fn info(&self) -> EngineInfo {
+            EngineInfo {
+                name: self.name().into(),
+                description: "test fixture".into(),
+                backend: "cpu".into(),
+                config: String::new(),
+            }
+        }
+        fn prefill(&mut self, _weights: &ModelWeights, _token_ids: &[u32]) -> Option<Array2<f32>> {
+            self.prefill_calls += 1;
+            Some(Array2::zeros((1, 4)))
+        }
+        fn decode_step(&mut self, _weights: &ModelWeights, _token_id: u32) -> Option<Array2<f32>> {
+            self.decode_calls += 1;
+            Some(Array2::zeros((1, 4)))
+        }
+        fn memory_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn default_q4k_methods_fallback_to_f32() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = cpu_backend();
+        let mut engine = DefaultMethodsEngine {
+            prefill_calls: 0,
+            decode_calls: 0,
+        };
+
+        // Build a separate &mut binding for the `prefill_q4k` call.
+        let mut weights_for_q4k = larql_inference::test_utils::make_test_weights();
+        let out = engine.prefill_q4k(&mut weights_for_q4k, &index, &[1, 2, 3], &*backend);
+        assert!(out.is_some());
+        assert_eq!(
+            engine.prefill_calls, 1,
+            "default prefill_q4k must call prefill"
+        );
+
+        let out = engine.decode_step_q4k(&mut weights_for_q4k, &index, 4, &*backend);
+        assert!(out.is_some());
+        assert_eq!(
+            engine.decode_calls, 1,
+            "default decode_step_q4k must call decode_step"
+        );
+    }
+
+    #[test]
+    fn default_window_tokens_and_cold_bytes_are_zero() {
+        // Both have default impls returning 0; exercises the trait defaults
+        // for an engine that doesn't override them.
+        let engine = DefaultMethodsEngine {
+            prefill_calls: 0,
+            decode_calls: 0,
+        };
+        assert_eq!(engine.window_tokens(), 0);
+        assert_eq!(engine.cold_bytes(), 0);
+        assert!(engine.stage_summary().is_none());
+        assert_eq!(engine.name(), "default-methods-test");
+    }
 }

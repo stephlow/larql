@@ -15,7 +15,10 @@ fn bench_prefill(c: &mut Criterion) {
     let prompt: Vec<u32> = (0..8).collect();
 
     let kinds = [
-        ("markov-rs", EngineKind::MarkovResidual { window_size: None }),
+        (
+            "markov-rs",
+            EngineKind::MarkovResidual { window_size: None },
+        ),
         (
             "unlimited-context",
             EngineKind::UnlimitedContext { window_size: 4 },
@@ -48,7 +51,10 @@ fn bench_decode_step(c: &mut Criterion) {
     let prompt: Vec<u32> = (0..8).collect();
 
     let kinds = [
-        ("markov-rs", EngineKind::MarkovResidual { window_size: None }),
+        (
+            "markov-rs",
+            EngineKind::MarkovResidual { window_size: None },
+        ),
         (
             "unlimited-context",
             EngineKind::UnlimitedContext { window_size: 4 },

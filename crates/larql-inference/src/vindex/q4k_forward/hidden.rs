@@ -25,8 +25,8 @@ pub fn predict_q4k_hidden(
 
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
     let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
-    let dump_dir = std::env::var("LARQL_CPU_DUMP_LAYERS").ok();
-    if let Some(ref dir) = dump_dir {
+    let dump_dir = crate::forward::dump_config::DumpConfig::get().layer_dir();
+    if let Some(dir) = dump_dir {
         let slice = h.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
         let _ = std::fs::write(format!("{dir}/cpu_h_embed.f32"), &bytes);
@@ -139,7 +139,7 @@ fn run_moe_layer_cpu(
         (h_pa, Some((k_rope, v_final)))
     };
 
-    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+    if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
         let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");
@@ -183,13 +183,9 @@ fn run_moe_layer_cpu(
 
     let combined = &h1 + &h2;
 
-    let l0_stage_dump = if layer == 0 {
-        std::env::var("LARQL_CPU_STAGE_DUMP").ok()
-    } else {
-        None
-    };
+    let l0_stage_dump = crate::forward::dump_config::DumpConfig::get().stage_dir(layer);
     let dump_l0_arr = |name: &str, arr: &Array2<f32>| {
-        if let Some(ref dir) = l0_stage_dump {
+        if let Some(dir) = l0_stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);
             let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = std::fs::write(format!("{dir}/cpu_L0_{name}.f32"), &bytes);

@@ -57,6 +57,14 @@ impl MetalBackend {
     /// top-level path; the layer's per-projection formats select the
     /// inner shader. Behaviour mirrors the inline form previously in
     /// `decode/mod.rs` byte-for-byte.
+    ///
+    /// **M2 migration note (2026-05-09)**: this function reads the
+    /// layer through structured views (`weights().attention.{wq,wk,wv}`,
+    /// `norms().{norm_type, ...}`) instead of touching `layer.wq` /
+    /// `layer.norm_type` directly. The inner helpers (`encode_q4k_qkv`,
+    /// `encode_q4k_input_norm`, etc.) still take `&FullPipelineLayer`
+    /// — migrating them is the next step. See modularity tracker M2 in
+    /// ROADMAP.md for the full migration plan.
     pub(super) fn encode_input_norm_and_qkv(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -77,6 +85,15 @@ impl MetalBackend {
             // by defusing. `LARQL_QKV_FUSED=1` opts back in.
             // Cached at startup; see `metal::flags::DecodeFlags`.
             let use_fused = self.decode_flags.qkv_fused;
+
+            // Pull structured views once at the top — replaces the
+            // direct `layer.wq.format` / `layer.norm_type` /
+            // `layer.input_norm_bias` reads scattered through the
+            // function body. The compiler optimises the view methods
+            // to plain field copies, so this is zero-cost.
+            let weights = layer.weights().attention;
+            let norms = layer.norms();
+
             // Route descriptor — replaces the inline `(q, k, v)`
             // boolean conjunction. The normed-QKV opt-in fires only on
             // the mixed-Q4K-Q6K-V route today, but reading it through
@@ -85,12 +102,12 @@ impl MetalBackend {
             // by `q4k_q6k_qkv_proj_normed`) lands as one match arm
             // here, not a new boolean.
             use crate::metal::stages::qkv_proj::{pick_qkv_route, QkvFormatRoute};
-            let route = pick_qkv_route(layer.wq.format, layer.wk.format, layer.wv.format);
+            let route = pick_qkv_route(weights.wq.format, weights.wk.format, weights.wv.format);
             let mixed_q4k_q6k_v = matches!(route, QkvFormatRoute::MixedQ4kQ6kV);
             if mixed_q4k_q6k_v
                 && use_fused
-                && layer.norm_type == crate::NormType::RmsNorm
-                && layer.input_norm_bias.is_none()
+                && norms.norm_type == crate::NormType::RmsNorm
+                && norms.input_norm_bias.is_none()
             {
                 // Fused norm+QKV path always recomputes norm internally;
                 // `input_already_normed` is ignored here.
@@ -131,7 +148,11 @@ impl MetalBackend {
             ..
         } = dims;
 
-        if layer.norm_type == crate::NormType::LayerNorm {
+        // M2: read through the structured norm view. `norms.norm_type`
+        // is the only `layer.*` field this function consumes; the rest
+        // of the inputs are already pre-extracted into `bufs` and `dims`.
+        let norms = layer.norms();
+        if norms.norm_type == crate::NormType::LayerNorm {
             let len_val = hidden as u32;
             if let Some(bias) = bufs.input_norm_bias {
                 let bias_buf = self.bufs.get_f32(bias);
@@ -184,11 +205,19 @@ impl MetalBackend {
             ..
         } = dims;
 
+        // M2: read attention weights through the structured view rather
+        // than touching `layer.wq` / `layer.wk` / `layer.wv` directly.
+        let attn_weights = layer.weights().attention;
+
         // Format-route descriptor — single source of truth for how a
         // `(q, k, v)` triple maps to a fused QKV pipeline. See
         // `metal::stages::qkv_proj::pick_qkv_route` for the table.
         use crate::metal::stages::qkv_proj::{pick_qkv_route, QkvFormatRoute};
-        let route = pick_qkv_route(layer.wq.format, layer.wk.format, layer.wv.format);
+        let route = pick_qkv_route(
+            attn_weights.wq.format,
+            attn_weights.wk.format,
+            attn_weights.wv.format,
+        );
 
         match route {
             QkvFormatRoute::UniformQ4K | QkvFormatRoute::UniformQ4Kf => {
@@ -275,21 +304,21 @@ impl MetalBackend {
                     0,
                     [
                         Proj {
-                            format: layer.wq.format,
+                            format: attn_weights.wq.format,
                             w_buf: bufs.wq,
                             out_buf: bufs.q_out,
                             out_off: 0,
                             rows: layer_q_dim,
                         },
                         Proj {
-                            format: layer.wk.format,
+                            format: attn_weights.wk.format,
                             w_buf: bufs.wk,
                             out_buf: bufs.k_out,
                             out_off: 0,
                             rows: layer_kv_dim,
                         },
                         Proj {
-                            format: layer.wv.format,
+                            format: attn_weights.wv.format,
                             w_buf: bufs.wv,
                             out_buf: bufs.v_out,
                             out_off: 0,
@@ -335,16 +364,24 @@ impl MetalBackend {
             MTLSize::new(256.min(hidden as u64), 1, 1),
         );
 
-        if layer.wq.format == crate::QuantFormat::Q8_0
-            && layer.wk.format == crate::QuantFormat::Q8_0
-            && layer.wv.format == crate::QuantFormat::Q8_0
+        // M2: read the per-projection format triple once, through the
+        // structured weights view.
+        let attn_weights = layer.weights().attention;
+        if attn_weights.wq.format == crate::QuantFormat::Q8_0
+            && attn_weights.wk.format == crate::QuantFormat::Q8_0
+            && attn_weights.wv.format == crate::QuantFormat::Q8_0
         {
             let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u32;
             let q_rows = layer_q_dim as u32;
             let k_rows = layer_kv_dim as u32;
             let v_rows = layer_kv_dim as u32;
             let k_val = hidden as u32;
-            enc.set_compute_pipeline_state(&self.attention.q8_qkv_proj_pipeline.state);
+            // Pull dispatch geometry from the bound `KernelHandle` —
+            // same fix class as the decode_hybrid Q4_K geometry bug.
+            // q8_qkv_proj is currently 8 rows/TG, 256 threads; if a
+            // future bump changes the variant, the dispatch follows.
+            let kh = &self.attention.q8_qkv_proj_pipeline;
+            enc.set_compute_pipeline_state(&kh.state);
             enc.set_buffer(0, Some(bufs.wq), 0);
             enc.set_buffer(1, Some(bufs.wk), 0);
             enc.set_buffer(2, Some(bufs.wv), 0);
@@ -361,8 +398,8 @@ impl MetalBackend {
             enc.set_bytes(13, 4, &v_rows as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(14, 4, &k_val as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
-                MTLSize::new((total_rows as u64).div_ceil(8), 1, 1),
-                MTLSize::new(256, 1, 1),
+                MTLSize::new((total_rows as u64).div_ceil(kh.rows_per_tg), 1, 1),
+                MTLSize::new(kh.threads_per_tg, 1, 1),
             );
         } else {
             use crate::metal::stages::qkv_proj::{self, Proj};
@@ -385,21 +422,21 @@ impl MetalBackend {
                 0,
                 [
                     Proj {
-                        format: layer.wq.format,
+                        format: attn_weights.wq.format,
                         w_buf: bufs.wq,
                         out_buf: bufs.q_out,
                         out_off: 0,
                         rows: layer_q_dim,
                     },
                     Proj {
-                        format: layer.wk.format,
+                        format: attn_weights.wk.format,
                         w_buf: bufs.wk,
                         out_buf: bufs.k_out,
                         out_off: 0,
                         rows: layer_kv_dim,
                     },
                     Proj {
-                        format: layer.wv.format,
+                        format: attn_weights.wv.format,
                         w_buf: bufs.wv,
                         out_buf: bufs.v_out,
                         out_off: 0,

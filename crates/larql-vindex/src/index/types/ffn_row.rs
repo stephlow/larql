@@ -8,8 +8,8 @@
 //! `ffn_row_*` is the load-bearing default that keeps walk-kernel
 //! callers storage-agnostic.
 
-use super::{Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess};
 use super::StorageBucket;
+use super::{Fp4FfnAccess, GateLookup, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess};
 
 /// Unified FFN row operations over native, Q4K/Q6K, and FP4/FP8 storage.
 pub trait FfnRowAccess: NativeFfnAccess + QuantizedFfnAccess + Fp4FfnAccess {
@@ -335,13 +335,7 @@ mod tests {
         fn has_interleaved_q4k(&self) -> bool {
             self.q4k_dot.is_some() || self.q4k_scaled_add_returns || self.q4k_into_returns
         }
-        fn q4k_ffn_row_dot(
-            &self,
-            _: usize,
-            _: usize,
-            _: usize,
-            _: &[f32],
-        ) -> Option<f32> {
+        fn q4k_ffn_row_dot(&self, _: usize, _: usize, _: usize, _: &[f32]) -> Option<f32> {
             self.q4k_dot
         }
         fn q4k_ffn_row_scaled_add(
@@ -364,22 +358,10 @@ mod tests {
         ) -> bool {
             self.q4k_scaled_add_returns
         }
-        fn q4k_down_feature_scaled_add(
-            &self,
-            _: usize,
-            _: usize,
-            _: f32,
-            _: &mut [f32],
-        ) -> bool {
+        fn q4k_down_feature_scaled_add(&self, _: usize, _: usize, _: f32, _: &mut [f32]) -> bool {
             self.q4k_down_feature_returns
         }
-        fn q4k_ffn_row_into(
-            &self,
-            _: usize,
-            _: usize,
-            _: usize,
-            _: &mut [f32],
-        ) -> bool {
+        fn q4k_ffn_row_into(&self, _: usize, _: usize, _: usize, _: &mut [f32]) -> bool {
             self.q4k_into_returns
         }
     }
@@ -388,13 +370,7 @@ mod tests {
         fn has_fp4_storage(&self) -> bool {
             self.fp4_dot.is_some() || self.fp4_scaled_add_returns || self.fp4_into_returns
         }
-        fn fp4_ffn_row_dot(
-            &self,
-            _: usize,
-            _: usize,
-            _: usize,
-            _: &[f32],
-        ) -> Option<f32> {
+        fn fp4_ffn_row_dot(&self, _: usize, _: usize, _: usize, _: &[f32]) -> Option<f32> {
             self.fp4_dot
         }
         fn fp4_ffn_row_scaled_add(
@@ -407,13 +383,7 @@ mod tests {
         ) -> bool {
             self.fp4_scaled_add_returns
         }
-        fn fp4_ffn_row_into(
-            &self,
-            _: usize,
-            _: usize,
-            _: usize,
-            _: &mut [f32],
-        ) -> bool {
+        fn fp4_ffn_row_into(&self, _: usize, _: usize, _: usize, _: &mut [f32]) -> bool {
             self.fp4_into_returns
         }
     }
@@ -703,7 +673,7 @@ mod tests {
         // to interleaved_down.
         let s = Stub {
             down_feature: Some(vec![1.0, 2.0, 3.0]), // 3-wide
-            down: Some(one_row(&[5.0, 5.0])),         // 2-wide
+            down: Some(one_row(&[5.0, 5.0])),        // 2-wide
             ..Default::default()
         };
         assert_eq!(s.ffn_row_dot(0, 2, 0, &[1.0, 2.0]), Some(15.0));
@@ -880,7 +850,7 @@ mod tests {
         // fall-through hits q4k.
         let s = Stub {
             down_feature: Some(vec![1.0, 2.0, 3.0]), // 3-wide
-            down: Some(one_row(&[1.0, 1.0, 1.0])),    // 3-wide
+            down: Some(one_row(&[1.0, 1.0, 1.0])),   // 3-wide
             down_layer: Some(one_row(&[1.0, 1.0, 1.0])),
             q4k_dot: Some(55.0),
             ..Default::default()

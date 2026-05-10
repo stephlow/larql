@@ -711,7 +711,7 @@ impl RemoteMoeBackend {
                 // otherwise fall back to f32 residual.
                 // Q8K wire: 4× smaller upload (client pre-quantises h_norm).
                 // Disable with LARQL_DISABLE_Q8K_WIRE=1 for debugging.
-                let q8k_enabled = std::env::var("LARQL_DISABLE_Q8K_WIRE").is_err();
+                let q8k_enabled = super::runtime::RemoteMoeRuntime::get().q8k_enabled();
                 let use_q8k = q8k_enabled
                     && h_norm_per_layer.iter().enumerate().all(|(l, q)| {
                         let has_task = tasks.iter().any(|t| t.layer == l);
@@ -795,7 +795,7 @@ impl RemoteMoeBackend {
                     }
                 }
                 let t_accum = t0.elapsed().as_secs_f64() * 1000.0;
-                if std::env::var("LARQL_VERBOSE").is_ok() {
+                if super::runtime::RemoteMoeRuntime::get().verbose {
                     eprintln!(
                         "[predispatch/multi] route={:.1}ms dispatch={:.1}ms accum={:.1}ms  shards={} wire={}",
                         t_route,

@@ -704,21 +704,17 @@ mod tests {
     fn hf_cache_repo_dir_replaces_slash_in_repo_id() {
         // HF cache uses `--` as the path separator; every `/` in the
         // repo ID maps to a literal `--` in the cache directory name.
-        let _e = EnvSet::new(&[
-            ("HUGGINGFACE_HUB_CACHE", Some("/tmp/x")),
-            ("HF_HOME", None),
-        ]);
+        let _e = EnvSet::new(&[("HUGGINGFACE_HUB_CACHE", Some("/tmp/x")), ("HF_HOME", None)]);
         let dir = hf_cache_repo_dir(RepoKind::Model, "complex/owner/name").unwrap();
-        assert!(dir.to_string_lossy().ends_with("models--complex--owner--name"));
+        assert!(dir
+            .to_string_lossy()
+            .ends_with("models--complex--owner--name"));
     }
 
     #[test]
     #[serial]
     fn hf_cache_repo_dir_distinguishes_dataset_from_model() {
-        let _e = EnvSet::new(&[
-            ("HUGGINGFACE_HUB_CACHE", Some("/tmp/y")),
-            ("HF_HOME", None),
-        ]);
+        let _e = EnvSet::new(&[("HUGGINGFACE_HUB_CACHE", Some("/tmp/y")), ("HF_HOME", None)]);
         let ds = hf_cache_repo_dir(RepoKind::Dataset, "x/y").unwrap();
         let md = hf_cache_repo_dir(RepoKind::Model, "x/y").unwrap();
         assert_ne!(ds, md, "RepoKind must produce distinct cache dirs");
@@ -769,15 +765,15 @@ mod tests {
 
     #[test]
     fn resolve_hf_vindex_with_progress_rejects_non_hf_path() {
-        let err = resolve_hf_vindex_with_progress("/tmp/foo", |_| NoOpProgress)
-            .expect_err("must reject");
+        let err =
+            resolve_hf_vindex_with_progress("/tmp/foo", |_| NoOpProgress).expect_err("must reject");
         assert!(err.to_string().contains("not an hf://"));
     }
 
     #[test]
     fn resolve_hf_model_with_progress_rejects_non_hf_path() {
-        let err =
-            resolve_hf_model_with_progress("./local-model", |_| NoOpProgress).expect_err("must reject");
+        let err = resolve_hf_model_with_progress("./local-model", |_| NoOpProgress)
+            .expect_err("must reject");
         assert!(err.to_string().contains("not an hf://"));
     }
 

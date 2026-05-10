@@ -355,4 +355,277 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, NpyError::DtypeMismatch { .. }));
     }
+
+    /// Build a minimal .npy v1.0 blob for a u32 1D array of given values.
+    fn synth_u32_1d(values: &[u32]) -> Vec<u8> {
+        let header = format!(
+            "{{'descr': '<u4', 'fortran_order': False, 'shape': ({},), }}",
+            values.len()
+        );
+        let mut padded = header.into_bytes();
+        let total = 10 + padded.len();
+        let pad_to = (total + 63) & !63;
+        while 10 + padded.len() + 1 < pad_to {
+            padded.push(b' ');
+        }
+        padded.push(b'\n');
+        let header_len = padded.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x93NUMPY");
+        out.push(1);
+        out.push(0);
+        out.extend_from_slice(&(header_len as u16).to_le_bytes());
+        out.extend_from_slice(&padded);
+        for v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Build a 2D .npy blob for read_f32_flat tests.
+    fn synth_f32_flat(values: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+        let header =
+            format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {cols}), }}");
+        let mut padded = header.into_bytes();
+        let total = 10 + padded.len();
+        let pad_to = (total + 63) & !63;
+        while 10 + padded.len() + 1 < pad_to {
+            padded.push(b' ');
+        }
+        padded.push(b'\n');
+        let header_len = padded.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x93NUMPY");
+        out.push(1);
+        out.push(0);
+        out.extend_from_slice(&(header_len as u16).to_le_bytes());
+        out.extend_from_slice(&padded);
+        for v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn read_u32_1d_roundtrip() {
+        let vals = [1u32, 7, 42, 999, u32::MAX];
+        let blob = synth_u32_1d(&vals);
+        assert_eq!(read_u32_1d(&blob).unwrap(), vals.to_vec());
+    }
+
+    #[test]
+    fn read_f32_flat_2d_roundtrip() {
+        let vals = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let blob = synth_f32_flat(&vals, 2, 3);
+        let (parsed, shape) = read_f32_flat(&blob).unwrap();
+        assert_eq!(parsed, vals.to_vec());
+        assert_eq!(shape, vec![2, 3]);
+    }
+
+    // ── Error paths ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_header_rejects_short_input() {
+        let err = parse_header(&[0u8; 5]).unwrap_err();
+        assert!(matches!(err, NpyError::TruncatedHeader));
+    }
+
+    #[test]
+    fn parse_header_rejects_bad_magic() {
+        let mut bad = vec![0u8; 16];
+        bad[..6].copy_from_slice(b"\x00WRONG");
+        let err = parse_header(&bad).unwrap_err();
+        assert!(matches!(err, NpyError::BadMagic));
+    }
+
+    #[test]
+    fn parse_header_rejects_v2() {
+        let mut blob = vec![0u8; 16];
+        blob[..6].copy_from_slice(b"\x93NUMPY");
+        blob[6] = 2; // major
+        blob[7] = 0; // minor
+        let err = parse_header(&blob).unwrap_err();
+        match err {
+            NpyError::UnsupportedVersion(2, 0) => {}
+            other => panic!("expected UnsupportedVersion(2,0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_truncated_after_header_len() {
+        // Magic + ver + a header_len that points past the buffer end.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x93NUMPY");
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&(9999u16).to_le_bytes());
+        // No actual header bytes.
+        let err = parse_header(&blob).unwrap_err();
+        assert!(matches!(err, NpyError::TruncatedHeader));
+    }
+
+    #[test]
+    fn parse_header_invalid_utf8_in_header() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x93NUMPY");
+        blob.push(1);
+        blob.push(0);
+        let header = vec![0xff, 0xfe, 0xfd, 0xfc];
+        blob.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        blob.extend_from_slice(&header);
+        let err = parse_header(&blob).unwrap_err();
+        assert!(matches!(err, NpyError::InvalidUtf8(_)));
+    }
+
+    #[test]
+    fn read_f32_1d_data_length_mismatch() {
+        let mut blob = synth_f32_1d(&[1.0f32, 2.0, 3.0]);
+        // Drop two bytes from the data tail.
+        blob.truncate(blob.len() - 2);
+        let err = read_f32_1d(&blob).unwrap_err();
+        match err {
+            NpyError::DataLength {
+                expected,
+                stride: 4,
+                ..
+            } => assert_eq!(expected, 12),
+            other => panic!("expected DataLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_f32_1d_rejects_2d() {
+        // 2D blob handed to a 1D reader → ParseField on shape.
+        let blob = synth_f32_flat(&[1.0f32, 2.0, 3.0, 4.0], 2, 2);
+        let err = read_f32_1d(&blob).unwrap_err();
+        match err {
+            NpyError::ParseField { field, .. } => assert_eq!(field, "shape"),
+            other => panic!("expected ParseField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_u32_1d_rejects_2d() {
+        let header = "{'descr': '<u4', 'fortran_order': False, 'shape': (2, 2), }".to_string();
+        let mut padded = header.into_bytes();
+        let total = 10 + padded.len();
+        let pad_to = (total + 63) & !63;
+        while 10 + padded.len() + 1 < pad_to {
+            padded.push(b' ');
+        }
+        padded.push(b'\n');
+        let header_len = padded.len();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x93NUMPY");
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&(header_len as u16).to_le_bytes());
+        blob.extend_from_slice(&padded);
+        for v in [1u32, 2, 3, 4] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let err = read_u32_1d(&blob).unwrap_err();
+        match err {
+            NpyError::ParseField { field, .. } => assert_eq!(field, "shape"),
+            other => panic!("expected ParseField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fortran_order_rejected() {
+        let header = "{'descr': '<f4', 'fortran_order': True, 'shape': (2,), }".to_string();
+        let mut padded = header.into_bytes();
+        let total = 10 + padded.len();
+        let pad_to = (total + 63) & !63;
+        while 10 + padded.len() + 1 < pad_to {
+            padded.push(b' ');
+        }
+        padded.push(b'\n');
+        let header_len = padded.len();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x93NUMPY");
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&(header_len as u16).to_le_bytes());
+        blob.extend_from_slice(&padded);
+        blob.extend_from_slice(&[0u8; 8]);
+        let err = parse_header(&blob).unwrap_err();
+        assert!(matches!(err, NpyError::FortranOrder));
+    }
+
+    // ── Header field-parsing helpers ──────────────────────────────────────
+
+    #[test]
+    fn parse_field_value_quoted_string() {
+        let h = "{'descr': '<f4', 'fortran_order': False}";
+        assert_eq!(parse_field_value(h, "descr"), Some("<f4".into()));
+    }
+
+    #[test]
+    fn parse_field_value_double_quoted_string() {
+        let h = "{\"descr\": \"<f4\", \"fortran_order\": False}";
+        // double-quoted name lookup works for the specific quoting we use
+        let h_alt = "{'descr': \"<f4\", 'fortran_order': False}";
+        assert_eq!(parse_field_value(h_alt, "descr"), Some("<f4".into()));
+        // The double-quoted name variant won't find by 'descr':
+        assert_eq!(parse_field_value(h, "descr"), None);
+    }
+
+    #[test]
+    fn parse_field_value_list_literal() {
+        let h = "{'descr': [('token_id', '<u4'), ('coef', '<f4')], 'shape': (3,)}";
+        let descr = parse_field_value(h, "descr").unwrap();
+        assert!(descr.starts_with('['));
+        assert!(descr.ends_with(']'));
+        assert!(descr.contains("token_id"));
+    }
+
+    #[test]
+    fn parse_field_value_tuple_literal() {
+        let h = "{'shape': (3, 4, 5), 'fortran_order': False}";
+        let val = parse_field_value(h, "shape").unwrap();
+        assert_eq!(val, "(3, 4, 5)");
+    }
+
+    #[test]
+    fn parse_field_value_bare_token() {
+        let h = "{'fortran_order': False, 'descr': '<f4'}";
+        assert_eq!(parse_field_value(h, "fortran_order"), Some("False".into()));
+    }
+
+    #[test]
+    fn parse_field_value_missing_field() {
+        let h = "{'descr': '<f4'}";
+        assert!(parse_field_value(h, "shape").is_none());
+    }
+
+    #[test]
+    fn parse_bool_field_true_false_invalid() {
+        let h_t = "{'fortran_order': True}";
+        let h_f = "{'fortran_order': False}";
+        let h_x = "{'fortran_order': maybe}";
+        let h_m = "{'descr': '<f4'}";
+        assert_eq!(parse_bool_field(h_t, "fortran_order"), Some(true));
+        assert_eq!(parse_bool_field(h_f, "fortran_order"), Some(false));
+        assert_eq!(parse_bool_field(h_x, "fortran_order"), None);
+        assert_eq!(parse_bool_field(h_m, "fortran_order"), None);
+    }
+
+    #[test]
+    fn parse_shape_no_match() {
+        let h = "{'descr': '<f4', 'fortran_order': False}";
+        assert_eq!(parse_shape(h), None);
+    }
+
+    #[test]
+    fn parse_shape_unparseable_dim() {
+        let h = "{'shape': (3, abc, 5)}";
+        assert!(parse_shape(h).is_none());
+    }
+
+    #[test]
+    fn parse_shape_zero_dim_ok() {
+        let h = "{'shape': (0,)}";
+        assert_eq!(parse_shape(h), Some(vec![0]));
+    }
 }

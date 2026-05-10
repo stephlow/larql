@@ -407,8 +407,8 @@ mod tests {
             .with_body("server boom")
             .create();
 
-        let err = preupload_decide("org/repo", "t", "f", &path, 1, "model")
-            .expect_err("500 must error");
+        let err =
+            preupload_decide("org/repo", "t", "f", &path, 1, "model").expect_err("500 must error");
         mock.assert();
         let msg = err.to_string();
         assert!(msg.contains("500"), "{msg}");
@@ -427,9 +427,7 @@ mod tests {
             .mock("POST", "/api/models/org/repo/commit/main")
             .match_header("authorization", "Bearer t")
             .match_header("content-type", "application/x-ndjson")
-            .match_body(mockito::Matcher::Regex(
-                r#""path":\s*"index\.json""#.into(),
-            ))
+            .match_body(mockito::Matcher::Regex(r#""path":\s*"index\.json""#.into()))
             .match_body(mockito::Matcher::Regex(r#""encoding":\s*"base64""#.into()))
             .with_status(200)
             .create();

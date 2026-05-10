@@ -10,7 +10,9 @@ use crate::format::filenames::*;
 
 impl<'a> StreamingContext<'a> {
     /// Stage 1b — router weights (MoE models only).
-    pub(in crate::extract::streaming) fn write_router_weights(&mut self) -> Result<(), VindexError> {
+    pub(in crate::extract::streaming) fn write_router_weights(
+        &mut self,
+    ) -> Result<(), VindexError> {
         if !self.is_moe {
             return Ok(());
         }

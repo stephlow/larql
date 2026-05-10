@@ -17,10 +17,12 @@ use larql_vindex::VectorIndex;
 use ndarray::{s, Array2};
 
 use super::{codebooks, lloyd_max, packing, rotation};
-use larql_inference::attention::SharedKV;
-use larql_inference::attention::{run_attention_block_decode_step_backend, run_attention_with_kv_backend};
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::{EngineInfo, KvEngine};
+use larql_inference::attention::SharedKV;
+use larql_inference::attention::{
+    run_attention_block_decode_step_backend, run_attention_with_kv_backend,
+};
 use larql_inference::ffn::BackendFfn;
 use larql_inference::forward::{embed_tokens_pub, run_ffn};
 use larql_inference::model::ModelWeights;
@@ -625,8 +627,8 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use larql_inference::test_utils::make_test_weights;
     use larql_inference::forward::hidden_to_raw_logits;
+    use larql_inference::test_utils::make_test_weights;
 
     #[test]
     fn prefill_compresses_kv_for_all_layers() {

@@ -12,15 +12,18 @@ use std::time::Duration;
 
 const HF_BASE_URL: &str = "https://huggingface.co";
 
-/// Test-only env var that overrides the HuggingFace base URL. Tests in
-/// this module spin up a `mockito` server and point `hf_base()` at it.
-/// Production callers never set this.
-pub(super) const TEST_BASE_ENV: &str = "LARQL_HF_TEST_BASE";
+/// Test-only env var that overrides the HuggingFace base URL. Tests
+/// across `huggingface/{publish,discovery,download}` spin up a
+/// `mockito` server and point `hf_base()` at it. Production callers
+/// never set this.
+pub(in crate::format::huggingface) const TEST_BASE_ENV: &str = "LARQL_HF_TEST_BASE";
 
 /// Base URL for HuggingFace requests. Defaults to
 /// `https://huggingface.co`; can be overridden for tests via
-/// [`TEST_BASE_ENV`].
-pub(super) fn hf_base() -> String {
+/// [`TEST_BASE_ENV`]. Visible to every sibling under
+/// `format::huggingface::*` so the `discovery` and `download`
+/// modules can route through the same override.
+pub(in crate::format::huggingface) fn hf_base() -> String {
     std::env::var(TEST_BASE_ENV).unwrap_or_else(|_| HF_BASE_URL.to_string())
 }
 

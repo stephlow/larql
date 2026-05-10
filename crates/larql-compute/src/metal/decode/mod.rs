@@ -281,9 +281,8 @@ impl MetalBackend {
             // AND the previous layer's `encode_post_ffn_residual` wrote
             // the pre-normalized data into `norm_f32_buf` via
             // `residual_norm_store` (only on the non-post-norms path).
-            let prelayer_norm_active = l > 0
-                && !layers[l - 1].has_post_norms
-                && self.decode_flags.fused_prelayer_norm;
+            let prelayer_norm_active =
+                l > 0 && !layers[l - 1].has_post_norms && self.decode_flags.fused_prelayer_norm;
 
             // ── Step 1: Input norm + Q/K/V projection ──
             // Format-aware: Q4_K family routes through fused QKV

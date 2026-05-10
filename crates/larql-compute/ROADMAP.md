@@ -33,34 +33,66 @@ Findings now tracked here so follow-up work does not live only in review notes:
 - [x] Replace remaining direct `std::env::var` reads in Metal decode/stage
   code with the same options surface, so env names and parsing live in
   `src/options.rs`.
-- [ ] Thread explicit options through backend construction for non-debug
+- [x] Thread explicit options through backend construction for non-debug
   behavior, keeping env-backed debug toggles as a compatibility bridge.
+  Shipped 2026-05-09 (M1): `BackendOptions` + `MetalBackend::with_options`,
+  `default_backend_with_options` in lib.rs. Env reads still flow through
+  `BackendOptions::from_env` for compatibility.
 - [ ] Split `FullPipelineLayer` into smaller architecture and runtime specs.
   Compatibility views now exist for `AttentionSpec`, `FfnSpec`, `MoeSpec`,
   `LayerWeights`, `LayerNorms`, and remote-FFN settings; remaining work is to
   migrate inference/vindex/backend call sites off the flat field bag and then
   make the wrapper private or narrower.
+  **Compute-side prep shipped 2026-05-09 (M2 partial)**: the four
+  hottest decode entry points (`encode_input_norm_and_qkv`,
+  `encode_q4k_qkv`, `encode_q4k_input_norm`, `encode_q4_0_norm_and_qkv`,
+  `encode_attention_block`, `encode_post_ffn_residual`) now read
+  `layer.<flat-field>` through `layer.weights().attention`,
+  `layer.attention_spec()`, `layer.norms()` views. Pattern
+  established: `let view = layer.method();` at the top of each
+  function, then `view.field` throughout. Remaining work for vindex
+  / inference call sites + final wrapper-narrowing is unchanged.
+  Also fixed an additional Q8_0 hybrid-path dispatch-geometry hardcode
+  in `encode_q4_0_norm_and_qkv` (same bug class as decode_hybrid Q4_K).
 - [x] Promote Gemma-style MoE assumptions into an explicit `MoeRoutingPolicy`:
   router input source, router norm policy, selected-weight renormalization,
   per-expert scale policy, post-expert norm policy, softmax/top-k semantics,
   and expert down-padding layout.
-- [ ] Group `MetalBackend` kernel handles into cohesive registries
+- [x] Group `MetalBackend` kernel handles into cohesive registries
   (`AttentionKernels`, `FfnKernels`, `NormKernels`, `QuantKernels`) and pass a
   compact dispatch context into full-pipeline execution instead of large
-  positional argument lists.
-- [ ] Replace hard-coded QKV quant-format branches with a descriptor/table keyed
+  positional argument lists. Shipped 2026-05-09 (M3) — 57 fields moved off
+  `MetalBackend` into the four registries; ~150 call sites updated. End-to-end
+  tok/s within noise of pre-M3 baseline (86.1 vs ~83 tok/s on Gemma 3 4B
+  Q4_K v2; the registry pattern is zero-cost — `&self.norms.foo` lowers to
+  the same load as `&self.foo`).
+- [x] Replace hard-coded QKV quant-format branches with a descriptor/table keyed
   by `(q_format, k_format, v_format)` so new model-format combinations do not
-  add another inline conditional.
-- [ ] Fix the trait-level `QuantMatVec` dispatch for `QuantFormat::Q8_0`.
-  `backend/quant_matvec.rs` currently routes Q8_0 through the Q4_0 kernel path,
-  but GGML Q8_0 blocks are 34 bytes per 32 values while Q4_0 blocks are 18
-  bytes. Add a real Q8_0 backend path or make the generic trait return `None`
-  for Q8_0 instead of silently interpreting Q8 bytes as Q4.
-- [ ] Align Metal FFN activation handling with public `pipeline::Activation`;
+  add another inline conditional. Shipped 2026-05-09 (M4): `QkvFormatRoute`
+  enum + `pick_qkv_route` table in `metal/stages/qkv_proj.rs`; encode_qkv +
+  decode_hybrid both read the route through it.
+- [x] Fix the trait-level `QuantMatVec` dispatch for `QuantFormat::Q8_0`.
+  Shipped 2026-05-09 (M-Q8): split the `Q4_0 | Q8_0` arms in
+  `backend/quant_matvec.rs::quant_matvec` and `quant_matvec_q8_input`; added
+  a `q8_matvec` trait method (default `None`); the Metal-side
+  `metal/stages/quant_matvec.rs::encode` panics loud on Q8_0 with a clear
+  message pointing at `quant.q8_matvec_pipeline`. Production decode reaches
+  Q8_0 weights via dedicated kernels (`q8_qkv_proj_pipeline` /
+  `q8_matvec_pipeline`), so the dead generic dispatch was lying rather than
+  load-bearing. 3 new unit tests pin the contract (Q4_0 still routes through
+  `q4_matvec`, Q8_0 returns `None` not silent garbage, float-input formats
+  stay `None`).
+- [x] Align Metal FFN activation handling with public `pipeline::Activation`;
   unsupported activations should fail explicitly or use a known fallback.
-- [ ] Name and validate remaining format/kernel constants (`256`, `144`, `210`,
+  Shipped 2026-05-09 (M5): `metal_supports_activation` /
+  `assert_metal_activation_supported` in `metal/stages/ffn.rs`; the three
+  silent `_ => silu` fallback sites now panic clearly on `GeluExact` / `ReLU`.
+- [x] Name and validate remaining format/kernel constants (`256`, `144`, `210`,
   `8192`, `16384`, debug layer modulo values) at the format or kernel-descriptor
-  boundary instead of scattering them through CPU/Metal paths.
+  boundary instead of scattering them through CPU/Metal paths. Shipped
+  2026-05-09 (M6): cpu/ops sites pull `Q4_K_BLOCK_BYTES` /
+  `Q6_K_BLOCK_BYTES` / `Q4_K_BLOCK_ELEMS` from `larql_models::quant::ggml`;
+  `MAX_FUSED_GEGLU_DOWN_INTER = 16384` named in `metal/decode/encode_ffn.rs`.
 
 Acceptance: adding a new supported architecture or quant layout should require
 declaring its layer specs and format routes, not editing Gemma-specific branches

@@ -232,15 +232,16 @@ mod tests {
     #[test]
     fn resolve_https_url_is_not_yet_implemented() {
         let tmp = tempfile::tempdir().unwrap();
-        let err =
-            resolve_vindexfile_path("https://example.com/vindex", tmp.path()).expect_err("not implemented");
+        let err = resolve_vindexfile_path("https://example.com/vindex", tmp.path())
+            .expect_err("not implemented");
         assert!(err.to_string().contains("not yet implemented"));
     }
 
     #[test]
     fn resolve_http_url_is_not_yet_implemented() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_vindexfile_path("http://example.com/v", tmp.path()).expect_err("not implemented");
+        let err = resolve_vindexfile_path("http://example.com/v", tmp.path())
+            .expect_err("not implemented");
         assert!(err.to_string().contains("not yet implemented"));
     }
 
@@ -251,8 +252,7 @@ mod tests {
         // error message than "path not found" or "not yet implemented").
         let tmp = tempfile::tempdir().unwrap();
         let err = resolve_vindexfile_path("hf://owner/repo", tmp.path())
-            .err()
-            .expect("hf:// will fail without network");
+            .expect_err("hf:// will fail without network");
         let msg = err.to_string();
         // Crucially NOT the local-path or https errors:
         assert!(!msg.contains("path not found"), "got: {msg}");

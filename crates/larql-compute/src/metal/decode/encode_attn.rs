@@ -84,19 +84,28 @@ impl MetalBackend {
             ffn_uses_q4k,
         } = dims;
         let hidden_val = hidden as u32;
-        let norm_offset = layer.norm_offset;
-        let eps = layer.eps;
-        let scale = layer.attn_scale;
-        let layer_head_dim = layer.head_dim;
-        let layer_num_q_heads = layer.num_q_heads;
-        let layer_num_kv_heads = layer.num_kv_heads;
-        let layer_rope_base = layer.rope_base;
-        let layer_rotary_dim = if layer.rotary_dim > 0 {
-            layer.rotary_dim
+        // M2: extract per-layer params via the structured views.
+        // `attn_spec` carries the attention shape (head_dim, head counts,
+        // RoPE, sliding_window, qk_norm flags); `norms` carries the eps
+        // and offsets. The compiler optimises these getter methods to
+        // plain field reads, so this is a clarity win — the function
+        // signature can later narrow to `(AttentionSpec, LayerNorms,
+        // ...)` once vindex/inference callers stop passing a flat layer.
+        let attn_spec = layer.attention_spec();
+        let norms_view = layer.norms();
+        let norm_offset = norms_view.norm_offset;
+        let eps = norms_view.eps;
+        let scale = attn_spec.attn_scale;
+        let layer_head_dim = attn_spec.head_dim;
+        let layer_num_q_heads = attn_spec.num_q_heads;
+        let layer_num_kv_heads = attn_spec.num_kv_heads;
+        let layer_rope_base = attn_spec.rope_base;
+        let layer_rotary_dim = if attn_spec.rotary_dim > 0 {
+            attn_spec.rotary_dim
         } else {
             layer_head_dim
         };
-        let window_size = layer.sliding_window as u32;
+        let window_size = attn_spec.sliding_window as u32;
 
         // Env flags governing kernel-level fusion. Cached at backend
         // startup (see `metal::flags::DecodeFlags`) so the decode hot
@@ -125,12 +134,16 @@ impl MetalBackend {
 
         // Path 1: full attention fusion. Skips both qk_norm_rope dispatch AND
         // kv_append_attend_fused dispatch — handles them in `attn_fused`.
+        // M2: `has_v_norm` and `q_norm_enabled` / `k_norm_enabled` come
+        // from the structured AttentionSpec; the actual `q_norm_weight`
+        // / `k_norm_weight` slices stay as direct layer reads because
+        // the spec only carries presence flags, not the weight bytes.
         let did_fused_attn = use_fused_attn
             && layer_head_dim <= MAX_HEAD_DIM_SINGLE_SG
             && attn_span <= ops::kv_cache::SHORT_ATTENTION_SPAN
-            && layer.q_norm_weight.is_some()
-            && layer.k_norm_weight.is_some()
-            && !layer.has_v_norm;
+            && attn_spec.q_norm_enabled
+            && attn_spec.k_norm_enabled
+            && !attn_spec.has_v_norm;
 
         // ── Step 1.5 + 2: QK-norm + RoPE ──
         if did_fused_attn {
@@ -143,7 +156,7 @@ impl MetalBackend {
             let hd_val = layer_head_dim as u32;
             let nq_val = layer_num_q_heads as u32;
             let nkv_val = cache.num_kv_heads as u32;
-            let qk_off = layer.qk_norm_offset;
+            let qk_off = norms_view.qk_norm_offset;
             let rdim = layer_rotary_dim as u32;
             let mut tg_w: u64 = 1;
             while tg_w < layer_head_dim as u64 && tg_w < MAX_HEAD_DIM_SINGLE_SG as u64 {
@@ -185,7 +198,7 @@ impl MetalBackend {
             let k_w = layer.k_norm_weight.unwrap();
             let hd_val = layer_head_dim as u32;
             let nq_val = layer_num_q_heads as u32;
-            let qk_off = layer.qk_norm_offset;
+            let qk_off = norms_view.qk_norm_offset;
             let rdim = layer_rotary_dim as u32;
             let mut tg_w: usize = 1;
             while tg_w < layer_head_dim && tg_w < MAX_HEAD_DIM_DOUBLE_SG {
@@ -218,7 +231,7 @@ impl MetalBackend {
             if let (Some(q_w), Some(k_w)) = (layer.q_norm_weight, layer.k_norm_weight) {
                 let hd_val = layer_head_dim as u32;
                 let nq_val = layer_num_q_heads as u32;
-                let qk_off = layer.qk_norm_offset;
+                let qk_off = norms_view.qk_norm_offset;
                 let mut tg_w: usize = 1;
                 while tg_w < layer_head_dim && tg_w < MAX_HEAD_DIM_DOUBLE_SG {
                     tg_w <<= 1;

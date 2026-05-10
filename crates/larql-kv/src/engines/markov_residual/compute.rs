@@ -4,11 +4,11 @@ use larql_compute::{dot_proj_gpu, ComputeBackend};
 use ndarray::{s, Array2};
 
 use super::store::RsStore;
+use crate::profiler::EngineProfiler;
 use larql_inference::attention::SharedKV;
 use larql_inference::attention::{
     apply_rope_partial_at, run_attention_block_decode_step_backend, run_attention_with_kv_backend,
 };
-use crate::profiler::EngineProfiler;
 use larql_inference::ffn::BackendFfn;
 use larql_inference::forward::{add_bias, apply_norm, embed_tokens_pub, run_ffn};
 use larql_inference::model::ModelWeights;
@@ -350,8 +350,8 @@ pub(super) fn last_row(h: &Array2<f32>) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use larql_inference::test_utils::make_test_weights;
     use larql_compute::CpuBackend;
+    use larql_inference::test_utils::make_test_weights;
 
     // ── recompute_kv ──────────────────────────────────────────────────────────
 

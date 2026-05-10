@@ -209,10 +209,7 @@ mod tests {
             ENV_FUSED_POST_ATTN_NORM,
             ENV_FUSED_POST_FFN_NORM,
         ];
-        let prior: Vec<_> = names
-            .iter()
-            .map(|n| (*n, std::env::var_os(n)))
-            .collect();
+        let prior: Vec<_> = names.iter().map(|n| (*n, std::env::var_os(n))).collect();
         for n in names {
             std::env::remove_var(n);
         }
@@ -268,10 +265,7 @@ mod tests {
             ENV_Q4K_MATVEC_8SG,
             ENV_Q6K_8SG,
         ];
-        let prior: Vec<_> = names
-            .iter()
-            .map(|n| (*n, std::env::var_os(n)))
-            .collect();
+        let prior: Vec<_> = names.iter().map(|n| (*n, std::env::var_os(n))).collect();
         for n in names {
             std::env::remove_var(n);
         }

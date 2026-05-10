@@ -31,7 +31,7 @@ pub fn run_layer_with_zeroed_pre_o_heads(
     let (h_post_attn, kv_out) = crate::attention::run_attention_block_zero_pre_o_heads(
         weights, h, layer, heads, shared_kv,
     )?;
-    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+    if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
         let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");

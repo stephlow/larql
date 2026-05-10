@@ -605,5 +605,168 @@ mod tests {
         let engine = mk_engine_with_store(3);
         assert!(engine.memory_bytes() > 0);
     }
-}
 
+    // ── store() getter ───────────────────────────────────────────────────────
+
+    #[test]
+    fn store_getter_none_until_attached() {
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        assert!(engine.store().is_none());
+        let engine = engine.with_store(mk_store(2, 4, 8));
+        assert!(engine.store().is_some());
+    }
+
+    // ── KvEngine name() ──────────────────────────────────────────────────────
+
+    #[test]
+    fn name_returns_apollo() {
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        assert_eq!(engine.name(), "apollo");
+    }
+
+    // ── KvEngine prefill / decode_step (compressed path) ────────────────────
+    //
+    // These exercise prepare_injection + the compressed forward through
+    // synthetic test_utils weights. The synthetic model has 2 layers and
+    // hidden=16, so we build a store with hidden=16 and inject at layer 1.
+
+    fn mk_apollo_for_synthetic_weights(weights: &larql_inference::ModelWeights) -> ApolloEngine {
+        // Synthetic test weights have vocab=32; clamp every token_id used in
+        // the store to be < 32 so embed_tokens_pub doesn't panic.
+        let store = mk_store_in_vocab(2, 4, weights.hidden_size, weights.vocab_size);
+        let cfg = InjectionConfig {
+            injection_layer: 1, // 2-layer model: inject before final layer
+            inject_coefficient: 2.0,
+            top_k: 4,
+        };
+        let mut engine = ApolloEngine::new(cfg).with_store(store);
+        engine.build_routing_index().unwrap();
+        engine
+    }
+
+    /// Variant of `mk_store` whose token IDs (window tokens + entries) are all
+    /// strictly less than `vocab` — required when the engine forwards through
+    /// real synthetic weights that embed those tokens.
+    fn mk_store_in_vocab(
+        windows: usize,
+        window_size: usize,
+        hidden: usize,
+        vocab: usize,
+    ) -> ApolloStore {
+        let v = vocab.max(2) as u32;
+        let window_tokens: Vec<Vec<u32>> = (0..windows)
+            .map(|w| {
+                (0..window_size)
+                    .map(|i| ((w * window_size + i) as u32) % v)
+                    .collect()
+            })
+            .collect();
+        let boundaries: Vec<Vec<f32>> =
+            (0..windows).map(|w| vec![w as f32 * 0.1; hidden]).collect();
+        let entries = vec![
+            VecInjectEntry {
+                token_id: 0 % v,
+                coefficient: 5.0,
+                window_id: 0,
+                position_in_window: 0,
+                fact_id: 1,
+            },
+            VecInjectEntry {
+                token_id: 1 % v,
+                coefficient: 3.0,
+                window_id: 0,
+                position_in_window: 1,
+                fact_id: 1,
+            },
+            VecInjectEntry {
+                token_id: 2 % v,
+                coefficient: 4.0,
+                window_id: 1,
+                position_in_window: 0,
+                fact_id: 2,
+            },
+        ];
+        ApolloStore {
+            manifest: StoreManifest {
+                version: 1,
+                num_entries: entries.len(),
+                num_windows: windows,
+                num_tokens: windows * window_size,
+                entries_per_window: 1,
+                crystal_layer: 1,
+                window_size,
+                arch_config: ArchConfig::default(),
+                has_residuals: true,
+            },
+            boundaries,
+            boundary_residual: None,
+            window_tokens,
+            entries,
+        }
+    }
+
+    #[test]
+    fn prefill_compressed_returns_hidden_state() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let mut engine = mk_apollo_for_synthetic_weights(&weights);
+        // Use one of the window tokens so routing succeeds.
+        let h = engine.prefill(&weights, &[0u32, 1u32]).expect("prefill");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn decode_step_after_compressed_prefill_grows_context() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let mut engine = mk_apollo_for_synthetic_weights(&weights);
+        engine.prefill(&weights, &[0u32]).expect("prefill");
+        let h = engine.decode_step(&weights, 1).expect("decode_step");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn prefill_uncompressed_path_when_no_boundaries() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let mut store = mk_store_in_vocab(2, 4, weights.hidden_size, weights.vocab_size);
+        store.boundaries.clear();
+        let mut engine = ApolloEngine::new(InjectionConfig {
+            injection_layer: 1,
+            inject_coefficient: 1.0,
+            top_k: 4,
+        })
+        .with_store(store);
+        engine.build_routing_index().unwrap();
+        // Token 0 is in window 0 → routing finds it; uncompressed full forward runs.
+        let h = engine
+            .prefill(&weights, &[0u32, 1u32])
+            .expect("prefill uncompressed");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn prefill_returns_none_without_routing_or_store() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        // No store → routing won't initialize from store.
+        let mut engine = ApolloEngine::new(InjectionConfig::default());
+        assert!(engine.prefill(&weights, &[0u32]).is_none());
+    }
+
+    // ── query_greedy ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn query_greedy_returns_trace_with_top1_token() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let engine = mk_apollo_for_synthetic_weights(&weights);
+        let trace = engine.query_greedy(&weights, &[0u32, 1u32]).expect("trace");
+        assert!(!trace.routed_windows.is_empty());
+        assert!(trace.context_tokens > 0);
+        // top1 logit is finite.
+        assert!(trace.top1_logit.is_finite());
+    }
+
+    #[test]
+    fn query_greedy_returns_none_without_routing() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let engine = ApolloEngine::new(InjectionConfig::default());
+        assert!(engine.query_greedy(&weights, &[0u32]).is_none());
+    }
+}

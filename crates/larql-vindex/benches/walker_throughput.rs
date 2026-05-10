@@ -18,14 +18,14 @@ use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use larql_core::Graph;
+use larql_vindex::walker::vector_extractor::VectorFileHeader;
+use larql_vindex::walker::vector_extractor::COMPONENT_FFN_DOWN;
 use larql_vindex::walker::{
     attention_walker::AttentionWalker,
     test_fixture::{create_with_dims, ModelDims},
     vector_extractor::{ExtractConfig, SilentExtractCallbacks, VectorExtractor, VectorWriter},
     weight_walker::{SilentWalkCallbacks, WalkConfig, WeightWalker},
 };
-use larql_vindex::walker::vector_extractor::COMPONENT_FFN_DOWN;
-use larql_vindex::walker::vector_extractor::VectorFileHeader;
 
 fn bench_root() -> PathBuf {
     let p = std::env::temp_dir().join("larql_bench_walker_throughput");

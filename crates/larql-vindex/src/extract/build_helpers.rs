@@ -346,7 +346,13 @@ mod tests {
         }
         let vocab_json: String = entries
             .iter()
-            .map(|(w, id)| format!("\"{}\": {}", w.replace('\\', "\\\\").replace('"', "\\\""), id))
+            .map(|(w, id)| {
+                format!(
+                    "\"{}\": {}",
+                    w.replace('\\', "\\\\").replace('"', "\\\""),
+                    id
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let json = format!(
@@ -394,8 +400,8 @@ mod tests {
         let s = chrono_now();
         let month: u32 = s[5..7].parse().unwrap();
         let day: u32 = s[8..10].parse().unwrap();
-        assert!(month >= 1 && month <= 12, "month {month} out of range");
-        assert!(day >= 1 && day <= 31, "day {day} out of range");
+        assert!((1..=12).contains(&month), "month {month} out of range");
+        assert!((1..=31).contains(&day), "day {day} out of range");
     }
 
     // ── build_whole_word_vocab ──────────────────────────────────────
@@ -504,13 +510,17 @@ mod tests {
         // 5 × 4 embed: rows 3 and 4 carry distinct directions.
         let mut embed = ndarray::Array2::<f32>::zeros((5, 4));
         // input ("France") = id 4 → embed row 4
-        embed.row_mut(4).assign(&ndarray::array![1.0, 0.0, 0.0, 0.0]);
+        embed
+            .row_mut(4)
+            .assign(&ndarray::array![1.0, 0.0, 0.0, 0.0]);
         // output ("Paris") = id 3 → embed row 3
-        embed.row_mut(3).assign(&ndarray::array![0.0, 1.0, 0.0, 0.0]);
+        embed
+            .row_mut(3)
+            .assign(&ndarray::array![0.0, 1.0, 0.0, 0.0]);
         let weights = weights_with_embed(embed, 5);
 
-        let dir = compute_offset_direction("France", 3, &weights, &toks, 4, 5)
-            .expect("offset computed");
+        let dir =
+            compute_offset_direction("France", 3, &weights, &toks, 4, 5).expect("offset computed");
         // output - input = [-1, 1, 0, 0]; norm = sqrt(2). Normalised
         // direction = [-1/√2, 1/√2, 0, 0].
         let expected_neg = -1.0_f32 / 2.0_f32.sqrt();
@@ -568,8 +578,12 @@ mod tests {
         let toks = vocab_tokenizer(&["[UNK]", "[PAD]", "[BOS]", "hello"]);
         // hello → id 4
         let mut embed = ndarray::Array2::<f32>::zeros((5, 4));
-        embed.row_mut(3).assign(&ndarray::array![1.0, 0.0, 0.0, 0.0]);
-        embed.row_mut(4).assign(&ndarray::array![1.0, 0.0, 0.0, 0.0]); // same as 3
+        embed
+            .row_mut(3)
+            .assign(&ndarray::array![1.0, 0.0, 0.0, 0.0]);
+        embed
+            .row_mut(4)
+            .assign(&ndarray::array![1.0, 0.0, 0.0, 0.0]); // same as 3
         let weights = weights_with_embed(embed, 5);
         // input ("hello"=4) and output id=3 share the same embedding → norm 0.
         assert!(compute_offset_direction("hello", 3, &weights, &toks, 4, 5).is_none());
@@ -712,8 +726,7 @@ mod tests {
         let gate_key = arch.ffn_gate_key(0);
         insert_tensor(&mut weights, &gate_key, gate);
 
-        let result =
-            compute_gate_top_tokens(&weights, &toks, 0, num_features, &ww_ids, &ww_embed);
+        let result = compute_gate_top_tokens(&weights, &toks, 0, num_features, &ww_ids, &ww_embed);
         assert_eq!(result.len(), num_features);
         assert!(
             result.iter().all(|s| s == "alpha"),

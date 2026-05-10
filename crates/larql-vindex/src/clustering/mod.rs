@@ -127,8 +127,8 @@ mod tests {
     fn classify_direction_negative_correlation_picks_least_negative() {
         // All centres anti-aligned with query: best is the *least* negative.
         let centres = vec![
-            vec![-1.0_f32, 0.0],  // cos = -1
-            vec![-0.5, -0.866],   // cos ≈ -0.5
+            vec![-1.0_f32, 0.0], // cos = -1
+            vec![-0.5, -0.866],  // cos ≈ -0.5
         ];
         let q = Array1::from_vec(vec![1.0_f32, 0.0]);
         let (idx, sim) = classify_direction(&q, &centres);

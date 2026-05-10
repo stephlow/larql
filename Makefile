@@ -170,7 +170,7 @@ larql-vindex-ci: larql-vindex-fmt-check larql-vindex-lint larql-vindex-test larq
 #
 # Default policy is 90% per-file line coverage; total floor tracks the
 # starting baseline and ratchets upward.
-LARQL_KV_COVERAGE_MIN ?= 69
+LARQL_KV_COVERAGE_MIN ?= 85
 LARQL_KV_COVERAGE_POLICY ?= crates/larql-kv/coverage-policy.json
 LARQL_KV_COVERAGE_REPORT ?= coverage/larql-kv/summary.json
 

@@ -620,8 +620,15 @@ mod tests {
         let mut cb = CapturingCallbacks::default();
         let href = format!("{}/lfs/upload/x", server.url());
         let extra: HashMap<String, String> = HashMap::new();
-        stream_put_with_progress(&href, &extra, &path, payload.len() as u64, "blob.bin", &mut cb)
-            .unwrap();
+        stream_put_with_progress(
+            &href,
+            &extra,
+            &path,
+            payload.len() as u64,
+            "blob.bin",
+            &mut cb,
+        )
+        .unwrap();
         mock.assert();
         let last = cb.progress_calls.last().expect("at least one tick");
         assert_eq!(last.0, "blob.bin");
@@ -704,10 +711,7 @@ mod tests {
         let mut server = mockito::Server::new();
         let _guard = EnvBaseGuard::new(&server.url());
 
-        let mock = server
-            .mock("POST", "/lfs/verify")
-            .with_status(500)
-            .create();
+        let mock = server.mock("POST", "/lfs/verify").with_status(500).create();
 
         let href = format!("{}/lfs/verify", server.url());
         let extra: HashMap<String, String> = HashMap::new();
@@ -765,8 +769,8 @@ mod tests {
             .with_body("conflict")
             .create();
 
-        let err = commit_lfs_file("org/repo", "t", "conf.bin", "x", 1, "model")
-            .expect_err("409 errors");
+        let err =
+            commit_lfs_file("org/repo", "t", "conf.bin", "x", 1, "model").expect_err("409 errors");
         mock.assert();
         let msg = err.to_string();
         assert!(msg.contains("conf.bin"), "{msg}");
@@ -855,7 +859,10 @@ mod tests {
         verify_mock.assert();
         commit_mock.assert();
         // Bar still ticks 100% via the skip path.
-        assert!(cb.progress_calls.iter().any(|(_, sent, total)| sent == total && *sent == 7));
+        assert!(cb
+            .progress_calls
+            .iter()
+            .any(|(_, sent, total)| sent == total && *sent == 7));
     }
 
     #[test]

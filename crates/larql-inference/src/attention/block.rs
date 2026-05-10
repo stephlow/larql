@@ -333,17 +333,9 @@ fn run_attention_block_core(
     // Default is layer 0 (noise budget); set LARQL_STAGE_DUMP_LAYER=<N> to
     // capture a specific layer instead — Gemma 4 global layers (5, 11, …)
     // are useful for bisecting partial-RoPE / V-norm interactions.
-    let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let stage_dump = if layer == stage_layer {
-        std::env::var("LARQL_CPU_STAGE_DUMP").ok()
-    } else {
-        None
-    };
+    let stage_dump = crate::forward::dump_config::DumpConfig::get().stage_dir(layer);
     let dump_f32 = |name: &str, arr: &Array2<f32>| {
-        if let Some(ref dir) = stage_dump {
+        if let Some(dir) = stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);
             let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = std::fs::write(format!("{dir}/cpu_L0_{name}.f32"), &bytes);

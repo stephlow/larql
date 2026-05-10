@@ -7,6 +7,7 @@
 use crate::error::VindexError;
 
 use super::publish::get_hf_token;
+use super::publish::protocol::hf_base;
 
 // ═══════════════════════════════════════════════════════════════
 // Collections
@@ -41,7 +42,7 @@ pub fn ensure_collection(
     for item in items {
         add_collection_item(&slug, item, &token)?;
     }
-    Ok(format!("https://huggingface.co/collections/{slug}"))
+    Ok(format!("{}/collections/{slug}", hf_base()))
 }
 
 fn find_collection_slug(
@@ -50,7 +51,7 @@ fn find_collection_slug(
     token: &str,
 ) -> Result<Option<String>, VindexError> {
     let client = reqwest::blocking::Client::new();
-    let url = format!("https://huggingface.co/api/users/{namespace}/collections?limit=100");
+    let url = format!("{}/api/users/{namespace}/collections?limit=100", hf_base());
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -100,8 +101,9 @@ fn create_collection(
     if let Some(desc) = description {
         body["description"] = serde_json::Value::String(desc.to_string());
     }
+    let url = format!("{}/api/collections", hf_base());
     let resp = client
-        .post("https://huggingface.co/api/collections")
+        .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
@@ -150,7 +152,7 @@ pub fn add_collection_item(
     // /api/collections/{slug}/item/{item_id}` for editing an existing
     // entry. Got caught by this on the first real publish — the add
     // failed with 404 after the four repos had already uploaded fine.
-    let url = format!("https://huggingface.co/api/collections/{slug}/items");
+    let url = format!("{}/api/collections/{slug}/items", hf_base());
     let mut body = serde_json::json!({
         "item": {
             "type": item.repo_type,
@@ -192,7 +194,7 @@ pub fn repo_exists(repo_id: &str, repo_type: &str) -> Result<bool, VindexError> 
     } else {
         "models"
     };
-    let url = format!("https://huggingface.co/api/{plural}/{repo_id}");
+    let url = format!("{}/api/{plural}/{repo_id}", hf_base());
     let client = reqwest::blocking::Client::new();
     let mut req = client.head(&url);
     if let Some(t) = token {
@@ -222,7 +224,7 @@ pub fn fetch_collection_items(slug_or_url: &str) -> Result<Vec<(String, String)>
         .trim_start_matches("hf://collections/")
         .trim_start_matches('/');
     let token = get_hf_token().ok();
-    let url = format!("https://huggingface.co/api/collections/{slug}");
+    let url = format!("{}/api/collections/{slug}", hf_base());
     let client = reqwest::blocking::Client::new();
     let mut req = client.get(&url);
     if let Some(t) = token {
@@ -263,6 +265,9 @@ pub fn fetch_collection_items(slug_or_url: &str) -> Result<Vec<(String, String)>
 #[cfg(test)]
 mod tests {
     use super::super::is_hf_path;
+    use super::*;
+    use crate::format::huggingface::publish::protocol::TEST_BASE_ENV;
+    use serial_test::serial;
 
     #[test]
     fn test_is_hf_path() {
@@ -279,5 +284,517 @@ mod tests {
         let (repo, rev) = stripped.split_once('@').unwrap();
         assert_eq!(repo, "chrishayuk/gemma-3-4b-it-vindex");
         assert_eq!(rev, "v2.0");
+    }
+
+    // ─── HTTP-mocked integration tests ─────────────────────────────
+
+    /// RAII env-var override for `LARQL_HF_TEST_BASE`, plus a fake
+    /// HF_TOKEN so the discovery functions don't try to read
+    /// `~/.huggingface/token` during the test. Restored on drop.
+    struct TestEnvGuard {
+        prev_base: Option<String>,
+        prev_token: Option<String>,
+    }
+
+    impl TestEnvGuard {
+        fn new(base: &str) -> Self {
+            let prev_base = std::env::var(TEST_BASE_ENV).ok();
+            let prev_token = std::env::var("HF_TOKEN").ok();
+            std::env::set_var(TEST_BASE_ENV, base);
+            std::env::set_var("HF_TOKEN", "test-token");
+            Self {
+                prev_base,
+                prev_token,
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_base.take() {
+                Some(v) => std::env::set_var(TEST_BASE_ENV, v),
+                None => std::env::remove_var(TEST_BASE_ENV),
+            }
+            match self.prev_token.take() {
+                Some(v) => std::env::set_var("HF_TOKEN", v),
+                None => std::env::remove_var("HF_TOKEN"),
+            }
+        }
+    }
+
+    // ── repo_exists / dataset_repo_exists ──
+
+    #[test]
+    #[serial]
+    fn repo_exists_returns_true_on_200() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("HEAD", "/api/models/org/repo")
+            .with_status(200)
+            .create();
+
+        assert!(repo_exists("org/repo", "model").unwrap());
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn repo_exists_returns_false_on_404() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("HEAD", "/api/models/missing/repo")
+            .with_status(404)
+            .create();
+
+        assert!(!repo_exists("missing/repo", "model").unwrap());
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn repo_exists_dataset_uses_datasets_path() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("HEAD", "/api/datasets/org/repo")
+            .with_status(200)
+            .create();
+
+        assert!(repo_exists("org/repo", "dataset").unwrap());
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn repo_exists_other_status_propagates_error() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("HEAD", "/api/models/org/repo")
+            .with_status(500)
+            .create();
+
+        let err = repo_exists("org/repo", "model").expect_err("500 must error");
+        mock.assert();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    #[serial]
+    fn dataset_repo_exists_is_thin_wrapper_over_repo_exists() {
+        // dataset_repo_exists hits the `model` HEAD path (the function
+        // body passes "model" — the misnomer is a known wart). Pin the
+        // wire contract via the model endpoint.
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("HEAD", "/api/models/org/repo")
+            .with_status(200)
+            .create();
+
+        assert!(dataset_repo_exists("org/repo").unwrap());
+        mock.assert();
+    }
+
+    // ── fetch_collection_items ──
+
+    #[test]
+    #[serial]
+    fn fetch_collection_items_parses_type_id_pairs() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("GET", "/api/collections/org/title-abc")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "items": [
+                        {"type": "dataset", "id": "owner/repo-a"},
+                        {"type": "model", "id": "owner/repo-b"},
+                    ]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let items = fetch_collection_items("org/title-abc").unwrap();
+        mock.assert();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], ("dataset".into(), "owner/repo-a".into()));
+        assert_eq!(items[1], ("model".into(), "owner/repo-b".into()));
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_collection_items_skips_malformed_entries() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("GET", "/api/collections/org/title-abc")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "items": [
+                        {"type": "dataset"},
+                        {"id": "owner/no-type"},
+                        {"type": "model", "id": "owner/good"},
+                    ]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let items = fetch_collection_items("org/title-abc").unwrap();
+        mock.assert();
+        assert_eq!(items, vec![("model".into(), "owner/good".into())]);
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_collection_items_strips_url_prefix() {
+        // Callers can pass a full collection URL — the function strips
+        // the prefix and treats the rest as a slug.
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("GET", "/api/collections/org/title-abc")
+            .with_status(200)
+            .with_body(r#"{"items":[]}"#)
+            .create();
+
+        let items =
+            fetch_collection_items("https://huggingface.co/collections/org/title-abc").unwrap();
+        mock.assert();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_collection_items_strips_hf_uri_scheme() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("GET", "/api/collections/org/title-abc")
+            .with_status(200)
+            .with_body(r#"{"items":[]}"#)
+            .create();
+
+        let items = fetch_collection_items("hf://collections/org/title-abc").unwrap();
+        mock.assert();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn fetch_collection_items_http_error_propagates() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("GET", "/api/collections/org/title-abc")
+            .with_status(404)
+            .with_body("not found")
+            .create();
+
+        let err = fetch_collection_items("org/title-abc").expect_err("404 errors");
+        mock.assert();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── add_collection_item ──
+
+    #[test]
+    #[serial]
+    fn add_collection_item_sends_typed_repo_payload() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("POST", "/api/collections/org/title-abc/items")
+            .match_header("authorization", "Bearer t")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "item": {"type": "dataset", "id": "org/data-repo"}
+            })))
+            .with_status(200)
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data-repo".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        add_collection_item("org/title-abc", &item, "t").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn add_collection_item_with_note_sends_note_field() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("POST", "/api/collections/org/title-abc/items")
+            .match_body(mockito::Matcher::Regex(
+                r#""note":\s*"why this repo""#.into(),
+            ))
+            .with_status(200)
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data-repo".into(),
+            repo_type: "dataset".into(),
+            note: Some("why this repo".into()),
+        };
+        add_collection_item("org/title-abc", &item, "t").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn add_collection_item_409_is_ok() {
+        // 409 = item already in the collection. ensure_collection's
+        // idempotency depends on this not erroring.
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("POST", "/api/collections/org/title-abc/items")
+            .with_status(409)
+            .with_body("already in collection")
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data-repo".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        add_collection_item("org/title-abc", &item, "t").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn add_collection_item_other_error_propagates() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let mock = server
+            .mock("POST", "/api/collections/org/title-abc/items")
+            .with_status(403)
+            .with_body("denied")
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data-repo".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        let err = add_collection_item("org/title-abc", &item, "t").expect_err("403 errors");
+        mock.assert();
+        assert!(err.to_string().contains("403"));
+    }
+
+    // ── ensure_collection orchestrator ──
+
+    #[test]
+    #[serial]
+    fn ensure_collection_creates_when_missing() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        // List returns an empty array — collection doesn't exist yet.
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(200)
+            .with_body("[]")
+            .create();
+        // Create succeeds.
+        let create_mock = server
+            .mock("POST", "/api/collections")
+            .with_status(200)
+            .with_body(r#"{"slug": "org/new-title-abc"}"#)
+            .create();
+        // Add-item succeeds.
+        let add_mock = server
+            .mock("POST", "/api/collections/org/new-title-abc/items")
+            .with_status(200)
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        let url = ensure_collection("org", "New Title", None, &[item]).unwrap();
+        list_mock.assert();
+        create_mock.assert();
+        add_mock.assert();
+        assert!(url.ends_with("/collections/org/new-title-abc"));
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_collection_reuses_existing_slug_case_insensitive() {
+        // Title match is case-insensitive — `find_collection_slug`
+        // returns the existing slug and `ensure_collection` skips
+        // the create endpoint entirely.
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(200)
+            .with_body(
+                serde_json::json!([
+                    {"title": "MY EXISTING TITLE", "slug": "org/existing-abc"}
+                ])
+                .to_string(),
+            )
+            .create();
+        // No `create` mock — if we hit it, the test fails.
+        let add_mock = server
+            .mock("POST", "/api/collections/org/existing-abc/items")
+            .with_status(200)
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        let url = ensure_collection("org", "my existing title", None, &[item]).unwrap();
+        list_mock.assert();
+        add_mock.assert();
+        assert!(url.ends_with("/collections/org/existing-abc"));
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_collection_uses_409_slug_when_create_conflicts() {
+        // Race: list returned no match, but create returns 409 with the
+        // existing slug in the body. We trust the 409 slug and proceed.
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(200)
+            .with_body("[]")
+            .create();
+        let create_mock = server
+            .mock("POST", "/api/collections")
+            .with_status(409)
+            .with_body(r#"{"slug": "org/raced-abc"}"#)
+            .create();
+        let add_mock = server
+            .mock("POST", "/api/collections/org/raced-abc/items")
+            .with_status(200)
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        ensure_collection("org", "Raced Title", None, &[item]).unwrap();
+        list_mock.assert();
+        create_mock.assert();
+        add_mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_collection_create_response_missing_slug_errors() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(200)
+            .with_body("[]")
+            .create();
+        let create_mock = server
+            .mock("POST", "/api/collections")
+            .with_status(200)
+            .with_body(r#"{"oops": "no slug"}"#)
+            .create();
+
+        let err = ensure_collection("org", "Bad", None, &[]).expect_err("missing slug errors");
+        list_mock.assert();
+        create_mock.assert();
+        assert!(err.to_string().contains("slug"));
+    }
+
+    #[test]
+    #[serial]
+    fn find_collection_slug_handles_404_as_no_match() {
+        // 404 list → returns Ok(None) (function falls through to create).
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(404)
+            .create();
+        // Falls through to create on the missing-list path.
+        let create_mock = server
+            .mock("POST", "/api/collections")
+            .with_status(200)
+            .with_body(r#"{"slug": "org/created-abc"}"#)
+            .create();
+        let add_mock = server
+            .mock("POST", "/api/collections/org/created-abc/items")
+            .with_status(200)
+            .create();
+
+        let item = CollectionItem {
+            repo_id: "org/data".into(),
+            repo_type: "dataset".into(),
+            note: None,
+        };
+        ensure_collection("org", "Title", None, &[item]).unwrap();
+        list_mock.assert();
+        create_mock.assert();
+        add_mock.assert();
+    }
+
+    #[test]
+    #[serial]
+    fn find_collection_slug_other_list_error_propagates() {
+        // 500 on list is a real failure — `ensure_collection` propagates
+        // the error rather than falling through to create.
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(500)
+            .with_body("server error")
+            .create();
+
+        let err = ensure_collection("org", "Title", None, &[]).expect_err("500 errors");
+        list_mock.assert();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    #[serial]
+    fn create_collection_includes_description_when_provided() {
+        let mut server = mockito::Server::new();
+        let _g = TestEnvGuard::new(&server.url());
+        let list_mock = server
+            .mock("GET", "/api/users/org/collections?limit=100")
+            .with_status(200)
+            .with_body("[]")
+            .create();
+        let create_mock = server
+            .mock("POST", "/api/collections")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "description": "my collection"
+            })))
+            .with_status(200)
+            .with_body(r#"{"slug": "org/with-desc"}"#)
+            .create();
+        let add_mock = server
+            .mock("POST", "/api/collections/org/with-desc/items")
+            .with_status(200)
+            .create();
+
+        ensure_collection("org", "Titled", Some("my collection"), &[]).unwrap();
+        list_mock.assert();
+        create_mock.assert();
+        let _ = add_mock; // no items → never invoked
     }
 }

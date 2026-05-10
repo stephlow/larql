@@ -127,8 +127,6 @@ mod tests {
     fn gate_scores_batch_backend_with_no_backend_falls_through() {
         let v = fresh();
         let x = Array2::<f32>::zeros((1, 8));
-        assert!(
-            <VectorIndex as GateLookup>::gate_scores_batch_backend(&v, 0, &x, None).is_none()
-        );
+        assert!(<VectorIndex as GateLookup>::gate_scores_batch_backend(&v, 0, &x, None).is_none());
     }
 }

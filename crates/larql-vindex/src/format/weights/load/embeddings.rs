@@ -164,9 +164,11 @@ mod tests {
         let err = load_embeddings(tmp.path(), &config, &mut cb).expect_err("missing file errors");
         // I/O error wrapping; just confirm we got an error rather than
         // producing zero-filled garbage.
-        assert!(err.to_string().to_lowercase().contains("no such")
-            || err.to_string().to_lowercase().contains("not found")
-            || err.to_string().to_lowercase().contains("os error"));
+        assert!(
+            err.to_string().to_lowercase().contains("no such")
+                || err.to_string().to_lowercase().contains("not found")
+                || err.to_string().to_lowercase().contains("os error")
+        );
     }
 
     #[test]

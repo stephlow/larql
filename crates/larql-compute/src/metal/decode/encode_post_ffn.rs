@@ -54,20 +54,26 @@ impl MetalBackend {
         use_fused: bool,
         prelayer_fusion: Option<&PreLayerNormFusion<'_>>,
     ) {
+        // M2: read norm-related layer fields through the structured view.
+        // `post_ffn_norm` is the only weight slice that doesn't have a
+        // pre-extracted buffer in `bufs` — keep that as a direct field
+        // access on the layer.
+        let norms_view = layer.norms();
+
         // D-RMS-FUSE Phase 1: on the non-post-norms path (Llama / Mistral /
         // Qwen / etc.), if the caller passed in next-layer info AND the
         // env var is on, dispatch `residual_norm_store` to fuse the
         // residual-add with the next layer's input rms_norm in one kernel.
         // Saves 1 dispatch per layer × num_layers (~7 µs each).
-        if !layer.has_post_norms
+        if !norms_view.has_post_norms
             && prelayer_fusion.is_some()
             && self.decode_flags.fused_prelayer_norm
         {
             let fusion = prelayer_fusion.unwrap();
             let next_input_norm_buf = self.bufs.get_f32(fusion.next_input_norm);
             let hidden_val = hidden as u32;
-            let eps = layer.eps;
-            let norm_offset = layer.norm_offset;
+            let eps = norms_view.eps;
+            let norm_offset = norms_view.norm_offset;
             enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
             enc.set_buffer(0, Some(bufs.h_post_attn), 0); // a (residual base)
             enc.set_buffer(1, Some(bufs.down_out), 0); // b (FFN output)
@@ -84,13 +90,13 @@ impl MetalBackend {
             return;
         }
 
-        if layer.has_post_norms {
+        if norms_view.has_post_norms {
             if let Some(post_ffn) = layer.post_ffn_norm {
                 let post_ffn_buf = self.bufs.get_f32(post_ffn);
                 if use_fused {
                     let hidden_val = hidden as u32;
-                    let eps = layer.eps;
-                    let norm_offset = layer.norm_offset;
+                    let eps = norms_view.eps;
+                    let norm_offset = norms_view.norm_offset;
                     enc.set_compute_pipeline_state(&self.norms.post_ffn_norm_residual_add_pipeline);
                     enc.set_buffer(0, Some(bufs.down_out), 0);
                     enc.set_buffer(1, Some(bufs.h_post_attn), 0);
@@ -111,8 +117,8 @@ impl MetalBackend {
                         &post_ffn_buf,
                         bufs.normed_scratch,
                         hidden,
-                        layer.eps,
-                        layer.norm_offset,
+                        norms_view.eps,
+                        norms_view.norm_offset,
                     );
                     encode_residual_add(
                         enc,

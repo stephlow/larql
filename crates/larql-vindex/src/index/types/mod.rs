@@ -355,7 +355,10 @@ mod tests {
     fn empty_tokenizer() -> tokenizers::Tokenizer {
         use tokenizers::models::wordlevel::WordLevel;
         use tokenizers::TokenizerBuilder;
-        let model = WordLevel::builder().unk_token("[UNK]".into()).build().unwrap();
+        let model = WordLevel::builder()
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
         TokenizerBuilder::<
             tokenizers::models::wordlevel::WordLevel,
             tokenizers::normalizers::NormalizerWrapper,
@@ -363,9 +366,9 @@ mod tests {
             tokenizers::processors::PostProcessorWrapper,
             tokenizers::decoders::DecoderWrapper,
         >::default()
-            .with_model(model)
-            .build()
-            .unwrap()
-            .into()
+        .with_model(model)
+        .build()
+        .unwrap()
+        .into()
     }
 }

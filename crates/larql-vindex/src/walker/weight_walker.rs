@@ -425,8 +425,8 @@ mod tests {
             stats: LayerStats::default(),
         };
         cb.on_layer_done(&dummy_result);
-        let mut g = Graph::new();
-        cb.on_checkpoint(&mut g);
+        let g = Graph::new();
+        cb.on_checkpoint(&g);
     }
 
     // ── WeightWalker::load ────────────────────────────────────────────────────
@@ -504,7 +504,9 @@ mod tests {
         let mut g_p = Graph::new();
         let mut g_s = Graph::new();
         let mut cb = SilentWalkCallbacks;
-        let r_p = walker.walk_layer(0, &permissive, &mut g_p, &mut cb).unwrap();
+        let r_p = walker
+            .walk_layer(0, &permissive, &mut g_p, &mut cb)
+            .unwrap();
         let r_s = walker.walk_layer(0, &strict, &mut g_s, &mut cb).unwrap();
         assert!(r_p.edges_found > 0);
         assert_eq!(r_s.edges_found, 0);
@@ -586,8 +588,7 @@ mod tests {
         };
         let mut g = Graph::new();
         let mut cb = SilentWalkCallbacks;
-        let results =
-            walk_model(dir.to_str().unwrap(), Some(&[1]), &cfg, &mut g, &mut cb).unwrap();
+        let results = walk_model(dir.to_str().unwrap(), Some(&[1]), &cfg, &mut g, &mut cb).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].layer, 1);
         cleanup(&dir);

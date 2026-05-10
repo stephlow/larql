@@ -61,7 +61,10 @@ pub fn create_with_dims(dir: &Path, dims: &ModelDims) {
 
     tensors.insert(
         "embed_tokens.weight".into(),
-        (random_f32(dims.vocab * dims.hidden, 42), vec![dims.vocab, dims.hidden]),
+        (
+            random_f32(dims.vocab * dims.hidden, 42),
+            vec![dims.vocab, dims.hidden],
+        ),
     );
     tensors.insert(
         "norm.weight".into(),
@@ -92,28 +95,40 @@ pub fn create_with_dims(dir: &Path, dims: &ModelDims) {
         tensors.insert(
             format!("{p}.self_attn.q_proj.weight"),
             (
-                random_f32(dims.num_q_heads * dims.head_dim * dims.hidden, layer * 100 + 1),
+                random_f32(
+                    dims.num_q_heads * dims.head_dim * dims.hidden,
+                    layer * 100 + 1,
+                ),
                 vec![dims.num_q_heads * dims.head_dim, dims.hidden],
             ),
         );
         tensors.insert(
             format!("{p}.self_attn.k_proj.weight"),
             (
-                random_f32(dims.num_kv_heads * dims.head_dim * dims.hidden, layer * 100 + 2),
+                random_f32(
+                    dims.num_kv_heads * dims.head_dim * dims.hidden,
+                    layer * 100 + 2,
+                ),
                 vec![dims.num_kv_heads * dims.head_dim, dims.hidden],
             ),
         );
         tensors.insert(
             format!("{p}.self_attn.v_proj.weight"),
             (
-                random_f32(dims.num_kv_heads * dims.head_dim * dims.hidden, layer * 100 + 3),
+                random_f32(
+                    dims.num_kv_heads * dims.head_dim * dims.hidden,
+                    layer * 100 + 3,
+                ),
                 vec![dims.num_kv_heads * dims.head_dim, dims.hidden],
             ),
         );
         tensors.insert(
             format!("{p}.self_attn.o_proj.weight"),
             (
-                random_f32(dims.hidden * dims.num_q_heads * dims.head_dim, layer * 100 + 4),
+                random_f32(
+                    dims.hidden * dims.num_q_heads * dims.head_dim,
+                    layer * 100 + 4,
+                ),
                 vec![dims.hidden, dims.num_q_heads * dims.head_dim],
             ),
         );

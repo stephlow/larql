@@ -153,7 +153,11 @@ mod tests {
             acc.record(t);
         }
         assert_eq!(acc.count, 3);
-        assert!(acc.total_us >= 150.0, "expected ≥150 µs, got {}", acc.total_us);
+        assert!(
+            acc.total_us >= 150.0,
+            "expected ≥150 µs, got {}",
+            acc.total_us
+        );
         let avg = acc.avg_us();
         assert!(avg >= 50.0, "expected avg ≥50 µs, got {avg}");
     }

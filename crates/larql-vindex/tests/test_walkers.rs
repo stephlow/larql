@@ -15,8 +15,8 @@ fn weight_walker_loads() {
     let _ = std::fs::remove_dir_all(&dir);
     create_mock_model(&dir);
 
-    let walker = larql_vindex::walker::weight_walker::WeightWalker::load(dir.to_str().unwrap())
-        .unwrap();
+    let walker =
+        larql_vindex::walker::weight_walker::WeightWalker::load(dir.to_str().unwrap()).unwrap();
     assert_eq!(walker.num_layers(), 2);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -28,8 +28,8 @@ fn weight_walker_extracts_edges() {
     let _ = std::fs::remove_dir_all(&dir);
     create_mock_model(&dir);
 
-    let walker = larql_vindex::walker::weight_walker::WeightWalker::load(dir.to_str().unwrap())
-        .unwrap();
+    let walker =
+        larql_vindex::walker::weight_walker::WeightWalker::load(dir.to_str().unwrap()).unwrap();
     let config = larql_vindex::walker::weight_walker::WalkConfig {
         top_k: 3,
         min_score: 0.0,
@@ -111,8 +111,8 @@ fn weight_walker_layer_stats_invariants() {
     let _ = std::fs::remove_dir_all(&dir);
     create_mock_model(&dir);
 
-    let walker = larql_vindex::walker::weight_walker::WeightWalker::load(dir.to_str().unwrap())
-        .unwrap();
+    let walker =
+        larql_vindex::walker::weight_walker::WeightWalker::load(dir.to_str().unwrap()).unwrap();
     let config = larql_vindex::walker::weight_walker::WalkConfig {
         top_k: 3,
         min_score: 0.0,

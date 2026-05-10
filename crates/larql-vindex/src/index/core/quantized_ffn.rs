@@ -144,8 +144,12 @@ mod tests {
     fn flag_methods_false_on_empty() {
         let v = fresh();
         assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_q4(&v));
-        assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_q4k(&v));
-        assert!(!<VectorIndex as QuantizedFfnAccess>::has_down_features_q4k(&v));
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_q4k(
+            &v
+        ));
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_down_features_q4k(
+            &v
+        ));
     }
 
     #[test]
@@ -161,9 +165,7 @@ mod tests {
         let v = fresh();
         assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4_mmap_ref(&v).is_none());
         assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4k_mmap_ref(&v).is_none());
-        assert!(
-            <VectorIndex as QuantizedFfnAccess>::interleaved_q4k_layer_data(&v, 0).is_none()
-        );
+        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4k_layer_data(&v, 0).is_none());
     }
 
     #[test]
@@ -186,9 +188,11 @@ mod tests {
                 &v, 0, 0, 0, 1.0, &mut out
             )
         );
-        assert!(!<VectorIndex as QuantizedFfnAccess>::q4k_ffn_row_scaled_add(
-            &v, 0, 0, 0, 1.0, &mut out
-        ));
+        assert!(
+            !<VectorIndex as QuantizedFfnAccess>::q4k_ffn_row_scaled_add(
+                &v, 0, 0, 0, 1.0, &mut out
+            )
+        );
         assert!(
             !<VectorIndex as QuantizedFfnAccess>::q4k_down_feature_scaled_add(
                 &v, 0, 0, 1.0, &mut out
@@ -212,8 +216,7 @@ mod tests {
         .is_none());
         // Backend=None path also covered.
         assert!(
-            <VectorIndex as QuantizedFfnAccess>::q4k_matmul_transb(&v, 0, 0, &x, 1, None)
-                .is_none()
+            <VectorIndex as QuantizedFfnAccess>::q4k_matmul_transb(&v, 0, 0, &x, 1, None).is_none()
         );
     }
 

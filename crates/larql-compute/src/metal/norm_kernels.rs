@@ -99,8 +99,9 @@ impl NormKernels {
             residual_norm_pipeline: get_shader_pipeline::<shaders::fused_ops::ResidualNormKernel>(
                 device, library,
             )?,
-            residual_norm_q8_pipeline:
-                get_shader_pipeline::<shaders::fused_ops::ResidualNormQ8Kernel>(device, library)?,
+            residual_norm_q8_pipeline: get_shader_pipeline::<
+                shaders::fused_ops::ResidualNormQ8Kernel,
+            >(device, library)?,
             residual_norm_store_pipeline: get_shader_pipeline::<
                 shaders::fused_ops::ResidualNormStoreKernel,
             >(device, library)?,
@@ -121,9 +122,9 @@ impl NormKernels {
             qk_norm_qk_pipeline: get_shader_pipeline::<shaders::qk_norm::QkKernel>(
                 device, library,
             )?,
-            qk_norm_rope_fused_pipeline: get_shader_pipeline::<
-                shaders::qk_norm_rope_fused::Kernel,
-            >(device, library)?,
+            qk_norm_rope_fused_pipeline: get_shader_pipeline::<shaders::qk_norm_rope_fused::Kernel>(
+                device, library,
+            )?,
 
             post_attn_residual_norm_store_pipeline: get_shader_pipeline::<
                 shaders::post_attn_residual_norm_store::Kernel,

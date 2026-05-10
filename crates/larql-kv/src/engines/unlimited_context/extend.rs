@@ -197,8 +197,8 @@ pub fn empty_prior(weights: &ModelWeights) -> Vec<SharedKV> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use larql_inference::test_utils::make_test_weights;
     use larql_inference::forward::hidden_to_raw_logits;
+    use larql_inference::test_utils::make_test_weights;
 
     // ── empty_prior ───────────────────────────────────────────────────────────
 

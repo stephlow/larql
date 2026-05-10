@@ -69,9 +69,7 @@ impl FfnKernels {
                 device, library,
             )?,
 
-            silu_pipeline: get_shader_pipeline::<shaders::activation::SiluKernel>(
-                device, library,
-            )?,
+            silu_pipeline: get_shader_pipeline::<shaders::activation::SiluKernel>(device, library)?,
             gelu_tanh_pipeline: get_shader_pipeline::<shaders::activation::GeluTanhKernel>(
                 device, library,
             )?,
@@ -89,9 +87,9 @@ impl FfnKernels {
                 shaders::q4k_ffn_gate_up_coop::Kernel,
             >(device, library)?,
 
-            q4kf_ffn_gate_up_pipeline: KernelHandle::from_kernel::<shaders::q4kf_ffn_gate_up::Kernel>(
-                device, library,
-            )?,
+            q4kf_ffn_gate_up_pipeline: KernelHandle::from_kernel::<
+                shaders::q4kf_ffn_gate_up::Kernel,
+            >(device, library)?,
 
             q4k_geglu_silu_down_pipeline: KernelHandle::from_kernel::<
                 shaders::q4k_geglu_down::SiluKernel,

@@ -64,7 +64,11 @@ mod tests {
     use super::*;
     use crate::format::filenames::DOWN_FEATURES_BIN;
 
-    fn vindex_with_layer_features(num_layers: usize, intermediate: usize, hidden: usize) -> VectorIndex {
+    fn vindex_with_layer_features(
+        num_layers: usize,
+        intermediate: usize,
+        hidden: usize,
+    ) -> VectorIndex {
         let mut v = VectorIndex::empty(num_layers, hidden);
         for layer in 0..num_layers {
             v.gate.gate_vectors[layer] = Some(Array2::<f32>::zeros((intermediate, hidden)));
@@ -81,7 +85,9 @@ mod tests {
     fn load_up_features_errors_when_file_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = vindex_with_layer_features(1, 2, 4);
-        let err = v.load_up_features(tmp.path()).expect_err("missing file errors");
+        let err = v
+            .load_up_features(tmp.path())
+            .expect_err("missing file errors");
         assert!(err.to_string().contains("up_features.bin"));
     }
 

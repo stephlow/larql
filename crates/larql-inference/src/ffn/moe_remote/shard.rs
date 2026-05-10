@@ -434,26 +434,18 @@ impl Shard {
                 Ok(out)
             }
             ShardTransport::Http(client) => {
-                // Per-stage client-side timing (`LARQL_HTTP_TIMING=1`).
-                thread_local! {
-                    static HTTP_TIMING: bool =
-                        std::env::var("LARQL_HTTP_TIMING").is_ok();
-                }
-                let timing = HTTP_TIMING.with(|t| *t);
-
-                // Wire format selection.  Default f32 (loopback / same-host
-                // grids — TCP buffer/copy costs dominate, f16 conversion
-                // CPU cost cancels the wire-bytes saving).  Set
-                // `LARQL_MOE_WIRE_F16=1` for LAN deployments where the
-                // 5 KB/call wire saving matters more than the 9 µs/call
-                // f32↔f16 conversion CPU.  Bench (M3 Max loopback,
-                // 2026-05-01): f16 was 0.5-1% slower (within noise) on
+                // Per-stage client-side timing + wire-format selection.
+                // Driven from the process-wide `RemoteMoeRuntime`; default
+                // is f32 wire on (loopback / same-host grids — TCP buffer
+                // costs dominate, f16 conversion CPU cancels the wire-byte
+                // saving).  Set `LARQL_MOE_WIRE_F16=1` for LAN deployments
+                // where the 5 KB/call wire saving matters more than the
+                // 9 µs/call f32↔f16 conversion CPU.  Bench (M3 Max loopback,
+                // 2026-05-01): f16 was 0.5-1% slower (within noise) on a
                 // 100-token poem; expected to invert on >100 µs RTT links.
-                thread_local! {
-                    static USE_F16_WIRE: bool =
-                        std::env::var("LARQL_MOE_WIRE_F16").is_ok();
-                }
-                let use_f16 = USE_F16_WIRE.with(|v| *v);
+                let runtime = super::runtime::RemoteMoeRuntime::get();
+                let timing = runtime.http_timing;
+                let use_f16 = runtime.wire_f16;
 
                 let url = if use_f16 {
                     format!("{}/v1/experts/layer-batch-f16", self.config.url)
@@ -538,14 +530,9 @@ impl Shard {
                 // the TCP `Http` variant, just no TCP stack.  The server
                 // is the same axum router on a `UnixListener`; from the
                 // handler's perspective it can't tell.
-                thread_local! {
-                    static HTTP_TIMING: bool =
-                        std::env::var("LARQL_HTTP_TIMING").is_ok();
-                    static USE_F16_WIRE: bool =
-                        std::env::var("LARQL_MOE_WIRE_F16").is_ok();
-                }
-                let timing = HTTP_TIMING.with(|t| *t);
-                let use_f16 = USE_F16_WIRE.with(|v| *v);
+                let runtime = super::runtime::RemoteMoeRuntime::get();
+                let timing = runtime.http_timing;
+                let use_f16 = runtime.wire_f16;
 
                 let path = if use_f16 {
                     "/v1/experts/layer-batch-f16"

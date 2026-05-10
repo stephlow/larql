@@ -72,16 +72,12 @@ pub fn run_ffn(
     let norm_offset = weights.arch.norm_weight_offset();
     let arch = &*weights.arch;
 
-    // Layer-0 stage dumps (LARQL_CPU_STAGE_DUMP=<dir>) — matches the
-    // Metal `LARQL_METAL_DUMP_LAYERS` convention. Lets us diff per-stage
-    // intermediates between CPU and Metal for the first layer.
-    let stage_dump_dir = if layer == 0 {
-        std::env::var("LARQL_CPU_STAGE_DUMP").ok()
-    } else {
-        None
-    };
+    // Layer-0 (or LARQL_STAGE_DUMP_LAYER) stage dumps — matches the Metal
+    // `LARQL_METAL_DUMP_LAYERS` convention. Lets us diff per-stage
+    // intermediates between CPU and Metal.
+    let stage_dump_dir = super::dump_config::DumpConfig::get().stage_dir(layer);
     let dump_f32 = |name: &str, arr: &Array2<f32>| {
-        if let Some(ref dir) = stage_dump_dir {
+        if let Some(dir) = stage_dump_dir {
             let slice = arr.as_slice().unwrap_or(&[]);
             let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = std::fs::write(format!("{dir}/cpu_L0_{name}.f32"), &bytes);
@@ -176,7 +172,7 @@ pub fn run_layer_with_ffn(
     // bisect any layer's drift into attention (compare h_post_attn) vs
     // FFN+PLE+scalar (compare h_out minus h_post_attn). Gated on the
     // same env var as the end-of-layer dump; no overhead when unset.
-    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+    if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
         let path = format!("{dir}/cpu_layer_{layer:02}_h_post_attn.f32");

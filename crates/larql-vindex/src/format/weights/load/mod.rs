@@ -245,7 +245,10 @@ mod tests {
             "model.embed_tokens.weight",
             "lm_head.weight",
         ] {
-            assert!(!LoadWeightsOptions::is_ffn_key(key), "false positive: {key}");
+            assert!(
+                !LoadWeightsOptions::is_ffn_key(key),
+                "false positive: {key}"
+            );
         }
     }
 

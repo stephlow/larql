@@ -473,8 +473,15 @@ fn decode_token_multi_layer_synthetic_smoke() {
 
     // Build 3 distinct layers with different seeds so the layer loop
     // genuinely advances state.
-    let mut layers_data: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
-        Vec::with_capacity(3);
+    let mut layers_data: Vec<(
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    )> = Vec::with_capacity(3);
     for l in 0..3usize {
         let s = l as f32 * 0.1;
         layers_data.push((
@@ -717,17 +724,15 @@ fn prefill_q4_seq4_synthetic_smoke() {
     let result = match result {
         Some(r) => r,
         None => {
-            eprintln!("skip: prefill_q4 returned None (synthetic layer not supported by this path)");
+            eprintln!(
+                "skip: prefill_q4 returned None (synthetic layer not supported by this path)"
+            );
             return;
         }
     };
 
     // prefill_q4 returns seq_len × hidden (all positions, not just last).
-    assert_eq!(
-        result.len(),
-        seq_len * HIDDEN,
-        "prefill_q4 output length"
-    );
+    assert_eq!(result.len(), seq_len * HIDDEN, "prefill_q4 output length");
     assert_eq!(result.iter().filter(|v| v.is_nan()).count(), 0);
     assert_eq!(result.iter().filter(|v| v.is_infinite()).count(), 0);
     let max_abs = result.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -804,12 +809,18 @@ fn qkv_pipeline_geometry_matches_shader_constants() {
 
     use larql_compute::metal::shaders::{q4k_qkv_proj as q4k, q4kf_qkv_proj as q4kf};
 
-    assert_eq!(metal.attention.q4k_qkv_proj_pipeline.rows_per_tg, q4k::ROWS_PER_TG);
+    assert_eq!(
+        metal.attention.q4k_qkv_proj_pipeline.rows_per_tg,
+        q4k::ROWS_PER_TG
+    );
     assert_eq!(
         metal.attention.q4k_qkv_proj_pipeline.threads_per_tg,
         q4k::THREADS_PER_TG
     );
-    assert_eq!(metal.attention.q4kf_qkv_proj_pipeline.rows_per_tg, q4kf::ROWS_PER_TG);
+    assert_eq!(
+        metal.attention.q4kf_qkv_proj_pipeline.rows_per_tg,
+        q4kf::ROWS_PER_TG
+    );
     assert_eq!(
         metal.attention.q4kf_qkv_proj_pipeline.threads_per_tg,
         q4kf::THREADS_PER_TG
@@ -819,7 +830,8 @@ fn qkv_pipeline_geometry_matches_shader_constants() {
     // reason the bug existed. If they ever converge, delete this assert
     // and document the consolidation.
     assert!(
-        metal.attention.q4k_qkv_proj_pipeline.rows_per_tg != metal.attention.q4kf_qkv_proj_pipeline.rows_per_tg
+        metal.attention.q4k_qkv_proj_pipeline.rows_per_tg
+            != metal.attention.q4kf_qkv_proj_pipeline.rows_per_tg
             || metal.attention.q4k_qkv_proj_pipeline.threads_per_tg
                 != metal.attention.q4kf_qkv_proj_pipeline.threads_per_tg,
         "Q4_K and Q4_KF QKV pipelines now share geometry — \

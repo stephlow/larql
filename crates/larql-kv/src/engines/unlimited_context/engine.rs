@@ -24,9 +24,9 @@ use super::extend::{
     empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_q4k,
 };
 use super::token_archive::TokenArchive;
-use larql_inference::attention::SharedKV;
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::{EngineInfo, KvEngine};
+use larql_inference::attention::SharedKV;
 use larql_inference::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 use larql_inference::model::ModelWeights;
 
@@ -702,8 +702,8 @@ mod tests {
 
     #[test]
     fn logits_from_unlimited_context_are_finite() {
-        use larql_inference::test_utils::make_test_weights;
         use larql_inference::forward::hidden_to_raw_logits;
+        use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(512);
         let h = engine.prefill(&weights, &[0u32, 1]).expect("prefill");

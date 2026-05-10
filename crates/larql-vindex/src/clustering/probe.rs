@@ -215,7 +215,10 @@ mod tests {
     fn empty_tokenizer() -> tokenizers::Tokenizer {
         use tokenizers::models::wordlevel::WordLevel;
         use tokenizers::TokenizerBuilder;
-        let model = WordLevel::builder().unk_token("[UNK]".into()).build().unwrap();
+        let model = WordLevel::builder()
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
         TokenizerBuilder::<
             tokenizers::models::wordlevel::WordLevel,
             tokenizers::normalizers::NormalizerWrapper,
@@ -223,10 +226,10 @@ mod tests {
             tokenizers::processors::PostProcessorWrapper,
             tokenizers::decoders::DecoderWrapper,
         >::default()
-            .with_model(model)
-            .build()
-            .unwrap()
-            .into()
+        .with_model(model)
+        .build()
+        .unwrap()
+        .into()
     }
 
     fn meta(token: &str, score: f32) -> crate::FeatureMeta {
@@ -319,7 +322,10 @@ mod tests {
 
         let entities = extract_probe_entities(&path);
         // Three unique strings, ascending.
-        assert_eq!(entities, vec!["ab".to_string(), "yc".to_string(), "zb".to_string()]);
+        assert_eq!(
+            entities,
+            vec!["ab".to_string(), "yc".to_string(), "zb".to_string()]
+        );
     }
 
     // ── build_confirmed_pairs ────────────────────────────────────
@@ -342,7 +348,7 @@ mod tests {
             2,
             4,
             &[
-                vec![Some(meta("Paris", 0.9))],   // layer 0, feat 0
+                vec![Some(meta("Paris", 0.9))],        // layer 0, feat 0
                 vec![None, Some(meta("French", 0.8))], // layer 1, feat 1
             ],
         );
@@ -354,9 +360,7 @@ mod tests {
         probe
             .feature_entities
             .insert((0, 0), vec!["France".into(), "Italy".into()]);
-        probe
-            .feature_entities
-            .insert((1, 1), vec!["France".into()]);
+        probe.feature_entities.insert((1, 1), vec!["France".into()]);
 
         let mut pairs = build_confirmed_pairs(&probe, &v);
         pairs.sort();

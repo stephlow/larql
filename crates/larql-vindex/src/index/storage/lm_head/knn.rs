@@ -391,7 +391,7 @@ mod tests {
         let mut v = VectorIndex::empty(1, 4);
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LM_HEAD_BIN);
-        std::fs::write(&path, &[0u8; 16]).unwrap();
+        std::fs::write(&path, [0u8; 16]).unwrap();
         v.load_lm_head(tmp.path()).unwrap();
         // Override vocab_size to 0 to hit the `vocab == 0` guard.
         v.vocab_size = 0;
@@ -510,7 +510,11 @@ mod tests {
     fn stride32_mode_falsy_values_select_disabled() {
         for val in ["0", "false", "off", "no"] {
             let _g = EnvSet::set(Some(val));
-            assert_eq!(lm_head_stride32_mode(), Stride32Mode::Disabled, "value {val}");
+            assert_eq!(
+                lm_head_stride32_mode(),
+                Stride32Mode::Disabled,
+                "value {val}"
+            );
         }
     }
 

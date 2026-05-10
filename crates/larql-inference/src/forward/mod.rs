@@ -21,6 +21,7 @@
 //! - `vocab_proj`: Direct W_E / W_U primitives — embedding rows, neighbors, raw unembed
 //! - `patching`: Activation patching — donor → recipient residual swap at (layer, position)
 
+pub mod dump_config;
 pub mod embed;
 pub mod hooks;
 pub mod infer_patched;

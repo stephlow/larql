@@ -78,10 +78,22 @@ fn write_synthetic_mixtral_model(
     for layer in 0..num_layers {
         let lp = format!("model.layers.{layer}");
         // Standard Llama-style attention.
-        push(&format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
+        push(
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
         push(&format!("{lp}.input_layernorm.weight"), vec![hidden]);
         push(
             &format!("{lp}.post_attention_layernorm.weight"),
@@ -174,8 +186,10 @@ fn streaming_extract_mixtral_exercises_moe_arms() {
 
     // ── Outputs the MoE arms must produce ───────────────────────
     assert!(output_dir.join("gate_vectors.bin").exists());
-    assert!(output_dir.join("router_weights.bin").exists(),
-            "MoE arm must write router_weights.bin (router_weights.rs whole body)");
+    assert!(
+        output_dir.join("router_weights.bin").exists(),
+        "MoE arm must write router_weights.bin (router_weights.rs whole body)"
+    );
     assert!(output_dir.join("embeddings.bin").exists());
     assert!(output_dir.join("down_meta.bin").exists());
     assert!(output_dir.join("index.json").exists());
@@ -225,6 +239,7 @@ fn streaming_extract_mixtral_exercises_moe_arms() {
 /// dispatch picks the PackedBF16 arm because Gemma4Arch advertises
 /// `expert_format() == ExpertFormat::PackedBF16` whenever
 /// `enable_moe_block=true`.
+#[allow(clippy::too_many_arguments)]
 fn write_synthetic_gemma4_hybrid_moe(
     model_dir: &Path,
     hidden: usize,
@@ -278,10 +293,22 @@ fn write_synthetic_gemma4_hybrid_moe(
     for layer in 0..num_layers {
         let lp = format!("model.layers.{layer}");
         // Standard Llama-style attention (Gemma 4 inherits this).
-        push(&format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
-        push(&format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
+        push(
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
         push(&format!("{lp}.input_layernorm.weight"), vec![hidden]);
         // Hybrid MoE renames post_feedforward_layernorm → _1 (dense
         // branch); the streaming pipeline doesn't need it for Browse
@@ -292,9 +319,18 @@ fn write_synthetic_gemma4_hybrid_moe(
         );
         // Dense MLP — both branches coexist in hybrid MoE; gate_vectors'
         // PackedBF16 arm reads from here.
-        push(&format!("{lp}.mlp.gate_proj.weight"), vec![intermediate, hidden]);
-        push(&format!("{lp}.mlp.up_proj.weight"), vec![intermediate, hidden]);
-        push(&format!("{lp}.mlp.down_proj.weight"), vec![hidden, intermediate]);
+        push(
+            &format!("{lp}.mlp.gate_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &format!("{lp}.mlp.up_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &format!("{lp}.mlp.down_proj.weight"),
+            vec![hidden, intermediate],
+        );
         // Packed expert tensors — only consumed by the q4k writer at
         // QuantFormat::Q4K. With QuantFormat::None they're present but
         // unused by Browse-level extraction.
@@ -307,7 +343,10 @@ fn write_synthetic_gemma4_hybrid_moe(
             vec![num_experts, hidden, moe_intermediate],
         );
         // Router (hybrid MoE: `router.proj` not `gate.weight`).
-        push(&format!("{lp}.router.proj.weight"), vec![num_experts, hidden]);
+        push(
+            &format!("{lp}.router.proj.weight"),
+            vec![num_experts, hidden],
+        );
     }
 
     let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
@@ -498,24 +537,52 @@ fn write_synthetic_gpt_oss_model(
     };
 
     // Globals
-    push_f32(&mut entries, "model.embed_tokens.weight".into(), vec![vocab, hidden]);
+    push_f32(
+        &mut entries,
+        "model.embed_tokens.weight".into(),
+        vec![vocab, hidden],
+    );
     push_f32(&mut entries, "model.norm.weight".into(), vec![hidden]);
 
     for layer in 0..num_layers {
         let lp = format!("model.layers.{layer}");
         // Standard attention.
-        push_f32(&mut entries, format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
-        push_f32(&mut entries, format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
-        push_f32(&mut entries, format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
-        push_f32(&mut entries, format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
-        push_f32(&mut entries, format!("{lp}.input_layernorm.weight"), vec![hidden]);
+        push_f32(
+            &mut entries,
+            format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push_f32(
+            &mut entries,
+            format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push_f32(
+            &mut entries,
+            format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push_f32(
+            &mut entries,
+            format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push_f32(
+            &mut entries,
+            format!("{lp}.input_layernorm.weight"),
+            vec![hidden],
+        );
         push_f32(
             &mut entries,
             format!("{lp}.post_attention_layernorm.weight"),
             vec![hidden],
         );
         // Router (gpt-oss: `mlp.router.weight`, NOT `block_sparse_moe.gate`).
-        push_f32(&mut entries, format!("{lp}.mlp.router.weight"), vec![num_experts, hidden]);
+        push_f32(
+            &mut entries,
+            format!("{lp}.mlp.router.weight"),
+            vec![num_experts, hidden],
+        );
 
         // Packed MXFP4 expert blocks (U8) + e8m0 scales (U8). All-zero
         // blocks → MXFP4_TABLE[0]=0.0 → zero-filled dequant. Scale 127

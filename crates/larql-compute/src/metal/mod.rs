@@ -19,6 +19,7 @@
 //! - Q4_K matvec: uint4 loads, 8 rows/TG, multi-row (nr0=2)
 //! - KV attention: simd_max/simd_sum reductions, float4 Q·K dot products
 
+mod attention_kernels; // AttentionKernels registry (M3 incremental — third of four)
 pub mod buffers;
 pub mod calibrate;
 mod decode;
@@ -28,11 +29,10 @@ mod decode_hybrid;
 pub mod diag;
 mod direct_ops;
 pub mod f32_ops;
+mod ffn_kernels; // FfnKernels registry (M3 incremental — fourth of four; M3 complete)
 mod flags; // cached env-var-derived backend flags (DecodeFlags)
 pub mod kernel; // KernelHandle: pipeline + dispatch geometry, bundled
 mod moe_dispatch;
-mod attention_kernels; // AttentionKernels registry (M3 incremental — third of four)
-mod ffn_kernels; // FfnKernels registry (M3 incremental — fourth of four; M3 complete)
 mod norm_kernels; // NormKernels registry (M3 incremental — first of four)
 mod quant_kernels; // QuantKernels registry (M3 incremental — second of four)
 pub use attention_kernels::AttentionKernels;

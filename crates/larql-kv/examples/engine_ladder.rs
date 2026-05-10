@@ -50,10 +50,7 @@ fn main() {
     ];
 
     println!("larql-kv engine ladder (synthetic 2-layer model)\n");
-    println!(
-        "{:<32} diagnostics",
-        "engine"
-    );
+    println!("{:<32} diagnostics", "engine");
     println!("{}", "-".repeat(96));
 
     for spec in specs {

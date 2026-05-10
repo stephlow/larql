@@ -14,7 +14,7 @@ use crate::format::filenames::*;
 use super::super::manifest::Q4kManifestEntry;
 use super::super::write_f32::WeightSource;
 use super::feature_major_down::FeatureMajorDownState;
-use super::{pad_rows_to_block, QuantBlockFormat, Q4kWriteOptions};
+use super::{pad_rows_to_block, Q4kWriteOptions, QuantBlockFormat};
 
 /// Write the FFN gate/up/down legs of every layer to
 /// `interleaved_q4k.bin` in `[gate Q4_K | up Q4_K | down Q6_K]`

@@ -105,7 +105,11 @@ mod tests {
 
     const Q4_0_BLOCK_ELEMS: usize = larql_models::quant::ggml::Q4_0_BLOCK_ELEMS;
 
-    fn vindex_with_layer_features(num_layers: usize, intermediate: usize, hidden: usize) -> VectorIndex {
+    fn vindex_with_layer_features(
+        num_layers: usize,
+        intermediate: usize,
+        hidden: usize,
+    ) -> VectorIndex {
         let mut v = VectorIndex::empty(num_layers, hidden);
         for layer in 0..num_layers {
             v.gate.gate_vectors[layer] = Some(Array2::<f32>::zeros((intermediate, hidden)));
@@ -116,10 +120,7 @@ mod tests {
     /// Build per-layer Q4_0 interleaved bytes for `[gate | up | down]`.
     /// Each matrix is `intermediate × hidden` floats (must be a multiple
     /// of `Q4_0_BLOCK_ELEMS`).
-    fn write_q4_interleaved(
-        dir: &std::path::Path,
-        layers: &[(Vec<f32>, Vec<f32>, Vec<f32>)],
-    ) {
+    fn write_q4_interleaved(dir: &std::path::Path, layers: &[(Vec<f32>, Vec<f32>, Vec<f32>)]) {
         let mut bytes = Vec::new();
         for (gate, up, down) in layers {
             for matrix in [gate, up, down] {
@@ -163,10 +164,7 @@ mod tests {
         let down: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.03).collect();
 
         let tmp = tempfile::tempdir().unwrap();
-        write_q4_interleaved(
-            tmp.path(),
-            &[(gate.clone(), up.clone(), down.clone())],
-        );
+        write_q4_interleaved(tmp.path(), &[(gate.clone(), up.clone(), down.clone())]);
 
         let mut v = vindex_with_layer_features(1, 1, hidden);
         v.load_interleaved_q4(tmp.path()).unwrap();

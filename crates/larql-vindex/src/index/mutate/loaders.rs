@@ -236,7 +236,11 @@ mod tests {
     use super::*;
     use crate::index::types::SilentLoadCallbacks;
 
-    fn write_ndjson(dir: &std::path::Path, name: &str, lines: &[serde_json::Value]) -> std::path::PathBuf {
+    fn write_ndjson(
+        dir: &std::path::Path,
+        name: &str,
+        lines: &[serde_json::Value],
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         let body: String = lines
             .iter()
@@ -250,7 +254,12 @@ mod tests {
         serde_json::json!({"_header": true, "dimension": dim})
     }
 
-    fn gate_record(layer: usize, feature: usize, vector: &[f32], top_token: &str) -> serde_json::Value {
+    fn gate_record(
+        layer: usize,
+        feature: usize,
+        vector: &[f32],
+        top_token: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "layer": layer,
             "feature": feature,
@@ -281,7 +290,8 @@ mod tests {
     #[test]
     fn load_gates_errors_when_file_missing() {
         let mut cb = SilentLoadCallbacks;
-        let result = VectorIndex::load_gates(std::path::Path::new("/tmp/_no_such_gates.jsonl"), &mut cb);
+        let result =
+            VectorIndex::load_gates(std::path::Path::new("/tmp/_no_such_gates.jsonl"), &mut cb);
         assert!(result.is_err(), "missing file must error");
     }
 
@@ -362,7 +372,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
         let mut cb = SilentLoadCallbacks;
         let v = VectorIndex::load_gates(&path, &mut cb).unwrap();
-        let meta = v.metadata.down_meta[0].as_ref().unwrap()[0].as_ref().unwrap();
+        let meta = v.metadata.down_meta[0].as_ref().unwrap()[0]
+            .as_ref()
+            .unwrap();
         assert!(meta.top_k.is_empty());
     }
 

@@ -6,6 +6,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/) conventions
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-10] — Coverage push
+
+Total line coverage **67.44 % → 85.13 %** (+17.69 pp, 217 tests, +66 vs
+extraction-day). 15 of 21 source files now at ≥ 90 %; the remaining 6
+all carry tightened debt baselines.
+
+| File | Before | After |
+|---|---:|---:|
+| `profiler.rs` | 0.00 % | 100.00 % |
+| `engines/apollo/npy.rs` | 58.20 % | 93.61 % |
+| `engines/apollo/engine.rs` | 71.98 % | 96.31 % |
+| `engines/apollo/store.rs` | 17.81 % | 89.78 % |
+| `engines/markov_residual/engine.rs` | 72.02 % | 93.23 % |
+| `engines/markov_residual/q4k.rs` | 0.00 % | 57.14 % |
+| `lib.rs` | 84.79 % | 90.03 % |
+
+Notable additions:
+
+- 8 `profiler` tests covering `StageAccumulator`, `EngineProfiler`, and
+  `DecodeStageSummary` (including the `print()` smoke test for both the
+  recompute-tier-present and total-zero branches).
+- 4 `compliance_tests` lifting the default `KvEngine::prefill_q4k` /
+  `decode_step_q4k` trait-method fallbacks via a synthetic
+  `DefaultMethodsEngine` fixture.
+- 5 `markov_residual::engine` tests covering profiling on/off split, the
+  `with_profiling` setter, and the Q4K CPU fallback (Metal returns
+  `None` → `rs_prefill_walk` / `rs_decode_step_walk`).
+- 22 `apollo::npy` tests covering all `NpyError` variants, structured
+  vs simple dtype dispatch, header field-parser branches.
+- 13 `apollo::store` tests including end-to-end `ApolloStore::load`
+  against a synthetic on-disk store built with `tempfile` + handwritten
+  `.npy`/`.npz` fixtures.
+- 11 `apollo::engine` tests including KvEngine `prefill` / `decode_step`
+  for both compressed (boundary residual) and uncompressed paths,
+  `query_greedy` smoke test, and `store()` getter.
+
+### Warnings cleanup
+
+Same day: removed 3 unused-import warnings in
+`kv-cache-benchmark/src/real_model/{decode_comparison,runner}.rs`,
+reverted a `kv_dim.is_multiple_of(hd)` clippy-fix in
+`turbo_quant/engine.rs` (1.87.0 stable, MSRV 1.80), and reordered
+`apollo/engine.rs` so the `KvEngine` impl precedes the test module
+(satisfies clippy's `items-after-test-module`). `cargo clippy -p
+larql-kv --all-targets` is now clean.
 ## [2026-05-09] — Initial extraction from larql-inference
 
 Genesis commit. The crate was carved out of
@@ -88,9 +133,9 @@ larql-kv apollo unit tests plus the `kv-cache-benchmark` criterion bench.
 ### Coverage at extraction
 
 After running `cargo llvm-cov --package larql-kv` plus `profiler.rs` test
-top-up, total line coverage is **69.82 %** (2 838 / 4 065 lines, 143 unit
-tests + 8 new profiler tests). 10 inherited files sit below the 90 %
-per-file floor and carry baselines in `coverage-policy.json` that may
+top-up, total line coverage was **69.82 %** (2 838 / 4 065 lines, 143 unit
+tests + 8 new profiler tests). 10 inherited files sat below the 90 %
+per-file floor and carried baselines in `coverage-policy.json` that may
 only ratchet upward. See [`ROADMAP.md`](ROADMAP.md) for the remediation
 list. `make larql-kv-coverage-policy` enforces the baselines.
 

@@ -1042,7 +1042,9 @@ mod tests {
         let path = dir.join("down.jsonl");
         let mut w = make_writer(&path);
         let mut cb = SilentExtractCallbacks;
-        let n = extractor.extract_ffn_down(0, &cfg, &mut w, &mut cb).unwrap();
+        let n = extractor
+            .extract_ffn_down(0, &cfg, &mut w, &mut cb)
+            .unwrap();
         assert_eq!(n, 4); // intermediate_size
         cleanup(&dir);
     }
@@ -1059,7 +1061,9 @@ mod tests {
         let path = dir.join("gate.jsonl");
         let mut w = make_writer(&path);
         let mut cb = SilentExtractCallbacks;
-        let n = extractor.extract_ffn_gate(0, &cfg, &mut w, &mut cb).unwrap();
+        let n = extractor
+            .extract_ffn_gate(0, &cfg, &mut w, &mut cb)
+            .unwrap();
         assert_eq!(n, 4);
         cleanup(&dir);
     }
@@ -1143,10 +1147,7 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
 
         let cfg = ExtractConfig {
-            components: vec![
-                COMPONENT_FFN_DOWN.into(),
-                COMPONENT_EMBEDDINGS.into(),
-            ],
+            components: vec![COMPONENT_FFN_DOWN.into(), COMPONENT_EMBEDDINGS.into()],
             layers: Some(vec![0]),
             top_k: 2,
         };

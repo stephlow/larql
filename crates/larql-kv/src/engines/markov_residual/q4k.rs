@@ -167,14 +167,15 @@ pub(super) fn rs_decode_step_walk(
 
         new_stored.push(h_new.clone());
 
-        let (h_post_attn, _new_kv) = larql_inference::attention::run_attention_block_decode_step_backend(
-            weights,
-            &h_new,
-            layer,
-            Some(&(k_full, v_full)),
-            abs_position,
-            Some(backend),
-        )?;
+        let (h_post_attn, _new_kv) =
+            larql_inference::attention::run_attention_block_decode_step_backend(
+                weights,
+                &h_new,
+                layer,
+                Some(&(k_full, v_full)),
+                abs_position,
+                Some(backend),
+            )?;
         let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
             .with_backend(backend);
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);

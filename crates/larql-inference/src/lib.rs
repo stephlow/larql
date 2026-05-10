@@ -97,19 +97,35 @@ pub use ffn::{
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
     ShardConfig, SparseFfn, WeightFfn, WirePreference,
 };
+// Crate-root forward re-exports — kept for any name with external use OR
+// in-crate examples/tests/benches that already import from the root. The
+// curated `research` module (below) re-sources these from subpaths so it
+// keeps working when individual root re-exports are dropped.
+//
+// Truly-unused root re-exports (no external + no inference example/test
+// usage) were dropped 2026-05-09: `capture_ffn_activation_matrix`,
+// `estimate_ffn_covariance`, `forward_raw_logits`, `infer_patched_q4k`,
+// `predict_from_hidden_with_ffn`, `predict_with_ffn_trace`,
+// `trace_forward_with_ffn`, `InferPatchedResult`, `LayerMode`,
+// `MemitFactResult`, `PredictResultWithAttention`,
+// `PredictResultWithResiduals`, `RawForward`, `SpecCapture`,
+// `TargetDelta`, `TraceResult`, `KNN_COSINE_THRESHOLD`. They remain
+// accessible via `larql_inference::forward::*` and `research::*`.
 pub use forward::{
-    apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,
-    capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals,
-    estimate_ffn_covariance, forward_from_layer, forward_raw_logits, forward_to_layer,
-    generate_cached_constrained, hidden_to_raw_logits, infer_patched, infer_patched_q4k,
-    logit_lens_top1, predict, predict_from_hidden, predict_from_hidden_with_ffn, predict_with_ffn,
-    predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router, predict_with_strategy,
+    apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals, capture_residuals,
+    capture_spec_residuals, forward_from_layer, forward_to_layer, generate_cached_constrained,
+    hidden_to_raw_logits, infer_patched, logit_lens_top1, predict, predict_from_hidden,
+    predict_with_ffn, predict_with_ffn_attention, predict_with_router, predict_with_strategy,
     run_memit, run_memit_with_target_opt, trace_forward, trace_forward_full,
-    trace_forward_with_ffn, walk_trace_from_residuals, InferPatchedResult, InferenceWeights,
-    KnnOverride, LayerAttentionCapture, LayerMode, MemitFact, MemitFactResult, MemitResult,
-    PredictResult, PredictResultWithAttention, PredictResultWithResiduals, RawForward, SpecCapture,
-    TargetDelta, TargetDeltaOpts, TraceResult, KNN_COSINE_THRESHOLD,
+    walk_trace_from_residuals, InferenceWeights, KnnOverride, LayerAttentionCapture, MemitFact,
+    MemitResult, PredictResult, TargetDeltaOpts,
 };
+// Crate-root layer_graph re-exports — kept for any name with external use
+// OR in-crate examples/tests/benches that import via the root. Truly-unused
+// names (no external + no inference example/test usage) dropped 2026-05-09:
+// `GridGenerateResult`, `ChatMLRenderer`, `GemmaRenderer`, `LayerOutput`,
+// `Llama3Renderer`, `PerLayerGraph`, `TurnRenderer`. They remain reachable
+// via `larql_inference::layer_graph::*`.
 pub use layer_graph::{
     build_adaptive_graph,
     detect_template,
@@ -119,7 +135,7 @@ pub use layer_graph::{
     // Expert grid generation
     grid::{
         generate_with_remote_ffn, generate_with_remote_ffn_batch, generate_with_remote_moe,
-        generate_with_remote_moe_batch, GridGenerateResult,
+        generate_with_remote_moe_batch,
     },
     hybrid::predict_hybrid,
     predict_honest,
@@ -135,28 +151,22 @@ pub use layer_graph::{
     AttentionCache,
     CachedLayerGraph,
     // Multi-turn chat session
-    ChatMLRenderer,
     ChatSession,
     DenseLayerGraph,
     // Generation building blocks (EOS, detok, sampling)
     Detokenizer,
     EosConfig,
-    GemmaRenderer,
     GenerateError,
     GenerateResult,
     GuidedWalkLayerGraph,
     // Production
     LayerGraph,
-    LayerOutput,
-    Llama3Renderer,
-    PerLayerGraph,
     PipelinedLayerGraph,
     Sampler,
     SamplingConfig,
     // Analysis/validation
     TemplatePattern,
     TemplateUniverse,
-    TurnRenderer,
     WalkLayerGraph,
 };
 pub use model::{load_model_dir, resolve_model_path, ModelWeights};
@@ -196,23 +206,31 @@ pub mod prelude {
 /// `cosine_similarity`, `kl_divergence`, …) now live in the `larql-kv`
 /// crate — depend on it directly.
 pub mod research {
-    pub use crate::{
+    // Source directly from subpaths so this curated surface keeps working
+    // even when individual root re-exports are dropped. Kept as a single
+    // import block per source module so the surface is easy to scan.
+    pub use crate::forward::{
         apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,
         capture_ffn_activation_matrix, capture_residuals, capture_spec_residuals,
         estimate_ffn_covariance, forward_from_layer, forward_raw_logits, forward_to_layer,
         generate_cached_constrained, hidden_to_raw_logits, infer_patched, infer_patched_q4k,
-        logit_lens_top1, predict_from_hidden, predict_from_hidden_with_ffn, predict_honest,
-        predict_pipeline, predict_with_ffn, predict_with_ffn_attention, predict_with_ffn_trace,
-        predict_with_graph, predict_with_graph_vindex_logits, predict_with_router,
-        predict_with_strategy, run_memit, run_memit_with_target_opt, trace_decomposed,
-        trace_forward, trace_forward_full, trace_forward_with_ffn, trace_residuals,
-        trace_with_graph, walk_trace_from_residuals, AnswerWaypoint, AttentionCache,
-        BoundaryStore, BoundaryWriter, ContextStore, ContextTier, ContextWriter,
+        logit_lens_top1, predict_from_hidden, predict_from_hidden_with_ffn, predict_with_ffn,
+        predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router,
+        predict_with_strategy, run_memit, run_memit_with_target_opt, trace_forward,
+        trace_forward_full, trace_forward_with_ffn, walk_trace_from_residuals,
         InferPatchedResult, InferenceWeights, KnnOverride, LayerAttentionCapture, LayerMode,
-        LayerSummary, MemitFact, MemitFactResult, MemitResult, PredictResult,
-        PredictResultWithAttention, PredictResultWithResiduals, RawForward, ResidualTrace,
-        SpecCapture, TargetDelta, TargetDeltaOpts, TemplatePattern, TemplateUniverse, TraceNode,
-        TracePositions, TraceResult, TraceStore, TraceWriter, KNN_COSINE_THRESHOLD,
+        MemitFact, MemitFactResult, MemitResult, PredictResult, PredictResultWithAttention,
+        PredictResultWithResiduals, RawForward, SpecCapture, TargetDelta, TargetDeltaOpts,
+        TraceResult, KNN_COSINE_THRESHOLD,
+    };
+    pub use crate::layer_graph::{
+        predict_honest, predict_pipeline, predict_with_graph, predict_with_graph_vindex_logits,
+        trace_with_graph, AttentionCache, TemplatePattern, TemplateUniverse,
+    };
+    pub use crate::trace::{
+        trace as trace_decomposed, trace_residuals, AnswerWaypoint, BoundaryStore, BoundaryWriter,
+        ContextStore, ContextTier, ContextWriter, LayerSummary, ResidualTrace, TraceNode,
+        TracePositions, TraceStore, TraceWriter,
     };
 }
 

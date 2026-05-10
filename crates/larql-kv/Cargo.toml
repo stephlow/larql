@@ -40,6 +40,7 @@ metal = ["larql-compute/metal", "larql-inference/metal"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [[bench]]
 name = "engine_decode"

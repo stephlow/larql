@@ -106,7 +106,11 @@ pub(super) fn pad_rows_to_block(data: &[f32], rows: usize, cols: usize) -> (Vec<
 /// architecture advertises `v_shares_k(layer) == true`. This keeps
 /// the 4-per-layer attn manifest contiguous: each layer emits exactly
 /// Q / K / V / O even when V physically reuses K's bytes.
-pub(super) fn resolve_v_tensor<T: Clone>(v: Option<T>, k: &Option<T>, v_shares_k: bool) -> Option<T> {
+pub(super) fn resolve_v_tensor<T: Clone>(
+    v: Option<T>,
+    k: &Option<T>,
+    v_shares_k: bool,
+) -> Option<T> {
     v.or_else(|| if v_shares_k { k.clone() } else { None })
 }
 

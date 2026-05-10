@@ -51,6 +51,7 @@ mod error;
 pub(crate) mod metrics;
 pub mod multi_layer_wire;
 mod router;
+mod runtime;
 mod shard;
 mod stream;
 mod wire;

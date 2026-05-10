@@ -144,11 +144,7 @@ mod tests {
         let stub = StubGate {
             per_row: vec![vec![3, 7], vec![1, 9], vec![7, 5]],
         };
-        let x = ndarray::Array2::from_shape_vec(
-            (3, 1),
-            vec![0.0_f32, 1.0, 2.0],
-        )
-        .unwrap();
+        let x = ndarray::Array2::from_shape_vec((3, 1), vec![0.0_f32, 1.0, 2.0]).unwrap();
         let out = stub.gate_knn_batch(0, &x, 4);
         assert_eq!(out, vec![1, 3, 5, 7, 9]);
     }
@@ -235,7 +231,9 @@ mod tests {
     fn stub_gate_knn_returns_empty_for_out_of_range_row() {
         // Residual[0] selects the row; passing an index past per_row
         // length should return empty.
-        let stub = StubGate { per_row: vec![vec![1]] };
+        let stub = StubGate {
+            per_row: vec![vec![1]],
+        };
         let r = Array1::from_vec(vec![5.0_f32; 4]); // index 5, only 1 row
         assert!(stub.gate_knn(0, &r, 4).is_empty());
     }

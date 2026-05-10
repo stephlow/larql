@@ -156,9 +156,9 @@ impl KvEngine for MarkovResidualEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use larql_inference::test_utils::make_test_weights;
     use crate::KvEngine;
     use larql_inference::forward::hidden_to_raw_logits;
+    use larql_inference::test_utils::make_test_weights;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -269,5 +269,89 @@ mod tests {
             let h = engine.decode_step(&weights, step as u32).expect("decode");
             assert_eq!(h.shape(), &[1, weights.hidden_size], "step {step}");
         }
+    }
+
+    // ── Profiling ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn with_profiling_enables_profiling_branch() {
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(None).with_profiling(true);
+        // No decode yet → stage_summary returns None even with profiling on.
+        assert!(engine.stage_summary().is_none());
+
+        engine.prefill(&weights, &[0u32, 1]).expect("prefill");
+        engine.decode_step(&weights, 2).expect("decode");
+
+        let summary = engine.stage_summary().expect("profiling summary");
+        assert_eq!(summary.engine, "markov-rs");
+        assert_eq!(summary.steps, 1);
+        assert!(summary.avg_total_decode_us > 0.0);
+    }
+
+    #[test]
+    fn stage_summary_none_without_profiling() {
+        let weights = make_test_weights();
+        let mut engine = MarkovResidualEngine::new(None); // profiling: false
+        engine.prefill(&weights, &[0u32]).expect("prefill");
+        engine.decode_step(&weights, 1).expect("decode");
+        assert!(
+            engine.stage_summary().is_none(),
+            "stage_summary must be None when profiling is disabled"
+        );
+    }
+
+    #[test]
+    fn profiling_decode_path_matches_unprofiled_shape() {
+        // Two engines: one profiled, one not. Both should yield hidden states
+        // of the same shape after the same prefill+decode sequence.
+        let weights = make_test_weights();
+        let mut profiled = MarkovResidualEngine::new(None).with_profiling(true);
+        let mut plain = MarkovResidualEngine::new(None);
+        profiled.prefill(&weights, &[0u32, 1]).unwrap();
+        plain.prefill(&weights, &[0u32, 1]).unwrap();
+        let h_p = profiled.decode_step(&weights, 2).unwrap();
+        let h_n = plain.decode_step(&weights, 2).unwrap();
+        assert_eq!(h_p.shape(), h_n.shape());
+    }
+
+    // ── Q4K paths via CPU fallback ────────────────────────────────────────
+    //
+    // On a CPU backend, `q4k_prefill_metal` returns `None`, so the engine
+    // falls through to `rs_prefill_walk` against the synthetic VectorIndex.
+    // This exercises the prefill_q4k / decode_step_q4k branches that the
+    // Metal-only happy path also takes (apart from the Metal early-return).
+
+    #[test]
+    fn prefill_q4k_cpu_fallback_runs_walk_path() {
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let mut engine = MarkovResidualEngine::new(None);
+        let h = engine
+            .prefill_q4k(&mut weights, &index, &[0u32, 1, 2], &*backend)
+            .expect("prefill_q4k cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(engine.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn decode_step_q4k_cpu_fallback_extends_store() {
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let mut engine = MarkovResidualEngine::new(None);
+        engine
+            .prefill_q4k(&mut weights, &index, &[0u32, 1], &*backend)
+            .expect("prefill_q4k");
+        let mem_before = engine.memory_bytes();
+        let h = engine
+            .decode_step_q4k(&mut weights, &index, 2, &*backend)
+            .expect("decode_step_q4k cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(
+            engine.memory_bytes() > mem_before,
+            "store should grow after decode_step_q4k"
+        );
     }
 }
