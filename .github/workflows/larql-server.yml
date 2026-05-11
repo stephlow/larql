@@ -75,6 +75,17 @@ jobs:
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           & "$vcpkgRoot\vcpkg.exe" install openblas:x64-windows
 
+      # `protobuf-src` is the cargo build-dep that bundles a fresh
+      # `protoc` via cmake on Linux/macOS, but its absl link step fails
+      # against the GitHub windows-latest runner's UCRT. Cargo.toml
+      # already drops `protobuf-src` on `cfg(windows)`, so `tonic-build`
+      # falls back to whatever `protoc` is on PATH — install one here.
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v4
         with:

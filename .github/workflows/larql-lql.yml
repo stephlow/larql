@@ -68,6 +68,15 @@ jobs:
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           & "$vcpkgRoot\vcpkg.exe" install openblas:x64-windows
 
+      # protoc on PATH satisfies the `cfg(not(windows))` skip in
+      # `larql-router-protocol` (pulled in via larql-inference). See
+      # its build.rs for the rationale.
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v4
         with:

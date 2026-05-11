@@ -64,4 +64,10 @@ metal-experts = ["larql-compute/metal"]
 
 [build-dependencies]
 tonic-build = "0.13"
+
+# See `crates/larql-router-protocol/Cargo.toml` for the Windows
+# rationale: `protobuf-src` builds protoc via cmake and the link step
+# fails on windows-latest. On Windows we rely on a system protoc
+# (installed by CI via `arduino/setup-protoc`).
+[target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2"
